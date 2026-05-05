@@ -6,6 +6,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 
 import requests
 
+from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
 from llm_browser.provider.types import ModelEvent, ToolCall
 
 
@@ -83,13 +84,16 @@ class OpenAIResponsesProvider:
         if self.previous_response_id and unsent_tool_messages:
             for message in unsent_tool_messages:
                 call_id = str(message["tool_call_id"])
+                tool_name = str(message.get("name") or "tool")
+                content = message.get("content", "")
                 input_items.append(
                     {
                         "type": "function_call_output",
                         "call_id": call_id,
-                        "output": message.get("content", ""),
+                        "output": tool_output_text(content),
                     }
                 )
+                input_items.extend(visual_context_messages(content, call_id=call_id, tool_name=tool_name))
         else:
             user_text = self._latest_user_text(messages)
             input_items.append(

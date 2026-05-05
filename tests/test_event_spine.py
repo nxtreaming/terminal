@@ -58,6 +58,21 @@ class EventSpineTest(unittest.TestCase):
             self.assertEqual(third.payload, {"status": "idle"})
             self.assertEqual(len(store.events.read(session.id)), 3)
 
+    def test_session_store_cancel_request_round_trip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+
+            store.request_cancel(session.id, "test cancel")
+
+            self.assertTrue(store.is_cancel_requested(session.id))
+            self.assertEqual(store.cancel_request(session.id), {"reason": "test cancel"})
+            events = store.events.read(session.id)
+            self.assertEqual(events[-1].type, "session.cancel_requested")
+
+            store.clear_cancel(session.id)
+            self.assertFalse(store.is_cancel_requested(session.id))
+
     def test_session_store_list_is_newest_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))

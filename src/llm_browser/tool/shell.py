@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import subprocess
+import time
 from typing import Any, Dict
 
 from llm_browser.tool.context import ToolContext
@@ -13,23 +14,61 @@ MAX_INLINE_OUTPUT = 20000
 def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     command = str(arguments["command"])
     timeout_s = float(arguments.get("timeout_s", 60))
-    result = subprocess.run(
+    deadline = time.time() + timeout_s
+    process = subprocess.Popen(
         command,
         shell=True,
         cwd=str(ctx.session.cwd),
         text=True,
-        capture_output=True,
-        timeout=timeout_s,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
     )
+    while process.poll() is None:
+        if ctx.is_cancel_requested():
+            process.terminate()
+            try:
+                stdout, stderr = process.communicate(timeout=2)
+            except subprocess.TimeoutExpired:
+                process.kill()
+                stdout, stderr = process.communicate(timeout=2)
+            combined_cancel = _combine(stdout, stderr)
+            return ToolResult(
+                text=combined_cancel,
+                data={"returncode": process.returncode, "cancelled": True, "truncated": False},
+            )
+        if time.time() >= deadline:
+            process.kill()
+            stdout, stderr = process.communicate(timeout=2)
+            combined_timeout = _combine(stdout, stderr)
+            return ToolResult(
+                text=combined_timeout,
+                data={
+                    "returncode": process.returncode,
+                    "timeout_s": timeout_s,
+                    "timed_out": True,
+                    "truncated": False,
+                },
+            )
+        time.sleep(0.1)
+
+    stdout, stderr = process.communicate()
+    combined = _combine(stdout, stderr)
+    return _tool_result_from_output(ctx, combined, process.returncode)
+
+
+def _combine(stdout: str, stderr: str) -> str:
     combined = ""
-    if result.stdout:
-        combined += result.stdout
-    if result.stderr:
+    if stdout:
+        combined += stdout
+    if stderr:
         if combined:
             combined += "\n"
-        combined += result.stderr
+        combined += stderr
+    return combined
 
-    data: Dict[str, Any] = {"returncode": result.returncode}
+
+def _tool_result_from_output(ctx: ToolContext, combined: str, returncode: int) -> ToolResult:
+    data: Dict[str, Any] = {"returncode": returncode}
     if len(combined) > MAX_INLINE_OUTPUT:
         output_dir = ctx.session.artifact_dir / "tool-output"
         output_dir.mkdir(parents=True, exist_ok=True)

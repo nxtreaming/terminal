@@ -14,6 +14,9 @@ class ToolContext:
     tool_call_id: str
     tool_name: str
 
+    def is_cancel_requested(self) -> bool:
+        return self.store.is_cancel_requested(self.session.id)
+
     def emit_image(self, image: ToolImage) -> None:
         self.store.emit(
             self.session.id,

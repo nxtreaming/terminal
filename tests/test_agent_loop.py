@@ -15,6 +15,19 @@ class NeverDoneProvider:
         yield ModelEvent.call(ToolCall(id=f"call_{len(messages)}", name="echo", arguments={"text": "again"}))
 
 
+class BadToolThenDoneProvider:
+    def __init__(self):
+        self.turn = 0
+
+    def start_turn(self, messages, tools):
+        self.turn += 1
+        if self.turn == 1:
+            yield ModelEvent.call(ToolCall(id="call_bad", name="missing_tool", arguments={}))
+        else:
+            tool_message = [message for message in messages if message.get("role") == "tool"][-1]
+            yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": tool_message["content"]}))
+
+
 class AgentLoopTest(unittest.TestCase):
     def test_fake_provider_executes_tools_and_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -84,6 +97,19 @@ class AgentLoopTest(unittest.TestCase):
             self.assertTrue(large_output["data"]["truncated"])
             self.assertTrue(Path(large_output["data"]["output_path"]).exists())
             self.assertIn("full output saved", large_output["text"])
+
+    def test_tool_errors_are_returned_to_model_for_recovery(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = Agent(store, provider=BadToolThenDoneProvider()).run("recover", cwd=Path(tmp))
+
+            self.assertEqual(session.status, "done")
+            events = store.events.read(session.id)
+            event_types = [event.type for event in events]
+            self.assertIn("tool.failed", event_types)
+            self.assertIn("session.done", event_types)
+            done = [event for event in events if event.type == "session.done"][-1]
+            self.assertIn("unknown tool", done.payload["result"])
 
 
 if __name__ == "__main__":

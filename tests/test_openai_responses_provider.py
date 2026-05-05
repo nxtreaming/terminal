@@ -93,6 +93,32 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         )
         self.assertEqual(events[0].text, "done")
 
+    def test_sends_visual_context_after_screenshot_tool_output(self) -> None:
+        provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")
+        provider.previous_response_id = "resp_1"
+        response = FakeResponse(200, {"id": "resp_2", "output": []})
+        content = [
+            {"type": "input_text", "text": "images=[after-click]"},
+            {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,abc"},
+        ]
+
+        with patch("llm_browser.provider.openai_responses.requests.post", return_value=response) as post:
+            list(
+                provider.start_turn(
+                    [
+                        {"role": "user", "content": "hello"},
+                        {"role": "tool", "tool_call_id": "call_1", "name": "python", "content": content},
+                    ],
+                    [],
+                )
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["input"][0]["type"], "function_call_output")
+        self.assertIn("screenshot image", payload["input"][0]["output"])
+        self.assertEqual(payload["input"][1]["role"], "user")
+        self.assertEqual(payload["input"][1]["content"][1]["type"], "input_image")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
