@@ -58,6 +58,15 @@ class Agent:
                 if not tool_calls:
                     break
 
+                messages.append(
+                    {
+                        "role": "assistant",
+                        "tool_calls": [
+                            {"id": call.id, "name": call.name, "arguments": call.arguments}
+                            for call in tool_calls
+                        ],
+                    }
+                )
                 for call in tool_calls:
                     result = self._execute_tool(session.id, call)
                     messages.append(

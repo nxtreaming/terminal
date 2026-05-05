@@ -28,7 +28,7 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument("--parent-id", default=None, help="Optional parent session id.")
     run.add_argument(
         "--provider",
-        choices=["fake", "openai"],
+        choices=["fake", "openai", "codex"],
         default="fake",
         help="Provider to use.",
     )
@@ -55,7 +55,7 @@ def build_parser() -> argparse.ArgumentParser:
     browser_smoke.set_defaults(func=cmd_browser_smoke)
 
     tui = sub.add_parser("tui", help="Start the simple terminal UI.")
-    tui.add_argument("--provider", choices=["fake", "openai"], default="fake")
+    tui.add_argument("--provider", choices=["fake", "openai", "codex"], default="fake")
     tui.add_argument("--model", default=None)
     tui.set_defaults(func=cmd_tui)
 
@@ -85,6 +85,10 @@ def cmd_run(args: argparse.Namespace) -> int:
         from llm_browser.provider.openai_responses import OpenAIResponsesProvider
 
         provider = OpenAIResponsesProvider(model=args.model)
+    elif args.provider == "codex":
+        from llm_browser.provider.codex_responses import CodexResponsesProvider
+
+        provider = CodexResponsesProvider(model=args.model)
     agent = Agent(store, provider=provider)
     session = agent.run(args.task, parent_id=args.parent_id)
     print(json.dumps(session.to_dict(), indent=2))
@@ -138,6 +142,10 @@ def cmd_tui(args: argparse.Namespace) -> int:
             from llm_browser.provider.openai_responses import OpenAIResponsesProvider
 
             return OpenAIResponsesProvider(model=args.model)
+        if args.provider == "codex":
+            from llm_browser.provider.codex_responses import CodexResponsesProvider
+
+            return CodexResponsesProvider(model=args.model)
         return None
 
     store = store_from_args(args)
