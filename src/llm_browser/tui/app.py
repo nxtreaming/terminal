@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import shlex
+import subprocess
 import threading
 from pathlib import Path
 from typing import Callable, Optional
@@ -87,6 +88,7 @@ class BrowserUseTerminalApp(App[None]):
         ("ctrl+c", "cancel_selected", "Cancel"),
         ("ctrl+r", "refresh", "Refresh"),
         ("ctrl+l", "clear_log", "Clear"),
+        ("o", "open_artifact", "Open"),
         ("q", "quit", "Quit"),
     ]
 
@@ -100,6 +102,7 @@ class BrowserUseTerminalApp(App[None]):
         self.store = store
         self.manager = SessionManager(store, provider_factory=provider_factory, max_turns=max_turns)
         self.selected_session_id: Optional[str] = None
+        self.selected_artifact_path: Optional[str] = None
         self._stop = threading.Event()
         self._listener: Optional[threading.Thread] = None
 
@@ -119,7 +122,7 @@ class BrowserUseTerminalApp(App[None]):
                 artifacts.add_columns("kind", "name", "path")
                 yield artifacts
         yield Input(
-            placeholder="run <task>  |  dataset <name> [count]  |  show <id>  |  cancel [id]  |  help",
+            placeholder="run <task>  |  dataset <name> [count]  |  show <id>  |  open [artifact-path]  |  help",
             id="command",
         )
         yield Footer()
@@ -158,7 +161,8 @@ class BrowserUseTerminalApp(App[None]):
         log.write("[bold #9ccfd8]browser use terminal[/bold #9ccfd8]")
         log.write(
             "Commands: [bold]run[/bold] a task, [bold]dataset real_v8 1[/bold], "
-            "[bold]resume[/bold] selected, [bold]cancel[/bold] a session, [bold]show[/bold] a session."
+            "[bold]resume[/bold] selected, [bold]cancel[/bold] a session, [bold]show[/bold] a session, "
+            "[bold]open[/bold] an artifact."
         )
 
     def _handle_event(self, event: Event) -> None:
@@ -187,11 +191,12 @@ class BrowserUseTerminalApp(App[None]):
         self._handle_command(line)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id != "sessions":
-            return
-        self.selected_session_id = str(event.row_key.value)
-        self._load_session_log(self.selected_session_id)
-        self.refresh_artifacts()
+        if event.data_table.id == "sessions":
+            self.selected_session_id = str(event.row_key.value)
+            self._load_session_log(self.selected_session_id)
+            self.refresh_artifacts()
+        elif event.data_table.id == "artifacts":
+            self.selected_artifact_path = str(event.row_key.value)
 
     def _handle_command(self, line: str) -> None:
         log = self.query_one("#events", RichLog)
@@ -247,6 +252,9 @@ class BrowserUseTerminalApp(App[None]):
                 return
             self.manager.cancel(session_id)
             log.write(f"[yellow]cancel requested for {escape(session_id)}[/yellow]")
+        elif command == "open":
+            path = args[1] if len(args) > 1 else self.selected_artifact_path
+            self._open_artifact(path)
         elif command == "dataset" and len(args) >= 2:
             count = int(args[2]) if len(args) >= 3 else 1
             tasks = select_tasks(load_dataset(args[1]), count=count)
@@ -291,8 +299,13 @@ class BrowserUseTerminalApp(App[None]):
         session = self.store.load(session_id)
         if session is None:
             return
+        first_path: Optional[str] = None
         for path in _artifact_paths(session):
+            if first_path is None:
+                first_path = str(path)
             table.add_row(_artifact_kind(path), path.name, str(path), key=str(path))
+        if self.selected_artifact_path is None:
+            self.selected_artifact_path = first_path
 
     def action_cancel_selected(self) -> None:
         if self.selected_session_id:
@@ -304,6 +317,24 @@ class BrowserUseTerminalApp(App[None]):
 
     def action_clear_log(self) -> None:
         self.query_one("#events", RichLog).clear()
+
+    def action_open_artifact(self) -> None:
+        self._open_artifact(self.selected_artifact_path)
+
+    def _open_artifact(self, path: Optional[str]) -> None:
+        log = self.query_one("#events", RichLog)
+        if not path:
+            log.write("[red]no selected artifact[/red]")
+            return
+        artifact = Path(path).expanduser()
+        if not artifact.exists():
+            log.write(f"[red]artifact not found: {escape(str(artifact))}[/red]")
+            return
+        try:
+            subprocess.Popen(["open", str(artifact)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            log.write(f"[green]opened {escape(str(artifact))}[/green]")
+        except Exception as exc:
+            log.write(f"[yellow]open failed: {escape(str(exc))}; path: {escape(str(artifact))}[/yellow]")
 
     def _task_for_session(self, session: SessionMetadata) -> str:
         for event in self.store.events.read(session.id):
