@@ -43,6 +43,13 @@ class Agent:
         cwd: Optional[Path] = None,
     ) -> SessionMetadata:
         session = self.store.create(parent_id=parent_id, cwd=cwd)
+        return self.run_session(session.id, task)
+
+    def run_session(self, session_id: str, task: str) -> SessionMetadata:
+        session = self.store.load(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+
         self.store.clear_cancel(session.id)
         self.store.emit(session.id, "session.input", {"text": task})
         self.store.update_status(session.id, "running")

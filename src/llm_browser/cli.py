@@ -48,6 +48,11 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_show.add_argument("--events", type=int, default=20, help="Number of events to print.")
     sessions_show.set_defaults(func=cmd_sessions_show)
 
+    sessions_cancel = sessions_sub.add_parser("cancel", help="Request cancellation for a running session.")
+    sessions_cancel.add_argument("session_id")
+    sessions_cancel.add_argument("--reason", default="cli requested cancellation")
+    sessions_cancel.set_defaults(func=cmd_sessions_cancel)
+
     browser = sub.add_parser("browser", help="Browser runtime commands.")
     browser_sub = browser.add_subparsers(dest="browser_command", required=True)
 
@@ -59,6 +64,7 @@ def build_parser() -> argparse.ArgumentParser:
     tui = sub.add_parser("tui", help="Start the simple terminal UI.")
     tui.add_argument("--provider", choices=["fake", "openai", "codex"], default="fake")
     tui.add_argument("--model", default=None)
+    tui.add_argument("--max-turns", type=int, default=80)
     tui.set_defaults(func=cmd_tui)
 
     auth = sub.add_parser("auth", help="Authentication commands.")
@@ -120,6 +126,13 @@ def cmd_sessions_show(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_sessions_cancel(args: argparse.Namespace) -> int:
+    store = store_from_args(args)
+    store.request_cancel(args.session_id, reason=args.reason)
+    print(json.dumps({"ok": True, "session_id": args.session_id, "reason": args.reason}, indent=2))
+    return 0
+
+
 def cmd_browser_smoke(args: argparse.Namespace) -> int:
     from llm_browser.browser import BrowserRuntime
 
@@ -137,7 +150,7 @@ def cmd_browser_smoke(args: argparse.Namespace) -> int:
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
-    from llm_browser.tui import SimpleTui
+    from llm_browser.tui import TextualTui
 
     def provider_factory():
         if args.provider == "openai":
@@ -151,7 +164,7 @@ def cmd_tui(args: argparse.Namespace) -> int:
         return None
 
     store = store_from_args(args)
-    return SimpleTui(store, provider_factory=provider_factory).run()
+    return TextualTui(store, provider_factory=provider_factory, max_turns=args.max_turns).run()
 
 
 def cmd_auth_status(args: argparse.Namespace) -> int:
