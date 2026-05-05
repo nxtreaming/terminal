@@ -12,6 +12,7 @@ from llm_browser.agent import Agent
 from llm_browser.brand import CLI_NAME, DEFAULT_STATE_DIR
 from llm_browser.datasets import build_dataset_prompt, dataset_summary, load_dataset, select_tasks
 from llm_browser.provider.base import Provider
+from llm_browser.session.trace import build_self_eval_prompt, write_trace_bundle
 from llm_browser.session.store import SessionStore
 
 
@@ -64,6 +65,17 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_resume.add_argument("--model", default="gpt-5.5")
     sessions_resume.add_argument("--max-turns", type=int, default=80)
     sessions_resume.set_defaults(func=cmd_sessions_resume)
+
+    sessions_trace = sessions_sub.add_parser("trace", help="Write a JSON trace bundle for a session.")
+    sessions_trace.add_argument("session_id")
+    sessions_trace.set_defaults(func=cmd_sessions_trace)
+
+    sessions_eval = sessions_sub.add_parser("self-eval", help="Run an LLM evaluator as a child session over a trace.")
+    sessions_eval.add_argument("session_id")
+    sessions_eval.add_argument("--provider", choices=["fake", "openai", "codex"], default="codex")
+    sessions_eval.add_argument("--model", default="gpt-5.5")
+    sessions_eval.add_argument("--max-turns", type=int, default=20)
+    sessions_eval.set_defaults(func=cmd_sessions_self_eval)
 
     browser = sub.add_parser("browser", help="Browser runtime commands.")
     browser_sub = browser.add_subparsers(dest="browser_command", required=True)
@@ -166,6 +178,22 @@ def cmd_sessions_resume(args: argparse.Namespace) -> int:
     store = store_from_args(args)
     agent = Agent(store, provider=make_provider(args.provider, args.model), max_turns=args.max_turns)
     session = agent.resume_session(args.session_id, args.instruction)
+    print(json.dumps(session.to_dict(), indent=2))
+    return 0
+
+
+def cmd_sessions_trace(args: argparse.Namespace) -> int:
+    store = store_from_args(args)
+    path = write_trace_bundle(store, args.session_id)
+    print(json.dumps({"ok": True, "path": str(path)}, indent=2))
+    return 0
+
+
+def cmd_sessions_self_eval(args: argparse.Namespace) -> int:
+    store = store_from_args(args)
+    prompt = build_self_eval_prompt(store, args.session_id)
+    agent = Agent(store, provider=make_provider(args.provider, args.model), max_turns=args.max_turns)
+    session = agent.run(prompt, parent_id=args.session_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
 
