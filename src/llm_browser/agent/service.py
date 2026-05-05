@@ -9,6 +9,7 @@ from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.metadata import SessionMetadata
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.builtins import build_builtin_registry
+from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolResult
 
@@ -76,6 +77,7 @@ class Agent:
 
             session = self.store.update_status(session.id, "done")
             self.store.emit(session.id, "session.done", {"result": final_result})
+            self.tools.close_session(session.id)
             return session
         except BaseException as exc:
             self.store.update_status(session.id, "failed")
@@ -84,16 +86,21 @@ class Agent:
                 "session.failed",
                 {"error": str(exc), "error_type": type(exc).__name__},
             )
+            self.tools.close_session(session.id)
             raise
 
     def _execute_tool(self, session_id: str, call: ToolCall) -> ToolResult:
+        session = self.store.load(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+        ctx = ToolContext(session=session, store=self.store, tool_call_id=call.id, tool_name=call.name)
         self.store.emit(
             session_id,
             "tool.started",
             {"tool_call_id": call.id, "name": call.name, "arguments": call.arguments},
         )
         try:
-            result = self.tools.run(call.name, call.arguments)
+            result = self.tools.run(call.name, call.arguments, ctx)
             self.store.emit(
                 session_id,
                 "tool.finished",

@@ -2,10 +2,11 @@ from __future__ import annotations
 
 from typing import Any, Callable, Dict, List
 
+from llm_browser.tool.context import ToolContext
 from llm_browser.tool.result import ToolResult
 from llm_browser.tool.spec import ToolSpec
 
-ToolHandler = Callable[[Dict[str, Any]], ToolResult]
+ToolHandler = Callable[[ToolContext, Dict[str, Any]], ToolResult]
 
 
 class ToolRegistry:
@@ -22,7 +23,13 @@ class ToolRegistry:
     def specs(self) -> List[Dict[str, Any]]:
         return [spec.to_provider_tool() for spec in self._specs.values()]
 
-    def run(self, name: str, arguments: Dict[str, Any]) -> ToolResult:
+    def run(self, name: str, arguments: Dict[str, Any], ctx: ToolContext) -> ToolResult:
         if name not in self._handlers:
             raise KeyError(f"unknown tool: {name}")
-        return self._handlers[name](arguments)
+        return self._handlers[name](ctx, arguments)
+
+    def close_session(self, session_id: str) -> None:
+        for handler in self._handlers.values():
+            close = getattr(handler, "close_session", None)
+            if callable(close):
+                close(session_id)

@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import base64
 from dataclasses import dataclass, field
-from typing import Any, Dict, List
+from pathlib import Path
+from typing import Any, Dict, List, Union
 
 
 @dataclass(frozen=True)
@@ -34,10 +36,29 @@ class ToolResult:
     images: List[ToolImage] = field(default_factory=list)
     data: Dict[str, Any] = field(default_factory=dict)
 
-    def to_provider_content(self) -> str:
-        # Image transport is provider-specific. For the fake provider and event log,
-        # keep a compact text representation until the OpenAI provider is wired.
-        parts = []
+    def to_provider_content(self) -> Union[str, List[Dict[str, Any]]]:
+        if self.images:
+            content: List[Dict[str, Any]] = []
+            text = self._text_summary()
+            if text:
+                content.append({"type": "input_text", "text": text})
+            for image in self.images:
+                try:
+                    data = base64.b64encode(Path(image.path).read_bytes()).decode("ascii")
+                    content.append(
+                        {
+                            "type": "input_image",
+                            "detail": image.detail,
+                            "image_url": f"data:{image.mime_type};base64,{data}",
+                        }
+                    )
+                except OSError:
+                    content.append({"type": "input_text", "text": f"[missing image artifact: {image.path}]"})
+            return content
+        return self._text_summary()
+
+    def _text_summary(self) -> str:
+        parts: List[str] = []
         if self.text:
             parts.append(self.text)
         if self.data:
