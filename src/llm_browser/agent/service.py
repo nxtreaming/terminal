@@ -81,9 +81,11 @@ class Agent:
                 self._check_cancel(session.id)
                 messages = self._maybe_compact(session, messages)
                 tool_calls: List[ToolCall] = []
+                text_parts: List[str] = []
                 for event in self.provider.start_turn(messages, self.tools.specs()):
                     self._check_cancel(session.id)
                     if event.type == "text_delta":
+                        text_parts.append(event.text)
                         self.store.emit(session.id, "model.delta", {"text": event.text})
                     elif event.type == "tool_call":
                         if event.tool_call is None:
@@ -95,6 +97,8 @@ class Agent:
                         raise RuntimeError(f"unknown provider event type: {event.type}")
 
                 if not tool_calls:
+                    if text_parts:
+                        final_result = "".join(text_parts).strip()
                     break
 
                 messages.append(

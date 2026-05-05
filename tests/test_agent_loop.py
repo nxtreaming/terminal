@@ -40,6 +40,11 @@ class ManyToolCallsProvider:
             yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": "ok"}))
 
 
+class TextOnlyProvider:
+    def start_turn(self, messages, tools):
+        yield ModelEvent.text("direct final")
+
+
 class AgentLoopTest(unittest.TestCase):
     def test_fake_provider_executes_tools_and_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -82,6 +87,16 @@ class AgentLoopTest(unittest.TestCase):
             events = store.events.read(sessions[0].id)
             self.assertEqual(events[-1].type, "session.failed")
             self.assertIn("did not call done", events[-1].payload["error"])
+
+    def test_text_only_model_response_is_final_result(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = Agent(store, provider=TextOnlyProvider()).run("answer directly", cwd=Path(tmp))
+
+            self.assertEqual(session.status, "done")
+            events = store.events.read(session.id)
+            self.assertEqual(events[-1].type, "session.done")
+            self.assertEqual(events[-1].payload["result"], "direct final")
 
     def test_large_tool_output_spills_to_artifact(self) -> None:
         class LargeOutputProvider:
