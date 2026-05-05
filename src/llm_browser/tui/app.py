@@ -315,7 +315,11 @@ class BrowserUseTerminalApp(App[None]):
 def _artifact_paths(session: SessionMetadata) -> list[Path]:
     if not session.artifact_dir.exists():
         return []
-    paths = [path for path in session.artifact_dir.rglob("*") if path.is_file()]
+    paths = [
+        path
+        for path in session.artifact_dir.rglob("*")
+        if path.is_file() and "chrome-profile" not in path.relative_to(session.artifact_dir).parts
+    ]
     return sorted(paths, key=lambda path: path.stat().st_mtime, reverse=True)[:200]
 
 

@@ -254,11 +254,24 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
         provider = make_provider(args.provider, args.model)
         agent = Agent(store, provider=provider, max_turns=args.max_turns)
         prompt = build_dataset_prompt(task, headless=args.headless)
+        workspace = store.state_dir / "dataset-runs" / run_id / f"task-{task.task_id}-workspace"
+        workspace.mkdir(parents=True, exist_ok=True)
         try:
-            session = agent.run(prompt)
-            result = {"task_id": task.task_id, "session": session.to_dict(), "ok": session.status == "done"}
+            session = agent.run(prompt, cwd=workspace)
+            result = {
+                "task_id": task.task_id,
+                "session": session.to_dict(),
+                "workspace": str(workspace),
+                "ok": session.status == "done",
+            }
         except Exception as exc:
-            result = {"task_id": task.task_id, "ok": False, "error": str(exc), "error_type": type(exc).__name__}
+            result = {
+                "task_id": task.task_id,
+                "workspace": str(workspace),
+                "ok": False,
+                "error": str(exc),
+                "error_type": type(exc).__name__,
+            }
             if args.stop_on_failure:
                 manifest["sessions"].append(result)
                 _write_dataset_manifest(store, run_id, manifest)
