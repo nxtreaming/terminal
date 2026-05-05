@@ -9,6 +9,9 @@ description = "A browser-specific LLM harness built around raw CDP, durable sess
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = [
+  "beautifulsoup4>=4.14.3",
+  "lxml>=6.1.0",
+  "pandas>=2.3.3",
   "requests>=2.31",
   "websocket-client>=1.8",
 ]

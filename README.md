@@ -20,13 +20,13 @@ Current status: vertical MVP implementation is underway. The current runtime alr
 ## Local Commands
 
 ```bash
-python3 -m llm_browser.cli doctor
-python3 -m llm_browser.cli auth status
-python3 -m llm_browser.cli run --provider fake "Open example.com"
-python3 -m llm_browser.cli run --provider codex --model gpt-5.5 "Call the done tool with result ok."
-python3 -m llm_browser.cli browser smoke --headless --url https://example.com
-python3 -m llm_browser.cli tui
-python3 -m llm_browser.cli sessions list
+uv run llm-browser doctor
+uv run llm-browser auth status
+uv run llm-browser run --provider fake "Open example.com"
+uv run llm-browser run --provider codex --model gpt-5.5 "Call the done tool with result ok."
+uv run llm-browser browser smoke --headless --url https://example.com
+uv run llm-browser tui
+uv run llm-browser sessions list
 ```
 
 By default runtime state is stored under `.llm-browser/`.
@@ -34,6 +34,6 @@ By default runtime state is stored under `.llm-browser/`.
 For headless browser tool runs:
 
 ```bash
-LLM_BROWSER_HEADLESS=1 python3 -m llm_browser.cli run --provider codex --model gpt-5.5 \
+LLM_BROWSER_HEADLESS=1 uv run llm-browser run --provider codex --model gpt-5.5 \
   "Use python headless true. Open https://example.com, screenshot('loaded', attach=True), then call done with the title."
 ```

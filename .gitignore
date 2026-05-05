@@ -6,6 +6,8 @@ __pycache__/
 .ruff_cache/
 .venv/
 .llm-browser/
+artifacts/
+*.egg-info/
 node_modules/
 dist/
 build/
