@@ -46,6 +46,14 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_show.add_argument("--events", type=int, default=20, help="Number of events to print.")
     sessions_show.set_defaults(func=cmd_sessions_show)
 
+    browser = sub.add_parser("browser", help="Browser runtime commands.")
+    browser_sub = browser.add_subparsers(dest="browser_command", required=True)
+
+    browser_smoke = browser_sub.add_parser("smoke", help="Launch Chrome, navigate, and capture a screenshot.")
+    browser_smoke.add_argument("--url", default="https://example.com", help="URL to open.")
+    browser_smoke.add_argument("--headless", action="store_true", help="Run Chrome headless.")
+    browser_smoke.set_defaults(func=cmd_browser_smoke)
+
     return parser
 
 
@@ -92,6 +100,22 @@ def cmd_sessions_show(args: argparse.Namespace) -> int:
         "events": [event.to_dict() for event in events[-args.events :]],
     }
     print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_browser_smoke(args: argparse.Namespace) -> int:
+    from llm_browser.browser import BrowserRuntime
+
+    root_dir = Path(args.state_dir) / "browser-smoke"
+    runtime = BrowserRuntime.start(root_dir=root_dir, headless=args.headless)
+    try:
+        runtime.new_tab(args.url)
+        runtime.wait_for_load()
+        image = runtime.screenshot("loaded", attach=True)
+        payload = {"page": runtime.page_info(), "screenshot": image.to_dict()}
+        print(json.dumps(payload, indent=2))
+    finally:
+        runtime.close()
     return 0
 
 
