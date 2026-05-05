@@ -57,7 +57,7 @@ class SessionStore:
             raise KeyError(f"session not found: {session_id}")
         updated = session.with_status(status)
         self._write_metadata(updated)
-        self.emit(session_id, f"session.{status}", {"status": status})
+        self.emit(session_id, "session.status", {"status": status})
         return updated
 
     def emit(self, session_id: str, event_type: str, payload: Optional[dict] = None) -> Event:

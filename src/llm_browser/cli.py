@@ -6,6 +6,7 @@ import sys
 from pathlib import Path
 from typing import Optional, Sequence
 
+from llm_browser.agent import Agent
 from llm_browser.session.store import SessionStore
 
 
@@ -25,6 +26,12 @@ def build_parser() -> argparse.ArgumentParser:
     run = sub.add_parser("run", help="Create a session with a user task.")
     run.add_argument("task", help="Task to give the browser agent.")
     run.add_argument("--parent-id", default=None, help="Optional parent session id.")
+    run.add_argument(
+        "--provider",
+        choices=["fake"],
+        default="fake",
+        help="Provider to use. Only fake is implemented so far.",
+    )
     run.set_defaults(func=cmd_run)
 
     sessions = sub.add_parser("sessions", help="Inspect sessions.")
@@ -53,9 +60,8 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     store = store_from_args(args)
-    session = store.create(parent_id=args.parent_id)
-    store.emit(session.id, "session.input", {"text": args.task})
-    session = store.update_status(session.id, "idle")
+    agent = Agent(store)
+    session = agent.run(args.task, parent_id=args.parent_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
 

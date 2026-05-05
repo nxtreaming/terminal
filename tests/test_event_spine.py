@@ -54,7 +54,8 @@ class EventSpineTest(unittest.TestCase):
             self.assertTrue(loaded.artifact_dir.exists())
             self.assertEqual(first.type, "session.created")
             self.assertEqual(second.type, "session.input")
-            self.assertEqual(third.type, "session.idle")
+            self.assertEqual(third.type, "session.status")
+            self.assertEqual(third.payload, {"status": "idle"})
             self.assertEqual(len(store.events.read(session.id)), 3)
 
     def test_session_store_list_is_newest_first(self) -> None:
