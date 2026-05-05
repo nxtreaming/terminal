@@ -13,6 +13,7 @@ from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 
 from llm_browser.agent import SessionManager
 from llm_browser.brand import PRODUCT_NAME
+from llm_browser.datasets import build_dataset_prompt, load_dataset, select_tasks
 from llm_browser.events import Event
 from llm_browser.provider.base import Provider
 from llm_browser.session.metadata import SessionMetadata
@@ -118,7 +119,7 @@ class BrowserUseTerminalApp(App[None]):
                 artifacts.add_columns("kind", "name", "path")
                 yield artifacts
         yield Input(
-            placeholder="run <task>  |  show <session-id>  |  cancel [session-id]  |  refresh  |  help",
+            placeholder="run <task>  |  dataset <name> [count]  |  show <id>  |  cancel [id]  |  help",
             id="command",
         )
         yield Footer()
@@ -155,7 +156,10 @@ class BrowserUseTerminalApp(App[None]):
     def _write_banner(self) -> None:
         log = self.query_one("#events", RichLog)
         log.write("[bold #9ccfd8]browser use terminal[/bold #9ccfd8]")
-        log.write("Commands: [bold]run[/bold] a task, [bold]cancel[/bold] a session, [bold]show[/bold] a session.")
+        log.write(
+            "Commands: [bold]run[/bold] a task, [bold]dataset real_v8 1[/bold], "
+            "[bold]cancel[/bold] a session, [bold]show[/bold] a session."
+        )
 
     def _handle_event(self, event: Event) -> None:
         if self.selected_session_id is None:
@@ -230,6 +234,16 @@ class BrowserUseTerminalApp(App[None]):
                 return
             self.manager.cancel(session_id)
             log.write(f"[yellow]cancel requested for {escape(session_id)}[/yellow]")
+        elif command == "dataset" and len(args) >= 2:
+            count = int(args[2]) if len(args) >= 3 else 1
+            tasks = select_tasks(load_dataset(args[1]), count=count)
+            for task in tasks:
+                session = self.manager.start(build_dataset_prompt(task, headless=True))
+                self.selected_session_id = session.id
+                log.write(
+                    f"[bold #9ccfd8]started {escape(task.dataset)} task {escape(task.task_id)} "
+                    f"as {escape(session.id)}[/bold #9ccfd8]"
+                )
         else:
             log.write(f"[red]unknown command: {escape(command)}[/red]")
 

@@ -2,12 +2,16 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import sys
+import uuid
 from pathlib import Path
 from typing import Optional, Sequence
 
 from llm_browser.agent import Agent
 from llm_browser.brand import CLI_NAME, DEFAULT_STATE_DIR
+from llm_browser.datasets import build_dataset_prompt, dataset_summary, load_dataset, select_tasks
+from llm_browser.provider.base import Provider
 from llm_browser.session.store import SessionStore
 
 
@@ -61,7 +65,32 @@ def build_parser() -> argparse.ArgumentParser:
     browser_smoke.add_argument("--headless", action="store_true", help="Run Chrome headless.")
     browser_smoke.set_defaults(func=cmd_browser_smoke)
 
-    tui = sub.add_parser("tui", help="Start the simple terminal UI.")
+    datasets = sub.add_parser("datasets", help="Run or sample browser benchmark datasets.")
+    datasets_sub = datasets.add_subparsers(dest="datasets_command", required=True)
+
+    datasets_list = datasets_sub.add_parser("list", help="List bundled dataset aliases.")
+    datasets_list.set_defaults(func=cmd_datasets_list)
+
+    datasets_sample = datasets_sub.add_parser("sample", help="Print random tasks from a dataset.")
+    datasets_sample.add_argument("dataset")
+    datasets_sample.add_argument("--count", type=int, default=1)
+    datasets_sample.add_argument("--seed", type=int, default=None)
+    datasets_sample.add_argument("--task-id", action="append", default=None)
+    datasets_sample.set_defaults(func=cmd_datasets_sample)
+
+    datasets_run = datasets_sub.add_parser("run", help="Run selected dataset tasks through the harness.")
+    datasets_run.add_argument("dataset")
+    datasets_run.add_argument("--count", type=int, default=1)
+    datasets_run.add_argument("--seed", type=int, default=None)
+    datasets_run.add_argument("--task-id", action="append", default=None)
+    datasets_run.add_argument("--provider", choices=["fake", "openai", "codex"], default="codex")
+    datasets_run.add_argument("--model", default="gpt-5.5")
+    datasets_run.add_argument("--max-turns", type=int, default=80)
+    datasets_run.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
+    datasets_run.add_argument("--stop-on-failure", action="store_true")
+    datasets_run.set_defaults(func=cmd_datasets_run)
+
+    tui = sub.add_parser("tui", help="Start the terminal UI.")
     tui.add_argument("--provider", choices=["fake", "openai", "codex"], default="fake")
     tui.add_argument("--model", default=None)
     tui.add_argument("--max-turns", type=int, default=80)
@@ -88,15 +117,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 
 def cmd_run(args: argparse.Namespace) -> int:
     store = store_from_args(args)
-    provider = None
-    if args.provider == "openai":
-        from llm_browser.provider.openai_responses import OpenAIResponsesProvider
-
-        provider = OpenAIResponsesProvider(model=args.model)
-    elif args.provider == "codex":
-        from llm_browser.provider.codex_responses import CodexResponsesProvider
-
-        provider = CodexResponsesProvider(model=args.model)
+    provider = make_provider(args.provider, args.model)
     agent = Agent(store, provider=provider, max_turns=args.max_turns)
     session = agent.run(args.task, parent_id=args.parent_id)
     print(json.dumps(session.to_dict(), indent=2))
@@ -149,19 +170,68 @@ def cmd_browser_smoke(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_datasets_list(args: argparse.Namespace) -> int:
+    from llm_browser.datasets import DATASET_ALIASES
+
+    payload = {}
+    for alias, path in DATASET_ALIASES.items():
+        resolved = (Path.cwd() / path).resolve()
+        payload[alias] = {"path": str(resolved), "exists": resolved.exists()}
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_datasets_sample(args: argparse.Namespace) -> int:
+    tasks = load_dataset(args.dataset)
+    selected = select_tasks(tasks, count=args.count, seed=args.seed, task_ids=args.task_id)
+    print(json.dumps([task.to_dict() for task in selected], indent=2))
+    return 0
+
+
+def cmd_datasets_run(args: argparse.Namespace) -> int:
+    if args.headless:
+        os.environ["LLM_BROWSER_HEADLESS"] = "1"
+    tasks = load_dataset(args.dataset)
+    selected = select_tasks(tasks, count=args.count, seed=args.seed, task_ids=args.task_id)
+    store = store_from_args(args)
+    run_id = uuid.uuid4().hex[:12]
+    manifest = {
+        "run_id": run_id,
+        "dataset": args.dataset,
+        "selection": [task.to_dict() for task in selected],
+        "summary": dataset_summary(selected),
+        "provider": args.provider,
+        "model": args.model,
+        "headless": args.headless,
+        "sessions": [],
+    }
+
+    for task in selected:
+        provider = make_provider(args.provider, args.model)
+        agent = Agent(store, provider=provider, max_turns=args.max_turns)
+        prompt = build_dataset_prompt(task, headless=args.headless)
+        try:
+            session = agent.run(prompt)
+            result = {"task_id": task.task_id, "session": session.to_dict(), "ok": session.status == "done"}
+        except Exception as exc:
+            result = {"task_id": task.task_id, "ok": False, "error": str(exc), "error_type": type(exc).__name__}
+            if args.stop_on_failure:
+                manifest["sessions"].append(result)
+                _write_dataset_manifest(store, run_id, manifest)
+                print(json.dumps(manifest, indent=2))
+                return 1
+        manifest["sessions"].append(result)
+        _write_dataset_manifest(store, run_id, manifest)
+
+    print(json.dumps(manifest, indent=2))
+    return 0 if all(item.get("ok") for item in manifest["sessions"]) else 1
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     from llm_browser.tui import TextualTui
 
     def provider_factory():
-        if args.provider == "openai":
-            from llm_browser.provider.openai_responses import OpenAIResponsesProvider
-
-            return OpenAIResponsesProvider(model=args.model)
-        if args.provider == "codex":
-            from llm_browser.provider.codex_responses import CodexResponsesProvider
-
-            return CodexResponsesProvider(model=args.model)
-        return None
+        return make_provider(args.provider, args.model)
 
     store = store_from_args(args)
     return TextualTui(store, provider_factory=provider_factory, max_turns=args.max_turns).run()
@@ -181,6 +251,25 @@ def cmd_auth_status(args: argparse.Namespace) -> int:
     }
     print(json.dumps(payload, indent=2))
     return 0
+
+
+def make_provider(provider_name: str, model: Optional[str]) -> Optional[Provider]:
+    if provider_name == "openai":
+        from llm_browser.provider.openai_responses import OpenAIResponsesProvider
+
+        return OpenAIResponsesProvider(model=model)
+    if provider_name == "codex":
+        from llm_browser.provider.codex_responses import CodexResponsesProvider
+
+        return CodexResponsesProvider(model=model)
+    return None
+
+
+def _write_dataset_manifest(store: SessionStore, run_id: str, manifest: dict) -> Path:
+    path = store.state_dir / "dataset-runs" / f"{run_id}.json"
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
+    return path
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
