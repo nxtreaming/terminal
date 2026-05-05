@@ -158,7 +158,7 @@ class BrowserUseTerminalApp(App[None]):
         log.write("[bold #9ccfd8]browser use terminal[/bold #9ccfd8]")
         log.write(
             "Commands: [bold]run[/bold] a task, [bold]dataset real_v8 1[/bold], "
-            "[bold]cancel[/bold] a session, [bold]show[/bold] a session."
+            "[bold]resume[/bold] selected, [bold]cancel[/bold] a session, [bold]show[/bold] a session."
         )
 
     def _handle_event(self, event: Event) -> None:
@@ -227,6 +227,19 @@ class BrowserUseTerminalApp(App[None]):
             self.selected_session_id = args[1]
             self._load_session_log(args[1])
             self.refresh_artifacts()
+        elif command == "resume":
+            session_id = args[1] if len(args) > 1 else self.selected_session_id
+            instruction = " ".join(args[2:]) if len(args) > 2 else "Continue from the previous session state."
+            if not session_id:
+                log.write("[red]no selected session to resume[/red]")
+                return
+            parent = self.store.load(session_id)
+            if parent is None:
+                log.write(f"[red]session not found: {escape(session_id)}[/red]")
+                return
+            resumed = self.manager.start(instruction, parent_id=parent.id)
+            self.selected_session_id = resumed.id
+            log.write(f"[bold #9ccfd8]started resume child {escape(resumed.id)} for {escape(parent.id)}[/bold #9ccfd8]")
         elif command == "cancel":
             session_id = args[1] if len(args) > 1 else self.selected_session_id
             if not session_id:

@@ -28,6 +28,18 @@ class BadToolThenDoneProvider:
             yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": tool_message["content"]}))
 
 
+class ManyToolCallsProvider:
+    def __init__(self):
+        self.turn = 0
+
+    def start_turn(self, messages, tools):
+        self.turn += 1
+        if self.turn < 16:
+            yield ModelEvent.call(ToolCall(id=f"call_{self.turn}", name="echo", arguments={"text": "x" * 80}))
+        else:
+            yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": "ok"}))
+
+
 class AgentLoopTest(unittest.TestCase):
     def test_fake_provider_executes_tools_and_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -110,6 +122,28 @@ class AgentLoopTest(unittest.TestCase):
             self.assertIn("session.done", event_types)
             done = [event for event in events if event.type == "session.done"][-1]
             self.assertIn("unknown tool", done.payload["result"])
+
+    def test_compaction_emits_event_and_artifact(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = Agent(store, provider=ManyToolCallsProvider(), compact_after_chars=500).run("compact", cwd=Path(tmp))
+            events = store.events.read(session.id)
+            compacted = [event for event in events if event.type == "session.compacted"]
+
+            self.assertTrue(compacted)
+            self.assertTrue(Path(compacted[0].payload["path"]).exists())
+
+    def test_resume_session_replays_existing_trace(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            agent = Agent(store)
+            session = agent.run("first", cwd=Path(tmp))
+
+            resumed = Agent(store).resume_session(session.id, "continue")
+
+            self.assertEqual(resumed.status, "done")
+            inputs = [event for event in store.events.read(session.id) if event.type == "session.input"]
+            self.assertTrue(inputs[-1].payload["resumed"])
 
 
 if __name__ == "__main__":

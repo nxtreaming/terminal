@@ -57,6 +57,14 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_cancel.add_argument("--reason", default="cli requested cancellation")
     sessions_cancel.set_defaults(func=cmd_sessions_cancel)
 
+    sessions_resume = sessions_sub.add_parser("resume", help="Resume a session from its event trace.")
+    sessions_resume.add_argument("session_id")
+    sessions_resume.add_argument("instruction", nargs="?", default="Continue from the previous session state.")
+    sessions_resume.add_argument("--provider", choices=["fake", "openai", "codex"], default="codex")
+    sessions_resume.add_argument("--model", default="gpt-5.5")
+    sessions_resume.add_argument("--max-turns", type=int, default=80)
+    sessions_resume.set_defaults(func=cmd_sessions_resume)
+
     browser = sub.add_parser("browser", help="Browser runtime commands.")
     browser_sub = browser.add_subparsers(dest="browser_command", required=True)
 
@@ -151,6 +159,14 @@ def cmd_sessions_cancel(args: argparse.Namespace) -> int:
     store = store_from_args(args)
     store.request_cancel(args.session_id, reason=args.reason)
     print(json.dumps({"ok": True, "session_id": args.session_id, "reason": args.reason}, indent=2))
+    return 0
+
+
+def cmd_sessions_resume(args: argparse.Namespace) -> int:
+    store = store_from_args(args)
+    agent = Agent(store, provider=make_provider(args.provider, args.model), max_turns=args.max_turns)
+    session = agent.resume_session(args.session_id, args.instruction)
+    print(json.dumps(session.to_dict(), indent=2))
     return 0
 
 

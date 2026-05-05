@@ -96,6 +96,10 @@ def format_event(event: Event) -> str:
         return f"[{event.session_id}] user: {payload.get('text', '')}"
     if event.type == "session.status":
         return f"[{event.session_id}] status: {payload.get('status', '')}"
+    if event.type == "session.cancel_requested":
+        return f"[{event.session_id}] cancel requested: {payload.get('reason', '')}"
+    if event.type == "session.compacted":
+        return f"[{event.session_id}] compacted: {payload.get('before_messages')} -> {payload.get('after_messages')} messages"
     if event.type == "model.delta":
         return f"[{event.session_id}] model: {payload.get('text', '').rstrip()}"
     if event.type == "tool.started":

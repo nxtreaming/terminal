@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict, List, Optional
 
+from llm_browser.agent.compaction import compact_messages, message_chars
 from llm_browser.provider.base import Provider
 from llm_browser.provider.fake import FakeProvider
 from llm_browser.provider.types import ModelEvent, ToolCall
@@ -15,6 +16,7 @@ from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolResult
 
 MAX_INLINE_TOOL_TEXT = 20000
+DEFAULT_COMPACT_AFTER_CHARS = 120000
 
 
 class MaxTurnsExceeded(RuntimeError):
@@ -29,12 +31,14 @@ class Agent:
         tools: Optional[ToolRegistry] = None,
         max_turns: int = 80,
         recover_tool_errors: bool = True,
+        compact_after_chars: int = DEFAULT_COMPACT_AFTER_CHARS,
     ) -> None:
         self.store = store
         self.provider = provider or FakeProvider()
         self.tools = tools or build_builtin_registry()
         self.max_turns = max_turns
         self.recover_tool_errors = recover_tool_errors
+        self.compact_after_chars = compact_after_chars
 
     def run(
         self,
@@ -55,11 +59,27 @@ class Agent:
         self.store.update_status(session.id, "running")
 
         messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
+        return self._run_with_messages(session, messages)
+
+    def resume_session(self, session_id: str, instruction: str = "Continue from the previous session state.") -> SessionMetadata:
+        session = self.store.load(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+
+        self.store.clear_cancel(session.id)
+        messages = self._messages_from_events(session.id)
+        messages.append({"role": "user", "content": instruction})
+        self.store.emit(session.id, "session.input", {"text": instruction, "resumed": True})
+        self.store.update_status(session.id, "running")
+        return self._run_with_messages(session, messages)
+
+    def _run_with_messages(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> SessionMetadata:
         final_result: Optional[str] = None
 
         try:
             for _ in range(self.max_turns):
                 self._check_cancel(session.id)
+                messages = self._maybe_compact(session, messages)
                 tool_calls: List[ToolCall] = []
                 for event in self.provider.start_turn(messages, self.tools.specs()):
                     self._check_cancel(session.id)
@@ -124,6 +144,64 @@ class Agent:
             raise
         finally:
             self.tools.close_session(session.id)
+
+    def _messages_from_events(self, session_id: str) -> List[Dict[str, Any]]:
+        messages: List[Dict[str, Any]] = []
+        pending_tool_call: Optional[Dict[str, Any]] = None
+        for event in self.store.events.read(session_id):
+            if event.type == "session.input":
+                text = str(event.payload.get("text") or "")
+                if text:
+                    messages.append({"role": "user", "content": text})
+            elif event.type == "tool.started":
+                pending_tool_call = {
+                    "id": str(event.payload.get("tool_call_id") or ""),
+                    "name": str(event.payload.get("name") or ""),
+                    "arguments": event.payload.get("arguments") or {},
+                }
+                messages.append({"role": "assistant", "tool_calls": [pending_tool_call]})
+            elif event.type == "tool.finished" and pending_tool_call:
+                output = event.payload.get("output") or {}
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": pending_tool_call["id"],
+                        "name": pending_tool_call["name"],
+                        "content": str(output.get("text") or ""),
+                    }
+                )
+                pending_tool_call = None
+            elif event.type == "tool.failed" and pending_tool_call:
+                messages.append(
+                    {
+                        "role": "tool",
+                        "tool_call_id": pending_tool_call["id"],
+                        "name": pending_tool_call["name"],
+                        "content": f"[tool error: {event.payload.get('error_type')}: {event.payload.get('error')}]",
+                    }
+                )
+                pending_tool_call = None
+        if not messages:
+            raise ValueError(f"session has no replayable messages: {session_id}")
+        return messages
+
+    def _maybe_compact(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        if self.compact_after_chars <= 0 or message_chars(messages) <= self.compact_after_chars:
+            return messages
+        compacted, path = compact_messages(messages, session.artifact_dir)
+        if compacted is not messages:
+            self.store.emit(
+                session.id,
+                "session.compacted",
+                {
+                    "path": str(path),
+                    "before_messages": len(messages),
+                    "after_messages": len(compacted),
+                    "before_chars": message_chars(messages),
+                    "after_chars": message_chars(compacted),
+                },
+            )
+        return compacted
 
     def _execute_tool(self, session_id: str, call: ToolCall) -> ToolResult:
         session = self.store.load(session_id)
