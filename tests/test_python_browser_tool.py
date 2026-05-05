@@ -15,14 +15,30 @@ class FakeRuntime:
     def __init__(self, root_dir: Path, headless: bool) -> None:
         self.root_dir = root_dir
         self.headless = headless
-        self.tabs = []
+        self.tab_urls = []
 
     def cdp(self, method: str, params=None, session_id=None) -> Dict[str, Any]:
         return {"method": method, "params": params or {}, "session_id": session_id}
 
     def new_tab(self, url: str = "about:blank") -> Dict[str, Any]:
-        self.tabs.append(url)
+        self.tab_urls.append(url)
         return {"url": url}
+
+    def tabs(self):
+        return [{"url": url, "type": "page"} for url in self.tab_urls]
+
+    def navigate(self, url: str, wait: bool = True, timeout_s: float = 20.0) -> Dict[str, Any]:
+        self.tab_urls.append(url)
+        return {"url": url, "wait": wait}
+
+    def attach_tab(self, target_id=None, index=None, url_contains=None) -> Dict[str, Any]:
+        return {"target_id": target_id, "index": index, "url_contains": url_contains}
+
+    def visible_text(self, max_chars: int = 8000) -> str:
+        return "Example visible text"[:max_chars]
+
+    def links(self, limit: int = 200):
+        return [{"text": "Example", "href": "https://example.com"}][:limit]
 
     def js(self, expression: str, await_promise: bool = False) -> Any:
         if expression == "document.title":

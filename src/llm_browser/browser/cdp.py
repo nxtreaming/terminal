@@ -11,6 +11,10 @@ class CdpError(RuntimeError):
     pass
 
 
+class CdpConnectionError(CdpError):
+    pass
+
+
 class CdpClient:
     """Synchronous CDP websocket client.
 
@@ -30,7 +34,10 @@ class CdpClient:
     def connect(self) -> None:
         if self._ws is not None:
             return
-        self._ws = websocket.create_connection(self.websocket_url, timeout=self.timeout_s)
+        try:
+            self._ws = websocket.create_connection(self.websocket_url, timeout=self.timeout_s)
+        except websocket.WebSocketException as exc:
+            raise CdpConnectionError(f"CDP websocket connection failed: {exc}") from exc
 
     def close(self) -> None:
         ws = self._ws
@@ -58,12 +65,21 @@ class CdpClient:
             }
             if session_id:
                 message["sessionId"] = session_id
-            self._ws.send(json.dumps(message, separators=(",", ":")))
+            try:
+                self._ws.send(json.dumps(message, separators=(",", ":")))
+            except websocket.WebSocketException as exc:
+                self.close()
+                raise CdpConnectionError(f"CDP websocket send failed: {exc}") from exc
 
             while True:
-                raw = self._ws.recv()
+                try:
+                    raw = self._ws.recv()
+                except websocket.WebSocketException as exc:
+                    self.close()
+                    raise CdpConnectionError(f"CDP websocket receive failed: {exc}") from exc
                 if not raw:
-                    raise CdpError("CDP websocket closed")
+                    self.close()
+                    raise CdpConnectionError("CDP websocket closed")
                 payload = json.loads(raw)
                 if payload.get("id") != request_id:
                     self._events.append(payload)

@@ -4,6 +4,7 @@ import contextlib
 import io
 import json
 import os
+import time
 import traceback
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
@@ -75,7 +76,9 @@ class PythonBrowserTool:
                 "json": json,
                 "os": os,
                 "Path": Path,
+                "time": time,
             }
+            _install_optional_imports(namespace)
             self._namespaces[ctx.session.id] = namespace
 
         def cdp(
@@ -94,6 +97,32 @@ class PythonBrowserTool:
         def wait_for_load(timeout_s: float = 20.0) -> None:
             runtime.wait_for_load(timeout_s=timeout_s)
 
+        def load_helper(path: str) -> None:
+            helper_path = Path(path).expanduser()
+            if not helper_path.is_absolute():
+                helper_path = ctx.session.cwd / helper_path
+            code = helper_path.read_text(encoding="utf-8")
+            exec(compile(code, str(helper_path), "exec"), namespace, namespace)
+
+        def save_helper(name: str, code: str) -> str:
+            safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in name)
+            if not safe_name.endswith(".py"):
+                safe_name += ".py"
+            path = ctx.session.artifact_dir / "helpers" / safe_name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            path.write_text(code, encoding="utf-8")
+            return str(path)
+
+        def save_artifact(name: str, content: Any, mode: str = "text") -> str:
+            safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in name)
+            path = ctx.session.artifact_dir / "python-artifacts" / safe_name
+            path.parent.mkdir(parents=True, exist_ok=True)
+            if mode == "bytes":
+                path.write_bytes(content)
+            else:
+                path.write_text(str(content), encoding="utf-8")
+            return str(path)
+
         def screenshot(label: str = "screenshot", attach: bool = True, full_page: bool = False) -> ToolImage:
             image = runtime.screenshot(label=label, attach=attach, full_page=full_page)
             if attach:
@@ -104,16 +133,26 @@ class PythonBrowserTool:
         namespace.update(
             {
                 "browser": runtime,
+                "artifact_dir": ctx.session.artifact_dir,
+                "download_dir": runtime.root_dir / "downloads",
                 "cdp": cdp,
                 "new_tab": new_tab,
+                "navigate": runtime.navigate,
+                "tabs": runtime.tabs,
+                "attach_tab": runtime.attach_tab,
                 "js": js,
                 "wait_for_load": wait_for_load,
                 "screenshot": screenshot,
                 "page_info": runtime.page_info,
+                "visible_text": runtime.visible_text,
+                "links": runtime.links,
                 "click_at": runtime.click_at,
                 "type_text": runtime.type_text,
                 "press": runtime.press,
                 "scroll": runtime.scroll,
+                "load_helper": load_helper,
+                "save_helper": save_helper,
+                "save_artifact": save_artifact,
             }
         )
         return namespace
@@ -154,3 +193,30 @@ def _is_jsonable(value: Any) -> bool:
         return True
     except TypeError:
         return False
+
+
+def _install_optional_imports(namespace: Dict[str, Any]) -> None:
+    try:
+        import requests
+
+        namespace["requests"] = requests
+    except Exception:
+        pass
+    try:
+        import pandas as pd
+
+        namespace["pd"] = pd
+    except Exception:
+        pass
+    try:
+        from bs4 import BeautifulSoup
+
+        namespace["BeautifulSoup"] = BeautifulSoup
+    except Exception:
+        pass
+    try:
+        from pypdf import PdfReader
+
+        namespace["PdfReader"] = PdfReader
+    except Exception:
+        pass

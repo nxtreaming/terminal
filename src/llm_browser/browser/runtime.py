@@ -2,14 +2,15 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import time
 from pathlib import Path
-from typing import Any, Dict, Optional
+from typing import Any, Dict, List, Optional
 from urllib.parse import quote
 
 import requests
 
-from llm_browser.browser.cdp import CdpClient
+from llm_browser.browser.cdp import CdpClient, CdpConnectionError
 from llm_browser.browser.chrome import ChromeProcess, start_chrome
 from llm_browser.events.event import now_ms
 from llm_browser.tool.result import ToolImage
@@ -53,14 +54,40 @@ class BrowserRuntime:
     def version(self) -> Dict[str, Any]:
         return requests.get(f"{self.http_url}/json/version", timeout=5).json()
 
-    def targets(self):
+    def targets(self) -> List[Dict[str, Any]]:
         return requests.get(f"{self.http_url}/json/list", timeout=5).json()
 
+    def tabs(self) -> List[Dict[str, Any]]:
+        return [target for target in self.targets() if target.get("type") == "page"]
+
     def attach_first_page(self) -> Dict[str, Any]:
-        pages = [target for target in self.targets() if target.get("type") == "page"]
+        pages = self.tabs()
         if not pages:
             return self.new_tab("about:blank")
         return self.attach_target(pages[0])
+
+    def attach_tab(
+        self,
+        target_id: Optional[str] = None,
+        index: Optional[int] = None,
+        url_contains: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        pages = self.tabs()
+        if target_id is not None:
+            for page in pages:
+                if page.get("id") == target_id:
+                    return self.attach_target(page)
+            raise ValueError(f"page target not found: {target_id}")
+        if url_contains is not None:
+            for page in pages:
+                if url_contains in str(page.get("url") or ""):
+                    return self.attach_target(page)
+            raise ValueError(f"page URL containing {url_contains!r} not found")
+        if index is None:
+            index = 0
+        if index < 0 or index >= len(pages):
+            raise IndexError(f"page index {index} out of range for {len(pages)} page(s)")
+        return self.attach_target(pages[index])
 
     def attach_target(self, target: Dict[str, Any]) -> Dict[str, Any]:
         websocket_url = target.get("webSocketDebuggerUrl")
@@ -90,7 +117,30 @@ class BrowserRuntime:
         if self.client is None:
             self.attach_first_page()
         assert self.client is not None
-        return self.client.call(method, params=params, session_id=session_id)
+        try:
+            return self.client.call(method, params=params, session_id=session_id)
+        except CdpConnectionError:
+            self._reattach_after_disconnect()
+            assert self.client is not None
+            return self.client.call(method, params=params, session_id=session_id)
+
+    def _reattach_after_disconnect(self) -> None:
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+        target_id = str((self.target or {}).get("id") or "")
+        if target_id:
+            for page in self.tabs():
+                if page.get("id") == target_id:
+                    self.attach_target(page)
+                    return
+        self.attach_first_page()
+
+    def navigate(self, url: str, wait: bool = True, timeout_s: float = 20.0) -> Dict[str, Any]:
+        result = self.cdp("Page.navigate", {"url": url})
+        if wait:
+            self.wait_for_load(timeout_s=timeout_s)
+        return result
 
     def js(self, expression: str, await_promise: bool = False) -> Any:
         response = self.cdp(
@@ -130,10 +180,31 @@ class BrowserRuntime:
         )
         return json.loads(raw)
 
+    def visible_text(self, max_chars: int = 8000) -> str:
+        text = self.js(
+            "(() => document.body ? document.body.innerText : '')()",
+            await_promise=False,
+        )
+        return str(text or "")[:max_chars]
+
+    def links(self, limit: int = 200) -> List[Dict[str, str]]:
+        raw = self.js(
+            "JSON.stringify(Array.from(document.links).slice(0, arguments_limit).map(a => "
+            "({text:(a.innerText||a.textContent||'').trim(), href:a.href, title:a.title||''})))".replace(
+                "arguments_limit", str(int(limit))
+            )
+        )
+        return json.loads(raw or "[]")
+
     def screenshot(self, label: str = "screenshot", attach: bool = True, full_page: bool = False) -> ToolImage:
         params: Dict[str, Any] = {"format": "png", "fromSurface": True}
         if full_page:
             params["captureBeyondViewport"] = True
+            metrics = self.cdp("Page.getLayoutMetrics")
+            size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
+            width = max(1, int(math.ceil(float(size.get("width") or 1280))))
+            height = max(1, int(math.ceil(float(size.get("height") or 900))))
+            params["clip"] = {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
         result = self.cdp("Page.captureScreenshot", params)
         data = base64.b64decode(result["data"])
 
@@ -146,7 +217,7 @@ class BrowserRuntime:
         path.write_bytes(data)
 
         info = self.page_info()
-        return ToolImage(
+        image = ToolImage(
             label=label,
             path=str(path),
             order=self._screenshot_index,
@@ -154,9 +225,12 @@ class BrowserRuntime:
             url=str(info.get("url", "")),
             title=str(info.get("title", "")),
         )
+        path.with_suffix(".json").write_text(json.dumps(image.to_dict(), indent=2) + "\n", encoding="utf-8")
+        return image
 
     def click_at(self, x: float, y: float, button: str = "left", clicks: int = 1) -> None:
         base = {"x": x, "y": y, "button": button, "clickCount": clicks}
+        self.cdp("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
         self.cdp("Input.dispatchMouseEvent", {"type": "mousePressed", **base})
         self.cdp("Input.dispatchMouseEvent", {"type": "mouseReleased", **base})
 
@@ -164,8 +238,29 @@ class BrowserRuntime:
         self.cdp("Input.insertText", {"text": text})
 
     def press(self, key: str) -> None:
-        self.cdp("Input.dispatchKeyEvent", {"type": "keyDown", "key": key})
-        self.cdp("Input.dispatchKeyEvent", {"type": "keyUp", "key": key})
+        event = _key_event(key)
+        self.cdp("Input.dispatchKeyEvent", {"type": "keyDown", **event})
+        self.cdp("Input.dispatchKeyEvent", {"type": "keyUp", **event})
 
     def scroll(self, dx: float = 0, dy: float = 500, x: float = 500, y: float = 500) -> None:
         self.cdp("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy})
+
+
+def _key_event(key: str) -> Dict[str, Any]:
+    common = {
+        "Enter": ("Enter", "Enter", 13),
+        "Escape": ("Escape", "Escape", 27),
+        "Backspace": ("Backspace", "Backspace", 8),
+        "Tab": ("Tab", "Tab", 9),
+        "ArrowDown": ("ArrowDown", "ArrowDown", 40),
+        "ArrowUp": ("ArrowUp", "ArrowUp", 38),
+        "ArrowLeft": ("ArrowLeft", "ArrowLeft", 37),
+        "ArrowRight": ("ArrowRight", "ArrowRight", 39),
+    }
+    if key in common:
+        key_name, code, vk = common[key]
+        return {"key": key_name, "code": code, "windowsVirtualKeyCode": vk, "nativeVirtualKeyCode": vk}
+    if len(key) == 1:
+        vk = ord(key.upper())
+        return {"key": key, "text": key, "code": f"Key{key.upper()}", "windowsVirtualKeyCode": vk}
+    return {"key": key, "code": key}
