@@ -7,6 +7,7 @@ from typing import Any, Dict, Iterable, List, Optional, Set
 import requests
 
 from llm_browser.auth import CodexAuth, load_codex_auth
+from llm_browser.provider.tool_content import tool_output_text, visual_context_messages
 from llm_browser.provider.types import ModelEvent, ToolCall
 
 
@@ -131,13 +132,17 @@ class CodexResponsesProvider:
                         }
                     )
             elif role == "tool":
+                call_id = str(message["tool_call_id"])
+                tool_name = str(message.get("name") or "tool")
+                content = message.get("content", "")
                 input_items.append(
                     {
                         "type": "function_call_output",
-                        "call_id": str(message["tool_call_id"]),
-                        "output": message.get("content", ""),
+                        "call_id": call_id,
+                        "output": tool_output_text(content),
                     }
                 )
+                input_items.extend(visual_context_messages(content, call_id=call_id, tool_name=tool_name))
         return input_items
 
     def _events_from_message(self, item: Dict[str, Any]) -> Iterable[ModelEvent]:

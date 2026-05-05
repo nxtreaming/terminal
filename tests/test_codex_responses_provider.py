@@ -103,6 +103,35 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][1]["call_id"], "call_1")
         self.assertEqual(payload["input"][2], {"type": "function_call_output", "call_id": "call_1", "output": "ok"})
 
+    def test_sends_screenshot_tool_output_as_visual_context(self) -> None:
+        provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
+        response = FakeResponse(200, [{"type": "response.completed", "response": {"id": "resp_2", "output": []}}])
+        content = [
+            {"type": "input_text", "text": "data={'ok': True}\nimages=[loaded]"},
+            {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,abc"},
+        ]
+
+        with patch("llm_browser.provider.codex_responses.requests.post", return_value=response) as post:
+            list(
+                provider.start_turn(
+                    [
+                        {"role": "user", "content": "open site"},
+                        {
+                            "role": "assistant",
+                            "tool_calls": [{"id": "call_1", "name": "python", "arguments": {"code": "screenshot()"}}],
+                        },
+                        {"role": "tool", "tool_call_id": "call_1", "name": "python", "content": content},
+                    ],
+                    [],
+                )
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["input"][2]["type"], "function_call_output")
+        self.assertIn("screenshot image", payload["input"][2]["output"])
+        self.assertEqual(payload["input"][3]["role"], "user")
+        self.assertEqual(payload["input"][3]["content"][1]["type"], "input_image")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

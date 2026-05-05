@@ -6,6 +6,7 @@ from typing import Any, Dict, List, Optional
 from llm_browser.provider.base import Provider
 from llm_browser.provider.fake import FakeProvider
 from llm_browser.provider.types import ModelEvent, ToolCall
+from llm_browser.session.cancel import SessionCancelled
 from llm_browser.session.metadata import SessionMetadata
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.builtins import build_builtin_registry
@@ -27,11 +28,13 @@ class Agent:
         provider: Optional[Provider] = None,
         tools: Optional[ToolRegistry] = None,
         max_turns: int = 80,
+        recover_tool_errors: bool = True,
     ) -> None:
         self.store = store
         self.provider = provider or FakeProvider()
         self.tools = tools or build_builtin_registry()
         self.max_turns = max_turns
+        self.recover_tool_errors = recover_tool_errors
 
     def run(
         self,
@@ -40,6 +43,7 @@ class Agent:
         cwd: Optional[Path] = None,
     ) -> SessionMetadata:
         session = self.store.create(parent_id=parent_id, cwd=cwd)
+        self.store.clear_cancel(session.id)
         self.store.emit(session.id, "session.input", {"text": task})
         self.store.update_status(session.id, "running")
 
@@ -48,8 +52,10 @@ class Agent:
 
         try:
             for _ in range(self.max_turns):
+                self._check_cancel(session.id)
                 tool_calls: List[ToolCall] = []
                 for event in self.provider.start_turn(messages, self.tools.specs()):
+                    self._check_cancel(session.id)
                     if event.type == "text_delta":
                         self.store.emit(session.id, "model.delta", {"text": event.text})
                     elif event.type == "tool_call":
@@ -74,6 +80,7 @@ class Agent:
                     }
                 )
                 for call in tool_calls:
+                    self._check_cancel(session.id)
                     result = self._execute_tool(session.id, call)
                     messages.append(
                         {
@@ -95,17 +102,21 @@ class Agent:
 
             session = self.store.update_status(session.id, "done")
             self.store.emit(session.id, "session.done", {"result": final_result})
-            self.tools.close_session(session.id)
             return session
-        except BaseException as exc:
+        except SessionCancelled as exc:
+            session = self.store.update_status(session.id, "cancelled")
+            self.store.emit(session.id, "session.cancelled", {"reason": exc.reason})
+            return session
+        except Exception as exc:
             self.store.update_status(session.id, "failed")
             self.store.emit(
                 session.id,
                 "session.failed",
                 {"error": str(exc), "error_type": type(exc).__name__},
             )
-            self.tools.close_session(session.id)
             raise
+        finally:
+            self.tools.close_session(session.id)
 
     def _execute_tool(self, session_id: str, call: ToolCall) -> ToolResult:
         session = self.store.load(session_id)
@@ -130,7 +141,9 @@ class Agent:
                 },
             )
             return result
-        except BaseException as exc:
+        except SessionCancelled:
+            raise
+        except Exception as exc:
             self.store.emit(
                 session_id,
                 "tool.failed",
@@ -141,7 +154,12 @@ class Agent:
                     "error_type": type(exc).__name__,
                 },
             )
-            raise
+            if not self.recover_tool_errors:
+                raise
+            return ToolResult(
+                text=f"[tool error: {type(exc).__name__}: {exc}]",
+                data={"ok": False, "error": str(exc), "error_type": type(exc).__name__},
+            )
 
     def _spill_large_tool_output(self, ctx: ToolContext, call: ToolCall, result: ToolResult) -> ToolResult:
         if len(result.text) <= MAX_INLINE_TOOL_TEXT:
@@ -156,3 +174,8 @@ class Agent:
         data["output_path"] = str(path)
         text = result.text[:MAX_INLINE_TOOL_TEXT] + f"\n\n[full output saved to {path}]"
         return ToolResult(text=text, data=data, images=result.images)
+
+    def _check_cancel(self, session_id: str) -> None:
+        request = self.store.cancel_request(session_id)
+        if request is not None:
+            raise SessionCancelled(session_id, request["reason"])
