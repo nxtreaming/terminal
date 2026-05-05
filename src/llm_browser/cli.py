@@ -59,6 +59,12 @@ def build_parser() -> argparse.ArgumentParser:
     tui.add_argument("--model", default=None)
     tui.set_defaults(func=cmd_tui)
 
+    auth = sub.add_parser("auth", help="Authentication commands.")
+    auth_sub = auth.add_subparsers(dest="auth_command", required=True)
+
+    auth_status = auth_sub.add_parser("status", help="Print redacted auth status.")
+    auth_status.set_defaults(func=cmd_auth_status)
+
     return parser
 
 
@@ -136,6 +142,22 @@ def cmd_tui(args: argparse.Namespace) -> int:
 
     store = store_from_args(args)
     return SimpleTui(store, provider_factory=provider_factory).run()
+
+
+def cmd_auth_status(args: argparse.Namespace) -> int:
+    import os
+
+    from llm_browser.auth import load_codex_auth
+
+    codex_auth = load_codex_auth()
+    payload = {
+        "codex": codex_auth.redacted_summary() if codex_auth else {"available": False},
+        "openai_api_key": {
+            "available": bool(os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY"))
+        },
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
