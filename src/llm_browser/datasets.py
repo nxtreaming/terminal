@@ -105,6 +105,51 @@ def dataset_summary(tasks: List[DatasetTask]) -> Dict[str, Any]:
     return {"count": len(tasks), "datasets": by_dataset}
 
 
+def manifest_path(state_dir: Path, run_id: str) -> Path:
+    return state_dir / "dataset-runs" / f"{run_id}.json"
+
+
+def load_manifest(state_dir: Path, run_id_or_path: str) -> Dict[str, Any]:
+    candidate = Path(run_id_or_path).expanduser()
+    if not candidate.is_absolute() and candidate.suffix != ".json":
+        candidate = manifest_path(state_dir, run_id_or_path)
+    elif not candidate.is_absolute():
+        candidate = Path.cwd() / candidate
+    return json.loads(candidate.resolve().read_text(encoding="utf-8"))
+
+
+def summarize_manifest(manifest: Dict[str, Any]) -> Dict[str, Any]:
+    latest: Dict[str, Dict[str, Any]] = {}
+    attempts_by_task: Dict[str, int] = {}
+    for item in manifest.get("sessions") or []:
+        task_id = str(item.get("task_id") or "")
+        if not task_id:
+            continue
+        latest[task_id] = item
+        attempts_by_task[task_id] = attempts_by_task.get(task_id, 0) + 1
+
+    selection = manifest.get("selection") or []
+    selected_ids = [str(item.get("task_id")) for item in selection if item.get("task_id") is not None]
+    passed = sorted(task_id for task_id, item in latest.items() if item.get("ok"))
+    failed = sorted(task_id for task_id, item in latest.items() if not item.get("ok"))
+    pending = sorted(task_id for task_id in selected_ids if task_id not in latest)
+    return {
+        "run_id": manifest.get("run_id"),
+        "dataset": manifest.get("dataset"),
+        "provider": manifest.get("provider"),
+        "model": manifest.get("model"),
+        "selected": len(selected_ids),
+        "attempted": len(latest),
+        "passed": len(passed),
+        "failed": len(failed),
+        "pending": len(pending),
+        "passed_task_ids": passed,
+        "failed_task_ids": failed,
+        "pending_task_ids": pending,
+        "attempts_by_task": attempts_by_task,
+    }
+
+
 def _dataset_name(name_or_path: str, path: Path) -> str:
     for alias, alias_path in DATASET_ALIASES.items():
         if path.name == alias_path.name:

@@ -3,7 +3,7 @@ from __future__ import annotations
 import unittest
 from pathlib import Path
 
-from llm_browser.datasets import build_dataset_prompt, load_dataset, select_tasks
+from llm_browser.datasets import build_dataset_prompt, load_dataset, select_tasks, summarize_manifest
 
 
 class DatasetTest(unittest.TestCase):
@@ -23,6 +23,25 @@ class DatasetTest(unittest.TestCase):
         self.assertIn("Task ID: 2", prompt)
         self.assertIn(task.text[:80], prompt)
         self.assertIn("Attach screenshots", prompt)
+
+    def test_summarize_manifest_uses_latest_attempt(self) -> None:
+        manifest = {
+            "run_id": "r1",
+            "dataset": "real_v8",
+            "provider": "fake",
+            "model": "gpt-test",
+            "selection": [{"task_id": "1"}, {"task_id": "2"}],
+            "sessions": [
+                {"task_id": "1", "ok": False},
+                {"task_id": "1", "ok": True},
+            ],
+        }
+
+        summary = summarize_manifest(manifest)
+
+        self.assertEqual(summary["passed_task_ids"], ["1"])
+        self.assertEqual(summary["pending_task_ids"], ["2"])
+        self.assertEqual(summary["attempts_by_task"], {"1": 2})
 
 
 if __name__ == "__main__":

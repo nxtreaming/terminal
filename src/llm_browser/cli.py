@@ -4,13 +4,22 @@ import argparse
 import json
 import os
 import sys
+import threading
 import uuid
 from pathlib import Path
-from typing import Optional, Sequence
+from typing import Any, Dict, Optional, Sequence
 
 from llm_browser.agent import Agent
 from llm_browser.brand import CLI_NAME, DEFAULT_STATE_DIR
-from llm_browser.datasets import build_dataset_prompt, dataset_summary, load_dataset, select_tasks
+from llm_browser.datasets import (
+    build_dataset_prompt,
+    dataset_summary,
+    load_dataset,
+    load_manifest,
+    manifest_path,
+    select_tasks,
+    summarize_manifest,
+)
 from llm_browser.provider.base import Provider
 from llm_browser.session.trace import build_self_eval_prompt, write_trace_bundle
 from llm_browser.session.store import SessionStore
@@ -100,15 +109,23 @@ def build_parser() -> argparse.ArgumentParser:
 
     datasets_run = datasets_sub.add_parser("run", help="Run selected dataset tasks through the harness.")
     datasets_run.add_argument("dataset")
+    datasets_run.add_argument("--all", action="store_true", help="Run every task in the dataset.")
     datasets_run.add_argument("--count", type=int, default=1)
     datasets_run.add_argument("--seed", type=int, default=None)
     datasets_run.add_argument("--task-id", action="append", default=None)
+    datasets_run.add_argument("--run-id", default=None, help="Use a stable run id for manifest/workspaces.")
+    datasets_run.add_argument("--resume", action="store_true", help="Skip latest successful task attempts in the run manifest.")
     datasets_run.add_argument("--provider", choices=["fake", "openai", "codex"], default="codex")
     datasets_run.add_argument("--model", default="gpt-5.5")
     datasets_run.add_argument("--max-turns", type=int, default=80)
+    datasets_run.add_argument("--task-timeout-s", type=float, default=0.0, help="Optional per-task timeout in seconds.")
     datasets_run.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
     datasets_run.add_argument("--stop-on-failure", action="store_true")
     datasets_run.set_defaults(func=cmd_datasets_run)
+
+    datasets_report = datasets_sub.add_parser("report", help="Summarize a dataset run manifest.")
+    datasets_report.add_argument("run_id_or_path")
+    datasets_report.set_defaults(func=cmd_datasets_report)
 
     tui = sub.add_parser("tui", help="Start the terminal UI.")
     tui.add_argument("--provider", choices=["fake", "openai", "codex"], default="fake")
@@ -236,52 +253,60 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
     if args.headless:
         os.environ["LLM_BROWSER_HEADLESS"] = "1"
     tasks = load_dataset(args.dataset)
-    selected = select_tasks(tasks, count=args.count, seed=args.seed, task_ids=args.task_id)
+    count = len(tasks) if args.all else args.count
+    selected = select_tasks(tasks, count=count, seed=args.seed, task_ids=args.task_id)
     store = store_from_args(args)
-    run_id = uuid.uuid4().hex[:12]
-    manifest = {
-        "run_id": run_id,
-        "dataset": args.dataset,
-        "selection": [task.to_dict() for task in selected],
-        "summary": dataset_summary(selected),
-        "provider": args.provider,
-        "model": args.model,
-        "headless": args.headless,
-        "sessions": [],
-    }
+    run_id = args.run_id or uuid.uuid4().hex[:12]
+    path = manifest_path(store.state_dir, run_id)
+    if args.resume and path.exists():
+        manifest = json.loads(path.read_text(encoding="utf-8"))
+        selected_by_id = {task.task_id: task for task in selected}
+        selected = [selected_by_id[str(item["task_id"])] for item in manifest.get("selection", []) if str(item.get("task_id")) in selected_by_id]
+    else:
+        manifest = {
+            "run_id": run_id,
+            "dataset": args.dataset,
+            "selection": [task.to_dict() for task in selected],
+            "summary": dataset_summary(selected),
+            "provider": args.provider,
+            "model": args.model,
+            "headless": args.headless,
+            "sessions": [],
+        }
+
+    completed_task_ids = _successful_task_ids(manifest) if args.resume else set()
 
     for task in selected:
-        provider = make_provider(args.provider, args.model)
-        agent = Agent(store, provider=provider, max_turns=args.max_turns)
+        if task.task_id in completed_task_ids:
+            continue
         prompt = build_dataset_prompt(task, headless=args.headless)
         workspace = store.state_dir / "dataset-runs" / run_id / f"task-{task.task_id}-workspace"
         workspace.mkdir(parents=True, exist_ok=True)
-        try:
-            session = agent.run(prompt, cwd=workspace)
-            result = {
-                "task_id": task.task_id,
-                "session": session.to_dict(),
-                "workspace": str(workspace),
-                "ok": session.status == "done",
-            }
-        except Exception as exc:
-            result = {
-                "task_id": task.task_id,
-                "workspace": str(workspace),
-                "ok": False,
-                "error": str(exc),
-                "error_type": type(exc).__name__,
-            }
-            if args.stop_on_failure:
-                manifest["sessions"].append(result)
-                _write_dataset_manifest(store, run_id, manifest)
-                print(json.dumps(manifest, indent=2))
-                return 1
+        result = _run_dataset_task(
+            store=store,
+            task_id=task.task_id,
+            prompt=prompt,
+            workspace=workspace,
+            provider_name=args.provider,
+            model=args.model,
+            max_turns=args.max_turns,
+            timeout_s=args.task_timeout_s,
+        )
         manifest["sessions"].append(result)
         _write_dataset_manifest(store, run_id, manifest)
+        if args.stop_on_failure and not result.get("ok"):
+            print(json.dumps(manifest, indent=2))
+            return 1
 
     print(json.dumps(manifest, indent=2))
     return 0 if all(item.get("ok") for item in manifest["sessions"]) else 1
+
+
+def cmd_datasets_report(args: argparse.Namespace) -> int:
+    store = store_from_args(args)
+    manifest = load_manifest(store.state_dir, args.run_id_or_path)
+    print(json.dumps(summarize_manifest(manifest), indent=2))
+    return 0
 
 
 def cmd_tui(args: argparse.Namespace) -> int:
@@ -323,10 +348,63 @@ def make_provider(provider_name: str, model: Optional[str]) -> Optional[Provider
 
 
 def _write_dataset_manifest(store: SessionStore, run_id: str, manifest: dict) -> Path:
-    path = store.state_dir / "dataset-runs" / f"{run_id}.json"
+    path = manifest_path(store.state_dir, run_id)
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(manifest, indent=2) + "\n", encoding="utf-8")
     return path
+
+
+def _successful_task_ids(manifest: Dict[str, Any]) -> set[str]:
+    summary = summarize_manifest(manifest)
+    return set(summary["passed_task_ids"])
+
+
+def _run_dataset_task(
+    store: SessionStore,
+    task_id: str,
+    prompt: str,
+    workspace: Path,
+    provider_name: str,
+    model: Optional[str],
+    max_turns: int,
+    timeout_s: float,
+) -> Dict[str, Any]:
+    session = store.create(cwd=workspace)
+    result: Dict[str, Any] = {"task_id": task_id, "workspace": str(workspace), "session": session.to_dict()}
+    error: Dict[str, str] = {}
+
+    def target() -> None:
+        try:
+            agent = Agent(store, provider=make_provider(provider_name, model), max_turns=max_turns)
+            finished = agent.run_session(session.id, prompt)
+            result["session"] = finished.to_dict()
+            result["ok"] = finished.status == "done"
+        except Exception as exc:
+            loaded = store.load(session.id)
+            if loaded is not None:
+                result["session"] = loaded.to_dict()
+            error["error"] = str(exc)
+            error["error_type"] = type(exc).__name__
+
+    if timeout_s and timeout_s > 0:
+        thread = threading.Thread(target=target, name=f"dataset-task-{task_id}", daemon=True)
+        thread.start()
+        thread.join(timeout_s)
+        if thread.is_alive():
+            store.request_cancel(session.id, reason=f"dataset task timeout after {timeout_s:g}s")
+            thread.join(10)
+            loaded = store.load(session.id)
+            if loaded is not None:
+                result["session"] = loaded.to_dict()
+            result.update({"ok": False, "error": f"dataset task timeout after {timeout_s:g}s", "error_type": "TimeoutError"})
+            return result
+    else:
+        target()
+
+    if error:
+        result.update({"ok": False, **error})
+    result.setdefault("ok", False)
+    return result
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
