@@ -248,7 +248,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 ctx,
                 {
                     "headless": True,
-                    "code": "result = screenshot_element('#rate-table', label='rates', padding=10)",
+                    "code": "load_skill('dom_tools')\nresult = screenshot_element('#rate-table', label='rates', padding=10)",
                 },
             )
 
@@ -307,6 +307,9 @@ class PythonBrowserToolTest(unittest.TestCase):
                     "code": "\n".join(
                         [
                             "goto_url('https://example.com')",
+                            "load_skill('tracing')",
+                            "load_skill('uploads')",
+                            "load_skill('harnesless_compat')",
                             "nav = cdp('Page.navigate', url='https://example.com/raw')",
                             "shot = capture_screenshot('alias-shot.png', attach=True)",
                             "waited = wait_for_element('#app', timeout=2)",
@@ -352,7 +355,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
             tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
 
-            result = tool(ctx, {"headless": True, "code": "image = attach_image('old.png'); result = image.to_dict()"})
+            result = tool(ctx, {"headless": True, "code": "load_skill('artifacts')\nimage = attach_image('old.png'); result = image.to_dict()"})
 
             self.assertTrue(result.data["ok"])
             self.assertEqual(result.images[0].label, "old_frame")
