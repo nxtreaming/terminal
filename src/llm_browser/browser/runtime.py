@@ -117,7 +117,11 @@ class BrowserRuntime:
         if response.status_code >= 400:
             response = requests.get(f"{self.http_url}/json/new?{encoded}", timeout=5)
         response.raise_for_status()
-        return self.attach_target(response.json())
+        target = self.attach_target(response.json())
+        target_url = str(target.get("url") or "")
+        if url != "about:blank" and target_url in {"", "about:blank"}:
+            self.navigate(url, wait=False)
+        return target
 
     def cdp(self, method: str, params: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
         if self.client is None:

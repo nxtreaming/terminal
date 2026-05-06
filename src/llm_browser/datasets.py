@@ -93,7 +93,9 @@ def build_dataset_prompt(task: DatasetTask, headless: bool = True) -> str:
         "or use artifact_dir/save_artifact for supporting evidence. "
         "Attach screenshots after meaningful page transitions or before relying on visual state. "
         "Recover from broken helpers by using raw CDP, JavaScript, shell, requests, or local helper code. "
-        "Respect any output constraints in the task. Finish by calling done with the final answer.\n\n"
+        "Respect any output constraints in the task. Once every requested field or artifact is complete, "
+        "call done with the final answer instead of running extra validation loops. "
+        "Finish by calling done with the final answer.\n\n"
         f"Task:\n{task.text}"
     )
 
