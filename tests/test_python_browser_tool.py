@@ -507,8 +507,8 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["result"]["direct"])
             self.assertTrue(result.data["result"]["imported"])
 
-    def test_core_only_autoload_keeps_small_browser_surface(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "core"}, clear=False):
+    def test_default_autoload_keeps_small_browser_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
             store = SessionStore(Path(tmp))
             session = store.create(cwd=Path(tmp))
             ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
@@ -521,7 +521,9 @@ class PythonBrowserToolTest(unittest.TestCase):
                     "code": (
                         "result = {"
                         "'has_cdp': callable(cdp), "
+                        "'has_http_get': callable(http_get), "
                         "'has_search': 'search_web' in globals(), "
+                        "'module_has_search': hasattr(__import__('browser_helpers'), 'search_web'), "
                         "'has_load_skill': callable(load_skill), "
                         "'skill_names': [item['name'] for item in list_skills()], "
                         "'help_mentions_skills': 'load_skill' in help_browser()"
@@ -532,10 +534,39 @@ class PythonBrowserToolTest(unittest.TestCase):
 
             self.assertTrue(result.data["ok"])
             self.assertTrue(result.data["result"]["has_cdp"])
+            self.assertTrue(result.data["result"]["has_http_get"])
             self.assertFalse(result.data["result"]["has_search"])
+            self.assertFalse(result.data["result"]["module_has_search"])
             self.assertTrue(result.data["result"]["has_load_skill"])
             self.assertIn("research", result.data["result"]["skill_names"])
             self.assertTrue(result.data["result"]["help_mentions_skills"])
+
+    def test_legacy_autoload_can_restore_old_large_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "all"}, clear=True):
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "import browser_helpers\n"
+                        "result = {"
+                        "'has_search': callable(search_web), "
+                        "'module_has_search': callable(browser_helpers.search_web), "
+                        "'loaded': loaded_skills()"
+                        "}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["has_search"])
+            self.assertTrue(result.data["result"]["module_has_search"])
+            self.assertIn("search", result.data["result"]["loaded"])
 
     def test_load_skill_inject_false_returns_namespace_without_globals(self) -> None:
         class Response:
