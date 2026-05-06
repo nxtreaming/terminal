@@ -11,8 +11,10 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
+from rich.align import Align
 from rich.markup import escape
 from rich.text import Text
+from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
@@ -52,17 +54,85 @@ COMMAND_PALETTE: list[tuple[str, str, str]] = [
 ]
 
 
+BROWSER_USE_MARK = [
+    "  ███████    █████████",
+    " ████     ██████   ████",
+    "███    █████         ███",
+    "███  ████      ████   ██",
+    " █  ███          ███",
+    "  ████            ████",
+    " ███                ███",
+    "████ ██          ██  ██",
+    "███   ███      ████  ███",
+    "███    █████         ███",
+    " ████     ██████   ████",
+    "   ██████     ████████",
+]
+
+BROWSER_USE_WORDMARK = [
+    "▄                                                        ",
+    "█▀▀▄ █▀▀▄ █▀▀█ █  █ █▀▀▀ █▀▀▀ █▀▀▄   █  █ █▀▀▀ █▀▀▀",
+    "█__█ █__  █__█ █^^█ ▀▀▀█ █___ █__    █__█ ▀▀▀█ █^^^",
+    "▀▀▀  ▀    ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀       ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
+]
+BROWSER_USE_WORDMARK_SPLIT = 36
+
+
+def _move_table_cursor(table: DataTable, target: int | str) -> None:
+    if table.row_count <= 0:
+        return
+    if target == "home":
+        next_row = 0
+    elif target == "end":
+        next_row = table.row_count - 1
+    else:
+        next_row = table.cursor_row + target
+    next_row = max(0, min(table.row_count - 1, int(next_row)))
+    table.move_cursor(row=next_row, column=0)
+
+
+class ModalFilterInput(Input):
+    def on_key(self, event: events.Key) -> None:
+        key = event.key
+        action = None
+        if key in {"escape", "ctrl+c"}:
+            action = "action_close"
+        elif key in {"up", "ctrl+p"} or (key == "k" and not self.value):
+            action = "action_cursor_up"
+        elif key in {"down", "ctrl+n"} or (key == "j" and not self.value):
+            action = "action_cursor_down"
+        elif key == "pageup":
+            action = "action_page_up"
+        elif key == "pagedown":
+            action = "action_page_down"
+        elif key == "home" or (key == "g" and not self.value):
+            action = "action_cursor_home"
+        elif key == "end" or (key == "G" and not self.value):
+            action = "action_cursor_end"
+        elif key == "enter":
+            action = "action_select"
+        if action is None:
+            return
+        handler = getattr(self.screen, action, None)
+        if handler is None:
+            return
+        event.prevent_default()
+        event.stop()
+        handler()
+
+
 class CommandPalette(ModalScreen[Optional[str]]):
     CSS = """
     CommandPalette {
         align: center middle;
-        background: #000000 70%;
+        background: #000000 88%;
     }
 
     #palette {
-        width: 72;
+        width: 78;
         max-width: 96%;
-        max-height: 70%;
+        height: 24;
+        max-height: 88%;
         padding: 2 3 1 3;
         background: #141414;
     }
@@ -92,13 +162,23 @@ class CommandPalette(ModalScreen[Optional[str]]):
     }
 
     #palette-table {
-        height: 1fr;
+        height: 15;
         background: #141414;
         color: #eeeeee;
     }
     """
 
-    BINDINGS = [("escape", "close", "Close"), ("ctrl+c", "close", "Close")]
+    BINDINGS = [
+        Binding("escape", "close", "Close", priority=True),
+        Binding("ctrl+c", "close", "Close", priority=True),
+        Binding("up,k,ctrl+p", "cursor_up", "Up", show=False, priority=True),
+        Binding("down,j,ctrl+n", "cursor_down", "Down", show=False, priority=True),
+        Binding("pageup", "page_up", "Page up", show=False, priority=True),
+        Binding("pagedown", "page_down", "Page down", show=False, priority=True),
+        Binding("home,g", "cursor_home", "First", show=False, priority=True),
+        Binding("end,G", "cursor_end", "Last", show=False, priority=True),
+        Binding("enter", "select", "Select", show=False, priority=True),
+    ]
 
     def __init__(self, commands: list[tuple[str, str, str]]) -> None:
         super().__init__()
@@ -109,15 +189,16 @@ class CommandPalette(ModalScreen[Optional[str]]):
             with Horizontal(id="palette-head"):
                 yield Static("Commands", id="palette-title")
                 yield Static("esc", id="palette-esc")
-            yield Input(placeholder="Search commands", id="palette-filter", compact=True)
+            yield ModalFilterInput(placeholder="Search commands", id="palette-filter", compact=True)
             table = DataTable(
                 id="palette-table",
                 cursor_type="row",
                 show_header=False,
                 show_row_labels=False,
-                cell_padding=1,
+                cell_padding=0,
             )
-            table.add_columns("name", "description")
+            table.add_column("name", width=28)
+            table.add_column("description", width=42)
             yield table
 
     def on_mount(self) -> None:
@@ -142,6 +223,33 @@ class CommandPalette(ModalScreen[Optional[str]]):
     def action_close(self) -> None:
         self.dismiss(None)
 
+    def action_cursor_up(self) -> None:
+        _move_table_cursor(self.query_one("#palette-table", DataTable), -1)
+
+    def action_cursor_down(self) -> None:
+        _move_table_cursor(self.query_one("#palette-table", DataTable), 1)
+
+    def action_page_up(self) -> None:
+        _move_table_cursor(self.query_one("#palette-table", DataTable), -8)
+
+    def action_page_down(self) -> None:
+        _move_table_cursor(self.query_one("#palette-table", DataTable), 8)
+
+    def action_cursor_home(self) -> None:
+        _move_table_cursor(self.query_one("#palette-table", DataTable), "home")
+
+    def action_cursor_end(self) -> None:
+        _move_table_cursor(self.query_one("#palette-table", DataTable), "end")
+
+    def action_select(self) -> None:
+        table = self.query_one("#palette-table", DataTable)
+        if table.row_count:
+            self.dismiss(str(table.get_row_at(table.cursor_row)[0]))
+            return
+        value = self.query_one("#palette-filter", Input).value.strip()
+        if value:
+            self.dismiss(value)
+
     def _populate(self, query: str) -> None:
         table = self.query_one("#palette-table", DataTable)
         table.clear()
@@ -158,13 +266,14 @@ class SessionPalette(ModalScreen[Optional[str]]):
     CSS = """
     SessionPalette {
         align: center middle;
-        background: #000000 70%;
+        background: #000000 88%;
     }
 
     #sessions-dialog {
         width: 88;
         max-width: 96%;
-        max-height: 70%;
+        height: 20;
+        max-height: 88%;
         padding: 2 3 1 3;
         background: #141414;
     }
@@ -194,13 +303,23 @@ class SessionPalette(ModalScreen[Optional[str]]):
     }
 
     #sessions-table {
-        height: 1fr;
+        height: 11;
         background: #141414;
         color: #eeeeee;
     }
     """
 
-    BINDINGS = [("escape", "close", "Close"), ("ctrl+c", "close", "Close")]
+    BINDINGS = [
+        Binding("escape", "close", "Close", priority=True),
+        Binding("ctrl+c", "close", "Close", priority=True),
+        Binding("up,k,ctrl+p", "cursor_up", "Up", show=False, priority=True),
+        Binding("down,j,ctrl+n", "cursor_down", "Down", show=False, priority=True),
+        Binding("pageup", "page_up", "Page up", show=False, priority=True),
+        Binding("pagedown", "page_down", "Page down", show=False, priority=True),
+        Binding("home,g", "cursor_home", "First", show=False, priority=True),
+        Binding("end,G", "cursor_end", "Last", show=False, priority=True),
+        Binding("enter", "select", "Select", show=False, priority=True),
+    ]
 
     def __init__(self, rows: list[tuple[str, str, str, str, str]]) -> None:
         super().__init__()
@@ -212,15 +331,18 @@ class SessionPalette(ModalScreen[Optional[str]]):
             with Horizontal(id="sessions-head"):
                 yield Static("Sessions", id="sessions-dialog-title")
                 yield Static("esc", id="sessions-esc")
-            yield Input(placeholder="Search sessions", id="sessions-filter", compact=True)
+            yield ModalFilterInput(placeholder="Search sessions", id="sessions-filter", compact=True)
             table = DataTable(
                 id="sessions-table",
                 cursor_type="row",
                 show_header=False,
                 show_row_labels=False,
-                cell_padding=1,
+                cell_padding=0,
             )
-            table.add_columns("session", "state", "age", "run")
+            table.add_column("session", width=48)
+            table.add_column("state", width=12)
+            table.add_column("age", width=9)
+            table.add_column("run", width=10)
             yield table
 
     def on_mount(self) -> None:
@@ -241,6 +363,29 @@ class SessionPalette(ModalScreen[Optional[str]]):
 
     def action_close(self) -> None:
         self.dismiss(None)
+
+    def action_cursor_up(self) -> None:
+        _move_table_cursor(self.query_one("#sessions-table", DataTable), -1)
+
+    def action_cursor_down(self) -> None:
+        _move_table_cursor(self.query_one("#sessions-table", DataTable), 1)
+
+    def action_page_up(self) -> None:
+        _move_table_cursor(self.query_one("#sessions-table", DataTable), -8)
+
+    def action_page_down(self) -> None:
+        _move_table_cursor(self.query_one("#sessions-table", DataTable), 8)
+
+    def action_cursor_home(self) -> None:
+        _move_table_cursor(self.query_one("#sessions-table", DataTable), "home")
+
+    def action_cursor_end(self) -> None:
+        _move_table_cursor(self.query_one("#sessions-table", DataTable), "end")
+
+    def action_select(self) -> None:
+        table = self.query_one("#sessions-table", DataTable)
+        if table.row_count:
+            self.dismiss(self._visible_session_ids[table.cursor_row])
 
     def _populate(self, query: str) -> None:
         table = self.query_one("#sessions-table", DataTable)
@@ -274,6 +419,11 @@ class BrowserUseTerminalApp(App[None]):
         background: #0a0a0a;
     }
 
+    #main.home {
+        padding: 0 0 2 0;
+        align: center middle;
+    }
+
     #transcript {
         height: 1fr;
         background: #0a0a0a;
@@ -282,12 +432,25 @@ class BrowserUseTerminalApp(App[None]):
         scrollbar-background: #0a0a0a;
     }
 
+    #main.home #transcript {
+        width: 86;
+        max-width: 96%;
+        height: auto;
+        min-height: 16;
+        max-height: 20;
+    }
+
     #composer {
         height: 5;
         margin-top: 1;
         padding: 1 2 0 2;
         background: #1e1e1e;
         border-left: tall #5c9cf5;
+    }
+
+    #main.home #composer {
+        width: 78;
+        max-width: 92%;
     }
 
     #command {
@@ -307,6 +470,11 @@ class BrowserUseTerminalApp(App[None]):
         height: 1;
         color: #808080;
         padding: 0 1;
+    }
+
+    #main.home #hintbar {
+        width: 78;
+        max-width: 92%;
     }
 
     #sidebar {
@@ -359,8 +527,9 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     DataTable > .datatable--cursor {
-        background: #282828;
-        color: #eeeeee;
+        background: #fab283;
+        color: #0a0a0a;
+        text-style: bold;
     }
 
     DataTable:focus > .datatable--cursor {
@@ -444,10 +613,8 @@ class BrowserUseTerminalApp(App[None]):
         self.title = PRODUCT_NAME
         self.sub_title = "raw CDP browser agent"
         self.refresh_sessions()
-        if self.selected_session_id:
-            self._load_session_log(self.selected_session_id)
-        else:
-            self._write_home()
+        self._write_home()
+        self.refresh_artifacts()
         self._update_statusbar()
         self._update_session_detail()
         self.query_one("#command", Input).focus()
@@ -477,14 +644,30 @@ class BrowserUseTerminalApp(App[None]):
         self._update_statusbar()
         self._update_session_detail()
 
+    def _set_home_mode(self, enabled: bool) -> None:
+        main = self.query_one("#main")
+        main.set_class(enabled, "home")
+        self.query_one("#sidebar").display = not enabled
+
     def _write_home(self) -> None:
+        self._set_home_mode(True)
         log = self.query_one("#transcript", RichLog)
         log.clear()
+        width = 78
+        mark_width = max(len(line) for line in BROWSER_USE_MARK)
+        wordmark_width = max(len(line.rstrip()) for line in BROWSER_USE_WORDMARK)
         log.write("")
-        log.write("[bold #eeeeee]browser use terminal[/bold #eeeeee]")
-        log.write("[#808080]Type a browser task below, or press [#eeeeee]ctrl+p[/] for commands.[/]")
-        log.write("")
-        log.write(f"[#5c9cf5]Build[/] [#808080]·[/] {escape(self.model_label or '-')} [#808080]{escape(self.provider_label)}[/]")
+        for line in BROWSER_USE_MARK:
+            log.write(Align.center(Text(line.ljust(mark_width).rstrip(), style="#eeeeee"), width=width))
+        for line in BROWSER_USE_WORDMARK:
+            raw = line.rstrip().ljust(wordmark_width)
+            left = raw[:BROWSER_USE_WORDMARK_SPLIT]
+            right = raw[BROWSER_USE_WORDMARK_SPLIT:]
+            text = Text()
+            text.append(left, style="#606060")
+            text.append(right, style="#eeeeee")
+            log.write(Align.center(text, width=width))
+        log.write(Align.center(Text("terminal", style="#808080"), width=width))
 
     def _write_banner(self) -> None:
         log = self.query_one("#transcript", RichLog)
@@ -497,9 +680,6 @@ class BrowserUseTerminalApp(App[None]):
         )
 
     def _handle_event(self, event: Event) -> None:
-        if self.selected_session_id is None:
-            self.selected_session_id = event.session_id
-
         if event.type == "model.delta":
             if event.session_id == self.selected_session_id:
                 self._append_model_delta(event)
@@ -695,6 +875,7 @@ class BrowserUseTerminalApp(App[None]):
                 self._start_task(line)
 
     def _load_session_log(self, session_id: str) -> None:
+        self._set_home_mode(False)
         log = self.query_one("#transcript", RichLog)
         log.clear()
         session = self.store.load(session_id)
@@ -708,10 +889,6 @@ class BrowserUseTerminalApp(App[None]):
         self._update_session_detail()
 
     def refresh_sessions(self) -> None:
-        if self.selected_session_id is None:
-            sessions = self.store.list()
-            if sessions:
-                self.selected_session_id = sessions[0].id
         self._update_statusbar()
 
     def refresh_artifacts(self) -> None:
@@ -745,6 +922,9 @@ class BrowserUseTerminalApp(App[None]):
         self._preview_artifact(self.selected_artifact_path)
 
     def action_cancel_selected(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            self.screen.dismiss(None)
+            return
         if self.selected_session_id:
             self.manager.cancel(self.selected_session_id)
 
@@ -760,6 +940,12 @@ class BrowserUseTerminalApp(App[None]):
         self._open_artifact(self.selected_artifact_path)
 
     def action_show_commands(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            handler = getattr(self.screen, "action_cursor_up", None)
+            if handler is not None:
+                handler()
+            return
+
         def selected(command: Optional[str]) -> None:
             if command is None:
                 self.query_one("#command", Input).focus()
@@ -775,6 +961,9 @@ class BrowserUseTerminalApp(App[None]):
         self.push_screen(CommandPalette(COMMAND_PALETTE), selected)
 
     def action_show_sessions(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+
         def selected(session_id: Optional[str]) -> None:
             if not session_id:
                 self.query_one("#command", Input).focus()
@@ -898,14 +1087,15 @@ class BrowserUseTerminalApp(App[None]):
             selected = self.store.load(self.selected_session_id)
             selected_running = bool(selected and selected.status in {"created", "running"})
         left = "esc interrupt" if selected_running else "tab sessions"
-        right = (
-            f"{len(sessions)} sessions  "
-            f"[#5c9cf5]{counts.get('running', 0)} running[/]  "
-            f"[#7fd88f]{counts.get('done', 0)} done[/]  "
-            f"[#e06c75]{counts.get('failed', 0)} failed[/]  "
-            "ctrl+p commands"
-        )
-        self.query_one("#hintbar", Static).update(f"[#eeeeee]{left}[/]  [#808080]{right}[/]")
+        hint_segments = [
+            f"[#eeeeee]{left}[/]",
+            f"[#808080]{len(sessions)} sessions[/]",
+            f"[#5c9cf5]{counts.get('running', 0)} running[/]",
+            f"[#7fd88f]{counts.get('done', 0)} done[/]",
+            f"[#e06c75]{counts.get('failed', 0)} failed[/]",
+            "[#808080]ctrl+p commands[/]",
+        ]
+        self.query_one("#hintbar", Static).update("   ".join(hint_segments))
 
         cwd = "-"
         if self.selected_session_id:
@@ -920,7 +1110,17 @@ class BrowserUseTerminalApp(App[None]):
         detail = self.query_one("#session-detail", Static)
         session_id = self.selected_session_id
         if not session_id:
-            detail.update("No session selected.")
+            detail.update(
+                "[bold #eeeeee]New task[/bold #eeeeee]\n\n"
+                "[bold #eeeeee]Context[/bold #eeeeee]\n"
+                "[#808080]0 events[/]\n"
+                "[#808080]0 tools[/]\n"
+                "[#808080]0 images[/]\n"
+                "[#808080]0 artifacts[/]\n\n"
+                "[bold #eeeeee]Session[/bold #eeeeee]\n"
+                "[#808080]not started[/]\n"
+                "[#808080]press tab for history[/]"
+            )
             return
         session = self.store.load(session_id)
         if session is None:

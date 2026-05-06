@@ -1,10 +1,15 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
 from pathlib import Path
 
 from llm_browser.events import Event
+from llm_browser.session.store import SessionStore
 from llm_browser.tui.app import (
+    BrowserUseTerminalApp,
+    CommandPalette,
+    SessionPalette,
     _artifact_kind,
     _current_tool,
     _dataset_run_id_from_path,
@@ -144,6 +149,95 @@ class TuiTest(unittest.TestCase):
     def test_artifact_kind_prioritizes_trace_and_download_dirs(self) -> None:
         self.assertEqual(_artifact_kind(Path("/tmp/session/browser/traces/001_trace.json")), "trace")
         self.assertEqual(_artifact_kind(Path("/tmp/session/browser/downloads/report.csv")), "download")
+
+
+class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
+    async def test_tui_starts_without_selecting_existing_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            store.create()
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause()
+
+            self.assertIsNone(app.selected_session_id)
+
+    async def test_command_palette_supports_arrow_and_vim_navigation(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.press("ctrl+p")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, CommandPalette)
+                table = app.screen.query_one("#palette-table")
+
+                self.assertEqual(table.cursor_row, 0)
+                await pilot.press("down")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, 1)
+                await pilot.press("j")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, 2)
+                await pilot.press("k")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, 1)
+                await pilot.press("G")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, table.row_count - 1)
+                await pilot.press("g")
+                await pilot.pause()
+                self.assertEqual(table.cursor_row, 0)
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, CommandPalette)
+
+    async def test_session_palette_supports_vim_navigation_and_enter_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            store.create()
+            store.create()
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.press("tab")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, SessionPalette)
+                screen = app.screen
+                table = screen.query_one("#sessions-table")
+                visible_ids = list(screen._visible_session_ids)
+
+                self.assertGreaterEqual(len(visible_ids), 2)
+                await pilot.press("j")
+                await pilot.pause()
+                expected = visible_ids[table.cursor_row]
+                await pilot.press("enter")
+                await pilot.pause()
+
+            self.assertEqual(app.selected_session_id, expected)
+
+    async def test_modal_escape_does_not_leave_stacked_palettes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            store.create()
+            store.create()
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.press("ctrl+p")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, CommandPalette)
+                await pilot.press("escape")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, CommandPalette)
+                await pilot.press("tab")
+                await pilot.pause()
+                self.assertIsInstance(app.screen, SessionPalette)
+                await pilot.press("j")
+                await pilot.press("enter")
+                await pilot.pause()
+                self.assertNotIsInstance(app.screen, CommandPalette)
 
 
 if __name__ == "__main__":
