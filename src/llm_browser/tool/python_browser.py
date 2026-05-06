@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
+from llm_browser.browser.helpers import ensure_agent_helpers_file
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.result import ToolImage, ToolResult
 
@@ -304,6 +305,41 @@ class PythonBrowserTool:
             path.parent.mkdir(parents=True, exist_ok=True)
             path.write_text(code, encoding="utf-8")
             return str(path)
+
+        def agent_helpers_path() -> str:
+            return str(ensure_agent_helpers_file(ctx.session.cwd))
+
+        def reload_agent_helpers(path: Optional[str] = None) -> Dict[str, Any]:
+            helper_path = Path(path).expanduser() if path else ensure_agent_helpers_file(ctx.session.cwd)
+            if not helper_path.is_absolute():
+                helper_path = ctx.session.cwd / helper_path
+            code = helper_path.read_text(encoding="utf-8")
+            module = types.ModuleType("agent_helpers")
+            module.__file__ = str(helper_path)
+            exec(compile(code, str(helper_path), "exec"), module.__dict__, module.__dict__)
+            sys.modules["agent_helpers"] = module
+            explicit_exports = module.__dict__.get("__all__")
+            browser_exports = set(getattr(sys.modules.get("browser_helpers"), "__all__", []))
+            if explicit_exports is not None:
+                export_names = [str(name) for name in explicit_exports]
+            else:
+                export_names = [
+                    name
+                    for name in module.__dict__
+                    if not name.startswith("_") and name not in browser_exports
+                ]
+            exported = []
+            for name in export_names:
+                if name not in module.__dict__:
+                    continue
+                value = module.__dict__[name]
+                if name.startswith("_"):
+                    continue
+                namespace[name] = value
+                exported.append(name)
+            namespace["_agent_helpers_path"] = str(helper_path)
+            namespace["_agent_helpers_loaded_mtime"] = helper_path.stat().st_mtime
+            return {"path": str(helper_path), "exports": sorted(exported)}
 
         def save_artifact(name: str, content: Any = None, mode: str = "text") -> str:
             source = Path(name).expanduser()
@@ -903,12 +939,14 @@ class PythonBrowserTool:
                 "wait_until": wait_until,
                 "wait_for_selector": wait_for_selector,
                 "wait_for_text": wait_for_text,
+                "wait_for_network_idle": getattr(runtime, "wait_for_network_idle", lambda *args, **kwargs: False),
                 "deep_text": deep_text,
                 "click_text": click_text,
                 "dismiss_cookie_banners": dismiss_cookie_banners,
                 "screenshot": screenshot,
                 "screenshot_element": screenshot_element,
                 "page_info": runtime.page_info,
+                "pending_dialog": getattr(runtime, "pending_dialog_info", lambda *args, **kwargs: None),
                 "drain_cdp_events": getattr(runtime, "drain_events", lambda *args, **kwargs: []),
                 "recent_cdp_events": getattr(runtime, "recent_cdp_events", lambda *args, **kwargs: []),
                 "recent_console": getattr(runtime, "recent_console_events", lambda *args, **kwargs: []),
@@ -927,11 +965,20 @@ class PythonBrowserTool:
                 "visible_text": runtime.visible_text,
                 "links": runtime.links,
                 "click_at": runtime.click_at,
+                "fill_input": getattr(runtime, "fill_input", lambda *args, **kwargs: (_raise_runtime("fill_input is unavailable on this runtime"))),
                 "type_text": runtime.type_text,
                 "press": runtime.press,
+                "press_key": getattr(runtime, "press_key", runtime.press),
                 "scroll": runtime.scroll,
+                "list_tabs": getattr(runtime, "list_tabs", runtime.tabs),
+                "current_tab": getattr(runtime, "current_tab", lambda: {}),
+                "switch_tab": getattr(runtime, "switch_tab", runtime.attach_tab),
+                "ensure_real_tab": getattr(runtime, "ensure_real_tab", lambda: None),
+                "iframe_target": getattr(runtime, "iframe_target", lambda url_substr: None),
                 "load_helper": load_helper,
                 "save_helper": save_helper,
+                "agent_helpers_path": agent_helpers_path,
+                "reload_agent_helpers": reload_agent_helpers,
                 "save_artifact": save_artifact,
                 "upload_artifact": upload_artifact,
                 "create_download_url": create_download_url,
@@ -954,6 +1001,7 @@ class PythonBrowserTool:
             }
         )
         _install_browser_helpers_module(namespace)
+        _auto_reload_agent_helpers(ctx.session.cwd, namespace, reload_agent_helpers)
         return namespace
 
     def _runtime(self, ctx: ToolContext, headless: bool) -> "BrowserRuntime":
@@ -998,6 +1046,21 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _raise_runtime(message: str) -> None:
+    raise RuntimeError(message)
+
+
+def _auto_reload_agent_helpers(workspace: Path, namespace: Dict[str, Any], reload_agent_helpers: Callable[[], Dict[str, Any]]) -> None:
+    helper_path = ensure_agent_helpers_file(workspace)
+    try:
+        mtime = helper_path.stat().st_mtime
+    except OSError:
+        return
+    if namespace.get("_agent_helpers_loaded_mtime") == mtime:
+        return
+    reload_agent_helpers()
 
 
 def _is_jsonable(value: Any) -> bool:
@@ -2965,20 +3028,38 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "wait_until",
         "wait_for_selector",
         "wait_for_text",
+        "wait_for_network_idle",
         "deep_text",
         "click_text",
         "dismiss_cookie_banners",
         "screenshot",
         "screenshot_element",
         "page_info",
+        "pending_dialog",
+        "drain_cdp_events",
+        "recent_cdp_events",
+        "recent_console",
+        "recent_network",
+        "recent_network_failures",
+        "download_info",
+        "save_browser_trace",
         "visible_text",
         "links",
         "click_at",
+        "fill_input",
         "type_text",
         "press",
+        "press_key",
         "scroll",
+        "list_tabs",
+        "current_tab",
+        "switch_tab",
+        "ensure_real_tab",
+        "iframe_target",
         "load_helper",
         "save_helper",
+        "agent_helpers_path",
+        "reload_agent_helpers",
         "save_artifact",
         "upload_artifact",
         "create_download_url",

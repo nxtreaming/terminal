@@ -82,6 +82,29 @@ class EvalRuntime(BrowserRuntime):
         return {"result": {"value": "ok"}}
 
 
+class RecordingRuntime(BrowserRuntime):
+    def __init__(self, root_dir: Path) -> None:
+        super().__init__(root_dir=root_dir)
+        self.calls: list[tuple[str, Dict[str, Any]]] = []
+        self.focused = True
+
+    def cdp(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        retry: bool = True,
+    ) -> Dict[str, Any]:
+        self.calls.append((method, params or {}))
+        if method == "Runtime.evaluate":
+            expression = str((params or {}).get("expression") or "")
+            if "document.querySelector" in expression and ".focus()" in expression:
+                return {"result": {"value": self.focused}}
+            return {"result": {"value": None}}
+        return {}
+
+
 class DrainClient:
     def __init__(self, events: list[Dict[str, Any]]) -> None:
         self.events = list(events)
@@ -220,7 +243,13 @@ class BrowserRuntimeTest(unittest.TestCase):
             session_id="session-1",
             timeout_s=None,
         )
-        client.call.assert_any_call("Target.createTarget", {"url": "https://new.example"})
+        client.call.assert_any_call("Target.createTarget", {"url": "about:blank"})
+        client.call.assert_any_call(
+            "Page.navigate",
+            params={"url": "https://new.example"},
+            session_id="session-1",
+            timeout_s=None,
+        )
 
     def test_start_cloud_creates_browser_attaches_ws_and_stops_on_close(self) -> None:
         client = Mock()
@@ -301,6 +330,73 @@ class BrowserRuntimeTest(unittest.TestCase):
         self.assertEqual(console[0]["text"], "boom")
         self.assertEqual(failures[0]["status"], 404)
         self.assertEqual(failures[1]["errorText"], "net::ERR_ABORTED")
+
+    def test_page_info_returns_pending_dialog_without_js(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BrowserRuntime(Path(tmp))
+            runtime.client = DrainClient(
+                [
+                    {
+                        "method": "Page.javascriptDialogOpening",
+                        "params": {"type": "alert", "message": "Confirm"},
+                    }
+                ]
+            )  # type: ignore[assignment]
+
+            info = runtime.page_info()
+
+        self.assertEqual(info["dialog"]["message"], "Confirm")
+
+    def test_wait_for_network_idle_filters_other_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BrowserRuntime(Path(tmp))
+            runtime.default_session_id = "active"
+            runtime.client = DrainClient(
+                [
+                    {
+                        "method": "Network.requestWillBeSent",
+                        "session_id": "background",
+                        "params": {"requestId": "bg"},
+                    }
+                ]
+            )  # type: ignore[assignment]
+
+            self.assertTrue(runtime.wait_for_network_idle(timeout_s=0.5, idle_ms=10))
+
+    def test_fill_input_uses_real_key_events_and_framework_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = RecordingRuntime(Path(tmp))
+
+            runtime.fill_input("#email", "ab")
+
+        event_types = [params.get("type") for method, params in runtime.calls if method == "Input.dispatchKeyEvent"]
+        self.assertIn("rawKeyDown", event_types)
+        self.assertIn("char", event_types)
+        expressions = [params.get("expression", "") for method, params in runtime.calls if method == "Runtime.evaluate"]
+        self.assertTrue(any("new Event('input'" in expression for expression in expressions))
+
+    def test_attach_first_page_prefers_real_page_targets(self) -> None:
+        class AttachRuntime(BrowserRuntime):
+            def __init__(self, root_dir: Path) -> None:
+                super().__init__(root_dir=root_dir)
+                self.attached: Optional[Dict[str, Any]] = None
+
+            def tabs(self) -> list[Dict[str, Any]]:
+                return [
+                    {"id": "chrome", "type": "page", "url": "chrome://new-tab-page"},
+                    {"id": "real", "type": "page", "url": "https://example.com"},
+                ]
+
+            def attach_target(self, target: Dict[str, Any]) -> Dict[str, Any]:
+                self.attached = target
+                return target
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = AttachRuntime(Path(tmp))
+
+            target = runtime.attach_first_page()
+
+        self.assertEqual(target["id"], "real")
 
     def test_download_info_lists_files_and_download_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -8,13 +8,21 @@ import shutil
 import time
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Any, Dict, List, Optional, Sequence, Tuple
+from typing import Any, Dict, List, Optional, Sequence, Tuple, Union
 from urllib.parse import quote, urlparse
 
 import requests
 
 from llm_browser.browser.cdp import CdpClient, CdpConnectionError, CdpError
 from llm_browser.browser.chrome import ChromeProcess, start_chrome
+from llm_browser.browser.helpers import (
+    decode_unserializable_js_value,
+    is_internal_url,
+    is_real_page_target,
+    key_event_for_cdp,
+    select_all_modifier,
+    wrap_js_if_return_statement,
+)
 from llm_browser.events.event import now_ms
 from llm_browser.tool.result import ToolImage
 
@@ -171,6 +179,7 @@ class BrowserRuntime:
         self._screenshot_index = 0
         self._trace_index = 0
         self._event_log: List[Dict[str, Any]] = []
+        self.pending_dialog: Optional[Dict[str, Any]] = None
         self.downloads_dir = root_dir / "downloads"
         self.downloads_dir.mkdir(parents=True, exist_ok=True)
 
@@ -352,11 +361,18 @@ class BrowserRuntime:
     def tabs(self) -> List[Dict[str, Any]]:
         return [target for target in self.targets() if target.get("type") == "page"]
 
+    def list_tabs(self, include_internal: bool = True) -> List[Dict[str, Any]]:
+        pages = self.tabs()
+        if include_internal:
+            return pages
+        return [target for target in pages if is_real_page_target(target)]
+
     def attach_first_page(self) -> Dict[str, Any]:
         pages = self.tabs()
-        if not pages:
-            return self.new_tab("about:blank")
-        return self.attach_target(pages[0])
+        real_pages = [page for page in pages if is_real_page_target(page)]
+        if real_pages:
+            return self.attach_target(real_pages[0])
+        return self.new_tab("about:blank")
 
     def attach_tab(
         self,
@@ -399,15 +415,67 @@ class BrowserRuntime:
         self._enable_page_domains()
         return target
 
+    def switch_tab(self, target: Union[Dict[str, Any], str]) -> Dict[str, Any]:
+        target_id = str(target.get("id") or target.get("targetId") if isinstance(target, dict) else target)
+        if not target_id:
+            raise RuntimeError("switch_tab requires a target id or target dict")
+        if self.client is not None and self.browser_level_ws:
+            try:
+                self.client.call("Target.activateTarget", {"targetId": target_id}, timeout_s=5)
+            except Exception:
+                pass
+            return self._attach_browser_target(target_id)
+        for page in self.tabs():
+            if str(page.get("id") or page.get("targetId") or "") == target_id:
+                try:
+                    self.cdp("Target.activateTarget", {"targetId": target_id}, retry=False)
+                except Exception:
+                    pass
+                return self.attach_target(page)
+        raise ValueError(f"page target not found: {target_id}")
+
+    def current_tab(self) -> Dict[str, Any]:
+        target_id = str((self.target or {}).get("id") or (self.target or {}).get("targetId") or self.target_id_from_session() or "")
+        if target_id:
+            found = self._target_info_by_id(target_id)
+            if found:
+                return found
+        return dict(self.target or {"id": "external", "type": "page", "url": ""})
+
+    def target_id_from_session(self) -> Optional[str]:
+        return str((self.target or {}).get("id") or (self.target or {}).get("targetId") or "") or None
+
+    def ensure_real_tab(self) -> Optional[Dict[str, Any]]:
+        try:
+            current = self.current_tab()
+            if is_real_page_target(current):
+                return current
+        except Exception:
+            pass
+        real_tabs = self.list_tabs(include_internal=False)
+        if not real_tabs:
+            return None
+        return self.switch_tab(real_tabs[0])
+
+    def iframe_target(self, url_substr: str) -> Optional[str]:
+        for target in self.targets():
+            if target.get("type") == "iframe" and url_substr in str(target.get("url") or ""):
+                return str(target.get("id") or target.get("targetId") or "")
+        return None
+
     def new_tab(self, url: str = "about:blank") -> Dict[str, Any]:
         if not self.http_url and self.browser_level_ws and self.client is not None:
-            result = self.client.call("Target.createTarget", {"url": url})
-            return self._attach_browser_target(str(result["targetId"]))
+            result = self.client.call("Target.createTarget", {"url": "about:blank"})
+            target = self._attach_browser_target(str(result["targetId"]))
+            if url != "about:blank":
+                self.navigate(url, wait=False)
+            return target
         if not self.http_url:
             if url != "about:blank":
                 self.navigate(url, wait=False)
             return self.target or {"id": "external", "type": "page", "url": url}
-        encoded = quote(url, safe=":/?&=%#")
+        create_url = "about:blank" if url != "about:blank" else url
+        encoded = quote(create_url, safe=":/?&=%#")
         response = requests.put(f"{self.http_url}/json/new?{encoded}", timeout=5)
         if response.status_code >= 400:
             response = requests.get(f"{self.http_url}/json/new?{encoded}", timeout=5)
@@ -439,6 +507,19 @@ class BrowserRuntime:
             assert self.client is not None
             effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
             return self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+        except CdpError as exc:
+            if (
+                retry
+                and effective_session_id is not None
+                and effective_session_id == self.default_session_id
+                and "Session with given id not found" in str(exc)
+            ):
+                target_id = str((self.target or {}).get("id") or (self.target or {}).get("targetId") or "")
+                if target_id:
+                    self._attach_browser_target(target_id)
+                    effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
+                    return self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
+            raise
 
     def _reattach_after_disconnect(self) -> None:
         if self.client is not None:
@@ -497,11 +578,21 @@ class BrowserRuntime:
         if not target_id:
             raise RuntimeError("browser-level CDP attach requires a target id")
         assert self.client is not None
+        old_session_id = self.default_session_id
+        try:
+            self.client.call("Target.activateTarget", {"targetId": target_id}, timeout_s=5)
+        except Exception:
+            pass
         result = self.client.call("Target.attachToTarget", {"targetId": target_id, "flatten": True})
         self.default_session_id = str(result["sessionId"])
         self.browser_level_ws = True
         target = self._target_info_by_id(target_id) or {"id": target_id, "type": "page", "url": ""}
         self.target = target
+        if old_session_id and old_session_id != self.default_session_id:
+            try:
+                self.client.call("Network.disable", session_id=old_session_id, timeout_s=2)
+            except Exception:
+                pass
         self._enable_page_domains()
         return target
 
@@ -519,7 +610,7 @@ class BrowserRuntime:
         return None
 
     def _enable_page_domains(self) -> None:
-        for domain in ("Page", "Runtime", "Network", "Log"):
+        for domain in ("Page", "DOM", "Runtime", "Network", "Log"):
             try:
                 self.cdp(f"{domain}.enable", retry=False)
             except Exception:
@@ -560,6 +651,7 @@ class BrowserRuntime:
         repl_mode: Optional[bool] = None,
         user_gesture: bool = False,
     ) -> Any:
+        expression = wrap_js_if_return_statement(expression)
         effective_repl_mode = self._default_repl_mode(expression, await_promise) if repl_mode is None else repl_mode
         response = self.cdp(
             "Runtime.evaluate",
@@ -578,7 +670,7 @@ class BrowserRuntime:
         if "value" in result:
             return result["value"]
         if "unserializableValue" in result:
-            return result["unserializableValue"]
+            return decode_unserializable_js_value(str(result["unserializableValue"]))
         return None
 
     def _default_repl_mode(self, expression: str, await_promise: bool) -> bool:
@@ -640,6 +732,9 @@ class BrowserRuntime:
         )
 
     def page_info(self) -> Dict[str, Any]:
+        dialog = self.pending_dialog_info()
+        if dialog:
+            return {"dialog": dialog}
         raw = self.js(
             """
             (() => {
@@ -742,6 +837,8 @@ class BrowserRuntime:
             }
 
     def click_at(self, x: float, y: float, button: str = "left", clicks: int = 1) -> None:
+        if _env_bool("LLM_BROWSER_DEBUG_CLICKS", False):
+            self._save_debug_click(x, y)
         base = {"x": x, "y": y, "button": button, "clickCount": clicks}
         self.cdp("Input.dispatchMouseEvent", {"type": "mouseMoved", "x": x, "y": y})
         self.cdp("Input.dispatchMouseEvent", {"type": "mousePressed", **base})
@@ -751,9 +848,45 @@ class BrowserRuntime:
         self.cdp("Input.insertText", {"text": text})
 
     def press(self, key: str) -> None:
-        event = _key_event(key)
+        self.press_key(key)
+
+    def press_key(self, key: str, modifiers: int = 0) -> None:
+        event, text = key_event_for_cdp(key, modifiers=modifiers)
         self.cdp("Input.dispatchKeyEvent", {"type": "keyDown", **event})
+        if text and len(text) == 1:
+            char_event = {k: v for k, v in event.items() if k != "text"}
+            self.cdp("Input.dispatchKeyEvent", {"type": "char", "text": text, **char_event})
         self.cdp("Input.dispatchKeyEvent", {"type": "keyUp", **event})
+
+    def fill_input(self, selector: str, text: str, clear_first: bool = True, timeout_s: float = 0.0) -> None:
+        if timeout_s > 0:
+            self.wait_for_selector(selector, timeout_s=timeout_s, visible=False)
+        selector_json = json.dumps(selector)
+        focused = self.js(
+            f"(()=>{{const e=document.querySelector({selector_json});"
+            "if(!e)return false;e.focus();return true;}})()"
+        )
+        if not focused:
+            raise RuntimeError(f"fill_input: element not found: {selector!r}")
+        if clear_first:
+            select_all = {
+                "key": "a",
+                "code": "KeyA",
+                "modifiers": select_all_modifier(),
+                "windowsVirtualKeyCode": 65,
+                "nativeVirtualKeyCode": 65,
+            }
+            self.cdp("Input.dispatchKeyEvent", {"type": "rawKeyDown", **select_all})
+            self.cdp("Input.dispatchKeyEvent", {"type": "keyUp", **select_all})
+            self.press_key("Backspace")
+        for char in text:
+            self.press_key(char)
+        self.js(
+            f"(()=>{{const e=document.querySelector({selector_json});"
+            "if(!e)return;"
+            "e.dispatchEvent(new Event('input',{bubbles:true}));"
+            "e.dispatchEvent(new Event('change',{bubbles:true}));}})()"
+        )
 
     def scroll(self, dx: float = 0, dy: float = 500, x: float = 500, y: float = 500) -> None:
         self.cdp("Input.dispatchMouseEvent", {"type": "mouseWheel", "x": x, "y": y, "deltaX": dx, "deltaY": dy})
@@ -767,6 +900,11 @@ class BrowserRuntime:
             raw_events = self.client.drain_events()
         events = [event for event in raw_events if isinstance(event, dict)]
         return self._record_events(events)
+
+    def pending_dialog_info(self, drain: bool = True) -> Optional[Dict[str, Any]]:
+        if drain:
+            self.drain_events(timeout_s=0.02)
+        return dict(self.pending_dialog) if self.pending_dialog else None
 
     def recent_cdp_events(
         self,
@@ -853,6 +991,31 @@ class BrowserRuntime:
                     )
         return failures[-max(0, int(limit)) :]
 
+    def wait_for_network_idle(self, timeout_s: float = 10.0, idle_ms: int = 500) -> bool:
+        deadline = time.time() + timeout_s
+        last_activity = time.time()
+        inflight = set()
+        active_session = self.default_session_id
+        while time.time() < deadline:
+            for event in self.drain_events(timeout_s=0.05):
+                event_session = event.get("sessionId") or event.get("session_id")
+                if active_session is not None and event_session not in {active_session, None}:
+                    continue
+                method = str(event.get("method") or "")
+                params = event.get("params") if isinstance(event.get("params"), dict) else {}
+                if method == "Network.requestWillBeSent":
+                    inflight.add(params.get("requestId"))
+                    last_activity = time.time()
+                elif method in {"Network.loadingFinished", "Network.loadingFailed"}:
+                    inflight.discard(params.get("requestId"))
+                    last_activity = time.time()
+                elif method.startswith("Network."):
+                    last_activity = time.time()
+            if not inflight and (time.time() - last_activity) * 1000 >= idle_ms:
+                return True
+            time.sleep(0.1)
+        return False
+
     def download_info(self, limit: int = 100, drain: bool = True) -> Dict[str, Any]:
         if drain:
             self.drain_events(timeout_s=0.02)
@@ -913,12 +1076,40 @@ class BrowserRuntime:
         for event in events:
             item = dict(event)
             item.setdefault("_ts_ms", ts_ms)
+            self._track_event_state(item)
             stamped.append(item)
         if stamped:
             self._event_log.extend(stamped)
             if len(self._event_log) > 5000:
                 self._event_log = self._event_log[-5000:]
         return stamped
+
+    def _track_event_state(self, event: Dict[str, Any]) -> None:
+        method = str(event.get("method") or "")
+        params = event.get("params") if isinstance(event.get("params"), dict) else {}
+        if method == "Page.javascriptDialogOpening":
+            self.pending_dialog = dict(params)
+        elif method == "Page.javascriptDialogClosed":
+            self.pending_dialog = None
+
+    def _save_debug_click(self, x: float, y: float) -> None:
+        try:
+            from PIL import Image, ImageDraw
+
+            image = self.screenshot(f"debug_click_{self._screenshot_index + 1}", attach=False)
+            path = Path(image.path)
+            device_pixel_ratio = float(self.js("window.devicePixelRatio") or 1)
+            with Image.open(path) as img:
+                draw = ImageDraw.Draw(img)
+                px, py = int(x * device_pixel_ratio), int(y * device_pixel_ratio)
+                radius = int(15 * device_pixel_ratio)
+                width = max(1, int(3 * device_pixel_ratio))
+                draw.ellipse([px - radius, py - radius, px + radius, py + radius], outline="red", width=width)
+                draw.line([px - radius, py, px + radius, py], fill="red", width=width)
+                draw.line([px, py - radius, px, py + radius], fill="red", width=width)
+                img.save(path)
+        except Exception:
+            pass
 
 
 def _key_event(key: str) -> Dict[str, Any]:

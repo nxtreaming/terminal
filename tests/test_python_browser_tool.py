@@ -254,6 +254,31 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"], {"ok": True})
             self.assertIn('"ok": true', result.text)
 
+    def test_agent_helpers_file_is_first_class_and_reloadable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "path = Path(agent_helpers_path())\n"
+                        "path.write_text('from browser_helpers import *\\n\\ndef helper_title():\\n    return js(\"document.title\")\\n')\n"
+                        "loaded = reload_agent_helpers()\n"
+                        "result = {'path': str(path), 'title': helper_title(), 'loaded': 'helper_title' in loaded['exports']}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(Path(result.data["result"]["path"]).exists())
+            self.assertEqual(result.data["result"]["title"], "Example Domain")
+            self.assertTrue(result.data["result"]["loaded"])
+
     def test_wait_for_load_accepts_timeout_alias(self) -> None:
         runtime_holder = {}
 
