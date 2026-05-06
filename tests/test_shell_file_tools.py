@@ -254,6 +254,65 @@ class ShellFileToolsTest(unittest.TestCase):
             self.assertEqual(result.data["returncode"], 0)
             self.assertIn("browser", read.text)
 
+    def test_apply_patch_accepts_codex_update_patch(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            write_file(ctx, {"path": "example.py", "content": "def value():\n    return 1\n"})
+            patch = """\
+*** Begin Patch
+*** Update File: example.py
+@@
+ def value():
+-    return 1
++    return 2
+*** End Patch
+"""
+
+            result = apply_patch_file(ctx, {"patch": patch})
+            read = read_file(ctx, {"path": "example.py"})
+
+            self.assertEqual(result.data["format"], "codex")
+            self.assertIn("return 2", read.text)
+
+    def test_apply_patch_codex_check_does_not_write(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            write_file(ctx, {"path": "example.py", "content": "value = 1\n"})
+            patch = """\
+*** Begin Patch
+*** Update File: example.py
+@@
+-value = 1
++value = 2
+*** End Patch
+"""
+
+            result = apply_patch_file(ctx, {"patch": patch, "check": True})
+            read = read_file(ctx, {"path": "example.py"})
+
+            self.assertTrue(result.data["check"])
+            self.assertIn("value = 1", read.text)
+
+    def test_apply_patch_accepts_codex_add_and_delete(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            write_file(ctx, {"path": "old.txt", "content": "remove me\n"})
+            patch = """\
+*** Begin Patch
+*** Add File: new.txt
++created
+*** Delete File: old.txt
+*** End Patch
+"""
+
+            result = apply_patch_file(ctx, {"patch": patch})
+            read = read_file(ctx, {"path": "new.txt"})
+
+            self.assertIn("new.txt", result.data["files"])
+            self.assertIn("old.txt", result.data["files"])
+            self.assertIn("created", read.text)
+            self.assertFalse((ctx.session.cwd / "old.txt").exists())
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
