@@ -4,8 +4,10 @@ Objective: make all tasks in both bundled datasets pass, make the TUI highly usa
 
 ## Evidence Collected
 
-- Unit suite: `uv run python -m unittest discover -s tests` passes with 42 tests.
-- Browser smoke: `uv run browser-use-terminal browser smoke --headless --url https://example.com` passes.
+- Unit suite: `uv run python -m unittest discover -s tests` passes with 162 tests.
+- Browser smoke: `uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com` passes.
+- Daemon browser smoke: `uv run browser-use-terminal browser smoke --browser daemon --headless --daemon-name smoke-test --url https://example.com` passes.
+- Codex GPT-5.5 provider image smoke: `uv run browser-use-terminal provider image-smoke --provider codex --model gpt-5.5` passes and returns `red then blue`.
 - Fake dataset smoke: `uv run browser-use-terminal datasets run real_v8 --provider fake --count 1 --seed 3` passes.
 - Real `gpt-5.5` dataset runs completed:
   - `real_v8` task 34, session `940ce19a2ef4`.
@@ -30,9 +32,13 @@ Objective: make all tasks in both bundled datasets pass, make the TUI highly usa
 - Trace compaction.
 - Background session manager.
 - Cancellation markers and cancellable shell.
+- Cooperative Python cancellation via trace checks and cancellable `sleep`/`time.sleep` helper.
+- Cancellation-aware parallel read-only tool scheduling with serialized mutation tools.
 - Streamed shell output events for long commands.
-- Session resume from trace.
-- Trace bundle export.
+- Session resume from trace with screenshot/tool-image rehydration where artifact files still exist.
+- Trace bundle export and trace-aware compaction references for screenshots/artifacts.
+- Browser daemon backend/root/headless identity checks and stale-daemon retry.
+- Browser helpers for cookies, storage, permissions, and download waiting.
 - LLM self-eval as child session.
 - Dataset list/sample/run commands.
 - Isolated dataset workspaces.
@@ -46,7 +52,7 @@ Objective: make all tasks in both bundled datasets pass, make the TUI highly usa
 - All 10 `real_v14_short` tasks have been executed and reached latest-attempt pass status, but several high-scrape outputs still deserve deeper semantic review beyond harness `done` status.
 - TUI has not been visually reviewed in a real terminal screenshot loop after every change.
 - Resume is useful for trace continuation, but arbitrary mid-provider/mid-tool resume is not fully solved.
-- Python tool cancellation cannot interrupt arbitrary CPU-bound Python code mid-execution; it stops at tool boundaries or cooperative checks.
-- Provider credential refresh is not hardened beyond current Codex auth availability.
+- Python tool cancellation is cooperative. It interrupts normal Python execution and the provided sleep helper, but it cannot preempt arbitrary blocking C extensions or external libraries.
+- Provider credential refresh/retry is improved but still not a complete provider-state replay system.
 
 Conclusion: the harness is substantially implemented and `real_v14_short` is green on latest attempts. The objective is not fully achieved until the `real_v8` full batch finishes and any remaining task-specific failures are fixed.
