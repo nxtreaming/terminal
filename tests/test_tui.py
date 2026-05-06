@@ -27,6 +27,17 @@ class TuiTest(unittest.TestCase):
         self.assertIn("[s1] tool done: shell", formatted)
         self.assertLess(len(formatted), 210)
 
+    def test_format_tool_output_truncates_stream_chunk(self) -> None:
+        event = Event(
+            type="tool.output",
+            session_id="s1",
+            payload={"name": "shell", "stream": "stdout", "text": "b" * 200},
+        )
+
+        formatted = format_event(event)
+        self.assertIn("[s1] tool output: shell stdout", formatted)
+        self.assertLess(len(formatted), 230)
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

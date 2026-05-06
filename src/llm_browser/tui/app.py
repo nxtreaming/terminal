@@ -238,6 +238,8 @@ class BrowserUseTerminalApp(App[None]):
             log.write(f"[red]{line}[/red]")
         elif event.type == "tool.image":
             log.write(f"[bold #9ccfd8]{line}[/bold #9ccfd8]")
+        elif event.type == "tool.output":
+            log.write(f"[dim]{line}[/dim]")
         elif event.type in {"session.done", "session.cancelled"}:
             log.write(f"[green]{line}[/green]")
         elif event.type == "session.failed":

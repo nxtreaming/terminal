@@ -27,3 +27,15 @@ class ToolContext:
                 "image": image.to_dict(),
             },
         )
+
+    def emit_output(self, text: str, stream: str = "stdout") -> None:
+        self.store.emit(
+            self.session.id,
+            "tool.output",
+            {
+                "tool_call_id": self.tool_call_id,
+                "name": self.tool_name,
+                "stream": stream,
+                "text": text,
+            },
+        )

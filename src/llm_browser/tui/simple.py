@@ -109,6 +109,11 @@ def format_event(event: Event) -> str:
     if event.type == "tool.image":
         image = payload.get("image") or {}
         return f"[{event.session_id}] image: {image.get('label')} -> {image.get('path')}"
+    if event.type == "tool.output":
+        text = str(payload.get("text") or "").strip().replace("\n", "\\n")
+        if len(text) > 160:
+            text = text[:157] + "..."
+        return f"[{event.session_id}] tool output: {payload.get('name')} {payload.get('stream')} {text}"
     if event.type == "tool.finished":
         output = payload.get("output") or {}
         text = str(output.get("text") or "").strip().replace("\n", "\\n")

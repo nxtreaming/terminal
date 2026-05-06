@@ -43,6 +43,17 @@ class ShellFileToolsTest(unittest.TestCase):
             self.assertIn(str(ctx.session.cwd), result.text)
             self.assertIn("hello", result.text)
 
+    def test_shell_streams_output_events(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+
+            result = shell(ctx, {"command": "printf streamed", "timeout_s": 5})
+
+            self.assertEqual(result.data["returncode"], 0)
+            output_events = [event for event in ctx.store.events.read(ctx.session.id) if event.type == "tool.output"]
+            self.assertTrue(output_events)
+            self.assertIn("streamed", output_events[-1].payload["text"])
+
     def test_apply_patch_applies_unified_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self.make_context(tmp)
