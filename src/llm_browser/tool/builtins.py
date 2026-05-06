@@ -73,6 +73,7 @@ def build_builtin_registry() -> ToolRegistry:
             name="exec_command",
             description=(
                 "Codex-compatible alias for shell. Run cmd in the session workspace; use workdir instead of cd. "
+                "For code exploration, pass one independent command per call instead of combining commands with && or ;. "
                 "Set tty=true only for long-running interactive processes, which returns a process_id for write_stdin/shell_poll."
             ),
             input_schema={
