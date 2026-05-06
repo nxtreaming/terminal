@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import queue
+import re
 import shlex
 import subprocess
 import threading
@@ -162,7 +163,7 @@ class BrowserUseTerminalApp(App[None]):
             with Vertical(id="left"):
                 yield Static("sessions", id="sessions-title")
                 sessions = DataTable(id="sessions", cursor_type="row")
-                sessions.add_columns("id", "state", "age", "task")
+                sessions.add_columns("id", "state", "age", "run", "task")
                 yield sessions
                 yield Static("commands", id="help-title")
                 yield Static(
@@ -431,10 +432,12 @@ class BrowserUseTerminalApp(App[None]):
         table.clear()
         for session in self.store.list():
             task = self._task_for_session(session)
+            run_label = _dataset_run_label(session.cwd)
             table.add_row(
                 session.id,
                 _status_text(session.status),
                 _format_age(session.updated_ms / 1000),
+                run_label,
                 task[:46],
                 key=session.id,
             )
@@ -671,6 +674,7 @@ class BrowserUseTerminalApp(App[None]):
             return f"[#b9b2a7]run[/] {escape(run_id)}"
         return (
             f"[#b9b2a7]run[/] {escape(run_id)} "
+            f"{_progress_bar(summary['passed'], summary['selected'], width=10)} "
             f"[green]{summary['passed']}[/green]/[bold]{summary['selected']}[/bold] "
             f"[yellow]{summary['pending']} pending[/yellow]"
         )
@@ -681,7 +685,8 @@ class BrowserUseTerminalApp(App[None]):
         except Exception:
             return run_id
         return (
-            f"{run_id} {summary['passed']}/{summary['selected']} passed, "
+            f"{run_id} {_progress_bar(summary['passed'], summary['selected'], width=16)} "
+            f"{summary['passed']}/{summary['selected']} passed, "
             f"{summary['failed']} failed, {summary['pending']} pending"
         )
 
@@ -752,6 +757,38 @@ def _dataset_run_id_from_path(path: Path) -> Optional[str]:
         if part == "dataset-runs" and index + 1 < len(parts):
             return parts[index + 1]
     return None
+
+
+def _dataset_task_id_from_path(path: Path) -> Optional[str]:
+    name = path.name
+    match = re.match(r"task-(.+)-workspace$", name)
+    if match:
+        return match.group(1)
+    return None
+
+
+def _dataset_run_label(path: Path) -> str:
+    run_id = _dataset_run_id_from_path(path)
+    if not run_id:
+        return "-"
+    task_id = _dataset_task_id_from_path(path)
+    compact_run = run_id
+    if compact_run.startswith("real-v8-"):
+        compact_run = "v8-" + compact_run.removeprefix("real-v8-")
+    if compact_run.startswith("real-v14-"):
+        compact_run = "v14-" + compact_run.removeprefix("real-v14-")
+    label = compact_run[:18]
+    return f"{label}:{task_id}" if task_id else label
+
+
+def _progress_bar(done: int, total: int, width: int = 12) -> str:
+    width = max(4, width)
+    if total <= 0:
+        filled = 0
+    else:
+        filled = min(width, max(0, round((done / total) * width)))
+    empty = width - filled
+    return "[#8bd5ca]" + ("█" * filled) + "[/][#3b424a]" + ("░" * empty) + "[/]"
 
 
 def _latest_image_line(events: list[Event]) -> str:

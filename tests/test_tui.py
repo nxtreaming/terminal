@@ -7,9 +7,12 @@ from llm_browser.events import Event
 from llm_browser.tui.app import (
     _current_tool,
     _dataset_run_id_from_path,
+    _dataset_run_label,
+    _dataset_task_id_from_path,
     _final_line,
     _format_events_for_log,
     _latest_image_line,
+    _progress_bar,
     _short_task_list,
     _summarize_task_text,
 )
@@ -116,6 +119,18 @@ class TuiTest(unittest.TestCase):
         path = Path("/tmp/state/dataset-runs/real-v8-gpt55-full/task-1-workspace")
 
         self.assertEqual(_dataset_run_id_from_path(path), "real-v8-gpt55-full")
+
+    def test_dataset_task_id_and_run_label_from_workspace_path(self) -> None:
+        path = Path("/tmp/state/dataset-runs/real-v8-gpt55-full/task-100-workspace")
+
+        self.assertEqual(_dataset_task_id_from_path(path), "100")
+        self.assertEqual(_dataset_run_label(path), "v8-gpt55-full:100")
+
+    def test_progress_bar_renders_filled_and_empty_cells(self) -> None:
+        rendered = _progress_bar(3, 6, width=6)
+
+        self.assertIn("███", rendered)
+        self.assertIn("░░░", rendered)
 
     def test_latest_image_line_uses_most_recent_image(self) -> None:
         events = [
