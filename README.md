@@ -8,7 +8,7 @@ Current status: vertical MVP is implemented and being hardened against the bundl
 - fake, OpenAI Responses, and Codex Responses provider paths
 - harness-owned Codex auth with import, device-code login, refresh, and read-only Codex CLI fallback
 - browser backends for owned Chromium/Chrome, Browser Use cloud browsers, explicit CDP endpoints, and real Chrome profile attach
-- persistent Python browser tool with raw `cdp(...)`, console/network/download helpers, and browser trace export
+- persistent Python browser tool with raw `cdp(...)`, console/network/download helpers, network-idle waits, dialog tracking, and browser trace export
 - model-visible screenshot tool outputs with ordered image timelines
 - shell streaming, long-running shell processes, optional PTY processes, cancellation, and Codex-style file tools
 - event-driven Textual terminal UI with session detail, artifact table, artifact preview, trace, eval, resume, cancel, auth, and config commands
@@ -92,11 +92,15 @@ The main browser tool is still an editable Python runtime. Useful built-ins incl
 
 ```python
 cdp("Runtime.evaluate", {"expression": "document.title", "returnByValue": True})
+fill_input("#email", "me@example.com")
+wait_for_network_idle()
 screenshot("after_click", attach=True)
 recent_console()
 recent_network_failures()
 download_info()
 save_browser_trace("checkout")
+Path(agent_helpers_path()).write_text("from browser_helpers import *\n\ndef page_title():\n    return js('document.title')\n")
+reload_agent_helpers()
 ```
 
 Downloads land under each session's `browser/downloads/`, screenshots under `browser/screenshots/`, browser traces under `browser/traces/`, and oversized tool output under `tool-output/`.

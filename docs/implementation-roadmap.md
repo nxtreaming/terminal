@@ -18,8 +18,8 @@ Implemented:
 - fake, OpenAI Responses, and Codex Responses providers
 - harness-owned Codex auth store, Codex CLI import/fallback, device-code login, refresh, logout, and redacted status
 - owned Chromium/headless Chromium, Browser Use cloud, explicit CDP, and real Chrome attachment modes
-- raw CDP browser runtime with page target/session handling, screenshot artifacts, element crops, download directory configuration, console/network/download helpers, and browser trace JSON export
-- persistent Python browser tool with raw `cdp(...)`, editable helper module imports, ordered model-visible image timelines, artifact upload/download helpers, PDF/text/search helpers, and output spillover
+- raw CDP browser runtime with real-page target selection, page target/session handling, stale-session retry, screenshot artifacts, element crops, download directory configuration, dialog tracking, network-idle waits, console/network/download helpers, and browser trace JSON export
+- persistent Python browser tool with raw `cdp(...)`, first-class reloadable `agent_helpers.py`, editable helper module imports, ordered model-visible image timelines, artifact upload/download helpers, PDF/text/search helpers, and output spillover
 - shell tool with streaming, cancellation, long-running process polling/stdin/stop, and optional PTY mode
 - file tools with range reads, binary detection, exact edit diagnostics, BOM/newline preservation, diffs, glob, grep, write, and patch
 - background child sessions exposed as normal sessions via a model-visible session tool
