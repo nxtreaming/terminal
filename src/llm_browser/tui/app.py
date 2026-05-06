@@ -14,6 +14,7 @@ from typing import Callable, Optional
 from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
+from textual.binding import Binding
 from textual.containers import Container, Horizontal, Vertical
 from textual.screen import ModalScreen
 from textual.widgets import DataTable, Input, RichLog, Static
@@ -356,17 +357,37 @@ class BrowserUseTerminalApp(App[None]):
         scrollbar-color: #606060;
         scrollbar-background: #141414;
     }
+
+    DataTable > .datatable--cursor {
+        background: #282828;
+        color: #eeeeee;
+    }
+
+    DataTable:focus > .datatable--cursor {
+        background: #fab283;
+        color: #0a0a0a;
+        text-style: bold;
+    }
+
+    Input > .input--cursor {
+        background: #eeeeee;
+        color: #0a0a0a;
+    }
+
+    Input > .input--placeholder {
+        color: #808080;
+    }
     """
 
     BINDINGS = [
-        ("escape", "cancel_selected", "Interrupt"),
-        ("ctrl+c", "cancel_selected", "Interrupt"),
-        ("tab", "show_sessions", "Sessions"),
-        ("ctrl+p", "show_commands", "Commands"),
-        ("ctrl+r", "refresh", "Refresh"),
-        ("ctrl+l", "clear_log", "Clear"),
-        ("o", "open_artifact", "Open"),
-        ("q", "quit", "Quit"),
+        Binding("escape", "cancel_selected", "Interrupt", priority=True),
+        Binding("ctrl+c", "cancel_selected", "Interrupt", priority=True),
+        Binding("tab", "show_sessions", "Sessions", priority=True),
+        Binding("ctrl+p", "show_commands", "Commands", priority=True),
+        Binding("ctrl+r", "refresh", "Refresh"),
+        Binding("ctrl+l", "clear_log", "Clear"),
+        Binding("o", "open_artifact", "Open"),
+        Binding("q", "quit", "Quit"),
     ]
 
     def __init__(
@@ -681,6 +702,7 @@ class BrowserUseTerminalApp(App[None]):
             log.write(f"[#e06c75]session not found: {escape(session_id)}[/]")
             return
         self.selected_session_id = session.id
+        self.selected_artifact_path = None
         for line, event_type in _format_events_for_transcript(self.store.events.read(session.id)[-400:]):
             self._write_log_line(line, event_type)
         self._update_session_detail()
@@ -697,9 +719,13 @@ class BrowserUseTerminalApp(App[None]):
         table.clear()
         session_id = self.selected_session_id
         if not session_id:
+            self.selected_artifact_path = None
+            self._preview_artifact(None)
             return
         session = self.store.load(session_id)
         if session is None:
+            self.selected_artifact_path = None
+            self._preview_artifact(None)
             return
         first_path: Optional[str] = None
         if self.selected_artifact_path is not None and not Path(self.selected_artifact_path).exists():
@@ -1234,7 +1260,7 @@ def _progress_bar(done: int, total: int, width: int = 12) -> str:
     else:
         filled = min(width, max(0, round((done / total) * width)))
     empty = width - filled
-    return "[#8bd5ca]" + ("█" * filled) + "[/][#3b424a]" + ("░" * empty) + "[/]"
+    return "[#5c9cf5]" + ("█" * filled) + "[/][#323232]" + ("░" * empty) + "[/]"
 
 
 def _latest_image_line(events: list[Event]) -> str:
@@ -1260,25 +1286,25 @@ def _short_task_list(task_ids: list[str], limit: int = 12) -> str:
 
 def _status_markup(status: str) -> str:
     styles = {
-        "running": "bold #a6e3d7",
-        "done": "bold green",
-        "failed": "bold red",
-        "cancelled": "bold yellow",
-        "created": "#c7baaa",
+        "running": "bold #5c9cf5",
+        "done": "bold #7fd88f",
+        "failed": "bold #e06c75",
+        "cancelled": "bold #f5a742",
+        "created": "#808080",
     }
-    return f"[{styles.get(status, '#ded4c8')}]{escape(status)}[/]"
+    return f"[{styles.get(status, '#eeeeee')}]{escape(status)}[/]"
 
 
 def _status_text(status: str) -> Text:
     styles = {
-        "running": "bold #a6e3d7",
-        "done": "bold green",
-        "failed": "bold red",
-        "cancelled": "bold yellow",
-        "created": "#c7baaa",
+        "running": "bold #5c9cf5",
+        "done": "bold #7fd88f",
+        "failed": "bold #e06c75",
+        "cancelled": "bold #f5a742",
+        "created": "#808080",
     }
-    label = status.upper()[:9]
-    return Text(label, style=styles.get(status, "#ded4c8"))
+    label = status[:9]
+    return Text(label, style=styles.get(status, "#eeeeee"))
 
 
 def _current_tool(events: list[Event]) -> str:
