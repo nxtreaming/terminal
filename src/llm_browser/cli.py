@@ -305,7 +305,7 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
             return 1
 
     print(json.dumps(manifest, indent=2))
-    return 0 if all(item.get("ok") for item in manifest["sessions"]) else 1
+    return _dataset_manifest_exit_code(manifest)
 
 
 def cmd_datasets_report(args: argparse.Namespace) -> int:
@@ -363,6 +363,11 @@ def _write_dataset_manifest(store: SessionStore, run_id: str, manifest: dict) ->
 def _successful_task_ids(manifest: Dict[str, Any]) -> set[str]:
     summary = summarize_manifest(manifest)
     return set(summary["passed_task_ids"])
+
+
+def _dataset_manifest_exit_code(manifest: Dict[str, Any]) -> int:
+    summary = summarize_manifest(manifest)
+    return 0 if summary["failed"] == 0 and summary["pending"] == 0 else 1
 
 
 def _run_dataset_task(

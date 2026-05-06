@@ -4,6 +4,7 @@ import unittest
 from pathlib import Path
 
 from llm_browser.datasets import build_dataset_prompt, load_dataset, select_tasks, summarize_manifest
+from llm_browser.cli import _dataset_manifest_exit_code
 
 
 class DatasetTest(unittest.TestCase):
@@ -42,6 +43,17 @@ class DatasetTest(unittest.TestCase):
         self.assertEqual(summary["passed_task_ids"], ["1"])
         self.assertEqual(summary["pending_task_ids"], ["2"])
         self.assertEqual(summary["attempts_by_task"], {"1": 2})
+
+    def test_dataset_exit_code_uses_latest_attempt(self) -> None:
+        manifest = {
+            "selection": [{"task_id": "1"}],
+            "sessions": [
+                {"task_id": "1", "ok": False},
+                {"task_id": "1", "ok": True},
+            ],
+        }
+
+        self.assertEqual(_dataset_manifest_exit_code(manifest), 0)
 
 
 if __name__ == "__main__":
