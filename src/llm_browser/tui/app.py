@@ -345,8 +345,12 @@ class BrowserUseTerminalApp(App[None]):
         elif command == "artifacts":
             self.refresh_artifacts()
             log.write("[green]artifacts refreshed[/green]")
-        elif command == "report" and len(args) >= 2:
-            self._write_dataset_report(args[1])
+        elif command == "report":
+            run_id = args[1] if len(args) >= 2 else self._selected_dataset_run_id()
+            if not run_id:
+                log.write("[red]report requires a run id or a selected dataset session[/red]")
+                return
+            self._write_dataset_report(run_id)
         elif command == "show" and len(args) == 2:
             self.selected_session_id = args[1]
             self._load_session_log(args[1])
@@ -562,6 +566,7 @@ class BrowserUseTerminalApp(App[None]):
             f"[#9ccfd8]running[/] [bold]{counts.get('running', 0)}[/bold]  "
             f"[green]done[/green] [bold]{counts.get('done', 0)}[/bold]  "
             f"[red]failed[/red] [bold]{counts.get('failed', 0)}[/bold]  "
+            f"{self._selected_run_summary_text()} "
             f"[#b9b2a7]selected[/] {escape(self.selected_session_id or '-')}"
         )
         self.query_one("#statusbar", Static).update(text)
@@ -583,12 +588,17 @@ class BrowserUseTerminalApp(App[None]):
         task = self._task_for_session(session)
         current_tool = _current_tool(events)
         final_line = _final_line(events)
+        run_id = _dataset_run_id_from_path(session.cwd)
+        run_line = self._dataset_run_detail(run_id) if run_id else "-"
+        latest_image = _latest_image_line(events)
         detail.update(
             f"[bold]{escape(session.id)}[/bold]\n"
             f"status: {_status_markup(session.status)}\n"
             f"parent: {escape(session.parent_id or '-')}\n"
+            f"dataset: {escape(run_line)}\n"
             f"events: {len(events)}  tools: {tools}  images: {images}  artifacts: {artifacts}\n"
             f"tool: {escape(current_tool)}\n"
+            f"image: {escape(latest_image)}\n"
             f"updated: {_format_age(session.updated_ms / 1000)}\n"
             f"cwd: {escape(str(session.cwd))}\n"
             f"task: {escape(task[:180])}\n"
@@ -642,6 +652,38 @@ class BrowserUseTerminalApp(App[None]):
             if event.type == "session.input":
                 return _summarize_task_text(str(event.payload.get("text") or ""))
         return ""
+
+    def _selected_dataset_run_id(self) -> Optional[str]:
+        if not self.selected_session_id:
+            return None
+        session = self.store.load(self.selected_session_id)
+        if session is None:
+            return None
+        return _dataset_run_id_from_path(session.cwd)
+
+    def _selected_run_summary_text(self) -> str:
+        run_id = self._selected_dataset_run_id()
+        if not run_id:
+            return ""
+        try:
+            summary = summarize_manifest(load_manifest(self.store.state_dir, run_id))
+        except Exception:
+            return f"[#b9b2a7]run[/] {escape(run_id)}"
+        return (
+            f"[#b9b2a7]run[/] {escape(run_id)} "
+            f"[green]{summary['passed']}[/green]/[bold]{summary['selected']}[/bold] "
+            f"[yellow]{summary['pending']} pending[/yellow]"
+        )
+
+    def _dataset_run_detail(self, run_id: str) -> str:
+        try:
+            summary = summarize_manifest(load_manifest(self.store.state_dir, run_id))
+        except Exception:
+            return run_id
+        return (
+            f"{run_id} {summary['passed']}/{summary['selected']} passed, "
+            f"{summary['failed']} failed, {summary['pending']} pending"
+        )
 
 
 def _artifact_paths(session: SessionMetadata) -> list[Path]:
@@ -702,6 +744,26 @@ def _summarize_task_text(text: str) -> str:
         if stop in task:
             task = task.split(stop, 1)[0]
     return " ".join(task.split())
+
+
+def _dataset_run_id_from_path(path: Path) -> Optional[str]:
+    parts = path.parts
+    for index, part in enumerate(parts):
+        if part == "dataset-runs" and index + 1 < len(parts):
+            return parts[index + 1]
+    return None
+
+
+def _latest_image_line(events: list[Event]) -> str:
+    for event in reversed(events):
+        if event.type != "tool.image":
+            continue
+        image = event.payload.get("image") or {}
+        label = str(image.get("label") or "image")
+        path = Path(str(image.get("path") or ""))
+        name = path.name if str(path) else "-"
+        return f"{label} -> {name}"
+    return "-"
 
 
 def _short_task_list(task_ids: list[str], limit: int = 12) -> str:
