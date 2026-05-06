@@ -9,7 +9,7 @@ from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep
 from llm_browser.tool.python_browser import PythonBrowserTool
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolResult
-from llm_browser.tool.shell import shell, shell_poll, shell_start, shell_stdin, shell_stop
+from llm_browser.tool.shell import exec_command, shell, shell_poll, shell_start, shell_stdin, shell_stop, write_stdin
 from llm_browser.tool.spec import ToolSpec
 
 
@@ -70,6 +70,36 @@ def build_builtin_registry() -> ToolRegistry:
     )
     registry.register(
         ToolSpec(
+            name="exec_command",
+            description=(
+                "Codex-compatible alias for shell. Run cmd in the session workspace; use workdir instead of cd. "
+                "Set tty=true only for long-running interactive processes, which returns a process_id for write_stdin/shell_poll."
+            ),
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "cmd": {"type": "string"},
+                    "command": {"type": "string"},
+                    "workdir": {"type": "string"},
+                    "timeout_s": {"type": "number"},
+                    "max_output_tokens": {"type": "integer"},
+                    "max_output_chars": {"type": "integer"},
+                    "yield_time_ms": {"type": "integer"},
+                    "shell": {"type": "string"},
+                    "login": {"type": "boolean"},
+                    "tty": {"type": "boolean"},
+                    "sandbox_permissions": {"type": "string"},
+                    "justification": {"type": "string"},
+                    "prefix_rule": {"type": "array", "items": {"type": "string"}},
+                },
+                "required": ["cmd"],
+                "additionalProperties": False,
+            },
+        ),
+        exec_command,
+    )
+    registry.register(
+        ToolSpec(
             name="shell_start",
             description="Start a long-running shell process and return a process id for polling/stdin/stop. Pass workdir instead of cd; pass pty=true for interactive terminal programs.",
             input_schema={
@@ -119,6 +149,26 @@ def build_builtin_registry() -> ToolRegistry:
             },
         ),
         shell_stdin,
+    )
+    registry.register(
+        ToolSpec(
+            name="write_stdin",
+            description="Codex-compatible alias for shell_stdin. Writes chars/text to a process_id/session_id and returns recent output when available.",
+            input_schema={
+                "type": "object",
+                "properties": {
+                    "session_id": {"type": "string"},
+                    "process_id": {"type": "string"},
+                    "chars": {"type": "string"},
+                    "text": {"type": "string"},
+                    "yield_time_ms": {"type": "integer"},
+                    "max_output_tokens": {"type": "integer"},
+                    "max_output_chars": {"type": "integer"},
+                },
+                "additionalProperties": False,
+            },
+        ),
+        write_stdin,
     )
     registry.register(
         ToolSpec(

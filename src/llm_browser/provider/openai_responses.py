@@ -26,6 +26,7 @@ class OpenAIResponsesProvider:
         base_url: Optional[str] = None,
         timeout_s: float = 120.0,
         max_retries: int = 2,
+        instructions: Optional[str] = None,
     ) -> None:
         self.api_key = api_key or os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.model = model or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.5"
@@ -36,6 +37,10 @@ class OpenAIResponsesProvider:
         self.max_retries = max(0, int(max_retries))
         self.previous_response_id: Optional[str] = None
         self._sent_tool_call_ids: Set[str] = set()
+        self.instructions = instructions or BROWSER_AGENT_INSTRUCTIONS
+
+    def set_instructions(self, instructions: str) -> None:
+        self.instructions = instructions
 
     def start_turn(
         self,
@@ -133,7 +138,7 @@ class OpenAIResponsesProvider:
             "model": self.model,
             "input": input_items,
             "store": True,
-            "instructions": BROWSER_AGENT_INSTRUCTIONS,
+            "instructions": self.instructions,
         }
         if tools:
             payload["tools"] = tools

@@ -140,6 +140,19 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     )
 
 
+def exec_command(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    """Codex-compatible alias for the synchronous shell command tool."""
+
+    command = str(arguments.get("cmd") or arguments.get("command") or "")
+    if not command:
+        raise ValueError("exec_command requires cmd")
+    mapped = dict(arguments)
+    mapped["command"] = command
+    if bool(arguments.get("tty", False)):
+        return shell_start(ctx, mapped)
+    return shell(ctx, mapped)
+
+
 def shell_start(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     command = str(arguments["command"])
     timeout_s = float(arguments.get("timeout_s", 0))
@@ -221,6 +234,33 @@ def shell_stdin(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
         managed.process.stdin.write(text)
         managed.process.stdin.flush()
     return ToolResult(text=f"wrote {len(text)} chars to {process_id}", data=managed.status())
+
+
+def write_stdin(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    """Codex-compatible alias for writing to a managed process."""
+
+    process_id = str(arguments.get("session_id") or arguments.get("process_id") or "")
+    if not process_id:
+        raise ValueError("write_stdin requires session_id or process_id")
+    text = str(arguments.get("chars") if "chars" in arguments else arguments.get("text", ""))
+    write_result = shell_stdin(ctx, {"process_id": process_id, "text": text})
+    wait_ms = arguments.get("yield_time_ms")
+    if wait_ms is not None:
+        try:
+            time.sleep(min(max(int(wait_ms), 0), 10000) / 1000)
+        except (TypeError, ValueError):
+            pass
+    poll_args: Dict[str, Any] = {"process_id": process_id}
+    for key in ("max_output_tokens", "max_output_chars"):
+        if key in arguments:
+            poll_args[key] = arguments[key]
+    poll_result = shell_poll(ctx, poll_args)
+    if poll_result.text:
+        return ToolResult(
+            text=poll_result.text,
+            data={**poll_result.data, "stdin_chars": len(text), "write": write_result.data},
+        )
+    return write_result
 
 
 def shell_stop(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
@@ -473,3 +513,4 @@ shell_start.close_session = close_shell_session  # type: ignore[attr-defined]
 shell_poll.close_session = close_shell_session  # type: ignore[attr-defined]
 shell_stdin.close_session = close_shell_session  # type: ignore[attr-defined]
 shell_stop.close_session = close_shell_session  # type: ignore[attr-defined]
+write_stdin.close_session = close_shell_session  # type: ignore[attr-defined]

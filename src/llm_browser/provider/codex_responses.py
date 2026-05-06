@@ -30,12 +30,17 @@ class CodexResponsesProvider:
         base_url: Optional[str] = None,
         timeout_s: float = 120.0,
         max_retries: int = 2,
+        instructions: Optional[str] = None,
     ) -> None:
         self.auth = auth or load_codex_auth()
         self.model = model or os.environ.get("LLM_BROWSER_CODEX_MODEL") or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.5"
         self.base_url = base_url or os.environ.get("LLM_BROWSER_CODEX_BASE_URL") or DEFAULT_CODEX_BASE_URL
         self.timeout_s = timeout_s
         self.max_retries = max(0, int(max_retries))
+        self.instructions = instructions or BROWSER_AGENT_INSTRUCTIONS
+
+    def set_instructions(self, instructions: str) -> None:
+        self.instructions = instructions
 
     def start_turn(
         self,
@@ -101,7 +106,7 @@ class CodexResponsesProvider:
             "input": input_items,
             "store": False,
             "stream": True,
-            "instructions": _default_instructions(),
+            "instructions": self.instructions,
             "text": {"verbosity": "low"},
             "tool_choice": "auto",
             "parallel_tool_calls": True,
@@ -222,10 +227,6 @@ def _codex_url(base_url: str) -> str:
     if normalized.endswith("/codex"):
         return f"{normalized}/responses"
     return f"{normalized}/codex/responses"
-
-
-def _default_instructions() -> str:
-    return BROWSER_AGENT_INSTRUCTIONS
 
 
 def _iter_sse_json(response: requests.Response):

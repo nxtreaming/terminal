@@ -79,6 +79,16 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertTrue(post.call_args.kwargs["stream"])
         self.assertTrue(response.closed)
 
+    def test_uses_custom_instructions_when_set(self) -> None:
+        provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test", instructions="custom codex instructions")
+        response = FakeResponse(200, [{"type": "response.completed", "response": {"id": "resp_2", "output": []}}])
+
+        with patch("llm_browser.provider.codex_responses.requests.post", return_value=response) as post:
+            list(provider.start_turn([{"role": "user", "content": "inspect repo"}], []))
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["instructions"], "custom codex instructions")
+
     def test_sends_full_function_call_history_for_tool_output(self) -> None:
         provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
         response = FakeResponse(200, [{"type": "response.completed", "response": {"id": "resp_2", "output": []}}])

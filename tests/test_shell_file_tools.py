@@ -8,7 +8,7 @@ from pathlib import Path
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep_files, read_file, write_file
-from llm_browser.tool.shell import shell, shell_poll, shell_start, shell_stdin, shell_stop
+from llm_browser.tool.shell import exec_command, shell, shell_poll, shell_start, shell_stdin, shell_stop, write_stdin
 
 
 class ShellFileToolsTest(unittest.TestCase):
@@ -130,6 +130,16 @@ class ShellFileToolsTest(unittest.TestCase):
             self.assertIn("hello", result.text)
             self.assertIn(str(ctx.session.cwd / "notes"), workdir_result.text)
 
+    def test_exec_command_alias_accepts_codex_shape(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            (ctx.session.cwd / "notes").mkdir()
+
+            result = exec_command(ctx, {"cmd": "pwd", "workdir": "notes", "timeout_s": 5})
+
+            self.assertEqual(result.data["returncode"], 0)
+            self.assertIn(str(ctx.session.cwd / "notes"), result.text)
+
     def test_shell_streams_output_events(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self.make_context(tmp)
@@ -179,6 +189,28 @@ class ShellFileToolsTest(unittest.TestCase):
 
             self.assertIn("ready", first.text)
             self.assertIn("echo:hello", second.text)
+            self.assertTrue(stopped.data["stopped"])
+
+    def test_write_stdin_alias_accepts_session_id_and_returns_recent_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            command = (
+                "python -u -c "
+                "\"import sys; print('ready', flush=True); "
+                "[print('echo:' + line.strip(), flush=True) for line in sys.stdin]\""
+            )
+
+            started = shell_start(ctx, {"command": command, "timeout_s": 10})
+            process_id = started.data["process_id"]
+            time.sleep(0.2)
+            shell_poll(ctx, {"process_id": process_id})
+            written = write_stdin(
+                ctx,
+                {"session_id": process_id, "chars": "hello\n", "yield_time_ms": 200, "max_output_tokens": 1000},
+            )
+            stopped = shell_stop(ctx, {"process_id": process_id})
+
+            self.assertIn("echo:hello", written.text)
             self.assertTrue(stopped.data["stopped"])
 
     def test_managed_shell_process_can_use_pty(self) -> None:

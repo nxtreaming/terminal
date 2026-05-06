@@ -8,13 +8,14 @@ from pathlib import Path
 
 from llm_browser.agent import Agent
 from llm_browser.agent.compaction import compact_messages
-from llm_browser.agent.service import MaxTurnsExceeded
+from llm_browser.agent.service import MaxTurnsExceeded, _is_parallel_safe_shell_call
 from llm_browser.provider.fake import FakeProvider
 from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolImage, ToolResult
+from llm_browser.tool.session import SessionTool
 from llm_browser.tool.spec import ToolSpec
 
 
@@ -72,6 +73,17 @@ class SpawnChildProvider:
             yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": str(tool_message["content"])}))
 
 
+class InstructionCaptureProvider:
+    def __init__(self):
+        self.instructions = ""
+
+    def set_instructions(self, instructions: str) -> None:
+        self.instructions = instructions
+
+    def start_turn(self, messages, tools):
+        yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": "ok"}))
+
+
 class AgentLoopTest(unittest.TestCase):
     def test_fake_provider_executes_tools_and_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -100,6 +112,26 @@ class AgentLoopTest(unittest.TestCase):
                 if event.type == "tool.started"
             ]
             self.assertEqual(tool_names, ["echo", "done"])
+
+    def test_auto_instruction_mode_switches_to_codex_for_repo_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            provider = InstructionCaptureProvider()
+
+            Agent(store, provider=provider).run("what is in this repo", cwd=Path(tmp))
+
+            self.assertIn("You are Codex", provider.instructions)
+            self.assertIn("rg --files", provider.instructions)
+
+    def test_auto_instruction_mode_keeps_browser_instructions_for_browser_tasks(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            provider = InstructionCaptureProvider()
+
+            Agent(store, provider=provider).run("Open example.com", cwd=Path(tmp))
+
+            self.assertIn("browser-native agent", provider.instructions)
+            self.assertIn("click_at_xy", provider.instructions)
 
     def test_max_turns_exhaustion_fails_session(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -366,6 +398,27 @@ class AgentLoopTest(unittest.TestCase):
             child_events = [event.type for event in store.events.read(child.id)]
             self.assertIn("session.parent", child_events)
 
+    def test_codex_subagent_wrappers_use_child_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            parent = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=parent, store=store, tool_call_id="call_spawn", tool_name="spawn_agent")
+            tool = SessionTool(store, provider_factory=lambda: None, max_turns=4, mode="codex")
+
+            spawned = tool.spawn_agent(ctx, {"agent_type": "explorer", "message": "Inspect the repo shape."})
+            agent_id = spawned.data["agent_id"]
+            waited = tool.wait_agent(ctx, {"targets": [agent_id], "timeout_ms": 5000})
+            closed = tool.close_agent(ctx, {"target": agent_id})
+
+            child = store.load(agent_id)
+            self.assertIsNotNone(child)
+            assert child is not None
+            self.assertEqual(child.parent_id, parent.id)
+            self.assertEqual(waited.data["statuses"][agent_id]["status"], "done")
+            self.assertEqual(closed.data["previous_status"]["status"], "done")
+            parent_events = [event.type for event in store.events.read(parent.id)]
+            self.assertIn("session.child_started", parent_events)
+
     def test_provider_object_is_not_reused_for_child_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
@@ -429,6 +482,78 @@ class AgentLoopTest(unittest.TestCase):
             self.assertLess(starts["a.txt"], ends["b.txt"])
             done = [event for event in store.events.read(session.id) if event.type == "session.done"][-1]
             self.assertEqual(done.payload["result"], "a.txt|b.txt")
+
+    def test_codex_exec_command_read_only_calls_run_in_parallel(self) -> None:
+        class ParallelExecProvider:
+            def __init__(self):
+                self.turn = 0
+
+            def start_turn(self, messages, tools):
+                self.turn += 1
+                if self.turn == 1:
+                    yield ModelEvent.call(ToolCall(id="call_pwd", name="exec_command", arguments={"cmd": "pwd"}))
+                    yield ModelEvent.call(ToolCall(id="call_ls", name="exec_command", arguments={"cmd": "ls"}))
+                else:
+                    outputs = [message["content"] for message in messages if message.get("role") == "tool"]
+                    yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": "|".join(outputs)}))
+
+        starts = {}
+        ends = {}
+
+        def slow_exec(ctx: ToolContext, arguments):
+            cmd = str(arguments["cmd"])
+            starts[cmd] = time.monotonic()
+            time.sleep(0.2)
+            ends[cmd] = time.monotonic()
+            return ToolResult(text=cmd)
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolSpec(
+                name="exec_command",
+                description="slow exec",
+                input_schema={"type": "object", "properties": {"cmd": {"type": "string"}}, "required": ["cmd"]},
+            ),
+            slow_exec,
+        )
+        registry.register(
+            ToolSpec(
+                name="done",
+                description="finish",
+                input_schema={"type": "object", "properties": {"result": {"type": "string"}}, "required": ["result"]},
+            ),
+            lambda ctx, arguments: ToolResult(text=str(arguments.get("result", ""))),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = Agent(store, provider=ParallelExecProvider(), tools=registry).run("parallel", cwd=Path(tmp))
+
+            self.assertEqual(session.status, "done")
+            self.assertLess(starts["ls"], ends["pwd"])
+            self.assertLess(starts["pwd"], ends["ls"])
+            done = [event for event in store.events.read(session.id) if event.type == "session.done"][-1]
+            self.assertEqual(done.payload["result"], "pwd|ls")
+
+    def test_shell_parallel_heuristic_is_conservative(self) -> None:
+        self.assertTrue(
+            _is_parallel_safe_shell_call(ToolCall(id="call_rg", name="exec_command", arguments={"cmd": "rg --files"}))
+        )
+        self.assertTrue(
+            _is_parallel_safe_shell_call(ToolCall(id="call_git", name="exec_command", arguments={"cmd": "git status --short"}))
+        )
+        self.assertTrue(
+            _is_parallel_safe_shell_call(ToolCall(id="call_pipe", name="exec_command", arguments={"cmd": "rg needle | head"}))
+        )
+        self.assertFalse(
+            _is_parallel_safe_shell_call(ToolCall(id="call_redirect", name="exec_command", arguments={"cmd": "printf x > out.txt"}))
+        )
+        self.assertFalse(
+            _is_parallel_safe_shell_call(ToolCall(id="call_mutating_git", name="exec_command", arguments={"cmd": "git checkout main"}))
+        )
+        self.assertFalse(
+            _is_parallel_safe_shell_call(ToolCall(id="call_chain", name="exec_command", arguments={"cmd": "pwd && ls"}))
+        )
 
     def test_parallel_read_batch_observes_cancellation_without_waiting_for_all_reads(self) -> None:
         class ParallelReadProvider:

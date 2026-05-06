@@ -38,6 +38,7 @@ from llm_browser.session.store import SessionStore
 DATASET_TIMEOUT_DRAIN_S = 10.0
 MAX_INLINE_DATASET_RESULT = 20_000
 BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud", "remote", "daemon"]
+AGENT_MODE_CHOICES = ["auto", "browser", "codex"]
 
 
 def add_browser_runtime_args(
@@ -141,6 +142,11 @@ def _max_turns_default(config: Optional[Dict[str, Any]], default: int) -> int:
         return default
 
 
+def _agent_mode_default(config: Optional[Dict[str, Any]], default: str = "auto") -> str:
+    value = config_get(config or {}, "agent.mode", default)
+    return str(value) if value in AGENT_MODE_CHOICES else default
+
+
 def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=CLI_NAME)
     parser.add_argument("--config", default=None, help="JSON config file. Defaults to ~/.browser-use-terminal/config.json and ./.browser-use-terminal/config.json.")
@@ -177,6 +183,7 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     )
     run.add_argument("--model", default=_model_default(config, None), help="Model name for provider=openai/codex.")
     run.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80), help="Maximum model/tool turns before failing.")
+    run.add_argument("--agent-mode", choices=AGENT_MODE_CHOICES, default=_agent_mode_default(config), help="Instruction mode: auto, browser, or codex.")
     add_browser_runtime_args(run, headless_default=None, config=config)
     run.set_defaults(func=cmd_run)
 
@@ -202,6 +209,7 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     sessions_resume.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
     sessions_resume.add_argument("--model", default=_model_default(config, "gpt-5.5"))
     sessions_resume.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80))
+    sessions_resume.add_argument("--agent-mode", choices=AGENT_MODE_CHOICES, default=_agent_mode_default(config))
     sessions_resume.set_defaults(func=cmd_sessions_resume)
 
     sessions_trace = sessions_sub.add_parser("trace", help="Write a JSON trace bundle for a session.")
@@ -213,6 +221,7 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     sessions_eval.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
     sessions_eval.add_argument("--model", default=_model_default(config, "gpt-5.5"))
     sessions_eval.add_argument("--max-turns", type=int, default=_max_turns_default(config, 20))
+    sessions_eval.add_argument("--agent-mode", choices=AGENT_MODE_CHOICES, default=_agent_mode_default(config))
     sessions_eval.set_defaults(func=cmd_sessions_self_eval)
 
     browser = sub.add_parser("browser", help="Browser runtime commands.")
@@ -361,7 +370,12 @@ def cmd_provider_image_smoke(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     apply_browser_runtime_args(args)
     store = store_from_args(args)
-    agent = Agent(store, provider_factory=lambda: make_provider(args.provider, args.model), max_turns=args.max_turns)
+    agent = Agent(
+        store,
+        provider_factory=lambda: make_provider(args.provider, args.model),
+        max_turns=args.max_turns,
+        mode=args.agent_mode,
+    )
     session = agent.run(args.task, parent_id=args.parent_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
@@ -399,7 +413,12 @@ def cmd_sessions_cancel(args: argparse.Namespace) -> int:
 
 def cmd_sessions_resume(args: argparse.Namespace) -> int:
     store = store_from_args(args)
-    agent = Agent(store, provider_factory=lambda: make_provider(args.provider, args.model), max_turns=args.max_turns)
+    agent = Agent(
+        store,
+        provider_factory=lambda: make_provider(args.provider, args.model),
+        max_turns=args.max_turns,
+        mode=args.agent_mode,
+    )
     session = agent.resume_session(args.session_id, args.instruction)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
@@ -415,7 +434,12 @@ def cmd_sessions_trace(args: argparse.Namespace) -> int:
 def cmd_sessions_self_eval(args: argparse.Namespace) -> int:
     store = store_from_args(args)
     prompt = build_self_eval_prompt(store, args.session_id)
-    agent = Agent(store, provider_factory=lambda: make_provider(args.provider, args.model), max_turns=args.max_turns)
+    agent = Agent(
+        store,
+        provider_factory=lambda: make_provider(args.provider, args.model),
+        max_turns=args.max_turns,
+        mode=args.agent_mode,
+    )
     session = agent.run(prompt, parent_id=args.session_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0

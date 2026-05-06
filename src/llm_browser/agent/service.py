@@ -9,6 +9,7 @@ from typing import Any, Callable, Dict, List, Optional
 from llm_browser.agent.compaction import compact_messages, message_chars
 from llm_browser.provider.base import Provider
 from llm_browser.provider.fake import FakeProvider
+from llm_browser.browser.instructions import select_agent_instructions
 from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.cancel import SessionCancelled
 from llm_browser.session.metadata import SessionMetadata
@@ -17,12 +18,21 @@ from llm_browser.tool.builtins import build_builtin_registry
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolImage, ToolResult
-from llm_browser.tool.session import SessionTool, session_tool_spec
+from llm_browser.tool.session import (
+    SessionTool,
+    close_agent_tool_spec,
+    session_tool_spec,
+    spawn_agent_tool_spec,
+    wait_agent_tool_spec,
+)
 
 MAX_INLINE_TOOL_TEXT = 20000
 DEFAULT_COMPACT_AFTER_CHARS = 120000
 PARALLEL_SAFE_TOOL_NAMES = {"echo", "read", "grep", "glob"}
 PARALLEL_SAFE_SESSION_ACTIONS = {"read", "status", "list"}
+PARALLEL_SAFE_COMMANDS = {"pwd", "rg", "sed", "ls", "git", "head", "tail", "wc", "nl"}
+PARALLEL_SAFE_GIT_SUBCOMMANDS = {"status", "show", "diff", "log", "rev-parse", "ls-files", "branch"}
+UNSAFE_SHELL_TOKENS = (";", "&&", "||", ">", "<", "`", "$(", "\n")
 
 
 class MaxTurnsExceeded(RuntimeError):
@@ -40,6 +50,7 @@ class Agent:
         recover_tool_errors: bool = True,
         compact_after_chars: int = DEFAULT_COMPACT_AFTER_CHARS,
         time_budget_s: Optional[float] = None,
+        mode: str = "auto",
     ) -> None:
         self.store = store
         self.provider_factory = provider_factory or (lambda: None)
@@ -49,13 +60,23 @@ class Agent:
         self.recover_tool_errors = recover_tool_errors
         self.compact_after_chars = compact_after_chars
         self.time_budget_s = time_budget_s
+        self.mode = mode
         self.deadline_at = time.monotonic() + time_budget_s if time_budget_s and time_budget_s > 0 else None
         self._deadline_warning_sent = False
         if tools is None:
+            session_tool = SessionTool(
+                self.store,
+                provider_factory=self._child_provider_factory,
+                max_turns=self.max_turns,
+                mode=self.mode,
+            )
             self.tools.register(
                 session_tool_spec(),
-                SessionTool(self.store, provider_factory=self._child_provider_factory, max_turns=self.max_turns),
+                session_tool,
             )
+            self.tools.register(spawn_agent_tool_spec(), session_tool.spawn_agent)
+            self.tools.register(wait_agent_tool_spec(), session_tool.wait_agent)
+            self.tools.register(close_agent_tool_spec(), session_tool.close_agent)
 
     def run(
         self,
@@ -75,6 +96,7 @@ class Agent:
         self.store.emit(session.id, "session.input", {"text": task})
         self.store.update_status(session.id, "running")
 
+        self._set_provider_instructions(select_agent_instructions(task, self.mode))
         messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
         return self._run_with_messages(session, messages)
 
@@ -88,6 +110,7 @@ class Agent:
         messages.append({"role": "user", "content": instruction})
         self.store.emit(session.id, "session.input", {"text": instruction, "resumed": True})
         self.store.update_status(session.id, "running")
+        self._set_provider_instructions(select_agent_instructions(instruction, self.mode))
         return self._run_with_messages(session, messages)
 
     def _run_with_messages(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> SessionMetadata:
@@ -397,10 +420,20 @@ class Agent:
     def _can_run_parallel(self, call: ToolCall) -> bool:
         if call.name in PARALLEL_SAFE_TOOL_NAMES:
             return True
+        if call.name in {"shell", "exec_command"}:
+            return _is_parallel_safe_shell_call(call)
         if call.name == "session":
             action = str(call.arguments.get("action") or "")
             return action in PARALLEL_SAFE_SESSION_ACTIONS
         return False
+
+    def _set_provider_instructions(self, instructions: str) -> None:
+        setter = getattr(self.provider, "set_instructions", None)
+        if callable(setter):
+            setter(instructions)
+            return
+        if hasattr(self.provider, "instructions"):
+            setattr(self.provider, "instructions", instructions)
 
     def _child_provider_factory(self) -> Optional[Provider]:
         provider = self.provider_factory()
@@ -430,3 +463,34 @@ class Agent:
         request = self.store.cancel_request(session_id)
         if request is not None:
             raise SessionCancelled(session_id, request["reason"])
+
+
+def _is_parallel_safe_shell_call(call: ToolCall) -> bool:
+    command = str(call.arguments.get("cmd") or call.arguments.get("command") or "").strip()
+    if not command:
+        return False
+    if any(token in command for token in UNSAFE_SHELL_TOKENS):
+        return False
+    segments = [segment.strip() for segment in command.split("|")]
+    if not segments:
+        return False
+    return all(_is_parallel_safe_command_segment(segment) for segment in segments)
+
+
+def _is_parallel_safe_command_segment(segment: str) -> bool:
+    import shlex
+
+    try:
+        parts = shlex.split(segment)
+    except ValueError:
+        return False
+    if not parts:
+        return False
+    name = Path(parts[0]).name
+    if name not in PARALLEL_SAFE_COMMANDS:
+        return False
+    if name != "git":
+        return True
+    if len(parts) < 2:
+        return False
+    return parts[1] in PARALLEL_SAFE_GIT_SUBCOMMANDS

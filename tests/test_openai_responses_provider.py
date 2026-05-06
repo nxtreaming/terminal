@@ -64,6 +64,16 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertIn("screenshot", payload["instructions"])
         self.assertIn("raw CDP", payload["instructions"])
 
+    def test_uses_custom_instructions_when_set(self) -> None:
+        provider = OpenAIResponsesProvider(api_key="test-key", model="test-model", instructions="custom instructions")
+        response = FakeResponse(200, {"id": "resp_1", "output": []})
+
+        with patch("llm_browser.provider.openai_responses.requests.post", return_value=response) as post:
+            list(provider.start_turn([{"role": "user", "content": "inspect repo"}], []))
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["instructions"], "custom instructions")
+
     def test_sends_function_call_output_with_previous_response_id(self) -> None:
         provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")
         provider.previous_response_id = "resp_1"
