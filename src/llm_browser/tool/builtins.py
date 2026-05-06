@@ -34,7 +34,7 @@ def build_builtin_registry() -> ToolRegistry:
                 "upload_artifact(path), create_download_url(path), download_file(url, path=None), "
                 "output_path(path=''), read_pdf_text(path_or_url, max_pages=None), "
                 "fetch_text(url, use_jina='auto'), and search_web(query). "
-                "requests, a browser-header http session, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
+                "requests, a browser-header http session, curl_requests from curl_cffi, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
                 "requests gets browser-like User-Agent and Accept-Language defaults unless overridden. "
                 "PyPDF2 imports are shimmed to pypdf when available. "
                 "Use output_path('/home/user/outputs/file.csv') for benchmark output files; it maps that expected path into the workspace outputs directory when needed. "

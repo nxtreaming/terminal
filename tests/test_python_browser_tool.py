@@ -504,7 +504,10 @@ class PythonBrowserToolTest(unittest.TestCase):
             ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
             tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
 
-            with patch("requests.get", side_effect=fake_get):
+            with patch("requests.get", side_effect=fake_get), patch(
+                "llm_browser.tool.python_browser._fetch_text_with_curl_cffi",
+                return_value=None,
+            ):
                 result = tool(ctx, {"headless": True, "code": "result = fetch_text('https://blocked.example/page', max_chars=12)"})
 
             self.assertTrue(result.data["ok"])
@@ -512,6 +515,41 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertIn("blocked", result.data["result"]["direct_error"])
             self.assertEqual(result.data["result"]["text"], "Title: reada")
             self.assertTrue(calls[1][0].startswith("https://r.jina.ai/http://https://blocked.example/page"))
+
+    def test_fetch_text_tries_curl_cffi_before_jina_reader(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 403) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", return_value=Response("Access Denied", "https://blocked.example/page")), patch(
+                "llm_browser.tool.python_browser._fetch_text_with_curl_cffi",
+                return_value={
+                    "ok": True,
+                    "url": "https://blocked.example/page",
+                    "final_url": "https://blocked.example/page",
+                    "status": 200,
+                    "source": "curl_cffi",
+                    "text": "curl worked",
+                    "chars": 11,
+                    "truncated": False,
+                    "impersonate": "chrome136",
+                },
+            ):
+                result = tool(ctx, {"headless": True, "code": "result = fetch_text('https://blocked.example/page')"})
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["source"], "curl_cffi")
+            self.assertEqual(result.data["result"]["text"], "curl worked")
+            self.assertEqual(result.data["result"]["direct_error"], "HTTP 403")
 
     def test_browser_helpers_module_exports_session_helpers(self) -> None:
         class Response:
