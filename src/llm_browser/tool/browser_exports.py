@@ -9,7 +9,7 @@ BROWSER_TOOL_DESCRIPTION = (
     "Run persistent Python for browser work. Core primitives: raw cdp(method, params), "
     "js(expr), navigate/new_tab/tabs/switch_tab, click_at/fill_input/press/scroll, "
     "screenshot(..., attach=True), attach_image(path), wait_for_load/wait_for_network_idle, page_info, "
-    "download_info, recent_console, recent_network_failures, save_browser_trace, "
+    "download_info/wait_for_download, cookies/storage/permissions, recent_console, recent_network_failures, save_browser_trace, "
     "agent_helpers_path/reload_agent_helpers, shell/file tools separately, and done. "
     "Use help_browser() inside Python for the full helper list and examples. "
     "Set result or _result for structured output."
@@ -30,6 +30,9 @@ Waiting and observation:
   wait_for_network_idle(timeout_s=10, idle_ms=500)
   page_info(), pending_dialog(), visible_text(), deep_text(), links()
   drain_cdp_events(), recent_console(), recent_network(), recent_network_failures()
+  get_cookies(), set_cookie(...), clear_cookies()
+  storage_state(), clear_storage(origin=None)
+  grant_permissions([...], origin=None), reset_permissions()
 
 Input:
   click_at(x, y), fill_input(selector, text), type_text(text)
@@ -37,7 +40,7 @@ Input:
 
 Images and artifacts:
   screenshot(label, attach=True), screenshot_element(selector, label=None), attach_image(path)
-  download_info(), save_browser_trace(label)
+  download_info(), wait_for_download(pattern=None), save_browser_trace(label)
   save_artifact(name, content=None), upload_artifact(path), create_download_url(path)
   output_path(path=''), download_file(url, path=None), read_pdf_text(path_or_url)
 
@@ -69,6 +72,7 @@ EXPORT_NAMES = [
     "cdp",
     "check_cancel",
     "cancel_requested",
+    "sleep",
     "new_tab",
     "navigate",
     "tabs",
@@ -93,6 +97,14 @@ EXPORT_NAMES = [
     "recent_network",
     "recent_network_failures",
     "download_info",
+    "wait_for_download",
+    "get_cookies",
+    "set_cookie",
+    "clear_cookies",
+    "storage_state",
+    "clear_storage",
+    "grant_permissions",
+    "reset_permissions",
     "save_browser_trace",
     "visible_text",
     "links",

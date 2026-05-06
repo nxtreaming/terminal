@@ -207,10 +207,14 @@ def request(name: str, payload: Dict[str, Any], timeout_s: float = 30.0) -> Dict
 
 
 def ensure_daemon(name: str, root_dir: Path, headless: bool, backend: str, wait_s: float = 20.0) -> None:
-    if ipc.ping(name):
-        return
+    existing = _daemon_status_payload(name)
+    if existing is not None:
+        if _daemon_matches(existing, root_dir=root_dir, headless=headless, backend=backend):
+            return
+        stop_daemon(name, timeout_s=5)
     ipc.cleanup_stale(name)
-    if ipc.ping(name):
+    existing = _daemon_status_payload(name)
+    if existing is not None and _daemon_matches(existing, root_dir=root_dir, headless=headless, backend=backend):
         return
     root_dir.mkdir(parents=True, exist_ok=True)
     env = os.environ.copy()
@@ -224,6 +228,8 @@ def ensure_daemon(name: str, root_dir: Path, headless: bool, backend: str, wait_
         name,
         "--root-dir",
         str(root_dir),
+        "--backend",
+        backend,
     ]
     if headless:
         command.append("--headless")
@@ -232,11 +238,35 @@ def ensure_daemon(name: str, root_dir: Path, headless: bool, backend: str, wait_
     ipc.pid_path(name).write_text(str(process.pid), encoding="utf-8")
     deadline = time.time() + wait_s
     while time.time() < deadline:
-        pid = ipc.identify(name, timeout_s=0.5)
-        if pid == process.pid or (pid is not None and ipc.pid_alive(pid)):
+        status = _daemon_status_payload(name, timeout_s=0.5)
+        pid = status.get("pid") if status else None
+        if status is not None and _daemon_matches(status, root_dir=root_dir, headless=headless, backend=backend) and (
+            pid == process.pid or (type(pid) is int and ipc.pid_alive(pid))
+        ):
             return
         time.sleep(0.2)
     raise RuntimeError(f"browser daemon {name!r} did not start; see {ipc.log_path(name)}")
+
+
+def _daemon_status_payload(name: str, timeout_s: float = 1.0) -> Optional[Dict[str, Any]]:
+    try:
+        status = ipc.request(name, {"meta": "status"}, timeout_s=timeout_s)
+    except Exception:
+        return None
+    return status if isinstance(status, dict) and status.get("ok") else None
+
+
+def _daemon_matches(status: Dict[str, Any], *, root_dir: Path, headless: bool, backend: str) -> bool:
+    try:
+        status_root = Path(str(status.get("root_dir") or "")).expanduser().resolve()
+        expected_root = root_dir.expanduser().resolve()
+    except Exception:
+        return False
+    return (
+        status_root == expected_root
+        and bool(status.get("headless")) == bool(headless)
+        and str(status.get("backend") or "") == str(backend or "")
+    )
 
 
 def stop_daemon(name: str, timeout_s: float = 10.0) -> bool:

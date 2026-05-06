@@ -56,19 +56,19 @@ CALLABLES = {
 
 
 class BrowserDaemon:
-    def __init__(self, name: str, root_dir: Path, headless: bool) -> None:
+    def __init__(self, name: str, root_dir: Path, headless: bool, backend: str = "chromium") -> None:
         self.name = ipc.normalize_name(name)
         self.root_dir = root_dir
         self.headless = headless
+        self.backend = backend
         self.runtime: Optional[BrowserRuntime] = None
         self.stop = threading.Event()
         self.lock = threading.RLock()
 
     def start_runtime(self) -> None:
         options = BrowserRuntimeOptions.from_env()
-        backend = os.environ.get("LLM_BROWSER_DAEMON_BACKEND")
-        if backend:
-            options = BrowserRuntimeOptions(**{**options.__dict__, "mode": backend})
+        if self.backend:
+            options = BrowserRuntimeOptions(**{**options.__dict__, "mode": self.backend})
         elif options.normalized_mode() == "daemon":
             options = BrowserRuntimeOptions(**{**options.__dict__, "mode": "chromium"})
         self.runtime = BrowserRuntime.start(root_dir=self.root_dir / "runtime", headless=self.headless, options=options)
@@ -89,6 +89,8 @@ class BrowserDaemon:
                 "name": self.name,
                 "endpoint": ipc.endpoint(self.name),
                 "root_dir": str(self.root_dir),
+                "backend": self.backend,
+                "headless": self.headless,
                 "runtime": self.runtime.connection_info() if self.runtime else None,
             }
         if meta == "shutdown":
@@ -195,9 +197,10 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     parser.add_argument("--name", required=True)
     parser.add_argument("--root-dir", required=True)
     parser.add_argument("--headless", action="store_true")
+    parser.add_argument("--backend", default=os.environ.get("LLM_BROWSER_DAEMON_BACKEND") or "chromium")
     args = parser.parse_args(argv)
 
-    daemon = BrowserDaemon(args.name, Path(args.root_dir).expanduser(), headless=args.headless)
+    daemon = BrowserDaemon(args.name, Path(args.root_dir).expanduser(), headless=args.headless, backend=args.backend)
     daemon.root_dir.mkdir(parents=True, exist_ok=True)
     ipc.pid_path(daemon.name).write_text(str(os.getpid()), encoding="utf-8")
 
@@ -208,11 +211,16 @@ def main(argv: Optional[Sequence[str]] = None) -> int:
     if hasattr(signal, "SIGINT"):
         signal.signal(signal.SIGINT, stop_signal)
 
-    daemon.start_runtime()
-    if ipc.IS_WINDOWS:
-        serve_windows(daemon)
-    else:
-        serve_posix(daemon)
+    try:
+        daemon.start_runtime()
+        if ipc.IS_WINDOWS:
+            serve_windows(daemon)
+        else:
+            serve_posix(daemon)
+    except Exception:
+        daemon.close()
+        ipc.cleanup(daemon.name)
+        raise
     return 0
 
 

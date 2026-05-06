@@ -47,6 +47,28 @@ def cancellation_trace(cancel_check: Optional[Callable[[], None]], interval_s: f
         sys.settrace(previous)
 
 
+def cancellable_sleep(seconds: float, cancel_check: Optional[Callable[[], None]], interval_s: float = 0.05) -> None:
+    deadline = time.monotonic() + max(0.0, float(seconds))
+    while True:
+        if cancel_check is not None:
+            cancel_check()
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return
+        time.sleep(min(interval_s, remaining))
+
+
+class CancellableTimeModule:
+    def __init__(self, cancel_check: Callable[[], None]) -> None:
+        self._cancel_check = cancel_check
+
+    def sleep(self, seconds: float) -> None:
+        cancellable_sleep(seconds, self._cancel_check)
+
+    def __getattr__(self, name: str) -> Any:
+        return getattr(time, name)
+
+
 @contextlib.contextmanager
 def execution_cwd(cwd: Path, lock: threading.RLock) -> Iterator[None]:
     with lock:

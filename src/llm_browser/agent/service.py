@@ -15,7 +15,7 @@ from llm_browser.session.store import SessionStore
 from llm_browser.tool.builtins import build_builtin_registry
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
-from llm_browser.tool.result import ToolResult
+from llm_browser.tool.result import ToolImage, ToolResult
 from llm_browser.tool.session import SessionTool, session_tool_spec
 
 MAX_INLINE_TOOL_TEXT = 20000
@@ -186,7 +186,7 @@ class Agent:
                         "role": "tool",
                         "tool_call_id": pending_tool_call["id"],
                         "name": pending_tool_call["name"],
-                        "content": str(output.get("text") or ""),
+                        "content": self._tool_event_provider_content(output),
                     }
                 )
                 pending_tool_call = None
@@ -203,6 +203,23 @@ class Agent:
         if not messages:
             raise ValueError(f"session has no replayable messages: {session_id}")
         return messages
+
+    def _tool_event_provider_content(self, output: Any) -> Any:
+        if not isinstance(output, dict):
+            return str(output or "")
+        images: List[ToolImage] = []
+        for item in output.get("images") or []:
+            if not isinstance(item, dict):
+                continue
+            try:
+                images.append(ToolImage(**item))
+            except TypeError:
+                continue
+        text = str(output.get("text") or "")
+        data = output.get("data") if isinstance(output.get("data"), dict) else {}
+        if images or data:
+            return ToolResult(text=text, data=data, images=images).to_provider_content()
+        return text
 
     def _maybe_compact(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         if self.compact_after_chars <= 0 or message_chars(messages) <= self.compact_after_chars:
@@ -316,12 +333,27 @@ class Agent:
 
             results: Dict[str, ToolResult] = {}
             max_workers = min(len(batch), 8)
-            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
-                futures = {executor.submit(self._execute_tool, session_id, call): call for call in batch}
-                for future in concurrent.futures.as_completed(futures):
+            executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
+            futures = {executor.submit(self._execute_tool, session_id, call): call for call in batch}
+            pending = set(futures)
+            try:
+                while pending:
+                    done, pending = concurrent.futures.wait(
+                        pending,
+                        timeout=0.05,
+                        return_when=concurrent.futures.FIRST_COMPLETED,
+                    )
                     self._check_cancel(session_id)
-                    call = futures[future]
-                    results[call.id] = future.result()
+                    for future in done:
+                        call = futures[future]
+                        results[call.id] = future.result()
+            except BaseException:
+                for future in pending:
+                    future.cancel()
+                executor.shutdown(wait=False, cancel_futures=True)
+                raise
+            else:
+                executor.shutdown(wait=True)
             for call in batch:
                 executed.append((call, results[call.id]))
         return executed

@@ -5,7 +5,7 @@ import unittest
 from pathlib import Path
 from unittest.mock import patch
 
-from llm_browser.browser.daemon_client import DaemonBrowserRuntime
+from llm_browser.browser.daemon_client import DaemonBrowserRuntime, _daemon_matches, ensure_daemon
 from llm_browser.browser.runtime import BrowserRuntime, BrowserRuntimeOptions
 
 
@@ -62,6 +62,27 @@ class BrowserDaemonTest(unittest.TestCase):
         self.assertEqual(result, {"ok": True})
         ensure.assert_called_once_with(name="demo", root_dir=Path("/tmp/demo"), headless=True, backend="chromium")
         self.assertEqual(request.call_count, 2)
+
+    def test_daemon_identity_match_includes_root_backend_and_headless(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            status = {"ok": True, "root_dir": str(root), "backend": "chromium", "headless": True}
+
+            self.assertTrue(_daemon_matches(status, root_dir=root, headless=True, backend="chromium"))
+            self.assertFalse(_daemon_matches(status, root_dir=root, headless=False, backend="chromium"))
+            self.assertFalse(_daemon_matches(status, root_dir=root, headless=True, backend="cdp"))
+            self.assertFalse(_daemon_matches(status, root_dir=root / "other", headless=True, backend="chromium"))
+
+    def test_ensure_daemon_reuses_matching_live_daemon(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            root = Path(tmp)
+            status = {"ok": True, "root_dir": str(root), "backend": "chromium", "headless": True}
+            with patch("llm_browser.browser.daemon_client._daemon_status_payload", return_value=status), patch(
+                "llm_browser.browser.daemon_client.subprocess.Popen"
+            ) as popen:
+                ensure_daemon(name="matched", root_dir=root, headless=True, backend="chromium")
+
+        popen.assert_not_called()
 
 
 if __name__ == "__main__":

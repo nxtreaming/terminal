@@ -155,6 +155,21 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertEqual(post.call_count, 2)
         self.assertEqual(post.call_args_list[1].kwargs["headers"]["Authorization"], "Bearer new-access")
 
+    def test_retries_transient_stream_response_errors(self) -> None:
+        provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
+        transient = FakeResponse(503, [], text="busy")
+        ok = FakeResponse(200, [{"type": "response.completed", "response": {"id": "resp_2", "output": []}}])
+
+        with patch("llm_browser.provider.codex_responses.time.sleep") as sleep, patch(
+            "llm_browser.provider.codex_responses.requests.post",
+            side_effect=[transient, ok],
+        ) as post:
+            list(provider.start_turn([{"role": "user", "content": "open site"}], []))
+
+        self.assertTrue(transient.closed)
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once()
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

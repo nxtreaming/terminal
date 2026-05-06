@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import tempfile
+import threading
+import time
 import unittest
 import os
 from pathlib import Path
@@ -26,10 +28,12 @@ class FakeRuntime:
         self.last_cdp_timeout = None
         self.last_cdp_retry = None
         self.last_navigate_timeout = None
+        self.cdp_calls = []
 
     def cdp(self, method: str, params=None, session_id=None, timeout_s=None, retry=True) -> Dict[str, Any]:
         self.last_cdp_timeout = timeout_s
         self.last_cdp_retry = retry
+        self.cdp_calls.append({"method": method, "params": params or {}, "session_id": session_id})
         return {"method": method, "params": params or {}, "session_id": session_id}
 
     def new_tab(self, url: str = "about:blank") -> Dict[str, Any]:
@@ -106,6 +110,20 @@ class FakeRuntime:
 
     def page_info(self) -> Dict[str, Any]:
         return {"url": "https://example.com", "title": "Example"}
+
+    def download_info(self, limit: int = 100, drain: bool = True) -> Dict[str, Any]:
+        return {
+            "downloads_dir": str(self.root_dir / "downloads"),
+            "files": [
+                {
+                    "name": "report.csv",
+                    "relative_path": "report.csv",
+                    "path": str(self.root_dir / "downloads" / "report.csv"),
+                    "complete": True,
+                }
+            ],
+            "events": [],
+        }
 
     def click_at(self, x: float, y: float, button: str = "left", clicks: int = 1) -> None:
         return None
@@ -230,6 +248,30 @@ class PythonBrowserToolTest(unittest.TestCase):
 
             with self.assertRaises(SessionCancelled):
                 tool(ctx, {"headless": True, "code": "for i in range(1000000):\n    pass"})
+
+    def test_time_sleep_is_cooperatively_cancellable(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+            caught: list[BaseException] = []
+
+            def target() -> None:
+                try:
+                    tool(ctx, {"headless": True, "code": "time.sleep(5)\nresult = 'missed cancel'"})
+                except BaseException as exc:
+                    caught.append(exc)
+
+            thread = threading.Thread(target=target)
+            thread.start()
+            time.sleep(0.15)
+            store.request_cancel(session.id, reason="sleep cancel")
+            thread.join(timeout=1.0)
+
+            self.assertFalse(thread.is_alive())
+            self.assertTrue(caught)
+            self.assertIsInstance(caught[0], SessionCancelled)
 
     def test_relative_state_dir_is_not_affected_by_python_cwd(self) -> None:
         previous = Path.cwd()
@@ -458,6 +500,46 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["ok"])
             self.assertTrue(result.data["result"]["clicked"])
             self.assertEqual(result.data["result"]["kind"], "cookie-banner")
+
+    def test_cookie_storage_permission_and_download_helpers(self) -> None:
+        runtime_holder: Dict[str, FakeRuntime] = {}
+
+        def factory(root_dir: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root_dir, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "result = {"
+                        "'cookies': get_cookies(), "
+                        "'set_cookie': set_cookie(name='token', value='abc'), "
+                        "'clear_storage': clear_storage(), "
+                        "'grant': grant_permissions(['clipboardReadWrite'], origin='https://example.com'), "
+                        "'reset': reset_permissions(), "
+                        "'download': wait_for_download('*.csv')"
+                        "}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            methods = [call["method"] for call in runtime_holder["runtime"].cdp_calls]
+            self.assertIn("Network.getCookies", methods)
+            self.assertIn("Network.setCookie", methods)
+            self.assertIn("Storage.clearDataForOrigin", methods)
+            self.assertIn("Browser.grantPermissions", methods)
+            self.assertIn("Browser.resetPermissions", methods)
+            self.assertEqual(result.data["result"]["download"]["name"], "report.csv")
 
     def test_pypdf_shims_pypdf2_import_and_exposes_pdf_helpers(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

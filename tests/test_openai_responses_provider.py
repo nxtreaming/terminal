@@ -11,9 +11,13 @@ class FakeResponse:
         self.status_code = status_code
         self._data = data
         self.text = text
+        self.closed = False
 
     def json(self) -> dict:
         return self._data
+
+    def close(self) -> None:
+        self.closed = True
 
 
 class OpenAIResponsesProviderTest(unittest.TestCase):
@@ -149,6 +153,22 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][3]["role"], "user")
         self.assertEqual(payload["input"][3]["content"][1]["type"], "input_image")
         self.assertEqual(payload["input"][4]["content"][0]["text"], "answer")
+
+    def test_retries_transient_response_errors(self) -> None:
+        provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")
+        transient = FakeResponse(500, {}, text="try again")
+        ok = FakeResponse(200, {"id": "resp_1", "output": [{"type": "message", "content": [{"type": "output_text", "text": "done"}]}]})
+
+        with patch("llm_browser.provider.openai_responses.time.sleep") as sleep, patch(
+            "llm_browser.provider.openai_responses.requests.post",
+            side_effect=[transient, ok],
+        ) as post:
+            events = list(provider.start_turn([{"role": "user", "content": "hello"}], []))
+
+        self.assertTrue(transient.closed)
+        self.assertEqual(post.call_count, 2)
+        sleep.assert_called_once()
+        self.assertEqual(events[0].text, "done")
 
 
 if __name__ == "__main__":

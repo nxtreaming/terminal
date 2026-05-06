@@ -90,6 +90,7 @@ def _event_summary(events: List[Dict[str, Any]]) -> str:
     if not events:
         return ""
     image_lines: List[str] = []
+    rehydrate_lines: List[str] = []
     browser_lines: List[str] = []
     status_lines: List[str] = []
     for event in events:
@@ -108,6 +109,7 @@ def _event_summary(events: List[Dict[str, Any]]) -> str:
                 bits.append(f"url={url[:180]}")
             if path:
                 bits.append(f"path={path}")
+                rehydrate_lines.append(f"attach_image({path!r}, label={label!r})")
             image_lines.append(" | ".join(bits))
         elif event_type in {"tool.failed", "session.failed", "session.cancelled"}:
             text = str(payload.get("error") or payload.get("reason") or "")
@@ -121,6 +123,8 @@ def _event_summary(events: List[Dict[str, Any]]) -> str:
     parts = []
     if image_lines:
         parts.append("Recent screenshot timeline:\n" + "\n".join(image_lines[-16:]))
+    if rehydrate_lines:
+        parts.append("Screenshot rehydration helpers:\n" + "\n".join(rehydrate_lines[-8:]))
     if browser_lines:
         parts.append("Recent trace/output artifacts:\n" + "\n".join(browser_lines[-12:]))
     if status_lines:
