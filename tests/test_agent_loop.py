@@ -545,8 +545,16 @@ class AgentLoopTest(unittest.TestCase):
         self.assertTrue(
             _is_parallel_safe_shell_call(ToolCall(id="call_pipe", name="exec_command", arguments={"cmd": "rg needle | head"}))
         )
+        self.assertTrue(
+            _is_parallel_safe_shell_call(
+                ToolCall(id="call_find", name="exec_command", arguments={"cmd": "find docs -maxdepth 2 -type f | sort | head"})
+            )
+        )
         self.assertFalse(
             _is_parallel_safe_shell_call(ToolCall(id="call_redirect", name="exec_command", arguments={"cmd": "printf x > out.txt"}))
+        )
+        self.assertFalse(
+            _is_parallel_safe_shell_call(ToolCall(id="call_find_delete", name="exec_command", arguments={"cmd": "find . -delete"}))
         )
         self.assertFalse(
             _is_parallel_safe_shell_call(ToolCall(id="call_mutating_git", name="exec_command", arguments={"cmd": "git checkout main"}))
