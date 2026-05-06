@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import queue
 import os
+import secrets
 import signal
 import subprocess
 import threading
@@ -13,6 +14,43 @@ from llm_browser.tool.result import ToolResult
 
 
 MAX_INLINE_OUTPUT = 20000
+MAX_POLL_OUTPUT = 20000
+_PROCESS_LOCK = threading.Lock()
+_PROCESSES: Dict[str, "ManagedProcess"] = {}
+
+
+class ManagedProcess:
+    def __init__(self, process_id: str, session_id: str, process: subprocess.Popen, command: str, timeout_s: float) -> None:
+        self.process_id = process_id
+        self.session_id = session_id
+        self.process = process
+        self.command = command
+        self.started_at = time.time()
+        self.timeout_at = self.started_at + timeout_s if timeout_s > 0 else None
+        self.output: list[tuple[str, str]] = []
+        self.read_index = 0
+        self.lock = threading.Lock()
+        self.readers: list[threading.Thread] = []
+
+    def append(self, stream: str, text: str) -> None:
+        with self.lock:
+            self.output.append((stream, text))
+
+    def read(self, all_output: bool = False) -> str:
+        with self.lock:
+            start = 0 if all_output else self.read_index
+            chunks = self.output[start:]
+            self.read_index = len(self.output)
+        return _combine_ordered(chunks)
+
+    def status(self) -> Dict[str, Any]:
+        return {
+            "process_id": self.process_id,
+            "command": self.command,
+            "returncode": self.process.poll(),
+            "running": self.process.poll() is None,
+            "age_s": max(0, time.time() - self.started_at),
+        }
 
 
 def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
@@ -78,6 +116,84 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     return _tool_result_from_output(ctx, combined, process.returncode)
 
 
+def shell_start(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    command = str(arguments["command"])
+    timeout_s = float(arguments.get("timeout_s", 0))
+    process = subprocess.Popen(
+        command,
+        shell=True,
+        cwd=str(ctx.session.cwd),
+        text=True,
+        bufsize=1,
+        stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE,
+        stderr=subprocess.PIPE,
+        start_new_session=True,
+    )
+    process_id = f"proc_{secrets.token_hex(4)}"
+    managed = ManagedProcess(process_id, ctx.session.id, process, command, timeout_s)
+    managed.readers = [
+        threading.Thread(target=_read_managed_pipe, args=(managed, process.stdout, "stdout"), daemon=True),
+        threading.Thread(target=_read_managed_pipe, args=(managed, process.stderr, "stderr"), daemon=True),
+    ]
+    for reader in managed.readers:
+        reader.start()
+    with _PROCESS_LOCK:
+        _PROCESSES[process_id] = managed
+    return ToolResult(
+        text=f"started {process_id}",
+        data={"process_id": process_id, "pid": process.pid, "running": True, "command": command},
+    )
+
+
+def shell_poll(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    process_id = str(arguments["process_id"])
+    all_output = bool(arguments.get("all", False))
+    managed = _get_process(ctx, process_id)
+    _enforce_managed_timeout(managed)
+    text = managed.read(all_output=all_output)
+    if text:
+        ctx.emit_output(_cap(text, 4000), stream="process")
+    status = managed.status()
+    if not status["running"]:
+        _finish_managed(managed)
+    return ToolResult(text=_cap(text, MAX_POLL_OUTPUT), data=status)
+
+
+def shell_stdin(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    process_id = str(arguments["process_id"])
+    text = str(arguments.get("text", ""))
+    managed = _get_process(ctx, process_id)
+    if managed.process.poll() is not None:
+        raise RuntimeError(f"process is not running: {process_id}")
+    if managed.process.stdin is None:
+        raise RuntimeError(f"process has no stdin: {process_id}")
+    managed.process.stdin.write(text)
+    managed.process.stdin.flush()
+    return ToolResult(text=f"wrote {len(text)} chars to {process_id}", data=managed.status())
+
+
+def shell_stop(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
+    process_id = str(arguments["process_id"])
+    managed = _get_process(ctx, process_id)
+    _terminate_process_group(managed.process, timeout=2)
+    _finish_managed(managed)
+    text = managed.read(all_output=True)
+    with _PROCESS_LOCK:
+        _PROCESSES.pop(process_id, None)
+    return ToolResult(text=_cap(text, MAX_POLL_OUTPUT), data={**managed.status(), "stopped": True})
+
+
+def close_shell_session(session_id: str) -> None:
+    with _PROCESS_LOCK:
+        owned = [process for process in _PROCESSES.values() if process.session_id == session_id]
+    for managed in owned:
+        _terminate_process_group(managed.process, timeout=1)
+        _finish_managed(managed)
+        with _PROCESS_LOCK:
+            _PROCESSES.pop(managed.process_id, None)
+
+
 def _read_pipe(pipe, stream: str, chunks: "queue.Queue[tuple[str, str]]") -> None:
     if pipe is None:
         return
@@ -90,6 +206,49 @@ def _read_pipe(pipe, stream: str, chunks: "queue.Queue[tuple[str, str]]") -> Non
             pipe.close()
         except Exception:
             pass
+
+
+def _read_managed_pipe(managed: ManagedProcess, pipe, stream: str) -> None:
+    if pipe is None:
+        return
+    try:
+        for line in iter(pipe.readline, ""):
+            if line:
+                managed.append(stream, line)
+    finally:
+        try:
+            pipe.close()
+        except Exception:
+            pass
+
+
+def _get_process(ctx: ToolContext, process_id: str) -> ManagedProcess:
+    with _PROCESS_LOCK:
+        managed = _PROCESSES.get(process_id)
+    if managed is None:
+        raise KeyError(f"unknown process id: {process_id}")
+    if managed.session_id != ctx.session.id:
+        raise PermissionError(f"process {process_id} belongs to another session")
+    return managed
+
+
+def _enforce_managed_timeout(managed: ManagedProcess) -> None:
+    if managed.timeout_at is None or managed.process.poll() is not None:
+        return
+    if time.time() < managed.timeout_at:
+        return
+    _kill_process_group(managed.process, timeout=1)
+    managed.append("stderr", f"\n[process timed out after {managed.timeout_at - managed.started_at:.1f}s]\n")
+
+
+def _finish_managed(managed: ManagedProcess) -> None:
+    if managed.process.stdin is not None:
+        try:
+            managed.process.stdin.close()
+        except Exception:
+            pass
+    for reader in managed.readers:
+        reader.join(timeout=0.5)
 
 
 def _terminate_process_group(process: subprocess.Popen, timeout: float) -> None:
@@ -178,3 +337,17 @@ def _tool_result_from_output(ctx: ToolContext, combined: str, returncode: int) -
         text = combined
         data["truncated"] = False
     return ToolResult(text=text, data=data)
+
+
+def _cap(text: str, max_chars: int) -> str:
+    if len(text) <= max_chars:
+        return text
+    head = max_chars // 2
+    tail = max_chars - head
+    return f"{text[:head]}\n[... omitted {len(text) - max_chars} chars ...]\n{text[-tail:]}"
+
+
+shell_start.close_session = close_shell_session  # type: ignore[attr-defined]
+shell_poll.close_session = close_shell_session  # type: ignore[attr-defined]
+shell_stdin.close_session = close_shell_session  # type: ignore[attr-defined]
+shell_stop.close_session = close_shell_session  # type: ignore[attr-defined]
