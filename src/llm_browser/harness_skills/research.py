@@ -7,40 +7,23 @@ import sys
 import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional
-from urllib.parse import quote_plus
 
 from llm_browser.harness.api import HelperAPI
 from llm_browser.tool.web_fetch import (
     _browser_headers,
     _count_values,
     _crawl_site,
-    _extract_cve_ids,
-    _extract_fcc_grantee_codes,
     _fetch_text_result,
     _fetch_text_with_curl_cffi,
     _fetch_text_with_jina_reader,
     _html_to_readable_text,
-    _jina_reader_url,
-    _looks_like_external_result_url,
-    _normalize_search_url,
-    _parse_bing_results,
-    _parse_brave_results,
-    _parse_duckduckgo_results,
-    _parse_generic_search_results,
-    _parse_markdown_links,
-    _query_looks_scholarly,
-    _search_crossref_api,
-    _search_cve_records,
-    _search_fcc_grantee_records,
-    _search_pubmed_api,
-    _search_wikipedia_api,
 )
 
 
 SKILL = {
     "name": "research",
-    "description": "HTTP fetch, readable text, web search, crawling, and bulk fetch helpers.",
-    "exports": ["http_get", "fetch_text", "fetch_readable_text", "fetch_many_text", "search_web", "crawl_site"],
+    "description": "Generic HTTP fetch, readable text, crawling, and bulk fetch helpers.",
+    "exports": ["http_get", "fetch_text", "fetch_readable_text", "fetch_many_text", "crawl_site"],
 }
 
 
@@ -81,129 +64,6 @@ def install(api: HelperAPI) -> Dict[str, Any]:
         cleaned["readable"] = True
         return cleaned
 
-    def search_web(
-        query: str,
-        max_results: int = 8,
-        timeout: float = 20.0,
-        save_raw: Any = "auto",
-        include_specialized: Any = "auto",
-    ) -> Dict[str, Any]:
-        try:
-            import requests
-        except Exception as exc:
-            raise RuntimeError("requests is not installed") from exc
-
-        raw_mode = str(save_raw).lower()
-        save_raw_always = save_raw is True or raw_mode in {"1", "true", "yes", "always", "all"}
-        save_raw_auto = raw_mode in {"auto", "failed", "empty"}
-        urls = [
-            ("bing", f"https://www.bing.com/search?q={quote_plus(query)}"),
-            ("duckduckgo_html", f"https://html.duckduckgo.com/html/?q={quote_plus(query)}"),
-            ("duckduckgo_lite", f"https://lite.duckduckgo.com/lite/?q={quote_plus(query)}"),
-            ("brave", f"https://search.brave.com/search?q={quote_plus(query)}"),
-            ("google_reader", _jina_reader_url(f"https://www.google.com/search?q={quote_plus(query)}")),
-            ("bing_reader", _jina_reader_url(f"https://www.bing.com/search?q={quote_plus(query)}")),
-        ]
-        results: List[Dict[str, str]] = []
-        attempts: List[Dict[str, Any]] = []
-        seen_urls: set[str] = set()
-
-        def add_results(candidates: List[Dict[str, str]]) -> List[Dict[str, str]]:
-            added: List[Dict[str, str]] = []
-            for candidate in candidates:
-                url = _normalize_search_url(candidate.get("url", ""))
-                if not url or url in seen_urls or not _looks_like_external_result_url(url):
-                    continue
-                seen_urls.add(url)
-                item = dict(candidate)
-                item["url"] = url
-                results.append(item)
-                added.append(item)
-                if len(results) >= max_results:
-                    break
-            return added
-
-        def save_search_page(source: str, text: str) -> str:
-            search_dir = api.cwd / "search_pages"
-            search_dir.mkdir(parents=True, exist_ok=True)
-            slug = re.sub(r"[^a-zA-Z0-9_.-]+", "-", query).strip("-")[:80] or "query"
-            path = search_dir / f"{int(time.time() * 1000)}-{source}-{slug}.html"
-            path.write_text(text, encoding="utf-8", errors="replace")
-            return str(path)
-
-        cve_ids = _extract_cve_ids(query)
-        if cve_ids:
-            found, attempt = _search_cve_records(cve_ids, limit=max_results)
-            added = add_results(found)
-            attempt["parsed"] = len(added)
-            attempts.append(attempt)
-
-        fcc_codes = _extract_fcc_grantee_codes(query)
-        if fcc_codes and len(results) < max_results:
-            found, attempt = _search_fcc_grantee_records(fcc_codes, limit=max_results - len(results))
-            added = add_results(found)
-            attempt["parsed"] = len(added)
-            attempts.append(attempt)
-
-        for source, search_url in urls:
-            if len(results) >= max_results:
-                break
-            try:
-                api.check_cancel()
-                source_timeout = min(timeout, 12.0 if source.endswith("_reader") else 6.0)
-                response = requests.get(search_url, headers=_browser_headers(), timeout=source_timeout)
-                api.check_cancel()
-                text = response.text
-                if source == "bing":
-                    parsed = _parse_bing_results(text, limit=max_results - len(results))
-                elif source.startswith("duckduckgo"):
-                    parsed = _parse_duckduckgo_results(text, limit=max_results - len(results))
-                elif source == "brave":
-                    parsed = _parse_brave_results(text, limit=max_results - len(results))
-                elif source.endswith("_reader"):
-                    parsed = _parse_markdown_links(text, limit=max_results - len(results), source=source)
-                else:
-                    parsed = _parse_generic_search_results(text, source=source, limit=max_results - len(results))
-                added = add_results(parsed)
-                attempt: Dict[str, Any] = {
-                    "source": source,
-                    "status": response.status_code,
-                    "url": response.url,
-                    "chars": len(text),
-                    "parsed": len(added),
-                }
-                if save_raw_always or (save_raw_auto and not added):
-                    attempt["raw_path"] = save_search_page(source, text)
-                attempts.append(attempt)
-            except Exception as exc:
-                attempts.append({"source": source, "url": search_url, "error": str(exc)})
-            if len(results) >= max_results:
-                break
-
-        specialized_mode = str(include_specialized).lower()
-        specialized_enabled = (
-            include_specialized is True
-            or specialized_mode in {"1", "true", "yes", "always"}
-            or (specialized_mode == "auto" and _query_looks_scholarly(query))
-        )
-        if specialized_enabled and len(results) < max_results:
-            for source, searcher in (
-                ("wikipedia_api", _search_wikipedia_api),
-                ("pubmed_api", _search_pubmed_api),
-                ("crossref_api", _search_crossref_api),
-            ):
-                try:
-                    found, attempt = searcher(query, limit=max_results - len(results), timeout=timeout)
-                    api.check_cancel()
-                    added = add_results(found)
-                    attempt["parsed"] = len(added)
-                    attempts.append(attempt)
-                except Exception as exc:
-                    attempts.append({"source": source, "error": str(exc)})
-                if len(results) >= max_results:
-                    break
-        return {"query": query, "results": results[:max_results], "attempts": attempts}
-
     def crawl_site(
         start_url: str,
         max_pages: int = 12,
@@ -235,7 +95,6 @@ def install(api: HelperAPI) -> Dict[str, Any]:
         "fetch_text": fetch_text,
         "fetch_readable_text": fetch_readable_text,
         "fetch_many_text": fetch_many_text,
-        "search_web": search_web,
         "crawl_site": crawl_site,
     }
 

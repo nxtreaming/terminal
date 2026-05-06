@@ -1,10 +1,10 @@
 from __future__ import annotations
 
 import json
-from pathlib import Path
 from typing import Any, Dict
 
 from llm_browser.harness.api import HelperAPI
+from llm_browser.harness_skills.uploads import make_upload_file
 
 
 SKILL = {
@@ -15,7 +15,6 @@ SKILL = {
         "visible_text",
         "links",
         "dispatch_key",
-        "upload_file",
         "load_helper",
         "save_helper",
     ],
@@ -49,23 +48,9 @@ def install(api: HelperAPI) -> Dict[str, Any]:
             await_promise=True,
         )
 
-    def upload_file(selector: str, path: Any) -> Dict[str, Any]:
-        cdp = api.namespace["cdp"]
-        files = path if isinstance(path, (list, tuple)) else [path]
-        normalized_files = []
-        for item in files:
-            file_path = Path(str(item)).expanduser()
-            if not file_path.is_absolute():
-                file_path = api.cwd / file_path
-            normalized_files.append(str(file_path.resolve()))
-        document = cdp("DOM.getDocument", depth=-1)
-        root = document.get("root") if isinstance(document.get("root"), dict) else {}
-        node_id = cdp("DOM.querySelector", nodeId=root.get("nodeId"), selector=selector).get("nodeId")
-        if not node_id:
-            raise RuntimeError(f"no element for {selector}")
-        return cdp("DOM.setFileInputFiles", files=normalized_files, nodeId=node_id)
-
     def load_helper(path: str) -> None:
+        from pathlib import Path
+
         helper_path = Path(path).expanduser()
         if not helper_path.is_absolute():
             helper_path = api.cwd / helper_path
@@ -73,6 +58,8 @@ def install(api: HelperAPI) -> Dict[str, Any]:
         exec(compile(code, str(helper_path), "exec"), api.namespace, api.namespace)
 
     def save_helper(name: str, code: str) -> str:
+        from pathlib import Path
+
         safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in name)
         if not safe_name.endswith(".py"):
             safe_name += ".py"
@@ -86,7 +73,7 @@ def install(api: HelperAPI) -> Dict[str, Any]:
         "visible_text": getattr(runtime, "visible_text", lambda max_chars=8000: ""),
         "links": getattr(runtime, "links", lambda limit=200: []),
         "dispatch_key": dispatch_key,
-        "upload_file": upload_file,
+        "upload_file": make_upload_file(api),
         "load_helper": load_helper,
         "save_helper": save_helper,
     }

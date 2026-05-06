@@ -4,7 +4,7 @@ import importlib
 import os
 from pathlib import Path
 from types import SimpleNamespace
-from typing import Any, Dict, Iterable, List, Optional
+from typing import Any, Dict, List, Optional
 
 from llm_browser.browser.instructions import BROWSER_HELP_PLAYBOOK
 from llm_browser.harness.api import HelperAPI
@@ -15,9 +15,16 @@ PYTHON_SKILLS: Dict[str, str] = {
     "downloads": "llm_browser.harness_skills.downloads",
     "cookies": "llm_browser.harness_skills.cookies",
     "artifacts": "llm_browser.harness_skills.artifacts",
+    "cloud_artifacts": "llm_browser.harness_skills.cloud_artifacts",
     "research": "llm_browser.harness_skills.research",
+    "search": "llm_browser.harness_skills.search",
+    "public_records": "llm_browser.harness_skills.public_records",
+    "scholarly": "llm_browser.harness_skills.scholarly",
     "extraction": "llm_browser.harness_skills.extraction",
+    "store_locators": "llm_browser.harness_skills.store_locators",
     "dom_tools": "llm_browser.harness_skills.dom_tools",
+    "cookie_banners": "llm_browser.harness_skills.cookie_banners",
+    "uploads": "llm_browser.harness_skills.uploads",
     "tracing": "llm_browser.harness_skills.tracing",
     "harnesless_compat": "llm_browser.harness_skills.harnesless_compat",
 }
@@ -73,7 +80,8 @@ def install_skill_loader(api: HelperAPI) -> Dict[str, Any]:
             + "\n".join(skill_lines)
             + "\n\nInteraction skills:\n  "
             + (interaction or "(none)")
-            + "\n\nUse load_skill('research') for specialized helpers, read_skill('iframes') for a mechanic playbook, "
+            + "\n\nUse load_skill('research') for fetch/crawl helpers, load_skill('search') for search results, "
+            "read_skill('iframes') for a mechanic playbook, "
             "and agent_helpers.py for task-specific reusable code."
         )
 
@@ -158,6 +166,7 @@ def _refresh_helper_modules(namespace: Dict[str, Any]) -> None:
 
 def _read_skill(name: str) -> str:
     normalized = _normalize_skill_name(name)
+    interaction_name = _normalize_interaction_skill_name(name)
     chunks: List[str] = []
     if normalized in PYTHON_SKILLS:
         meta = _skill_meta(normalized)
@@ -172,7 +181,7 @@ def _read_skill(name: str) -> str:
         docs = str(meta.get("docs") or "").strip()
         if docs:
             chunks.append(docs)
-    interaction = _interaction_skill_paths().get(normalized)
+    interaction = _interaction_skill_paths().get(interaction_name)
     if interaction is not None:
         chunks.append(interaction.read_text(encoding="utf-8"))
     if chunks:
@@ -192,6 +201,13 @@ def _normalize_skill_name(name: str) -> str:
     if dashed in _interaction_skill_paths():
         return dashed
     return underscored
+
+
+def _normalize_interaction_skill_name(name: str) -> str:
+    raw = str(name).strip().lower()
+    if raw.endswith(".md"):
+        raw = raw[:-3]
+    return raw.replace("_", "-")
 
 
 def _interaction_skill_paths() -> Dict[str, Path]:
