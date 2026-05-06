@@ -123,6 +123,11 @@ def build_parser() -> argparse.ArgumentParser:
     datasets_run.add_argument("--max-turns", type=int, default=80)
     datasets_run.add_argument("--task-timeout-s", type=float, default=0.0, help="Optional per-task timeout in seconds.")
     datasets_run.add_argument("--headless", action=argparse.BooleanOptionalAction, default=True)
+    datasets_run.add_argument(
+        "--skip-failed",
+        action="store_true",
+        help="With --resume, skip latest failed attempts so pending tasks can continue; rerun failed tasks separately.",
+    )
     datasets_run.add_argument("--stop-on-failure", action="store_true")
     datasets_run.set_defaults(func=cmd_datasets_run)
 
@@ -278,7 +283,7 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
         }
 
     _write_dataset_manifest(store, run_id, manifest)
-    completed_task_ids = _successful_task_ids(manifest) if args.resume else set()
+    completed_task_ids = _resume_skip_task_ids(manifest, skip_failed=args.skip_failed) if args.resume else set()
 
     for task in selected:
         if task.task_id in completed_task_ids:
@@ -372,6 +377,14 @@ def _write_dataset_manifest(store: SessionStore, run_id: str, manifest: dict) ->
 def _successful_task_ids(manifest: Dict[str, Any]) -> set[str]:
     summary = summarize_manifest(manifest)
     return set(summary["passed_task_ids"])
+
+
+def _resume_skip_task_ids(manifest: Dict[str, Any], *, skip_failed: bool = False) -> set[str]:
+    summary = summarize_manifest(manifest)
+    skipped = set(summary["passed_task_ids"])
+    if skip_failed:
+        skipped.update(summary["failed_task_ids"])
+    return skipped
 
 
 def _dataset_manifest_exit_code(manifest: Dict[str, Any]) -> int:
