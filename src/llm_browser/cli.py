@@ -274,6 +274,7 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
             "sessions": [],
         }
 
+    _write_dataset_manifest(store, run_id, manifest)
     completed_task_ids = _successful_task_ids(manifest) if args.resume else set()
 
     for task in selected:
