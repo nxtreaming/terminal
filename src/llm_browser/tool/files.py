@@ -176,6 +176,9 @@ def edit_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
 def apply_patch_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     patch = str(arguments["patch"])
     check = bool(arguments.get("check", False))
+    if _is_codex_patch(patch):
+        return _apply_codex_patch(ctx, patch, check=check)
+
     command = ["git", "apply", "--recount", "--whitespace=nowarn"]
     if check:
         command.append("--check")
@@ -196,6 +199,165 @@ def apply_patch_file(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
         text=(text + (f"\nfiles: {', '.join(changed_files)}" if changed_files else "") + (f"\n{output}" if output else "")),
         data={"returncode": result.returncode, "check": check, "files": changed_files},
     )
+
+
+def _is_codex_patch(patch: str) -> bool:
+    return patch.lstrip().startswith("*** Begin Patch")
+
+
+def _apply_codex_patch(ctx: ToolContext, patch: str, check: bool) -> ToolResult:
+    operations = _parse_codex_patch(patch)
+    if not operations:
+        raise ValueError("patch contains no operations")
+
+    changed_files: List[str] = []
+    diffs: List[str] = []
+    for operation in operations:
+        op = str(operation["op"])
+        path = _resolve(ctx, str(operation["path"]))
+        changed_files.append(str(path.relative_to(ctx.session.cwd)) if path.is_relative_to(ctx.session.cwd) else str(path))
+
+        if op == "add":
+            if path.exists():
+                raise ValueError(f"cannot add existing file: {path}")
+            new_text = "\n".join(operation["lines"]) + ("\n" if operation["lines"] else "")
+            diff = _unified_diff("", new_text, fromfile="/dev/null", tofile=str(path))
+            if not check:
+                path.parent.mkdir(parents=True, exist_ok=True)
+                _write_text_file(path, new_text, _TextMeta(newline=_detect_newline(new_text)))
+            diffs.append(diff)
+            continue
+
+        if op == "delete":
+            old_text, _ = _read_text_file(path)
+            diff = _unified_diff(old_text, "", fromfile=str(path), tofile="/dev/null")
+            if not check:
+                path.unlink()
+            diffs.append(diff)
+            continue
+
+        if op != "update":
+            raise ValueError(f"unknown Codex patch operation: {op}")
+
+        with _file_lock(path):
+            old_text, meta = _read_text_file(path)
+            updated = _apply_codex_hunks(old_text, operation["hunks"], path)
+            updated = _normalize_newlines(updated, meta.newline)
+            diff = _unified_diff(old_text, updated, fromfile=str(path), tofile=str(path))
+            move_to = operation.get("move_to")
+            if move_to:
+                target = _resolve(ctx, str(move_to))
+                changed_files.append(str(target.relative_to(ctx.session.cwd)) if target.is_relative_to(ctx.session.cwd) else str(target))
+                diff = _unified_diff(old_text, updated, fromfile=str(path), tofile=str(target))
+            if not check:
+                if move_to:
+                    target.parent.mkdir(parents=True, exist_ok=True)
+                    _write_text_file(target, updated, meta)
+                    path.unlink()
+                else:
+                    _write_text_file(path, updated, meta)
+            diffs.append(diff)
+
+    text = "patch check passed" if check else "patch applied"
+    diff_text = _cap("\n".join(diff for diff in diffs if diff), MAX_DIFF_CHARS)
+    if diff_text:
+        text += f"\n{diff_text}"
+    return ToolResult(
+        text=text,
+        data={"returncode": 0, "check": check, "files": changed_files, "diff": diff_text, "format": "codex"},
+    )
+
+
+def _parse_codex_patch(patch: str) -> List[Dict[str, Any]]:
+    lines = patch.strip().splitlines()
+    if not lines or lines[0] != "*** Begin Patch" or lines[-1] != "*** End Patch":
+        raise ValueError("invalid Codex patch envelope")
+
+    operations: List[Dict[str, Any]] = []
+    index = 1
+    while index < len(lines) - 1:
+        line = lines[index]
+        if line.startswith("*** Add File: "):
+            path = line.removeprefix("*** Add File: ").strip()
+            index += 1
+            add_lines: List[str] = []
+            while index < len(lines) - 1 and not lines[index].startswith("*** "):
+                if not lines[index].startswith("+"):
+                    raise ValueError(f"invalid add-file line: {lines[index]}")
+                add_lines.append(lines[index][1:])
+                index += 1
+            operations.append({"op": "add", "path": path, "lines": add_lines})
+            continue
+        if line.startswith("*** Delete File: "):
+            path = line.removeprefix("*** Delete File: ").strip()
+            operations.append({"op": "delete", "path": path})
+            index += 1
+            continue
+        if line.startswith("*** Update File: "):
+            path = line.removeprefix("*** Update File: ").strip()
+            index += 1
+            move_to: Optional[str] = None
+            hunks: List[List[str]] = []
+            while index < len(lines) - 1:
+                if lines[index].startswith("*** Move to: "):
+                    move_to = lines[index].removeprefix("*** Move to: ").strip()
+                    index += 1
+                    continue
+                if lines[index].startswith("*** "):
+                    break
+                if not lines[index].startswith("@@"):
+                    raise ValueError(f"expected hunk header, got: {lines[index]}")
+                index += 1
+                hunk: List[str] = []
+                while index < len(lines) - 1 and not lines[index].startswith("@@") and not lines[index].startswith("*** "):
+                    if lines[index].startswith("\\ No newline"):
+                        index += 1
+                        continue
+                    if not lines[index] or lines[index][0] not in {" ", "+", "-"}:
+                        raise ValueError(f"invalid hunk line: {lines[index]}")
+                    hunk.append(lines[index])
+                    index += 1
+                hunks.append(hunk)
+            operations.append({"op": "update", "path": path, "move_to": move_to, "hunks": hunks})
+            continue
+        raise ValueError(f"unknown Codex patch line: {line}")
+    return operations
+
+
+def _apply_codex_hunks(old_text: str, hunks: List[List[str]], path: Path) -> str:
+    old_normalized = old_text.replace("\r\n", "\n").replace("\r", "\n")
+    had_final_newline = old_normalized.endswith("\n")
+    lines = old_normalized.split("\n")
+    if had_final_newline:
+        lines = lines[:-1]
+    cursor = 0
+
+    for hunk in hunks:
+        old_seq = [line[1:] for line in hunk if line.startswith((" ", "-"))]
+        new_seq = [line[1:] for line in hunk if line.startswith((" ", "+"))]
+        start = _find_subsequence(lines, old_seq, cursor)
+        if start is None:
+            start = _find_subsequence(lines, old_seq, 0)
+        if start is None:
+            context = "\n".join(old_seq[:8])
+            raise ValueError(f"patch context not found in {path}:\n{context}")
+        lines[start : start + len(old_seq)] = new_seq
+        cursor = start + len(new_seq)
+
+    updated = "\n".join(lines)
+    if had_final_newline:
+        updated += "\n"
+    return updated
+
+
+def _find_subsequence(lines: List[str], needle: List[str], start: int) -> Optional[int]:
+    if not needle:
+        return min(max(start, 0), len(lines))
+    max_start = len(lines) - len(needle)
+    for index in range(max(0, start), max_start + 1):
+        if lines[index : index + len(needle)] == needle:
+            return index
+    return None
 
 
 def glob_files(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
