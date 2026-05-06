@@ -152,13 +152,21 @@ class BrowserRuntime:
             self.wait_for_load(timeout_s=timeout_s)
         return result
 
-    def js(self, expression: str, await_promise: bool = False) -> Any:
+    def js(
+        self,
+        expression: str,
+        await_promise: bool = False,
+        repl_mode: bool = True,
+        user_gesture: bool = False,
+    ) -> Any:
         response = self.cdp(
             "Runtime.evaluate",
             {
                 "expression": expression,
                 "returnByValue": True,
                 "awaitPromise": await_promise,
+                "replMode": repl_mode,
+                "userGesture": user_gesture,
             },
         )
         result = response.get("result", {})

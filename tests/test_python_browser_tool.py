@@ -43,7 +43,13 @@ class FakeRuntime:
     def links(self, limit: int = 200):
         return [{"text": "Example", "href": "https://example.com"}][:limit]
 
-    def js(self, expression: str, await_promise: bool = False) -> Any:
+    def js(
+        self,
+        expression: str,
+        await_promise: bool = False,
+        repl_mode: bool = True,
+        user_gesture: bool = False,
+    ) -> Any:
         self.last_await_promise = await_promise
         if expression == "document.title":
             return "Example Domain"

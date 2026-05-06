@@ -34,7 +34,8 @@ def build_builtin_registry() -> ToolRegistry:
                 "requests, a browser-header http session, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
                 "requests gets browser-like User-Agent and Accept-Language defaults unless overridden. "
                 "PyPDF2 imports are shimmed to pypdf when available. "
-                "js(expr) awaits promises by default; pass await_promise=False only when you need raw synchronous evaluation. "
+                "js(expr) awaits promises and uses CDP replMode by default so repeated let/const snippets are recoverable; "
+                "pass await_promise=False or repl_mode=False only when you need exact Runtime.evaluate behavior. "
                 "Set result or _result for structured output."
             ),
             input_schema={

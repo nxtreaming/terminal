@@ -54,6 +54,21 @@ class NewTabRuntime(BrowserRuntime):
         return {"url": url, "wait": wait}
 
 
+class EvalRuntime(BrowserRuntime):
+    def __init__(self, root_dir: Path) -> None:
+        super().__init__(root_dir=root_dir)
+        self.last_params: Optional[Dict[str, Any]] = None
+
+    def cdp(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        self.last_params = params or {}
+        return {"result": {"value": "ok"}}
+
+
 class SequenceRuntime(BrowserRuntime):
     def __init__(self, root_dir: Path, values: list[Any]) -> None:
         super().__init__(root_dir=root_dir)
@@ -110,6 +125,26 @@ class BrowserRuntimeTest(unittest.TestCase):
 
             self.assertEqual(target["id"], "target-1")
             self.assertEqual(runtime.navigated_to, "https://example.com")
+
+    def test_js_uses_repl_mode_by_default_for_repeated_snippets(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            self.assertEqual(runtime.js("let f = 1; f", await_promise=True), "ok")
+
+            self.assertEqual(runtime.last_params["expression"], "let f = 1; f")
+            self.assertTrue(runtime.last_params["awaitPromise"])
+            self.assertTrue(runtime.last_params["replMode"])
+            self.assertFalse(runtime.last_params["userGesture"])
+
+    def test_js_allows_exact_runtime_evaluate_mode(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            runtime.js("document.title", repl_mode=False, user_gesture=True)
+
+            self.assertFalse(runtime.last_params["replMode"])
+            self.assertTrue(runtime.last_params["userGesture"])
 
     def test_wait_until_polls_until_truthy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
