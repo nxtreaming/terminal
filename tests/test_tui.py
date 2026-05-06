@@ -5,6 +5,7 @@ from pathlib import Path
 
 from llm_browser.events import Event
 from llm_browser.tui.app import (
+    _artifact_kind,
     _current_tool,
     _dataset_run_id_from_path,
     _dataset_run_label,
@@ -139,6 +140,10 @@ class TuiTest(unittest.TestCase):
         ]
 
         self.assertEqual(_latest_image_line(events), "final -> final.png")
+
+    def test_artifact_kind_prioritizes_trace_and_download_dirs(self) -> None:
+        self.assertEqual(_artifact_kind(Path("/tmp/session/browser/traces/001_trace.json")), "trace")
+        self.assertEqual(_artifact_kind(Path("/tmp/session/browser/downloads/report.csv")), "download")
 
 
 if __name__ == "__main__":

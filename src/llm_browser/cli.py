@@ -12,6 +12,7 @@ from typing import Any, Dict, Optional, Sequence
 
 from llm_browser.agent import Agent
 from llm_browser.brand import CLI_NAME, DEFAULT_STATE_DIR
+from llm_browser.config import config_get, example_config, load_config, redacted_config, write_default_config
 from llm_browser.datasets import (
     build_dataset_prompt,
     dataset_summary,
@@ -30,33 +31,50 @@ MAX_INLINE_DATASET_RESULT = 20_000
 BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud"]
 
 
-def add_browser_runtime_args(parser: argparse.ArgumentParser, headless_default: Optional[bool]) -> None:
+def add_browser_runtime_args(
+    parser: argparse.ArgumentParser,
+    headless_default: Optional[bool],
+    config: Optional[Dict[str, Any]] = None,
+) -> None:
+    browser_config = config_get(config or {}, "browser", {})
+    if not isinstance(browser_config, dict):
+        browser_config = {}
+
+    def browser_default(name: str, default: Any = None) -> Any:
+        value = browser_config.get(name)
+        return default if value is None else value
+
     parser.add_argument(
         "--browser",
         choices=BROWSER_MODE_CHOICES,
-        default=None,
+        default=browser_default("mode", None),
         help="Browser backend: owned Chromium, real Chrome, explicit CDP, or Browser Use cloud.",
     )
     parser.add_argument(
         "--headless",
         action=argparse.BooleanOptionalAction,
-        default=headless_default,
+        default=browser_default("headless", headless_default),
         help="Run owned Chromium headless. Ignored for real/cdp/cloud backends.",
     )
-    parser.add_argument("--cdp-url", default=None, help="DevTools HTTP endpoint, e.g. http://127.0.0.1:9222.")
-    parser.add_argument("--cdp-ws", default=None, help="Raw CDP websocket URL.")
-    parser.add_argument("--chrome-path", default=None, help="Chrome/Chromium executable for owned Chromium mode.")
-    parser.add_argument("--profile-template", default=None, help="Copy this profile directory into the owned Chromium profile.")
-    parser.add_argument("--keep-profile", action="store_true", help="Keep the owned Chromium profile after runtime close.")
-    parser.add_argument("--browser-width", type=int, default=None, help="Browser viewport/window width.")
-    parser.add_argument("--browser-height", type=int, default=None, help="Browser viewport/window height.")
-    parser.add_argument("--cloud-profile-id", default=None, help="Browser Use cloud profile UUID.")
-    parser.add_argument("--cloud-profile-name", default=None, help="Browser Use cloud profile name, resolved at startup.")
-    parser.add_argument("--cloud-proxy-country", default=None, help="Browser Use proxy country code; pass 'none' to disable.")
-    parser.add_argument("--cloud-timeout", type=int, default=None, help="Browser Use cloud timeout in minutes.")
-    parser.add_argument("--cloud-allow-resizing", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--cloud-recording", action=argparse.BooleanOptionalAction, default=None)
-    parser.add_argument("--cloud-custom-proxy-json", default=None, help="JSON object forwarded as Browser Use customProxy.")
+    parser.add_argument("--cdp-url", default=browser_default("cdp_url"), help="DevTools HTTP endpoint, e.g. http://127.0.0.1:9222.")
+    parser.add_argument("--cdp-ws", default=browser_default("cdp_ws"), help="Raw CDP websocket URL.")
+    parser.add_argument("--chrome-path", default=browser_default("chrome_path"), help="Chrome/Chromium executable for owned Chromium mode.")
+    parser.add_argument("--profile-template", default=browser_default("profile_template"), help="Copy this profile directory into the owned Chromium profile.")
+    parser.add_argument(
+        "--keep-profile",
+        action=argparse.BooleanOptionalAction,
+        default=browser_default("keep_profile", False),
+        help="Keep the owned Chromium profile after runtime close.",
+    )
+    parser.add_argument("--browser-width", type=int, default=browser_default("width"), help="Browser viewport/window width.")
+    parser.add_argument("--browser-height", type=int, default=browser_default("height"), help="Browser viewport/window height.")
+    parser.add_argument("--cloud-profile-id", default=browser_default("cloud_profile_id"), help="Browser Use cloud profile UUID.")
+    parser.add_argument("--cloud-profile-name", default=browser_default("cloud_profile_name"), help="Browser Use cloud profile name, resolved at startup.")
+    parser.add_argument("--cloud-proxy-country", default=browser_default("cloud_proxy_country"), help="Browser Use proxy country code; pass 'none' to disable.")
+    parser.add_argument("--cloud-timeout", type=int, default=browser_default("cloud_timeout"), help="Browser Use cloud timeout in minutes.")
+    parser.add_argument("--cloud-allow-resizing", action=argparse.BooleanOptionalAction, default=browser_default("cloud_allow_resizing"))
+    parser.add_argument("--cloud-recording", action=argparse.BooleanOptionalAction, default=browser_default("cloud_recording"))
+    parser.add_argument("--cloud-custom-proxy-json", default=browser_default("cloud_custom_proxy_json"), help="JSON object forwarded as Browser Use customProxy.")
 
 
 def apply_browser_runtime_args(args: argparse.Namespace) -> None:
@@ -90,11 +108,32 @@ def apply_browser_runtime_args(args: argparse.Namespace) -> None:
         os.environ["LLM_BROWSER_CLOUD_ENABLE_RECORDING"] = "1" if args.cloud_recording else "0"
 
 
-def build_parser() -> argparse.ArgumentParser:
+def _provider_default(config: Optional[Dict[str, Any]], default: str) -> str:
+    provider = config_get(config or {}, "provider", default)
+    if provider in {"fake", "openai", "codex"}:
+        return str(provider)
+    return default
+
+
+def _model_default(config: Optional[Dict[str, Any]], default: Optional[str]) -> Optional[str]:
+    value = config_get(config or {}, "model", default)
+    return str(value) if value else default
+
+
+def _max_turns_default(config: Optional[Dict[str, Any]], default: int) -> int:
+    value = config_get(config or {}, "agent.max_turns", config_get(config or {}, "max_turns", default))
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(prog=CLI_NAME)
+    parser.add_argument("--config", default=None, help="JSON config file. Defaults to ~/.browser-use-terminal/config.json and ./.browser-use-terminal/config.json.")
     parser.add_argument(
         "--state-dir",
-        default=DEFAULT_STATE_DIR,
+        default=config_get(config or {}, "state_dir", DEFAULT_STATE_DIR),
         help=f"Runtime state directory. Defaults to {DEFAULT_STATE_DIR} in the current directory.",
     )
 
@@ -109,12 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
     run.add_argument(
         "--provider",
         choices=["fake", "openai", "codex"],
-        default="fake",
+        default=_provider_default(config, "fake"),
         help="Provider to use.",
     )
-    run.add_argument("--model", default=None, help="Model name for provider=openai.")
-    run.add_argument("--max-turns", type=int, default=80, help="Maximum model/tool turns before failing.")
-    add_browser_runtime_args(run, headless_default=None)
+    run.add_argument("--model", default=_model_default(config, None), help="Model name for provider=openai/codex.")
+    run.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80), help="Maximum model/tool turns before failing.")
+    add_browser_runtime_args(run, headless_default=None, config=config)
     run.set_defaults(func=cmd_run)
 
     sessions = sub.add_parser("sessions", help="Inspect sessions.")
@@ -136,9 +175,9 @@ def build_parser() -> argparse.ArgumentParser:
     sessions_resume = sessions_sub.add_parser("resume", help="Resume a session from its event trace.")
     sessions_resume.add_argument("session_id")
     sessions_resume.add_argument("instruction", nargs="?", default="Continue from the previous session state.")
-    sessions_resume.add_argument("--provider", choices=["fake", "openai", "codex"], default="codex")
-    sessions_resume.add_argument("--model", default="gpt-5.5")
-    sessions_resume.add_argument("--max-turns", type=int, default=80)
+    sessions_resume.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
+    sessions_resume.add_argument("--model", default=_model_default(config, "gpt-5.5"))
+    sessions_resume.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80))
     sessions_resume.set_defaults(func=cmd_sessions_resume)
 
     sessions_trace = sessions_sub.add_parser("trace", help="Write a JSON trace bundle for a session.")
@@ -147,9 +186,9 @@ def build_parser() -> argparse.ArgumentParser:
 
     sessions_eval = sessions_sub.add_parser("self-eval", help="Run an LLM evaluator as a child session over a trace.")
     sessions_eval.add_argument("session_id")
-    sessions_eval.add_argument("--provider", choices=["fake", "openai", "codex"], default="codex")
-    sessions_eval.add_argument("--model", default="gpt-5.5")
-    sessions_eval.add_argument("--max-turns", type=int, default=20)
+    sessions_eval.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
+    sessions_eval.add_argument("--model", default=_model_default(config, "gpt-5.5"))
+    sessions_eval.add_argument("--max-turns", type=int, default=_max_turns_default(config, 20))
     sessions_eval.set_defaults(func=cmd_sessions_self_eval)
 
     browser = sub.add_parser("browser", help="Browser runtime commands.")
@@ -157,7 +196,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     browser_smoke = browser_sub.add_parser("smoke", help="Launch Chrome, navigate, and capture a screenshot.")
     browser_smoke.add_argument("--url", default="https://example.com", help="URL to open.")
-    add_browser_runtime_args(browser_smoke, headless_default=False)
+    add_browser_runtime_args(browser_smoke, headless_default=False, config=config)
     browser_smoke.set_defaults(func=cmd_browser_smoke)
 
     datasets = sub.add_parser("datasets", help="Run or sample browser benchmark datasets.")
@@ -181,11 +220,11 @@ def build_parser() -> argparse.ArgumentParser:
     datasets_run.add_argument("--task-id", action="append", default=None)
     datasets_run.add_argument("--run-id", default=None, help="Use a stable run id for manifest/workspaces.")
     datasets_run.add_argument("--resume", action="store_true", help="Skip latest successful task attempts in the run manifest.")
-    datasets_run.add_argument("--provider", choices=["fake", "openai", "codex"], default="codex")
-    datasets_run.add_argument("--model", default="gpt-5.5")
-    datasets_run.add_argument("--max-turns", type=int, default=80)
+    datasets_run.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "codex"))
+    datasets_run.add_argument("--model", default=_model_default(config, "gpt-5.5"))
+    datasets_run.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80))
     datasets_run.add_argument("--task-timeout-s", type=float, default=0.0, help="Optional per-task timeout in seconds.")
-    add_browser_runtime_args(datasets_run, headless_default=True)
+    add_browser_runtime_args(datasets_run, headless_default=True, config=config)
     datasets_run.add_argument(
         "--skip-failed",
         action="store_true",
@@ -199,11 +238,22 @@ def build_parser() -> argparse.ArgumentParser:
     datasets_report.set_defaults(func=cmd_datasets_report)
 
     tui = sub.add_parser("tui", help="Start the terminal UI.")
-    tui.add_argument("--provider", choices=["fake", "openai", "codex"], default="fake")
-    tui.add_argument("--model", default=None)
-    tui.add_argument("--max-turns", type=int, default=80)
-    add_browser_runtime_args(tui, headless_default=None)
+    tui.add_argument("--provider", choices=["fake", "openai", "codex"], default=_provider_default(config, "fake"))
+    tui.add_argument("--model", default=_model_default(config, None))
+    tui.add_argument("--max-turns", type=int, default=_max_turns_default(config, 80))
+    add_browser_runtime_args(tui, headless_default=None, config=config)
     tui.set_defaults(func=cmd_tui)
+
+    config_cmd = sub.add_parser("config", help="Inspect or create browser use terminal config.")
+    config_sub = config_cmd.add_subparsers(dest="config_command", required=True)
+
+    config_show = config_sub.add_parser("show", help="Print merged redacted config.")
+    config_show.set_defaults(func=cmd_config_show)
+
+    config_init = config_sub.add_parser("init", help="Write an example JSON config.")
+    config_init.add_argument("--path", default=str(Path.home() / ".browser-use-terminal" / "config.json"))
+    config_init.add_argument("--force", action="store_true")
+    config_init.set_defaults(func=cmd_config_init)
 
     auth = sub.add_parser("auth", help="Authentication commands.")
     auth_sub = auth.add_subparsers(dest="auth_command", required=True)
@@ -241,7 +291,17 @@ def cmd_doctor(args: argparse.Namespace) -> int:
     from llm_browser.browser import browser_runtime_diagnostics
 
     state_dir = Path(args.state_dir)
-    print(json.dumps({"ok": True, "state_dir": str(state_dir.resolve()), "browser": browser_runtime_diagnostics()}, indent=2))
+    print(
+        json.dumps(
+            {
+                "ok": True,
+                "state_dir": str(state_dir.resolve()),
+                "config": redacted_config(getattr(args, "loaded_config", {})),
+                "browser": browser_runtime_diagnostics(),
+            },
+            indent=2,
+        )
+    )
     return 0
 
 
@@ -415,6 +475,22 @@ def cmd_datasets_report(args: argparse.Namespace) -> int:
     return 0
 
 
+def cmd_config_show(args: argparse.Namespace) -> int:
+    config = getattr(args, "loaded_config", {})
+    payload = {
+        "config": redacted_config(config),
+        "example": example_config() if not config else None,
+    }
+    print(json.dumps(payload, indent=2))
+    return 0
+
+
+def cmd_config_init(args: argparse.Namespace) -> int:
+    path = write_default_config(args.path, force=args.force)
+    print(json.dumps({"ok": True, "path": str(path)}, indent=2))
+    return 0
+
+
 def cmd_tui(args: argparse.Namespace) -> int:
     from llm_browser.tui import TextualTui
 
@@ -424,7 +500,14 @@ def cmd_tui(args: argparse.Namespace) -> int:
         return make_provider(args.provider, args.model)
 
     store = store_from_args(args)
-    return TextualTui(store, provider_factory=provider_factory, max_turns=args.max_turns).run()
+    return TextualTui(
+        store,
+        provider_factory=provider_factory,
+        max_turns=args.max_turns,
+        provider_label=args.provider,
+        model_label=args.model,
+        config=getattr(args, "loaded_config", {}),
+    ).run()
 
 
 def cmd_auth_status(args: argparse.Namespace) -> int:
@@ -673,8 +756,13 @@ def _session_done_result(store: SessionStore, session_id: str) -> Optional[str]:
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:
-    parser = build_parser()
+    pre = argparse.ArgumentParser(add_help=False)
+    pre.add_argument("--config", default=None)
+    pre_args, _ = pre.parse_known_args(argv)
+    config = load_config(pre_args.config)
+    parser = build_parser(config=config)
     args = parser.parse_args(argv)
+    args.loaded_config = config
     return int(args.func(args))
 
 

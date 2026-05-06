@@ -1,13 +1,15 @@
 from __future__ import annotations
 
-import queue
+import errno
 import os
+import pty
+import queue
 import secrets
 import signal
 import subprocess
 import threading
 import time
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.result import ToolResult
@@ -20,11 +22,20 @@ _PROCESSES: Dict[str, "ManagedProcess"] = {}
 
 
 class ManagedProcess:
-    def __init__(self, process_id: str, session_id: str, process: subprocess.Popen, command: str, timeout_s: float) -> None:
+    def __init__(
+        self,
+        process_id: str,
+        session_id: str,
+        process: subprocess.Popen,
+        command: str,
+        timeout_s: float,
+        pty_fd: Optional[int] = None,
+    ) -> None:
         self.process_id = process_id
         self.session_id = session_id
         self.process = process
         self.command = command
+        self.pty_fd = pty_fd
         self.started_at = time.time()
         self.timeout_at = self.started_at + timeout_s if timeout_s > 0 else None
         self.output: list[tuple[str, str]] = []
@@ -50,6 +61,7 @@ class ManagedProcess:
             "returncode": self.process.poll(),
             "running": self.process.poll() is None,
             "age_s": max(0, time.time() - self.started_at),
+            "pty": self.pty_fd is not None,
         }
 
 
@@ -119,30 +131,51 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
 def shell_start(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     command = str(arguments["command"])
     timeout_s = float(arguments.get("timeout_s", 0))
-    process = subprocess.Popen(
-        command,
-        shell=True,
-        cwd=str(ctx.session.cwd),
-        text=True,
-        bufsize=1,
-        stdin=subprocess.PIPE,
-        stdout=subprocess.PIPE,
-        stderr=subprocess.PIPE,
-        start_new_session=True,
-    )
+    use_pty = bool(arguments.get("pty", False))
+    master_fd: int | None = None
+    if use_pty:
+        master_fd, slave_fd = pty.openpty()
+        try:
+            process = subprocess.Popen(
+                command,
+                shell=True,
+                cwd=str(ctx.session.cwd),
+                stdin=slave_fd,
+                stdout=slave_fd,
+                stderr=slave_fd,
+                close_fds=True,
+                start_new_session=True,
+            )
+        finally:
+            os.close(slave_fd)
+    else:
+        process = subprocess.Popen(
+            command,
+            shell=True,
+            cwd=str(ctx.session.cwd),
+            text=True,
+            bufsize=1,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            start_new_session=True,
+        )
     process_id = f"proc_{secrets.token_hex(4)}"
-    managed = ManagedProcess(process_id, ctx.session.id, process, command, timeout_s)
-    managed.readers = [
-        threading.Thread(target=_read_managed_pipe, args=(managed, process.stdout, "stdout"), daemon=True),
-        threading.Thread(target=_read_managed_pipe, args=(managed, process.stderr, "stderr"), daemon=True),
-    ]
+    managed = ManagedProcess(process_id, ctx.session.id, process, command, timeout_s, pty_fd=master_fd)
+    if use_pty:
+        managed.readers = [threading.Thread(target=_read_managed_pty, args=(managed, master_fd), daemon=True)]
+    else:
+        managed.readers = [
+            threading.Thread(target=_read_managed_pipe, args=(managed, process.stdout, "stdout"), daemon=True),
+            threading.Thread(target=_read_managed_pipe, args=(managed, process.stderr, "stderr"), daemon=True),
+        ]
     for reader in managed.readers:
         reader.start()
     with _PROCESS_LOCK:
         _PROCESSES[process_id] = managed
     return ToolResult(
         text=f"started {process_id}",
-        data={"process_id": process_id, "pid": process.pid, "running": True, "command": command},
+        data={"process_id": process_id, "pid": process.pid, "running": True, "command": command, "pty": use_pty},
     )
 
 
@@ -166,10 +199,13 @@ def shell_stdin(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     managed = _get_process(ctx, process_id)
     if managed.process.poll() is not None:
         raise RuntimeError(f"process is not running: {process_id}")
-    if managed.process.stdin is None:
+    if managed.pty_fd is not None:
+        os.write(managed.pty_fd, text.encode("utf-8", errors="replace"))
+    elif managed.process.stdin is None:
         raise RuntimeError(f"process has no stdin: {process_id}")
-    managed.process.stdin.write(text)
-    managed.process.stdin.flush()
+    else:
+        managed.process.stdin.write(text)
+        managed.process.stdin.flush()
     return ToolResult(text=f"wrote {len(text)} chars to {process_id}", data=managed.status())
 
 
@@ -222,6 +258,22 @@ def _read_managed_pipe(managed: ManagedProcess, pipe, stream: str) -> None:
             pass
 
 
+def _read_managed_pty(managed: ManagedProcess, fd: Optional[int]) -> None:
+    if fd is None:
+        return
+    while True:
+        try:
+            data = os.read(fd, 4096)
+        except OSError as exc:
+            if exc.errno in {errno.EIO, errno.EBADF}:
+                return
+            managed.append("pty", f"\n[pty read failed: {exc}]\n")
+            return
+        if not data:
+            return
+        managed.append("pty", data.decode("utf-8", errors="replace"))
+
+
 def _get_process(ctx: ToolContext, process_id: str) -> ManagedProcess:
     with _PROCESS_LOCK:
         managed = _PROCESSES.get(process_id)
@@ -249,6 +301,12 @@ def _finish_managed(managed: ManagedProcess) -> None:
             pass
     for reader in managed.readers:
         reader.join(timeout=0.5)
+    if managed.pty_fd is not None:
+        try:
+            os.close(managed.pty_fd)
+        except OSError:
+            pass
+        managed.pty_fd = None
 
 
 def _terminate_process_group(process: subprocess.Popen, timeout: float) -> None:

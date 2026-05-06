@@ -95,12 +95,13 @@ def build_builtin_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="shell_start",
-            description="Start a long-running shell process in the session working directory and return a process id for polling/stdin/stop.",
+            description="Start a long-running shell process in the session working directory and return a process id for polling/stdin/stop. Pass pty=true for interactive terminal programs.",
             input_schema={
                 "type": "object",
                 "properties": {
                     "command": {"type": "string"},
                     "timeout_s": {"type": "number"},
+                    "pty": {"type": "boolean"},
                 },
                 "required": ["command"],
                 "additionalProperties": False,

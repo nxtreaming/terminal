@@ -6,14 +6,15 @@ Current status: vertical MVP is implemented and being hardened against the bundl
 
 - append-only session/event logs
 - fake, OpenAI Responses, and Codex Responses provider paths
-- redacted Codex auth detection from `~/.codex/auth.json`
+- harness-owned Codex auth with import, device-code login, refresh, and read-only Codex CLI fallback
 - browser backends for owned Chromium/Chrome, Browser Use cloud browsers, explicit CDP endpoints, and real Chrome profile attach
-- persistent Python browser tool with raw `cdp(...)`
+- persistent Python browser tool with raw `cdp(...)`, console/network/download helpers, and browser trace export
 - model-visible screenshot tool outputs with ordered image timelines
-- shell streaming, shell cancellation, and basic file tools
-- event-driven Textual terminal UI with session detail, artifact table, artifact preview, trace, eval, resume, and cancel commands
+- shell streaming, long-running shell processes, optional PTY processes, cancellation, and Codex-style file tools
+- event-driven Textual terminal UI with session detail, artifact table, artifact preview, trace, eval, resume, cancel, auth, and config commands
 - background sessions, cancellation, trace replay, resume, and self-eval commands
 - dataset sampling/running for `real_v8` and `real_v14_short`
+- JSON config defaults for provider, model, browser backend, profile, cloud, and viewport settings
 
 - `docs/browser-agent-harness-plan.md`
 - `docs/browser-agent-harness-learnings.md`
@@ -24,6 +25,9 @@ Current status: vertical MVP is implemented and being hardened against the bundl
 ```bash
 uv run browser-use-terminal doctor
 uv run browser-use-terminal auth status
+uv run browser-use-terminal auth codex import
+uv run browser-use-terminal config show
+uv run browser-use-terminal config init
 uv run browser-use-terminal run --provider fake "Open example.com"
 uv run browser-use-terminal run --provider codex --model gpt-5.5 "Call the done tool with result ok."
 uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
@@ -34,7 +38,7 @@ uv run browser-use-terminal datasets run real_v8 --provider codex --model gpt-5.
 uv run browser-use-terminal sessions self-eval <session-id> --provider codex --model gpt-5.5
 ```
 
-By default runtime state is stored under `.browser-use-terminal/`.
+By default runtime state is stored under `.browser-use-terminal/`. Config is loaded from `~/.browser-use-terminal/config.json` and then `./.browser-use-terminal/config.json`; local config overrides global config, and explicit CLI flags override both.
 
 For headless browser tool runs:
 
@@ -81,6 +85,23 @@ uv run browser-use-terminal tui --browser cloud --cloud-profile-id <uuid> --prov
 ```
 
 Useful shared options: `--browser-width`, `--browser-height`, `--chrome-path`, `--profile-template`, `--keep-profile`, `--cloud-profile-name`, `--cloud-recording`, and `--cloud-custom-proxy-json`.
+
+## Browser Python Helpers
+
+The main browser tool is still an editable Python runtime. Useful built-ins include:
+
+```python
+cdp("Runtime.evaluate", {"expression": "document.title", "returnByValue": True})
+screenshot("after_click", attach=True)
+recent_console()
+recent_network_failures()
+download_info()
+save_browser_trace("checkout")
+```
+
+Downloads land under each session's `browser/downloads/`, screenshots under `browser/screenshots/`, browser traces under `browser/traces/`, and oversized tool output under `tool-output/`.
+
+For interactive terminal programs, use the `shell_start` tool with `pty=true`, then `shell_poll`, `shell_stdin`, and `shell_stop`.
 
 ## Recent Verification
 

@@ -1,6 +1,6 @@
 # Browser Agent Harness Roadmap
 
-Status: execution plan.
+Status: execution plan with the vertical MVP implemented and the main infrastructure slices actively hardened.
 
 This roadmap splits the work into a small vertical MVP and later infrastructure. The MVP is not a toy; it is the thinnest end-to-end product that proves the key idea:
 
@@ -9,6 +9,33 @@ LLM session -> tool execution -> raw CDP/Python browser control -> multiple scre
 ```
 
 Everything else should be added after that spine works on real browser tasks.
+
+## Current Implementation Snapshot
+
+Implemented:
+
+- durable session/event logs and event bus
+- fake, OpenAI Responses, and Codex Responses providers
+- harness-owned Codex auth store, Codex CLI import/fallback, device-code login, refresh, logout, and redacted status
+- owned Chromium/headless Chromium, Browser Use cloud, explicit CDP, and real Chrome attachment modes
+- raw CDP browser runtime with page target/session handling, screenshot artifacts, element crops, download directory configuration, console/network/download helpers, and browser trace JSON export
+- persistent Python browser tool with raw `cdp(...)`, editable helper module imports, ordered model-visible image timelines, artifact upload/download helpers, PDF/text/search helpers, and output spillover
+- shell tool with streaming, cancellation, long-running process polling/stdin/stop, and optional PTY mode
+- file tools with range reads, binary detection, exact edit diagnostics, BOM/newline preservation, diffs, glob, grep, write, and patch
+- background child sessions exposed as normal sessions via a model-visible session tool
+- cancellation, resume, compaction, trace export, and self-eval child sessions
+- Textual TUI with multi-session table, event log, artifact table/preview, trace/eval/resume/cancel/open/report/browser/auth/config commands
+- JSON config defaults for provider, model, browser backend/profile/cloud/viewport settings
+- dataset sample/run/report commands for `real_v8` and `real_v14_short`
+
+Still intentionally pending or incomplete:
+
+- a separate cross-process browser daemon and IPC layer like the original browser harness
+- external sidecar viewer/websocket
+- shell completions and installer polish
+- broad dataset iteration/regression work after the infrastructure settles
+- named profile migration UI and richer profile picker
+- live terminal image rendering beyond artifact preview/open
 
 ## Definition of Done
 

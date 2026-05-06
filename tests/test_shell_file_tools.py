@@ -121,6 +121,28 @@ class ShellFileToolsTest(unittest.TestCase):
             self.assertIn("echo:hello", second.text)
             self.assertTrue(stopped.data["stopped"])
 
+    def test_managed_shell_process_can_use_pty(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            command = (
+                "python -c "
+                "\"import sys; print('tty=' + str(sys.stdin.isatty()), flush=True); "
+                "line = sys.stdin.readline(); print('got:' + line.strip(), flush=True)\""
+            )
+
+            started = shell_start(ctx, {"command": command, "timeout_s": 5, "pty": True})
+            process_id = started.data["process_id"]
+            time.sleep(0.2)
+            first = shell_poll(ctx, {"process_id": process_id})
+            shell_stdin(ctx, {"process_id": process_id, "text": "hello\n"})
+            time.sleep(0.2)
+            second = shell_poll(ctx, {"process_id": process_id})
+            shell_stop(ctx, {"process_id": process_id})
+
+            self.assertTrue(started.data["pty"])
+            self.assertIn("tty=True", first.text)
+            self.assertIn("got:hello", second.text)
+
     def test_apply_patch_applies_unified_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             ctx = self.make_context(tmp)

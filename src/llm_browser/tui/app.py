@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import queue
 import re
@@ -19,6 +20,7 @@ from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
 from llm_browser.agent import SessionManager
 from llm_browser.browser import browser_runtime_diagnostics
 from llm_browser.brand import PRODUCT_NAME
+from llm_browser.config import redacted_config
 from llm_browser.datasets import build_dataset_prompt, load_dataset, load_manifest, select_tasks, summarize_manifest
 from llm_browser.events import Event
 from llm_browser.provider.base import Provider
@@ -147,10 +149,16 @@ class BrowserUseTerminalApp(App[None]):
         store: SessionStore,
         provider_factory: Optional[ProviderFactory] = None,
         max_turns: int = 80,
+        provider_label: str = "fake",
+        model_label: Optional[str] = None,
+        config: Optional[dict] = None,
     ) -> None:
         super().__init__()
         self.store = store
         self.manager = SessionManager(store, provider_factory=provider_factory, max_turns=max_turns)
+        self.provider_label = provider_label
+        self.model_label = model_label
+        self.config = config or {}
         self.selected_session_id: Optional[str] = None
         self.selected_artifact_path: Optional[str] = None
         self._preview_key: Optional[tuple[str, float, int]] = None
@@ -176,6 +184,7 @@ class BrowserUseTerminalApp(App[None]):
                     "show/resume/cancel [id]\n"
                     "trace/eval [id]\n"
                     "browser\n"
+                    "auth/config\n"
                     "open [artifact]\n"
                     "ctrl-r refresh  ctrl-l clear",
                     id="help",
@@ -240,6 +249,7 @@ class BrowserUseTerminalApp(App[None]):
             "[bold]report[/bold] a dataset run, [bold]browser[/bold] config, [bold]open[/bold] an artifact."
         )
         log.write(f"Browser: [bold]{escape(_browser_runtime_label())}[/bold]")
+        log.write(f"Provider: [bold]{escape(self.provider_label)}[/bold]  Model: [bold]{escape(self.model_label or '-')}[/bold]")
 
     def _handle_event(self, event: Event) -> None:
         if self.selected_session_id is None:
@@ -352,6 +362,22 @@ class BrowserUseTerminalApp(App[None]):
             log.write("[green]artifacts refreshed[/green]")
         elif command == "browser":
             log.write(escape(_browser_runtime_detail()))
+        elif command == "config":
+            log.write(escape(json.dumps(redacted_config(self.config), indent=2)))
+        elif command == "auth":
+            from llm_browser.auth import auth_status
+
+            log.write(
+                escape(
+                    json.dumps(
+                        {
+                            "codex": auth_status(),
+                            "openai_api_key": bool(os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")),
+                        },
+                        indent=2,
+                    )
+                )
+            )
         elif command == "report":
             run_id = args[1] if len(args) >= 2 else self._selected_dataset_run_id()
             if not run_id:
@@ -575,6 +601,8 @@ class BrowserUseTerminalApp(App[None]):
             f"[#9ccfd8]running[/] [bold]{counts.get('running', 0)}[/bold]  "
             f"[green]done[/green] [bold]{counts.get('done', 0)}[/bold]  "
             f"[red]failed[/red] [bold]{counts.get('failed', 0)}[/bold]  "
+            f"[#b9b2a7]provider[/] {escape(self.provider_label)}  "
+            f"[#b9b2a7]model[/] {escape(self.model_label or '-')}  "
             f"[#b9b2a7]browser[/] {escape(_browser_runtime_label())}  "
             f"{self._selected_run_summary_text()} "
             f"[#b9b2a7]selected[/] {escape(self.selected_session_id or '-')}"
@@ -928,13 +956,15 @@ def _final_line(events: list[Event]) -> str:
 
 
 def _artifact_kind(path: Path) -> str:
+    if "traces" in path.parts:
+        return "trace"
+    if "downloads" in path.parts:
+        return "download"
     suffix = path.suffix.lower()
     if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
         return "image"
     if suffix in {".json", ".jsonl"}:
         return "json"
-    if "downloads" in path.parts:
-        return "download"
     if "tool-output" in path.parts:
         return "tool"
     if "dataset-runs" in path.parts:
@@ -980,8 +1010,18 @@ class TextualTui:
         store: SessionStore,
         provider_factory: Optional[ProviderFactory] = None,
         max_turns: int = 80,
+        provider_label: str = "fake",
+        model_label: Optional[str] = None,
+        config: Optional[dict] = None,
     ) -> None:
-        self.app = BrowserUseTerminalApp(store, provider_factory=provider_factory, max_turns=max_turns)
+        self.app = BrowserUseTerminalApp(
+            store,
+            provider_factory=provider_factory,
+            max_turns=max_turns,
+            provider_label=provider_label,
+            model_label=model_label,
+            config=config,
+        )
 
     def run(self) -> int:
         self.app.run()
