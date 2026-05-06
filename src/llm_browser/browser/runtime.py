@@ -123,16 +123,25 @@ class BrowserRuntime:
             self.navigate(url, wait=False)
         return target
 
-    def cdp(self, method: str, params: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None) -> Dict[str, Any]:
+    def cdp(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+        retry: bool = True,
+    ) -> Dict[str, Any]:
         if self.client is None:
             self.attach_first_page()
         assert self.client is not None
         try:
-            return self.client.call(method, params=params, session_id=session_id)
+            return self.client.call(method, params=params, session_id=session_id, timeout_s=timeout_s)
         except CdpConnectionError:
+            if not retry:
+                raise
             self._reattach_after_disconnect()
             assert self.client is not None
-            return self.client.call(method, params=params, session_id=session_id)
+            return self.client.call(method, params=params, session_id=session_id, timeout_s=timeout_s)
 
     def _reattach_after_disconnect(self) -> None:
         if self.client is not None:
@@ -277,16 +286,22 @@ class BrowserRuntime:
         )
         return json.loads(raw or "[]")
 
-    def screenshot(self, label: str = "screenshot", attach: bool = True, full_page: bool = False) -> ToolImage:
+    def screenshot(
+        self,
+        label: str = "screenshot",
+        attach: bool = True,
+        full_page: bool = False,
+        timeout_s: float = 8.0,
+    ) -> ToolImage:
         params: Dict[str, Any] = {"format": "png", "fromSurface": True}
         if full_page:
             params["captureBeyondViewport"] = True
-            metrics = self.cdp("Page.getLayoutMetrics")
+            metrics = self.cdp("Page.getLayoutMetrics", timeout_s=timeout_s, retry=False)
             size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
             width = max(1, int(math.ceil(float(size.get("width") or 1280))))
             height = max(1, int(math.ceil(float(size.get("height") or 900))))
             params["clip"] = {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
-        result = self.cdp("Page.captureScreenshot", params)
+        result = self.cdp("Page.captureScreenshot", params, timeout_s=timeout_s, retry=False)
         data = base64.b64decode(result["data"])
 
         self._screenshot_index += 1

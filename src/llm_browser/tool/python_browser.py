@@ -394,8 +394,13 @@ class PythonBrowserTool:
                 if close_stream:
                     stream.close()
 
-        def screenshot(label: str = "screenshot", attach: bool = True, full_page: bool = False) -> ToolImage:
-            image = runtime.screenshot(label=label, attach=attach, full_page=full_page)
+        def screenshot(
+            label: str = "screenshot",
+            attach: bool = True,
+            full_page: bool = False,
+            timeout_s: float = 8.0,
+        ) -> ToolImage:
+            image = runtime.screenshot(label=label, attach=attach, full_page=full_page, timeout_s=timeout_s)
             if attach:
                 images.append(image)
                 ctx.emit_image(image)

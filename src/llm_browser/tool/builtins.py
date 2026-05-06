@@ -27,7 +27,7 @@ def build_builtin_registry() -> ToolRegistry:
             description=(
                 "Run persistent Python for browser work. Raw CDP is available as "
                 "cdp(method, params=None). Helpers include new_tab(url), navigate(url), tabs(), "
-                "attach_tab(...), js(expr), wait_for_load(), screenshot(label, attach=True), "
+                "attach_tab(...), js(expr), wait_for_load(), screenshot(label, attach=True, timeout_s=8), "
                 "click_at(x,y), type_text(text), press(key), scroll(dx=0, dy=500), page_info(), "
                 "visible_text(), deep_text(), links(), click_text(text_or_regex), dismiss_cookie_banners(), "
                 "save_helper(), load_helper(), save_artifact(), "

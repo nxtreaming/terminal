@@ -12,12 +12,19 @@ class FakeWebSocket:
         self.replies = list(replies)
         self.sent = []
         self.closed = False
+        self.timeout = 30.0
 
     def send(self, payload: str) -> None:
         self.sent.append(json.loads(payload))
 
     def recv(self) -> str:
         return json.dumps(self.replies.pop(0))
+
+    def settimeout(self, timeout: float) -> None:
+        self.timeout = timeout
+
+    def gettimeout(self) -> float:
+        return self.timeout
 
     def close(self) -> None:
         self.closed = True
@@ -47,6 +54,15 @@ class CdpClientTest(unittest.TestCase):
             client = CdpClient("ws://example")
             with self.assertRaises(CdpError):
                 client.call("Bad.method")
+
+    def test_call_uses_per_call_timeout_and_restores_default(self) -> None:
+        ws = FakeWebSocket([{"id": 1, "result": {"ok": True}}])
+
+        with patch("llm_browser.browser.cdp.websocket.create_connection", return_value=ws):
+            client = CdpClient("ws://example")
+            self.assertEqual(client.call("Runtime.evaluate", timeout_s=4), {"ok": True})
+
+        self.assertEqual(ws.timeout, 30.0)
 
 
 if __name__ == "__main__":

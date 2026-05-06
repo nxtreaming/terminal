@@ -80,7 +80,13 @@ class FakeRuntime:
         self.last_load_timeout = timeout_s
         return {"text": text, "timeout_s": timeout_s}
 
-    def screenshot(self, label: str = "screenshot", attach: bool = True, full_page: bool = False) -> ToolImage:
+    def screenshot(
+        self,
+        label: str = "screenshot",
+        attach: bool = True,
+        full_page: bool = False,
+        timeout_s: float = 8.0,
+    ) -> ToolImage:
         path = self.root_dir / "shot.png"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_bytes(b"png-bytes")

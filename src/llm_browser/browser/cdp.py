@@ -50,44 +50,55 @@ class CdpClient:
         method: str,
         params: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         self.connect()
         if self._ws is None:
             raise CdpError("CDP websocket is not connected")
 
         with self._lock:
-            self._next_id += 1
-            request_id = self._next_id
-            message: Dict[str, Any] = {
-                "id": request_id,
-                "method": method,
-                "params": params or {},
-            }
-            if session_id:
-                message["sessionId"] = session_id
+            previous_timeout = None
+            timeout_changed = timeout_s is not None and hasattr(self._ws, "settimeout")
+            if timeout_changed:
+                if hasattr(self._ws, "gettimeout"):
+                    previous_timeout = self._ws.gettimeout()
+                self._ws.settimeout(timeout_s)
             try:
-                self._ws.send(json.dumps(message, separators=(",", ":")))
-            except websocket.WebSocketException as exc:
-                self.close()
-                raise CdpConnectionError(f"CDP websocket send failed: {exc}") from exc
-
-            while True:
+                self._next_id += 1
+                request_id = self._next_id
+                message: Dict[str, Any] = {
+                    "id": request_id,
+                    "method": method,
+                    "params": params or {},
+                }
+                if session_id:
+                    message["sessionId"] = session_id
                 try:
-                    raw = self._ws.recv()
+                    self._ws.send(json.dumps(message, separators=(",", ":")))
                 except websocket.WebSocketException as exc:
                     self.close()
-                    raise CdpConnectionError(f"CDP websocket receive failed: {exc}") from exc
-                if not raw:
-                    self.close()
-                    raise CdpConnectionError("CDP websocket closed")
-                payload = json.loads(raw)
-                if payload.get("id") != request_id:
-                    self._events.append(payload)
-                    continue
-                if "error" in payload:
-                    error = payload["error"]
-                    raise CdpError(f"{method} failed: {error}")
-                return payload.get("result") or {}
+                    raise CdpConnectionError(f"CDP websocket send failed: {exc}") from exc
+
+                while True:
+                    try:
+                        raw = self._ws.recv()
+                    except websocket.WebSocketException as exc:
+                        self.close()
+                        raise CdpConnectionError(f"CDP websocket receive failed: {exc}") from exc
+                    if not raw:
+                        self.close()
+                        raise CdpConnectionError("CDP websocket closed")
+                    payload = json.loads(raw)
+                    if payload.get("id") != request_id:
+                        self._events.append(payload)
+                        continue
+                    if "error" in payload:
+                        error = payload["error"]
+                        raise CdpError(f"{method} failed: {error}")
+                    return payload.get("result") or {}
+            finally:
+                if timeout_changed and previous_timeout is not None and self._ws is not None and hasattr(self._ws, "settimeout"):
+                    self._ws.settimeout(previous_timeout)
 
     def drain_events(self):
         events = list(self._events)
