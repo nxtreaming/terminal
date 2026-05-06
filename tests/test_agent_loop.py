@@ -49,6 +49,25 @@ class TextOnlyProvider:
         yield ModelEvent.text("direct final")
 
 
+class SpawnChildProvider:
+    def __init__(self):
+        self.turn = 0
+
+    def start_turn(self, messages, tools):
+        self.turn += 1
+        if self.turn == 1:
+            yield ModelEvent.call(
+                ToolCall(
+                    id="call_session",
+                    name="session",
+                    arguments={"action": "create", "prompt": "child task"},
+                )
+            )
+        else:
+            tool_message = [message for message in messages if message.get("role") == "tool"][-1]
+            yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": str(tool_message["content"])}))
+
+
 class AgentLoopTest(unittest.TestCase):
     def test_fake_provider_executes_tools_and_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -265,6 +284,32 @@ class AgentLoopTest(unittest.TestCase):
             self.assertEqual(resumed.status, "done")
             inputs = [event for event in store.events.read(session.id) if event.type == "session.input"]
             self.assertTrue(inputs[-1].payload["resumed"])
+
+    def test_session_tool_starts_child_as_normal_background_session(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            parent = Agent(
+                store,
+                provider=SpawnChildProvider(),
+                provider_factory=lambda: None,
+            ).run("spawn child", cwd=Path(tmp))
+
+            children = [session for session in store.list() if session.parent_id == parent.id]
+            self.assertEqual(len(children), 1)
+            child = children[0]
+            for _ in range(40):
+                loaded = store.load(child.id)
+                if loaded and loaded.status == "done":
+                    break
+                __import__("time").sleep(0.05)
+            loaded = store.load(child.id)
+            self.assertIsNotNone(loaded)
+            assert loaded is not None
+            self.assertEqual(loaded.status, "done")
+            parent_events = [event.type for event in store.events.read(parent.id)]
+            self.assertIn("session.child_started", parent_events)
+            child_events = [event.type for event in store.events.read(child.id)]
+            self.assertIn("session.parent", child_events)
 
 
 if __name__ == "__main__":

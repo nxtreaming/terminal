@@ -49,8 +49,7 @@ class SessionManager:
 
         def target() -> None:
             try:
-                provider = self.provider_factory()
-                agent = Agent(self.store, provider=provider, max_turns=self.max_turns)
+                agent = Agent(self.store, provider_factory=self.provider_factory, max_turns=self.max_turns)
                 agent.run_session(session.id, task)
             except BaseException:
                 active_ref["active"].error = traceback.format_exc()

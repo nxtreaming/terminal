@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import time
 from pathlib import Path
-from typing import Any, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional
 
 from llm_browser.agent.compaction import compact_messages, message_chars
 from llm_browser.provider.base import Provider
@@ -15,6 +15,7 @@ from llm_browser.tool.builtins import build_builtin_registry
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
 from llm_browser.tool.result import ToolResult
+from llm_browser.tool.session import SessionTool, session_tool_spec
 
 MAX_INLINE_TOOL_TEXT = 20000
 DEFAULT_COMPACT_AFTER_CHARS = 120000
@@ -29,6 +30,7 @@ class Agent:
         self,
         store: SessionStore,
         provider: Optional[Provider] = None,
+        provider_factory: Optional[Callable[[], Optional[Provider]]] = None,
         tools: Optional[ToolRegistry] = None,
         max_turns: int = 80,
         recover_tool_errors: bool = True,
@@ -36,7 +38,8 @@ class Agent:
         time_budget_s: Optional[float] = None,
     ) -> None:
         self.store = store
-        self.provider = provider or FakeProvider()
+        self.provider_factory = provider_factory or (lambda: provider)
+        self.provider = provider or (provider_factory() if provider_factory else None) or FakeProvider()
         self.tools = tools or build_builtin_registry()
         self.max_turns = max_turns
         self.recover_tool_errors = recover_tool_errors
@@ -44,6 +47,11 @@ class Agent:
         self.time_budget_s = time_budget_s
         self.deadline_at = time.monotonic() + time_budget_s if time_budget_s and time_budget_s > 0 else None
         self._deadline_warning_sent = False
+        if tools is None:
+            self.tools.register(
+                session_tool_spec(),
+                SessionTool(self.store, provider_factory=self._child_provider_factory, max_turns=self.max_turns),
+            )
 
     def run(
         self,
@@ -278,6 +286,12 @@ class Agent:
                 text=f"[tool error: {type(exc).__name__}: {exc}]",
                 data={"ok": False, "error": str(exc), "error_type": type(exc).__name__},
             )
+
+    def _child_provider_factory(self) -> Optional[Provider]:
+        provider = self.provider_factory()
+        if provider is None:
+            return FakeProvider()
+        return provider
 
     def _spill_large_tool_output(self, ctx: ToolContext, call: ToolCall, result: ToolResult) -> ToolResult:
         summary = result._text_summary()

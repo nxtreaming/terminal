@@ -51,8 +51,7 @@ class SimpleTui:
             print("unknown command")
 
     def _run_task(self, task: str) -> None:
-        provider = self.provider_factory()
-        agent = Agent(self.store, provider=provider)
+        agent = Agent(self.store, provider_factory=self.provider_factory)
         error = []
 
         def target() -> None:

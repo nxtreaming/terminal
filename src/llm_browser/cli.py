@@ -248,8 +248,7 @@ def cmd_doctor(args: argparse.Namespace) -> int:
 def cmd_run(args: argparse.Namespace) -> int:
     apply_browser_runtime_args(args)
     store = store_from_args(args)
-    provider = make_provider(args.provider, args.model)
-    agent = Agent(store, provider=provider, max_turns=args.max_turns)
+    agent = Agent(store, provider_factory=lambda: make_provider(args.provider, args.model), max_turns=args.max_turns)
     session = agent.run(args.task, parent_id=args.parent_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
@@ -287,7 +286,7 @@ def cmd_sessions_cancel(args: argparse.Namespace) -> int:
 
 def cmd_sessions_resume(args: argparse.Namespace) -> int:
     store = store_from_args(args)
-    agent = Agent(store, provider=make_provider(args.provider, args.model), max_turns=args.max_turns)
+    agent = Agent(store, provider_factory=lambda: make_provider(args.provider, args.model), max_turns=args.max_turns)
     session = agent.resume_session(args.session_id, args.instruction)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
@@ -303,7 +302,7 @@ def cmd_sessions_trace(args: argparse.Namespace) -> int:
 def cmd_sessions_self_eval(args: argparse.Namespace) -> int:
     store = store_from_args(args)
     prompt = build_self_eval_prompt(store, args.session_id)
-    agent = Agent(store, provider=make_provider(args.provider, args.model), max_turns=args.max_turns)
+    agent = Agent(store, provider_factory=lambda: make_provider(args.provider, args.model), max_turns=args.max_turns)
     session = agent.run(prompt, parent_id=args.session_id)
     print(json.dumps(session.to_dict(), indent=2))
     return 0
@@ -593,7 +592,7 @@ def _run_dataset_task(
         try:
             agent = Agent(
                 store,
-                provider=make_provider(provider_name, model),
+                provider_factory=lambda: make_provider(provider_name, model),
                 max_turns=max_turns,
                 time_budget_s=timeout_s if timeout_s and timeout_s > 0 else None,
             )
