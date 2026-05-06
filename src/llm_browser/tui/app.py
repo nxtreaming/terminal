@@ -9,6 +9,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from rich.markup import escape
+from rich.text import Text
 from textual.app import App, ComposeResult
 from textual.containers import Horizontal, Vertical
 from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
@@ -29,13 +30,13 @@ ProviderFactory = Callable[[], Optional[Provider]]
 class BrowserUseTerminalApp(App[None]):
     CSS = """
     Screen {
-        background: #091016;
-        color: #dce7ef;
+        background: #0b0d10;
+        color: #e5e1d8;
     }
 
     Header {
-        background: #101820;
-        color: #f5fbff;
+        background: #171a20;
+        color: #f4f0e8;
     }
 
     #body {
@@ -45,16 +46,16 @@ class BrowserUseTerminalApp(App[None]):
     #statusbar {
         height: 1;
         padding: 0 1;
-        background: #14212b;
-        color: #b8d8e3;
+        background: #20242b;
+        color: #c9c3b8;
         text-style: bold;
     }
 
     #left {
-        width: 38;
-        min-width: 28;
-        background: #0d1820;
-        border: tall #22313d;
+        width: 44;
+        min-width: 34;
+        background: #11141a;
+        border: tall #2b3039;
     }
 
     #center {
@@ -63,66 +64,66 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #right {
-        width: 52;
+        width: 56;
         min-width: 36;
-        background: #0d1820;
-        border: tall #22313d;
+        background: #11141a;
+        border: tall #2b3039;
     }
 
     #sessions-title, #events-title, #artifacts-title, #detail-title, #preview-title, #help-title {
         height: 1;
         padding: 0 1;
-        background: #16232e;
-        color: #9edbe8;
+        background: #20242b;
+        color: #9ccfd8;
         text-style: bold;
     }
 
     #sessions {
         height: 1fr;
-        background: #0d1820;
+        background: #11141a;
     }
 
     #help {
-        height: 7;
+        height: 8;
         padding: 1;
-        color: #9fb2bf;
-        background: #0a141b;
+        color: #b9b2a7;
+        background: #0f1116;
     }
 
     #events {
         height: 1fr;
-        border: tall #22313d;
-        background: #091016;
+        border: tall #2b3039;
+        background: #0b0d10;
     }
 
     #session-detail {
         height: 10;
         padding: 1;
-        color: #c8d9e2;
-        background: #0a141b;
+        color: #d8d1c8;
+        background: #0f1116;
     }
 
     #artifacts {
         height: 1fr;
-        background: #0d1820;
+        background: #11141a;
     }
 
     #artifact-preview {
         height: 12;
-        border: tall #22313d;
-        background: #091016;
+        border: tall #2b3039;
+        background: #0b0d10;
     }
 
     #command {
         height: 3;
-        border: tall #9edbe8;
-        background: #101820;
-        color: #f5fbff;
+        border: tall #9ccfd8;
+        background: #171a20;
+        color: #f4f0e8;
     }
 
     DataTable {
-        scrollbar-color: #315162;
-        scrollbar-background: #0a141b;
+        scrollbar-color: #3c5660;
+        scrollbar-background: #0f1116;
     }
     """
 
@@ -147,6 +148,7 @@ class BrowserUseTerminalApp(App[None]):
         self.selected_session_id: Optional[str] = None
         self.selected_artifact_path: Optional[str] = None
         self._preview_key: Optional[tuple[str, float, int]] = None
+        self._model_buffers: dict[str, str] = {}
         self._stop = threading.Event()
         self._listener: Optional[threading.Thread] = None
 
@@ -157,12 +159,13 @@ class BrowserUseTerminalApp(App[None]):
             with Vertical(id="left"):
                 yield Static("sessions", id="sessions-title")
                 sessions = DataTable(id="sessions", cursor_type="row")
-                sessions.add_columns("id", "status", "task")
+                sessions.add_columns("id", "state", "age", "task")
                 yield sessions
                 yield Static("commands", id="help-title")
                 yield Static(
                     "run <task>\n"
-                    "dataset <name> [count]\n"
+                    "dataset <name> [count|--all]\n"
+                    "dataset <name> --task-id <id>\n"
                     "show/resume/cancel [id]\n"
                     "trace/eval [id]\n"
                     "open [artifact]\n"
@@ -224,7 +227,7 @@ class BrowserUseTerminalApp(App[None]):
         log = self.query_one("#events", RichLog)
         log.write("[bold #9ccfd8]browser use terminal[/bold #9ccfd8]")
         log.write(
-            "Commands: [bold]run[/bold] a task, [bold]dataset real_v8 1[/bold], "
+            "Commands: [bold]run[/bold] a task, [bold]dataset real_v8 --task-id 20[/bold], "
             "[bold]resume[/bold] selected, [bold]cancel[/bold] a session, [bold]show[/bold] a session, "
             "[bold]open[/bold] an artifact."
         )
@@ -232,24 +235,57 @@ class BrowserUseTerminalApp(App[None]):
     def _handle_event(self, event: Event) -> None:
         if self.selected_session_id is None:
             self.selected_session_id = event.session_id
-        log = self.query_one("#events", RichLog)
-        line = escape(format_event(event))
-        if event.type == "tool.failed":
-            log.write(f"[red]{line}[/red]")
-        elif event.type == "tool.image":
-            log.write(f"[bold #9ccfd8]{line}[/bold #9ccfd8]")
-        elif event.type == "tool.output":
-            log.write(f"[dim]{line}[/dim]")
-        elif event.type in {"session.done", "session.cancelled"}:
-            log.write(f"[green]{line}[/green]")
-        elif event.type == "session.failed":
-            log.write(f"[bold red]{line}[/bold red]")
-        else:
-            log.write(line)
+
+        if event.type == "model.delta":
+            self._append_model_delta(event)
+            return
+
+        self._flush_model_delta(event.session_id)
+        self._write_log_line(format_event(event), event.type)
         self.refresh_sessions()
         self.refresh_artifacts()
         self._update_statusbar()
         self._update_session_detail()
+
+    def _append_model_delta(self, event: Event) -> None:
+        text = str(event.payload.get("text") or "")
+        if not text:
+            return
+        buffered = self._model_buffers.get(event.session_id, "") + text
+        self._model_buffers[event.session_id] = buffered
+        if "\n" in buffered or len(buffered) >= 700:
+            self._flush_model_delta(event.session_id)
+
+    def _flush_model_delta(self, session_id: str) -> None:
+        text = self._model_buffers.pop(session_id, "")
+        if not text.strip():
+            return
+        collapsed = " ".join(text.strip().split())
+        self._write_log_line(f"[{session_id}] model: {collapsed}", "model.delta")
+
+    def _flush_all_model_deltas(self) -> None:
+        for session_id in list(self._model_buffers):
+            self._flush_model_delta(session_id)
+
+    def _write_log_line(self, line: str, event_type: str) -> None:
+        log = self.query_one("#events", RichLog)
+        escaped = escape(line)
+        if event_type == "tool.failed":
+            log.write(f"[red]{escaped}[/red]")
+        elif event_type == "tool.image":
+            log.write(f"[bold #9ccfd8]{escaped}[/bold #9ccfd8]")
+        elif event_type == "tool.output":
+            log.write(f"[dim]{escaped}[/dim]")
+        elif event_type == "model.delta":
+            log.write(f"[#d8cab8]{escaped}[/]")
+        elif event_type in {"session.done", "session.cancelled"}:
+            log.write(f"[green]{escaped}[/green]")
+        elif event_type == "session.failed":
+            log.write(f"[bold red]{escaped}[/bold red]")
+        elif event_type == "session.deadline_warning":
+            log.write(f"[yellow]{escaped}[/yellow]")
+        else:
+            log.write(escaped)
 
     def on_input_submitted(self, event: Input.Submitted) -> None:
         line = event.value.strip()
@@ -347,8 +383,15 @@ class BrowserUseTerminalApp(App[None]):
                 if rest[index] == "--task-id" and index + 1 < len(rest):
                     task_ids.append(rest[index + 1])
                     index += 2
+                elif rest[index] == "--all":
+                    count = len(load_dataset(args[1]))
+                    index += 1
                 else:
-                    count = int(rest[index])
+                    try:
+                        count = int(rest[index])
+                    except ValueError:
+                        log.write(f"[red]invalid dataset option: {escape(rest[index])}[/red]")
+                        return
                     index += 1
             tasks = select_tasks(load_dataset(args[1]), count=count, task_ids=task_ids or None)
             for task in tasks:
@@ -369,8 +412,8 @@ class BrowserUseTerminalApp(App[None]):
             log.write(f"[red]session not found: {escape(session_id)}[/red]")
             return
         log.write(f"[bold #9ccfd8]session {escape(session.id)}[/bold #9ccfd8] {escape(session.status)}")
-        for event in self.store.events.read(session.id)[-400:]:
-            log.write(escape(format_event(event)))
+        for line, event_type in _format_events_for_log(self.store.events.read(session.id)[-400:]):
+            self._write_log_line(line, event_type)
         self._update_session_detail()
 
     def refresh_sessions(self) -> None:
@@ -378,7 +421,13 @@ class BrowserUseTerminalApp(App[None]):
         table.clear()
         for session in self.store.list():
             task = self._task_for_session(session)
-            table.add_row(session.id, session.status, task[:38], key=session.id)
+            table.add_row(
+                session.id,
+                _status_text(session.status),
+                _format_age(session.updated_ms / 1000),
+                task[:46],
+                key=session.id,
+            )
         if self.selected_session_id is None:
             sessions = self.store.list()
             if sessions:
@@ -421,6 +470,7 @@ class BrowserUseTerminalApp(App[None]):
         self.refresh_artifacts()
 
     def action_clear_log(self) -> None:
+        self._model_buffers.clear()
         self.query_one("#events", RichLog).clear()
 
     def action_open_artifact(self) -> None:
@@ -479,14 +529,14 @@ class BrowserUseTerminalApp(App[None]):
         for session in sessions:
             counts[session.status] = counts.get(session.status, 0) + 1
         text = (
-            f"{PRODUCT_NAME}  "
-            f"sessions {len(sessions)}  "
-            f"running {counts.get('running', 0)}  "
-            f"done {counts.get('done', 0)}  "
-            f"failed {counts.get('failed', 0)}  "
-            f"selected {self.selected_session_id or '-'}"
+            f"[bold #f4f0e8]{PRODUCT_NAME}[/bold #f4f0e8]  "
+            f"[#b9b2a7]sessions[/] [bold]{len(sessions)}[/bold]  "
+            f"[#9ccfd8]running[/] [bold]{counts.get('running', 0)}[/bold]  "
+            f"[green]done[/green] [bold]{counts.get('done', 0)}[/bold]  "
+            f"[red]failed[/red] [bold]{counts.get('failed', 0)}[/bold]  "
+            f"[#b9b2a7]selected[/] {escape(self.selected_session_id or '-')}"
         )
-        self.query_one("#statusbar", Static).update(escape(text))
+        self.query_one("#statusbar", Static).update(text)
 
     def _update_session_detail(self) -> None:
         detail = self.query_one("#session-detail", Static)
@@ -501,14 +551,16 @@ class BrowserUseTerminalApp(App[None]):
         events = self.store.events.read(session.id)
         images = sum(1 for event in events if event.type == "tool.image")
         tools = sum(1 for event in events if event.type == "tool.started")
+        artifacts = len(_artifact_paths(session))
         task = self._task_for_session(session)
         detail.update(
             f"[bold]{escape(session.id)}[/bold]\n"
             f"status: {escape(session.status)}\n"
             f"parent: {escape(session.parent_id or '-')}\n"
-            f"events: {len(events)}  tools: {tools}  images: {images}\n"
+            f"events: {len(events)}  tools: {tools}  images: {images}  artifacts: {artifacts}\n"
+            f"updated: {_format_age(session.updated_ms / 1000)}\n"
             f"cwd: {escape(str(session.cwd))}\n"
-            f"task: {escape(task[:180])}"
+            f"task: {escape(task[:220])}"
         )
 
     def _preview_artifact(self, path: Optional[str], force: bool = False) -> None:
@@ -534,6 +586,9 @@ class BrowserUseTerminalApp(App[None]):
         preview.write(f"[bold #9edbe8]{escape(artifact.name)}[/bold #9edbe8]  {kind}  {_format_bytes(stat.st_size)}")
         preview.write(escape(str(artifact)))
         if kind == "image":
+            dims = _image_dimensions(artifact)
+            if dims:
+                preview.write(f"dimensions: {dims[0]} x {dims[1]}")
             preview.write("[dim]Image artifact. Press enter or `open` to view it.[/dim]")
             meta = artifact.with_suffix(".json")
             if meta.exists():
@@ -553,7 +608,7 @@ class BrowserUseTerminalApp(App[None]):
     def _task_for_session(self, session: SessionMetadata) -> str:
         for event in self.store.events.read(session.id):
             if event.type == "session.input":
-                return str(event.payload.get("text") or "")
+                return _summarize_task_text(str(event.payload.get("text") or ""))
         return ""
 
 
@@ -578,6 +633,57 @@ def _artifact_paths(session: SessionMetadata) -> list[Path]:
     return sorted(set(paths), key=lambda path: path.stat().st_mtime, reverse=True)[:200]
 
 
+def _format_events_for_log(events: list[Event]) -> list[tuple[str, str]]:
+    lines: list[tuple[str, str]] = []
+    model_buffers: dict[str, str] = {}
+
+    def flush(session_id: str) -> None:
+        text = model_buffers.pop(session_id, "")
+        if text.strip():
+            collapsed = " ".join(text.strip().split())
+            lines.append((f"[{session_id}] model: {collapsed}", "model.delta"))
+
+    for event in events:
+        if event.type == "model.delta":
+            text = str(event.payload.get("text") or "")
+            if not text:
+                continue
+            buffered = model_buffers.get(event.session_id, "") + text
+            model_buffers[event.session_id] = buffered
+            if "\n" in buffered or len(buffered) >= 700:
+                flush(event.session_id)
+            continue
+        flush(event.session_id)
+        lines.append((format_event(event), event.type))
+
+    for session_id in list(model_buffers):
+        flush(session_id)
+    return lines
+
+
+def _summarize_task_text(text: str) -> str:
+    task = text
+    marker = "\nTask:\n"
+    if marker in task:
+        task = task.split(marker, 1)[1]
+    for stop in ("\n\nRuntime budget:", "\nRuntime budget:"):
+        if stop in task:
+            task = task.split(stop, 1)[0]
+    return " ".join(task.split())
+
+
+def _status_text(status: str) -> Text:
+    styles = {
+        "running": "bold #9ccfd8",
+        "done": "bold green",
+        "failed": "bold red",
+        "cancelled": "bold yellow",
+        "created": "#b9b2a7",
+    }
+    label = status.upper()[:9]
+    return Text(label, style=styles.get(status, "#d8cab8"))
+
+
 def _artifact_kind(path: Path) -> str:
     suffix = path.suffix.lower()
     if suffix in {".png", ".jpg", ".jpeg", ".webp"}:
@@ -591,6 +697,16 @@ def _artifact_kind(path: Path) -> str:
     if "dataset-runs" in path.parts:
         return "workspace"
     return suffix.lstrip(".") or "file"
+
+
+def _image_dimensions(path: Path) -> Optional[tuple[int, int]]:
+    try:
+        from PIL import Image
+
+        with Image.open(path) as image:
+            return image.size
+    except Exception:
+        return None
 
 
 def _format_bytes(size: int) -> str:
