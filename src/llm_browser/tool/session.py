@@ -4,6 +4,7 @@ import json
 import threading
 import time
 import traceback
+from copy import deepcopy
 from pathlib import Path
 from typing import Any, Callable, Optional
 
@@ -74,7 +75,12 @@ class SessionTool:
         message = _message_from_subagent_arguments(arguments)
         if not message.strip():
             raise ValueError("spawn_agent requires message or items")
-        prompt = _subagent_prompt(agent_type, message)
+        fork_context = bool(arguments.get("fork_context")) and ctx.conversation_messages is not None
+        prompt = _subagent_prompt(agent_type, message, fork_context=fork_context)
+        fork_messages = None
+        if fork_context:
+            fork_messages = deepcopy(ctx.conversation_messages)
+            fork_messages.append({"role": "user", "content": prompt})
         result = self._create(
             ctx,
             {
@@ -82,6 +88,7 @@ class SessionTool:
                 "parent_id": ctx.session.id,
                 "cwd": arguments.get("cwd"),
             },
+            messages=fork_messages,
         )
         session = result.data.get("session", {}) if isinstance(result.data, dict) else {}
         agent_id = str(session.get("id") or "")
@@ -90,8 +97,9 @@ class SessionTool:
             "nickname": agent_type,
             "session": session,
             "running": True,
+            "fork_context": fork_context,
         }
-        return ToolResult(text=f"spawned {agent_type} agent {agent_id}", data=payload)
+        return ToolResult(text=json.dumps(payload, indent=2), data=payload)
 
     def wait_agent(self, ctx: ToolContext, arguments: dict) -> ToolResult:
         raw_targets = arguments.get("targets") or []
@@ -116,11 +124,11 @@ class SessionTool:
                 break
             time.sleep(0.05)
 
-        completed = {
-            target: status
+        completed = [
+            target
             for target, status in statuses.items()
             if status.get("status") in FINAL_SESSION_STATUSES or status.get("status") == "not_found"
-        }
+        ]
         payload = {
             "statuses": statuses,
             "completed": completed,
@@ -145,7 +153,12 @@ class SessionTool:
         payload = {"target": target, "previous_status": previous}
         return ToolResult(text=json.dumps(payload, indent=2), data=payload)
 
-    def _create(self, ctx: ToolContext, arguments: dict) -> ToolResult:
+    def _create(
+        self,
+        ctx: ToolContext,
+        arguments: dict,
+        messages: Optional[list[dict[str, Any]]] = None,
+    ) -> ToolResult:
         prompt = str(arguments.get("prompt") or "")
         if not prompt.strip():
             raise ValueError("session create requires a non-empty prompt")
@@ -155,7 +168,7 @@ class SessionTool:
         child = self.store.create(parent_id=parent_id, cwd=cwd)
         self.store.emit(ctx.session.id, "session.child_started", {"child_id": child.id, "prompt": prompt[:500]})
         self.store.emit(child.id, "session.parent", {"parent_id": parent_id})
-        self._start_runner(child.id, prompt, resume=False)
+        self._start_runner(child.id, prompt, resume=False, messages=messages)
         return ToolResult(
             text=f"started child session {child.id}",
             data={"session": child.to_dict(), "cursor": 0, "running": True},
@@ -221,7 +234,7 @@ class SessionTool:
         if session is None:
             return {"agent_id": session_id, "status": "not_found"}
         events = self.store.events.read(session_id)
-        latest = events[-1].to_dict() if events else None
+        latest = events[-1] if events else None
         final_event = next(
             (
                 event
@@ -235,10 +248,18 @@ class SessionTool:
             "status": session.status,
             "session": session.to_dict(),
             "events": len(events),
-            "latest_event": latest,
+            "latest_event_type": latest.type if latest is not None else None,
         }
         if final_event is not None:
-            payload["final_event"] = final_event.to_dict()
+            payload["final_event_type"] = final_event.type
+            if "result" in final_event.payload:
+                payload["result"] = str(final_event.payload.get("result") or "")
+            if "error" in final_event.payload:
+                payload["error"] = str(final_event.payload.get("error") or "")
+            if "error_type" in final_event.payload:
+                payload["error_type"] = str(final_event.payload.get("error_type") or "")
+            if "reason" in final_event.payload:
+                payload["reason"] = str(final_event.payload.get("reason") or "")
         return payload
 
     def _descendant_session_ids(self, parent_id: str) -> list[str]:
@@ -251,7 +272,13 @@ class SessionTool:
             pending.extend(children)
         return descendants
 
-    def _start_runner(self, session_id: str, prompt: str, resume: bool) -> None:
+    def _start_runner(
+        self,
+        session_id: str,
+        prompt: str,
+        resume: bool,
+        messages: Optional[list[dict[str, Any]]] = None,
+    ) -> None:
         def target() -> None:
             from llm_browser.agent.service import Agent
 
@@ -264,6 +291,8 @@ class SessionTool:
                 )
                 if resume:
                     agent.resume_session(session_id, prompt)
+                elif messages is not None:
+                    agent.run_session_with_messages(session_id, prompt, messages)
                 else:
                     agent.run_session(session_id, prompt)
             except BaseException:
@@ -378,11 +407,19 @@ def _message_from_subagent_arguments(arguments: dict) -> str:
     return "\n".join(part for part in parts if part.strip())
 
 
-def _subagent_prompt(agent_type: str, message: str) -> str:
+def _subagent_prompt(agent_type: str, message: str, *, fork_context: bool = False) -> str:
     guidance = SUBAGENT_ROLE_GUIDANCE[agent_type]
+    context_note = ""
+    if fork_context:
+        context_note = (
+            "The messages before this assignment are inherited from the parent agent. "
+            "Treat those prior user messages, tool calls, and tool outputs as parent context available to you. "
+            "Do not discard them just because you did not produce those calls.\n\n"
+        )
     return (
         f"You are a Codex subagent with role: {agent_type}.\n"
         f"{guidance}\n\n"
+        f"{context_note}"
         "Assigned task:\n"
         f"{message}"
     )

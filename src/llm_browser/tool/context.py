@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+from typing import Any, Dict, List, Optional
 
 from llm_browser.session.cancel import SessionCancelled
 from llm_browser.session.metadata import SessionMetadata
@@ -14,6 +15,7 @@ class ToolContext:
     store: SessionStore
     tool_call_id: str
     tool_name: str
+    conversation_messages: Optional[List[Dict[str, Any]]] = None
 
     def is_cancel_requested(self) -> bool:
         return self.store.is_cancel_requested(self.session.id)

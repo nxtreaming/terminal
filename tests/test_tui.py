@@ -786,7 +786,7 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 self.assertEqual(command.styles.height.value, 5)
-                self.assertEqual(app.query_one("#composer").styles.height.value, 9)
+                self.assertEqual(app.query_one("#composer").styles.height.value, 7)
 
     async def test_home_runtime_meta_shows_model_provider_and_browser(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -827,6 +827,70 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 self.assertEqual(fake_manager.started, ["first line\nsecond line"])
+                self.assertEqual(app.query_one("#command", ComposerInput).text, "")
+
+    async def test_multiline_task_is_not_parsed_as_command(self) -> None:
+        class FakeManager:
+            def __init__(self, store: SessionStore) -> None:
+                self.store = store
+                self.started: list[str] = []
+
+            def start(self, task: str):
+                self.started.append(task)
+                return self.store.create()
+
+            def reap(self) -> None:
+                pass
+
+        task = "\n".join(
+            [
+                "model the browser task as a real user workflow",
+                "open the target page",
+                "extract the visible prices",
+                "save the result as JSON",
+                "tell me where the file is",
+            ]
+        )
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+            fake_manager = FakeManager(store)
+            app.manager = fake_manager  # type: ignore[assignment]
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._set_composer_text(task)
+                await pilot.press("enter")
+                await pilot.pause()
+
+                self.assertEqual(fake_manager.started, [task])
+                self.assertEqual(app.query_one("#command", ComposerInput).text, "")
+
+    async def test_plain_prompt_with_unbalanced_quote_starts_task(self) -> None:
+        class FakeManager:
+            def __init__(self, store: SessionStore) -> None:
+                self.store = store
+                self.started: list[str] = []
+
+            def start(self, task: str):
+                self.started.append(task)
+                return self.store.create()
+
+            def reap(self) -> None:
+                pass
+
+        task = 'find the page titled "prices and save a screenshot'
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+            fake_manager = FakeManager(store)
+            app.manager = fake_manager  # type: ignore[assignment]
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._set_composer_text(task)
+                await pilot.press("enter")
+                await pilot.pause()
+
+                self.assertEqual(fake_manager.started, [task])
                 self.assertEqual(app.query_one("#command", ComposerInput).text, "")
 
     async def test_ctrl_b_is_not_bound_to_browser_palette(self) -> None:

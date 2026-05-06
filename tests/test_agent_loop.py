@@ -73,6 +73,53 @@ class SpawnChildProvider:
             yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": str(tool_message["content"])}))
 
 
+class ForkContextParentProvider:
+    def __init__(self):
+        self.turn = 0
+
+    def start_turn(self, messages, tools):
+        self.turn += 1
+        if self.turn == 1:
+            yield ModelEvent.call(ToolCall(id="call_echo", name="echo", arguments={"text": "parent secret"}))
+        elif self.turn == 2:
+            yield ModelEvent.call(
+                ToolCall(
+                    id="call_spawn",
+                    name="spawn_agent",
+                    arguments={
+                        "agent_type": "explorer",
+                        "fork_context": True,
+                        "message": "What value did the parent echo? Do not use tools.",
+                    },
+                )
+            )
+        elif self.turn == 3:
+            tool_message = [message for message in messages if message.get("role") == "tool"][-1]
+            text = str(tool_message["content"])
+            marker = "agent_id': '"
+            if marker in text:
+                agent_id = text.split(marker, 1)[1].split("'", 1)[0]
+            else:
+                agent_id = text.split('"agent_id": "', 1)[1].split('"', 1)[0]
+            yield ModelEvent.call(
+                ToolCall(
+                    id="call_wait",
+                    name="wait_agent",
+                    arguments={"targets": [agent_id], "timeout_ms": 5000},
+                )
+            )
+        else:
+            tool_message = [message for message in messages if message.get("role") == "tool"][-1]
+            yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": str(tool_message["content"])}))
+
+
+class ForkContextChildProvider:
+    def start_turn(self, messages, tools):
+        text = str(messages)
+        result = "saw parent secret" if "parent secret" in text else "NO INHERITED CONTEXT"
+        yield ModelEvent.call(ToolCall(id="call_done_child", name="done", arguments={"result": result}))
+
+
 class InstructionCaptureProvider:
     def __init__(self):
         self.instructions = ""
@@ -450,6 +497,32 @@ class AgentLoopTest(unittest.TestCase):
             self.assertEqual(closed.data["previous_status"]["status"], "done")
             parent_events = [event.type for event in store.events.read(parent.id)]
             self.assertIn("session.child_started", parent_events)
+
+    def test_spawn_agent_fork_context_passes_parent_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            parent = Agent(
+                store,
+                provider=ForkContextParentProvider(),
+                provider_factory=ForkContextChildProvider,
+                max_turns=6,
+                mode="codex",
+            ).run("spawn with forked context", cwd=Path(tmp))
+
+            children = [session for session in store.list() if session.parent_id == parent.id]
+            self.assertEqual(len(children), 1)
+            child_done = [
+                event
+                for event in store.events.read(children[0].id)
+                if event.type == "session.done"
+            ][-1]
+            self.assertEqual(child_done.payload["result"], "saw parent secret")
+            parent_done = [
+                event
+                for event in store.events.read(parent.id)
+                if event.type == "session.done"
+            ][-1]
+            self.assertIn("saw parent secret", parent_done.payload["result"])
 
     def test_provider_object_is_not_reused_for_child_sessions(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

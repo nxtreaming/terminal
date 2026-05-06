@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import copy
 import os
 import time
 from pathlib import Path
@@ -103,6 +104,30 @@ class Agent:
         messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
         return self._run_with_messages(session, messages)
 
+    def run_session_with_messages(
+        self,
+        session_id: str,
+        task: str,
+        messages: List[Dict[str, Any]],
+    ) -> SessionMetadata:
+        session = self.store.load(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+
+        self.store.clear_cancel(session.id)
+        self.store.emit(
+            session.id,
+            "session.input",
+            {
+                "text": task,
+                "forked": True,
+                "message_count": len(messages),
+            },
+        )
+        self.store.update_status(session.id, "running")
+        self._set_provider_instructions(select_agent_instructions(task, self.mode))
+        return self._run_with_messages(session, copy.deepcopy(messages))
+
     def resume_session(self, session_id: str, instruction: str = "Continue from the previous session state.") -> SessionMetadata:
         session = self.store.load(session_id)
         if session is None:
@@ -156,7 +181,8 @@ class Agent:
                         ],
                     }
                 )
-                for call, result in self._execute_tool_calls(session.id, tool_calls):
+                fork_messages = messages[:-1]
+                for call, result in self._execute_tool_calls(session.id, tool_calls, fork_messages=fork_messages):
                     messages.append(
                         {
                             "role": "tool",
@@ -329,11 +355,22 @@ class Agent:
         )
         return [*messages, {"role": "user", "content": text}]
 
-    def _execute_tool(self, session_id: str, call: ToolCall) -> ToolResult:
+    def _execute_tool(
+        self,
+        session_id: str,
+        call: ToolCall,
+        fork_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> ToolResult:
         session = self.store.load(session_id)
         if session is None:
             raise KeyError(f"session not found: {session_id}")
-        ctx = ToolContext(session=session, store=self.store, tool_call_id=call.id, tool_name=call.name)
+        ctx = ToolContext(
+            session=session,
+            store=self.store,
+            tool_call_id=call.id,
+            tool_name=call.name,
+            conversation_messages=copy.deepcopy(fork_messages) if fork_messages is not None else None,
+        )
         self.store.emit(
             session_id,
             "tool.started",
@@ -372,14 +409,19 @@ class Agent:
                 data={"ok": False, "error": str(exc), "error_type": type(exc).__name__},
             )
 
-    def _execute_tool_calls(self, session_id: str, tool_calls: List[ToolCall]) -> List[tuple[ToolCall, ToolResult]]:
+    def _execute_tool_calls(
+        self,
+        session_id: str,
+        tool_calls: List[ToolCall],
+        fork_messages: Optional[List[Dict[str, Any]]] = None,
+    ) -> List[tuple[ToolCall, ToolResult]]:
         executed: List[tuple[ToolCall, ToolResult]] = []
         index = 0
         while index < len(tool_calls):
             self._check_cancel(session_id)
             call = tool_calls[index]
             if call.name == "done" or not self._can_run_parallel(call):
-                result = self._execute_tool(session_id, call)
+                result = self._execute_tool(session_id, call, fork_messages=fork_messages)
                 executed.append((call, result))
                 index += 1
                 if call.name == "done":
@@ -391,13 +433,13 @@ class Agent:
                 batch.append(tool_calls[index])
                 index += 1
             if len(batch) == 1:
-                executed.append((batch[0], self._execute_tool(session_id, batch[0])))
+                executed.append((batch[0], self._execute_tool(session_id, batch[0], fork_messages=fork_messages)))
                 continue
 
             results: Dict[str, ToolResult] = {}
             max_workers = min(len(batch), 8)
             executor = concurrent.futures.ThreadPoolExecutor(max_workers=max_workers)
-            futures = {executor.submit(self._execute_tool, session_id, call): call for call in batch}
+            futures = {executor.submit(self._execute_tool, session_id, call, fork_messages): call for call in batch}
             pending = set(futures)
             try:
                 while pending:

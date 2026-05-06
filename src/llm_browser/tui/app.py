@@ -14,6 +14,7 @@ from pathlib import Path
 from typing import Any, Callable, Optional
 
 from rich.align import Align
+from rich.console import Group
 from rich.markup import escape
 from rich.markdown import Markdown
 from rich.padding import Padding
@@ -138,21 +139,6 @@ MODEL_PALETTE: list[tuple[str, str, str]] = [
 ]
 
 
-BROWSER_USE_MARK = [
-    "  ███████    █████████",
-    " ████     ██████   ████",
-    "███    █████         ███",
-    "███  ████      ████   ██",
-    " █  ███          ███",
-    "  ████            ████",
-    " ███                ███",
-    "████ ██          ██  ██",
-    "███   ███      ████  ███",
-    "███    █████         ███",
-    " ████     ██████   ████",
-    "   ██████     ████████",
-]
-
 BROWSER_USE_WORDMARK = [
     "▄                                                        ",
     "█▀▀▄ █▀▀▄ █▀▀█ █  █ █▀▀▀ █▀▀▀ █▀▀▄   █  █ █▀▀▀ █▀▀▀",
@@ -160,6 +146,15 @@ BROWSER_USE_WORDMARK = [
     "▀▀▀  ▀    ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀▀▀▀ ▀       ▀▀▀▀ ▀▀▀▀ ▀▀▀▀",
 ]
 BROWSER_USE_WORDMARK_SPLIT = 36
+
+def _centered_wordmark_line(line: str, *, canvas_width: int) -> Align:
+    raw = line.rstrip()
+    left = raw[:BROWSER_USE_WORDMARK_SPLIT]
+    right = raw[BROWSER_USE_WORDMARK_SPLIT:]
+    text = Text(" ")
+    text.append(left, style="#7a7d86")
+    text.append(right, style="#e4e4e7")
+    return Align.center(text, width=canvas_width)
 
 
 def _move_table_cursor(table: DataTable, target: int | str) -> None:
@@ -619,14 +614,14 @@ class BrowserUseTerminalApp(App[None]):
 
     #body {
         height: 1fr;
-        background: #15161a;
+        background: #0a0a0a;
     }
 
     #main {
         width: 1fr;
         min-width: 52;
         padding: 1 2;
-        background: #15161a;
+        background: #0a0a0a;
         align: center middle;
     }
 
@@ -642,15 +637,27 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #main.home #workspace {
-        width: 86;
-        max-width: 96%;
+        width: 76;
+        max-width: 94%;
+        height: auto;
+    }
+
+    #home-logo {
+        display: none;
+        height: auto;
+        margin-bottom: 2;
+        background: #0a0a0a;
+    }
+
+    #main.home #home-logo {
+        display: block;
         height: auto;
     }
 
     #transcript {
         height: 1fr;
         padding: 0 1;
-        background: #15161a;
+        background: #0a0a0a;
         color: #e4e4e7;
         scrollbar-color: #6f727d;
         scrollbar-background: #20222b;
@@ -660,22 +667,25 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #main.home #transcript {
+        display: none;
         height: auto;
-        min-height: 16;
-        max-height: 20;
+        min-height: 20;
+        max-height: 36;
+        padding: 0 0;
         scrollbar-size: 0 0;
     }
 
     #slash-panel {
-        height: 9;
-        margin-top: 1;
+        height: 8;
+        margin-top: 2;
         padding: 0 1;
-        background: #20222b;
+        background: #1e1e1e;
         color: #e4e4e7;
         border: none;
-        scrollbar-size: 1 0;
+        scrollbar-size-horizontal: 0;
+        scrollbar-size-vertical: 0;
         scrollbar-color: #6f727d;
-        scrollbar-background: #20222b;
+        scrollbar-background: #1e1e1e;
     }
 
     #activity {
@@ -691,7 +701,7 @@ class BrowserUseTerminalApp(App[None]):
     #runtime-meta {
         display: none;
         height: 1;
-        margin-top: 1;
+        margin-top: 2;
         color: #6f727d;
         content-align-horizontal: center;
     }
@@ -701,15 +711,19 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #composer {
-        height: 5;
-        margin-top: 1;
-        padding: 2 2;
-        background: #20222b;
+        height: 3;
+        margin-top: 2;
+        padding: 1 2;
+        background: #1e1e1e;
         border: none;
     }
 
     #composer:focus-within {
-        background: #24262f;
+        background: #1e1e1e;
+    }
+
+    #main.home #composer {
+        border-left: solid #5c9cf5;
     }
 
     #command {
@@ -731,6 +745,10 @@ class BrowserUseTerminalApp(App[None]):
         height: 1;
         color: #9b9ca5;
         padding: 0 1 0 0;
+    }
+
+    #main.home #hintbar {
+        content-align-horizontal: right;
     }
 
     #sidebar {
@@ -787,7 +805,7 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #slash-panel {
-        background: #20222b;
+        background: #1e1e1e;
     }
 
     DataTable > .datatable--cursor {
@@ -885,7 +903,10 @@ class BrowserUseTerminalApp(App[None]):
         with Horizontal(id="body"):
             with Vertical(id="main"):
                 with Vertical(id="workspace"):
+                    yield Static("", id="home-logo")
                     yield RichLog(id="transcript", wrap=True, highlight=False, markup=True)
+                    yield Static("", id="activity")
+                    yield Static("", id="runtime-meta")
                     slash_panel = DataTable(
                         id="slash-panel",
                         cursor_type="row",
@@ -896,8 +917,6 @@ class BrowserUseTerminalApp(App[None]):
                     slash_panel.add_column("command", width=22)
                     slash_panel.add_column("description", width=72)
                     yield slash_panel
-                    yield Static("", id="activity")
-                    yield Static("", id="runtime-meta")
                     with Vertical(id="composer"):
                         yield ComposerInput(
                             "",
@@ -946,12 +965,21 @@ class BrowserUseTerminalApp(App[None]):
         self._sync_sidebar_visibility()
         self.query_one("#command", ComposerInput).focus()
         self.resize_composer()
+        self.call_after_refresh(self._rewrite_home_after_layout)
         self._listener = threading.Thread(target=self._listen_events, name="browser-use-terminal-events", daemon=True)
         self._listener.start()
         self.set_interval(1.0, self._tick)
 
     def on_unmount(self) -> None:
         self._stop.set()
+
+    def on_resize(self, event: events.Resize) -> None:
+        if self._home_mode and not self.selected_session_id:
+            self._write_home()
+
+    def _rewrite_home_after_layout(self) -> None:
+        if self._home_mode and not self.selected_session_id:
+            self._write_home()
 
     def on_click(self, event: events.Click) -> None:
         pass
@@ -1030,6 +1058,7 @@ class BrowserUseTerminalApp(App[None]):
 
     def _ui_ready(self) -> bool:
         try:
+            self.query_one("#home-logo", Static)
             self.query_one("#composer-meta", Static)
             self.query_one("#runtime-meta", Static)
         except Exception:
@@ -1040,6 +1069,13 @@ class BrowserUseTerminalApp(App[None]):
         main = self.query_one("#main")
         main.set_class(enabled, "home")
         self._home_mode = enabled
+        try:
+            transcript = self.query_one("#transcript", RichLog)
+            transcript.display = not enabled
+            transcript.wrap = not enabled
+            self.query_one("#home-logo", Static).display = enabled
+        except Exception:
+            pass
         self._sync_sidebar_visibility()
 
     def _sync_sidebar_visibility(self) -> None:
@@ -1050,23 +1086,17 @@ class BrowserUseTerminalApp(App[None]):
         self._update_activity_strip()
         log = self.query_one("#transcript", RichLog)
         log.clear()
-        width = 78
-        mark_width = max(len(line) for line in BROWSER_USE_MARK)
-        wordmark_width = max(len(line.rstrip()) for line in BROWSER_USE_WORDMARK)
-        log.write("")
-        for line in BROWSER_USE_MARK:
-            log.write(Align.center(Text(line.ljust(mark_width).rstrip(), style="#e4e4e7"), width=width))
-        for line in BROWSER_USE_WORDMARK:
-            raw = line.rstrip().ljust(wordmark_width)
-            left = raw[:BROWSER_USE_WORDMARK_SPLIT]
-            right = raw[BROWSER_USE_WORDMARK_SPLIT:]
-            text = Text()
-            text.append(left, style="#6f727d")
-            text.append(right, style="#e4e4e7")
-            log.write(Align.center(text, width=width))
-        log.write(Align.center(Text("terminal", style="#9b9ca5"), width=width))
+        logo = self.query_one("#home-logo", Static)
+        available_width = int(logo.size.width or self.query_one("#workspace").size.width or self.size.width or 128)
+        canvas_width = max(58, min(76, available_width))
+        renderables = [
+            _centered_wordmark_line(line, canvas_width=canvas_width)
+            for line in BROWSER_USE_WORDMARK
+        ]
+        logo.update(Group(*renderables))
 
     def _write_banner(self) -> None:
+        self._set_home_mode(False)
         log = self.query_one("#transcript", RichLog)
         log.write("[bold #e4e4e7]Slash commands[/bold #e4e4e7]")
         for name, command, description in SLASH_COMMANDS:
@@ -1242,6 +1272,7 @@ class BrowserUseTerminalApp(App[None]):
         if not matches:
             table.display = False
             return
+        table.styles.height = min(len(matches), 8)
         for name, _command, description in matches:
             table.add_row(
                 Text(f"/{name}", style="#e4e4e7"),
@@ -1313,13 +1344,16 @@ class BrowserUseTerminalApp(App[None]):
         self.hide_slash_panel()
         if not line:
             return
+        if "\n" in line and not line.startswith("/"):
+            self._start_or_resume_task(line)
+            return
         self._handle_command(line)
 
     def resize_composer(self) -> None:
         command_input = self.query_one("#command", ComposerInput)
         visible_lines = _composer_visible_line_count(command_input.text, command_input.size.width)
         command_input.styles.height = visible_lines
-        self.query_one("#composer").styles.height = visible_lines + 4
+        self.query_one("#composer").styles.height = visible_lines + 2
 
     def _set_composer_text(self, text: str) -> None:
         command_input = self.query_one("#command", ComposerInput)
@@ -1350,6 +1384,9 @@ class BrowserUseTerminalApp(App[None]):
         try:
             args = shlex.split(normalized_line)
         except ValueError as exc:
+            if not is_slash_command:
+                self._start_or_resume_task(line)
+                return
             log.write(f"[#e4e4e7]parse error: {escape(str(exc))}[/]")
             return
         if not args:
@@ -1520,14 +1557,18 @@ class BrowserUseTerminalApp(App[None]):
             if is_slash_command:
                 log.write(f"[#e4e4e7]unknown command: {escape(command)}[/]")
             else:
-                if self.selected_session_id:
-                    session = self.store.load(self.selected_session_id)
-                    if session is not None and session.status in {"created", "running"}:
-                        log.write("[#9b9ca5]selected session is still running; press esc to interrupt or wait for it to finish[/]")
-                        return
-                    self._resume_session(self.selected_session_id, line)
-                else:
-                    self._start_task(line)
+                self._start_or_resume_task(line)
+
+    def _start_or_resume_task(self, instruction: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        if self.selected_session_id:
+            session = self.store.load(self.selected_session_id)
+            if session is not None and session.status in {"created", "running"}:
+                log.write("[#9b9ca5]selected session is still running; press esc to interrupt or wait for it to finish[/]")
+                return
+            self._resume_session(self.selected_session_id, instruction)
+            return
+        self._start_task(instruction)
 
     def _load_session_log(self, session_id: str) -> None:
         self._set_home_mode(False)
