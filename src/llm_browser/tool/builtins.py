@@ -31,7 +31,8 @@ def build_builtin_registry() -> ToolRegistry:
                 "click_at(x,y), type_text(text), press(key), scroll(dx=0, dy=500), page_info(), "
                 "visible_text(), links(), save_helper(), load_helper(), save_artifact(), "
                 "download_file(url, path=None), and read_pdf_text(path_or_url, max_pages=None). "
-                "requests, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
+                "requests, a browser-header http session, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
+                "requests gets browser-like User-Agent and Accept-Language defaults unless overridden. "
                 "PyPDF2 imports are shimmed to pypdf when available. "
                 "Set result or _result for structured output."
             ),

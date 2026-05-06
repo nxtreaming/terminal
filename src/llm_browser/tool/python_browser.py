@@ -307,7 +307,11 @@ def _install_optional_imports(namespace: Dict[str, Any]) -> None:
     try:
         import requests
 
+        _install_requests_browser_defaults(requests)
         namespace["requests"] = requests
+        session = requests.Session()
+        session.headers.update(_browser_headers())
+        namespace["http"] = session
     except Exception:
         pass
     try:
@@ -336,6 +340,35 @@ def _install_optional_imports(namespace: Dict[str, Any]) -> None:
         namespace["Image"] = Image
     except Exception:
         pass
+
+
+def _browser_headers() -> Dict[str, str]:
+    return {
+        "User-Agent": (
+            "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/125.0 Safari/537.36"
+        ),
+        "Accept-Language": "en-US,en;q=0.9",
+    }
+
+
+def _install_requests_browser_defaults(requests_module: Any) -> None:
+    request = requests_module.sessions.Session.request
+    if getattr(request, "_llm_browser_default_headers", False):
+        return
+
+    default_headers = _browser_headers()
+
+    def request_with_browser_defaults(self: Any, method: str, url: str, **kwargs: Any) -> Any:
+        headers = dict(kwargs.pop("headers", None) or {})
+        for key, value in default_headers.items():
+            headers.setdefault(key, value)
+        kwargs["headers"] = headers
+        return request(self, method, url, **kwargs)
+
+    request_with_browser_defaults._llm_browser_default_headers = True  # type: ignore[attr-defined]
+    request_with_browser_defaults._llm_browser_original = request  # type: ignore[attr-defined]
+    requests_module.sessions.Session.request = request_with_browser_defaults
 
 
 def _looks_like_statements(code: str) -> bool:

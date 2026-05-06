@@ -240,6 +240,39 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["result"]["download_helper"])
             self.assertTrue(result.data["result"]["pdf_helper"])
 
+    def test_requests_gets_browser_headers_by_default(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "import http.server, socketserver, threading, json\n"
+                        "seen = {}\n"
+                        "class Handler(http.server.BaseHTTPRequestHandler):\n"
+                        "    def do_GET(self):\n"
+                        "        seen['ua'] = self.headers.get('User-Agent')\n"
+                        "        seen['lang'] = self.headers.get('Accept-Language')\n"
+                        "        self.send_response(200); self.end_headers(); self.wfile.write(b'ok')\n"
+                        "    def log_message(self, *args): pass\n"
+                        "server = socketserver.TCPServer(('127.0.0.1', 0), Handler)\n"
+                        "threading.Thread(target=server.handle_request, daemon=True).start()\n"
+                        "requests.get(f'http://127.0.0.1:{server.server_address[1]}/')\n"
+                        "server.server_close()\n"
+                        "result = seen\n"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertIn("Mozilla/5.0", result.data["result"]["ua"])
+            self.assertIn("en-US", result.data["result"]["lang"])
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())
