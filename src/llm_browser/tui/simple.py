@@ -93,7 +93,7 @@ def format_event(event: Event) -> str:
     if event.type == "session.created":
         return f"[{event.session_id}] session created"
     if event.type == "session.input":
-        return f"[{event.session_id}] user: {payload.get('text', '')}"
+        return f"[{event.session_id}] user: {_compact_text(payload.get('text', ''), limit=240)}"
     if event.type == "session.status":
         return f"[{event.session_id}] status: {payload.get('status', '')}"
     if event.type == "session.cancel_requested":
@@ -110,20 +110,23 @@ def format_event(event: Event) -> str:
         image = payload.get("image") or {}
         return f"[{event.session_id}] image: {image.get('label')} -> {image.get('path')}"
     if event.type == "tool.output":
-        text = str(payload.get("text") or "").strip().replace("\n", "\\n")
-        if len(text) > 160:
-            text = text[:157] + "..."
+        text = _compact_text(payload.get("text", ""))
         return f"[{event.session_id}] tool output: {payload.get('name')} {payload.get('stream')} {text}"
     if event.type == "tool.finished":
         output = payload.get("output") or {}
-        text = str(output.get("text") or "").strip().replace("\n", "\\n")
-        if len(text) > 160:
-            text = text[:157] + "..."
+        text = _compact_text(output.get("text", ""))
         return f"[{event.session_id}] tool done: {payload.get('name')} {text}"
     if event.type == "tool.failed":
         return f"[{event.session_id}] tool failed: {payload.get('name')} {payload.get('error')}"
     if event.type == "session.done":
-        return f"[{event.session_id}] done: {payload.get('result')}"
+        return f"[{event.session_id}] done: {_compact_text(payload.get('result', ''), limit=240)}"
     if event.type == "session.failed":
         return f"[{event.session_id}] failed: {payload.get('error')}"
     return f"[{event.session_id}] {event.type}: {payload}"
+
+
+def _compact_text(value: object, limit: int = 160) -> str:
+    text = str(value or "").strip().replace("\n", "\\n")
+    if len(text) > limit:
+        return text[: max(0, limit - 3)] + "..."
+    return text

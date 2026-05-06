@@ -1,9 +1,18 @@
 from __future__ import annotations
 
 import unittest
+from pathlib import Path
 
 from llm_browser.events import Event
-from llm_browser.tui.app import _current_tool, _final_line, _format_events_for_log, _short_task_list, _summarize_task_text
+from llm_browser.tui.app import (
+    _current_tool,
+    _dataset_run_id_from_path,
+    _final_line,
+    _format_events_for_log,
+    _latest_image_line,
+    _short_task_list,
+    _summarize_task_text,
+)
 from llm_browser.tui import format_event
 
 
@@ -27,6 +36,18 @@ class TuiTest(unittest.TestCase):
         formatted = format_event(event)
         self.assertIn("[s1] tool done: shell", formatted)
         self.assertLess(len(formatted), 210)
+
+    def test_format_done_truncates_large_final_result(self) -> None:
+        event = Event(
+            type="session.done",
+            session_id="s1",
+            payload={"result": "x" * 1000},
+        )
+
+        formatted = format_event(event)
+
+        self.assertIn("[s1] done:", formatted)
+        self.assertLess(len(formatted), 280)
 
     def test_format_tool_output_truncates_stream_chunk(self) -> None:
         event = Event(
@@ -90,6 +111,19 @@ class TuiTest(unittest.TestCase):
     def test_short_task_list_limits_long_runs(self) -> None:
         self.assertEqual(_short_task_list([]), "-")
         self.assertEqual(_short_task_list([str(index) for index in range(14)], limit=3), "0, 1, 2 +11")
+
+    def test_dataset_run_id_from_workspace_path(self) -> None:
+        path = Path("/tmp/state/dataset-runs/real-v8-gpt55-full/task-1-workspace")
+
+        self.assertEqual(_dataset_run_id_from_path(path), "real-v8-gpt55-full")
+
+    def test_latest_image_line_uses_most_recent_image(self) -> None:
+        events = [
+            Event(type="tool.image", session_id="s1", payload={"image": {"label": "first", "path": "/tmp/1.png"}}),
+            Event(type="tool.image", session_id="s1", payload={"image": {"label": "final", "path": "/tmp/final.png"}}),
+        ]
+
+        self.assertEqual(_latest_image_line(events), "final -> final.png")
 
 
 if __name__ == "__main__":
