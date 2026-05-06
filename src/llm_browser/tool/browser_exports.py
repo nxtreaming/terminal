@@ -12,7 +12,7 @@ BROWSER_TOOL_DESCRIPTION = (
     "js(expr), new_tab/navigate/tabs/switch_tab, click_at_xy/fill_input/press_key/scroll, "
     "screenshot(..., attach=True), capture_screenshot(...), wait_for_load/wait_for_network_idle, page_info, "
     "agent_helpers_path/reload_agent_helpers, and load_skill/list_skills/read_skill/help_browser. "
-    "Specialized helpers are skill-driven: load_skill('downloads'), load_skill('research'), load_skill('dom_tools'), etc. "
+    "Specialized helpers are skill-driven: load_skill('downloads'), load_skill('research'), load_skill('search'), load_skill('dom_tools'), etc. "
     "Set result or _result for structured output."
 )
 
@@ -46,10 +46,17 @@ Skills:
   list_skills(), load_skill("research"), read_skill("iframes"), loaded_skills()
   downloads: download_info, wait_for_download
   cookies: get_cookies, set_cookie, clear_cookies, storage_state
-  artifacts: save_artifact, upload_artifact, attach_image, download_file, read_pdf_text
-  research: http_get, fetch_text, fetch_readable_text, fetch_many_text, search_web, crawl_site
+  artifacts: save_artifact, attach_image, download_file, read_pdf_text
+  cloud_artifacts: upload_artifact, create_download_url
+  research: http_get, fetch_text, fetch_readable_text, fetch_many_text, crawl_site
+  search: search_web
+  public_records: search_cve_records, search_fcc_grantee_records, search_public_records
+  scholarly: search_scholarly
   extraction: html_to_text, extract_links, extract_emails, read_sitemap
-  dom_tools: deep_text, click_text, dismiss_cookie_banners, screenshot_element
+  store_locators: extract_store_locator_locations
+  dom_tools: deep_text, click_text, screenshot_element
+  cookie_banners: dismiss_cookie_banners
+  uploads: upload_file
   tracing: recent_console, recent_network_failures, save_browser_trace
 
 Editable helpers:

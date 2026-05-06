@@ -607,6 +607,73 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["loaded"], ["dom_tools"])
             self.assertTrue(result.data["result"]["iframe_skill"])
 
+    def test_split_skills_make_specialized_helpers_explicit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "core"}, clear=False):
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "load_skill('research')\n"
+                        "after_research = {'fetch': callable(fetch_text), 'search': 'search_web' in globals()}\n"
+                        "load_skill('search')\n"
+                        "load_skill('cookie_banners')\n"
+                        "load_skill('uploads')\n"
+                        "load_skill('cloud_artifacts')\n"
+                        "result = {"
+                        "'after_research': after_research, "
+                        "'has_search': callable(search_web), "
+                        "'has_banner': callable(dismiss_cookie_banners), "
+                        "'has_upload': callable(upload_file), "
+                        "'has_cloud_upload': callable(upload_artifact), "
+                        "'docs': 'Store Locators' in read_skill('store-locators'), "
+                        "'loaded': loaded_skills()"
+                        "}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["after_research"]["fetch"])
+            self.assertFalse(result.data["result"]["after_research"]["search"])
+            self.assertTrue(result.data["result"]["has_search"])
+            self.assertTrue(result.data["result"]["has_banner"])
+            self.assertTrue(result.data["result"]["has_upload"])
+            self.assertTrue(result.data["result"]["has_cloud_upload"])
+            self.assertTrue(result.data["result"]["docs"])
+            self.assertEqual(
+                result.data["result"]["loaded"],
+                ["cloud_artifacts", "cookie_banners", "research", "search", "uploads"],
+            )
+
+    def test_public_record_skill_can_be_loaded_with_dash_name(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "core"}, clear=False):
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "load_skill('public-records')\n"
+                        "payload = search_cve_records('CVE-2020-8166 Rails details')\n"
+                        "result = {'url': payload['results'][0]['url'], 'loaded': loaded_skills()}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["url"], "https://nvd.nist.gov/vuln/detail/CVE-2020-8166")
+            self.assertEqual(result.data["result"]["loaded"], ["public_records"])
+
     def test_wait_for_load_accepts_timeout_alias(self) -> None:
         runtime_holder = {}
 
