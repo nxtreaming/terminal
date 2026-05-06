@@ -25,6 +25,7 @@ from llm_browser.session.trace import build_self_eval_prompt, write_trace_bundle
 from llm_browser.session.store import SessionStore
 
 DATASET_TIMEOUT_DRAIN_S = 10.0
+MAX_INLINE_DATASET_RESULT = 20_000
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -445,8 +446,36 @@ def _run_dataset_task(
 
     if error:
         result.update({"ok": False, **error})
+    _attach_dataset_final_result(store, result, session.id, workspace)
     result.setdefault("ok", False)
     return result
+
+
+def _attach_dataset_final_result(
+    store: SessionStore,
+    result: Dict[str, Any],
+    session_id: str,
+    workspace: Path,
+) -> None:
+    final_result = _session_done_result(store, session_id)
+    if final_result is None:
+        return
+    result["final_result_chars"] = len(final_result)
+    if len(final_result) <= MAX_INLINE_DATASET_RESULT:
+        result["final_result"] = final_result
+        return
+    workspace.mkdir(parents=True, exist_ok=True)
+    path = workspace / "final_result.txt"
+    path.write_text(final_result, encoding="utf-8")
+    result["final_result_preview"] = final_result[:MAX_INLINE_DATASET_RESULT]
+    result["final_result_path"] = str(path)
+
+
+def _session_done_result(store: SessionStore, session_id: str) -> Optional[str]:
+    for event in reversed(store.events.read(session_id)):
+        if event.type == "session.done":
+            return str(event.payload.get("result") or "")
+    return None
 
 
 def main(argv: Optional[Sequence[str]] = None) -> int:

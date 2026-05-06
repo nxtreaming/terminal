@@ -61,6 +61,66 @@ class DatasetTest(unittest.TestCase):
 
         self.assertEqual(_dataset_manifest_exit_code(manifest), 0)
 
+    def test_dataset_task_records_final_result(self) -> None:
+        class DoneAgent:
+            def __init__(self, *args, **kwargs) -> None:
+                self.tools = Mock()
+
+            def run_session(self, session_id: str, prompt: str):
+                store.update_status(session_id, "done")
+                store.emit(session_id, "session.done", {"result": "final answer"})
+                return store.load(session_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            with patch("llm_browser.cli.Agent", DoneAgent):
+                result = _run_dataset_task(
+                    store=store,
+                    task_id="1",
+                    prompt="finish",
+                    workspace=Path(tmp) / "work",
+                    provider_name="fake",
+                    model=None,
+                    max_turns=1,
+                    timeout_s=0,
+                )
+
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["final_result"], "final answer")
+        self.assertEqual(result["final_result_chars"], len("final answer"))
+
+    def test_dataset_task_spills_large_final_result(self) -> None:
+        final = "x" * 21000
+
+        class DoneAgent:
+            def __init__(self, *args, **kwargs) -> None:
+                self.tools = Mock()
+
+            def run_session(self, session_id: str, prompt: str):
+                store.update_status(session_id, "done")
+                store.emit(session_id, "session.done", {"result": final})
+                return store.load(session_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            with patch("llm_browser.cli.Agent", DoneAgent):
+                result = _run_dataset_task(
+                    store=store,
+                    task_id="1",
+                    prompt="finish",
+                    workspace=Path(tmp) / "work",
+                    provider_name="fake",
+                    model=None,
+                    max_turns=1,
+                    timeout_s=0,
+                )
+
+            self.assertTrue(result["ok"])
+            self.assertNotIn("final_result", result)
+            self.assertEqual(result["final_result_chars"], len(final))
+            self.assertTrue(Path(result["final_result_path"]).exists())
+            self.assertEqual(Path(result["final_result_path"]).read_text(encoding="utf-8"), final)
+
     def test_dataset_timeout_closes_agent_tools(self) -> None:
         unblocked = threading.Event()
         close_session = Mock(side_effect=lambda session_id: unblocked.set())
