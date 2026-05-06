@@ -93,6 +93,7 @@ def build_dataset_prompt(task: DatasetTask, headless: bool = True) -> str:
         "or use artifact_dir/save_artifact for supporting evidence. "
         "If a task asks for /home/user/outputs, use output_path('/home/user/outputs/name.ext') so the file lands "
         "in this workspace's outputs directory on systems where that absolute path is unavailable. "
+        "For research pages, use fetch_readable_text(url) or html_to_text(markup) when raw HTML would waste context. "
         "If a task asks for a downloadable or Browser Use signed URL for a local file, call create_download_url(path) "
         "or upload_artifact(path) and use its downloadUrl. "
         "Attach screenshots after meaningful page transitions or before relying on visual state; for table/image-region tasks, "
