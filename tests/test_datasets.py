@@ -29,6 +29,7 @@ class DatasetTest(unittest.TestCase):
         self.assertIn(task.text[:80], prompt)
         self.assertIn("Attach screenshots", prompt)
         self.assertIn("output_path('/home/user/outputs/name.ext')", prompt)
+        self.assertIn("load_skill('research')", prompt)
         self.assertIn("fetch_many_text", prompt)
         self.assertIn("fccid.io/<grantee-code>/", prompt)
 
