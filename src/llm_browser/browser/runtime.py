@@ -833,7 +833,10 @@ class BrowserRuntime:
         full_page: bool = False,
         timeout_s: float = 8.0,
         clip: Optional[Dict[str, float]] = None,
+        timeout: Optional[float] = None,
     ) -> ToolImage:
+        if timeout is not None:
+            timeout_s = timeout
         params: Dict[str, Any] = {"format": "png", "fromSurface": True}
         if clip is not None:
             params["captureBeyondViewport"] = True

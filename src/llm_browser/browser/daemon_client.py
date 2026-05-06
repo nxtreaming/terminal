@@ -154,14 +154,26 @@ class DaemonBrowserRuntime:
         full_page: bool = False,
         timeout_s: float = 8.0,
         clip: Optional[Dict[str, float]] = None,
+        timeout: Optional[float] = None,
     ) -> ToolImage:
+        if timeout is not None:
+            timeout_s = timeout
         data = self._call("screenshot", label, attach=attach, full_page=full_page, timeout_s=timeout_s, clip=clip)
         return ToolImage(**data)
 
     def click_at(self, x: float, y: float, button: str = "left", clicks: int = 1) -> None:
         self._call("click_at", x, y, button=button, clicks=clicks)
 
-    def fill_input(self, selector: str, text: str, clear_first: bool = True, timeout_s: float = 0.0) -> None:
+    def fill_input(
+        self,
+        selector: str,
+        text: str,
+        clear_first: bool = True,
+        timeout_s: float = 0.0,
+        timeout: Optional[float] = None,
+    ) -> None:
+        if timeout is not None:
+            timeout_s = timeout
         self._call("fill_input", selector, text, clear_first=clear_first, timeout_s=timeout_s)
 
     def type_text(self, text: str) -> None:

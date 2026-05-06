@@ -29,6 +29,7 @@ class FakeRuntime:
         self.last_cdp_retry = None
         self.last_navigate_timeout = None
         self.last_js_timeout_s = None
+        self.last_screenshot_timeout = None
         self.last_network_idle_timeout = None
         self.last_network_idle_idle_ms = None
         self.cdp_calls = []
@@ -120,6 +121,7 @@ class FakeRuntime:
         timeout_s: float = 8.0,
         clip: Dict[str, float] | None = None,
     ) -> ToolImage:
+        self.last_screenshot_timeout = timeout_s
         self.last_screenshot_clip = clip
         path = self.root_dir / "shot.png"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -255,6 +257,31 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["clip"]["width"], 340)
             self.assertEqual(runtime_holder["runtime"].last_screenshot_clip["height"], 200)
             self.assertEqual(result.images[0].label, "rates")
+
+    def test_image_helpers_accept_timeout_alias(self) -> None:
+        runtime_holder: Dict[str, FakeRuntime] = {}
+
+        def factory(root: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "screenshot(timeout=6); capture_screenshot('alias.png', timeout=7); result = 'ok'",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(runtime_holder["runtime"].last_screenshot_timeout, 7)
 
     def test_harnesless_aliases_are_available_in_persistent_python_tool(self) -> None:
         runtime_holder: Dict[str, FakeRuntime] = {}
