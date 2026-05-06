@@ -30,6 +30,12 @@ class BrowserRuntime:
 
     @classmethod
     def start(cls, root_dir: Path, headless: bool = False) -> "BrowserRuntime":
+        cdp_http_url = os.environ.get("LLM_BROWSER_CDP_HTTP_URL") or os.environ.get("BROWSER_USE_CDP_HTTP_URL")
+        if cdp_http_url:
+            return cls.attach(root_dir=root_dir, http_url=cdp_http_url)
+        cdp_ws_url = os.environ.get("LLM_BROWSER_CDP_WS_URL") or os.environ.get("BROWSER_USE_CDP_WS_URL")
+        if cdp_ws_url:
+            return cls.attach_ws(root_dir=root_dir, websocket_url=cdp_ws_url)
         runtime = cls(root_dir=root_dir, preserve_profile=_env_bool("LLM_BROWSER_KEEP_CHROME_PROFILE", False))
         try:
             runtime.chrome = start_chrome(root_dir=root_dir, headless=headless)
@@ -46,6 +52,19 @@ class BrowserRuntime:
         runtime.attach_first_page()
         return runtime
 
+    @classmethod
+    def attach_ws(cls, root_dir: Path, websocket_url: str) -> "BrowserRuntime":
+        runtime = cls(root_dir=root_dir, preserve_profile=True)
+        runtime.target = {"id": "external", "type": "page", "url": "", "webSocketDebuggerUrl": websocket_url}
+        runtime.client = CdpClient(websocket_url)
+        runtime.client.connect()
+        for domain in ("Page", "Runtime", "Network"):
+            try:
+                runtime.cdp(f"{domain}.enable", retry=False)
+            except Exception:
+                pass
+        return runtime
+
     def close(self) -> None:
         if self.client is not None:
             self.client.close()
@@ -58,9 +77,13 @@ class BrowserRuntime:
                 shutil.rmtree(profile_dir, ignore_errors=True)
 
     def version(self) -> Dict[str, Any]:
+        if not self.http_url:
+            return self.cdp("Browser.getVersion")
         return requests.get(f"{self.http_url}/json/version", timeout=5).json()
 
     def targets(self) -> List[Dict[str, Any]]:
+        if not self.http_url:
+            return [self.target or {"id": "external", "type": "page", "url": ""}]
         return requests.get(f"{self.http_url}/json/list", timeout=5).json()
 
     def tabs(self) -> List[Dict[str, Any]]:
@@ -112,6 +135,10 @@ class BrowserRuntime:
         return target
 
     def new_tab(self, url: str = "about:blank") -> Dict[str, Any]:
+        if not self.http_url:
+            if url != "about:blank":
+                self.navigate(url, wait=False)
+            return self.target or {"id": "external", "type": "page", "url": url}
         encoded = quote(url, safe=":/?&=%#")
         response = requests.put(f"{self.http_url}/json/new?{encoded}", timeout=5)
         if response.status_code >= 400:

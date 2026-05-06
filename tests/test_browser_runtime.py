@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import json
+import os
 import tempfile
 import unittest
 from pathlib import Path
@@ -145,6 +146,33 @@ class BrowserRuntimeTest(unittest.TestCase):
 
             self.assertEqual(target["id"], "target-1")
             self.assertEqual(runtime.navigated_to, "https://example.com")
+
+    def test_start_attaches_to_env_http_cdp_endpoint(self) -> None:
+        sentinel = object()
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch.dict(os.environ, {"LLM_BROWSER_CDP_HTTP_URL": "http://127.0.0.1:9222"}, clear=False):
+                with patch.object(BrowserRuntime, "attach", return_value=sentinel) as attach:
+                    runtime = BrowserRuntime.start(Path(tmp), headless=True)
+
+            self.assertIs(runtime, sentinel)
+            attach.assert_called_once_with(root_dir=Path(tmp), http_url="http://127.0.0.1:9222")
+
+    def test_attach_ws_can_drive_current_target_without_http_endpoint(self) -> None:
+        client = Mock()
+        client.call.return_value = {}
+        client_cls = Mock(return_value=client)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("llm_browser.browser.runtime.CdpClient", client_cls):
+                runtime = BrowserRuntime.attach_ws(Path(tmp), "ws://remote/page")
+                target = runtime.new_tab("https://example.com")
+
+        client.connect.assert_called_once()
+        self.assertEqual(target["id"], "external")
+        client.call.assert_any_call("Page.enable", params=None, session_id=None, timeout_s=None)
+        client.call.assert_any_call("Runtime.enable", params=None, session_id=None, timeout_s=None)
+        client.call.assert_any_call("Network.enable", params=None, session_id=None, timeout_s=None)
+        client.call.assert_any_call("Page.navigate", params={"url": "https://example.com"}, session_id=None, timeout_s=None)
 
     def test_js_uses_repl_mode_by_default_for_repeated_snippets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
