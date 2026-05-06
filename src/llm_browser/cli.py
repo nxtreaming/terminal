@@ -28,7 +28,7 @@ from llm_browser.session.store import SessionStore
 
 DATASET_TIMEOUT_DRAIN_S = 10.0
 MAX_INLINE_DATASET_RESULT = 20_000
-BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud"]
+BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud", "daemon"]
 
 
 def add_browser_runtime_args(
@@ -75,6 +75,8 @@ def add_browser_runtime_args(
     parser.add_argument("--cloud-allow-resizing", action=argparse.BooleanOptionalAction, default=browser_default("cloud_allow_resizing"))
     parser.add_argument("--cloud-recording", action=argparse.BooleanOptionalAction, default=browser_default("cloud_recording"))
     parser.add_argument("--cloud-custom-proxy-json", default=browser_default("cloud_custom_proxy_json"), help="JSON object forwarded as Browser Use customProxy.")
+    parser.add_argument("--daemon-name", default=browser_default("daemon_name"), help="Name for daemon browser mode.")
+    parser.add_argument("--daemon-backend", default=browser_default("daemon_backend"), help="Backend used inside daemon mode: chromium, cdp, real, or cloud.")
 
 
 def apply_browser_runtime_args(args: argparse.Namespace) -> None:
@@ -91,6 +93,8 @@ def apply_browser_runtime_args(args: argparse.Namespace) -> None:
         ("cloud_proxy_country", "LLM_BROWSER_CLOUD_PROXY_COUNTRY"),
         ("cloud_timeout", "LLM_BROWSER_CLOUD_TIMEOUT"),
         ("cloud_custom_proxy_json", "LLM_BROWSER_CLOUD_CUSTOM_PROXY_JSON"),
+        ("daemon_name", "LLM_BROWSER_DAEMON_NAME"),
+        ("daemon_backend", "LLM_BROWSER_DAEMON_BACKEND"),
     ]
     for attr, env_name in mappings:
         if not hasattr(args, attr):
@@ -198,6 +202,17 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     browser_smoke.add_argument("--url", default="https://example.com", help="URL to open.")
     add_browser_runtime_args(browser_smoke, headless_default=False, config=config)
     browser_smoke.set_defaults(func=cmd_browser_smoke)
+
+    browser_daemon = browser_sub.add_parser("daemon", help="Manage local browser daemon.")
+    browser_daemon_sub = browser_daemon.add_subparsers(dest="browser_daemon_command", required=True)
+
+    browser_daemon_status = browser_daemon_sub.add_parser("status", help="Show daemon status.")
+    browser_daemon_status.add_argument("--name", default=None)
+    browser_daemon_status.set_defaults(func=cmd_browser_daemon_status)
+
+    browser_daemon_stop = browser_daemon_sub.add_parser("stop", help="Stop daemon.")
+    browser_daemon_stop.add_argument("--name", default=None)
+    browser_daemon_stop.set_defaults(func=cmd_browser_daemon_stop)
 
     datasets = sub.add_parser("datasets", help="Run or sample browser benchmark datasets.")
     datasets_sub = datasets.add_subparsers(dest="datasets_command", required=True)
@@ -382,6 +397,31 @@ def cmd_browser_smoke(args: argparse.Namespace) -> int:
         print(json.dumps(payload, indent=2))
     finally:
         runtime.close()
+    return 0
+
+
+def _daemon_name_from_args(args: argparse.Namespace) -> str:
+    return (
+        args.name
+        or os.environ.get("LLM_BROWSER_DAEMON_NAME")
+        or os.environ.get("BROWSER_USE_TERMINAL_DAEMON_NAME")
+        or "default"
+    )
+
+
+def cmd_browser_daemon_status(args: argparse.Namespace) -> int:
+    from llm_browser.browser.daemon_client import daemon_status
+
+    print(json.dumps(daemon_status(_daemon_name_from_args(args)), indent=2))
+    return 0
+
+
+def cmd_browser_daemon_stop(args: argparse.Namespace) -> int:
+    from llm_browser.browser.daemon_client import stop_daemon
+
+    name = _daemon_name_from_args(args)
+    stopped = stop_daemon(name)
+    print(json.dumps({"ok": True, "name": name, "stopped": stopped}, indent=2))
     return 0
 
 

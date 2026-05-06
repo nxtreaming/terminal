@@ -31,6 +31,7 @@ uv run browser-use-terminal config init
 uv run browser-use-terminal run --provider fake "Open example.com"
 uv run browser-use-terminal run --provider codex --model gpt-5.5 "Call the done tool with result ok."
 uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
+uv run browser-use-terminal browser smoke --browser daemon --headless --daemon-name smoke-test --url https://example.com
 uv run browser-use-terminal tui --browser chromium
 uv run browser-use-terminal sessions list
 uv run browser-use-terminal datasets sample real_v8 --count 1 --seed 21
@@ -86,6 +87,16 @@ uv run browser-use-terminal tui --browser cloud --cloud-profile-id <uuid> --prov
 
 Useful shared options: `--browser-width`, `--browser-height`, `--chrome-path`, `--profile-template`, `--keep-profile`, `--cloud-profile-name`, `--cloud-recording`, and `--cloud-custom-proxy-json`.
 
+Daemon mode runs a local browser owner process behind the same runtime facade. Use it when you want harnesless-style CDP ownership while keeping this harness's sessions, screenshots, and artifacts:
+
+```bash
+uv run browser-use-terminal tui --browser daemon --headless --daemon-name default --provider codex --model gpt-5.5
+uv run browser-use-terminal browser daemon status --name default
+uv run browser-use-terminal browser daemon stop --name default
+```
+
+Daemon mode defaults to an owned Chromium backend. Pass `--daemon-backend cdp`, `real`, or `cloud` to make the daemon attach to that backend instead.
+
 ## Browser Python Helpers
 
 The main browser tool is still an editable Python runtime. Useful built-ins include:
@@ -112,6 +123,7 @@ For interactive terminal programs, use the `shell_start` tool with `pty=true`, t
 ```bash
 uv run python -m unittest discover -s tests
 uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
+uv run browser-use-terminal browser smoke --browser daemon --headless --daemon-name smoke-test --url https://example.com
 uv run browser-use-terminal datasets run real_v8 --provider fake --count 1 --seed 3
 ```
 

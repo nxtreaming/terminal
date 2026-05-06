@@ -80,6 +80,8 @@ class BrowserRuntimeOptions:
     cloud_allow_resizing: Optional[bool] = None
     cloud_enable_recording: Optional[bool] = None
     cloud_custom_proxy: Optional[Dict[str, Any]] = None
+    daemon_name: Optional[str] = None
+    daemon_backend: Optional[str] = None
 
     @classmethod
     def from_env(cls) -> "BrowserRuntimeOptions":
@@ -109,6 +111,8 @@ class BrowserRuntimeOptions:
             cloud_allow_resizing=_env_bool_optional("LLM_BROWSER_CLOUD_ALLOW_RESIZING"),
             cloud_enable_recording=_env_bool_optional("LLM_BROWSER_CLOUD_ENABLE_RECORDING"),
             cloud_custom_proxy=_env_json_object("LLM_BROWSER_CLOUD_CUSTOM_PROXY_JSON"),
+            daemon_name=_first_env("LLM_BROWSER_DAEMON_NAME", "BROWSER_USE_TERMINAL_DAEMON_NAME"),
+            daemon_backend=_first_env("LLM_BROWSER_DAEMON_BACKEND", "BROWSER_USE_TERMINAL_DAEMON_BACKEND"),
         )
 
     def normalized_mode(self) -> str:
@@ -125,6 +129,8 @@ class BrowserRuntimeOptions:
             "remote": "cloud",
             "browser-use": "cloud",
             "browser-use-cloud": "cloud",
+            "browser-daemon": "daemon",
+            "cdp-daemon": "daemon",
             "real-chrome": "real",
             "existing": "real",
             "attach": "cdp",
@@ -216,8 +222,13 @@ class BrowserRuntime:
         if mode == "cloud":
             return cls.start_cloud(root_dir=root_dir, options=options)
 
+        if mode == "daemon":
+            from llm_browser.browser.daemon_client import DaemonBrowserRuntime
+
+            return DaemonBrowserRuntime.start(root_dir=root_dir, headless=headless, options=options)  # type: ignore[return-value]
+
         if mode not in {"chromium"}:
-            raise RuntimeError(f"unknown browser mode {options.mode!r}; expected auto, chromium, real, cdp, or cloud")
+            raise RuntimeError(f"unknown browser mode {options.mode!r}; expected auto, chromium, real, cdp, cloud, or daemon")
 
         runtime = cls(root_dir=root_dir, preserve_profile=options.preserve_profile)
         runtime.mode = "chromium"
@@ -1174,6 +1185,10 @@ def browser_runtime_diagnostics(options: Optional[BrowserRuntimeOptions] = None)
             "allow_resizing": options.cloud_allow_resizing,
             "enable_recording": options.cloud_enable_recording,
             "custom_proxy_configured": bool(options.cloud_custom_proxy),
+        },
+        "daemon": {
+            "name": options.daemon_name,
+            "backend": options.daemon_backend,
         },
     }
 

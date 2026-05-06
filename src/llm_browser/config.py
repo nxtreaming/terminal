@@ -66,6 +66,8 @@ def example_config() -> Dict[str, Any]:
             "cloud_allow_resizing": None,
             "cloud_recording": None,
             "cloud_custom_proxy_json": None,
+            "daemon_name": None,
+            "daemon_backend": None,
         },
     }
 
