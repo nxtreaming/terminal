@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import time
 import unittest
 from pathlib import Path
 
@@ -53,6 +54,24 @@ class ShellFileToolsTest(unittest.TestCase):
             output_events = [event for event in ctx.store.events.read(ctx.session.id) if event.type == "tool.output"]
             self.assertTrue(output_events)
             self.assertIn("streamed", output_events[-1].payload["text"])
+
+    def test_shell_timeout_kills_child_process_group(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            ctx = self.make_context(tmp)
+            marker = ctx.session.cwd / "child-survived.txt"
+            command = (
+                "python - <<'PY'\n"
+                "import subprocess, sys, time\n"
+                f"subprocess.Popen([sys.executable, '-c', \"import pathlib, time; time.sleep(1); pathlib.Path({str(marker)!r}).write_text('alive')\"])\n"
+                "time.sleep(10)\n"
+                "PY"
+            )
+
+            result = shell(ctx, {"command": command, "timeout_s": 0.2})
+            time.sleep(1.2)
+
+            self.assertTrue(result.data["timed_out"])
+            self.assertFalse(marker.exists())
 
     def test_apply_patch_applies_unified_diff(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

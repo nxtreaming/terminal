@@ -1,6 +1,8 @@
 from __future__ import annotations
 
 import queue
+import os
+import signal
 import subprocess
 import threading
 import time
@@ -28,6 +30,7 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
         bufsize=1,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
+        start_new_session=True,
     )
 
     readers = [
@@ -44,12 +47,7 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
             _emit_pending(ctx, pending)
             last_emit = time.time()
         if ctx.is_cancel_requested():
-            process.terminate()
-            try:
-                process.communicate(timeout=2)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.communicate(timeout=2)
+            _terminate_process_group(process, timeout=2)
             _finish_readers(readers, chunks, output, pending)
             _emit_pending(ctx, pending)
             combined_cancel = _combine_ordered(output)
@@ -58,8 +56,7 @@ def shell(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
                 data={"returncode": process.returncode, "cancelled": True, "truncated": False},
             )
         if time.time() >= deadline:
-            process.kill()
-            process.communicate(timeout=2)
+            _kill_process_group(process, timeout=2)
             _finish_readers(readers, chunks, output, pending)
             _emit_pending(ctx, pending)
             combined_timeout = _combine_ordered(output)
@@ -93,6 +90,33 @@ def _read_pipe(pipe, stream: str, chunks: "queue.Queue[tuple[str, str]]") -> Non
             pipe.close()
         except Exception:
             pass
+
+
+def _terminate_process_group(process: subprocess.Popen, timeout: float) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGTERM)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        _kill_process_group(process, timeout=timeout)
+
+
+def _kill_process_group(process: subprocess.Popen, timeout: float) -> None:
+    if process.poll() is not None:
+        return
+    try:
+        os.killpg(process.pid, signal.SIGKILL)
+    except ProcessLookupError:
+        return
+    try:
+        process.wait(timeout=timeout)
+    except subprocess.TimeoutExpired:
+        process.kill()
+        process.wait(timeout=timeout)
 
 
 def _drain_chunks(
