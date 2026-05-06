@@ -26,13 +26,14 @@ def build_builtin_registry() -> ToolRegistry:
             name="python",
             description=(
                 "Run persistent Python for browser work. Raw CDP is available as "
-                "cdp(method, params=None). Helpers include new_tab(url), navigate(url), tabs(), "
+                "cdp(method, params=None, timeout_s=None, retry=True). Helpers include new_tab(url), navigate(url), tabs(), "
                 "attach_tab(...), js(expr), wait_for_load(), screenshot(label, attach=True, timeout_s=8), "
                 "click_at(x,y), type_text(text), press(key), scroll(dx=0, dy=500), page_info(), "
                 "visible_text(), deep_text(), links(), click_text(text_or_regex), dismiss_cookie_banners(), "
                 "save_helper(), load_helper(), save_artifact(), "
                 "upload_artifact(path), create_download_url(path), download_file(url, path=None), "
-                "output_path(path=''), and read_pdf_text(path_or_url, max_pages=None). "
+                "output_path(path=''), read_pdf_text(path_or_url, max_pages=None), "
+                "fetch_text(url, use_jina='auto'), and search_web(query). "
                 "requests, a browser-header http session, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
                 "requests gets browser-like User-Agent and Accept-Language defaults unless overridden. "
                 "PyPDF2 imports are shimmed to pypdf when available. "

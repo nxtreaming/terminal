@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import contextlib
+import html
 import io
 import json
 import mimetypes
 import os
+import re
 import shutil
 import sys
 import threading
@@ -14,6 +16,7 @@ import types
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
+from urllib.parse import quote_plus
 
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.result import ToolImage, ToolResult
@@ -93,11 +96,18 @@ class PythonBrowserTool:
             method: str,
             params: Optional[Dict[str, Any]] = None,
             session_id: Optional[str] = None,
+            timeout_s: Optional[float] = None,
+            retry: bool = True,
         ) -> Dict[str, Any]:
-            return runtime.cdp(method, params=params, session_id=session_id)
+            return runtime.cdp(method, params=params, session_id=session_id, timeout_s=timeout_s, retry=retry)
 
         def new_tab(url: str = "about:blank") -> Dict[str, Any]:
             return runtime.new_tab(url)
+
+        def navigate(url: str, wait: bool = True, timeout_s: float = 20.0, timeout: Optional[float] = None) -> Dict[str, Any]:
+            if timeout is not None:
+                timeout_s = timeout
+            return runtime.navigate(url, wait=wait, timeout_s=timeout_s)
 
         def js(
             expression: str,
@@ -394,6 +404,94 @@ class PythonBrowserTool:
                 if close_stream:
                     stream.close()
 
+        def fetch_text(
+            url: str,
+            max_chars: int = 20000,
+            use_jina: Any = "auto",
+            timeout: float = 20.0,
+            headers: Optional[Dict[str, str]] = None,
+        ) -> Dict[str, Any]:
+            try:
+                import requests
+            except Exception as exc:
+                raise RuntimeError("requests is not installed") from exc
+
+            mode = str(use_jina).lower()
+            force_jina = use_jina is True or mode in {"1", "true", "yes", "always", "jina", "reader"}
+            disable_jina = use_jina is False or mode in {"0", "false", "no", "never", "direct"}
+            request_headers = _browser_headers()
+            if headers:
+                request_headers.update(headers)
+
+            direct_error: Optional[str] = None
+            if not force_jina:
+                try:
+                    response = requests.get(url, headers=request_headers, timeout=timeout)
+                    text = response.text
+                    result = _fetch_text_result(url, response.url, response.status_code, text, "direct", max_chars)
+                    if response.ok and text.strip():
+                        return result
+                    direct_error = f"HTTP {response.status_code}"
+                    if disable_jina:
+                        return result
+                except Exception as exc:
+                    direct_error = str(exc)
+                    if disable_jina:
+                        return {
+                            "ok": False,
+                            "url": url,
+                            "source": "direct",
+                            "error": direct_error,
+                            "text": "",
+                            "truncated": False,
+                        }
+
+            reader_url = _jina_reader_url(url)
+            try:
+                response = requests.get(reader_url, headers=request_headers, timeout=max(timeout, 30.0))
+                result = _fetch_text_result(url, response.url, response.status_code, response.text, "jina", max_chars)
+                if direct_error:
+                    result["direct_error"] = direct_error
+                return result
+            except Exception as exc:
+                return {
+                    "ok": False,
+                    "url": url,
+                    "source": "jina",
+                    "reader_url": reader_url,
+                    "direct_error": direct_error,
+                    "error": str(exc),
+                    "text": "",
+                    "truncated": False,
+                }
+
+        def search_web(query: str, max_results: int = 8, timeout: float = 20.0) -> Dict[str, Any]:
+            try:
+                import requests
+            except Exception as exc:
+                raise RuntimeError("requests is not installed") from exc
+
+            urls = [
+                ("bing", f"https://www.bing.com/search?q={quote_plus(query)}"),
+                ("bing_reader", _jina_reader_url(f"https://www.bing.com/search?q={quote_plus(query)}")),
+            ]
+            results: List[Dict[str, str]] = []
+            attempts: List[Dict[str, Any]] = []
+            for source, search_url in urls:
+                try:
+                    response = requests.get(search_url, headers=_browser_headers(), timeout=timeout)
+                    text = response.text
+                    attempts.append({"source": source, "status": response.status_code, "url": response.url, "chars": len(text)})
+                    if source == "bing":
+                        results.extend(_parse_bing_results(text, limit=max_results - len(results)))
+                    else:
+                        results.extend(_parse_markdown_links(text, limit=max_results - len(results)))
+                except Exception as exc:
+                    attempts.append({"source": source, "url": search_url, "error": str(exc)})
+                if len(results) >= max_results:
+                    break
+            return {"query": query, "results": results[:max_results], "attempts": attempts}
+
         def screenshot(
             label: str = "screenshot",
             attach: bool = True,
@@ -417,7 +515,7 @@ class PythonBrowserTool:
                 "output_path": output_path,
                 "cdp": cdp,
                 "new_tab": new_tab,
-                "navigate": runtime.navigate,
+                "navigate": navigate,
                 "tabs": runtime.tabs,
                 "attach_tab": runtime.attach_tab,
                 "js": js,
@@ -444,6 +542,8 @@ class PythonBrowserTool:
                 "artifact_download_url": create_download_url,
                 "download_file": download_file,
                 "read_pdf_text": read_pdf_text,
+                "fetch_text": fetch_text,
+                "search_web": search_web,
             }
         )
         return namespace
@@ -548,6 +648,80 @@ def _browser_headers() -> Dict[str, str]:
         ),
         "Accept-Language": "en-US,en;q=0.9",
     }
+
+
+def _jina_reader_url(url: str) -> str:
+    return "https://r.jina.ai/http://" + url
+
+
+def _fetch_text_result(
+    requested_url: str,
+    final_url: str,
+    status_code: int,
+    text: str,
+    source: str,
+    max_chars: int,
+) -> Dict[str, Any]:
+    truncated = len(text) > max_chars
+    return {
+        "ok": 200 <= status_code < 400,
+        "url": requested_url,
+        "final_url": final_url,
+        "status": status_code,
+        "source": source,
+        "text": text[:max_chars],
+        "chars": len(text),
+        "truncated": truncated,
+    }
+
+
+def _parse_bing_results(page: str, limit: int) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    if limit <= 0:
+        return results
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(page, "html.parser")
+        for item in soup.select("li.b_algo"):
+            link = item.select_one("h2 a") or item.find("a")
+            if not link:
+                continue
+            title = link.get_text(" ", strip=True)
+            url = str(link.get("href") or "")
+            snippet = item.get_text(" ", strip=True)
+            results.append({"title": title, "url": url, "snippet": snippet[:600], "source": "bing"})
+            if len(results) >= limit:
+                return results
+    except Exception:
+        pass
+
+    for match in re.finditer(r'<a[^>]+href="([^"]+)"[^>]*>(.*?)</a>', page, flags=re.I | re.S):
+        url = html.unescape(match.group(1))
+        title = re.sub(r"<[^>]+>", " ", match.group(2))
+        title = html.unescape(re.sub(r"\s+", " ", title)).strip()
+        if title and url.startswith(("http://", "https://")):
+            results.append({"title": title, "url": url, "snippet": "", "source": "bing"})
+            if len(results) >= limit:
+                break
+    return results
+
+
+def _parse_markdown_links(markdown: str, limit: int) -> List[Dict[str, str]]:
+    results: List[Dict[str, str]] = []
+    if limit <= 0:
+        return results
+    seen = set()
+    for match in re.finditer(r"\[([^\]]{1,220})\]\((https?://[^)\s]+)\)", markdown):
+        title = re.sub(r"\s+", " ", match.group(1)).strip()
+        url = match.group(2).strip()
+        if not title or url in seen:
+            continue
+        seen.add(url)
+        results.append({"title": title, "url": url, "snippet": "", "source": "bing_reader"})
+        if len(results) >= limit:
+            break
+    return results
 
 
 def _click_text_script(

@@ -21,8 +21,13 @@ class FakeRuntime:
         self.last_load_timeout = None
         self.last_await_promise = None
         self.last_js_expression = None
+        self.last_cdp_timeout = None
+        self.last_cdp_retry = None
+        self.last_navigate_timeout = None
 
-    def cdp(self, method: str, params=None, session_id=None) -> Dict[str, Any]:
+    def cdp(self, method: str, params=None, session_id=None, timeout_s=None, retry=True) -> Dict[str, Any]:
+        self.last_cdp_timeout = timeout_s
+        self.last_cdp_retry = retry
         return {"method": method, "params": params or {}, "session_id": session_id}
 
     def new_tab(self, url: str = "about:blank") -> Dict[str, Any]:
@@ -34,6 +39,7 @@ class FakeRuntime:
 
     def navigate(self, url: str, wait: bool = True, timeout_s: float = 20.0) -> Dict[str, Any]:
         self.tab_urls.append(url)
+        self.last_navigate_timeout = timeout_s
         return {"url": url, "wait": wait}
 
     def attach_tab(self, target_id=None, index=None, url_contains=None) -> Dict[str, Any]:
@@ -232,6 +238,37 @@ class PythonBrowserToolTest(unittest.TestCase):
 
             self.assertTrue(result.data["ok"])
             self.assertEqual(runtime_holder["runtime"].last_load_timeout, 7)
+
+    def test_cdp_and_navigate_expose_timeout_controls(self) -> None:
+        runtime_holder = {}
+
+        def factory(root_dir: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root_dir, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "raw = cdp('Runtime.evaluate', {'expression': '1'}, timeout_s=2, retry=False)\n"
+                        "nav = navigate('https://example.com', timeout=4)\n"
+                        "result = {'raw': raw, 'nav': nav}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(runtime_holder["runtime"].last_cdp_timeout, 2)
+            self.assertFalse(runtime_holder["runtime"].last_cdp_retry)
+            self.assertEqual(runtime_holder["runtime"].last_navigate_timeout, 4)
 
     def test_wait_helpers_are_exposed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -444,6 +481,37 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["ok"])
             self.assertIn("Mozilla/5.0", result.data["result"]["ua"])
             self.assertIn("en-US", result.data["result"]["lang"])
+
+    def test_fetch_text_falls_back_to_jina_reader(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        calls = []
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            calls.append((url, kwargs))
+            if url == "https://blocked.example/page":
+                raise TimeoutError("blocked")
+            return Response("Title: readable page\n\nMarkdown Content:\nhello world", url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(ctx, {"headless": True, "code": "result = fetch_text('https://blocked.example/page', max_chars=12)"})
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["source"], "jina")
+            self.assertIn("blocked", result.data["result"]["direct_error"])
+            self.assertEqual(result.data["result"]["text"], "Title: reada")
+            self.assertTrue(calls[1][0].startswith("https://r.jina.ai/http://https://blocked.example/page"))
 
     def test_js_helper_awaits_promises_by_default(self) -> None:
         runtime_holder = {}
