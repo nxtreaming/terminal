@@ -98,6 +98,8 @@ def build_dataset_prompt(task: DatasetTask, headless: bool = True) -> str:
         "Attach screenshots after meaningful page transitions or before relying on visual state. "
         "For large sitemap or directory tasks, prefer read_sitemap(...) and fetch_many_text(..., save_to='pages.json') "
         "so bulk pages are fetched in bounded parallelism and saved to disk instead of printed into context. "
+        "If a reader service or site starts returning 429s, use fetch_many_text(..., requests_per_minute=15, save_to='pages.json') "
+        "so work continues serially and writes partial results as it goes. "
         "For store/location directories, look for lower-cardinality state/city/category directory pages or JSON APIs "
         "before fetching one page per listed item; extract_markdown_link_blocks(...) is useful for repeated directory cards, "
         "and per-item page crawls should be rate-aware and treated as a fallback. "

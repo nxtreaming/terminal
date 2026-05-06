@@ -542,10 +542,23 @@ class PythonBrowserTool:
             timeout: float = 20.0,
             headers: Optional[Dict[str, str]] = None,
             save_to: Optional[str] = None,
+            requests_per_minute: Optional[float] = None,
+            rate_limit_retries: int = 3,
         ) -> Dict[str, Any]:
             url_list = [str(url) for url in urls]
             worker_count = max(1, min(int(max_workers), 64, len(url_list) or 1))
             results: List[Optional[Dict[str, Any]]] = [None] * len(url_list)
+
+            def save_results() -> Optional[Path]:
+                if not save_to:
+                    return None
+                target = Path(save_to).expanduser()
+                if not target.is_absolute():
+                    target = ctx.session.cwd / target
+                target.parent.mkdir(parents=True, exist_ok=True)
+                compact = [item or {"ok": False, "error": "missing result", "text": ""} for item in results]
+                target.write_text(json.dumps(compact, ensure_ascii=False, indent=2), encoding="utf-8")
+                return target
 
             def fetch_one(index_and_url: tuple[int, str]) -> tuple[int, Dict[str, Any]]:
                 index, item_url = index_and_url
@@ -567,9 +580,44 @@ class PythonBrowserTool:
                         "truncated": False,
                     }
 
-            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                for index, result_item in executor.map(fetch_one, enumerate(url_list)):
-                    results[index] = result_item
+            rpm = None
+            if requests_per_minute is not None:
+                try:
+                    rpm = float(requests_per_minute)
+                except (TypeError, ValueError):
+                    raise ValueError("requests_per_minute must be a positive number") from None
+                if rpm <= 0:
+                    raise ValueError("requests_per_minute must be a positive number")
+
+            if rpm is not None:
+                min_interval_s = 60.0 / rpm
+                next_allowed_at = time.monotonic()
+                retry_count = max(0, int(rate_limit_retries))
+                for index, item_url in enumerate(url_list):
+                    attempt = 0
+                    while True:
+                        delay = next_allowed_at - time.monotonic()
+                        if delay > 0:
+                            time.sleep(delay)
+                        _, result_item = fetch_one((index, item_url))
+                        results[index] = result_item
+                        save_results()
+                        next_allowed_at = time.monotonic() + min_interval_s
+                        if not result_item.get("rate_limited") or attempt >= retry_count:
+                            break
+                        retry_after = result_item.get("retry_after_s")
+                        try:
+                            wait_s = max(float(retry_after), min_interval_s)
+                        except (TypeError, ValueError):
+                            wait_s = max(5.0, min_interval_s)
+                        time.sleep(min(wait_s, 90.0))
+                        next_allowed_at = time.monotonic()
+                        attempt += 1
+            else:
+                with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                    for index, result_item in executor.map(fetch_one, enumerate(url_list)):
+                        results[index] = result_item
+                save_results()
 
             compact_results = [item or {"ok": False, "error": "missing result", "text": ""} for item in results]
             summary: Dict[str, Any] = {
@@ -577,14 +625,11 @@ class PythonBrowserTool:
                 "ok": sum(1 for item in compact_results if item.get("ok")),
                 "failed": sum(1 for item in compact_results if not item.get("ok")),
                 "truncated": sum(1 for item in compact_results if item.get("truncated")),
+                "rate_limited": sum(1 for item in compact_results if item.get("rate_limited")),
                 "sources": _count_values(str(item.get("source") or "") for item in compact_results),
             }
             if save_to:
-                target = Path(save_to).expanduser()
-                if not target.is_absolute():
-                    target = ctx.session.cwd / target
-                target.parent.mkdir(parents=True, exist_ok=True)
-                target.write_text(json.dumps(compact_results, ensure_ascii=False, indent=2), encoding="utf-8")
+                target = save_results()
                 summary["path"] = str(target)
                 return summary
             summary["results"] = compact_results
@@ -761,6 +806,8 @@ def _browser_headers() -> Dict[str, str]:
 
 
 def _jina_reader_url(url: str) -> str:
+    if url.startswith(("https://r.jina.ai/http://", "http://r.jina.ai/http://")):
+        return url
     return "https://r.jina.ai/http://" + url
 
 
@@ -864,7 +911,7 @@ def _fetch_text_with_jina_reader(
 
 def _jina_retry_delay(text: str) -> Optional[float]:
     stripped = text.strip()
-    if not stripped.startswith("{") or "RateLimit" not in stripped:
+    if not stripped.startswith("{"):
         return None
     try:
         payload = json.loads(stripped)
@@ -872,7 +919,13 @@ def _jina_retry_delay(text: str) -> Optional[float]:
         return None
     code = payload.get("code")
     status = payload.get("status")
-    if code != 429 and status not in {429, 42903}:
+    code_text = str(code or "")
+    status_text = str(status or "")
+    message = str(payload.get("message") or "").lower()
+    rate_limited = code_text.startswith("429") or status_text.startswith("429") or (
+        "retryAfter" in payload and "rate limit" in message
+    )
+    if not rate_limited:
         return None
     retry_after = payload.get("retryAfter")
     try:
@@ -1507,3 +1560,5 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
 
     module.__all__ = [name for name in export_names if hasattr(module, name)]
     sys.modules["browser_helpers"] = module
+    sys.modules["browser_use"] = module
+    sys.modules["browser_tools"] = module

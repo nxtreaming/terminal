@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
 import os
@@ -672,6 +673,62 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(saved.exists())
             self.assertIn("https://example.com/a", saved.read_text(encoding="utf-8"))
 
+    def test_fetch_many_text_can_rate_limit_and_retry_bulk_results(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        calls: list[str] = []
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            calls.append(url)
+            if len(calls) <= 3:
+                return Response(
+                    json.dumps(
+                        {
+                            "data": None,
+                            "retryAfter": 0.1,
+                            "code": 429,
+                            "status": 42903,
+                            "message": "Per IP rate limit exceeded",
+                        }
+                    ),
+                    url,
+                    429,
+                )
+            return Response(f"page for {url}", url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get), patch("time.sleep") as sleep:
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "from browser_helpers import fetch_many_text\n"
+                            "result = fetch_many_text(['https://example.com/a'], "
+                            "use_jina=True, requests_per_minute=60000, rate_limit_retries=1, save_to='pages.json')"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            summary = result.data["result"]
+            self.assertEqual(summary["count"], 1)
+            self.assertEqual(summary["ok"], 1)
+            self.assertGreaterEqual(len(calls), 4)
+            self.assertTrue(sleep.called)
+            saved = Path(summary["path"])
+            self.assertIn("page for", saved.read_text(encoding="utf-8"))
+
     def test_extract_markdown_link_blocks_captures_directory_cards(self) -> None:
         markdown = (
             "*   [Morrilton](https://www.tractorsupply.com/tsc/store_Morrilton-AR-72110_2306)\n"
@@ -746,6 +803,35 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["many"], 1)
             self.assertEqual(result.data["result"]["blocks"], "A")
             self.assertEqual(result.data["result"]["title"], "Example Domain")
+
+    def test_browser_use_module_alias_exports_helpers(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", return_value=Response("hello from alias", "https://example.com")):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "from browser_use import *\n"
+                            "result = fetch_text('https://example.com')"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"], "hello from alias")
 
     def test_js_helper_awaits_promises_by_default(self) -> None:
         runtime_holder = {}
