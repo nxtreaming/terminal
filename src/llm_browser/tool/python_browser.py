@@ -548,6 +548,13 @@ class PythonBrowserTool:
                 attempt["parsed"] = len(added)
                 attempts.append(attempt)
 
+            fcc_codes = _extract_fcc_grantee_codes(query)
+            if fcc_codes and len(results) < max_results:
+                found, attempt = _search_fcc_grantee_records(fcc_codes, limit=max_results - len(results))
+                added = add_results(found)
+                attempt["parsed"] = len(added)
+                attempts.append(attempt)
+
             for source, search_url in urls:
                 if len(results) >= max_results:
                     break
@@ -1422,6 +1429,66 @@ def _extract_cve_ids(text: str) -> List[str]:
             seen.add(cve_id)
             cve_ids.append(cve_id)
     return cve_ids
+
+
+def _extract_fcc_grantee_codes(text: str) -> List[str]:
+    if not re.search(r"\b(fcc|fccid|grantee)\b", text or "", flags=re.I):
+        return []
+    stop_words = {
+        "FCC",
+        "FCCID",
+        "ID",
+        "IO",
+        "SITE",
+        "HTTP",
+        "HTML",
+        "THE",
+        "AND",
+        "FOR",
+        "CODE",
+        "CODES",
+        "QUERY",
+        "SEARCH",
+    }
+    seen: set[str] = set()
+    codes: List[str] = []
+    for token in re.findall(r"\b[A-Z0-9]{3,5}\b", (text or "").upper()):
+        if token in stop_words:
+            continue
+        if len(token) == 5 and not token.startswith("2"):
+            continue
+        if not any(ch.isdigit() for ch in token) and len(token) != 3:
+            continue
+        if token not in seen:
+            seen.add(token)
+            codes.append(token)
+    return codes
+
+
+def _search_fcc_grantee_records(codes: List[str], *, limit: int) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
+    if limit <= 0:
+        return [], {"source": "fcc_grantee_records", "skipped": True}
+    results: List[Dict[str, str]] = []
+    for code in codes:
+        candidates = [
+            {
+                "title": f"FCCID.io grantee page - {code}",
+                "url": f"https://fccid.io/{code}/",
+                "snippet": f"FCCID.io grantee page listing FCC ID applications for grantee code {code}.",
+                "source": "fcc_grantee_records",
+            },
+            {
+                "title": f"FCCID.io company lookup - {code}",
+                "url": f"https://fccid.io/company.php?grantee={code}",
+                "snippet": f"FCCID.io company lookup for FCC grantee code {code}.",
+                "source": "fcc_grantee_records",
+            },
+        ]
+        for candidate in candidates:
+            results.append(candidate)
+            if len(results) >= limit:
+                return results, {"source": "fcc_grantee_records", "fcc_grantee_codes": codes}
+    return results, {"source": "fcc_grantee_records", "fcc_grantee_codes": codes}
 
 
 def _normalize_email_domains(domains: Optional[Any]) -> Optional[set[str]]:
