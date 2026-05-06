@@ -76,6 +76,50 @@ class EventSpineTest(unittest.TestCase):
             store.clear_cancel(session.id)
             self.assertFalse(store.is_cancel_requested(session.id))
 
+    def test_session_store_reconciles_dead_runner_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.update_status(session.id, "running")
+            store.begin_run(session.id, pid=999999999)
+
+            reconciled = store.reconcile_orphaned_sessions()
+
+            self.assertEqual([item.id for item in reconciled], [session.id])
+            self.assertIsNone(store.runner_info(session.id))
+            loaded = store.load(session.id)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.status, "failed")  # type: ignore[union-attr]
+            events = store.events.read(session.id)
+            self.assertEqual(events[-3].type, "session.reconciled")
+            self.assertEqual(events[-2].type, "session.status")
+            self.assertEqual(events[-1].type, "session.failed")
+            self.assertEqual(events[-1].payload["error_type"], "StaleSession")
+
+    def test_session_store_keeps_live_runner_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.update_status(session.id, "running")
+            store.begin_run(session.id)
+
+            reconciled = store.reconcile_orphaned_sessions()
+
+            self.assertEqual(reconciled, [])
+            self.assertIsNotNone(store.runner_info(session.id))
+            self.assertEqual(store.load(session.id).status, "running")  # type: ignore[union-attr]
+
+    def test_session_store_can_reconcile_old_running_session_without_marker(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.update_status(session.id, "running")
+
+            reconciled = store.reconcile_orphaned_sessions(stale_without_runner_ms=0)
+
+            self.assertEqual([item.id for item in reconciled], [session.id])
+            self.assertEqual(store.load(session.id).status, "failed")  # type: ignore[union-attr]
+
     def test_session_store_list_is_newest_first(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))

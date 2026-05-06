@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import concurrent.futures
+import os
 import time
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
@@ -91,6 +92,8 @@ class Agent:
 
     def _run_with_messages(self, session: SessionMetadata, messages: List[Dict[str, Any]]) -> SessionMetadata:
         final_result: Optional[str] = None
+        runner_pid = os.getpid()
+        self.store.begin_run(session.id, pid=runner_pid)
 
         try:
             for _ in range(self.max_turns):
@@ -162,6 +165,7 @@ class Agent:
             )
             raise
         finally:
+            self.store.clear_runner(session.id, pid=runner_pid)
             self.tools.close_session(session.id)
 
     def _messages_from_events(self, session_id: str) -> List[Dict[str, Any]]:

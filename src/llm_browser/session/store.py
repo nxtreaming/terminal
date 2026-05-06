@@ -2,14 +2,17 @@ from __future__ import annotations
 
 import json
 import os
+import socket
 import uuid
 from pathlib import Path
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional
 
 from llm_browser.events.bus import EventBus
-from llm_browser.events.event import Event
+from llm_browser.events.event import Event, now_ms
 from llm_browser.events.store import EventStore
 from llm_browser.session.metadata import SessionMetadata
+
+RUNNABLE_STATUSES = {"created", "running"}
 
 
 class SessionStore:
@@ -95,6 +98,80 @@ class SessionStore:
     def is_cancel_requested(self, session_id: str) -> bool:
         return self.cancel_request(session_id) is not None
 
+    def begin_run(self, session_id: str, label: str = "agent", pid: Optional[int] = None) -> Dict[str, Any]:
+        existing = self.runner_info(session_id)
+        if existing is not None and self._runner_is_live(existing):
+            raise RuntimeError(f"session already has a live runner: {session_id}")
+
+        session = self.load(session_id)
+        if session is None:
+            raise KeyError(f"session not found: {session_id}")
+
+        runner = {
+            "pid": int(pid if pid is not None else os.getpid()),
+            "hostname": socket.gethostname(),
+            "label": str(label),
+            "session_id": session_id,
+            "started_ms": now_ms(),
+            "cwd": str(session.cwd),
+        }
+        path = self._runner_path(session_id)
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp_path = path.with_suffix(".json.tmp")
+        with tmp_path.open("w", encoding="utf-8") as fh:
+            json.dump(runner, fh, indent=2)
+            fh.write("\n")
+        os.replace(tmp_path, path)
+        return runner
+
+    def clear_runner(self, session_id: str, pid: Optional[int] = None) -> bool:
+        path = self._runner_path(session_id)
+        if not path.exists():
+            return False
+        if pid is not None:
+            info = self.runner_info(session_id)
+            if info is not None and int(info.get("pid") or -1) != int(pid):
+                return False
+        try:
+            path.unlink()
+        except FileNotFoundError:
+            return False
+        return True
+
+    def runner_info(self, session_id: str) -> Optional[Dict[str, Any]]:
+        path = self._runner_path(session_id)
+        if not path.exists():
+            return None
+        try:
+            with path.open("r", encoding="utf-8") as fh:
+                data = json.load(fh)
+        except (OSError, json.JSONDecodeError):
+            return None
+        return data if isinstance(data, dict) else None
+
+    def reconcile_orphaned_sessions(self, stale_without_runner_ms: Optional[int] = None) -> List[SessionMetadata]:
+        reconciled: List[SessionMetadata] = []
+        current_ms = now_ms()
+        for session in self.list():
+            if session.status not in RUNNABLE_STATUSES:
+                continue
+
+            runner = self.runner_info(session.id)
+            if runner is not None:
+                if self._runner_is_live(runner):
+                    continue
+                reason = self._stale_runner_reason(runner)
+                reconciled.append(self._fail_orphaned_session(session, reason, runner))
+                continue
+
+            if stale_without_runner_ms is None:
+                continue
+            age_ms = current_ms - session.updated_ms
+            if age_ms >= max(0, int(stale_without_runner_ms)):
+                reason = f"session has been {session.status} for {age_ms}ms with no runner marker"
+                reconciled.append(self._fail_orphaned_session(session, reason, None))
+        return reconciled
+
     def emit(self, session_id: str, event_type: str, payload: Optional[dict] = None) -> Event:
         event = Event(type=event_type, session_id=session_id, payload=payload or {})
         self.events.append(event)
@@ -107,6 +184,9 @@ class SessionStore:
     def _cancel_path(self, session_id: str) -> Path:
         return self.sessions_dir / session_id / "cancel.json"
 
+    def _runner_path(self, session_id: str) -> Path:
+        return self.sessions_dir / session_id / "runner.json"
+
     def _write_metadata(self, session: SessionMetadata) -> None:
         path = self._metadata_path(session.id)
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -115,3 +195,58 @@ class SessionStore:
             json.dump(session.to_dict(), fh, indent=2)
             fh.write("\n")
         os.replace(tmp_path, path)
+
+    def _runner_is_live(self, runner: Dict[str, Any]) -> bool:
+        hostname = str(runner.get("hostname") or "")
+        if hostname and hostname != socket.gethostname():
+            return True
+        try:
+            pid = int(runner.get("pid") or 0)
+        except (TypeError, ValueError):
+            return False
+        return self._pid_alive(pid)
+
+    def _pid_alive(self, pid: int) -> bool:
+        if pid <= 0:
+            return False
+        try:
+            os.kill(pid, 0)
+        except ProcessLookupError:
+            return False
+        except PermissionError:
+            return True
+        except OSError:
+            return False
+        return True
+
+    def _stale_runner_reason(self, runner: Dict[str, Any]) -> str:
+        pid = runner.get("pid")
+        label = runner.get("label") or "agent"
+        return f"session runner {label} pid {pid} is no longer alive"
+
+    def _fail_orphaned_session(
+        self,
+        session: SessionMetadata,
+        reason: str,
+        runner: Optional[Dict[str, Any]],
+    ) -> SessionMetadata:
+        payload = {
+            "from_status": session.status,
+            "to_status": "failed",
+            "reason": reason,
+            "runner": runner,
+        }
+        self.emit(session.id, "session.reconciled", payload)
+        updated = self.update_status(session.id, "failed")
+        self.emit(
+            session.id,
+            "session.failed",
+            {
+                "error": reason,
+                "error_type": "StaleSession",
+                "reconciled": True,
+                "runner": runner,
+            },
+        )
+        self.clear_runner(session.id)
+        return updated

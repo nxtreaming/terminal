@@ -82,6 +82,7 @@ class AgentLoopTest(unittest.TestCase):
             loaded = store.load(session.id)
             self.assertIsNotNone(loaded)
             self.assertEqual(loaded.status, "done")
+            self.assertIsNone(store.runner_info(session.id))
 
             events = store.events.read(session.id)
             event_types = [event.type for event in events]
@@ -110,9 +111,25 @@ class AgentLoopTest(unittest.TestCase):
             sessions = store.list()
             self.assertEqual(len(sessions), 1)
             self.assertEqual(sessions[0].status, "failed")
+            self.assertIsNone(store.runner_info(sessions[0].id))
             events = store.events.read(sessions[0].id)
             self.assertEqual(events[-1].type, "session.failed")
             self.assertIn("did not call done", events[-1].payload["error"])
+
+    def test_live_runner_marker_blocks_duplicate_session_runner(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.begin_run(session.id)
+            agent = Agent(store, provider=TextOnlyProvider())
+
+            with self.assertRaises(RuntimeError):
+                agent.run_session(session.id, "duplicate")
+
+            loaded = store.load(session.id)
+            self.assertIsNotNone(loaded)
+            self.assertEqual(loaded.status, "running")
+            self.assertIsNotNone(store.runner_info(session.id))
 
     def test_text_only_model_response_is_final_result(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
