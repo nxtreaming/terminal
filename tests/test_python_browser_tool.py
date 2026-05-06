@@ -585,6 +585,38 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["text"], "curl worked")
             self.assertEqual(result.data["result"]["direct_error"], "HTTP 403")
 
+    def test_fetch_readable_text_cleans_html_chrome(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = 200
+                self.ok = True
+                self.headers = {"content-type": "text/html; charset=utf-8"}
+
+        html_page = (
+            "<html><head><title>Example</title><style>.x{}</style></head>"
+            "<body><nav>Menu Home</nav><main><h1>Report Title</h1><p>Useful paragraph.</p>"
+            "<script>bad()</script><p>Useful paragraph.</p></main><footer>Footer</footer></body></html>"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", return_value=Response(html_page, "https://example.com/report")):
+                result = tool(ctx, {"headless": True, "code": "result = fetch_readable_text('https://example.com/report')"})
+
+            self.assertTrue(result.data["ok"])
+            text = result.data["result"]["text"]
+            self.assertIn("Report Title", text)
+            self.assertIn("Useful paragraph.", text)
+            self.assertNotIn("Menu Home", text)
+            self.assertNotIn("bad()", text)
+            self.assertEqual(text.count("Useful paragraph."), 1)
+
     def test_read_sitemap_extracts_large_url_lists(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:

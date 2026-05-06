@@ -467,6 +467,28 @@ class PythonBrowserTool:
                 direct_error=direct_error,
             )
 
+        def html_to_text(markup: str, max_chars: int = 30000, remove_chrome: bool = True) -> str:
+            return _html_to_readable_text(str(markup or ""), max_chars=max_chars, remove_chrome=remove_chrome)
+
+        def fetch_readable_text(
+            url: str,
+            max_chars: int = 30000,
+            use_jina: Any = "auto",
+            timeout: float = 20.0,
+            headers: Optional[Dict[str, str]] = None,
+        ) -> Dict[str, Any]:
+            result = fetch_text(url, max_chars=max_chars * 4, use_jina=use_jina, timeout=timeout, headers=headers)
+            raw_text = str(result.get("text") or "")
+            content_type = str(result.get("content_type") or "").lower()
+            looks_like_html = "<html" in raw_text[:1000].lower() or "<body" in raw_text[:2000].lower() or "text/html" in content_type
+            readable = _html_to_readable_text(raw_text, max_chars=max_chars) if looks_like_html else re.sub(r"\s+", " ", raw_text).strip()[:max_chars]
+            cleaned = dict(result)
+            cleaned["text"] = readable
+            cleaned["chars"] = len(readable)
+            cleaned["raw_chars"] = len(raw_text)
+            cleaned["readable"] = True
+            return cleaned
+
         def search_web(
             query: str,
             max_results: int = 8,
@@ -863,7 +885,9 @@ class PythonBrowserTool:
                 "artifact_download_url": create_download_url,
                 "download_file": download_file,
                 "read_pdf_text": read_pdf_text,
+                "html_to_text": html_to_text,
                 "fetch_text": fetch_text,
+                "fetch_readable_text": fetch_readable_text,
                 "fetch_many_text": fetch_many_text,
                 "search_web": search_web,
                 "extract_links": extract_links,
@@ -1813,6 +1837,41 @@ def _extract_html_title(text: str) -> str:
     return re.sub(r"\s+", " ", html.unescape(re.sub(r"<[^>]+>", " ", match.group(1)))).strip()[:200]
 
 
+def _html_to_readable_text(markup: str, *, max_chars: int = 30000, remove_chrome: bool = True) -> str:
+    value = str(markup or "")
+    if max_chars <= 0:
+        return ""
+    try:
+        from bs4 import BeautifulSoup
+
+        soup = BeautifulSoup(value, "html.parser")
+        selectors = ["script", "style", "noscript", "template", "svg"]
+        if remove_chrome:
+            selectors.extend(["header", "footer", "nav"])
+        for node in soup.select(",".join(selectors)):
+            node.decompose()
+        for node in soup.select("br,p,li,h1,h2,h3,h4,h5,h6,tr"):
+            node.append("\n")
+        text = soup.get_text("\n")
+    except Exception:
+        text = re.sub(r"<(script|style|noscript|template|svg)\b.*?</\1>", " ", value, flags=re.I | re.S)
+        text = re.sub(r"<br\s*/?>|</?(p|li|h[1-6]|tr|div|section|article)\b[^>]*>", "\n", text, flags=re.I)
+        text = re.sub(r"<[^>]+>", " ", text)
+    lines: List[str] = []
+    seen: set[str] = set()
+    for line in html.unescape(text).splitlines():
+        normalized = re.sub(r"\s+", " ", line).strip()
+        if not normalized:
+            continue
+        if normalized in seen:
+            continue
+        seen.add(normalized)
+        lines.append(normalized)
+        if sum(len(item) + 1 for item in lines) >= max_chars:
+            break
+    return "\n".join(lines)[:max_chars]
+
+
 def _looks_like_social_url(url: str) -> bool:
     host = urlparse(url).netloc.lower()
     social_hosts = (
@@ -2530,6 +2589,8 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "artifact_download_url",
         "download_file",
         "read_pdf_text",
+        "html_to_text",
+        "fetch_readable_text",
         "search_web",
         "extract_links",
         "extract_markdown_link_blocks",
