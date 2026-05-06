@@ -7,7 +7,7 @@ from pathlib import Path
 from unittest.mock import Mock, patch
 
 from llm_browser.datasets import build_dataset_prompt, load_dataset, select_tasks, summarize_manifest
-from llm_browser.cli import _dataset_manifest_exit_code, _run_dataset_task
+from llm_browser.cli import _dataset_manifest_exit_code, _resume_skip_task_ids, _run_dataset_task
 from llm_browser.session.store import SessionStore
 
 
@@ -60,6 +60,18 @@ class DatasetTest(unittest.TestCase):
         }
 
         self.assertEqual(_dataset_manifest_exit_code(manifest), 0)
+
+    def test_resume_skip_task_ids_can_include_failed_attempts(self) -> None:
+        manifest = {
+            "selection": [{"task_id": "1"}, {"task_id": "2"}, {"task_id": "3"}],
+            "sessions": [
+                {"task_id": "1", "ok": True},
+                {"task_id": "2", "ok": False},
+            ],
+        }
+
+        self.assertEqual(_resume_skip_task_ids(manifest), {"1"})
+        self.assertEqual(_resume_skip_task_ids(manifest, skip_failed=True), {"1", "2"})
 
     def test_dataset_task_records_final_result(self) -> None:
         class DoneAgent:
