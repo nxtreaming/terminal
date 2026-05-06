@@ -10,8 +10,8 @@ Current status: vertical MVP is implemented and being hardened against the bundl
 - harness-owned Chrome launch through CDP
 - persistent Python browser tool with raw `cdp(...)`
 - model-visible screenshot tool outputs with ordered image timelines
-- shell and basic file tools
-- event-driven Textual terminal UI
+- shell streaming, shell cancellation, and basic file tools
+- event-driven Textual terminal UI with session detail, artifact table, artifact preview, trace, eval, resume, and cancel commands
 - background sessions, cancellation, trace replay, resume, and self-eval commands
 - dataset sampling/running for `real_v8` and `real_v14_short`
 
@@ -56,3 +56,8 @@ Real `gpt-5.5` dataset runs completed:
 - `real_v8` task 34, session `940ce19a2ef4`: Shopify app contact extraction with screenshot artifact.
 - `real_v14_short` task 9, session `a4c4517fd58d`: SBI home loan rate table screenshot, verified image output in isolated workspace.
 - `real_v8` task 22, session `eedd29928174`: DNA/Telia package extraction after workspace isolation fixes.
+- `real_v14_short` full run `real-v14-gpt55-full`: 10 selected, 10 passed. Task 11 required a second latest attempt after the FCC origin stalled; the successful attempt used the `fccid.io` mirror and returned all seven grantee-code counts.
+
+Current long run:
+
+- `real_v8` full run `real-v8-gpt55-full` is in progress with `gpt-5.5`, `--all`, `--resume`, and per-task timeout.
