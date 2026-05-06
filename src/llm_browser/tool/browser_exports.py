@@ -46,8 +46,8 @@ Input:
   upload_file(selector, path)
 
 Images and artifacts:
-  screenshot(label, attach=True), capture_screenshot(path=None, attach=True), screenshot_element(selector, label=None), attach_image(path)
-  download_info(), wait_for_download(pattern=None), save_browser_trace(label)
+  screenshot(label, attach=True, timeout=8), capture_screenshot(path=None, attach=True, timeout=8), screenshot_element(selector, label=None)
+  download_info(), wait_for_download(pattern=None, timeout=30), save_browser_trace(label), attach_image(path)
   save_artifact(name, content=None), upload_artifact(path), create_download_url(path)
   output_path(path=''), download_file(url, path=None), read_pdf_text(path_or_url)
 

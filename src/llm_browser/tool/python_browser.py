@@ -982,7 +982,10 @@ class PythonBrowserTool:
             attach: bool = True,
             full_page: bool = False,
             timeout_s: float = 8.0,
+            timeout: Optional[float] = None,
         ) -> ToolImage:
+            if timeout is not None:
+                timeout_s = timeout
             image = runtime.screenshot(label=label, attach=attach, full_page=full_page, timeout_s=timeout_s)
             if attach:
                 images.append(image)
@@ -996,7 +999,10 @@ class PythonBrowserTool:
             attach: bool = True,
             label: Optional[str] = None,
             timeout_s: float = 8.0,
+            timeout: Optional[float] = None,
         ) -> str:
+            if timeout is not None:
+                timeout_s = timeout
             target_path: Optional[Path] = Path(path).expanduser() if path else None
             if target_path is not None and not target_path.is_absolute():
                 target_path = ctx.session.cwd / target_path
@@ -1036,7 +1042,10 @@ class PythonBrowserTool:
             attach: bool = True,
             padding: float = 8.0,
             timeout_s: float = 8.0,
+            timeout: Optional[float] = None,
         ) -> Dict[str, Any]:
+            if timeout is not None:
+                timeout_s = timeout
             selector_json = json.dumps(selector)
             rect = runtime.js(
                 f"""
@@ -1131,7 +1140,14 @@ class PythonBrowserTool:
         def reset_permissions(browser_context_id: Optional[str] = None) -> Dict[str, Any]:
             return _browser_reset_permissions(runtime, check_cancel, browser_context_id=browser_context_id)
 
-        def wait_for_download(pattern: Optional[str] = None, timeout_s: float = 30.0, poll_s: float = 0.25) -> Dict[str, Any]:
+        def wait_for_download(
+            pattern: Optional[str] = None,
+            timeout_s: float = 30.0,
+            poll_s: float = 0.25,
+            timeout: Optional[float] = None,
+        ) -> Dict[str, Any]:
+            if timeout is not None:
+                timeout_s = timeout
             return _browser_wait_for_download(runtime, check_cancel, pattern=pattern, timeout_s=timeout_s, poll_s=poll_s)
 
         def click_at_xy(x: float, y: float, button: str = "left", clicks: int = 1) -> None:
