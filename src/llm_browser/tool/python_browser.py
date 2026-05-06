@@ -446,6 +446,15 @@ class PythonBrowserTool:
                             "truncated": False,
                         }
 
+                curl_result = _fetch_text_with_curl_cffi(url, max_chars=max_chars, timeout=timeout, headers=request_headers)
+                if curl_result is not None:
+                    if direct_error:
+                        curl_result["direct_error"] = direct_error
+                    if curl_result.get("ok") and str(curl_result.get("text") or "").strip():
+                        return curl_result
+                    if not direct_error:
+                        direct_error = f"curl_cffi HTTP {curl_result.get('status')}"
+
             reader_url = _jina_reader_url(url)
             try:
                 response = requests.get(reader_url, headers=request_headers, timeout=max(timeout, 30.0))
@@ -544,6 +553,7 @@ class PythonBrowserTool:
                 "read_pdf_text": read_pdf_text,
                 "fetch_text": fetch_text,
                 "search_web": search_web,
+                "curl_requests": namespace.get("curl_requests"),
             }
         )
         _install_browser_helpers_module(namespace)
@@ -614,6 +624,12 @@ def _install_optional_imports(namespace: Dict[str, Any]) -> None:
     except Exception:
         pass
     try:
+        from curl_cffi import requests as curl_requests
+
+        namespace["curl_requests"] = curl_requests
+    except Exception:
+        pass
+    try:
         import pandas as pd
 
         namespace["pd"] = pd
@@ -673,6 +689,37 @@ def _fetch_text_result(
         "text": text[:max_chars],
         "chars": len(text),
         "truncated": truncated,
+    }
+
+
+def _fetch_text_with_curl_cffi(
+    url: str,
+    *,
+    max_chars: int,
+    timeout: float,
+    headers: Dict[str, str],
+) -> Optional[Dict[str, Any]]:
+    try:
+        from curl_cffi import requests as curl_requests
+    except Exception:
+        return None
+
+    last_error: Optional[str] = None
+    for impersonate in ("chrome136", "chrome124", "chrome120"):
+        try:
+            response = curl_requests.get(url, headers=headers, timeout=timeout, impersonate=impersonate)
+            result = _fetch_text_result(url, response.url, response.status_code, response.text, "curl_cffi", max_chars)
+            result["impersonate"] = impersonate
+            return result
+        except Exception as exc:
+            last_error = str(exc)
+    return {
+        "ok": False,
+        "url": url,
+        "source": "curl_cffi",
+        "error": last_error or "curl_cffi request failed",
+        "text": "",
+        "truncated": False,
     }
 
 
@@ -1195,6 +1242,7 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "search_web",
         "requests",
         "http",
+        "curl_requests",
         "BeautifulSoup",
         "pd",
         "PdfReader",
