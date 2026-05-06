@@ -39,8 +39,11 @@ class DaemonBrowserRuntime:
         params: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
+        timeout: Optional[float] = None,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        if timeout is not None:
+            timeout_s = timeout
         payload = {
             "op": "cdp",
             "method": method,
@@ -99,13 +102,18 @@ class DaemonBrowserRuntime:
         await_promise: bool = False,
         repl_mode: Optional[bool] = None,
         user_gesture: bool = False,
+        timeout_s: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
+        if timeout is not None:
+            timeout_s = timeout
         return self._call(
             "js",
             expression,
             await_promise=await_promise,
             repl_mode=repl_mode,
             user_gesture=user_gesture,
+            timeout_s=timeout_s,
         )
 
     def wait_for_load(self, timeout_s: float = 20.0) -> None:
@@ -120,7 +128,14 @@ class DaemonBrowserRuntime:
     def wait_for_text(self, text: str, timeout_s: float = 20.0) -> Any:
         return self._call("wait_for_text", text, timeout_s=timeout_s)
 
-    def wait_for_network_idle(self, timeout_s: float = 10.0, idle_ms: int = 500) -> bool:
+    def wait_for_network_idle(
+        self,
+        timeout_s: float = 10.0,
+        idle_ms: int = 500,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        if timeout is not None:
+            timeout_s = timeout
         return bool(self._call("wait_for_network_idle", timeout_s=timeout_s, idle_ms=idle_ms))
 
     def page_info(self) -> Dict[str, Any]:

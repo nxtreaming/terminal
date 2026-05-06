@@ -7,7 +7,7 @@ import time
 import unittest
 import os
 from pathlib import Path
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 from unittest.mock import Mock, patch
 
 from llm_browser.session.cancel import SessionCancelled
@@ -28,6 +28,9 @@ class FakeRuntime:
         self.last_cdp_timeout = None
         self.last_cdp_retry = None
         self.last_navigate_timeout = None
+        self.last_js_timeout_s = None
+        self.last_network_idle_timeout = None
+        self.last_network_idle_idle_ms = None
         self.cdp_calls = []
 
     def cdp(self, method: str, params=None, session_id=None, timeout_s=None, retry=True) -> Dict[str, Any]:
@@ -69,9 +72,11 @@ class FakeRuntime:
         await_promise: bool = False,
         repl_mode: bool = True,
         user_gesture: bool = False,
+        timeout_s: Optional[float] = None,
     ) -> Any:
         self.last_await_promise = await_promise
         self.last_js_expression = expression
+        self.last_js_timeout_s = timeout_s
         if expression == "document.title":
             return "Example Domain"
         if "document.querySelector" in expression and "viewportX" in expression:
@@ -101,6 +106,11 @@ class FakeRuntime:
     def wait_for_text(self, text: str, timeout_s: float = 20.0) -> Any:
         self.last_load_timeout = timeout_s
         return {"text": text, "timeout_s": timeout_s}
+
+    def wait_for_network_idle(self, timeout_s: float = 10.0, idle_ms: int = 500) -> bool:
+        self.last_network_idle_timeout = timeout_s
+        self.last_network_idle_idle_ms = idle_ms
+        return True
 
     def screenshot(
         self,
@@ -152,6 +162,14 @@ class FakeRuntime:
         return None
 
 
+class CloudRuntime(FakeRuntime):
+    def __init__(self, root_dir: Path, headless: bool) -> None:
+        super().__init__(root_dir, headless)
+        self.mode = "cloud"
+        self.cloud_browser_id = "browser-1"
+        self.cloud_live_url = "https://live.example/session"
+
+
 class PythonBrowserToolTest(unittest.TestCase):
     def test_executes_code_and_emits_attached_screenshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -190,6 +208,24 @@ class PythonBrowserToolTest(unittest.TestCase):
             image_events = [event for event in store.events.read(session.id) if event.type == "tool.image"]
             self.assertEqual(len(image_events), 1)
             self.assertEqual(image_events[0].payload["image"]["label"], "loaded")
+
+    def test_cloud_runtime_emits_live_preview_url_event(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root, headless: CloudRuntime(root, headless))
+
+            result = tool(ctx, {"headless": True, "code": "result = 1"})
+            second = tool(ctx, {"headless": True, "code": "result = 2"})
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(second.data["ok"])
+            live_events = [event for event in store.events.read(session.id) if event.type == "browser.live_url"]
+            self.assertEqual(len(live_events), 1)
+            self.assertEqual(live_events[0].payload["mode"], "cloud")
+            self.assertEqual(live_events[0].payload["browser_id"], "browser-1")
+            self.assertEqual(live_events[0].payload["live_url"], "https://live.example/session")
 
     def test_screenshot_element_captures_clipped_element(self) -> None:
         runtime_holder: Dict[str, FakeRuntime] = {}
@@ -493,6 +529,33 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertFalse(runtime_holder["runtime"].last_cdp_retry)
             self.assertEqual(runtime_holder["runtime"].last_navigate_timeout, 4)
 
+    def test_raw_cdp_accepts_timeout_alias_without_leaking_to_params(self) -> None:
+        runtime_holder = {}
+
+        def factory(root_dir: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root_dir, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "result = cdp('Runtime.evaluate', expression='1', timeout=7)",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            runtime = runtime_holder["runtime"]
+            self.assertEqual(runtime.last_cdp_timeout, 7)
+            self.assertNotIn("timeout", runtime.cdp_calls[-1]["params"])
+
     def test_wait_helpers_are_exposed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
@@ -508,7 +571,8 @@ class PythonBrowserToolTest(unittest.TestCase):
                         "result = {"
                         "'until': wait_until('window.ready', timeout=3), "
                         "'selector': wait_for_selector('#accept', visible=True), "
-                        "'text': wait_for_text('Accept')"
+                        "'text': wait_for_text('Accept'), "
+                        "'network': wait_for_network_idle(timeout=4, idle_ms=250)"
                         "}"
                     ),
                 },
@@ -519,6 +583,9 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["selector"]["selector"], "#accept")
             self.assertTrue(result.data["result"]["selector"]["visible"])
             self.assertEqual(result.data["result"]["text"]["text"], "Accept")
+            self.assertTrue(result.data["result"]["network"])
+            self.assertEqual(tool._runtimes[session.id].last_network_idle_timeout, 4)
+            self.assertEqual(tool._runtimes[session.id].last_network_idle_idle_ms, 250)
 
     def test_deep_text_and_click_text_are_shadow_dom_aware_helpers(self) -> None:
         runtime_holder = {}
@@ -1697,6 +1764,25 @@ class PythonBrowserToolTest(unittest.TestCase):
 
             self.assertTrue(result.data["ok"])
             self.assertIs(runtime_holder["runtime"].last_await_promise, True)
+
+    def test_js_helper_accepts_timeout_alias(self) -> None:
+        runtime_holder = {}
+
+        def factory(root_dir: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root_dir, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(ctx, {"headless": True, "code": "js('document.title', timeout=9); result = 'ok'"})
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(runtime_holder["runtime"].last_js_timeout_s, 9)
 
 
 if __name__ == "__main__":

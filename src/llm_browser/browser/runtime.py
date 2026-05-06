@@ -527,8 +527,11 @@ class BrowserRuntime:
         params: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
+        timeout: Optional[float] = None,
         retry: bool = True,
     ) -> Dict[str, Any]:
+        if timeout is not None:
+            timeout_s = timeout
         self._check_cancel()
         if self.client is None:
             self.attach_first_page()
@@ -693,7 +696,11 @@ class BrowserRuntime:
         await_promise: bool = False,
         repl_mode: Optional[bool] = None,
         user_gesture: bool = False,
+        timeout_s: Optional[float] = None,
+        timeout: Optional[float] = None,
     ) -> Any:
+        if timeout is not None:
+            timeout_s = timeout
         expression = wrap_js_if_return_statement(expression)
         effective_repl_mode = self._default_repl_mode(expression, await_promise) if repl_mode is None else repl_mode
         response = self.cdp(
@@ -705,6 +712,7 @@ class BrowserRuntime:
                 "replMode": effective_repl_mode,
                 "userGesture": user_gesture,
             },
+            timeout_s=timeout_s,
         )
         result = response.get("result", {})
         details = response.get("exceptionDetails")
@@ -917,7 +925,7 @@ class BrowserRuntime:
         selector_json = json.dumps(selector)
         focused = self.js(
             f"(()=>{{const e=document.querySelector({selector_json});"
-            "if(!e)return false;e.focus();return true;}})()"
+            "if(!e)return false;e.focus();return true;})()"
         )
         if not focused:
             raise RuntimeError(f"fill_input: element not found: {selector!r}")
@@ -938,7 +946,7 @@ class BrowserRuntime:
             f"(()=>{{const e=document.querySelector({selector_json});"
             "if(!e)return;"
             "e.dispatchEvent(new Event('input',{bubbles:true}));"
-            "e.dispatchEvent(new Event('change',{bubbles:true}));}})()"
+            "e.dispatchEvent(new Event('change',{bubbles:true}));})()"
         )
 
     def scroll(self, dx: float = 0, dy: float = 500, x: float = 500, y: float = 500) -> None:
@@ -1045,7 +1053,14 @@ class BrowserRuntime:
                     )
         return failures[-max(0, int(limit)) :]
 
-    def wait_for_network_idle(self, timeout_s: float = 10.0, idle_ms: int = 500) -> bool:
+    def wait_for_network_idle(
+        self,
+        timeout_s: float = 10.0,
+        idle_ms: int = 500,
+        timeout: Optional[float] = None,
+    ) -> bool:
+        if timeout is not None:
+            timeout_s = timeout
         deadline = time.time() + timeout_s
         last_activity = time.time()
         inflight = set()

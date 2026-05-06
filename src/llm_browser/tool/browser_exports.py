@@ -25,9 +25,9 @@ BROWSER_HELP_TEXT = (
     + """
 
 Core CDP/browser:
-  cdp(method, params=None, timeout_s=None, retry=True) or cdp("Page.navigate", url="...")
+  cdp(method, params=None, timeout_s=None, retry=True) or cdp("Page.navigate", url="...", timeout=30)
   check_cancel(), cancel_requested()
-  js(expr, await_promise=True, repl_mode=None)
+  js(expr, await_promise=True, repl_mode=None, timeout_s=None) or js(expr, timeout=30)
   new_tab(url), navigate(url), goto_url(url), tabs(), list_tabs(include_internal=True)
   switch_tab(target), current_tab(), ensure_real_tab(), iframe_target(url_substr)
 

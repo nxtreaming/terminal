@@ -71,14 +71,17 @@ class EvalRuntime(BrowserRuntime):
     def __init__(self, root_dir: Path) -> None:
         super().__init__(root_dir=root_dir)
         self.last_params: Optional[Dict[str, Any]] = None
+        self.last_timeout_s: Optional[float] = None
 
     def cdp(
         self,
         method: str,
         params: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
     ) -> Dict[str, Any]:
         self.last_params = params or {}
+        self.last_timeout_s = timeout_s
         return {"result": {"value": "ok"}}
 
 
@@ -426,6 +429,14 @@ class BrowserRuntimeTest(unittest.TestCase):
         self.assertIn("char", event_types)
         expressions = [params.get("expression", "") for method, params in runtime.calls if method == "Runtime.evaluate"]
         self.assertTrue(any("new Event('input'" in expression for expression in expressions))
+        self.assertFalse(any(";}})()" in expression for expression in expressions))
+
+    def test_wait_for_network_idle_accepts_timeout_alias(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BrowserRuntime(Path(tmp))
+            runtime.client = DrainClient([])  # type: ignore[assignment]
+
+            self.assertTrue(runtime.wait_for_network_idle(timeout=0.5, idle_ms=10))
 
     def test_attach_first_page_prefers_real_page_targets(self) -> None:
         class AttachRuntime(BrowserRuntime):
@@ -540,6 +551,14 @@ class BrowserRuntimeTest(unittest.TestCase):
 
             self.assertFalse(runtime.last_params["replMode"])
             self.assertTrue(runtime.last_params["userGesture"])
+
+    def test_js_passes_timeout_to_cdp(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            runtime.js("document.title", timeout=12)
+
+            self.assertEqual(runtime.last_timeout_s, 12)
 
     def test_wait_until_polls_until_truthy(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

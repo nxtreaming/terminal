@@ -143,9 +143,12 @@ class PythonBrowserTool:
             params: Optional[Dict[str, Any]] = None,
             session_id: Optional[str] = None,
             timeout_s: Optional[float] = None,
+            timeout: Optional[float] = None,
             retry: bool = True,
             **kwargs: Any,
         ) -> Dict[str, Any]:
+            if timeout is not None:
+                timeout_s = timeout
             check_cancel()
             if params is not None and not isinstance(params, dict):
                 raise TypeError("cdp params must be a dict when provided")
@@ -171,13 +174,18 @@ class PythonBrowserTool:
             await_promise: bool = True,
             repl_mode: Optional[bool] = None,
             user_gesture: bool = False,
+            timeout_s: Optional[float] = None,
+            timeout: Optional[float] = None,
         ) -> Any:
+            if timeout is not None:
+                timeout_s = timeout
             check_cancel()
             return runtime.js(
                 expression,
                 await_promise=await_promise,
                 repl_mode=repl_mode,
                 user_gesture=user_gesture,
+                timeout_s=timeout_s,
             )
 
         def wait_for_load(timeout_s: float = 20.0, timeout: Optional[float] = None) -> None:
@@ -220,6 +228,15 @@ class PythonBrowserTool:
                 timeout_s = timeout
             check_cancel()
             return runtime.wait_for_text(text, timeout_s=timeout_s)
+
+        def wait_for_network_idle(timeout_s: float = 10.0, timeout: Optional[float] = None, idle_ms: int = 500) -> bool:
+            if timeout is not None:
+                timeout_s = timeout
+            check_cancel()
+            handler = getattr(runtime, "wait_for_network_idle", None)
+            if handler is None:
+                return False
+            return bool(handler(timeout_s=timeout_s, idle_ms=idle_ms))
 
         def deep_text(max_chars: int = 12000) -> str:
             script = f"""
@@ -1191,7 +1208,7 @@ class PythonBrowserTool:
                 "wait_for_selector": wait_for_selector,
                 "wait_for_element": wait_for_element,
                 "wait_for_text": wait_for_text,
-                "wait_for_network_idle": getattr(runtime, "wait_for_network_idle", lambda *args, **kwargs: False),
+                "wait_for_network_idle": wait_for_network_idle,
                 "deep_text": deep_text,
                 "click_text": click_text,
                 "dismiss_cookie_banners": dismiss_cookie_banners,
@@ -1281,6 +1298,17 @@ class PythonBrowserTool:
         root_dir = ctx.session.artifact_dir / "browser"
         runtime = self.runtime_factory(root_dir, headless)
         self._runtimes[ctx.session.id] = runtime
+        live_url = str(getattr(runtime, "cloud_live_url", "") or "")
+        if live_url:
+            ctx.store.emit(
+                ctx.session.id,
+                "browser.live_url",
+                {
+                    "mode": str(getattr(runtime, "mode", "") or "cloud"),
+                    "browser_id": str(getattr(runtime, "cloud_browser_id", "") or ""),
+                    "live_url": live_url,
+                },
+            )
         return runtime
 
     def _default_runtime_factory(self, root_dir: Path, headless: bool) -> "BrowserRuntime":
