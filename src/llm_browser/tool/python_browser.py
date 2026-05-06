@@ -3,6 +3,7 @@ from __future__ import annotations
 import contextlib
 import io
 import json
+import mimetypes
 import os
 import shutil
 import sys
@@ -165,11 +166,47 @@ class PythonBrowserTool:
             safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in name)
             path = ctx.session.artifact_dir / "python-artifacts" / safe_name
             path.parent.mkdir(parents=True, exist_ok=True)
-            if mode == "bytes":
-                path.write_bytes(content)
+            if mode == "bytes" or isinstance(content, (bytes, bytearray, memoryview)):
+                path.write_bytes(bytes(content))
             else:
                 path.write_text(str(content), encoding="utf-8")
             return str(path)
+
+        def upload_artifact(path: str, filename: Optional[str] = None, content_type: Optional[str] = None) -> Dict[str, Any]:
+            source = Path(path).expanduser()
+            if not source.is_absolute():
+                source = ctx.session.cwd / source
+            source = source.resolve()
+            if not source.exists():
+                raise FileNotFoundError(str(source))
+            artifact_path = Path(save_artifact(str(source)))
+            upload_name = _safe_artifact_name(filename or artifact_path.name)
+            mime = content_type or mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
+            local_url = artifact_path.as_uri()
+            api_key = _browser_use_api_key()
+            if not api_key:
+                return {
+                    "filename": upload_name,
+                    "path": str(artifact_path),
+                    "downloadUrl": local_url,
+                    "cloud": False,
+                    "note": "BROWSER_USE_API_KEY is not set; returning local file URL.",
+                }
+            try:
+                cloud = _upload_to_browser_use_cloud(artifact_path, filename=upload_name, content_type=mime, api_key=api_key)
+            except Exception as exc:
+                return {
+                    "filename": upload_name,
+                    "path": str(artifact_path),
+                    "downloadUrl": local_url,
+                    "cloud": False,
+                    "error": str(exc),
+                    "note": "Browser Use upload failed; returning local file URL.",
+                }
+            return {"filename": upload_name, "path": str(artifact_path), "downloadUrl": cloud["downloadUrl"], "cloud": True, **cloud}
+
+        def create_download_url(path: str, filename: Optional[str] = None, content_type: Optional[str] = None) -> str:
+            return str(upload_artifact(path, filename=filename, content_type=content_type)["downloadUrl"])
 
         def download_file(url: str, path: Optional[str] = None, timeout: float = 30.0, headers: Optional[Dict[str, str]] = None) -> str:
             try:
@@ -254,6 +291,9 @@ class PythonBrowserTool:
                 "load_helper": load_helper,
                 "save_helper": save_helper,
                 "save_artifact": save_artifact,
+                "upload_artifact": upload_artifact,
+                "create_download_url": create_download_url,
+                "artifact_download_url": create_download_url,
                 "download_file": download_file,
                 "read_pdf_text": read_pdf_text,
             }
@@ -379,6 +419,88 @@ def _install_requests_browser_defaults(requests_module: Any) -> None:
     request_with_browser_defaults._llm_browser_default_headers = True  # type: ignore[attr-defined]
     request_with_browser_defaults._llm_browser_original = request  # type: ignore[attr-defined]
     requests_module.sessions.Session.request = request_with_browser_defaults
+
+
+def _safe_artifact_name(name: str) -> str:
+    safe_name = "".join(ch if ch.isalnum() or ch in {"-", "_", "."} else "_" for ch in Path(name).name)
+    return safe_name or "artifact.bin"
+
+
+def _browser_use_api_key() -> Optional[str]:
+    return os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("BU_API_KEY")
+
+
+def _browser_use_api_base() -> str:
+    return (
+        os.environ.get("BROWSER_USE_API_BASE_URL")
+        or os.environ.get("BROWSER_USE_API_BASE")
+        or "https://api.browser-use.com/api/v3"
+    ).rstrip("/")
+
+
+def _upload_to_browser_use_cloud(path: Path, filename: str, content_type: str, api_key: str) -> Dict[str, Any]:
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError("requests is not installed") from exc
+
+    base_url = _browser_use_api_base()
+    headers = {"X-Browser-Use-API-Key": api_key}
+    session_response = requests.post(f"{base_url}/sessions", headers=headers, json={"keep_alive": True}, timeout=30)
+    session_response.raise_for_status()
+    session_data = session_response.json()
+    session_id = str(session_data.get("id") or session_data.get("sessionId") or session_data.get("session_id") or "")
+    if not session_id:
+        raise RuntimeError(f"Browser Use session response did not include an id: {session_data}")
+
+    upload_payload = {"files": [{"name": filename, "contentType": content_type}]}
+    upload_response = requests.post(
+        f"{base_url}/sessions/{session_id}/files/upload",
+        headers=headers,
+        json=upload_payload,
+        timeout=30,
+    )
+    if upload_response.status_code == 422:
+        upload_payload = {"files": [{"name": filename, "content_type": content_type}]}
+        upload_response = requests.post(
+            f"{base_url}/sessions/{session_id}/files/upload",
+            headers=headers,
+            json=upload_payload,
+            timeout=30,
+        )
+    upload_response.raise_for_status()
+    upload_data = upload_response.json()
+    files = upload_data.get("files") or []
+    if not files:
+        raise RuntimeError(f"Browser Use upload response did not include files: {upload_data}")
+    uploaded = files[0]
+    upload_url = uploaded.get("uploadUrl") or uploaded.get("upload_url")
+    remote_path = uploaded.get("path") or uploaded.get("filePath") or uploaded.get("file_path") or filename
+    if not upload_url:
+        raise RuntimeError(f"Browser Use upload response did not include uploadUrl: {upload_data}")
+
+    put_response = requests.put(upload_url, data=path.read_bytes(), headers={"Content-Type": content_type}, timeout=60)
+    put_response.raise_for_status()
+
+    list_response = requests.get(
+        f"{base_url}/sessions/{session_id}/files",
+        headers=headers,
+        params={"includeUrls": "true", "prefix": remote_path, "limit": 10},
+        timeout=30,
+    )
+    list_response.raise_for_status()
+    list_data = list_response.json()
+    for item in list_data.get("files", []):
+        item_path = str(item.get("path") or "")
+        if item_path == remote_path or item_path.endswith(f"/{filename}") or item_path.endswith(filename):
+            download_url = item.get("url") or item.get("downloadUrl") or item.get("download_url")
+            if download_url:
+                return {
+                    "browserUseSessionId": session_id,
+                    "remotePath": item_path or remote_path,
+                    "downloadUrl": download_url,
+                }
+    raise RuntimeError(f"Browser Use file list did not include a download URL for {remote_path}: {list_data}")
 
 
 def _looks_like_statements(code: str) -> bool:
