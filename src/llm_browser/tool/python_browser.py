@@ -530,7 +530,8 @@ class PythonBrowserTool:
                 if len(results) >= max_results:
                     break
                 try:
-                    response = requests.get(search_url, headers=_browser_headers(), timeout=timeout)
+                    source_timeout = min(timeout, 12.0 if source.endswith("_reader") else 6.0)
+                    response = requests.get(search_url, headers=_browser_headers(), timeout=source_timeout)
                     text = response.text
                     if source == "bing":
                         parsed = _parse_bing_results(text, limit=max_results - len(results))
