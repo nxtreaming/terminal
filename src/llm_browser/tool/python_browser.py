@@ -100,7 +100,9 @@ class PythonBrowserTool:
         def js(expression: str, await_promise: bool = False) -> Any:
             return runtime.js(expression, await_promise=await_promise)
 
-        def wait_for_load(timeout_s: float = 20.0) -> None:
+        def wait_for_load(timeout_s: float = 20.0, timeout: Optional[float] = None) -> None:
+            if timeout is not None:
+                timeout_s = timeout
             runtime.wait_for_load(timeout_s=timeout_s)
 
         def load_helper(path: str) -> None:

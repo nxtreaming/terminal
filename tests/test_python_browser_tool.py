@@ -17,6 +17,7 @@ class FakeRuntime:
         self.root_dir = root_dir
         self.headless = headless
         self.tab_urls = []
+        self.last_load_timeout = None
 
     def cdp(self, method: str, params=None, session_id=None) -> Dict[str, Any]:
         return {"method": method, "params": params or {}, "session_id": session_id}
@@ -47,6 +48,7 @@ class FakeRuntime:
         return None
 
     def wait_for_load(self, timeout_s: float = 20.0) -> None:
+        self.last_load_timeout = timeout_s
         return None
 
     def screenshot(self, label: str = "screenshot", attach: bool = True, full_page: bool = False) -> ToolImage:
@@ -152,6 +154,25 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["ok"])
             self.assertEqual(result.data["result"], {"ok": True})
             self.assertIn('"ok": true', result.text)
+
+    def test_wait_for_load_accepts_timeout_alias(self) -> None:
+        runtime_holder = {}
+
+        def factory(root_dir: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root_dir, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(ctx, {"headless": True, "code": "wait_for_load(timeout=7); result = 'ok'"})
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(runtime_holder["runtime"].last_load_timeout, 7)
 
 
 if __name__ == "__main__":
