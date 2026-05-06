@@ -32,6 +32,7 @@ CORE_HELPERS = [
     "wait_for_selector",
     "wait_for_text",
     "wait_for_network_idle",
+    "http_get",
     "list_tabs",
     "tabs",
     "current_tab",
@@ -237,6 +238,20 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
         api.check_cancel()
         return runtime.scroll(dx=dx, dy=dy, x=x, y=y)
 
+    def http_get(url: str, headers: Optional[Dict[str, str]] = None, timeout: float = 20.0) -> str:
+        try:
+            import requests
+        except Exception as exc:
+            raise RuntimeError("requests is not installed") from exc
+        request_headers = {"User-Agent": "Mozilla/5.0"}
+        if headers:
+            request_headers.update(headers)
+        api.check_cancel()
+        response = requests.get(url, headers=request_headers, timeout=timeout)
+        api.check_cancel()
+        response.raise_for_status()
+        return response.text
+
     def reload_agent_helpers(path: Optional[str] = None) -> Dict[str, Any]:
         helper_path = Path(path).expanduser() if path else api.agent_helpers_path()
         if not helper_path.is_absolute():
@@ -301,6 +316,7 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
         "press": press,
         "press_key": press_key,
         "scroll": scroll,
+        "http_get": http_get,
         "list_tabs": getattr(runtime, "list_tabs", getattr(runtime, "tabs", lambda: [])),
         "current_tab": getattr(runtime, "current_tab", lambda: {}),
         "switch_tab": getattr(runtime, "switch_tab", getattr(runtime, "attach_tab", lambda *args, **kwargs: None)),

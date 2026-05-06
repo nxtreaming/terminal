@@ -29,6 +29,8 @@ PYTHON_SKILLS: Dict[str, str] = {
     "harnesless_compat": "llm_browser.harness_skills.harnesless_compat",
 }
 
+DEFAULT_AUTOLOAD_SKILLS = "core"
+
 
 def install_skill_loader(api: HelperAPI) -> Dict[str, Any]:
     def list_skills() -> List[Dict[str, Any]]:
@@ -59,11 +61,7 @@ def install_skill_loader(api: HelperAPI) -> Dict[str, Any]:
     def help_browser(topic: Optional[str] = None) -> str:
         if topic:
             return _read_skill(topic)
-        skill_lines = []
-        for item in list_skills():
-            if item["kind"] == "python":
-                exports = ", ".join(item.get("exports", [])[:10])
-                skill_lines.append(f"  {item['name']}: {item.get('description', '')} Exports: {exports}")
+        python_skills = ", ".join(sorted(PYTHON_SKILLS))
         interaction = ", ".join(sorted(_interaction_skill_paths()))
         return (
             "Browser Python harness\n\n"
@@ -76,13 +74,11 @@ def install_skill_loader(api: HelperAPI) -> Dict[str, Any]:
             + BROWSER_HELP_PLAYBOOK.rstrip()
             + "\n\nCore helpers:\n  "
             + ", ".join(CORE_HELPERS + ["load_skill", "list_skills", "read_skill", "loaded_skills", "help_browser"])
-            + "\n\nPython skills:\n"
-            + "\n".join(skill_lines)
-            + "\n\nInteraction skills:\n  "
+            + "\n\nPython skills are opt-in. Use list_skills() for metadata and load_skill(name) before calling exports.\n  "
+            + (python_skills or "(none)")
+            + "\n\nInteraction skills are readable playbooks, not default behavior. Use read_skill(name).\n  "
             + (interaction or "(none)")
-            + "\n\nUse load_skill('research') for fetch/crawl helpers, load_skill('search') for search results, "
-            "read_skill('iframes') for a mechanic playbook, "
-            "and agent_helpers.py for task-specific reusable code."
+            + "\n\nKeep task-specific routines in agent_helpers.py. Use raw cdp(...) when a helper is too narrow."
         )
 
     exports = {
@@ -97,7 +93,9 @@ def install_skill_loader(api: HelperAPI) -> Dict[str, Any]:
 
 
 def autoload_skills(api: HelperAPI) -> None:
-    requested = os.environ.get("LLM_BROWSER_AUTOLOAD_SKILLS", "all").strip()
+    requested = os.environ.get("LLM_BROWSER_AUTOLOAD_SKILLS", DEFAULT_AUTOLOAD_SKILLS).strip()
+    if _env_truthy("LLM_BROWSER_LEGACY_AUTOLOAD_SKILLS"):
+        requested = "all"
     loaded = set((api.namespace.get("_loaded_browser_skills") or {}).keys())
     names = _parse_autoload(requested)
     names.update(loaded)
@@ -108,9 +106,14 @@ def autoload_skills(api: HelperAPI) -> None:
 def _parse_autoload(value: str) -> set[str]:
     if not value or value.lower() in {"0", "false", "no", "none", "core", "off"}:
         return set()
-    if value.lower() == "all":
+    if value.lower() in {"all", "legacy", "compat", "compatibility"}:
         return set(PYTHON_SKILLS)
     return {item.strip() for item in value.split(",") if item.strip()}
+
+
+def _env_truthy(name: str) -> bool:
+    value = os.environ.get(name)
+    return bool(value and value.strip().lower() in {"1", "true", "yes", "on"})
 
 
 def _load_python_skill(api: HelperAPI, name: str, inject: bool = True) -> Any:

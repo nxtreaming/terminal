@@ -330,7 +330,7 @@ class TuiTest(unittest.TestCase):
         self.assertEqual(_latest_browser_live_url(events), "https://live.example/session")
         self.assertEqual(
             _rich_link("open live preview", "https://live.example/session"),
-            "[link=\"https://live.example/session\"][#5c9cf5]open live preview[/][/link]",
+            "[link=\"https://live.example/session\"][#8be9fd]open live preview[/][/link]",
         )
 
     def test_artifact_kind_prioritizes_trace_and_download_dirs(self) -> None:
@@ -382,6 +382,44 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertIsNone(app.selected_session_id)
 
+    async def test_session_inspector_is_hidden_by_default_and_toggles_with_f2(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "inspect me"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                await pilot.pause()
+                sidebar = app.query_one("#sidebar")
+
+                self.assertFalse(sidebar.display)
+                await pilot.press("f2")
+                await pilot.pause()
+                self.assertTrue(sidebar.display)
+                await pilot.press("f2")
+                await pilot.pause()
+                self.assertFalse(sidebar.display)
+
+    async def test_artifact_shortcut_opens_inspector(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            artifact = session.artifact_dir / "result.md"
+            artifact.write_text("# Result", encoding="utf-8")
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                await pilot.press("f3")
+                await pilot.pause()
+
+                self.assertTrue(app.query_one("#sidebar").display)
+                self.assertEqual(app.selected_artifact_path, str(artifact))
+
     async def test_command_palette_supports_arrow_and_vim_navigation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
@@ -411,6 +449,17 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("escape")
                 await pilot.pause()
                 self.assertNotIsInstance(app.screen, CommandPalette)
+
+    async def test_question_mark_opens_keyboard_shortcuts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.press("?")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, CommandPalette)
+                self.assertEqual(app.screen.title_text, "Keyboard")
 
     async def test_session_palette_supports_vim_navigation_and_enter_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -498,7 +547,7 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 self.assertEqual(command.styles.height.value, 5)
-                self.assertEqual(app.query_one("#composer").styles.height.value, 8)
+                self.assertEqual(app.query_one("#composer").styles.height.value, 7)
 
     async def test_composer_enter_submits_and_clears_text(self) -> None:
         class FakeManager:

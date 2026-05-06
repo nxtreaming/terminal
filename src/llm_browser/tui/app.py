@@ -41,11 +41,13 @@ COMMAND_PALETTE: list[tuple[str, str, str]] = [
     ("New task", "", "Type a plain request and press enter"),
     ("Dataset sample", "dataset real_v8 1", "Run one real_v8 dataset task"),
     ("Dataset by task id", "dataset real_v8 --task-id ", "Start a specific dataset task"),
+    ("Keyboard shortcuts", "keys", "Open the keyboard control map"),
     ("Resume selected", "resume", "Continue from the selected session"),
     ("Cancel selected", "cancel", "Interrupt the selected session"),
     ("Trace selected", "trace", "Write a trace bundle artifact"),
     ("Self eval", "eval", "Start a self-evaluation child session"),
     ("Report run", "report", "Summarize the selected dataset run"),
+    ("Toggle inspector", "inspect", "Show or hide session details and artifacts"),
     ("Open artifact", "open", "Open the selected artifact"),
     ("Refresh", "refresh", "Reload sessions and artifacts"),
     ("Clear transcript", "clear", "Clear the visible transcript"),
@@ -62,6 +64,7 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
     ("browser", "browser", "Select browser backend"),
     ("settings", "settings", "Open settings"),
     ("help", "help", "Help"),
+    ("keys", "keys", "Keyboard shortcuts"),
     ("sessions", "sessions", "Switch session"),
     ("new", "new", "Start a new task"),
     ("resume", "resume", "Continue selected session"),
@@ -71,6 +74,8 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
     ("trace", "trace", "Write trace artifact"),
     ("eval", "eval", "Start self-evaluation session"),
     ("report", "report", "Summarize selected dataset run"),
+    ("inspect", "inspect", "Toggle session details"),
+    ("artifacts", "artifacts", "Show artifacts"),
     ("open", "open", "Open selected artifact"),
     ("auth", "auth", "Show auth status"),
     ("config", "config", "Show redacted config"),
@@ -78,6 +83,22 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
     ("dataset", "dataset ", "Run dataset task"),
     ("run", "run ", "Run a new task"),
     ("exit", "exit", "Exit the app"),
+]
+
+
+SHORTCUT_PALETTE: list[tuple[str, str, str]] = [
+    ("tab", "sessions", "Switch sessions"),
+    ("ctrl+p", "", "Open command palette"),
+    ("?", "", "Open this shortcut map"),
+    ("f2", "inspect", "Show or hide inspector"),
+    ("f3", "artifacts", "Focus artifacts"),
+    ("enter", "", "Submit composer"),
+    ("shift+enter", "", "Insert composer newline"),
+    ("esc", "cancel", "Interrupt running session or close inspector"),
+    ("ctrl+r", "refresh", "Refresh sessions and artifacts"),
+    ("ctrl+l", "clear", "Clear transcript"),
+    ("o", "open", "Open selected artifact"),
+    ("q", "", "Quit when composer is empty"),
 ]
 
 
@@ -178,7 +199,11 @@ class ModalFilterInput(Input):
 class ComposerInput(TextArea):
     def on_key(self, event: events.Key) -> None:
         if not getattr(self.app, "_slash_panel_visible", lambda: False)():
-            if event.key == "q" and not self.text:
+            if event.key in {"?", "question_mark"} or event.character == "?":
+                event.prevent_default()
+                event.stop()
+                self.app.action_show_shortcuts()
+            elif (event.key == "q" or event.character == "q") and not self.text:
                 event.prevent_default()
                 event.stop()
                 self.app.exit()
@@ -222,16 +247,17 @@ class CommandPalette(ModalScreen[Optional[str]]):
     CSS = """
     CommandPalette {
         align: center middle;
-        background: #000000 88%;
+        background: #282a36 92%;
     }
 
     #palette {
-        width: 96;
-        max-width: 96%;
+        width: 94;
+        max-width: 94%;
         height: 24;
         max-height: 88%;
-        padding: 2 3 1 3;
-        background: #141414;
+        padding: 1 2;
+        background: #21222c;
+        border: round #bd93f9;
     }
 
     #palette-head {
@@ -241,27 +267,39 @@ class CommandPalette(ModalScreen[Optional[str]]):
 
     #palette-title {
         width: 1fr;
-        color: #eeeeee;
+        color: #f8f8f2;
         text-style: bold;
     }
 
     #palette-esc {
         width: auto;
-        color: #808080;
+        padding: 0 1;
+        background: #44475a;
+        color: #f8f8f2;
     }
 
     #palette-filter {
         height: 1;
         margin-bottom: 1;
-        background: #141414;
-        color: #eeeeee;
+        padding: 0 1;
+        background: #282a36;
+        color: #f8f8f2;
         border: none;
     }
 
     #palette-table {
         height: 15;
-        background: #141414;
-        color: #eeeeee;
+        background: #21222c;
+        color: #f8f8f2;
+        scrollbar-size: 1 0;
+        scrollbar-color: #6272a4;
+        scrollbar-background: #21222c;
+    }
+
+    #palette-table > .datatable--cursor {
+        background: #bd93f9;
+        color: #21222c;
+        text-style: bold;
     }
     """
 
@@ -287,6 +325,7 @@ class CommandPalette(ModalScreen[Optional[str]]):
         self.commands = commands
         self.title_text = title
         self.placeholder = placeholder
+        self._visible_commands: list[str] = []
 
     def compose(self) -> ComposeResult:
         with Container(id="palette"):
@@ -301,8 +340,7 @@ class CommandPalette(ModalScreen[Optional[str]]):
                 show_row_labels=False,
                 cell_padding=0,
             )
-            table.add_column("name", width=30)
-            table.add_column("description", width=58)
+            table.add_column("command", width=88)
             yield table
 
     def on_mount(self) -> None:
@@ -317,12 +355,12 @@ class CommandPalette(ModalScreen[Optional[str]]):
         value = event.value.strip()
         table = self.query_one("#palette-table", DataTable)
         if table.row_count:
-            self.dismiss(str(table.get_row_at(table.cursor_row)[0]))
+            self.dismiss(self._command_for_cursor(table))
         elif value:
             self.dismiss(value)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        self.dismiss(str(event.row_key.value))
+        self.dismiss(self._command_for_cursor(event.data_table))
 
     def action_close(self) -> None:
         self.dismiss(None)
@@ -348,38 +386,49 @@ class CommandPalette(ModalScreen[Optional[str]]):
     def action_select(self) -> None:
         table = self.query_one("#palette-table", DataTable)
         if table.row_count:
-            self.dismiss(str(table.get_row_at(table.cursor_row)[0]))
+            self.dismiss(self._command_for_cursor(table))
             return
         value = self.query_one("#palette-filter", Input).value.strip()
         if value:
             self.dismiss(value)
 
+    def _command_for_cursor(self, table: DataTable) -> str:
+        if not self._visible_commands:
+            return ""
+        index = max(0, min(table.cursor_row, len(self._visible_commands) - 1))
+        return self._visible_commands[index]
+
     def _populate(self, query: str) -> None:
         table = self.query_one("#palette-table", DataTable)
         table.clear()
+        self._visible_commands = []
         needle = query.strip().lower()
         for title, command, description in self.commands:
             searchable = f"{title} {command} {description}".lower()
             if needle and needle not in searchable:
                 continue
-            key = command or "run "
-            table.add_row(key, Text(description, style="#808080"), key=key)
+            self._visible_commands.append(command)
+            row = Text("❯ ", style="#6272a4")
+            row.append(f"{title:<28}", style="bold #f8f8f2")
+            row.append(description, style="#a7aecb")
+            table.add_row(row, key=f"command-{len(self._visible_commands) - 1}")
 
 
 class SessionPalette(ModalScreen[Optional[str]]):
     CSS = """
     SessionPalette {
         align: center middle;
-        background: #000000 88%;
+        background: #282a36 92%;
     }
 
     #sessions-dialog {
-        width: 88;
-        max-width: 96%;
-        height: 20;
+        width: 94;
+        max-width: 94%;
+        height: 22;
         max-height: 88%;
-        padding: 2 3 1 3;
-        background: #141414;
+        padding: 1 2;
+        background: #21222c;
+        border: round #bd93f9;
     }
 
     #sessions-head {
@@ -389,27 +438,39 @@ class SessionPalette(ModalScreen[Optional[str]]):
 
     #sessions-dialog-title {
         width: 1fr;
-        color: #eeeeee;
+        color: #f8f8f2;
         text-style: bold;
     }
 
     #sessions-esc {
         width: auto;
-        color: #808080;
+        padding: 0 1;
+        background: #44475a;
+        color: #f8f8f2;
     }
 
     #sessions-filter {
         height: 1;
         margin-bottom: 1;
-        background: #141414;
-        color: #eeeeee;
+        padding: 0 1;
+        background: #282a36;
+        color: #f8f8f2;
         border: none;
     }
 
     #sessions-table {
-        height: 11;
-        background: #141414;
-        color: #eeeeee;
+        height: 13;
+        background: #21222c;
+        color: #f8f8f2;
+        scrollbar-size: 1 0;
+        scrollbar-color: #6272a4;
+        scrollbar-background: #21222c;
+    }
+
+    #sessions-table > .datatable--cursor {
+        background: #bd93f9;
+        color: #21222c;
+        text-style: bold;
     }
     """
 
@@ -443,10 +504,7 @@ class SessionPalette(ModalScreen[Optional[str]]):
                 show_row_labels=False,
                 cell_padding=0,
             )
-            table.add_column("session", width=48)
-            table.add_column("state", width=12)
-            table.add_column("age", width=9)
-            table.add_column("run", width=10)
+            table.add_column("session", width=88)
             yield table
 
     def on_mount(self) -> None:
@@ -501,15 +559,21 @@ class SessionPalette(ModalScreen[Optional[str]]):
             if needle and needle not in searchable:
                 continue
             self._visible_session_ids.append(session_id)
-            title = f"[bold]{escape(task[:42] or session_id)}[/bold]\n[dim]{escape(session_id)}[/dim]"
-            table.add_row(Text.from_markup(title), _status_text(status), age, run, key=session_id)
+            task_label = _compact_inline(task or session_id, limit=56)
+            row = Text("❯ ", style="#6272a4")
+            row.append(f"{task_label:<58}", style="bold #f8f8f2")
+            row.append(f"{status[:9]:<10}", style=_status_text(status).style)
+            row.append(f"{age:<8}", style="#a7aecb")
+            if run != "-":
+                row.append(run, style="#a7aecb")
+            table.add_row(row, key=session_id)
 
 
 class BrowserUseTerminalApp(App[None]):
     CSS = """
     Screen {
-        background: #0a0a0a;
-        color: #eeeeee;
+        background: #282a36;
+        color: #f8f8f2;
     }
 
     #body {
@@ -519,8 +583,9 @@ class BrowserUseTerminalApp(App[None]):
     #main {
         width: 1fr;
         min-width: 52;
-        padding: 2 3 1 3;
-        background: #0a0a0a;
+        padding: 1 2;
+        background: #282a36;
+        align: center middle;
     }
 
     #main.home {
@@ -528,100 +593,105 @@ class BrowserUseTerminalApp(App[None]):
         align: center middle;
     }
 
+    #workspace {
+        width: 1fr;
+        max-width: 100%;
+        height: 1fr;
+    }
+
+    #main.home #workspace {
+        width: 86;
+        max-width: 96%;
+        height: auto;
+    }
+
     #transcript {
         height: 1fr;
-        background: #0a0a0a;
-        color: #eeeeee;
-        scrollbar-color: #606060;
-        scrollbar-background: #0a0a0a;
-        scrollbar-size: 0 0;
+        padding: 0 1;
+        background: #282a36;
+        color: #f8f8f2;
+        scrollbar-color: #6272a4;
+        scrollbar-background: #21222c;
+        scrollbar-size: 1 0;
     }
 
     #main.home #transcript {
-        width: 86;
-        max-width: 96%;
         height: auto;
         min-height: 16;
         max-height: 20;
     }
 
     #slash-panel {
-        height: 10;
+        height: 9;
         margin-top: 1;
-        padding: 0 2;
-        background: #1e1e1e;
-        border-left: solid #5c9cf5;
-        color: #eeeeee;
-    }
-
-    #main.home #slash-panel {
-        width: 86;
-        max-width: 92%;
+        padding: 0 1;
+        background: #21222c;
+        color: #f8f8f2;
+        border: round #6272a4;
+        scrollbar-size: 1 0;
+        scrollbar-color: #6272a4;
+        scrollbar-background: #21222c;
     }
 
     #composer {
         height: 4;
         margin-top: 1;
-        padding: 1 2 0 2;
-        background: #1b1b1b;
-        border-left: solid #5c9cf5;
+        padding: 0 1;
+        background: #21222c;
+        border: tall #bd93f9;
     }
 
-    #main.home #composer {
-        width: 86;
-        max-width: 92%;
+    #composer:focus-within {
+        border: tall #bd93f9;
     }
 
     #command {
         height: 1;
         border: none;
-        background: #222222;
-        color: #eeeeee;
+        background: transparent;
+        color: #f8f8f2;
         scrollbar-size: 0 0;
     }
 
     #composer-meta {
-        height: 1;
-        margin-top: 1;
-        color: #808080;
+        display: none;
+        height: 0;
+        margin: 0;
+        color: #a7aecb;
     }
 
     #hintbar {
         height: 1;
-        color: #808080;
+        color: #a7aecb;
         padding: 0 1;
     }
 
-    #main.home #hintbar {
-        width: 86;
-        max-width: 92%;
-    }
-
     #sidebar {
-        width: 46;
+        width: 44;
         min-width: 38;
-        padding: 2 2 1 2;
-        background: #121212;
+        padding: 1 2;
+        background: #21222c;
+        border-left: tall #191a21;
     }
 
     #session-detail {
         height: auto;
         max-height: 15;
-        color: #eeeeee;
-        background: #121212;
+        color: #f8f8f2;
+        background: #21222c;
     }
 
     #artifacts-title, #preview-title {
         height: 1;
         margin-top: 1;
-        color: #eeeeee;
+        color: #f8f8f2;
         text-style: bold;
     }
 
     #artifacts {
         height: 8;
-        background: #121212;
-        color: #eeeeee;
+        background: #21222c;
+        color: #f8f8f2;
         scrollbar-size: 0 0;
     }
 
@@ -629,64 +699,65 @@ class BrowserUseTerminalApp(App[None]):
         height: 1fr;
         min-height: 12;
         margin-top: 1;
-        background: #121212;
-        color: #808080;
-        scrollbar-color: #606060;
-        scrollbar-background: #121212;
-        scrollbar-size: 0 0;
+        background: #21222c;
+        color: #a7aecb;
+        scrollbar-color: #6272a4;
+        scrollbar-background: #21222c;
+        scrollbar-size: 1 0;
     }
 
     #sidebar-footer {
         display: none;
         height: 0;
-        color: #808080;
+        color: #a7aecb;
     }
 
     DataTable {
-        background: #141414;
-        color: #eeeeee;
-        scrollbar-color: #606060;
-        scrollbar-background: #141414;
+        background: #21222c;
+        color: #f8f8f2;
+        scrollbar-color: #6272a4;
+        scrollbar-background: #21222c;
     }
 
     #slash-panel {
-        background: #1e1e1e;
-        scrollbar-color: #606060;
-        scrollbar-background: #1e1e1e;
-        scrollbar-size: 0 0;
+        background: #21222c;
     }
 
     DataTable > .datatable--cursor {
-        background: #303030;
-        color: #eeeeee;
+        background: #44475a;
+        color: #f8f8f2;
         text-style: bold;
     }
 
     DataTable:focus > .datatable--cursor {
-        background: #383838;
-        color: #eeeeee;
+        background: #bd93f9;
+        color: #21222c;
         text-style: bold;
     }
 
     #artifacts > .datatable--cursor {
-        background: #2a2a2a;
-        color: #eeeeee;
+        background: #44475a;
+        color: #f8f8f2;
         text-style: bold;
     }
 
     #artifacts:focus > .datatable--cursor {
-        background: #303030;
-        color: #eeeeee;
+        background: #bd93f9;
+        color: #21222c;
         text-style: bold;
     }
 
     Input > .input--cursor {
-        background: #eeeeee;
-        color: #0a0a0a;
+        background: #f8f8f2;
+        color: #21222c;
     }
 
     Input > .input--placeholder {
-        color: #808080;
+        color: #6272a4;
+    }
+
+    TextArea > .text-area--placeholder {
+        color: #6272a4;
     }
     """
 
@@ -695,8 +766,11 @@ class BrowserUseTerminalApp(App[None]):
         Binding("ctrl+c", "cancel_selected", "Interrupt", priority=True),
         Binding("tab", "show_sessions", "Sessions", priority=True),
         Binding("ctrl+p", "show_commands", "Commands", priority=True),
+        Binding("?", "show_shortcuts", "Keys", priority=True),
         Binding("ctrl+r", "refresh", "Refresh"),
         Binding("ctrl+l", "clear_log", "Clear"),
+        Binding("f2", "toggle_inspector", "Inspector"),
+        Binding("f3", "focus_artifacts", "Artifacts"),
         Binding("o", "open_artifact", "Open"),
         Binding("q", "quit", "Quit"),
     ]
@@ -728,35 +802,38 @@ class BrowserUseTerminalApp(App[None]):
         self._last_transcript_text: dict[str, str] = {}
         self._recent_model_text: dict[str, str] = {}
         self._rendered_event_ids: set[str] = set()
+        self._home_mode = False
+        self._inspector_visible = False
         self._stop = threading.Event()
         self._listener: Optional[threading.Thread] = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="body"):
             with Vertical(id="main"):
-                yield RichLog(id="transcript", wrap=True, highlight=True, markup=True)
-                slash_panel = DataTable(
-                    id="slash-panel",
-                    cursor_type="row",
-                    show_header=False,
-                    show_row_labels=False,
-                    cell_padding=0,
-                )
-                slash_panel.add_column("command", width=22)
-                slash_panel.add_column("description", width=72)
-                yield slash_panel
-                with Vertical(id="composer"):
-                    yield ComposerInput(
-                        "",
-                        placeholder=' Ask anything... "Find the page and save a screenshot"',
-                        id="command",
-                        compact=True,
-                        soft_wrap=True,
-                        show_line_numbers=False,
-                        highlight_cursor_line=False,
+                with Vertical(id="workspace"):
+                    yield RichLog(id="transcript", wrap=True, highlight=True, markup=True)
+                    slash_panel = DataTable(
+                        id="slash-panel",
+                        cursor_type="row",
+                        show_header=False,
+                        show_row_labels=False,
+                        cell_padding=0,
                     )
-                    yield Static("", id="composer-meta")
-                yield Static("", id="hintbar")
+                    slash_panel.add_column("command", width=22)
+                    slash_panel.add_column("description", width=72)
+                    yield slash_panel
+                    with Vertical(id="composer"):
+                        yield ComposerInput(
+                            "",
+                            placeholder=' Ask anything... "Find the page and save a screenshot"',
+                            id="command",
+                            compact=True,
+                            soft_wrap=True,
+                            show_line_numbers=False,
+                            highlight_cursor_line=False,
+                        )
+                        yield Static("", id="composer-meta")
+                    yield Static("", id="hintbar")
             with Vertical(id="sidebar"):
                 yield Static("", id="session-detail")
                 yield Static("artifacts", id="artifacts-title")
@@ -785,6 +862,7 @@ class BrowserUseTerminalApp(App[None]):
         self._update_session_detail()
         self.query_one("#slash-panel", DataTable).display = False
         self.query_one("#artifact-preview", RichLog).auto_scroll = False
+        self._sync_sidebar_visibility()
         self.query_one("#command", ComposerInput).focus()
         self._listener = threading.Thread(target=self._listen_events, name="browser-use-terminal-events", daemon=True)
         self._listener.start()
@@ -830,7 +908,11 @@ class BrowserUseTerminalApp(App[None]):
     def _set_home_mode(self, enabled: bool) -> None:
         main = self.query_one("#main")
         main.set_class(enabled, "home")
-        self.query_one("#sidebar").display = not enabled
+        self._home_mode = enabled
+        self._sync_sidebar_visibility()
+
+    def _sync_sidebar_visibility(self) -> None:
+        self.query_one("#sidebar").display = bool(not self._home_mode and self._inspector_visible)
 
     def _write_home(self) -> None:
         self._set_home_mode(True)
@@ -841,25 +923,25 @@ class BrowserUseTerminalApp(App[None]):
         wordmark_width = max(len(line.rstrip()) for line in BROWSER_USE_WORDMARK)
         log.write("")
         for line in BROWSER_USE_MARK:
-            log.write(Align.center(Text(line.ljust(mark_width).rstrip(), style="#eeeeee"), width=width))
+            log.write(Align.center(Text(line.ljust(mark_width).rstrip(), style="#f8f8f2"), width=width))
         for line in BROWSER_USE_WORDMARK:
             raw = line.rstrip().ljust(wordmark_width)
             left = raw[:BROWSER_USE_WORDMARK_SPLIT]
             right = raw[BROWSER_USE_WORDMARK_SPLIT:]
             text = Text()
-            text.append(left, style="#606060")
-            text.append(right, style="#eeeeee")
+            text.append(left, style="#6272a4")
+            text.append(right, style="#f8f8f2")
             log.write(Align.center(text, width=width))
-        log.write(Align.center(Text("terminal", style="#808080"), width=width))
+        log.write(Align.center(Text("terminal", style="#a7aecb"), width=width))
 
     def _write_banner(self) -> None:
         log = self.query_one("#transcript", RichLog)
-        log.write("[bold #eeeeee]Slash commands[/bold #eeeeee]")
+        log.write("[bold #f8f8f2]Slash commands[/bold #f8f8f2]")
         for name, command, description in SLASH_COMMANDS:
             command_label = f"/{command}".rstrip()
-            log.write(f"[#eeeeee]{escape(command_label):<18}[/] [#808080]{escape(description)}[/]")
-        log.write("[#808080]Use /settings for model, provider, browser, API keys, viewport, cloud, CDP, and max-turns settings.[/]")
-        log.write("[#808080]Paste keys with /auth browser-use <key> or /auth openai <key>; values are saved redacted in config output.[/]")
+            log.write(f"[#f8f8f2]{escape(command_label):<18}[/] [#a7aecb]{escape(description)}[/]")
+        log.write("[#a7aecb]Use /settings for model, provider, browser, API keys, viewport, cloud, CDP, and max-turns settings.[/]")
+        log.write("[#a7aecb]Paste keys with /auth browser-use <key> or /auth openai <key>; values are saved redacted in config output.[/]")
 
     def _handle_event(self, event: Event) -> None:
         should_render = event.session_id == self.selected_session_id and event.id not in self._rendered_event_ids
@@ -918,27 +1000,27 @@ class BrowserUseTerminalApp(App[None]):
         log = self.query_one("#transcript", RichLog)
         escaped = escape(line)
         if event_type == "session.input":
-            log.write(f"[bold #5c9cf5]▌[/] [bold #eeeeee]Task[/bold #eeeeee]\n{escaped}")
+            log.write(f"[bold #bd93f9]❯[/] [bold #f8f8f2]Task[/bold #f8f8f2]\n{escaped}")
         elif event_type == "session.followup":
-            log.write(f"\n[bold #5c9cf5]▌[/] [bold #eeeeee]Follow-up[/bold #eeeeee]\n{escaped}")
+            log.write(f"\n[bold #bd93f9]❯[/] [bold #f8f8f2]Follow-up[/bold #f8f8f2]\n{escaped}")
         elif event_type == "tool.started":
-            log.write(f"[#606060]{escaped}[/]")
+            log.write(f"[#a7aecb]{escaped}[/]")
         elif event_type == "tool.failed":
-            log.write(f"[#e06c75]{escaped}[/]")
+            log.write(f"[#ff6e6e]{escaped}[/]")
         elif event_type == "tool.image":
-            log.write(f"[#5c9cf5]{escaped}[/]")
+            log.write(f"[#8be9fd]{escaped}[/]")
         elif event_type == "tool.output":
-            _write_markdown(log, line, style="#808080")
+            _write_markdown(log, line, style="#a7aecb")
         elif event_type == "tool.finished":
-            log.write(f"[#606060]{escaped}[/]")
+            log.write(f"[#a7aecb]{escaped}[/]")
         elif event_type == "model.delta":
             _write_markdown(log, line)
         elif event_type in {"session.done", "session.cancelled"}:
-            _write_markdown(log, line, style="#7fd88f")
+            _write_markdown(log, line, style="#50fa7b")
         elif event_type == "browser.live_url":
             _write_markdown(log, line)
         elif event_type == "session.failed":
-            log.write(f"[bold #e06c75]{escaped}[/bold #e06c75]")
+            log.write(f"[bold #ff6e6e]{escaped}[/bold #ff6e6e]")
         elif event_type == "session.deadline_warning":
             log.write(f"[#f5a742]{escaped}[/]")
         else:
@@ -982,8 +1064,8 @@ class BrowserUseTerminalApp(App[None]):
             return
         for name, _command, description in matches:
             table.add_row(
-                Text(f"/{name}", style="#eeeeee"),
-                Text(description, style="#808080"),
+                Text(f"/{name}", style="#f8f8f2"),
+                Text(description, style="#a7aecb"),
                 key=name,
             )
         table.display = True
@@ -1057,7 +1139,7 @@ class BrowserUseTerminalApp(App[None]):
         command_input = self.query_one("#command", ComposerInput)
         visible_lines = _composer_visible_line_count(command_input.text, command_input.size.width)
         command_input.styles.height = visible_lines
-        self.query_one("#composer").styles.height = visible_lines + 3
+        self.query_one("#composer").styles.height = visible_lines + 2
 
     def _set_composer_text(self, text: str) -> None:
         command_input = self.query_one("#command", ComposerInput)
@@ -1098,6 +1180,8 @@ class BrowserUseTerminalApp(App[None]):
             self.exit()
         elif command == "help":
             self._write_banner()
+        elif command in {"keys", "shortcuts", "keyboard"}:
+            self.action_show_shortcuts()
         elif command == "new":
             self.selected_session_id = None
             self.selected_artifact_path = None
@@ -1111,9 +1195,13 @@ class BrowserUseTerminalApp(App[None]):
             self.action_clear_log()
         elif command == "sessions":
             self.action_show_sessions()
+        elif command in {"inspect", "inspector", "details"}:
+            self.action_toggle_inspector()
         elif command == "artifacts":
-            self.refresh_artifacts()
-            log.write("[#7fd88f]artifacts refreshed[/]")
+            if not self.selected_session_id:
+                log.write("[#808080]no selected session[/]")
+                return
+            self.action_focus_artifacts()
         elif command == "model":
             if len(args) >= 2:
                 self._set_model(args[1])
@@ -1302,9 +1390,9 @@ class BrowserUseTerminalApp(App[None]):
                 first_path = str(path)
             stat = path.stat()
             table.add_row(
-                Text(_artifact_kind(path), style="#808080"),
+                Text(_artifact_kind(path), style="#a7aecb"),
                 _artifact_display_name(session, path),
-                _format_bytes(stat.st_size),
+                Text(_format_bytes(stat.st_size), style="#a7aecb"),
                 key=str(path),
             )
         if self.selected_artifact_path is None:
@@ -1332,6 +1420,61 @@ class BrowserUseTerminalApp(App[None]):
 
     def action_open_artifact(self) -> None:
         self._open_artifact(self.selected_artifact_path)
+
+    def action_toggle_inspector(self) -> None:
+        if self._home_mode and not self.selected_session_id:
+            self._inspector_visible = False
+            self._sync_sidebar_visibility()
+            self._update_statusbar()
+            return
+        self._inspector_visible = not self._inspector_visible
+        if self._inspector_visible and self.selected_session_id:
+            self._set_home_mode(False)
+        self._sync_sidebar_visibility()
+        self.refresh_artifacts()
+        self._update_session_detail()
+        self._update_statusbar()
+        if self._inspector_visible:
+            artifacts = self.query_one("#artifacts", DataTable)
+            if artifacts.row_count:
+                artifacts.focus()
+        else:
+            self.query_one("#command", ComposerInput).focus()
+
+    def action_focus_artifacts(self) -> None:
+        if not self.selected_session_id:
+            self.action_show_sessions()
+            return
+        self._inspector_visible = True
+        self._set_home_mode(False)
+        self._sync_sidebar_visibility()
+        self.refresh_artifacts()
+        self._update_session_detail()
+        self._update_statusbar()
+        artifacts = self.query_one("#artifacts", DataTable)
+        if artifacts.row_count:
+            artifacts.focus()
+        else:
+            self.query_one("#command", ComposerInput).focus()
+
+    def action_show_shortcuts(self) -> None:
+        if isinstance(self.screen, ModalScreen):
+            return
+
+        def selected(command: Optional[str]) -> None:
+            command_input = self.query_one("#command", ComposerInput)
+            if command:
+                self._handle_command(f"/{command}")
+            command_input.focus()
+
+        self.push_screen(
+            CommandPalette(
+                SHORTCUT_PALETTE,
+                title="Keyboard",
+                placeholder="Search shortcuts",
+            ),
+            selected,
+        )
 
     def action_show_commands(self) -> None:
         if isinstance(self.screen, ModalScreen):
@@ -1790,9 +1933,9 @@ class BrowserUseTerminalApp(App[None]):
         for session in sessions:
             counts[session.status] = counts.get(session.status, 0) + 1
         meta = (
-            f"[#5c9cf5]Build[/] [#808080]·[/] "
-            f"[#eeeeee]{escape(self.model_label or '-')}[/] "
-            f"[#808080]{escape(self.provider_label)}  {escape(_browser_runtime_label())}[/]"
+            f"[#8be9fd]Build[/] [#6272a4]·[/] "
+            f"[#f8f8f2]{escape(self.model_label or '-')}[/] "
+            f"[#a7aecb]{escape(self.provider_label)}  {escape(_browser_runtime_label())}[/]"
         )
         run_summary = self._selected_run_summary_text()
         if run_summary:
@@ -1805,14 +1948,21 @@ class BrowserUseTerminalApp(App[None]):
             selected_running = bool(selected and selected.status in {"created", "running"})
         left = "esc interrupt" if selected_running else "tab sessions"
         hint_segments = [
-            f"[#eeeeee]{left}[/]",
-            f"[#808080]{len(sessions)} sessions[/]",
-            f"[#5c9cf5]{counts.get('running', 0)} running[/]",
-            f"[#7fd88f]{counts.get('done', 0)} done[/]",
-            f"[#e06c75]{counts.get('failed', 0)} failed[/]",
-            "[#808080]/ settings[/]",
-            "[#808080]ctrl+p commands[/]",
+            f"[#f8f8f2]{left}[/]",
+            f"[#a7aecb]{len(sessions)} sessions[/]",
+            f"[#8be9fd]{counts.get('running', 0)} running[/]",
+            f"[#50fa7b]{counts.get('done', 0)} done[/]",
+            f"[#ff6e6e]{counts.get('failed', 0)} failed[/]",
+            "[#a7aecb]? keys[/]",
         ]
+        if not self._home_mode:
+            hint_segments.extend(
+                [
+                    f"[#a7aecb]f2 {'hide inspector' if self._inspector_visible else 'inspector'}[/]",
+                    "[#a7aecb]f3 artifacts[/]",
+                ]
+            )
+        hint_segments.extend(["[#a7aecb]/ settings[/]", "[#a7aecb]ctrl+p commands[/]"])
         self.query_one("#hintbar", Static).update("   ".join(hint_segments))
 
         cwd = "-"
@@ -1821,7 +1971,7 @@ class BrowserUseTerminalApp(App[None]):
             if session is not None:
                 cwd = _compact_path(session.cwd)
         self.query_one("#sidebar-footer", Static).update(
-            f"[#808080]{escape(cwd)}[/]\n[#7fd88f]•[/] [bold #808080]{PRODUCT_NAME}[/bold #808080]"
+            f"[#a7aecb]{escape(cwd)}[/]\n[#50fa7b]•[/] [bold #a7aecb]{PRODUCT_NAME}[/bold #a7aecb]"
         )
 
     def _update_session_detail(self) -> None:
@@ -1829,11 +1979,11 @@ class BrowserUseTerminalApp(App[None]):
         session_id = self.selected_session_id
         if not session_id:
             detail.update(
-                "[bold #eeeeee]New task[/bold #eeeeee]\n\n"
-                "[#808080]not started[/]\n"
-                "[#808080]press tab for history[/]\n\n"
-                "[bold #eeeeee]browser[/bold #eeeeee]\n"
-                f"[#808080]{escape(_browser_runtime_label())}[/]"
+                "[#bd93f9]❯[/] [bold #f8f8f2]New task[/bold #f8f8f2]\n\n"
+                "[#a7aecb]not started[/]\n"
+                "[#a7aecb]press tab for history[/]\n\n"
+                "[bold #f8f8f2]browser[/bold #f8f8f2]\n"
+                f"[#a7aecb]{escape(_browser_runtime_label())}[/]"
             )
             return
         session = self.store.load(session_id)
@@ -1853,24 +2003,24 @@ class BrowserUseTerminalApp(App[None]):
         if final_line != "-" and session.status in {"done", "failed", "cancelled"}:
             result_lines.extend(_sidebar_result_lines(final_line))
         if current_tool != "-" and session.status in {"created", "running"}:
-            result_lines.append(f"[#808080]working: {escape(_compact_inline(current_tool, limit=46))}[/]")
+            result_lines.append(f"[#a7aecb]working: {escape(_compact_inline(current_tool, limit=46))}[/]")
         if not result_lines:
             waiting = "waiting for browser output" if session.status in {"created", "running"} else "idle"
-            result_lines.append(f"[#808080]{waiting}[/]")
+            result_lines.append(f"[#a7aecb]{waiting}[/]")
         result_markup = "\n".join(result_lines[:4])
         browser_markup = ""
         if session.status in {"created", "running"} and live_url:
             browser_markup = (
-                "[bold #eeeeee]browser[/bold #eeeeee]\n"
+                "[bold #f8f8f2]browser[/bold #f8f8f2]\n"
                 f"{_rich_link('open live preview', live_url)}\n"
                 f"{_rich_link(_compact_inline(live_url, limit=42), live_url)}\n\n"
             )
         detail.update(
-            f"[bold #eeeeee]{escape(title)}[/bold #eeeeee]\n\n"
-            f"{_status_markup(session.status)} [#808080]· {escape(session.id)}[/]\n"
-            f"[#808080]updated {_format_age(session.updated_ms / 1000)}[/]\n\n"
+            f"[#bd93f9]❯[/] [bold #f8f8f2]{escape(title)}[/bold #f8f8f2]\n\n"
+            f"{_status_markup(session.status)} [#a7aecb]· {escape(session.id)}[/]\n"
+            f"[#a7aecb]updated {_format_age(session.updated_ms / 1000)}[/]\n\n"
             f"{browser_markup}"
-            f"[bold #eeeeee]answer[/bold #eeeeee]\n"
+            f"[bold #f8f8f2]answer[/bold #f8f8f2]\n"
             f"{result_markup}"
         )
 
@@ -2052,14 +2202,14 @@ def _screenshot_meta_summary(payload: object) -> str:
     title = str(payload.get("title") or "").strip()
     viewport = payload.get("viewport")
     if title:
-        lines.append(f"[#808080]title: {escape(_compact_inline(title, limit=36))}[/]")
+        lines.append(f"[#a7aecb]title: {escape(_compact_inline(title, limit=36))}[/]")
     if url:
         lines.append(_rich_link(_compact_inline(url, limit=42), url))
     if isinstance(viewport, dict):
         width = viewport.get("width")
         height = viewport.get("height")
         if width and height:
-            lines.append(f"[#808080]viewport: {width} x {height}[/]")
+            lines.append(f"[#a7aecb]viewport: {width} x {height}[/]")
     return "\n".join(lines)
 
 
@@ -2697,21 +2847,21 @@ def _sidebar_result_lines(value: object) -> list[str]:
     files = _file_links_for_text(text, limit=1)
     if files:
         path = files[0]
-        return [f"[#808080]file[/] {_rich_link(path.name, path.resolve().as_uri())}"]
+        return [f"[#a7aecb]file[/] {_rich_link(path.name, path.resolve().as_uri())}"]
     table_rows = _markdown_table_row_count(text)
     if table_rows:
         label = "row" if table_rows == 1 else "rows"
-        return [f"[#808080]table: {table_rows} {label}[/]"]
+        return [f"[#a7aecb]table: {table_rows} {label}[/]"]
     if text.startswith("failed:"):
         text = _compact_error_text(text.removeprefix("failed:").strip(), limit=96)
-    return [f"[#808080]{escape(_compact_result_text(text, limit=64))}[/]"]
+    return [f"[#a7aecb]{escape(_compact_result_text(text, limit=64))}[/]"]
 
 
 def _sidebar_image_line(value: str) -> str:
     text = value
     if text.startswith("screenshot -> "):
         text = text.removeprefix("screenshot -> ")
-    return f"[#808080]screenshot: {escape(_compact_inline(text, limit=42))}[/]"
+    return f"[#a7aecb]screenshot: {escape(_compact_inline(text, limit=42))}[/]"
 
 
 def _markdown_table_row_count(text: str) -> int:
@@ -2778,7 +2928,7 @@ def _progress_bar(done: int, total: int, width: int = 12) -> str:
     else:
         filled = min(width, max(0, round((done / total) * width)))
     empty = width - filled
-    return "[#5c9cf5]" + ("█" * filled) + "[/][#323232]" + ("░" * empty) + "[/]"
+    return "[#8be9fd]" + ("█" * filled) + "[/][#44475a]" + ("░" * empty) + "[/]"
 
 
 def _latest_image_line(events: list[Event]) -> str:
@@ -2806,7 +2956,7 @@ def _latest_browser_live_url(events: list[Event]) -> str:
 
 def _rich_link(label: str, url: str) -> str:
     target = url.replace('"', "%22").replace("]", "%5D").replace("\n", "")
-    return f"[link=\"{target}\"][#5c9cf5]{escape(label)}[/][/link]"
+    return f"[link=\"{target}\"][#8be9fd]{escape(label)}[/][/link]"
 
 
 def _short_task_list(task_ids: list[str], limit: int = 12) -> str:
@@ -2820,25 +2970,25 @@ def _short_task_list(task_ids: list[str], limit: int = 12) -> str:
 
 def _status_markup(status: str) -> str:
     styles = {
-        "running": "bold #5c9cf5",
-        "done": "bold #7fd88f",
-        "failed": "bold #e06c75",
+        "running": "bold #8be9fd",
+        "done": "bold #50fa7b",
+        "failed": "bold #ff6e6e",
         "cancelled": "bold #f5a742",
-        "created": "#808080",
+        "created": "#a7aecb",
     }
-    return f"[{styles.get(status, '#eeeeee')}]{escape(status)}[/]"
+    return f"[{styles.get(status, '#f8f8f2')}]{escape(status)}[/]"
 
 
 def _status_text(status: str) -> Text:
     styles = {
-        "running": "bold #5c9cf5",
-        "done": "bold #7fd88f",
-        "failed": "bold #e06c75",
+        "running": "bold #8be9fd",
+        "done": "bold #50fa7b",
+        "failed": "bold #ff6e6e",
         "cancelled": "bold #f5a742",
-        "created": "#808080",
+        "created": "#a7aecb",
     }
     label = status[:9]
-    return Text(label, style=styles.get(status, "#eeeeee"))
+    return Text(label, style=styles.get(status, "#f8f8f2"))
 
 
 def _current_tool(events: list[Event]) -> str:

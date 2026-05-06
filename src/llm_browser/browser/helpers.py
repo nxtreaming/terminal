@@ -101,9 +101,7 @@ from browser_helpers import *
 def browser_state():
     return {
         "page": page_info(),
-        "downloads": download_info(),
-        "console": recent_console(limit=10),
-        "network_failures": recent_network_failures(limit=10),
+        "tabs": tabs(),
     }
 '''
 

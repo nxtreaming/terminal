@@ -8,11 +8,10 @@ from llm_browser.browser.instructions import BROWSER_HELP_PLAYBOOK
 
 
 BROWSER_TOOL_DESCRIPTION = (
-    "Run persistent Python for browser work. Always-loaded core primitives: raw cdp('Domain.method', key=value), "
-    "js(expr), new_tab/navigate/tabs/switch_tab, click_at_xy/fill_input/press_key/scroll, "
-    "screenshot(..., attach=True), capture_screenshot(...), wait_for_load/wait_for_network_idle, page_info, "
-    "agent_helpers_path/reload_agent_helpers, and load_skill/list_skills/read_skill/help_browser. "
-    "Specialized helpers are skill-driven: load_skill('downloads'), load_skill('research'), load_skill('search'), load_skill('dom_tools'), etc. "
+    "Run persistent Python for direct browser control. Default surface is intentionally small: "
+    "raw cdp('Domain.method', key=value), js(expr), new_tab/goto_url, screenshots, coordinate clicks, "
+    "keyboard/text input, waits, tabs, simple http_get, output_path, agent_helpers_path/reload_agent_helpers, and "
+    "load_skill/list_skills/read_skill/help_browser. Specialized helpers are opt-in with load_skill(name). "
     "Set result or _result for structured output."
 )
 
@@ -33,31 +32,20 @@ Waiting and observation:
   wait_for_load(), wait_for_selector(selector, visible=False), wait_for_element(selector), wait_for_text(text)
   wait_for_network_idle(timeout_s=10, idle_ms=500)
   page_info()
+  http_get(url)
 
 Input:
   click_at(x, y), click_at_xy(x, y), fill_input(selector, text), type_text(text)
   press(key), press_key(key, modifiers=0), scroll(dx=0, dy=500)
 
-Images and artifacts:
+Images:
   screenshot(label, attach=True, timeout=8), capture_screenshot(path=None, attach=True, timeout=8)
   output_path(path='')
 
 Skills:
-  list_skills(), load_skill("research"), read_skill("iframes"), loaded_skills()
-  downloads: download_info, wait_for_download
-  cookies: get_cookies, set_cookie, clear_cookies, storage_state
-  artifacts: save_artifact, attach_image, download_file, read_pdf_text
-  cloud_artifacts: upload_artifact, create_download_url
-  research: http_get, fetch_text, fetch_readable_text, fetch_many_text, crawl_site
-  search: search_web
-  public_records: search_cve_records, search_fcc_grantee_records, search_public_records
-  scholarly: search_scholarly
-  extraction: html_to_text, extract_links, extract_emails, read_sitemap
-  store_locators: extract_store_locator_locations
-  dom_tools: deep_text, click_text, screenshot_element
-  cookie_banners: dismiss_cookie_banners
-  uploads: upload_file
-  tracing: recent_console, recent_network_failures, save_browser_trace
+  list_skills(), load_skill(name), read_skill(name), loaded_skills()
+  Python skills are opt-in. Examples: load_skill("downloads"), load_skill("research"), load_skill("search").
+  Interaction skills are markdown playbooks. Example: read_skill("iframes").
 
 Editable helpers:
   Path(agent_helpers_path()).write_text(...)
@@ -68,13 +56,12 @@ Example:
   new_tab("https://example.com")
   wait_for_load()
   screenshot("loaded", attach=True)
-  load_skill("research")
   result = {"title": js("document.title"), "page": page_info()}
 """
 )
 
 
-EXPORT_NAMES = [
+CORE_EXPORT_NAMES = [
     "artifact_dir",
     "download_dir",
     "cwd",
@@ -96,75 +83,32 @@ EXPORT_NAMES = [
     "attach_tab",
     "js",
     "wait_for_load",
-    "wait_until",
     "wait_for_selector",
     "wait_for_element",
     "wait_for_text",
     "wait_for_network_idle",
-    "deep_text",
-    "click_text",
-    "dismiss_cookie_banners",
+    "http_get",
     "screenshot",
     "capture_screenshot",
-    "screenshot_element",
-    "attach_image",
     "page_info",
-    "pending_dialog",
-    "drain_cdp_events",
-    "drain_events",
-    "recent_cdp_events",
-    "recent_console",
-    "recent_network",
-    "recent_network_failures",
-    "download_info",
-    "wait_for_download",
-    "get_cookies",
-    "set_cookie",
-    "clear_cookies",
-    "storage_state",
-    "clear_storage",
-    "grant_permissions",
-    "reset_permissions",
-    "save_browser_trace",
-    "visible_text",
-    "links",
     "click_at",
     "click_at_xy",
     "fill_input",
     "type_text",
     "press",
     "press_key",
-    "dispatch_key",
     "scroll",
     "list_tabs",
     "current_tab",
     "switch_tab",
     "ensure_real_tab",
     "iframe_target",
-    "upload_file",
-    "load_helper",
-    "save_helper",
     "agent_helpers_path",
     "reload_agent_helpers",
     "help_browser",
-    "save_artifact",
-    "upload_artifact",
-    "create_download_url",
-    "artifact_download_url",
-    "download_file",
-    "read_pdf_text",
-    "http_get",
-    "html_to_text",
-    "fetch_readable_text",
-    "search_web",
-    "extract_links",
-    "extract_markdown_link_blocks",
-    "extract_emails",
-    "crawl_site",
-    "extract_store_locator_locations",
-    "store_locator_locations",
-    "read_sitemap",
-    "fetch_many_text",
+]
+
+PYTHON_AFFORDANCE_EXPORT_NAMES = [
     "requests",
     "http",
     "curl_requests",
@@ -185,7 +129,7 @@ def help_browser() -> str:
 
 def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
     module = types.ModuleType("browser_helpers")
-    export_names = list(EXPORT_NAMES)
+    export_names = _browser_helper_export_names(namespace)
     for name in export_names:
         if name in namespace:
             setattr(module, name, namespace[name])
@@ -242,3 +186,24 @@ def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
     sys.modules["browser_helpers"] = module
     sys.modules["browser_use"] = module
     sys.modules["browser_tools"] = module
+
+
+def _browser_helper_export_names(namespace: Dict[str, Any]) -> list[str]:
+    names = list(CORE_EXPORT_NAMES)
+    loaded = namespace.get("_loaded_browser_skills") or {}
+    if isinstance(loaded, dict):
+        for meta in loaded.values():
+            if not isinstance(meta, dict):
+                continue
+            for export in meta.get("exports", []):
+                if isinstance(export, str):
+                    names.append(export)
+    names.extend(PYTHON_AFFORDANCE_EXPORT_NAMES)
+    seen = set()
+    unique = []
+    for name in names:
+        if name in seen:
+            continue
+        seen.add(name)
+        unique.append(name)
+    return unique
