@@ -183,6 +183,43 @@ class BrowserRuntime:
             time.sleep(0.1)
         raise TimeoutError("page did not reach interactive/complete readyState")
 
+    def wait_until(self, expression: str, timeout_s: float = 20.0, interval_s: float = 0.25) -> Any:
+        deadline = time.time() + timeout_s
+        last_error: Optional[Exception] = None
+        last_value: Any = None
+        while time.time() < deadline:
+            try:
+                last_value = self.js(expression)
+                if last_value:
+                    return last_value
+            except Exception as exc:
+                last_error = exc
+            time.sleep(interval_s)
+        if last_error is not None:
+            raise TimeoutError(f"condition did not become truthy before timeout: {last_error}") from last_error
+        raise TimeoutError(f"condition did not become truthy before timeout; last value: {last_value!r}")
+
+    def wait_for_selector(self, selector: str, timeout_s: float = 20.0, visible: bool = False) -> Any:
+        expression = json.dumps(selector)
+        if visible:
+            return self.wait_until(
+                "(() => {"
+                f"const el = document.querySelector({expression});"
+                "if (!el) return false;"
+                "const rect = el.getBoundingClientRect();"
+                "return !!(rect.width || rect.height || el.getClientRects().length);"
+                "})()",
+                timeout_s=timeout_s,
+            )
+        return self.wait_until(f"document.querySelector({expression}) !== null", timeout_s=timeout_s)
+
+    def wait_for_text(self, text: str, timeout_s: float = 20.0) -> Any:
+        needle = json.dumps(text)
+        return self.wait_until(
+            f"((document.body && document.body.innerText) || '').includes({needle})",
+            timeout_s=timeout_s,
+        )
+
     def page_info(self) -> Dict[str, Any]:
         raw = self.js(
             """

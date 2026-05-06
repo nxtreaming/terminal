@@ -105,6 +105,26 @@ class PythonBrowserTool:
                 timeout_s = timeout
             runtime.wait_for_load(timeout_s=timeout_s)
 
+        def wait_until(expression: str, timeout_s: float = 20.0, timeout: Optional[float] = None, interval_s: float = 0.25) -> Any:
+            if timeout is not None:
+                timeout_s = timeout
+            return runtime.wait_until(expression, timeout_s=timeout_s, interval_s=interval_s)
+
+        def wait_for_selector(
+            selector: str,
+            timeout_s: float = 20.0,
+            timeout: Optional[float] = None,
+            visible: bool = False,
+        ) -> Any:
+            if timeout is not None:
+                timeout_s = timeout
+            return runtime.wait_for_selector(selector, timeout_s=timeout_s, visible=visible)
+
+        def wait_for_text(text: str, timeout_s: float = 20.0, timeout: Optional[float] = None) -> Any:
+            if timeout is not None:
+                timeout_s = timeout
+            return runtime.wait_for_text(text, timeout_s=timeout_s)
+
         def load_helper(path: str) -> None:
             helper_path = Path(path).expanduser()
             if not helper_path.is_absolute():
@@ -161,6 +181,9 @@ class PythonBrowserTool:
                 "attach_tab": runtime.attach_tab,
                 "js": js,
                 "wait_for_load": wait_for_load,
+                "wait_until": wait_until,
+                "wait_for_selector": wait_for_selector,
+                "wait_for_text": wait_for_text,
                 "screenshot": screenshot,
                 "page_info": runtime.page_info,
                 "visible_text": runtime.visible_text,

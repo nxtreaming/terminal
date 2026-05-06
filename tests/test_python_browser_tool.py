@@ -51,6 +51,18 @@ class FakeRuntime:
         self.last_load_timeout = timeout_s
         return None
 
+    def wait_until(self, expression: str, timeout_s: float = 20.0, interval_s: float = 0.25) -> Any:
+        self.last_load_timeout = timeout_s
+        return {"expression": expression, "timeout_s": timeout_s, "interval_s": interval_s}
+
+    def wait_for_selector(self, selector: str, timeout_s: float = 20.0, visible: bool = False) -> Any:
+        self.last_load_timeout = timeout_s
+        return {"selector": selector, "timeout_s": timeout_s, "visible": visible}
+
+    def wait_for_text(self, text: str, timeout_s: float = 20.0) -> Any:
+        self.last_load_timeout = timeout_s
+        return {"text": text, "timeout_s": timeout_s}
+
     def screenshot(self, label: str = "screenshot", attach: bool = True, full_page: bool = False) -> ToolImage:
         path = self.root_dir / "shot.png"
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -173,6 +185,33 @@ class PythonBrowserToolTest(unittest.TestCase):
 
             self.assertTrue(result.data["ok"])
             self.assertEqual(runtime_holder["runtime"].last_load_timeout, 7)
+
+    def test_wait_helpers_are_exposed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "result = {"
+                        "'until': wait_until('window.ready', timeout=3), "
+                        "'selector': wait_for_selector('#accept', visible=True), "
+                        "'text': wait_for_text('Accept')"
+                        "}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["until"]["timeout_s"], 3)
+            self.assertEqual(result.data["result"]["selector"]["selector"], "#accept")
+            self.assertTrue(result.data["result"]["selector"]["visible"])
+            self.assertEqual(result.data["result"]["text"]["text"], "Accept")
 
 
 if __name__ == "__main__":

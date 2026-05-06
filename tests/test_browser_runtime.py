@@ -54,6 +54,19 @@ class NewTabRuntime(BrowserRuntime):
         return {"url": url, "wait": wait}
 
 
+class SequenceRuntime(BrowserRuntime):
+    def __init__(self, root_dir: Path, values: list[Any]) -> None:
+        super().__init__(root_dir=root_dir)
+        self.values = values
+        self.expressions: list[str] = []
+
+    def js(self, expression: str, await_promise: bool = False) -> Any:
+        self.expressions.append(expression)
+        if self.values:
+            return self.values.pop(0)
+        return False
+
+
 class BrowserRuntimeTest(unittest.TestCase):
     def test_page_info_handles_missing_document_elements(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -97,6 +110,19 @@ class BrowserRuntimeTest(unittest.TestCase):
 
             self.assertEqual(target["id"], "target-1")
             self.assertEqual(runtime.navigated_to, "https://example.com")
+
+    def test_wait_until_polls_until_truthy(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = SequenceRuntime(Path(tmp), [False, "", "ready"])
+
+            self.assertEqual(runtime.wait_until("window.ready", timeout_s=1, interval_s=0), "ready")
+
+    def test_wait_for_selector_builds_selector_expression(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = SequenceRuntime(Path(tmp), [True])
+
+            self.assertTrue(runtime.wait_for_selector("#accept", timeout_s=1))
+            self.assertIn('document.querySelector("#accept")', runtime.expressions[0])
 
 
 if __name__ == "__main__":
