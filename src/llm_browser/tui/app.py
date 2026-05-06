@@ -14,8 +14,9 @@ from typing import Callable, Optional
 from rich.markup import escape
 from rich.text import Text
 from textual.app import App, ComposeResult
-from textual.containers import Horizontal, Vertical
-from textual.widgets import DataTable, Footer, Header, Input, RichLog, Static
+from textual.containers import Container, Horizontal, Vertical
+from textual.screen import ModalScreen
+from textual.widgets import DataTable, Input, RichLog, Static
 
 from llm_browser.agent import SessionManager
 from llm_browser.browser import browser_runtime_diagnostics
@@ -32,115 +33,339 @@ from llm_browser.tui.simple import format_event
 ProviderFactory = Callable[[], Optional[Provider]]
 
 
+COMMAND_PALETTE: list[tuple[str, str, str]] = [
+    ("New task", "", "Type a plain request and press enter"),
+    ("Dataset sample", "dataset real_v8 1", "Run one real_v8 dataset task"),
+    ("Dataset by task id", "dataset real_v8 --task-id ", "Start a specific dataset task"),
+    ("Resume selected", "resume", "Continue from the selected session"),
+    ("Cancel selected", "cancel", "Interrupt the selected session"),
+    ("Trace selected", "trace", "Write a trace bundle artifact"),
+    ("Self eval", "eval", "Start a self-evaluation child session"),
+    ("Report run", "report", "Summarize the selected dataset run"),
+    ("Open artifact", "open", "Open the selected artifact"),
+    ("Refresh", "refresh", "Reload sessions and artifacts"),
+    ("Clear transcript", "clear", "Clear the visible transcript"),
+    ("Browser config", "browser", "Show browser runtime details"),
+    ("Auth status", "auth", "Show provider authentication status"),
+    ("Config", "config", "Show redacted app configuration"),
+]
+
+
+class CommandPalette(ModalScreen[Optional[str]]):
+    CSS = """
+    CommandPalette {
+        align: center middle;
+        background: #000000 70%;
+    }
+
+    #palette {
+        width: 72;
+        max-width: 96%;
+        max-height: 70%;
+        padding: 2 3 1 3;
+        background: #141414;
+    }
+
+    #palette-head {
+        height: 1;
+        margin-bottom: 1;
+    }
+
+    #palette-title {
+        width: 1fr;
+        color: #eeeeee;
+        text-style: bold;
+    }
+
+    #palette-esc {
+        width: auto;
+        color: #808080;
+    }
+
+    #palette-filter {
+        height: 1;
+        margin-bottom: 1;
+        background: #141414;
+        color: #eeeeee;
+        border: none;
+    }
+
+    #palette-table {
+        height: 1fr;
+        background: #141414;
+        color: #eeeeee;
+    }
+    """
+
+    BINDINGS = [("escape", "close", "Close"), ("ctrl+c", "close", "Close")]
+
+    def __init__(self, commands: list[tuple[str, str, str]]) -> None:
+        super().__init__()
+        self.commands = commands
+
+    def compose(self) -> ComposeResult:
+        with Container(id="palette"):
+            with Horizontal(id="palette-head"):
+                yield Static("Commands", id="palette-title")
+                yield Static("esc", id="palette-esc")
+            yield Input(placeholder="Search commands", id="palette-filter", compact=True)
+            table = DataTable(
+                id="palette-table",
+                cursor_type="row",
+                show_header=False,
+                show_row_labels=False,
+                cell_padding=1,
+            )
+            table.add_columns("name", "description")
+            yield table
+
+    def on_mount(self) -> None:
+        self._populate("")
+        self.query_one("#palette-filter", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "palette-filter":
+            self._populate(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        value = event.value.strip()
+        table = self.query_one("#palette-table", DataTable)
+        if table.row_count:
+            self.dismiss(str(table.get_row_at(table.cursor_row)[0]))
+        elif value:
+            self.dismiss(value)
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.dismiss(str(event.row_key.value))
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def _populate(self, query: str) -> None:
+        table = self.query_one("#palette-table", DataTable)
+        table.clear()
+        needle = query.strip().lower()
+        for title, command, description in self.commands:
+            searchable = f"{title} {command} {description}".lower()
+            if needle and needle not in searchable:
+                continue
+            key = command or "run "
+            table.add_row(key, Text(description, style="#808080"), key=key)
+
+
+class SessionPalette(ModalScreen[Optional[str]]):
+    CSS = """
+    SessionPalette {
+        align: center middle;
+        background: #000000 70%;
+    }
+
+    #sessions-dialog {
+        width: 88;
+        max-width: 96%;
+        max-height: 70%;
+        padding: 2 3 1 3;
+        background: #141414;
+    }
+
+    #sessions-head {
+        height: 1;
+        margin-bottom: 1;
+    }
+
+    #sessions-dialog-title {
+        width: 1fr;
+        color: #eeeeee;
+        text-style: bold;
+    }
+
+    #sessions-esc {
+        width: auto;
+        color: #808080;
+    }
+
+    #sessions-filter {
+        height: 1;
+        margin-bottom: 1;
+        background: #141414;
+        color: #eeeeee;
+        border: none;
+    }
+
+    #sessions-table {
+        height: 1fr;
+        background: #141414;
+        color: #eeeeee;
+    }
+    """
+
+    BINDINGS = [("escape", "close", "Close"), ("ctrl+c", "close", "Close")]
+
+    def __init__(self, rows: list[tuple[str, str, str, str, str]]) -> None:
+        super().__init__()
+        self.rows = rows
+        self._visible_session_ids: list[str] = []
+
+    def compose(self) -> ComposeResult:
+        with Container(id="sessions-dialog"):
+            with Horizontal(id="sessions-head"):
+                yield Static("Sessions", id="sessions-dialog-title")
+                yield Static("esc", id="sessions-esc")
+            yield Input(placeholder="Search sessions", id="sessions-filter", compact=True)
+            table = DataTable(
+                id="sessions-table",
+                cursor_type="row",
+                show_header=False,
+                show_row_labels=False,
+                cell_padding=1,
+            )
+            table.add_columns("session", "state", "age", "run")
+            yield table
+
+    def on_mount(self) -> None:
+        self._populate("")
+        self.query_one("#sessions-filter", Input).focus()
+
+    def on_input_changed(self, event: Input.Changed) -> None:
+        if event.input.id == "sessions-filter":
+            self._populate(event.value)
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        table = self.query_one("#sessions-table", DataTable)
+        if table.row_count:
+            self.dismiss(self._visible_session_ids[table.cursor_row])
+
+    def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
+        self.dismiss(str(event.row_key.value))
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+    def _populate(self, query: str) -> None:
+        table = self.query_one("#sessions-table", DataTable)
+        table.clear()
+        self._visible_session_ids = []
+        needle = query.strip().lower()
+        for session_id, status, age, run, task in self.rows:
+            searchable = f"{session_id} {status} {age} {run} {task}".lower()
+            if needle and needle not in searchable:
+                continue
+            self._visible_session_ids.append(session_id)
+            title = f"[bold]{escape(task[:42] or session_id)}[/bold]\n[dim]{escape(session_id)}[/dim]"
+            table.add_row(Text.from_markup(title), _status_text(status), age, run, key=session_id)
+
+
 class BrowserUseTerminalApp(App[None]):
     CSS = """
     Screen {
-        background: #0c0e12;
-        color: #eee8dc;
-    }
-
-    Header {
-        background: #171b20;
-        color: #f6efe3;
-        text-style: bold;
+        background: #0a0a0a;
+        color: #eeeeee;
     }
 
     #body {
         height: 1fr;
     }
 
-    #statusbar {
-        height: 1;
-        padding: 0 1;
-        background: #252018;
-        color: #d9cdbd;
-        text-style: bold;
-    }
-
-    #left {
-        width: 44;
-        min-width: 34;
-        background: #101318;
-        border: tall #33424b;
-    }
-
-    #center {
+    #main {
         width: 1fr;
-        min-width: 44;
+        min-width: 52;
+        padding: 2 3 1 3;
+        background: #0a0a0a;
     }
 
-    #right {
-        width: 56;
-        min-width: 36;
-        background: #101318;
-        border: tall #33424b;
+    #transcript {
+        height: 1fr;
+        background: #0a0a0a;
+        color: #eeeeee;
+        scrollbar-color: #606060;
+        scrollbar-background: #0a0a0a;
     }
 
-    #sessions-title, #events-title, #artifacts-title, #detail-title, #preview-title, #help-title {
+    #composer {
+        height: 5;
+        margin-top: 1;
+        padding: 1 2 0 2;
+        background: #1e1e1e;
+        border-left: tall #5c9cf5;
+    }
+
+    #command {
         height: 1;
+        border: none;
+        background: #1e1e1e;
+        color: #eeeeee;
+    }
+
+    #composer-meta {
+        height: 1;
+        margin-top: 1;
+        color: #808080;
+    }
+
+    #hintbar {
+        height: 1;
+        color: #808080;
         padding: 0 1;
-        background: #1b2325;
-        color: #a6e3d7;
-        text-style: bold;
     }
 
-    #sessions {
-        height: 1fr;
-        background: #101318;
-    }
-
-    #help {
-        height: 9;
-        padding: 1;
-        color: #c7baaa;
-        background: #11151a;
-    }
-
-    #events {
-        height: 1fr;
-        border: tall #2a343a;
-        background: #0c0e12;
+    #sidebar {
+        width: 42;
+        min-width: 34;
+        padding: 2 2 1 2;
+        background: #141414;
     }
 
     #session-detail {
-        height: 12;
-        padding: 1;
-        color: #ded4c8;
-        background: #11151a;
+        height: auto;
+        max-height: 18;
+        color: #eeeeee;
+        background: #141414;
+    }
+
+    #artifacts-title, #preview-title {
+        height: 1;
+        margin-top: 1;
+        color: #eeeeee;
+        text-style: bold;
     }
 
     #artifacts {
         height: 1fr;
-        background: #101318;
+        background: #141414;
+        color: #eeeeee;
     }
 
     #artifact-preview {
-        height: 12;
-        border: tall #2a343a;
-        background: #0c0e12;
+        height: 10;
+        margin-top: 1;
+        background: #141414;
+        color: #808080;
+        scrollbar-color: #606060;
+        scrollbar-background: #141414;
     }
 
-    #command {
-        height: 3;
-        border: tall #a6e3d7;
-        background: #171b20;
-        color: #f6efe3;
+    #sidebar-footer {
+        height: 2;
+        color: #808080;
+        padding-top: 1;
     }
 
     DataTable {
-        background: #101318;
-        color: #e8ded1;
-        scrollbar-color: #47656a;
-        scrollbar-background: #11151a;
+        background: #141414;
+        color: #eeeeee;
+        scrollbar-color: #606060;
+        scrollbar-background: #141414;
     }
     """
 
     BINDINGS = [
-        ("ctrl+c", "cancel_selected", "Cancel"),
+        ("escape", "cancel_selected", "Interrupt"),
+        ("ctrl+c", "cancel_selected", "Interrupt"),
+        ("tab", "show_sessions", "Sessions"),
+        ("ctrl+p", "show_commands", "Commands"),
         ("ctrl+r", "refresh", "Refresh"),
         ("ctrl+l", "clear_log", "Clear"),
         ("o", "open_artifact", "Open"),
-        ("enter", "open_artifact", "Open"),
         ("q", "quit", "Quit"),
     ]
 
@@ -167,53 +392,44 @@ class BrowserUseTerminalApp(App[None]):
         self._listener: Optional[threading.Thread] = None
 
     def compose(self) -> ComposeResult:
-        yield Header(name=PRODUCT_NAME, show_clock=True)
-        yield Static("", id="statusbar")
         with Horizontal(id="body"):
-            with Vertical(id="left"):
-                yield Static("sessions", id="sessions-title")
-                sessions = DataTable(id="sessions", cursor_type="row")
-                sessions.add_columns("id", "state", "age", "run", "task")
-                yield sessions
-                yield Static("commands", id="help-title")
-                yield Static(
-                    "run <task>\n"
-                    "dataset <name> [count|--all]\n"
-                    "dataset <name> --task-id <id>\n"
-                    "report <run-id>\n"
-                    "show/resume/cancel [id]\n"
-                    "trace/eval [id]\n"
-                    "browser\n"
-                    "auth/config\n"
-                    "open [artifact]\n"
-                    "ctrl-r refresh  ctrl-l clear",
-                    id="help",
-                )
-            with Vertical(id="center"):
-                yield Static("events", id="events-title")
-                yield RichLog(id="events", wrap=True, highlight=True, markup=True)
-            with Vertical(id="right"):
-                yield Static("selected session", id="detail-title")
+            with Vertical(id="main"):
+                yield RichLog(id="transcript", wrap=True, highlight=True, markup=True)
+                with Vertical(id="composer"):
+                    yield Input(
+                        placeholder='Ask anything... "Find the page and save a screenshot"',
+                        id="command",
+                        compact=True,
+                    )
+                    yield Static("", id="composer-meta")
+                yield Static("", id="hintbar")
+            with Vertical(id="sidebar"):
                 yield Static("", id="session-detail")
                 yield Static("artifacts", id="artifacts-title")
-                artifacts = DataTable(id="artifacts", cursor_type="row")
-                artifacts.add_columns("kind", "name", "size", "modified")
+                artifacts = DataTable(
+                    id="artifacts",
+                    cursor_type="row",
+                    show_header=False,
+                    show_row_labels=False,
+                    cell_padding=1,
+                )
+                artifacts.add_columns("kind", "name", "size")
                 yield artifacts
                 yield Static("preview", id="preview-title")
                 yield RichLog(id="artifact-preview", wrap=True, highlight=True, markup=True)
-        yield Input(
-            placeholder="run <task>  |  dataset <name> [count]  |  report <run-id>  |  show/trace/eval/open  |  help",
-            id="command",
-        )
-        yield Footer()
+                yield Static("", id="sidebar-footer")
 
     def on_mount(self) -> None:
         self.title = PRODUCT_NAME
         self.sub_title = "raw CDP browser agent"
-        self._write_banner()
         self.refresh_sessions()
+        if self.selected_session_id:
+            self._load_session_log(self.selected_session_id)
+        else:
+            self._write_home()
         self._update_statusbar()
         self._update_session_detail()
+        self.query_one("#command", Input).focus()
         self._listener = threading.Thread(target=self._listen_events, name="browser-use-terminal-events", daemon=True)
         self._listener.start()
         self.set_interval(1.0, self._tick)
@@ -240,27 +456,37 @@ class BrowserUseTerminalApp(App[None]):
         self._update_statusbar()
         self._update_session_detail()
 
+    def _write_home(self) -> None:
+        log = self.query_one("#transcript", RichLog)
+        log.clear()
+        log.write("")
+        log.write("[bold #eeeeee]browser use terminal[/bold #eeeeee]")
+        log.write("[#808080]Type a browser task below, or press [#eeeeee]ctrl+p[/] for commands.[/]")
+        log.write("")
+        log.write(f"[#5c9cf5]Build[/] [#808080]·[/] {escape(self.model_label or '-')} [#808080]{escape(self.provider_label)}[/]")
+
     def _write_banner(self) -> None:
-        log = self.query_one("#events", RichLog)
-        log.write("[bold #a6e3d7]browser use terminal[/bold #a6e3d7]")
+        log = self.query_one("#transcript", RichLog)
+        log.write("[bold #eeeeee]Commands[/bold #eeeeee]")
         log.write(
-            "Commands: [bold]run[/bold] a task, [bold]dataset real_v8 --task-id 20[/bold], "
-            "[bold]resume[/bold] selected, [bold]cancel[/bold] a session, [bold]show[/bold] a session, "
-            "[bold]report[/bold] a dataset run, [bold]browser[/bold] config, [bold]open[/bold] an artifact."
+            "[#808080]Plain text starts a task. Slash commands include "
+            "[#eeeeee]/dataset[/], [#eeeeee]/resume[/], [#eeeeee]/cancel[/], "
+            "[#eeeeee]/trace[/], [#eeeeee]/eval[/], [#eeeeee]/report[/], "
+            "[#eeeeee]/browser[/], and [#eeeeee]/open[/].[/]"
         )
-        log.write(f"Browser: [bold]{escape(_browser_runtime_label())}[/bold]")
-        log.write(f"Provider: [bold]{escape(self.provider_label)}[/bold]  Model: [bold]{escape(self.model_label or '-')}[/bold]")
 
     def _handle_event(self, event: Event) -> None:
         if self.selected_session_id is None:
             self.selected_session_id = event.session_id
 
         if event.type == "model.delta":
-            self._append_model_delta(event)
+            if event.session_id == self.selected_session_id:
+                self._append_model_delta(event)
             return
 
-        self._flush_model_delta(event.session_id)
-        self._write_log_line(format_event(event), event.type)
+        if event.session_id == self.selected_session_id:
+            self._flush_model_delta(event.session_id)
+            self._write_log_line(_format_event_for_transcript(event), event.type)
         self.refresh_sessions()
         self.refresh_artifacts()
         self._update_statusbar()
@@ -280,29 +506,37 @@ class BrowserUseTerminalApp(App[None]):
         if not text.strip():
             return
         collapsed = " ".join(text.strip().split())
-        self._write_log_line(f"[{session_id}] model: {collapsed}", "model.delta")
+        self._write_log_line(collapsed, "model.delta")
 
     def _flush_all_model_deltas(self) -> None:
         for session_id in list(self._model_buffers):
             self._flush_model_delta(session_id)
 
     def _write_log_line(self, line: str, event_type: str) -> None:
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#transcript", RichLog)
         escaped = escape(line)
-        if event_type == "tool.failed":
-            log.write(f"[red]{escaped}[/red]")
+        if event_type == "session.input":
+            log.write(f"[bold #5c9cf5]▌[/] [bold #eeeeee]Task[/bold #eeeeee]\n{escaped}")
+        elif event_type == "session.created":
+            log.write(f"[#808080]{escaped}[/]")
+        elif event_type == "tool.started":
+            log.write(f"[#808080]{escaped}[/]")
+        elif event_type == "tool.failed":
+            log.write(f"[#e06c75]{escaped}[/]")
         elif event_type == "tool.image":
-            log.write(f"[bold #9ccfd8]{escaped}[/bold #9ccfd8]")
+            log.write(f"[#5c9cf5]{escaped}[/]")
         elif event_type == "tool.output":
-            log.write(f"[dim]{escaped}[/dim]")
+            log.write(f"[#808080]{escaped}[/]")
+        elif event_type == "tool.finished":
+            log.write(f"[#808080]{escaped}[/]")
         elif event_type == "model.delta":
-            log.write(f"[#d8cab8]{escaped}[/]")
+            log.write(f"[#eeeeee]{escaped}[/]")
         elif event_type in {"session.done", "session.cancelled"}:
-            log.write(f"[green]{escaped}[/green]")
+            log.write(f"[#7fd88f]{escaped}[/]")
         elif event_type == "session.failed":
-            log.write(f"[bold red]{escaped}[/bold red]")
+            log.write(f"[bold #e06c75]{escaped}[/bold #e06c75]")
         elif event_type == "session.deadline_warning":
-            log.write(f"[yellow]{escaped}[/yellow]")
+            log.write(f"[#f5a742]{escaped}[/]")
         else:
             log.write(escaped)
 
@@ -314,33 +548,26 @@ class BrowserUseTerminalApp(App[None]):
         self._handle_command(line)
 
     def on_data_table_row_selected(self, event: DataTable.RowSelected) -> None:
-        if event.data_table.id == "sessions":
-            self.selected_session_id = str(event.row_key.value)
-            self._load_session_log(self.selected_session_id)
-            self.refresh_artifacts()
-            self._update_session_detail()
-        elif event.data_table.id == "artifacts":
+        if event.data_table.id == "artifacts":
             self.selected_artifact_path = str(event.row_key.value)
             self._preview_artifact(self.selected_artifact_path, force=True)
 
     def _handle_command(self, line: str) -> None:
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#transcript", RichLog)
+        is_slash_command = line.startswith("/")
         normalized_line = line.lstrip("/")
         if normalized_line.startswith("run "):
             task = normalized_line[4:].strip()
             if not task:
-                log.write("[red]run requires a task[/red]")
+                log.write("[#e06c75]run requires a task[/]")
                 return
-            session = self.manager.start(task)
-            self.selected_session_id = session.id
-            log.write(f"[bold #9ccfd8]started {session.id}[/bold #9ccfd8] {escape(task[:160])}")
-            self.refresh_sessions()
+            self._start_task(task)
             return
 
         try:
             args = shlex.split(normalized_line)
         except ValueError as exc:
-            log.write(f"[red]parse error: {escape(str(exc))}[/red]")
+            log.write(f"[#e06c75]parse error: {escape(str(exc))}[/]")
             return
         if not args:
             return
@@ -355,11 +582,10 @@ class BrowserUseTerminalApp(App[None]):
         elif command == "clear":
             self.action_clear_log()
         elif command == "sessions":
-            self.refresh_sessions()
-            log.write("[green]sessions refreshed[/green]")
+            self.action_show_sessions()
         elif command == "artifacts":
             self.refresh_artifacts()
-            log.write("[green]artifacts refreshed[/green]")
+            log.write("[#7fd88f]artifacts refreshed[/]")
         elif command == "browser":
             log.write(escape(_browser_runtime_detail()))
         elif command == "config":
@@ -381,7 +607,7 @@ class BrowserUseTerminalApp(App[None]):
         elif command == "report":
             run_id = args[1] if len(args) >= 2 else self._selected_dataset_run_id()
             if not run_id:
-                log.write("[red]report requires a run id or a selected dataset session[/red]")
+                log.write("[#e06c75]report requires a run id or a selected dataset session[/]")
                 return
             self._write_dataset_report(run_id)
         elif command == "show" and len(args) == 2:
@@ -392,22 +618,22 @@ class BrowserUseTerminalApp(App[None]):
             session_id = args[1] if len(args) > 1 else self.selected_session_id
             instruction = " ".join(args[2:]) if len(args) > 2 else "Continue from the previous session state."
             if not session_id:
-                log.write("[red]no selected session to resume[/red]")
+                log.write("[#e06c75]no selected session to resume[/]")
                 return
             parent = self.store.load(session_id)
             if parent is None:
-                log.write(f"[red]session not found: {escape(session_id)}[/red]")
+                log.write(f"[#e06c75]session not found: {escape(session_id)}[/]")
                 return
             resumed = self.manager.start(instruction, parent_id=parent.id)
             self.selected_session_id = resumed.id
-            log.write(f"[bold #9ccfd8]started resume child {escape(resumed.id)} for {escape(parent.id)}[/bold #9ccfd8]")
+            self._load_session_log(resumed.id)
         elif command == "cancel":
             session_id = args[1] if len(args) > 1 else self.selected_session_id
             if not session_id:
-                log.write("[red]no selected session to cancel[/red]")
+                log.write("[#e06c75]no selected session to cancel[/]")
                 return
             self.manager.cancel(session_id)
-            log.write(f"[yellow]cancel requested for {escape(session_id)}[/yellow]")
+            log.write(f"[#f5a742]cancel requested for {escape(session_id)}[/]")
         elif command == "open":
             path = args[1] if len(args) > 1 else self.selected_artifact_path
             self._open_artifact(path)
@@ -433,46 +659,33 @@ class BrowserUseTerminalApp(App[None]):
                     try:
                         count = int(rest[index])
                     except ValueError:
-                        log.write(f"[red]invalid dataset option: {escape(rest[index])}[/red]")
+                        log.write(f"[#e06c75]invalid dataset option: {escape(rest[index])}[/]")
                         return
                     index += 1
             tasks = select_tasks(load_dataset(args[1]), count=count, task_ids=task_ids or None)
             for task in tasks:
                 session = self.manager.start(build_dataset_prompt(task, headless=_browser_headless_default()))
                 self.selected_session_id = session.id
-                log.write(
-                    f"[bold #9ccfd8]started {escape(task.dataset)} task {escape(task.task_id)} "
-                    f"as {escape(session.id)}[/bold #9ccfd8]"
-                )
+                self._load_session_log(session.id)
         else:
-            log.write(f"[red]unknown command: {escape(command)}[/red]")
+            if is_slash_command:
+                log.write(f"[#e06c75]unknown command: {escape(command)}[/]")
+            else:
+                self._start_task(line)
 
     def _load_session_log(self, session_id: str) -> None:
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#transcript", RichLog)
         log.clear()
         session = self.store.load(session_id)
         if session is None:
-            log.write(f"[red]session not found: {escape(session_id)}[/red]")
+            log.write(f"[#e06c75]session not found: {escape(session_id)}[/]")
             return
-        log.write(f"[bold #9ccfd8]session {escape(session.id)}[/bold #9ccfd8] {escape(session.status)}")
-        for line, event_type in _format_events_for_log(self.store.events.read(session.id)[-400:]):
+        self.selected_session_id = session.id
+        for line, event_type in _format_events_for_transcript(self.store.events.read(session.id)[-400:]):
             self._write_log_line(line, event_type)
         self._update_session_detail()
 
     def refresh_sessions(self) -> None:
-        table = self.query_one("#sessions", DataTable)
-        table.clear()
-        for session in self.store.list():
-            task = self._task_for_session(session)
-            run_label = _dataset_run_label(session.cwd)
-            table.add_row(
-                session.id,
-                _status_text(session.status),
-                _format_age(session.updated_ms / 1000),
-                run_label,
-                task[:46],
-                key=session.id,
-            )
         if self.selected_session_id is None:
             sessions = self.store.list()
             if sessions:
@@ -499,7 +712,6 @@ class BrowserUseTerminalApp(App[None]):
                 _artifact_kind(path),
                 path.name,
                 _format_bytes(stat.st_size),
-                _format_age(stat.st_mtime),
                 key=str(path),
             )
         if self.selected_artifact_path is None:
@@ -516,98 +728,167 @@ class BrowserUseTerminalApp(App[None]):
 
     def action_clear_log(self) -> None:
         self._model_buffers.clear()
-        self.query_one("#events", RichLog).clear()
+        self.query_one("#transcript", RichLog).clear()
 
     def action_open_artifact(self) -> None:
         self._open_artifact(self.selected_artifact_path)
 
+    def action_show_commands(self) -> None:
+        def selected(command: Optional[str]) -> None:
+            if command is None:
+                self.query_one("#command", Input).focus()
+                return
+            command_input = self.query_one("#command", Input)
+            if command.endswith(" "):
+                command_input.value = command
+                command_input.focus()
+                return
+            self._handle_command(command)
+            command_input.focus()
+
+        self.push_screen(CommandPalette(COMMAND_PALETTE), selected)
+
+    def action_show_sessions(self) -> None:
+        def selected(session_id: Optional[str]) -> None:
+            if not session_id:
+                self.query_one("#command", Input).focus()
+                return
+            self.selected_session_id = session_id
+            self._load_session_log(session_id)
+            self.refresh_artifacts()
+            self._update_session_detail()
+            self.query_one("#command", Input).focus()
+
+        self.push_screen(SessionPalette(self._session_rows()), selected)
+
+    def _start_task(self, task: str) -> None:
+        session = self.manager.start(task)
+        self.selected_session_id = session.id
+        self.selected_artifact_path = None
+        self._load_session_log(session.id)
+        self.refresh_sessions()
+        self.refresh_artifacts()
+
+    def _session_rows(self) -> list[tuple[str, str, str, str, str]]:
+        rows = []
+        for session in self.store.list():
+            rows.append(
+                (
+                    session.id,
+                    session.status,
+                    _format_age(session.updated_ms / 1000),
+                    _dataset_run_label(session.cwd),
+                    self._task_for_session(session),
+                )
+            )
+        return rows
+
     def _open_artifact(self, path: Optional[str]) -> None:
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#transcript", RichLog)
         if not path:
-            log.write("[red]no selected artifact[/red]")
+            log.write("[#e06c75]no selected artifact[/]")
             return
         artifact = Path(path).expanduser()
         if not artifact.exists():
-            log.write(f"[red]artifact not found: {escape(str(artifact))}[/red]")
+            log.write(f"[#e06c75]artifact not found: {escape(str(artifact))}[/]")
             return
         try:
             subprocess.Popen(["open", str(artifact)], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-            log.write(f"[green]opened {escape(str(artifact))}[/green]")
+            log.write(f"[#7fd88f]opened {escape(str(artifact))}[/]")
         except Exception as exc:
-            log.write(f"[yellow]open failed: {escape(str(exc))}; path: {escape(str(artifact))}[/yellow]")
+            log.write(f"[#f5a742]open failed: {escape(str(exc))}; path: {escape(str(artifact))}[/]")
 
     def _write_trace(self, session_id: Optional[str]) -> None:
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#transcript", RichLog)
         if not session_id:
-            log.write("[red]no selected session for trace[/red]")
+            log.write("[#e06c75]no selected session for trace[/]")
             return
         from llm_browser.session.trace import write_trace_bundle
 
         try:
             path = write_trace_bundle(self.store, session_id)
         except Exception as exc:
-            log.write(f"[red]trace failed: {escape(str(exc))}[/red]")
+            log.write(f"[#e06c75]trace failed: {escape(str(exc))}[/]")
             return
         self.selected_artifact_path = str(path)
-        log.write(f"[green]trace written: {escape(str(path))}[/green]")
+        log.write(f"[#7fd88f]trace written: {escape(str(path))}[/]")
         self.refresh_artifacts()
 
     def _start_self_eval(self, session_id: Optional[str]) -> None:
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#transcript", RichLog)
         if not session_id:
-            log.write("[red]no selected session for eval[/red]")
+            log.write("[#e06c75]no selected session for eval[/]")
             return
         from llm_browser.session.trace import build_self_eval_prompt
 
         try:
             prompt = build_self_eval_prompt(self.store, session_id)
         except Exception as exc:
-            log.write(f"[red]eval prompt failed: {escape(str(exc))}[/red]")
+            log.write(f"[#e06c75]eval prompt failed: {escape(str(exc))}[/]")
             return
         child = self.manager.start(prompt, parent_id=session_id)
         self.selected_session_id = child.id
-        log.write(f"[bold #9ccfd8]started self-eval {escape(child.id)} for {escape(session_id)}[/bold #9ccfd8]")
+        self._load_session_log(child.id)
 
     def _write_dataset_report(self, run_id_or_path: str) -> None:
-        log = self.query_one("#events", RichLog)
+        log = self.query_one("#transcript", RichLog)
         try:
             manifest = load_manifest(self.store.state_dir, run_id_or_path)
             summary = summarize_manifest(manifest)
         except Exception as exc:
-            log.write(f"[red]report failed: {escape(str(exc))}[/red]")
+            log.write(f"[#e06c75]report failed: {escape(str(exc))}[/]")
             return
 
         failed = _short_task_list(summary["failed_task_ids"])
         pending = _short_task_list(summary["pending_task_ids"])
         log.write(
-            "[bold #a6e3d7]dataset report[/bold #a6e3d7] "
+            "[bold #eeeeee]dataset report[/bold #eeeeee] "
             f"{escape(str(summary['run_id']))}  "
             f"{escape(str(summary['dataset']))}  "
-            f"passed [green]{summary['passed']}[/green] / {summary['selected']}  "
-            f"failed [red]{summary['failed']}[/red]  "
-            f"pending [yellow]{summary['pending']}[/yellow]"
+            f"passed [#7fd88f]{summary['passed']}[/] / {summary['selected']}  "
+            f"failed [#e06c75]{summary['failed']}[/]  "
+            f"pending [#f5a742]{summary['pending']}[/]"
         )
-        log.write(f"[red]failed:[/red] {escape(failed)}")
-        log.write(f"[yellow]pending:[/yellow] {escape(pending)}")
+        log.write(f"[#e06c75]failed:[/] {escape(failed)}")
+        log.write(f"[#f5a742]pending:[/] {escape(pending)}")
 
     def _update_statusbar(self) -> None:
         sessions = self.store.list()
         counts: dict[str, int] = {}
         for session in sessions:
             counts[session.status] = counts.get(session.status, 0) + 1
-        text = (
-            f"[bold #f4f0e8]{PRODUCT_NAME}[/bold #f4f0e8]  "
-            f"[#b9b2a7]sessions[/] [bold]{len(sessions)}[/bold]  "
-            f"[#9ccfd8]running[/] [bold]{counts.get('running', 0)}[/bold]  "
-            f"[green]done[/green] [bold]{counts.get('done', 0)}[/bold]  "
-            f"[red]failed[/red] [bold]{counts.get('failed', 0)}[/bold]  "
-            f"[#b9b2a7]provider[/] {escape(self.provider_label)}  "
-            f"[#b9b2a7]model[/] {escape(self.model_label or '-')}  "
-            f"[#b9b2a7]browser[/] {escape(_browser_runtime_label())}  "
-            f"{self._selected_run_summary_text()} "
-            f"[#b9b2a7]selected[/] {escape(self.selected_session_id or '-')}"
+        meta = (
+            f"[#5c9cf5]Build[/] [#808080]·[/] "
+            f"[#eeeeee]{escape(self.model_label or '-')}[/] "
+            f"[#808080]{escape(self.provider_label)}  {escape(_browser_runtime_label())}[/]"
         )
-        self.query_one("#statusbar", Static).update(text)
+        run_summary = self._selected_run_summary_text()
+        if run_summary:
+            meta += f"  {run_summary}"
+        self.query_one("#composer-meta", Static).update(meta)
+
+        selected_running = False
+        if self.selected_session_id:
+            selected = self.store.load(self.selected_session_id)
+            selected_running = bool(selected and selected.status in {"created", "running"})
+        left = "esc interrupt" if selected_running else "tab sessions"
+        right = (
+            f"{len(sessions)} sessions  "
+            f"[#5c9cf5]{counts.get('running', 0)} running[/]  "
+            f"[#7fd88f]{counts.get('done', 0)} done[/]  "
+            f"[#e06c75]{counts.get('failed', 0)} failed[/]  "
+            "ctrl+p commands"
+        )
+        self.query_one("#hintbar", Static).update(f"[#eeeeee]{left}[/]  [#808080]{right}[/]")
+
+        cwd = "-"
+        if self.selected_session_id:
+            session = self.store.load(self.selected_session_id)
+            if session is not None:
+                cwd = _compact_path(session.cwd)
+        self.query_one("#sidebar-footer", Static).update(
+            f"[#808080]{escape(cwd)}[/]\n[#7fd88f]•[/] [bold #808080]{PRODUCT_NAME}[/bold #808080]"
+        )
 
     def _update_session_detail(self) -> None:
         detail = self.query_one("#session-detail", Static)
@@ -629,18 +910,23 @@ class BrowserUseTerminalApp(App[None]):
         run_id = _dataset_run_id_from_path(session.cwd)
         run_line = self._dataset_run_detail(run_id) if run_id else "-"
         latest_image = _latest_image_line(events)
+        title = task[:36] if task else "Browser session"
         detail.update(
-            f"[bold]{escape(session.id)}[/bold]\n"
-            f"status: {_status_markup(session.status)}\n"
-            f"parent: {escape(session.parent_id or '-')}\n"
-            f"dataset: {escape(run_line)}\n"
-            f"events: {len(events)}  tools: {tools}  images: {images}  artifacts: {artifacts}\n"
-            f"tool: {escape(current_tool)}\n"
-            f"image: {escape(latest_image)}\n"
-            f"updated: {_format_age(session.updated_ms / 1000)}\n"
-            f"cwd: {escape(str(session.cwd))}\n"
-            f"task: {escape(task[:180])}\n"
-            f"last: {escape(final_line[:180])}"
+            f"[bold #eeeeee]{escape(title)}[/bold #eeeeee]\n\n"
+            f"[bold #eeeeee]Context[/bold #eeeeee]\n"
+            f"[#808080]{len(events):,} events[/]\n"
+            f"[#808080]{tools} tools[/]\n"
+            f"[#808080]{images} images[/]\n"
+            f"[#808080]{artifacts} artifacts[/]\n\n"
+            f"[bold #eeeeee]Session[/bold #eeeeee]\n"
+            f"{_status_markup(session.status)}  [#808080]{escape(session.id)}[/]\n"
+            f"[#808080]parent {escape(session.parent_id or '-')}[/]\n"
+            f"[#808080]updated {_format_age(session.updated_ms / 1000)}[/]\n\n"
+            f"[bold #eeeeee]Current[/bold #eeeeee]\n"
+            f"[#808080]{escape(current_tool)}[/]\n"
+            f"[#808080]{escape(latest_image)}[/]\n"
+            f"[#808080]{escape(final_line[:80])}[/]\n"
+            f"[#808080]{escape(run_line[:80])}[/]"
         )
 
     def _preview_artifact(self, path: Optional[str], force: bool = False) -> None:
@@ -648,13 +934,13 @@ class BrowserUseTerminalApp(App[None]):
         if not path:
             self._preview_key = None
             preview.clear()
-            preview.write("[dim]No artifact selected.[/dim]")
+            preview.write("[#808080]No artifact selected.[/]")
             return
         artifact = Path(path)
         if not artifact.exists():
             self._preview_key = None
             preview.clear()
-            preview.write(f"[red]Missing artifact: {escape(str(artifact))}[/red]")
+            preview.write(f"[#e06c75]Missing artifact: {escape(str(artifact))}[/]")
             return
         stat = artifact.stat()
         key = (str(artifact), stat.st_mtime, stat.st_size)
@@ -663,13 +949,13 @@ class BrowserUseTerminalApp(App[None]):
         self._preview_key = key
         preview.clear()
         kind = _artifact_kind(artifact)
-        preview.write(f"[bold #9edbe8]{escape(artifact.name)}[/bold #9edbe8]  {kind}  {_format_bytes(stat.st_size)}")
-        preview.write(escape(str(artifact)))
+        preview.write(f"[bold #eeeeee]{escape(artifact.name)}[/bold #eeeeee]  [#808080]{kind}  {_format_bytes(stat.st_size)}[/]")
+        preview.write(f"[#808080]{escape(str(artifact))}[/]")
         if kind == "image":
             dims = _image_dimensions(artifact)
             if dims:
                 preview.write(f"dimensions: {dims[0]} x {dims[1]}")
-            preview.write("[dim]Image artifact. Press enter or `open` to view it.[/dim]")
+            preview.write("[#808080]Image artifact. Press `o` or `/open` to view it.[/]")
             meta = artifact.with_suffix(".json")
             if meta.exists():
                 try:
@@ -681,9 +967,9 @@ class BrowserUseTerminalApp(App[None]):
             try:
                 preview.write(escape(artifact.read_text(encoding="utf-8", errors="replace")[:4000]))
             except Exception as exc:
-                preview.write(f"[yellow]preview failed: {escape(str(exc))}[/yellow]")
+                preview.write(f"[#f5a742]preview failed: {escape(str(exc))}[/]")
             return
-        preview.write("[dim]Binary artifact. Press enter or `open` to view it.[/dim]")
+        preview.write("[#808080]Binary artifact. Press `o` or `/open` to view it.[/]")
 
     def _task_for_session(self, session: SessionMetadata) -> str:
         for event in self.store.events.read(session.id):
@@ -706,12 +992,12 @@ class BrowserUseTerminalApp(App[None]):
         try:
             summary = summarize_manifest(load_manifest(self.store.state_dir, run_id))
         except Exception:
-            return f"[#b9b2a7]run[/] {escape(run_id)}"
+            return f"[#808080]run[/] {escape(run_id)}"
         return (
-            f"[#b9b2a7]run[/] {escape(run_id)} "
+            f"[#808080]run[/] {escape(run_id)} "
             f"{_progress_bar(summary['passed'], summary['selected'], width=10)} "
-            f"[green]{summary['passed']}[/green]/[bold]{summary['selected']}[/bold] "
-            f"[yellow]{summary['pending']} pending[/yellow]"
+            f"[#7fd88f]{summary['passed']}[/]/[bold]{summary['selected']}[/bold] "
+            f"[#f5a742]{summary['pending']} pending[/]"
         )
 
     def _dataset_run_detail(self, run_id: str) -> str:
@@ -789,6 +1075,72 @@ def _browser_runtime_detail() -> str:
     return "\n".join(parts)
 
 
+def _format_event_for_transcript(event: Event) -> str:
+    payload = event.payload
+    if event.type == "session.created":
+        return f"session {event.session_id} created"
+    if event.type == "session.input":
+        return _summarize_task_text(str(payload.get("text") or ""))
+    if event.type == "session.status":
+        return f"status {payload.get('status', '')}"
+    if event.type == "session.cancel_requested":
+        return f"cancel requested: {payload.get('reason', '')}"
+    if event.type == "session.compacted":
+        return f"compacted {payload.get('before_messages')} -> {payload.get('after_messages')} messages"
+    if event.type == "session.deadline_warning":
+        return f"deadline warning: {payload.get('remaining_s')}s remaining"
+    if event.type == "tool.started":
+        return f"→ {payload.get('name') or 'tool'} {payload.get('tool_call_id') or ''}".strip()
+    if event.type == "tool.image":
+        image = payload.get("image") or {}
+        path = Path(str(image.get("path") or ""))
+        label = image.get("label") or "image"
+        return f"image: {label} -> {path.name or path}"
+    if event.type == "tool.output":
+        text = _compact_inline(payload.get("text", ""))
+        return f"  {payload.get('name') or 'tool'} {payload.get('stream') or ''} {text}".strip()
+    if event.type == "tool.finished":
+        output = payload.get("output") or {}
+        text = _compact_inline(output.get("text", ""))
+        suffix = f" {text}" if text else ""
+        return f"✓ {payload.get('name') or 'tool'}{suffix}"
+    if event.type == "tool.failed":
+        return f"tool failed: {payload.get('name') or 'tool'} {payload.get('error') or ''}".strip()
+    if event.type == "session.done":
+        text = _compact_inline(payload.get("result", ""), limit=220)
+        return f"done: {text}" if text else "done"
+    if event.type == "session.failed":
+        return f"failed: {payload.get('error') or ''}".strip()
+    return f"{event.type}: {payload}"
+
+
+def _format_events_for_transcript(events: list[Event]) -> list[tuple[str, str]]:
+    lines: list[tuple[str, str]] = []
+    model_buffers: dict[str, str] = {}
+
+    def flush(session_id: str) -> None:
+        text = model_buffers.pop(session_id, "")
+        if text.strip():
+            lines.append((" ".join(text.strip().split()), "model.delta"))
+
+    for event in events:
+        if event.type == "model.delta":
+            text = str(event.payload.get("text") or "")
+            if not text:
+                continue
+            buffered = model_buffers.get(event.session_id, "") + text
+            model_buffers[event.session_id] = buffered
+            if "\n" in buffered or len(buffered) >= 700:
+                flush(event.session_id)
+            continue
+        flush(event.session_id)
+        lines.append((_format_event_for_transcript(event), event.type))
+
+    for session_id in list(model_buffers):
+        flush(session_id)
+    return lines
+
+
 def _format_events_for_log(events: list[Event]) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = []
     model_buffers: dict[str, str] = {}
@@ -826,6 +1178,23 @@ def _summarize_task_text(text: str) -> str:
         if stop in task:
             task = task.split(stop, 1)[0]
     return " ".join(task.split())
+
+
+def _compact_inline(value: object, limit: int = 160) -> str:
+    text = " ".join(str(value or "").strip().split())
+    if len(text) > limit:
+        return text[: max(0, limit - 3)] + "..."
+    return text
+
+
+def _compact_path(path: Path, limit: int = 38) -> str:
+    text = str(path.expanduser())
+    home = str(Path.home())
+    if text.startswith(home):
+        text = "~" + text[len(home) :]
+    if len(text) > limit:
+        return "…" + text[-(limit - 1) :]
+    return text
 
 
 def _dataset_run_id_from_path(path: Path) -> Optional[str]:
