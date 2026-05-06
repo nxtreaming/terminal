@@ -305,7 +305,9 @@ def cmd_datasets_run(args: argparse.Namespace) -> int:
         _write_dataset_manifest(store, run_id, manifest)
         if result.get("fatal_runner_restart_required"):
             print(json.dumps(manifest, indent=2))
-            return 124
+            sys.stdout.flush()
+            sys.stderr.flush()
+            os._exit(124)
         if args.stop_on_failure and not result.get("ok"):
             print(json.dumps(manifest, indent=2))
             return 1

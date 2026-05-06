@@ -594,6 +594,84 @@ class PythonBrowserToolTest(unittest.TestCase):
             )
             self.assertEqual(result.data["result"]["count"], 2)
 
+    def test_fetch_text_retries_jina_rate_limit_body(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        calls = []
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            calls.append((url, kwargs))
+            if len(calls) == 1:
+                return Response('{"code":429,"status":42903,"retryAfter":1,"message":"RateLimitTriggeredError"}', url)
+            return Response("Title: ok\n\nMarkdown Content:\nhello after retry", url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get), patch("time.sleep") as sleep:
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "from browser_helpers import fetch_text_result\n"
+                            "result = fetch_text_result('https://blocked.example/page', use_jina=True)"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["source"], "jina")
+            self.assertIn("hello after retry", result.data["result"]["text"])
+            self.assertEqual(len(calls), 2)
+            sleep.assert_called_once()
+
+    def test_fetch_many_text_can_save_bulk_results(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            return Response(f"page for {url}", url)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "from browser_helpers import fetch_many_text\n"
+                            "result = fetch_many_text(['https://example.com/a', 'https://example.com/b'], "
+                            "max_workers=2, save_to='pages.json')"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            summary = result.data["result"]
+            self.assertEqual(summary["count"], 2)
+            self.assertEqual(summary["ok"], 2)
+            saved = Path(summary["path"])
+            self.assertTrue(saved.exists())
+            self.assertIn("https://example.com/a", saved.read_text(encoding="utf-8"))
+
     def test_browser_helpers_module_exports_session_helpers(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:
@@ -618,6 +696,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                             "result = {"
                             "'text': fetch_text('https://example.com')[:5], "
                             "'structured': fetch_text_result('https://example.com')['source'], "
+                            "'many': fetch_many_text(['https://example.com'], save_to='bulk.json')['count'], "
                             "'title': js('document.title')"
                             "}"
                         ),
@@ -627,6 +706,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["ok"])
             self.assertEqual(result.data["result"]["text"], "hello")
             self.assertEqual(result.data["result"]["structured"], "direct")
+            self.assertEqual(result.data["result"]["many"], 1)
             self.assertEqual(result.data["result"]["title"], "Example Domain")
 
     def test_js_helper_awaits_promises_by_default(self) -> None:

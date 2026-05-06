@@ -8,6 +8,10 @@ from llm_browser.agent import Agent
 from llm_browser.agent.service import MaxTurnsExceeded
 from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.store import SessionStore
+from llm_browser.tool.context import ToolContext
+from llm_browser.tool.registry import ToolRegistry
+from llm_browser.tool.result import ToolResult
+from llm_browser.tool.spec import ToolSpec
 
 
 class NeverDoneProvider:
@@ -124,6 +128,54 @@ class AgentLoopTest(unittest.TestCase):
             self.assertTrue(large_output["data"]["truncated"])
             self.assertTrue(Path(large_output["data"]["output_path"]).exists())
             self.assertIn("full output saved", large_output["text"])
+
+    def test_large_tool_data_spills_without_reinlining_data(self) -> None:
+        class LargeDataProvider:
+            def __init__(self):
+                self.turn = 0
+
+            def start_turn(self, messages, tools):
+                self.turn += 1
+                if self.turn == 1:
+                    yield ModelEvent.call(ToolCall(id="call_large_data", name="large_data", arguments={}))
+                else:
+                    tool_message = [m for m in messages if m.get("role") == "tool"][-1]
+                    yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": tool_message["content"]}))
+
+        def large_data(ctx: ToolContext, arguments):
+            return ToolResult(data={"ok": True, "result": {"payload": "x" * 21000}})
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolSpec(
+                name="large_data",
+                description="return large data",
+                input_schema={"type": "object", "properties": {}, "additionalProperties": False},
+            ),
+            large_data,
+        )
+        registry.register(
+            ToolSpec(
+                name="done",
+                description="finish",
+                input_schema={"type": "object", "properties": {"result": {"type": "string"}}, "required": ["result"]},
+            ),
+            lambda ctx, arguments: ToolResult(text=str(arguments.get("result", ""))),
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            Agent(store, provider=LargeDataProvider(), tools=registry).run("large data", cwd=Path(tmp))
+            events = store.events.read(store.list()[0].id)
+            large_output = [
+                event.payload["output"]
+                for event in events
+                if event.type == "tool.finished" and event.payload["name"] == "large_data"
+            ][0]
+
+            self.assertTrue(large_output["data"]["truncated"])
+            self.assertNotIn("result", large_output["data"])
+            self.assertTrue(Path(large_output["data"]["output_path"]).exists())
 
     def test_tool_errors_are_returned_to_model_for_recovery(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

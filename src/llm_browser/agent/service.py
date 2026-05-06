@@ -280,17 +280,21 @@ class Agent:
             )
 
     def _spill_large_tool_output(self, ctx: ToolContext, call: ToolCall, result: ToolResult) -> ToolResult:
-        if len(result.text) <= MAX_INLINE_TOOL_TEXT:
+        summary = result._text_summary()
+        if len(summary) <= MAX_INLINE_TOOL_TEXT:
             return result
 
         output_dir = ctx.session.artifact_dir / "tool-output"
         output_dir.mkdir(parents=True, exist_ok=True)
         path = output_dir / f"{call.id}_{call.name}.txt"
-        path.write_text(result.text, encoding="utf-8")
-        data = dict(result.data)
-        data["truncated"] = True
-        data["output_path"] = str(path)
-        text = result.text[:MAX_INLINE_TOOL_TEXT] + f"\n\n[full output saved to {path}]"
+        path.write_text(summary, encoding="utf-8")
+        data: Dict[str, Any] = {"truncated": True, "output_path": str(path)}
+        if "ok" in result.data:
+            data["ok"] = result.data["ok"]
+        for key in ("stderr", "error", "error_type"):
+            if key in result.data:
+                data[key] = str(result.data[key])[:2000]
+        text = summary[:MAX_INLINE_TOOL_TEXT] + f"\n\n[full output saved to {path}]"
         return ToolResult(text=text, data=data, images=result.images)
 
     def _check_cancel(self, session_id: str) -> None:

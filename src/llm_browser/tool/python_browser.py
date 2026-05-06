@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import contextlib
+import concurrent.futures
 import html
 import io
 import json
@@ -457,24 +458,13 @@ class PythonBrowserTool:
                     if not direct_error:
                         direct_error = f"curl_cffi HTTP {curl_result.get('status')}"
 
-            reader_url = _jina_reader_url(url)
-            try:
-                response = requests.get(reader_url, headers=request_headers, timeout=max(timeout, 30.0))
-                result = _fetch_text_result(url, response.url, response.status_code, response.text, "jina", max_chars)
-                if direct_error:
-                    result["direct_error"] = direct_error
-                return result
-            except Exception as exc:
-                return {
-                    "ok": False,
-                    "url": url,
-                    "source": "jina",
-                    "reader_url": reader_url,
-                    "direct_error": direct_error,
-                    "error": str(exc),
-                    "text": "",
-                    "truncated": False,
-                }
+            return _fetch_text_with_jina_reader(
+                url,
+                max_chars=max_chars,
+                timeout=timeout,
+                headers=request_headers,
+                direct_error=direct_error,
+            )
 
         def search_web(query: str, max_results: int = 8, timeout: float = 20.0) -> Dict[str, Any]:
             try:
@@ -531,6 +521,62 @@ class PythonBrowserTool:
                 "count": len(links),
             }
 
+        def fetch_many_text(
+            urls: List[str],
+            max_workers: int = 8,
+            max_chars: int = 20000,
+            use_jina: Any = "auto",
+            timeout: float = 20.0,
+            headers: Optional[Dict[str, str]] = None,
+            save_to: Optional[str] = None,
+        ) -> Dict[str, Any]:
+            url_list = [str(url) for url in urls]
+            worker_count = max(1, min(int(max_workers), 64, len(url_list) or 1))
+            results: List[Optional[Dict[str, Any]]] = [None] * len(url_list)
+
+            def fetch_one(index_and_url: tuple[int, str]) -> tuple[int, Dict[str, Any]]:
+                index, item_url = index_and_url
+                try:
+                    return index, fetch_text(
+                        item_url,
+                        max_chars=max_chars,
+                        use_jina=use_jina,
+                        timeout=timeout,
+                        headers=headers,
+                    )
+                except Exception as exc:
+                    return index, {
+                        "ok": False,
+                        "url": item_url,
+                        "source": "fetch_many_text",
+                        "error": str(exc),
+                        "text": "",
+                        "truncated": False,
+                    }
+
+            with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
+                for index, result_item in executor.map(fetch_one, enumerate(url_list)):
+                    results[index] = result_item
+
+            compact_results = [item or {"ok": False, "error": "missing result", "text": ""} for item in results]
+            summary: Dict[str, Any] = {
+                "count": len(compact_results),
+                "ok": sum(1 for item in compact_results if item.get("ok")),
+                "failed": sum(1 for item in compact_results if not item.get("ok")),
+                "truncated": sum(1 for item in compact_results if item.get("truncated")),
+                "sources": _count_values(str(item.get("source") or "") for item in compact_results),
+            }
+            if save_to:
+                target = Path(save_to).expanduser()
+                if not target.is_absolute():
+                    target = ctx.session.cwd / target
+                target.parent.mkdir(parents=True, exist_ok=True)
+                target.write_text(json.dumps(compact_results, ensure_ascii=False, indent=2), encoding="utf-8")
+                summary["path"] = str(target)
+                return summary
+            summary["results"] = compact_results
+            return summary
+
         def screenshot(
             label: str = "screenshot",
             attach: bool = True,
@@ -582,6 +628,7 @@ class PythonBrowserTool:
                 "download_file": download_file,
                 "read_pdf_text": read_pdf_text,
                 "fetch_text": fetch_text,
+                "fetch_many_text": fetch_many_text,
                 "search_web": search_web,
                 "extract_links": extract_links,
                 "read_sitemap": read_sitemap,
@@ -753,6 +800,80 @@ def _fetch_text_with_curl_cffi(
         "text": "",
         "truncated": False,
     }
+
+
+def _fetch_text_with_jina_reader(
+    url: str,
+    *,
+    max_chars: int,
+    timeout: float,
+    headers: Dict[str, str],
+    direct_error: Optional[str] = None,
+) -> Dict[str, Any]:
+    try:
+        import requests
+    except Exception as exc:
+        raise RuntimeError("requests is not installed") from exc
+
+    reader_url = _jina_reader_url(url)
+    last_error: Optional[str] = None
+    for attempt in range(3):
+        try:
+            response = requests.get(reader_url, headers=headers, timeout=max(timeout, 30.0))
+            retry_delay = _jina_retry_delay(response.text)
+            if retry_delay is not None and attempt < 2:
+                time.sleep(min(max(retry_delay, 1.0), 30.0))
+                continue
+            result = _fetch_text_result(url, response.url, response.status_code, response.text, "jina", max_chars)
+            if retry_delay is not None:
+                result["ok"] = False
+                result["rate_limited"] = True
+                result["retry_after_s"] = retry_delay
+            if direct_error:
+                result["direct_error"] = direct_error
+            return result
+        except Exception as exc:
+            last_error = str(exc)
+            if attempt < 2:
+                time.sleep(1.0 + attempt)
+    return {
+        "ok": False,
+        "url": url,
+        "source": "jina",
+        "reader_url": reader_url,
+        "direct_error": direct_error,
+        "error": last_error or "jina reader request failed",
+        "text": "",
+        "truncated": False,
+    }
+
+
+def _jina_retry_delay(text: str) -> Optional[float]:
+    stripped = text.strip()
+    if not stripped.startswith("{") or "RateLimit" not in stripped:
+        return None
+    try:
+        payload = json.loads(stripped)
+    except json.JSONDecodeError:
+        return None
+    code = payload.get("code")
+    status = payload.get("status")
+    if code != 429 and status not in {429, 42903}:
+        return None
+    retry_after = payload.get("retryAfter")
+    try:
+        return float(retry_after)
+    except (TypeError, ValueError):
+        return 5.0
+
+
+def _count_values(values: Any) -> Dict[str, int]:
+    counts: Dict[str, int] = {}
+    for value in values:
+        if not value:
+            value = "-"
+        counts[str(value)] = counts.get(str(value), 0) + 1
+    return counts
 
 
 def _parse_bing_results(page: str, limit: int) -> List[Dict[str, str]]:
@@ -1300,6 +1421,7 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "search_web",
         "extract_links",
         "read_sitemap",
+        "fetch_many_text",
         "requests",
         "http",
         "curl_requests",

@@ -29,6 +29,7 @@ class DatasetTest(unittest.TestCase):
         self.assertIn(task.text[:80], prompt)
         self.assertIn("Attach screenshots", prompt)
         self.assertIn("output_path('/home/user/outputs/name.ext')", prompt)
+        self.assertIn("fetch_many_text", prompt)
 
     def test_summarize_manifest_uses_latest_attempt(self) -> None:
         manifest = {

@@ -96,6 +96,8 @@ def build_dataset_prompt(task: DatasetTask, headless: bool = True) -> str:
         "If a task asks for a downloadable or Browser Use signed URL for a local file, call create_download_url(path) "
         "or upload_artifact(path) and use its downloadUrl. "
         "Attach screenshots after meaningful page transitions or before relying on visual state. "
+        "For large sitemap or directory tasks, prefer read_sitemap(...) and fetch_many_text(..., save_to='pages.json') "
+        "so bulk pages are fetched in bounded parallelism and saved to disk instead of printed into context. "
         "Recover from broken helpers by using raw CDP, JavaScript, shell, requests, or local helper code. "
         "Respect any output constraints in the task. Once every requested field or artifact is complete, "
         "call done with the final answer instead of running extra validation loops. "
