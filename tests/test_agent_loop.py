@@ -6,6 +6,7 @@ from pathlib import Path
 
 from llm_browser.agent import Agent
 from llm_browser.agent.service import MaxTurnsExceeded
+from llm_browser.provider.fake import FakeProvider
 from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.context import ToolContext
@@ -310,6 +311,18 @@ class AgentLoopTest(unittest.TestCase):
             self.assertIn("session.child_started", parent_events)
             child_events = [event.type for event in store.events.read(child.id)]
             self.assertIn("session.parent", child_events)
+
+    def test_provider_object_is_not_reused_for_child_sessions(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            provider = SpawnChildProvider()
+            agent = Agent(store, provider=provider)
+
+            child_provider = agent._child_provider_factory()
+
+            self.assertIs(agent.provider, provider)
+            self.assertIsInstance(child_provider, FakeProvider)
+            self.assertIsNot(child_provider, provider)
 
 
 if __name__ == "__main__":

@@ -251,6 +251,31 @@ class BrowserRuntimeTest(unittest.TestCase):
             timeout_s=None,
         )
 
+    def test_attach_browser_level_ws_prefers_real_page_target(self) -> None:
+        client = Mock()
+
+        def call(method: str, params: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, timeout_s: Optional[float] = None):
+            if method == "Target.getTargets":
+                return {
+                    "targetInfos": [
+                        {"targetId": "blank", "type": "page", "url": "about:blank"},
+                        {"targetId": "settings", "type": "page", "url": "chrome://settings"},
+                        {"targetId": "real", "type": "page", "url": "https://example.com"},
+                    ]
+                }
+            if method == "Target.attachToTarget":
+                return {"sessionId": f"session-{params['targetId']}"}
+            return {}
+
+        client.call.side_effect = call
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("llm_browser.browser.runtime.CdpClient", Mock(return_value=client)):
+                runtime = BrowserRuntime.attach_ws(Path(tmp), "ws://remote/browser")
+
+        self.assertEqual(runtime.default_session_id, "session-real")
+        client.call.assert_any_call("Target.attachToTarget", {"targetId": "real", "flatten": True})
+
     def test_start_cloud_creates_browser_attaches_ws_and_stops_on_close(self) -> None:
         client = Mock()
 

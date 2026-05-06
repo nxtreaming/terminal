@@ -21,7 +21,10 @@ from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
 from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
 
 from llm_browser.browser.helpers import ensure_agent_helpers_file
+from llm_browser.tool.browser_artifacts import browser_use_api_key, upload_to_browser_use_cloud
+from llm_browser.tool.browser_exports import help_browser, install_browser_helpers_module
 from llm_browser.tool.context import ToolContext
+from llm_browser.tool.python_exec import execute_python, execution_cwd, is_jsonable
 from llm_browser.tool.result import ToolImage, ToolResult
 
 if TYPE_CHECKING:
@@ -55,8 +58,8 @@ class PythonBrowserTool:
         stderr = io.StringIO()
         try:
             with _GLOBAL_EXEC_LOCK:
-                with self._execution_cwd(ctx.session.cwd), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
-                    value = self._execute(code, namespace)
+                with execution_cwd(ctx.session.cwd, self._exec_lock), contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
+                    value = execute_python(code, namespace)
         except BaseException:
             err = stderr.getvalue()
             err += traceback.format_exc()
@@ -70,7 +73,7 @@ class PythonBrowserTool:
         if stderr.getvalue():
             data["stderr"] = stderr.getvalue()
         if value is not None:
-            if _is_jsonable(value):
+            if is_jsonable(value):
                 data["result"] = value
             else:
                 data["result_repr"] = repr(value)
@@ -371,7 +374,7 @@ class PythonBrowserTool:
             upload_name = _safe_artifact_name(filename or artifact_path.name)
             mime = content_type or mimetypes.guess_type(upload_name)[0] or "application/octet-stream"
             local_url = artifact_path.as_uri()
-            api_key = _browser_use_api_key()
+            api_key = browser_use_api_key()
             if not api_key:
                 return {
                     "filename": upload_name,
@@ -381,7 +384,7 @@ class PythonBrowserTool:
                     "note": "BROWSER_USE_API_KEY is not set; returning local file URL.",
                 }
             try:
-                cloud = _upload_to_browser_use_cloud(artifact_path, filename=upload_name, content_type=mime, api_key=api_key)
+                cloud = upload_to_browser_use_cloud(artifact_path, filename=upload_name, content_type=mime, api_key=api_key)
             except Exception as exc:
                 return {
                     "filename": upload_name,
@@ -979,6 +982,7 @@ class PythonBrowserTool:
                 "save_helper": save_helper,
                 "agent_helpers_path": agent_helpers_path,
                 "reload_agent_helpers": reload_agent_helpers,
+                "help_browser": help_browser,
                 "save_artifact": save_artifact,
                 "upload_artifact": upload_artifact,
                 "create_download_url": create_download_url,
@@ -1000,7 +1004,7 @@ class PythonBrowserTool:
                 "curl_requests": namespace.get("curl_requests"),
             }
         )
-        _install_browser_helpers_module(namespace)
+        install_browser_helpers_module(namespace)
         _auto_reload_agent_helpers(ctx.session.cwd, namespace, reload_agent_helpers)
         return namespace
 
@@ -1017,28 +1021,6 @@ class PythonBrowserTool:
         from llm_browser.browser import BrowserRuntime
 
         return BrowserRuntime.start(root_dir=root_dir, headless=headless)
-
-    def _execute(self, code: str, namespace: Dict[str, Any]) -> Any:
-        if _looks_like_statements(code):
-            exec(compile(code, "<llm-browser-python>", "exec"), namespace, namespace)
-            return None
-        try:
-            compiled = compile(code, "<llm-browser-python>", "eval")
-        except SyntaxError:
-            exec(compile(code, "<llm-browser-python>", "exec"), namespace, namespace)
-            return None
-        return eval(compiled, namespace, namespace)
-
-    @contextlib.contextmanager
-    def _execution_cwd(self, cwd: Path):
-        with self._exec_lock:
-            previous = Path.cwd()
-            cwd.mkdir(parents=True, exist_ok=True)
-            os.chdir(cwd)
-            try:
-                yield
-            finally:
-                os.chdir(previous)
 
 
 def _env_bool(name: str, default: bool) -> bool:
@@ -1061,14 +1043,6 @@ def _auto_reload_agent_helpers(workspace: Path, namespace: Dict[str, Any], reloa
     if namespace.get("_agent_helpers_loaded_mtime") == mtime:
         return
     reload_agent_helpers()
-
-
-def _is_jsonable(value: Any) -> bool:
-    try:
-        json.dumps(value)
-        return True
-    except TypeError:
-        return False
 
 
 def _install_optional_imports(namespace: Dict[str, Any]) -> None:
@@ -2865,105 +2839,6 @@ def _safe_artifact_name(name: str) -> str:
     return safe_name or "artifact.bin"
 
 
-def _browser_use_api_key() -> Optional[str]:
-    return os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("BU_API_KEY")
-
-
-def _browser_use_api_base() -> str:
-    return (
-        os.environ.get("BROWSER_USE_API_BASE_URL")
-        or os.environ.get("BROWSER_USE_API_BASE")
-        or "https://api.browser-use.com/api/v3"
-    ).rstrip("/")
-
-
-def _upload_to_browser_use_cloud(path: Path, filename: str, content_type: str, api_key: str) -> Dict[str, Any]:
-    try:
-        import requests
-    except Exception as exc:
-        raise RuntimeError("requests is not installed") from exc
-
-    base_url = _browser_use_api_base()
-    headers = {"X-Browser-Use-API-Key": api_key}
-    session_response = requests.post(f"{base_url}/sessions", headers=headers, json={"keep_alive": True}, timeout=30)
-    session_response.raise_for_status()
-    session_data = session_response.json()
-    session_id = str(session_data.get("id") or session_data.get("sessionId") or session_data.get("session_id") or "")
-    if not session_id:
-        raise RuntimeError(f"Browser Use session response did not include an id: {session_data}")
-
-    upload_payload = {"files": [{"name": filename, "contentType": content_type}]}
-    upload_response = requests.post(
-        f"{base_url}/sessions/{session_id}/files/upload",
-        headers=headers,
-        json=upload_payload,
-        timeout=30,
-    )
-    if upload_response.status_code == 422:
-        upload_payload = {"files": [{"name": filename, "content_type": content_type}]}
-        upload_response = requests.post(
-            f"{base_url}/sessions/{session_id}/files/upload",
-            headers=headers,
-            json=upload_payload,
-            timeout=30,
-        )
-    upload_response.raise_for_status()
-    upload_data = upload_response.json()
-    files = upload_data.get("files") or []
-    if not files:
-        raise RuntimeError(f"Browser Use upload response did not include files: {upload_data}")
-    uploaded = files[0]
-    upload_url = uploaded.get("uploadUrl") or uploaded.get("upload_url")
-    remote_path = uploaded.get("path") or uploaded.get("filePath") or uploaded.get("file_path") or filename
-    if not upload_url:
-        raise RuntimeError(f"Browser Use upload response did not include uploadUrl: {upload_data}")
-
-    put_response = requests.put(upload_url, data=path.read_bytes(), headers={"Content-Type": content_type}, timeout=60)
-    put_response.raise_for_status()
-
-    list_response = requests.get(
-        f"{base_url}/sessions/{session_id}/files",
-        headers=headers,
-        params={"includeUrls": "true", "prefix": remote_path, "limit": 10},
-        timeout=30,
-    )
-    list_response.raise_for_status()
-    list_data = list_response.json()
-    for item in list_data.get("files", []):
-        item_path = str(item.get("path") or "")
-        if item_path == remote_path or item_path.endswith(f"/{filename}") or item_path.endswith(filename):
-            download_url = item.get("url") or item.get("downloadUrl") or item.get("download_url")
-            if download_url:
-                return {
-                    "browserUseSessionId": session_id,
-                    "remotePath": item_path or remote_path,
-                    "downloadUrl": download_url,
-                }
-    raise RuntimeError(f"Browser Use file list did not include a download URL for {remote_path}: {list_data}")
-
-
-def _looks_like_statements(code: str) -> bool:
-    stripped = code.strip()
-    if "\n" in stripped:
-        return True
-    statement_prefixes = (
-        "import ",
-        "from ",
-        "for ",
-        "while ",
-        "if ",
-        "with ",
-        "try:",
-        "def ",
-        "class ",
-        "return ",
-        "raise ",
-        "assert ",
-        "print(",
-    )
-    return stripped.startswith(statement_prefixes) or "=" in stripped and "==" not in stripped
-
-
 def _display(*values: Any, **_: Any) -> None:
     for value in values:
         if hasattr(value, "to_markdown"):
@@ -3008,139 +2883,3 @@ def _install_display_shim() -> None:
     setattr(ipython_module, "display", display_module)
     sys.modules["IPython.display"] = display_module
 
-
-def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
-    module = types.ModuleType("browser_helpers")
-    export_names = [
-        "artifact_dir",
-        "download_dir",
-        "cwd",
-        "workspace_dir",
-        "output_dir",
-        "output_path",
-        "cdp",
-        "new_tab",
-        "navigate",
-        "tabs",
-        "attach_tab",
-        "js",
-        "wait_for_load",
-        "wait_until",
-        "wait_for_selector",
-        "wait_for_text",
-        "wait_for_network_idle",
-        "deep_text",
-        "click_text",
-        "dismiss_cookie_banners",
-        "screenshot",
-        "screenshot_element",
-        "page_info",
-        "pending_dialog",
-        "drain_cdp_events",
-        "recent_cdp_events",
-        "recent_console",
-        "recent_network",
-        "recent_network_failures",
-        "download_info",
-        "save_browser_trace",
-        "visible_text",
-        "links",
-        "click_at",
-        "fill_input",
-        "type_text",
-        "press",
-        "press_key",
-        "scroll",
-        "list_tabs",
-        "current_tab",
-        "switch_tab",
-        "ensure_real_tab",
-        "iframe_target",
-        "load_helper",
-        "save_helper",
-        "agent_helpers_path",
-        "reload_agent_helpers",
-        "save_artifact",
-        "upload_artifact",
-        "create_download_url",
-        "artifact_download_url",
-        "download_file",
-        "read_pdf_text",
-        "html_to_text",
-        "fetch_readable_text",
-        "search_web",
-        "extract_links",
-        "extract_markdown_link_blocks",
-        "extract_emails",
-        "crawl_site",
-        "extract_store_locator_locations",
-        "store_locator_locations",
-        "read_sitemap",
-        "fetch_many_text",
-        "requests",
-        "http",
-        "curl_requests",
-        "BeautifulSoup",
-        "pd",
-        "PdfReader",
-        "Image",
-        "Path",
-        "json",
-        "os",
-        "time",
-    ]
-    for name in export_names:
-        if name in namespace:
-            setattr(module, name, namespace[name])
-
-    structured_fetch_text = namespace.get("fetch_text")
-    if callable(structured_fetch_text):
-        setattr(module, "fetch_text_result", structured_fetch_text)
-
-        def fetch_text(*args: Any, **kwargs: Any) -> str:
-            result = structured_fetch_text(*args, **kwargs)
-            if isinstance(result, dict):
-                return str(result.get("text") or "")
-            return str(result or "")
-
-        setattr(module, "fetch_text", fetch_text)
-        setattr(module, "read_url", fetch_text)
-        export_names.extend(["fetch_text", "fetch_text_result", "read_url"])
-
-    structured_fetch_readable_text = namespace.get("fetch_readable_text")
-    if callable(structured_fetch_readable_text):
-        setattr(module, "fetch_readable_text_result", structured_fetch_readable_text)
-
-        def fetch_readable_text(*args: Any, **kwargs: Any) -> str:
-            result = structured_fetch_readable_text(*args, **kwargs)
-            if isinstance(result, dict):
-                return str(result.get("text") or "")
-            return str(result or "")
-
-        setattr(module, "fetch_readable_text", fetch_readable_text)
-        setattr(module, "readable_text", fetch_readable_text)
-        export_names.extend(["fetch_readable_text", "fetch_readable_text_result", "readable_text"])
-
-    structured_search_web = namespace.get("search_web")
-    if callable(structured_search_web):
-        class SearchResult(dict):
-            def __getitem__(self, key: Any) -> Any:
-                if isinstance(key, slice):
-                    return str(dict(self))[key]
-                return super().__getitem__(key)
-
-        setattr(module, "search_web_result", structured_search_web)
-
-        def search_web(*args: Any, **kwargs: Any) -> SearchResult:
-            result = structured_search_web(*args, **kwargs)
-            if isinstance(result, dict):
-                return SearchResult(result)
-            return SearchResult({"results": result})
-
-        setattr(module, "search_web", search_web)
-        export_names.extend(["search_web", "search_web_result"])
-
-    module.__all__ = [name for name in export_names if hasattr(module, name)]
-    sys.modules["browser_helpers"] = module
-    sys.modules["browser_use"] = module
-    sys.modules["browser_tools"] = module

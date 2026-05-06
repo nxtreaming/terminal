@@ -577,7 +577,8 @@ class BrowserRuntime:
         targets = [_normalize_target_info(target) for target in raw_targets]
         self.browser_level_ws = True
         pages = [target for target in targets if target.get("type") == "page"]
-        target = pages[0] if pages else self._create_browser_target("about:blank")
+        real_pages = [target for target in pages if is_real_page_target(target)]
+        target = real_pages[0] if real_pages else (pages[0] if pages else self._create_browser_target("about:blank"))
         self._attach_browser_target(str(target.get("id") or target.get("targetId") or ""))
 
     def _create_browser_target(self, url: str) -> Dict[str, Any]:

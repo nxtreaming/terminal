@@ -38,7 +38,7 @@ class Agent:
         time_budget_s: Optional[float] = None,
     ) -> None:
         self.store = store
-        self.provider_factory = provider_factory or (lambda: provider)
+        self.provider_factory = provider_factory or (lambda: None)
         self.provider = provider or (provider_factory() if provider_factory else None) or FakeProvider()
         self.tools = tools or build_builtin_registry()
         self.max_turns = max_turns

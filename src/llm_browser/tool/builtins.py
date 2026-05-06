@@ -3,6 +3,7 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any, Dict
 
+from llm_browser.tool.browser_exports import BROWSER_TOOL_DESCRIPTION
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.files import apply_patch_file, edit_file, glob_files, grep_files, read_file, write_file
 from llm_browser.tool.python_browser import PythonBrowserTool
@@ -32,39 +33,7 @@ def build_builtin_registry() -> ToolRegistry:
     registry.register(
         ToolSpec(
             name="python",
-            description=(
-                "Run persistent Python for browser work. Raw CDP is available as "
-                "cdp(method, params=None, timeout_s=None, retry=True). Helpers include new_tab(url), navigate(url), tabs(), "
-                "attach_tab(...), list_tabs(include_internal=True), switch_tab(target), current_tab(), ensure_real_tab(), iframe_target(url_substr), "
-                "js(expr), wait_for_load(), wait_for_network_idle(), screenshot(label, attach=True, timeout_s=8), "
-                "screenshot_element(selector, label=None, attach=True, padding=8), "
-                "click_at(x,y), fill_input(selector,text), type_text(text), press(key), press_key(key, modifiers=0), scroll(dx=0, dy=500), page_info(), pending_dialog(), "
-                "drain_cdp_events(), recent_cdp_events(), recent_console(), recent_network(), recent_network_failures(), "
-                "download_info(), save_browser_trace(label='browser_trace'), "
-                "visible_text(), deep_text(), links(), click_text(text_or_regex), dismiss_cookie_banners(), "
-                "agent_helpers_path(), reload_agent_helpers(), save_helper(), load_helper(), save_artifact(), "
-                "upload_artifact(path), create_download_url(path), download_file(url, path=None), "
-                "output_path(path=''), read_pdf_text(path_or_url, max_pages=None), "
-                "fetch_text(url, use_jina='auto'), fetch_readable_text(url) for cleaned page text, html_to_text(markup), "
-                "fetch_many_text(urls, max_workers=8, save_to=None, requests_per_minute=None), "
-                "search_web(query, save_raw='auto', include_specialized='auto') with multi-engine parsing and scholarly fallbacks, "
-                "extract_links(text, pattern=None), extract_markdown_link_blocks(text, url_pattern=None), "
-                "extract_emails(text, domains=None), crawl_site(url, max_pages=12, purpose='contact') for bounded contact/about/team crawling, "
-                "extract_store_locator_locations(url_or_interface, save_to=None) returns a dict with locations/count/sample for Bullseye-style store locator JSON lists, "
-                "and read_sitemap(url, include=None) for large XML or markdown URL lists. "
-                "You can also import these helpers with from browser_helpers import * or from browser_use import *; "
-                "those imports make fetch_text(...) and fetch_readable_text(...) return strings, with fetch_text_result(...) "
-                "and fetch_readable_text_result(...) available for metadata. "
-                "requests, a browser-header http session, curl_requests from curl_cffi, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
-                "requests gets browser-like User-Agent and Accept-Language defaults unless overridden. "
-                "PyPDF2 imports are shimmed to pypdf when available. "
-                "Use output_path('/home/user/outputs/file.csv') for benchmark output files; it maps that expected path into the workspace outputs directory when needed. "
-                "create_download_url(path) uploads to Browser Use cloud when BROWSER_USE_API_KEY is set and otherwise returns a local file URL. "
-                "js(expr) awaits promises, uses CDP replMode for ordinary snippets so repeated let/const declarations are recoverable, "
-                "and disables replMode automatically for async/fetch/Promise expressions so returned data serializes correctly; "
-                "pass await_promise=False, repl_mode=True, or repl_mode=False when you need exact Runtime.evaluate behavior. "
-                "Set result or _result for structured output."
-            ),
+            description=BROWSER_TOOL_DESCRIPTION,
             input_schema={
                 "type": "object",
                 "properties": {

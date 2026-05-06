@@ -279,6 +279,28 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["title"], "Example Domain")
             self.assertTrue(result.data["result"]["loaded"])
 
+    def test_help_browser_is_available_in_namespace_and_helper_module(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "from browser_helpers import help_browser as imported_help\n"
+                        "result = {'direct': 'fill_input' in help_browser(), 'imported': 'wait_for_network_idle' in imported_help()}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["direct"])
+            self.assertTrue(result.data["result"]["imported"])
+
     def test_wait_for_load_accepts_timeout_alias(self) -> None:
         runtime_holder = {}
 
