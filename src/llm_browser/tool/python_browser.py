@@ -2,8 +2,6 @@ from __future__ import annotations
 
 import contextlib
 import concurrent.futures
-import base64
-import html
 import io
 import json
 import mimetypes
@@ -18,15 +16,25 @@ import types
 from io import BytesIO
 from pathlib import Path
 from typing import TYPE_CHECKING, Any, Callable, Dict, List, Optional
-from urllib.parse import parse_qs, quote_plus, unquote, urljoin, urlparse
+from urllib.parse import quote_plus
 
 from llm_browser.browser.helpers import ensure_agent_helpers_file
 from llm_browser.events.event import now_ms
 from llm_browser.session.cancel import SessionCancelled
 from llm_browser.tool.browser_artifacts import browser_use_api_key, upload_to_browser_use_cloud
 from llm_browser.tool.browser_exports import help_browser, install_browser_helpers_module
+from llm_browser.tool.browser_state import (
+    clear_cookies as _browser_clear_cookies,
+    clear_storage as _browser_clear_storage,
+    get_cookies as _browser_get_cookies,
+    grant_permissions as _browser_grant_permissions,
+    reset_permissions as _browser_reset_permissions,
+    set_cookie as _browser_set_cookie,
+    storage_state as _browser_storage_state,
+    wait_for_download as _browser_wait_for_download,
+)
 from llm_browser.tool.context import ToolContext
-from llm_browser.tool.python_exec import cancellation_trace, execute_python, execution_cwd, is_jsonable
+from llm_browser.tool.python_exec import CancellableTimeModule, cancellable_sleep, cancellation_trace, execute_python, execution_cwd, is_jsonable
 from llm_browser.tool.result import ToolImage, ToolResult
 from llm_browser.tool.web_fetch import *  # noqa: F403 - helper substrate intentionally re-exported locally.
 
@@ -62,9 +70,7 @@ class PythonBrowserTool:
         previous_cancel_check = getattr(self._runtime(ctx, headless=headless), "cancel_check", None)
 
         def check_cancel() -> None:
-            request = ctx.store.cancel_request(ctx.session.id)
-            if request is not None:
-                raise SessionCancelled(ctx.session.id, request["reason"])
+            ctx.check_cancel()
 
         runtime = self._runtime(ctx, headless=headless)
         if hasattr(runtime, "set_cancel_check"):
@@ -124,12 +130,13 @@ class PythonBrowserTool:
             self._namespaces[ctx.session.id] = namespace
 
         def check_cancel() -> None:
-            request = ctx.store.cancel_request(ctx.session.id)
-            if request is not None:
-                raise SessionCancelled(ctx.session.id, request["reason"])
+            ctx.check_cancel()
 
         def cancel_requested() -> bool:
             return ctx.is_cancel_requested()
+
+        def sleep(seconds: float) -> None:
+            cancellable_sleep(seconds, check_cancel)
 
         def cdp(
             method: str,
@@ -276,7 +283,7 @@ class PythonBrowserTool:
                         return result
                 if time.monotonic() >= deadline:
                     return last_result
-                time.sleep(0.25)
+                sleep(0.25)
 
         def dismiss_cookie_banners(timeout_s: float = 5.0, prefer: str = "accept") -> Dict[str, Any]:
             deadline = time.monotonic() + timeout_s
@@ -453,7 +460,9 @@ class PythonBrowserTool:
             request_headers = {"User-Agent": "Mozilla/5.0"}
             if headers:
                 request_headers.update(headers)
+            check_cancel()
             response = requests.get(url, headers=request_headers, timeout=timeout)
+            check_cancel()
             response.raise_for_status()
             target.write_bytes(response.content)
             return str(target)
@@ -472,7 +481,9 @@ class PythonBrowserTool:
                     import requests
                 except Exception as exc:
                     raise RuntimeError("requests is not installed") from exc
+                check_cancel()
                 response = requests.get(source, headers={"User-Agent": "Mozilla/5.0"}, timeout=30)
+                check_cancel()
                 response.raise_for_status()
                 stream = BytesIO(response.content)
                 close_stream = True
@@ -510,7 +521,9 @@ class PythonBrowserTool:
             direct_error: Optional[str] = None
             if not force_jina:
                 try:
+                    check_cancel()
                     response = requests.get(url, headers=request_headers, timeout=timeout)
+                    check_cancel()
                     text = response.text
                     result = _fetch_text_result(url, response.url, response.status_code, text, "direct", max_chars)
                     if response.ok and text.strip():
@@ -530,7 +543,9 @@ class PythonBrowserTool:
                             "truncated": False,
                         }
 
+                check_cancel()
                 curl_result = _fetch_text_with_curl_cffi(url, max_chars=max_chars, timeout=timeout, headers=request_headers)
+                check_cancel()
                 if curl_result is not None:
                     if direct_error:
                         curl_result["direct_error"] = direct_error
@@ -539,6 +554,7 @@ class PythonBrowserTool:
                     if not direct_error:
                         direct_error = f"curl_cffi HTTP {curl_result.get('status')}"
 
+            check_cancel()
             return _fetch_text_with_jina_reader(
                 url,
                 max_chars=max_chars,
@@ -639,8 +655,10 @@ class PythonBrowserTool:
                 if len(results) >= max_results:
                     break
                 try:
+                    check_cancel()
                     source_timeout = min(timeout, 12.0 if source.endswith("_reader") else 6.0)
                     response = requests.get(search_url, headers=_browser_headers(), timeout=source_timeout)
+                    check_cancel()
                     text = response.text
                     if source == "bing":
                         parsed = _parse_bing_results(text, limit=max_results - len(results))
@@ -681,6 +699,7 @@ class PythonBrowserTool:
                 ):
                     try:
                         found, attempt = searcher(query, limit=max_results - len(results), timeout=timeout)
+                        check_cancel()
                         added = add_results(found)
                         attempt["parsed"] = len(added)
                         attempts.append(attempt)
@@ -829,6 +848,7 @@ class PythonBrowserTool:
             def fetch_one(index_and_url: tuple[int, str]) -> tuple[int, Dict[str, Any]]:
                 index, item_url = index_and_url
                 try:
+                    check_cancel()
                     return index, fetch_text(
                         item_url,
                         max_chars=max_chars,
@@ -865,7 +885,7 @@ class PythonBrowserTool:
                         check_cancel()
                         delay = next_allowed_at - time.monotonic()
                         if delay > 0:
-                            time.sleep(delay)
+                            sleep(delay)
                         _, result_item = fetch_one((index, item_url))
                         results[index] = result_item
                         save_results()
@@ -877,14 +897,31 @@ class PythonBrowserTool:
                             wait_s = max(float(retry_after), min_interval_s)
                         except (TypeError, ValueError):
                             wait_s = max(5.0, min_interval_s)
-                        time.sleep(min(wait_s, 90.0))
+                        sleep(min(wait_s, 90.0))
                         next_allowed_at = time.monotonic()
                         attempt += 1
             else:
-                with concurrent.futures.ThreadPoolExecutor(max_workers=worker_count) as executor:
-                    for index, result_item in executor.map(fetch_one, enumerate(url_list)):
+                executor = concurrent.futures.ThreadPoolExecutor(max_workers=worker_count)
+                pending: set[concurrent.futures.Future[tuple[int, Dict[str, Any]]]] = set()
+                try:
+                    pending = {executor.submit(fetch_one, item) for item in enumerate(url_list)}
+                    while pending:
+                        done, pending = concurrent.futures.wait(
+                            pending,
+                            timeout=0.05,
+                            return_when=concurrent.futures.FIRST_COMPLETED,
+                        )
                         check_cancel()
-                        results[index] = result_item
+                        for future in done:
+                            index, result_item = future.result()
+                            results[index] = result_item
+                except BaseException:
+                    for future in pending:
+                        future.cancel()
+                    executor.shutdown(wait=False, cancel_futures=True)
+                    raise
+                else:
+                    executor.shutdown(wait=True)
                 save_results()
 
             compact_results = [item or {"ok": False, "error": "missing result", "text": ""} for item in results]
@@ -995,6 +1032,30 @@ class PythonBrowserTool:
             ctx.emit_image(image)
             return image
 
+        def get_cookies(urls: Optional[List[str]] = None) -> Dict[str, Any]:
+            return _browser_get_cookies(runtime, check_cancel, urls=urls)
+
+        def set_cookie(cookie: Optional[Dict[str, Any]] = None, **kwargs: Any) -> Dict[str, Any]:
+            return _browser_set_cookie(runtime, check_cancel, cookie=cookie, **kwargs)
+
+        def clear_cookies() -> Dict[str, Any]:
+            return _browser_clear_cookies(runtime, check_cancel)
+
+        def storage_state(include_cookies: bool = True) -> Dict[str, Any]:
+            return _browser_storage_state(runtime, check_cancel, include_cookies=include_cookies)
+
+        def clear_storage(origin: Optional[str] = None, storage_types: str = "all") -> Dict[str, Any]:
+            return _browser_clear_storage(runtime, check_cancel, origin=origin, storage_types=storage_types)
+
+        def grant_permissions(permissions: List[str], origin: Optional[str] = None, browser_context_id: Optional[str] = None) -> Dict[str, Any]:
+            return _browser_grant_permissions(runtime, check_cancel, permissions, origin=origin, browser_context_id=browser_context_id)
+
+        def reset_permissions(browser_context_id: Optional[str] = None) -> Dict[str, Any]:
+            return _browser_reset_permissions(runtime, check_cancel, browser_context_id=browser_context_id)
+
+        def wait_for_download(pattern: Optional[str] = None, timeout_s: float = 30.0, poll_s: float = 0.25) -> Dict[str, Any]:
+            return _browser_wait_for_download(runtime, check_cancel, pattern=pattern, timeout_s=timeout_s, poll_s=poll_s)
+
         downloads_dir = getattr(runtime, "downloads_dir", runtime.root_dir / "downloads")
         namespace.update(
             {
@@ -1004,6 +1065,8 @@ class PythonBrowserTool:
                 "cwd": ctx.session.cwd,
                 "workspace_dir": ctx.session.cwd,
                 "output_dir": ctx.session.cwd / "outputs",
+                "time": CancellableTimeModule(check_cancel),
+                "sleep": sleep,
                 "output_path": output_path,
                 "cdp": cdp,
                 "new_tab": new_tab,
@@ -1034,6 +1097,14 @@ class PythonBrowserTool:
                     "download_info",
                     lambda *args, **kwargs: {"downloads_dir": str(downloads_dir), "files": [], "events": []},
                 ),
+                "wait_for_download": wait_for_download,
+                "get_cookies": get_cookies,
+                "set_cookie": set_cookie,
+                "clear_cookies": clear_cookies,
+                "storage_state": storage_state,
+                "clear_storage": clear_storage,
+                "grant_permissions": grant_permissions,
+                "reset_permissions": reset_permissions,
                 "save_browser_trace": getattr(
                     runtime,
                     "save_browser_trace",

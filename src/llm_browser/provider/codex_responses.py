@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 import requests
@@ -27,11 +28,13 @@ class CodexResponsesProvider:
         model: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout_s: float = 120.0,
+        max_retries: int = 2,
     ) -> None:
         self.auth = auth or load_codex_auth()
         self.model = model or os.environ.get("LLM_BROWSER_CODEX_MODEL") or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.5"
         self.base_url = base_url or os.environ.get("LLM_BROWSER_CODEX_BASE_URL") or DEFAULT_CODEX_BASE_URL
         self.timeout_s = timeout_s
+        self.max_retries = max(0, int(max_retries))
 
     def start_turn(
         self,
@@ -108,20 +111,35 @@ class CodexResponsesProvider:
 
     def _post_payload(self, payload: Dict[str, Any]) -> requests.Response:
         assert self.auth is not None
-        return requests.post(
-            _codex_url(self.base_url),
-            headers={
-                "Authorization": f"Bearer {self.auth.access_token}",
-                "chatgpt-account-id": self.auth.account_id,
-                "originator": "llm-browser",
-                "OpenAI-Beta": "responses=experimental",
-                "Content-Type": "application/json",
-                "Accept": "text/event-stream",
-            },
-            json=payload,
-            timeout=self.timeout_s,
-            stream=True,
-        )
+        last_exc: Optional[BaseException] = None
+        transient_statuses = {408, 409, 429, 500, 502, 503, 504}
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = requests.post(
+                    _codex_url(self.base_url),
+                    headers={
+                        "Authorization": f"Bearer {self.auth.access_token}",
+                        "chatgpt-account-id": self.auth.account_id,
+                        "originator": "llm-browser",
+                        "OpenAI-Beta": "responses=experimental",
+                        "Content-Type": "application/json",
+                        "Accept": "text/event-stream",
+                    },
+                    json=payload,
+                    timeout=self.timeout_s,
+                    stream=True,
+                )
+                if response.status_code not in transient_statuses or attempt >= self.max_retries:
+                    return response
+                response.close()
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt >= self.max_retries:
+                    raise
+            time.sleep(min(2.0, 0.25 * (2**attempt)))
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("Codex Responses request failed before receiving a response")
 
     def _convert_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         input_items: List[Dict[str, Any]] = []

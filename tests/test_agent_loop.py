@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import tempfile
+import threading
 import time
 import unittest
 from pathlib import Path
@@ -12,7 +13,7 @@ from llm_browser.provider.types import ModelEvent, ToolCall
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.context import ToolContext
 from llm_browser.tool.registry import ToolRegistry
-from llm_browser.tool.result import ToolResult
+from llm_browser.tool.result import ToolImage, ToolResult
 from llm_browser.tool.spec import ToolSpec
 
 
@@ -376,6 +377,76 @@ class AgentLoopTest(unittest.TestCase):
             self.assertLess(starts["a.txt"], ends["b.txt"])
             done = [event for event in store.events.read(session.id) if event.type == "session.done"][-1]
             self.assertEqual(done.payload["result"], "a.txt|b.txt")
+
+    def test_parallel_read_batch_observes_cancellation_without_waiting_for_all_reads(self) -> None:
+        class ParallelReadProvider:
+            def start_turn(self, messages, tools):
+                yield ModelEvent.call(ToolCall(id="call_a", name="read", arguments={"path": "a.txt"}))
+                yield ModelEvent.call(ToolCall(id="call_b", name="read", arguments={"path": "b.txt"}))
+
+        started = threading.Event()
+
+        def slow_read(ctx: ToolContext, arguments):
+            started.set()
+            time.sleep(0.8)
+            return ToolResult(text=str(arguments["path"]))
+
+        registry = ToolRegistry()
+        registry.register(
+            ToolSpec(
+                name="read",
+                description="slow read",
+                input_schema={"type": "object", "properties": {"path": {"type": "string"}}, "required": ["path"]},
+            ),
+            slow_read,
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            agent = Agent(store, provider=ParallelReadProvider(), tools=registry)
+            finished: list[str] = []
+
+            def run_agent() -> None:
+                session = agent.run("parallel cancel", cwd=Path(tmp))
+                finished.append(session.status)
+
+            thread = threading.Thread(target=run_agent)
+            started_at = time.monotonic()
+            thread.start()
+            self.assertTrue(started.wait(timeout=1.0))
+            session_id = store.list()[0].id
+            store.request_cancel(session_id, reason="stop reads")
+            thread.join(timeout=0.5)
+
+            self.assertFalse(thread.is_alive())
+            self.assertLess(time.monotonic() - started_at, 0.7)
+            self.assertEqual(finished, ["cancelled"])
+
+    def test_resume_rehydrates_tool_images_from_event_payloads(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            image_path = Path(tmp) / "frame.png"
+            image_path.write_bytes(b"png-bytes")
+            image = ToolImage(label="frame", path=str(image_path), order=1)
+            store.emit(session.id, "session.input", {"text": "look"})
+            store.emit(session.id, "tool.started", {"tool_call_id": "call_1", "name": "python", "arguments": {"code": "screenshot()"}})
+            store.emit(
+                session.id,
+                "tool.finished",
+                {
+                    "tool_call_id": "call_1",
+                    "name": "python",
+                    "output": ToolResult(text="captured", images=[image], data={"ok": True}).to_event_payload(),
+                },
+            )
+
+            messages = Agent(store)._messages_from_events(session.id)
+
+            tool_message = [message for message in messages if message.get("role") == "tool"][-1]
+            self.assertIsInstance(tool_message["content"], list)
+            self.assertEqual(tool_message["content"][0]["type"], "input_text")
+            self.assertEqual(tool_message["content"][1]["type"], "input_image")
 
 
 if __name__ == "__main__":

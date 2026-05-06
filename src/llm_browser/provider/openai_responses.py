@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+import time
 from typing import Any, Dict, Iterable, List, Optional, Set
 
 import requests
@@ -23,6 +24,7 @@ class OpenAIResponsesProvider:
         model: Optional[str] = None,
         base_url: Optional[str] = None,
         timeout_s: float = 120.0,
+        max_retries: int = 2,
     ) -> None:
         self.api_key = api_key or os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
         self.model = model or os.environ.get("LLM_BROWSER_MODEL") or "gpt-5.5"
@@ -30,6 +32,7 @@ class OpenAIResponsesProvider:
             "/"
         )
         self.timeout_s = timeout_s
+        self.max_retries = max(0, int(max_retries))
         self.previous_response_id: Optional[str] = None
         self._sent_tool_call_ids: Set[str] = set()
 
@@ -42,15 +45,7 @@ class OpenAIResponsesProvider:
             raise RuntimeError("OpenAI API key missing. Set LLM_BROWSER_OPENAI_API_KEY or OPENAI_API_KEY.")
 
         payload = self._build_payload(messages, tools)
-        response = requests.post(
-            f"{self.base_url}/responses",
-            headers={
-                "Authorization": f"Bearer {self.api_key}",
-                "Content-Type": "application/json",
-            },
-            json=payload,
-            timeout=self.timeout_s,
-        )
+        response = self._post_payload(payload)
         if response.status_code >= 400:
             raise RuntimeError(f"OpenAI Responses request failed: HTTP {response.status_code}: {response.text[:1000]}")
 
@@ -72,6 +67,34 @@ class OpenAIResponsesProvider:
                 text = self._extract_text_from_unknown_item(item)
                 if text:
                     yield ModelEvent.text(text)
+
+    def _post_payload(self, payload: Dict[str, Any]) -> requests.Response:
+        last_exc: Optional[BaseException] = None
+        transient_statuses = {408, 409, 429, 500, 502, 503, 504}
+        for attempt in range(self.max_retries + 1):
+            try:
+                response = requests.post(
+                    f"{self.base_url}/responses",
+                    headers={
+                        "Authorization": f"Bearer {self.api_key}",
+                        "Content-Type": "application/json",
+                    },
+                    json=payload,
+                    timeout=self.timeout_s,
+                )
+                if response.status_code not in transient_statuses or attempt >= self.max_retries:
+                    return response
+                close = getattr(response, "close", None)
+                if callable(close):
+                    close()
+            except requests.RequestException as exc:
+                last_exc = exc
+                if attempt >= self.max_retries:
+                    raise
+            time.sleep(min(2.0, 0.25 * (2**attempt)))
+        if last_exc is not None:
+            raise last_exc
+        raise RuntimeError("OpenAI Responses request failed before receiving a response")
 
     def _build_payload(self, messages: List[Dict[str, Any]], tools: List[Dict[str, Any]]) -> Dict[str, Any]:
         input_items: List[Dict[str, Any]] = []

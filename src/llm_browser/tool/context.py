@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 
+from llm_browser.session.cancel import SessionCancelled
 from llm_browser.session.metadata import SessionMetadata
 from llm_browser.session.store import SessionStore
 from llm_browser.tool.result import ToolImage
@@ -16,6 +17,11 @@ class ToolContext:
 
     def is_cancel_requested(self) -> bool:
         return self.store.is_cancel_requested(self.session.id)
+
+    def check_cancel(self) -> None:
+        request = self.store.cancel_request(self.session.id)
+        if request is not None:
+            raise SessionCancelled(self.session.id, request["reason"])
 
     def emit_image(self, image: ToolImage) -> None:
         self.store.emit(
