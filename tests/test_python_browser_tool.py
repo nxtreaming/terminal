@@ -672,6 +672,42 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(saved.exists())
             self.assertIn("https://example.com/a", saved.read_text(encoding="utf-8"))
 
+    def test_extract_markdown_link_blocks_captures_directory_cards(self) -> None:
+        markdown = (
+            "*   [Morrilton](https://www.tractorsupply.com/tsc/store_Morrilton-AR-72110_2306)\n"
+            "944 Hwy 287\n\n"
+            "Morrilton, AR 72110\n\n"
+            "[(501) 477-2220](tel:501-477-2220)\n\n"
+            "    *   [PetVet clinic](https://www.tractorsupply.com/tsc/services/petvet)\n"
+            "*   [Mountain Home](https://www.tractorsupply.com/tsc/store_MountainHome-AR-72653_2865)\n"
+            "1025 Hwy 62 East Suite 1\n\n"
+            "Mountain Home, AR 72653\n"
+        )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "from browser_helpers import extract_markdown_link_blocks\n"
+                        f"markdown = {markdown!r}\n"
+                        "result = extract_markdown_link_blocks(markdown, url_pattern=r'/tsc/store_', max_lines_after=4)"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            cards = result.data["result"]
+            self.assertEqual(len(cards), 2)
+            self.assertEqual(cards[0]["title"], "Morrilton")
+            self.assertEqual(cards[0]["lines"][:2], ["944 Hwy 287", "Morrilton, AR 72110"])
+
     def test_browser_helpers_module_exports_session_helpers(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:
@@ -697,6 +733,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                             "'text': fetch_text('https://example.com')[:5], "
                             "'structured': fetch_text_result('https://example.com')['source'], "
                             "'many': fetch_many_text(['https://example.com'], save_to='bulk.json')['count'], "
+                            "'blocks': extract_markdown_link_blocks('[A](https://example.com/a)')[0]['title'], "
                             "'title': js('document.title')"
                             "}"
                         ),
@@ -707,6 +744,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["text"], "hello")
             self.assertEqual(result.data["result"]["structured"], "direct")
             self.assertEqual(result.data["result"]["many"], 1)
+            self.assertEqual(result.data["result"]["blocks"], "A")
             self.assertEqual(result.data["result"]["title"], "Example Domain")
 
     def test_js_helper_awaits_promises_by_default(self) -> None:

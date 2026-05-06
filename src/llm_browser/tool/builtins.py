@@ -34,7 +34,7 @@ def build_builtin_registry() -> ToolRegistry:
                 "upload_artifact(path), create_download_url(path), download_file(url, path=None), "
                 "output_path(path=''), read_pdf_text(path_or_url, max_pages=None), "
                 "fetch_text(url, use_jina='auto'), fetch_many_text(urls, max_workers=8, save_to=None), "
-                "search_web(query), extract_links(text, pattern=None), "
+                "search_web(query), extract_links(text, pattern=None), extract_markdown_link_blocks(text, url_pattern=None), "
                 "and read_sitemap(url, include=None) for large XML or markdown URL lists. "
                 "requests, a browser-header http session, curl_requests from curl_cffi, BeautifulSoup, pandas as pd, and PdfReader are preloaded when available. "
                 "requests gets browser-like User-Agent and Accept-Language defaults unless overridden. "

@@ -497,6 +497,19 @@ class PythonBrowserTool:
             links = _extract_links(str(text), pattern=pattern, limit=limit)
             return links
 
+        def extract_markdown_link_blocks(
+            text: str,
+            url_pattern: Optional[str] = None,
+            max_lines_after: int = 8,
+            limit: int = 1000,
+        ) -> List[Dict[str, Any]]:
+            return _extract_markdown_link_blocks(
+                str(text),
+                url_pattern=url_pattern,
+                max_lines_after=max_lines_after,
+                limit=limit,
+            )
+
         def read_sitemap(
             url: str,
             include: Optional[str] = None,
@@ -631,6 +644,7 @@ class PythonBrowserTool:
                 "fetch_many_text": fetch_many_text,
                 "search_web": search_web,
                 "extract_links": extract_links,
+                "extract_markdown_link_blocks": extract_markdown_link_blocks,
                 "read_sitemap": read_sitemap,
                 "curl_requests": namespace.get("curl_requests"),
             }
@@ -949,6 +963,44 @@ def _extract_links(text: str, pattern: Optional[str] = None, limit: int = 1000) 
         if len(links) >= limit:
             return links
     return links
+
+
+def _extract_markdown_link_blocks(
+    text: str,
+    *,
+    url_pattern: Optional[str] = None,
+    max_lines_after: int = 8,
+    limit: int = 1000,
+) -> List[Dict[str, Any]]:
+    if limit <= 0:
+        return []
+    compiled = re.compile(url_pattern) if url_pattern else None
+    lines = text.splitlines()
+    link_re = re.compile(r"^\s*(?:[-*]\s*)?\[([^\]]{1,300})\]\((https?://[^)\s]+)\)\s*$")
+    cards: List[Dict[str, Any]] = []
+    for index, line in enumerate(lines):
+        match = link_re.match(line.strip())
+        if not match:
+            continue
+        title = re.sub(r"\s+", " ", html.unescape(match.group(1))).strip()
+        url = html.unescape(match.group(2)).strip()
+        if compiled and not compiled.search(url):
+            continue
+
+        following: List[str] = []
+        for next_line in lines[index + 1 :]:
+            stripped = next_line.strip()
+            if not stripped:
+                continue
+            if link_re.match(stripped) and following:
+                break
+            following.append(stripped)
+            if len(following) >= max_lines_after:
+                break
+        cards.append({"title": title, "url": url, "lines": following})
+        if len(cards) >= limit:
+            break
+    return cards
 
 
 def _click_text_script(
@@ -1420,6 +1472,7 @@ def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         "read_pdf_text",
         "search_web",
         "extract_links",
+        "extract_markdown_link_blocks",
         "read_sitemap",
         "fetch_many_text",
         "requests",
