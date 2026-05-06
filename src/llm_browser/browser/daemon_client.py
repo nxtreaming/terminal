@@ -30,8 +30,9 @@ class DaemonBrowserRuntime:
         ensure_daemon(name=name, root_dir=root_dir / "daemon", headless=headless, backend=backend)
         return cls(name=name, root_dir=root_dir / "daemon", headless=headless, backend=backend)
 
-    def close(self) -> None:
-        request(self.name, {"meta": "shutdown"}, timeout_s=10)
+    def close(self, stop_browser: bool = True) -> None:
+        if stop_browser:
+            request(self.name, {"meta": "shutdown"}, timeout_s=10)
 
     def cdp(
         self,

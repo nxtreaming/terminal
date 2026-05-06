@@ -52,6 +52,7 @@ class Agent:
         compact_after_chars: int = DEFAULT_COMPACT_AFTER_CHARS,
         time_budget_s: Optional[float] = None,
         mode: str = "auto",
+        close_tools_on_finish: bool = True,
     ) -> None:
         self.store = store
         self.provider_factory = provider_factory or (lambda: None)
@@ -62,6 +63,7 @@ class Agent:
         self.compact_after_chars = compact_after_chars
         self.time_budget_s = time_budget_s
         self.mode = mode
+        self.close_tools_on_finish = close_tools_on_finish
         self.deadline_at = time.monotonic() + time_budget_s if time_budget_s and time_budget_s > 0 else None
         self._deadline_warning_sent = False
         if tools is None:
@@ -190,7 +192,8 @@ class Agent:
             raise
         finally:
             self.store.clear_runner(session.id, pid=runner_pid)
-            self.tools.close_session(session.id)
+            if self.close_tools_on_finish:
+                self.tools.close_session(session.id)
 
     def _messages_from_events(self, session_id: str) -> List[Dict[str, Any]]:
         messages: List[Dict[str, Any]] = []

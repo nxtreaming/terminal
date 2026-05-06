@@ -14,6 +14,7 @@ from llm_browser.tui.app import (
     ComposerInput,
     CommandPalette,
     SessionPalette,
+    TextualTui,
     _artifact_kind,
     _artifact_paths,
     _composer_visible_line_count,
@@ -34,7 +35,9 @@ from llm_browser.tui.app import (
     _progress_bar,
     _rich_link,
     _short_task_list,
+    _summarize_code,
     _summarize_task_text,
+    _textual_mouse_enabled,
 )
 from llm_browser.tui import format_event
 
@@ -130,8 +133,49 @@ class TuiTest(unittest.TestCase):
         lines = _format_events_for_transcript(events)
 
         self.assertIn("print('hello')", lines[0][0])
-        self.assertIn(long_text, lines[1][0])
+        self.assertIn("1 lines", lines[1][0])
+        self.assertIn("400 B", lines[1][0])
         self.assertNotIn('"ok": true', lines[1][0])
+
+    def test_python_code_summary_describes_intent_instead_of_dumping_first_line(self) -> None:
+        self.assertEqual(
+            _summarize_code("# but: extract Netflix country prices to JSON\nimport requests"),
+            "extract Netflix country prices to JSON",
+        )
+        explicit_event = Event(
+            type="tool.started",
+            session_id="s1",
+            payload={"name": "python", "arguments": {"code": "# but: parse visible article text\nprint('x')"}},
+        )
+        self.assertEqual(_format_event_for_transcript(explicit_event), "→ parse visible article text")
+        self.assertEqual(
+            _summarize_code("goto_url('https://help.netflix.com/en/node/24926')"),
+            "open https://help.netflix.com/en/node/24926",
+        )
+        self.assertEqual(
+            _summarize_code("import requests, bs4, re, json, time"),
+            "prepare imports: requests, bs4, re, json, time",
+        )
+        self.assertEqual(
+            _summarize_code("from browser import goto_url, wait_for_load, capture_screenshot, js"),
+            "prepare browser helpers: nav, wait, screenshot, JS",
+        )
+        self.assertEqual(
+            _summarize_code("print(js('document.documentElement.innerHTML'))"),
+            "read page HTML",
+        )
+        self.assertEqual(
+            _summarize_code("print(js(\"document.querySelector('select').outerHTML\"))"),
+            "inspect page DOM",
+        )
+        scraper = """
+import requests, bs4, json
+html = requests.get(url).text
+for country in countries:
+    prices[country] = extract_price(country, html)
+json.dump(prices, open('/tmp/netflix_prices.json', 'w'))
+"""
+        self.assertEqual(_summarize_code(scraper), "5 lines · extract country pricing to JSON")
 
     def test_done_transcript_preserves_markdown(self) -> None:
         event = Event(type="session.done", session_id="s1", payload={"result": "**Done**\n- item"})
@@ -191,7 +235,7 @@ class TuiTest(unittest.TestCase):
             self.assertIn("<https://example.com>", linked)
             self.assertEqual(_file_links_for_text(str(path)), [path.resolve()])
 
-    def test_linkify_markdown_chunks_long_links_and_inline_file_paths(self) -> None:
+    def test_linkify_markdown_keeps_long_links_clickable_and_inline_file_paths(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / ("very_" + "long_" * 18 + "notes.md")
             path.write_text("# Notes\n", encoding="utf-8")
@@ -199,9 +243,64 @@ class TuiTest(unittest.TestCase):
 
             linked = _linkify_markdown(f"browser live preview:\n{url}\n`{path}`")
 
-            self.assertGreaterEqual(linked.count(f"](<{url}>)"), 2)
+            self.assertIn(f"<{url}>", linked)
             self.assertNotIn("file://", linked)
             self.assertEqual(_file_links_for_text(f"`{path}`"), [path.resolve()])
+
+    def test_browser_reconnect_event_renders_recovery_status(self) -> None:
+        event = Event(
+            type="browser.reconnected",
+            session_id="s1",
+            payload={
+                "reason": "started new Browser Use cloud browser",
+                "reconnect_count": 2,
+                "live_url": "https://live.example/new",
+            },
+        )
+
+        formatted = _format_event_for_transcript(event)
+
+        self.assertIn("browser reconnected (2): started new Browser Use cloud browser", formatted)
+        self.assertIn("[open live preview](https://live.example/new)", formatted)
+
+    def test_browser_live_preview_event_renders_compact_link(self) -> None:
+        event = Event(
+            type="browser.live_url",
+            session_id="s1",
+            payload={"live_url": "https://live.example/session"},
+        )
+
+        formatted = _format_event_for_transcript(event)
+
+        self.assertEqual(formatted, "browser live preview: [open live preview](https://live.example/session)")
+
+    def test_session_followup_renders_text_not_raw_payload(self) -> None:
+        event = Event(type="session.followup", session_id="s1", payload={"text": "where is the file?"})
+
+        formatted = _format_event_for_transcript(event)
+
+        self.assertEqual(formatted, "where is the file?")
+
+    def test_transcript_dedupes_streamed_tool_output_from_finished_event(self) -> None:
+        text = "line 1\nline 2"
+        events = [
+            Event(
+                type="tool.output",
+                session_id="s1",
+                payload={"name": "shell", "stream": "stdout", "tool_call_id": "call_1", "text": text},
+            ),
+            Event(
+                type="tool.finished",
+                session_id="s1",
+                payload={"name": "shell", "tool_call_id": "call_1", "output": {"text": text, "data": {"ok": True}}},
+            ),
+        ]
+
+        lines = _format_events_for_transcript(events)
+
+        self.assertEqual(len(lines), 1)
+        self.assertEqual(lines[0][1], "tool.output")
+        self.assertIn("line 1", lines[0][0])
 
     def test_tool_output_preview_decodes_json_payload_instead_of_storage_format(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -330,7 +429,7 @@ class TuiTest(unittest.TestCase):
         self.assertEqual(_latest_browser_live_url(events), "https://live.example/session")
         self.assertEqual(
             _rich_link("open live preview", "https://live.example/session"),
-            "[link=\"https://live.example/session\"][#8be9fd]open live preview[/][/link]",
+            "[link=\"https://live.example/session\"][#8aa6a0]open live preview[/][/link]",
         )
 
     def test_artifact_kind_prioritizes_trace_and_download_dirs(self) -> None:
@@ -419,6 +518,102 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
 
                 self.assertTrue(app.query_one("#sidebar").display)
                 self.assertEqual(app.selected_artifact_path, str(artifact))
+                self.assertIs(app.focused, app.query_one("#command", ComposerInput))
+
+    async def test_composer_ctrl_c_requires_second_press_to_quit(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._set_composer_text("draft task text")
+                await pilot.pause()
+                with patch.object(app, "exit") as exit_mock:
+                    await pilot.press("ctrl+c")
+                    await pilot.pause()
+
+                    self.assertFalse(exit_mock.called)
+                    self.assertEqual(app.query_one("#command", ComposerInput).text, "")
+                    self.assertIn("press ctrl+c again to quit", str(app.query_one("#hintbar").visual))
+
+                    await pilot.press("ctrl+c")
+                    await pilot.pause()
+
+                    exit_mock.assert_called_once()
+
+    async def test_plain_q_types_into_composer_instead_of_quitting(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                with patch.object(app, "exit") as exit_mock:
+                    await pilot.press("q")
+                    await pilot.pause()
+
+                    self.assertEqual(app.query_one("#command", ComposerInput).text, "q")
+                    self.assertFalse(exit_mock.called)
+
+    async def test_ctrl_q_quits_from_composer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                with patch.object(app, "exit") as exit_mock:
+                    await pilot.press("ctrl+q")
+                    await pilot.pause()
+
+                    exit_mock.assert_called_once()
+
+    async def test_empty_composer_arrow_scroll_targets_transcript(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "long task"})
+            for index in range(80):
+                store.emit(session.id, "model.delta", {"text": f"line {index}\n"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(90, 18)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                await pilot.pause()
+                transcript = app.query_one("#transcript")
+                transcript.scroll_end(animate=False, immediate=True)
+                await pilot.pause()
+                bottom = transcript.scroll_y
+
+                self.assertGreater(bottom, 0)
+                await pilot.press("up")
+                await pilot.pause()
+                self.assertLess(transcript.scroll_y, bottom)
+                scrolled_up = transcript.scroll_y
+                await pilot.press("down")
+                await pilot.pause()
+                self.assertGreater(transcript.scroll_y, scrolled_up)
+                self.assertIs(app.focused, app.query_one("#command", ComposerInput))
+
+    def test_textual_tui_disables_mouse_reporting_outside_tmux_for_terminal_selection(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tui = TextualTui(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            with patch.dict(os.environ, {}, clear=True), patch.object(tui.app, "run") as run_mock:
+                self.assertEqual(tui.run(), 0)
+
+            run_mock.assert_called_once_with(mouse=False)
+
+    def test_textual_tui_enables_mouse_reporting_inside_tmux_for_scroll_wheel(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            tui = TextualTui(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            with patch.dict(os.environ, {"TMUX": "/tmp/tmux"}, clear=True), patch.object(tui.app, "run") as run_mock:
+                self.assertEqual(tui.run(), 0)
+
+            run_mock.assert_called_once_with(mouse=True)
+
+    def test_textual_tui_mouse_reporting_env_override(self) -> None:
+        with patch.dict(os.environ, {"TMUX": "/tmp/tmux", "LLM_BROWSER_TUI_MOUSE": "0"}, clear=True):
+            self.assertFalse(_textual_mouse_enabled())
+        with patch.dict(os.environ, {"LLM_BROWSER_TUI_MOUSE": "1"}, clear=True):
+            self.assertTrue(_textual_mouse_enabled())
 
     async def test_command_palette_supports_arrow_and_vim_navigation(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -450,7 +645,18 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertNotIsInstance(app.screen, CommandPalette)
 
-    async def test_question_mark_opens_keyboard_shortcuts(self) -> None:
+    async def test_f1_opens_keyboard_shortcuts(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.press("f1")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, CommandPalette)
+                self.assertEqual(app.screen.title_text, "Keyboard")
+
+    async def test_question_mark_stays_in_composer(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
 
@@ -458,8 +664,41 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.press("?")
                 await pilot.pause()
 
-                self.assertIsInstance(app.screen, CommandPalette)
-                self.assertEqual(app.screen.title_text, "Keyboard")
+                self.assertNotIsInstance(app.screen, CommandPalette)
+                self.assertEqual(app.query_one("#command", ComposerInput).text, "?")
+
+    async def test_ctrl_u_keeps_text_area_line_editing_behavior(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._set_composer_text("draft task text")
+                await pilot.press("ctrl+u")
+                await pilot.pause()
+
+                self.assertEqual(app.query_one("#command", ComposerInput).text, "")
+
+    async def test_option_delete_removes_previous_word_in_composer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._set_composer_text("draft task text")
+                await pilot.press("alt+backspace")
+                await pilot.pause()
+
+                self.assertEqual(app.query_one("#command", ComposerInput).text, "draft task ")
+
+    async def test_ctrl_o_toggles_raw_tool_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                self.assertFalse(app._tool_details_visible)
+                await pilot.press("ctrl+o")
+                await pilot.pause()
+
+                self.assertTrue(app._tool_details_visible)
 
     async def test_session_palette_supports_vim_navigation_and_enter_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -547,7 +786,21 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
 
                 self.assertEqual(command.styles.height.value, 5)
-                self.assertEqual(app.query_one("#composer").styles.height.value, 7)
+                self.assertEqual(app.query_one("#composer").styles.height.value, 9)
+
+    async def test_home_runtime_meta_shows_model_provider_and_browser(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="codex", model_label="gpt-5.5")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause()
+                runtime_meta = app.query_one("#runtime-meta")
+
+                self.assertTrue(runtime_meta.display)
+                visual = str(runtime_meta.visual)
+                self.assertIn("gpt-5.5", visual)
+                self.assertIn("codex", visual)
+                self.assertIn("auto", visual)
 
     async def test_composer_enter_submits_and_clears_text(self) -> None:
         class FakeManager:
@@ -614,6 +867,25 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
 
             self.assertIn("open live preview", str(detail.visual))
             self.assertIn("https://live.example/session", str(detail.visual))
+
+    async def test_running_cloud_session_shows_live_preview_activity_strip(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            store.update_status(session.id, "running")
+            store.emit(session.id, "browser.live_url", {"live_url": "https://live.example/session"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._set_home_mode(False)
+                app._update_activity_strip()
+                await pilot.pause()
+                activity = app.query_one("#activity")
+
+                self.assertTrue(activity.display)
+                self.assertIn("browsing", str(activity.visual))
+                self.assertIn("live.example/session", str(activity.visual))
 
     async def test_done_session_detail_hides_finished_tool_noise(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

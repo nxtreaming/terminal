@@ -9,7 +9,7 @@ from llm_browser.browser.instructions import BROWSER_HELP_PLAYBOOK
 
 BROWSER_TOOL_DESCRIPTION = (
     "Run persistent Python for direct browser control. Default surface is intentionally small: "
-    "raw cdp('Domain.method', key=value), js(expr), new_tab/goto_url, screenshots, coordinate clicks, "
+    "raw cdp('Domain.method', key=value), js(expr), new_tab/goto_url, capture_screenshot, coordinate clicks, "
     "keyboard/text input, waits, tabs, simple http_get, output_path, agent_helpers_path/reload_agent_helpers, and "
     "load_skill/list_skills/read_skill/help_browser. Specialized helpers are opt-in with load_skill(name). "
     "Set result or _result for structured output."
@@ -23,23 +23,22 @@ BROWSER_HELP_TEXT = (
 
 Core browser:
   cdp(method, params=None, timeout_s=None, retry=True) or cdp("Page.navigate", url="...", timeout=30)
-  check_cancel(), cancel_requested()
   js(expr, await_promise=True, repl_mode=None, timeout_s=None) or js(expr, timeout=30)
-  new_tab(url), navigate(url), goto_url(url), tabs(), list_tabs(include_internal=True)
-  switch_tab(target), current_tab(), ensure_real_tab(), iframe_target(url_substr)
+  new_tab(url), goto_url(url), list_tabs(include_internal=True)
+  switch_tab(target), current_tab(), ensure_real_tab()
 
 Waiting and observation:
-  wait_for_load(), wait_for_selector(selector, visible=False), wait_for_element(selector), wait_for_text(text)
+  wait_for_load(), wait_for_element(selector)
   wait_for_network_idle(timeout_s=10, idle_ms=500)
   page_info()
   http_get(url)
 
 Input:
-  click_at(x, y), click_at_xy(x, y), fill_input(selector, text), type_text(text)
-  press(key), press_key(key, modifiers=0), scroll(dx=0, dy=500)
+  click_at_xy(x, y), fill_input(selector, text), type_text(text)
+  press_key(key, modifiers=0), scroll(dx=0, dy=500)
 
 Images:
-  screenshot(label, attach=True, timeout=8), capture_screenshot(path=None, attach=True, timeout=8)
+  capture_screenshot(path=None, attach=True, timeout=8)
   output_path(path='')
 
 Skills:
@@ -55,58 +54,64 @@ Editable helpers:
 Example:
   new_tab("https://example.com")
   wait_for_load()
-  screenshot("loaded", attach=True)
+  capture_screenshot()
   result = {"title": js("document.title"), "page": page_info()}
 """
 )
 
 
-CORE_EXPORT_NAMES = [
-    "artifact_dir",
-    "download_dir",
-    "cwd",
-    "workspace_dir",
-    "output_dir",
-    "output_path",
+PRIMARY_CORE_EXPORT_NAMES = [
     "cdp",
-    "check_cancel",
-    "cancel_requested",
-    "sleep",
     "load_skill",
     "list_skills",
     "read_skill",
     "loaded_skills",
+    "help_browser",
     "new_tab",
-    "navigate",
     "goto_url",
-    "tabs",
-    "attach_tab",
     "js",
     "wait_for_load",
-    "wait_for_selector",
     "wait_for_element",
-    "wait_for_text",
     "wait_for_network_idle",
     "http_get",
-    "screenshot",
     "capture_screenshot",
     "page_info",
-    "click_at",
     "click_at_xy",
     "fill_input",
     "type_text",
-    "press",
     "press_key",
     "scroll",
     "list_tabs",
     "current_tab",
     "switch_tab",
     "ensure_real_tab",
-    "iframe_target",
+    "output_path",
     "agent_helpers_path",
     "reload_agent_helpers",
-    "help_browser",
 ]
+
+COMPAT_CORE_EXPORT_NAMES = [
+    "artifact_dir",
+    "download_dir",
+    "cwd",
+    "workspace_dir",
+    "output_dir",
+    "check_cancel",
+    "cancel_requested",
+    "sleep",
+    "browser",
+    "navigate",
+    "tabs",
+    "attach_tab",
+    "screenshot",
+    "click_at",
+    "press",
+    "wait_for_selector",
+    "wait_for_text",
+    "iframe_target",
+]
+
+CORE_EXPORT_NAMES = PRIMARY_CORE_EXPORT_NAMES + COMPAT_CORE_EXPORT_NAMES
 
 PYTHON_AFFORDANCE_EXPORT_NAMES = [
     "requests",
@@ -129,8 +134,9 @@ def help_browser() -> str:
 
 def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
     module = types.ModuleType("browser_helpers")
-    export_names = _browser_helper_export_names(namespace)
-    for name in export_names:
+    attribute_names = _browser_helper_export_names(namespace, include_compat=True)
+    star_names = _browser_helper_export_names(namespace, include_compat=False)
+    for name in attribute_names:
         if name in namespace:
             setattr(module, name, namespace[name])
 
@@ -146,7 +152,7 @@ def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
 
         setattr(module, "fetch_text", fetch_text)
         setattr(module, "read_url", fetch_text)
-        export_names.extend(["fetch_text", "fetch_text_result", "read_url"])
+        star_names.extend(["fetch_text", "fetch_text_result", "read_url"])
 
     structured_fetch_readable_text = namespace.get("fetch_readable_text")
     if callable(structured_fetch_readable_text):
@@ -160,7 +166,7 @@ def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
 
         setattr(module, "fetch_readable_text", fetch_readable_text)
         setattr(module, "readable_text", fetch_readable_text)
-        export_names.extend(["fetch_readable_text", "fetch_readable_text_result", "readable_text"])
+        star_names.extend(["fetch_readable_text", "fetch_readable_text_result", "readable_text"])
 
     structured_search_web = namespace.get("search_web")
     if callable(structured_search_web):
@@ -179,17 +185,17 @@ def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
             return SearchResult({"results": result})
 
         setattr(module, "search_web", search_web)
-        export_names.extend(["search_web", "search_web_result"])
+        star_names.extend(["search_web", "search_web_result"])
 
     module.help_browser = namespace.get("help_browser", help_browser)
-    module.__all__ = [name for name in export_names if hasattr(module, name)]
+    module.__all__ = _unique_names([name for name in star_names if hasattr(module, name)])
     sys.modules["browser_helpers"] = module
     sys.modules["browser_use"] = module
     sys.modules["browser_tools"] = module
 
 
-def _browser_helper_export_names(namespace: Dict[str, Any]) -> list[str]:
-    names = list(CORE_EXPORT_NAMES)
+def _browser_helper_export_names(namespace: Dict[str, Any], include_compat: bool) -> list[str]:
+    names = list(CORE_EXPORT_NAMES if include_compat else PRIMARY_CORE_EXPORT_NAMES)
     loaded = namespace.get("_loaded_browser_skills") or {}
     if isinstance(loaded, dict):
         for meta in loaded.values():
@@ -199,6 +205,10 @@ def _browser_helper_export_names(namespace: Dict[str, Any]) -> list[str]:
                 if isinstance(export, str):
                     names.append(export)
     names.extend(PYTHON_AFFORDANCE_EXPORT_NAMES)
+    return _unique_names(names)
+
+
+def _unique_names(names: list[str]) -> list[str]:
     seen = set()
     unique = []
     for name in names:

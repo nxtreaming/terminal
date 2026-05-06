@@ -11,41 +11,53 @@ from llm_browser.harness.api import HelperAPI
 from llm_browser.tool.result import ToolImage
 
 
-CORE_HELPERS = [
+PRIMARY_CORE_HELPERS = [
     "cdp",
     "js",
     "new_tab",
-    "navigate",
     "goto_url",
     "page_info",
     "capture_screenshot",
-    "screenshot",
     "click_at_xy",
-    "click_at",
     "type_text",
     "fill_input",
     "press_key",
-    "press",
     "scroll",
     "wait_for_load",
     "wait_for_element",
-    "wait_for_selector",
-    "wait_for_text",
     "wait_for_network_idle",
     "http_get",
     "list_tabs",
-    "tabs",
     "current_tab",
     "switch_tab",
     "ensure_real_tab",
-    "iframe_target",
     "output_path",
-    "sleep",
-    "check_cancel",
-    "cancel_requested",
     "agent_helpers_path",
     "reload_agent_helpers",
 ]
+
+COMPAT_CORE_HELPERS = [
+    "navigate",
+    "tabs",
+    "attach_tab",
+    "screenshot",
+    "click_at",
+    "press",
+    "wait_for_selector",
+    "wait_for_text",
+    "iframe_target",
+    "sleep",
+    "check_cancel",
+    "cancel_requested",
+    "browser",
+    "artifact_dir",
+    "download_dir",
+    "cwd",
+    "workspace_dir",
+    "output_dir",
+]
+
+CORE_HELPERS = PRIMARY_CORE_HELPERS + COMPAT_CORE_HELPERS
 
 
 def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:

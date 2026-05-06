@@ -9,7 +9,7 @@ from pathlib import Path
 from typing import Any, Dict, Optional
 from unittest.mock import Mock, patch
 
-from llm_browser.browser.cdp import CdpError
+from llm_browser.browser.cdp import CdpConnectionError, CdpError
 from llm_browser.browser.runtime import (
     BrowserRuntime,
     BrowserRuntimeOptions,
@@ -116,6 +116,58 @@ class DrainClient:
         events = self.events[:max_events]
         self.events = self.events[max_events:]
         return events
+
+
+class BrokenCdpClient:
+    def __init__(self) -> None:
+        self.closed = False
+
+    def call(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        raise CdpConnectionError("connection lost")
+
+    def close(self) -> None:
+        self.closed = True
+
+
+class FailingConnectClient:
+    def connect(self) -> None:
+        raise CdpConnectionError("stale websocket")
+
+    def close(self) -> None:
+        return None
+
+
+class RecoveredBrowserClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Optional[str]]] = []
+
+    def connect(self) -> None:
+        return None
+
+    def call(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        self.calls.append((method, session_id))
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"targetId": "new-page", "type": "page", "url": "https://recovered.example"}]}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "new-session"}
+        if method == "Browser.getVersion":
+            return {"product": "Recovered Chrome"}
+        return {}
+
+    def close(self) -> None:
+        return None
 
 
 class SequenceRuntime(BrowserRuntime):
@@ -360,6 +412,103 @@ class BrowserRuntimeTest(unittest.TestCase):
             headers={"X-Browser-Use-API-Key": "key", "Content-Type": "application/json"},
         )
 
+    def test_cloud_runtime_self_heals_by_creating_new_browser_when_websocket_is_dead(self) -> None:
+        broken = BrokenCdpClient()
+        recovered = RecoveredBrowserClient()
+
+        def cloud_request(
+            api_base: str,
+            api_key: str,
+            path: str,
+            method: str,
+            body: Optional[Dict[str, Any]] = None,
+        ) -> Dict[str, Any]:
+            if method == "PATCH":
+                return {}
+            if method == "POST":
+                return {"id": "browser-2", "wsUrl": "ws://cloud/new", "liveUrl": "https://live.example/new"}
+            raise AssertionError(method)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BrowserRuntime(Path(tmp))
+            runtime.mode = "cloud"
+            runtime.client = broken  # type: ignore[assignment]
+            runtime.websocket_url = "ws://cloud/old"
+            runtime.browser_level_ws = True
+            runtime.target = {"id": "old-page", "type": "page", "url": "https://old.example"}
+            runtime.default_session_id = "old-session"
+            runtime.cloud_api_key = "key"
+            runtime.cloud_api_base = "https://api.example"
+            runtime.cloud_browser_id = "browser-1"
+            runtime.cloud_live_url = "https://live.example/old"
+            runtime._cloud_create_body = {"timeout": 30}
+
+            with patch("llm_browser.browser.runtime.CdpClient", side_effect=[FailingConnectClient(), recovered]), patch(
+                "llm_browser.browser.runtime._browser_use_request", side_effect=cloud_request
+            ) as request:
+                result = runtime.cdp("Browser.getVersion")
+
+        self.assertEqual(result, {"product": "Recovered Chrome"})
+        self.assertTrue(broken.closed)
+        self.assertEqual(runtime.cloud_browser_id, "browser-2")
+        self.assertEqual(runtime.cloud_live_url, "https://live.example/new")
+        self.assertEqual(runtime.websocket_url, "ws://cloud/new")
+        self.assertEqual(runtime.default_session_id, "new-session")
+        self.assertEqual(runtime.connection_info()["reconnect_count"], 1)
+        request.assert_any_call(
+            api_base="https://api.example",
+            api_key="key",
+            path="/browsers/browser-1",
+            method="PATCH",
+            body={"action": "stop"},
+        )
+        request.assert_any_call(
+            api_base="https://api.example",
+            api_key="key",
+            path="/browsers",
+            method="POST",
+            body={"timeout": 30},
+        )
+
+    def test_cloud_runtime_retry_false_does_not_self_heal_dead_websocket(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = BrowserRuntime(Path(tmp))
+            runtime.mode = "cloud"
+            runtime.client = BrokenCdpClient()  # type: ignore[assignment]
+            runtime.websocket_url = "ws://cloud/old"
+            runtime.cloud_api_key = "key"
+            runtime.cloud_browser_id = "browser-1"
+
+            with patch("llm_browser.browser.runtime._browser_use_request") as request:
+                with self.assertRaises(CdpConnectionError):
+                    runtime.cdp("Browser.getVersion", retry=False)
+
+        request.assert_not_called()
+
+    def test_cloud_runtime_close_can_leave_remote_browser_running(self) -> None:
+        client = Mock()
+
+        def call(method: str, params: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, timeout_s: Optional[float] = None):
+            if method == "Target.getTargets":
+                raise CdpError("page websocket")
+            return {}
+
+        client.call.side_effect = call
+        post_response = Mock(content=b"{}")
+        post_response.raise_for_status.return_value = None
+        post_response.json.return_value = {"id": "browser-1", "wsUrl": "ws://cloud/page", "liveUrl": "https://live.example"}
+
+        with tempfile.TemporaryDirectory() as tmp:
+            options = BrowserRuntimeOptions(mode="cloud", cloud_api_key="key")
+            with patch("llm_browser.browser.runtime.CdpClient", Mock(return_value=client)), patch(
+                "llm_browser.browser.runtime.requests.request", return_value=post_response
+            ) as request_mock:
+                runtime = BrowserRuntime.start(Path(tmp), options=options)
+                runtime.close(stop_browser=False)
+
+        methods = [call.args[0] for call in request_mock.call_args_list]
+        self.assertEqual(methods, ["POST"])
+
     def test_runtime_drains_console_and_network_failures(self) -> None:
         events = [
             {
@@ -515,6 +664,46 @@ class BrowserRuntimeTest(unittest.TestCase):
 
         self.assertIs(runtime, sentinel)
         attach_ws.assert_called_once_with(root_dir=Path(tmp), websocket_url="ws://real/browser", mode="real")
+
+    def test_real_websocket_attach_suppresses_loopback_origin(self) -> None:
+        client = Mock()
+
+        def call(method: str, params: Optional[Dict[str, Any]] = None, session_id: Optional[str] = None, timeout_s: Optional[float] = None):
+            if method == "Target.getTargets":
+                return {"targetInfos": [{"targetId": "page-1", "type": "page", "url": "https://example.com"}]}
+            if method == "Target.attachToTarget":
+                return {"sessionId": "session-1"}
+            return {}
+
+        client.call.side_effect = call
+        client_cls = Mock(return_value=client)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            with patch("llm_browser.browser.runtime.CdpClient", client_cls):
+                runtime = BrowserRuntime.attach_ws(Path(tmp), "ws://127.0.0.1:9222/devtools/browser/abc", mode="real")
+
+        self.assertEqual(runtime.mode, "real")
+        client_cls.assert_called_once_with("ws://127.0.0.1:9222/devtools/browser/abc", timeout_s=8.0, suppress_origin=True)
+
+    def test_real_browser_permission_failure_opens_inspect_and_retries(self) -> None:
+        sentinel = object()
+        endpoint = DiscoveredCdpEndpoint(websocket_url="ws://127.0.0.1:9222/devtools/browser/abc", source="test-profile")
+        failure = CdpConnectionError("CDP websocket connection failed: Handshake status 403 Forbidden; --remote-allow-origins=*")
+
+        with tempfile.TemporaryDirectory() as tmp:
+            options = BrowserRuntimeOptions(mode="real")
+            with patch("llm_browser.browser.runtime.discover_real_browser_endpoint", return_value=endpoint), patch.object(
+                BrowserRuntime, "attach_ws", side_effect=[failure, sentinel]
+            ) as attach_ws, patch("llm_browser.browser.runtime._open_chrome_remote_debugging") as open_inspect, patch(
+                "llm_browser.browser.runtime._print_real_browser_allow_instructions"
+            ), patch(
+                "llm_browser.browser.runtime.time.sleep"
+            ):
+                runtime = BrowserRuntime.start(Path(tmp), options=options)
+
+        self.assertIs(runtime, sentinel)
+        self.assertEqual(attach_ws.call_count, 2)
+        open_inspect.assert_called_once()
 
     def test_js_uses_repl_mode_by_default_for_repeated_snippets(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

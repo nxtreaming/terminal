@@ -11,4 +11,4 @@ wait_for_network_idle()
 capture_screenshot()
 ```
 
-Prefer visible verification over assuming a DOM action worked. Use `screenshot(label, attach=True)` when you want the image returned to the model immediately, and `capture_screenshot(path)` when you also need a file.
+Prefer visible verification over assuming a DOM action worked. `capture_screenshot(path=None, attach=True)` returns the image to the model and, when `path` is provided, also saves a named file.

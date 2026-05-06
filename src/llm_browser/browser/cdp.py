@@ -24,9 +24,10 @@ class CdpClient:
     are matched by id.
     """
 
-    def __init__(self, websocket_url: str, timeout_s: float = 30.0) -> None:
+    def __init__(self, websocket_url: str, timeout_s: float = 30.0, suppress_origin: bool = False) -> None:
         self.websocket_url = websocket_url
         self.timeout_s = timeout_s
+        self.suppress_origin = suppress_origin
         self._ws: Optional[websocket.WebSocket] = None
         self._next_id = 0
         self._lock = threading.Lock()
@@ -36,8 +37,11 @@ class CdpClient:
         if self._ws is not None:
             return
         try:
-            self._ws = websocket.create_connection(self.websocket_url, timeout=self.timeout_s)
-        except websocket.WebSocketException as exc:
+            options = {"timeout": self.timeout_s}
+            if self.suppress_origin:
+                options["suppress_origin"] = True
+            self._ws = websocket.create_connection(self.websocket_url, **options)
+        except (websocket.WebSocketException, TimeoutError, OSError) as exc:
             raise CdpConnectionError(f"CDP websocket connection failed: {exc}") from exc
 
     def close(self) -> None:

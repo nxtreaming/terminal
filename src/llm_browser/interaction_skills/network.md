@@ -3,7 +3,7 @@
 Use `wait_for_network_idle()` after navigation, form submit, or actions that trigger XHR/fetch work.
 
 ```python
-navigate("https://example.com/search")
+goto_url("https://example.com/search")
 wait_for_network_idle(timeout=10, idle_ms=500)
 capture_screenshot()
 ```

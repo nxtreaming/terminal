@@ -52,6 +52,8 @@ class PythonBrowserTool:
         stdout = io.StringIO()
         stderr = io.StringIO()
         runtime = self._runtime(ctx, headless=headless)
+        live_url_before = str(getattr(runtime, "cloud_live_url", "") or "")
+        reconnect_count_before = _runtime_reconnect_count(runtime)
         previous_cancel_check = getattr(runtime, "cancel_check", None)
 
         def check_cancel() -> None:
@@ -73,11 +75,15 @@ class PythonBrowserTool:
         except BaseException:
             err = stderr.getvalue()
             err += traceback.format_exc()
+            self._emit_reconnect_if_changed(ctx, runtime, reconnect_count_before)
+            self._emit_live_preview_if_changed(ctx, runtime, live_url_before)
             return ToolResult(text=stdout.getvalue(), data={"stderr": err, "ok": False}, images=images)
         finally:
             if hasattr(runtime, "set_cancel_check"):
                 runtime.set_cancel_check(previous_cancel_check)
 
+        self._emit_reconnect_if_changed(ctx, runtime, reconnect_count_before)
+        self._emit_live_preview_if_changed(ctx, runtime, live_url_before)
         if value is None:
             value = namespace.get("_result", namespace.get("result"))
 
@@ -92,10 +98,10 @@ class PythonBrowserTool:
                 data["result_repr"] = repr(value)
         return ToolResult(text=text, data=data, images=images)
 
-    def close_session(self, session_id: str) -> None:
+    def close_session(self, session_id: str, stop_browser: bool = True) -> None:
         runtime = self._runtimes.pop(session_id, None)
         if runtime is not None:
-            runtime.close()
+            runtime.close(stop_browser=stop_browser)
         self._namespaces.pop(session_id, None)
 
     def _namespace(self, ctx: ToolContext, headless: bool, images: List[ToolImage]) -> Dict[str, Any]:
@@ -159,6 +165,42 @@ class PythonBrowserTool:
             )
         return runtime
 
+    def _emit_reconnect_if_changed(self, ctx: ToolContext, runtime: "BrowserRuntime", previous_count: int) -> None:
+        info = _runtime_connection_info(runtime)
+        count = int(info.get("reconnect_count") or 0)
+        if count <= previous_count:
+            return
+        reason = str(info.get("last_reconnect_reason") or "")
+        live_url = str(info.get("cloud_live_url") or getattr(runtime, "cloud_live_url", "") or "")
+        if reason == "reattached existing CDP endpoint":
+            return
+        ctx.store.emit(
+            ctx.session.id,
+            "browser.reconnected",
+            {
+                "mode": str(info.get("mode") or getattr(runtime, "mode", "") or ""),
+                "browser_id": str(info.get("cloud_browser_id") or getattr(runtime, "cloud_browser_id", "") or ""),
+                "live_url": live_url,
+                "reconnect_count": count,
+                "reason": reason,
+            },
+        )
+
+    def _emit_live_preview_if_changed(self, ctx: ToolContext, runtime: "BrowserRuntime", previous_live_url: str) -> None:
+        live_url = str(getattr(runtime, "cloud_live_url", "") or "")
+        if not live_url or live_url == previous_live_url:
+            return
+        ctx.store.emit(
+            ctx.session.id,
+            "browser.live_url",
+            {
+                "mode": str(getattr(runtime, "mode", "") or "cloud"),
+                "browser_id": str(getattr(runtime, "cloud_browser_id", "") or ""),
+                "live_url": live_url,
+                "reconnected": True,
+            },
+        )
+
     def _default_runtime_factory(self, root_dir: Path, headless: bool) -> "BrowserRuntime":
         from llm_browser.browser import BrowserRuntime
 
@@ -170,6 +212,21 @@ def _env_bool(name: str, default: bool) -> bool:
     if value is None:
         return default
     return value.lower() in {"1", "true", "yes", "on"}
+
+
+def _runtime_connection_info(runtime: "BrowserRuntime") -> Dict[str, Any]:
+    connection_info = getattr(runtime, "connection_info", None)
+    if not callable(connection_info):
+        return {}
+    try:
+        info = connection_info()
+    except Exception:
+        return {}
+    return dict(info or {}) if isinstance(info, dict) else {}
+
+
+def _runtime_reconnect_count(runtime: "BrowserRuntime") -> int:
+    return int(_runtime_connection_info(runtime).get("reconnect_count") or 0)
 
 
 def _install_optional_imports(namespace: Dict[str, Any]) -> None:

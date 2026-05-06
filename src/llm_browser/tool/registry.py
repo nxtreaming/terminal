@@ -28,8 +28,11 @@ class ToolRegistry:
             raise KeyError(f"unknown tool: {name}")
         return self._handlers[name](ctx, arguments)
 
-    def close_session(self, session_id: str) -> None:
+    def close_session(self, session_id: str, stop_browser: bool = True) -> None:
         for handler in self._handlers.values():
             close = getattr(handler, "close_session", None)
             if callable(close):
-                close(session_id)
+                try:
+                    close(session_id, stop_browser=stop_browser)
+                except TypeError:
+                    close(session_id)

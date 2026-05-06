@@ -84,6 +84,17 @@ class InstructionCaptureProvider:
         yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"result": "ok"}))
 
 
+class CloseRecordingTool:
+    def __init__(self) -> None:
+        self.closed: list[tuple[str, bool]] = []
+
+    def __call__(self, ctx: ToolContext, arguments):
+        return ToolResult(text="ok")
+
+    def close_session(self, session_id: str, stop_browser: bool = True) -> None:
+        self.closed.append((session_id, stop_browser))
+
+
 class AgentLoopTest(unittest.TestCase):
     def test_fake_provider_executes_tools_and_finishes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -112,6 +123,27 @@ class AgentLoopTest(unittest.TestCase):
                 if event.type == "tool.started"
             ]
             self.assertEqual(tool_names, ["echo", "done"])
+
+    def test_agent_can_leave_tools_open_after_done(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            registry = ToolRegistry()
+            recorder = CloseRecordingTool()
+            registry.register(ToolSpec(name="record", description="record", input_schema={"type": "object"}), recorder)
+            registry.register(ToolSpec(name="done", description="done", input_schema={"type": "object"}), lambda ctx, args: ToolResult(text="ok"))
+
+            session = Agent(
+                store,
+                provider=InstructionCaptureProvider(),
+                tools=registry,
+                close_tools_on_finish=False,
+            ).run("Open example.com", cwd=Path(tmp))
+
+            self.assertEqual(session.status, "done")
+            self.assertEqual(recorder.closed, [])
+
+            registry.close_session(session.id)
+            self.assertEqual(recorder.closed, [(session.id, True)])
 
     def test_auto_instruction_mode_switches_to_codex_for_repo_tasks(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

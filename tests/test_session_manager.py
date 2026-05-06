@@ -62,6 +62,7 @@ class SessionManagerTest(unittest.TestCase):
 
             session = manager.start("first", cwd=Path(tmp))
             self._wait_finished(store, session.id)
+            first_tools = manager._tools[session.id]
             resumed = manager.resume(session.id, "second")
             self._wait_resumed_done(store, session.id)
 
@@ -70,6 +71,9 @@ class SessionManagerTest(unittest.TestCase):
             inputs = [event for event in store.events.read(session.id) if event.type == "session.input"]
             self.assertEqual([event.payload.get("text") for event in inputs], ["first", "second"])
             self.assertTrue(inputs[-1].payload.get("resumed"))
+            self.assertIs(manager._tools[session.id], first_tools)
+            manager.close(session.id, stop_browser=False)
+            self.assertNotIn(session.id, manager._tools)
             self._wait_reaped(manager, session.id)
 
 

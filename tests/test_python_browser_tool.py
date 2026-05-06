@@ -172,6 +172,29 @@ class CloudRuntime(FakeRuntime):
         self.cloud_live_url = "https://live.example/session"
 
 
+class ReconnectedCloudRuntime(CloudRuntime):
+    def __init__(self, root_dir: Path, headless: bool) -> None:
+        super().__init__(root_dir, headless)
+        self.reconnect_count = 0
+        self.last_reconnect_reason = None
+
+    def page_info(self) -> Dict[str, Any]:
+        self.cloud_browser_id = "browser-2"
+        self.cloud_live_url = "https://live.example/reconnected"
+        self.reconnect_count = 1
+        self.last_reconnect_reason = "started new Browser Use cloud browser"
+        return {"url": "https://example.com", "title": "Example"}
+
+    def connection_info(self) -> Dict[str, Any]:
+        return {
+            "mode": self.mode,
+            "cloud_browser_id": self.cloud_browser_id,
+            "cloud_live_url": self.cloud_live_url,
+            "reconnect_count": self.reconnect_count,
+            "last_reconnect_reason": self.last_reconnect_reason,
+        }
+
+
 class PythonBrowserToolTest(unittest.TestCase):
     def test_executes_code_and_emits_attached_screenshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -229,6 +252,27 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(live_events[0].payload["mode"], "cloud")
             self.assertEqual(live_events[0].payload["browser_id"], "browser-1")
             self.assertEqual(live_events[0].payload["live_url"], "https://live.example/session")
+
+    def test_cloud_runtime_emits_new_live_preview_after_reconnect(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root, headless: ReconnectedCloudRuntime(root, headless))
+
+            result = tool(ctx, {"headless": True, "code": "page_info(); result = 1"})
+
+            self.assertTrue(result.data["ok"])
+            live_events = [event for event in store.events.read(session.id) if event.type == "browser.live_url"]
+            reconnect_events = [event for event in store.events.read(session.id) if event.type == "browser.reconnected"]
+            self.assertEqual(len(live_events), 2)
+            self.assertEqual(live_events[0].payload["live_url"], "https://live.example/session")
+            self.assertEqual(live_events[1].payload["browser_id"], "browser-2")
+            self.assertEqual(live_events[1].payload["live_url"], "https://live.example/reconnected")
+            self.assertTrue(live_events[1].payload["reconnected"])
+            self.assertEqual(len(reconnect_events), 1)
+            self.assertEqual(reconnect_events[0].payload["reason"], "started new Browser Use cloud browser")
+            self.assertEqual(reconnect_events[0].payload["reconnect_count"], 1)
 
     def test_screenshot_element_captures_clipped_element(self) -> None:
         runtime_holder: Dict[str, FakeRuntime] = {}
@@ -543,6 +587,40 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["result"]["has_load_skill"])
             self.assertIn("research", result.data["result"]["skill_names"])
             self.assertTrue(result.data["result"]["help_mentions_skills"])
+
+    def test_browser_helpers_star_export_prefers_primary_surface(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "import browser_helpers\n"
+                        "result = {"
+                        "'star': browser_helpers.__all__, "
+                        "'module_has_compat': all(hasattr(browser_helpers, name) for name in ['navigate', 'screenshot', 'tabs']), "
+                        "'namespace_has_compat': all(name in globals() for name in ['navigate', 'screenshot', 'tabs'])"
+                        "}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            star = result.data["result"]["star"]
+            self.assertIn("goto_url", star)
+            self.assertIn("capture_screenshot", star)
+            self.assertIn("click_at_xy", star)
+            self.assertNotIn("navigate", star)
+            self.assertNotIn("screenshot", star)
+            self.assertNotIn("tabs", star)
+            self.assertNotIn("wait_for_text", star)
+            self.assertTrue(result.data["result"]["module_has_compat"])
+            self.assertTrue(result.data["result"]["namespace_has_compat"])
 
     def test_legacy_autoload_can_restore_old_large_surface(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "all"}, clear=True):

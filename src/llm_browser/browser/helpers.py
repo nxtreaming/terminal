@@ -101,7 +101,7 @@ from browser_helpers import *
 def browser_state():
     return {
         "page": page_info(),
-        "tabs": tabs(),
+        "tabs": list_tabs(),
     }
 '''
 

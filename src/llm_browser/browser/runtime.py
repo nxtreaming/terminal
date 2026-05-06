@@ -4,8 +4,12 @@ import base64
 import json
 import math
 import os
+import platform
 import shutil
+import subprocess
+import sys
 import time
+import webbrowser
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
@@ -182,6 +186,9 @@ class BrowserRuntime:
         self.cloud_live_url: Optional[str] = None
         self.cloud_api_key: Optional[str] = None
         self.cloud_api_base: str = BROWSER_USE_CLOUD_API
+        self._cloud_create_body: Optional[Dict[str, Any]] = None
+        self._reconnect_count = 0
+        self._last_reconnect_reason: Optional[str] = None
         self._screenshot_index = 0
         self._trace_index = 0
         self._event_log: List[Dict[str, Any]] = []
@@ -278,15 +285,58 @@ class BrowserRuntime:
     def attach_real(cls, root_dir: Path, options: Optional[BrowserRuntimeOptions] = None) -> "BrowserRuntime":
         options = options or BrowserRuntimeOptions.from_env()
         if options.cdp_http_url:
-            return cls.attach_devtools_http(root_dir=root_dir, http_url=options.cdp_http_url, mode="real")
+            return cls._attach_real_http(root_dir=root_dir, http_url=options.cdp_http_url, source="LLM_BROWSER_CDP_HTTP_URL")
         if options.cdp_ws_url:
-            return cls.attach_ws(root_dir=root_dir, websocket_url=options.cdp_ws_url, mode="real")
+            return cls._attach_real_websocket(root_dir=root_dir, websocket_url=options.cdp_ws_url, source="LLM_BROWSER_CDP_WS_URL")
         endpoint = discover_real_browser_endpoint()
         if endpoint.http_url:
-            return cls.attach_devtools_http(root_dir=root_dir, http_url=endpoint.http_url, mode="real")
+            return cls._attach_real_http(root_dir=root_dir, http_url=endpoint.http_url, source=endpoint.source)
         if endpoint.websocket_url:
-            return cls.attach_ws(root_dir=root_dir, websocket_url=endpoint.websocket_url, mode="real")
+            return cls._attach_real_websocket(root_dir=root_dir, websocket_url=endpoint.websocket_url, source=endpoint.source)
         raise RuntimeError("real browser discovery returned no CDP endpoint")
+
+    @classmethod
+    def _attach_real_http(cls, root_dir: Path, http_url: str, source: str = "") -> "BrowserRuntime":
+        try:
+            return cls.attach_devtools_http(root_dir=root_dir, http_url=http_url, mode="real")
+        except CdpConnectionError as exc:
+            websocket_url = _ws_from_devtools_active_port(http_url)
+            if websocket_url:
+                return cls._attach_real_websocket(
+                    root_dir=root_dir,
+                    websocket_url=websocket_url,
+                    source=source or http_url,
+                    first_error=exc,
+                )
+            raise RuntimeError(_real_browser_connection_error(str(exc), source=source or http_url)) from exc
+
+    @classmethod
+    def _attach_real_websocket(
+        cls,
+        root_dir: Path,
+        websocket_url: str,
+        source: str = "",
+        first_error: Optional[BaseException] = None,
+    ) -> "BrowserRuntime":
+        try:
+            return cls.attach_ws(root_dir=root_dir, websocket_url=websocket_url, mode="real")
+        except CdpConnectionError as exc:
+            if not _needs_real_browser_allow_flow(str(exc)):
+                raise RuntimeError(_real_browser_connection_error(str(exc), source=source or websocket_url)) from exc
+            last_error: BaseException = first_error or exc
+
+        _open_chrome_remote_debugging()
+        _print_real_browser_allow_instructions()
+        deadline = time.time() + _real_browser_allow_timeout_s()
+        while time.time() < deadline:
+            time.sleep(1.0)
+            try:
+                return cls.attach_ws(root_dir=root_dir, websocket_url=websocket_url, mode="real")
+            except CdpConnectionError as exc:
+                last_error = exc
+                if not _needs_real_browser_allow_flow(str(exc)):
+                    break
+        raise RuntimeError(_real_browser_connection_error(str(last_error), source=source or websocket_url, opened_inspect=True)) from last_error
 
     @classmethod
     def start_cloud(cls, root_dir: Path, options: Optional[BrowserRuntimeOptions] = None) -> "BrowserRuntime":
@@ -318,6 +368,7 @@ class BrowserRuntime:
             runtime.cloud_live_url = str(browser.get("liveUrl") or browser.get("live_url") or "") or None
             runtime.cloud_api_key = options.cloud_api_key
             runtime.cloud_api_base = options.cloud_api_base
+            runtime._cloud_create_body = dict(body)
             runtime.preserve_profile = True
             return runtime
         except BaseException:
@@ -330,7 +381,7 @@ class BrowserRuntime:
         runtime = cls(root_dir=root_dir, preserve_profile=True)
         runtime.mode = mode
         runtime.websocket_url = websocket_url
-        runtime.client = CdpClient(websocket_url)
+        runtime.client = CdpClient(websocket_url, **_cdp_client_kwargs(websocket_url, mode))
         runtime.client.connect()
         runtime._initialize_websocket_target()
         return runtime
@@ -347,17 +398,17 @@ class BrowserRuntime:
             return cls.attach_ws(root_dir=root_dir, websocket_url=endpoint.websocket_url, mode="real")
         return None
 
-    def close(self) -> None:
+    def close(self, stop_browser: bool = True) -> None:
         if self.client is not None:
             self.client.close()
             self.client = None
-        if self.chrome is not None:
+        if stop_browser and self.chrome is not None:
             profile_dir = self.chrome.config.user_data_dir
             self.chrome.stop()
             self.chrome = None
             if not self.preserve_profile:
                 shutil.rmtree(profile_dir, ignore_errors=True)
-        if self.cloud_browser_id and self.cloud_api_key:
+        if stop_browser and self.cloud_browser_id and self.cloud_api_key:
             _stop_cloud_browser(self.cloud_api_base, self.cloud_api_key, self.cloud_browser_id)
             self.cloud_browser_id = None
 
@@ -371,6 +422,8 @@ class BrowserRuntime:
             "cloud_browser_id": self.cloud_browser_id,
             "cloud_live_url": self.cloud_live_url,
             "downloads_dir": str(self.downloads_dir),
+            "reconnect_count": self._reconnect_count,
+            "last_reconnect_reason": self._last_reconnect_reason,
         }
 
     def set_cancel_check(self, cancel_check: Optional[Callable[[], None]]) -> None:
@@ -445,7 +498,7 @@ class BrowserRuntime:
         self.websocket_url = websocket_url
         self.default_session_id = None
         self.browser_level_ws = False
-        self.client = CdpClient(websocket_url)
+        self.client = CdpClient(websocket_url, **_cdp_client_kwargs(websocket_url, self.mode))
         self.client.connect()
         self._enable_page_domains()
         return target
@@ -533,18 +586,19 @@ class BrowserRuntime:
         if timeout is not None:
             timeout_s = timeout
         self._check_cancel()
-        if self.client is None:
-            self.attach_first_page()
-        assert self.client is not None
-        effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
+        effective_session_id: Optional[str] = None
         try:
+            if self.client is None:
+                self.attach_first_page()
+            assert self.client is not None
+            effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
             result = self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
             self._check_cancel()
             return result
-        except CdpConnectionError:
+        except (CdpConnectionError, requests.RequestException, OSError) as exc:
             if not retry:
                 raise
-            self._reattach_after_disconnect()
+            self._self_heal_after_disconnect(exc)
             assert self.client is not None
             effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
             result = self.client.call(method, params=params, session_id=effective_session_id, timeout_s=timeout_s)
@@ -566,6 +620,28 @@ class BrowserRuntime:
                     return result
             raise
 
+    def _self_heal_after_disconnect(self, original: BaseException) -> None:
+        errors: List[BaseException] = []
+        try:
+            self._reattach_after_disconnect()
+            self._mark_reconnected("reattached existing CDP endpoint")
+            return
+        except BaseException as exc:
+            errors.append(exc)
+
+        try:
+            if self._restart_browser_after_disconnect():
+                return
+        except BaseException as exc:
+            errors.append(exc)
+
+        detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors) or str(original)
+        raise CdpConnectionError(f"CDP connection lost and browser self-heal failed: {detail}") from original
+
+    def _mark_reconnected(self, reason: str) -> None:
+        self._reconnect_count += 1
+        self._last_reconnect_reason = reason
+
     def _reattach_after_disconnect(self) -> None:
         if self.client is not None:
             self.client.close()
@@ -577,7 +653,7 @@ class BrowserRuntime:
                     self.attach_target(page)
                     return
         if self.websocket_url:
-            self.client = CdpClient(self.websocket_url)
+            self.client = CdpClient(self.websocket_url, **_cdp_client_kwargs(self.websocket_url, self.mode))
             self.client.connect()
             if self.browser_level_ws:
                 if target_id:
@@ -588,6 +664,94 @@ class BrowserRuntime:
                 self._enable_page_domains()
             return
         self.attach_first_page()
+
+    def _restart_browser_after_disconnect(self) -> bool:
+        if self.mode == "cloud":
+            self._restart_cloud_browser()
+            self._mark_reconnected("started new Browser Use cloud browser")
+            return True
+        if self.mode == "chromium":
+            self._restart_owned_chromium()
+            self._mark_reconnected("restarted owned Chromium")
+            return True
+        if self.mode == "real":
+            self._rediscover_real_browser()
+            self._mark_reconnected("rediscovered real Chrome CDP endpoint")
+            return True
+        return False
+
+    def _clear_cdp_state(self) -> None:
+        if self.client is not None:
+            self.client.close()
+            self.client = None
+        self.target = None
+        self.default_session_id = None
+        self.browser_level_ws = False
+        self.pending_dialog = None
+
+    def _attach_websocket_in_place(self, websocket_url: str) -> None:
+        self._clear_cdp_state()
+        self.http_url = None
+        self.websocket_url = websocket_url
+        self.client = CdpClient(websocket_url, **_cdp_client_kwargs(websocket_url, self.mode))
+        self.client.connect()
+        self._initialize_websocket_target()
+
+    def _restart_cloud_browser(self) -> None:
+        if not self.cloud_api_key:
+            raise RuntimeError("cannot restart cloud browser without Browser Use API key")
+        old_browser_id = self.cloud_browser_id
+        if old_browser_id:
+            _stop_cloud_browser(self.cloud_api_base, self.cloud_api_key, old_browser_id)
+        body = dict(self._cloud_create_body or {})
+        browser = _browser_use_request(
+            api_base=self.cloud_api_base,
+            api_key=self.cloud_api_key,
+            path="/browsers",
+            method="POST",
+            body=body,
+        )
+        self.cloud_browser_id = str(browser.get("id") or "") or None
+        self.cloud_live_url = str(browser.get("liveUrl") or browser.get("live_url") or "") or None
+        self._attach_websocket_in_place(_cloud_browser_websocket_url(browser))
+        self.mode = "cloud"
+        self.preserve_profile = True
+
+    def _restart_owned_chromium(self) -> None:
+        if self.chrome is None:
+            raise RuntimeError("cannot restart owned Chromium because launch metadata is missing")
+        config = self.chrome.config
+        self._clear_cdp_state()
+        self.chrome.stop()
+        self.chrome = start_chrome(
+            root_dir=self.root_dir,
+            profile_template=config.profile_template,
+            chrome_path=config.chrome_path,
+            headless=config.headless,
+            width=config.width,
+            height=config.height,
+        )
+        self.downloads_dir = self.chrome.config.downloads_dir
+        self.http_url = self.chrome.http_url
+        self.websocket_url = None
+        self.mode = "chromium"
+        self.attach_first_page()
+
+    def _rediscover_real_browser(self) -> None:
+        endpoint = discover_real_browser_endpoint(timeout_s=3.0)
+        self._clear_cdp_state()
+        self.mode = "real"
+        self.preserve_profile = True
+        if endpoint.http_url:
+            self.http_url = endpoint.http_url.rstrip("/")
+            self.websocket_url = None
+            self.attach_first_page()
+            return
+        if endpoint.websocket_url:
+            self._attach_websocket_in_place(endpoint.websocket_url)
+            self.mode = "real"
+            return
+        raise RuntimeError("real browser discovery returned no CDP endpoint")
 
     def _initialize_websocket_target(self) -> None:
         assert self.client is not None
@@ -1221,6 +1385,101 @@ def _remote_object_text(obj: Dict[str, Any]) -> str:
     return str(obj.get("type") or "")
 
 
+def _cdp_client_kwargs(websocket_url: str, mode: str) -> Dict[str, Any]:
+    if mode != "real" or not _is_loopback_ws(websocket_url):
+        return {}
+    return {
+        "timeout_s": _env_float("LLM_BROWSER_REAL_WS_TIMEOUT", 8.0),
+        # Browser Harness uses websockets.connect(), which sends no Origin by default.
+        # websocket-client sends one unless suppressed, and recent Chrome builds reject it
+        # for default-profile remote debugging.
+        "suppress_origin": True,
+    }
+
+
+def _is_loopback_ws(websocket_url: str) -> bool:
+    try:
+        host = (urlparse(websocket_url).hostname or "").lower()
+    except Exception:
+        return False
+    return host in {"127.0.0.1", "localhost", "::1"}
+
+
+def _needs_real_browser_allow_flow(message: str) -> bool:
+    lower = message.lower()
+    return (
+        "remote-allow-origins" in lower
+        or "rejected an incoming websocket connection" in lower
+        or "handshake status 403" in lower
+        or (
+            "handshake" in lower
+            and (
+                "403" in lower
+                or "forbidden" in lower
+                or "timed out" in lower
+                or "timeout" in lower
+                or "opening handshake" in lower
+            )
+        )
+        or "websockettimeoutexception" in lower
+        or "connection timed out" in lower
+    )
+
+
+def _open_chrome_remote_debugging() -> bool:
+    url = "chrome://inspect/#remote-debugging"
+    if platform.system() == "Darwin":
+        try:
+            subprocess.run(
+                [
+                    "osascript",
+                    "-e",
+                    'tell application "Google Chrome" to activate',
+                    "-e",
+                    f'tell application "Google Chrome" to open location "{url}"',
+                ],
+                timeout=5,
+                check=False,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+            )
+            return True
+        except Exception:
+            pass
+    try:
+        return bool(webbrowser.open(url, new=2))
+    except Exception:
+        return False
+
+
+def _print_real_browser_allow_instructions() -> None:
+    if _env_bool("LLM_BROWSER_QUIET_REAL_BROWSER_PROMPT", False):
+        return
+    print(
+        'browser-use-terminal: opened chrome://inspect/#remote-debugging. '
+        'Tick "Allow remote debugging for this browser instance" and click Allow if Chrome asks, then the attach will retry.',
+        file=sys.stderr,
+    )
+
+
+def _real_browser_allow_timeout_s() -> float:
+    return max(0.0, _env_float("LLM_BROWSER_REAL_ALLOW_TIMEOUT", 60.0))
+
+
+def _real_browser_connection_error(message: str, source: str = "", opened_inspect: bool = False) -> str:
+    source_text = f" Source: {source}." if source else ""
+    opened_text = " I opened chrome://inspect/#remote-debugging." if opened_inspect else ""
+    return (
+        "Real Chrome was discovered, but Chrome blocked the CDP websocket handshake."
+        f"{source_text}{opened_text} "
+        'In Chrome, open chrome://inspect/#remote-debugging, tick "Allow remote debugging for this browser instance", '
+        "and click Allow if prompted. If Chrome still rejects the connection with --remote-allow-origins, fully quit "
+        "Chrome and relaunch it with --remote-debugging-port=9222 --remote-allow-origins=*. "
+        "Use --browser chromium for an isolated owned browser that does not require this permission flow. "
+        f"Last error: {message}"
+    )
+
+
 def browser_runtime_diagnostics(options: Optional[BrowserRuntimeOptions] = None) -> Dict[str, Any]:
     options = options or BrowserRuntimeOptions.from_env()
     active_ports = _active_devtools_ports(REAL_BROWSER_PROFILE_DIRS)
@@ -1467,6 +1726,16 @@ def _env_int_optional(name: str) -> Optional[int]:
     if value is None or value == "":
         return None
     return int(value)
+
+
+def _env_float(name: str, default: float) -> float:
+    value = os.environ.get(name)
+    if value is None or value == "":
+        return default
+    try:
+        return float(value)
+    except ValueError:
+        return default
 
 
 def _env_bool(name: str, default: bool) -> bool:

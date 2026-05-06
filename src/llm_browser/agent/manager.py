@@ -10,6 +10,7 @@ from llm_browser.agent.service import Agent
 from llm_browser.provider.base import Provider
 from llm_browser.session.metadata import SessionMetadata
 from llm_browser.session.store import SessionStore
+from llm_browser.tool.registry import ToolRegistry
 
 
 ProviderFactory = Callable[[], Optional[Provider]]
@@ -41,6 +42,7 @@ class SessionManager:
         self.max_turns = max_turns
         self._lock = threading.Lock()
         self._active: Dict[str, ActiveSession] = {}
+        self._tools: Dict[str, ToolRegistry] = {}
 
     def start(self, task: str, parent_id: Optional[str] = None, cwd: Optional[Path] = None) -> SessionMetadata:
         session = self.store.create(parent_id=parent_id, cwd=cwd)
@@ -49,7 +51,14 @@ class SessionManager:
 
         def target() -> None:
             try:
-                agent = Agent(self.store, provider_factory=self.provider_factory, max_turns=self.max_turns)
+                agent = Agent(
+                    self.store,
+                    provider_factory=self.provider_factory,
+                    max_turns=self.max_turns,
+                    close_tools_on_finish=False,
+                )
+                with self._lock:
+                    self._tools[session.id] = agent.tools
                 agent.run_session(session.id, task)
             except BaseException:
                 active_ref["active"].error = traceback.format_exc()
@@ -75,7 +84,17 @@ class SessionManager:
 
         def target() -> None:
             try:
-                agent = Agent(self.store, provider_factory=self.provider_factory, max_turns=self.max_turns)
+                with self._lock:
+                    tools = self._tools.get(session.id)
+                agent = Agent(
+                    self.store,
+                    provider_factory=self.provider_factory,
+                    tools=tools,
+                    max_turns=self.max_turns,
+                    close_tools_on_finish=False,
+                )
+                with self._lock:
+                    self._tools[session.id] = agent.tools
                 agent.resume_session(session.id, instruction)
             except BaseException:
                 active_ref["active"].error = traceback.format_exc()
@@ -90,6 +109,12 @@ class SessionManager:
 
     def cancel(self, session_id: str, reason: str = "user requested cancellation") -> None:
         self.store.request_cancel(session_id, reason=reason)
+
+    def close(self, session_id: str, stop_browser: bool = True) -> None:
+        with self._lock:
+            tools = self._tools.pop(session_id, None)
+        if tools is not None:
+            tools.close_session(session_id, stop_browser=stop_browser)
 
     def active(self) -> Dict[str, ActiveSession]:
         with self._lock:

@@ -8,7 +8,7 @@ from typing import Any, Dict, List, Optional
 
 from llm_browser.browser.instructions import BROWSER_HELP_PLAYBOOK
 from llm_browser.harness.api import HelperAPI
-from llm_browser.harness.helpers import CORE_HELPERS
+from llm_browser.harness.helpers import PRIMARY_CORE_HELPERS
 
 
 PYTHON_SKILLS: Dict[str, str] = {
@@ -73,7 +73,7 @@ def install_skill_loader(api: HelperAPI) -> Dict[str, Any]:
             "  capture_screenshot()\n\n"
             + BROWSER_HELP_PLAYBOOK.rstrip()
             + "\n\nCore helpers:\n  "
-            + ", ".join(CORE_HELPERS + ["load_skill", "list_skills", "read_skill", "loaded_skills", "help_browser"])
+            + ", ".join(PRIMARY_CORE_HELPERS + ["load_skill", "list_skills", "read_skill", "loaded_skills", "help_browser"])
             + "\n\nPython skills are opt-in. Use list_skills() for metadata and load_skill(name) before calling exports.\n  "
             + (python_skills or "(none)")
             + "\n\nInteraction skills are readable playbooks, not default behavior. Use read_skill(name).\n  "
