@@ -237,6 +237,41 @@ class DatasetTest(unittest.TestCase):
         self.assertIn("runner must restart", result["error"])
         close_session.assert_called_once()
 
+    def test_dataset_keyboard_interrupt_cancels_active_session(self) -> None:
+        class InterruptingThread:
+            def __init__(self, target, name=None, daemon=None) -> None:
+                self.target = target
+
+            def start(self) -> None:
+                pass
+
+            def join(self, timeout=None) -> None:
+                raise KeyboardInterrupt
+
+            def is_alive(self) -> bool:
+                return False
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            with patch("llm_browser.cli.threading.Thread", InterruptingThread):
+                with self.assertRaises(KeyboardInterrupt):
+                    _run_dataset_task(
+                        store=store,
+                        task_id="1",
+                        prompt="interrupt",
+                        workspace=Path(tmp) / "work",
+                        provider_name="fake",
+                        model=None,
+                        max_turns=1,
+                        timeout_s=60,
+                    )
+
+            sessions = store.list()
+            self.assertEqual(len(sessions), 1)
+            self.assertEqual(sessions[0].status, "cancelled")
+            cancel = store.cancel_request(sessions[0].id)
+            self.assertEqual(cancel, {"reason": "dataset runner interrupted"})
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

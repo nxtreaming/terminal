@@ -757,7 +757,20 @@ def _run_dataset_task(
     if timeout_s and timeout_s > 0:
         thread = threading.Thread(target=target, name=f"dataset-task-{task_id}", daemon=True)
         thread.start()
-        thread.join(timeout_s)
+        try:
+            thread.join(timeout_s)
+        except KeyboardInterrupt:
+            store.request_cancel(session.id, reason="dataset runner interrupted")
+            agent = agent_ref.get("agent")
+            if agent is not None:
+                try:
+                    agent.tools.close_session(session.id)
+                except Exception as exc:
+                    result["cleanup_error"] = str(exc)
+            loaded = store.load(session.id)
+            if loaded is not None:
+                result["session"] = loaded.to_dict()
+            raise
         if thread.is_alive():
             store.request_cancel(session.id, reason=f"dataset task timeout after {timeout_s:g}s")
             agent = agent_ref.get("agent")
