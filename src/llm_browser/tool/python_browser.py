@@ -98,7 +98,7 @@ class PythonBrowserTool:
         def new_tab(url: str = "about:blank") -> Dict[str, Any]:
             return runtime.new_tab(url)
 
-        def js(expression: str, await_promise: bool = False) -> Any:
+        def js(expression: str, await_promise: bool = True) -> Any:
             return runtime.js(expression, await_promise=await_promise)
 
         def wait_for_load(timeout_s: float = 20.0, timeout: Optional[float] = None) -> None:

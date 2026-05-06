@@ -18,6 +18,7 @@ class FakeRuntime:
         self.headless = headless
         self.tab_urls = []
         self.last_load_timeout = None
+        self.last_await_promise = None
 
     def cdp(self, method: str, params=None, session_id=None) -> Dict[str, Any]:
         return {"method": method, "params": params or {}, "session_id": session_id}
@@ -43,6 +44,7 @@ class FakeRuntime:
         return [{"text": "Example", "href": "https://example.com"}][:limit]
 
     def js(self, expression: str, await_promise: bool = False) -> Any:
+        self.last_await_promise = await_promise
         if expression == "document.title":
             return "Example Domain"
         return None
@@ -272,6 +274,25 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["ok"])
             self.assertIn("Mozilla/5.0", result.data["result"]["ua"])
             self.assertIn("en-US", result.data["result"]["lang"])
+
+    def test_js_helper_awaits_promises_by_default(self) -> None:
+        runtime_holder = {}
+
+        def factory(root_dir: Path, headless: bool) -> FakeRuntime:
+            runtime = FakeRuntime(root_dir, headless)
+            runtime_holder["runtime"] = runtime
+            return runtime
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=factory)
+
+            result = tool(ctx, {"headless": True, "code": "js('Promise.resolve(1)'); result = 'ok'"})
+
+            self.assertTrue(result.data["ok"])
+            self.assertIs(runtime_holder["runtime"].last_await_promise, True)
 
 
 if __name__ == "__main__":
