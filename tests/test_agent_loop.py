@@ -7,6 +7,7 @@ import unittest
 from pathlib import Path
 
 from llm_browser.agent import Agent
+from llm_browser.agent.compaction import compact_messages
 from llm_browser.agent.service import MaxTurnsExceeded
 from llm_browser.provider.fake import FakeProvider
 from llm_browser.provider.types import ModelEvent, ToolCall
@@ -277,6 +278,40 @@ class AgentLoopTest(unittest.TestCase):
             self.assertTrue(compacted)
             self.assertTrue(Path(compacted[0].payload["path"]).exists())
             self.assertLess(compacted[-1].payload["after_messages"], compacted[-1].payload["before_messages"])
+
+    def test_compaction_keeps_tool_output_with_matching_function_call(self) -> None:
+        messages = [{"role": "user", "content": "start"}]
+        for index in range(5):
+            messages.append(
+                {
+                    "role": "assistant",
+                    "tool_calls": [
+                        {
+                            "id": f"call_{index}",
+                            "name": "echo",
+                            "arguments": {"text": str(index)},
+                        }
+                    ],
+                }
+            )
+            messages.append(
+                {
+                    "role": "tool",
+                    "tool_call_id": f"call_{index}",
+                    "name": "echo",
+                    "content": f"result {index}",
+                }
+            )
+
+        with tempfile.TemporaryDirectory() as tmp:
+            compacted, _ = compact_messages(messages, Path(tmp), keep_last=3)
+
+        self.assertEqual(compacted[1]["role"], "assistant")
+        self.assertEqual(compacted[1]["tool_calls"][0]["id"], "call_3")
+        self.assertEqual(compacted[2]["role"], "tool")
+        self.assertEqual(compacted[2]["tool_call_id"], "call_3")
+        self.assertEqual(compacted[3]["role"], "assistant")
+        self.assertEqual(compacted[4]["role"], "tool")
 
     def test_deadline_warning_is_injected_before_timeout(self) -> None:
         class WarnAwareProvider:

@@ -144,6 +144,7 @@ class CodexResponsesProvider:
 
     def _convert_messages(self, messages: List[Dict[str, Any]]) -> List[Dict[str, Any]]:
         input_items: List[Dict[str, Any]] = []
+        known_tool_call_ids: Set[str] = set()
         for message in messages:
             role = message.get("role")
             if role == "user":
@@ -155,10 +156,12 @@ class CodexResponsesProvider:
                 )
             elif role == "assistant":
                 for call in message.get("tool_calls") or []:
+                    call_id = str(call["id"])
+                    known_tool_call_ids.add(call_id)
                     input_items.append(
                         {
                             "type": "function_call",
-                            "call_id": str(call["id"]),
+                            "call_id": call_id,
                             "name": str(call["name"]),
                             "arguments": json.dumps(call.get("arguments") or {}),
                         }
@@ -167,6 +170,25 @@ class CodexResponsesProvider:
                 call_id = str(message["tool_call_id"])
                 tool_name = str(message.get("name") or "tool")
                 content = message.get("content", "")
+                if call_id not in known_tool_call_ids:
+                    input_items.append(
+                        {
+                            "role": "user",
+                            "content": [
+                                {
+                                    "type": "input_text",
+                                    "text": (
+                                        "Recovered tool output from compacted history. "
+                                        f"The original function_call for {tool_name} ({call_id}) "
+                                        "was outside the retained transcript.\n\n"
+                                        f"{tool_output_text(content)}"
+                                    ),
+                                }
+                            ],
+                        }
+                    )
+                    input_items.extend(visual_context_messages(content, call_id=call_id, tool_name=tool_name))
+                    continue
                 input_items.append(
                     {
                         "type": "function_call_output",

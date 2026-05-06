@@ -24,8 +24,9 @@ def compact_messages(
     if len(messages) <= keep_last + 1:
         return messages, artifact_dir / "compactions" / "noop.json"
 
-    kept = [_trim_message(message) for message in messages[-keep_last:]]
-    summary = _summary(messages[:-keep_last], session_events=session_events or [])
+    keep_start = _valid_suffix_start(messages, max(0, len(messages) - keep_last))
+    kept = [_trim_message(message) for message in messages[keep_start:]]
+    summary = _summary(messages[:keep_start], session_events=session_events or [])
     compaction_dir = artifact_dir / "compactions"
     compaction_dir.mkdir(parents=True, exist_ok=True)
     path = compaction_dir / f"{len(list(compaction_dir.glob('*.json'))) + 1:03d}.json"
@@ -44,6 +45,34 @@ def compact_messages(
     ]
     compacted.extend(kept)
     return compacted, path
+
+
+def _valid_suffix_start(messages: List[Dict[str, Any]], desired_start: int) -> int:
+    """Move the compaction boundary to a provider-valid message boundary.
+
+    Responses-style providers reject a function_call_output unless the same
+    request also contains the matching function_call, or the request is chained
+    to the response that produced that call. After local compaction we replay a
+    compacted transcript, so a suffix that starts with a tool message is invalid.
+    Move the boundary back to the assistant turn that created the leading tool
+    output and keep that whole assistant/tool block intact.
+    """
+
+    if desired_start <= 0:
+        return 0
+    if desired_start >= len(messages):
+        return len(messages)
+    start = desired_start
+    while start > 0 and messages[start].get("role") == "tool":
+        previous = start - 1
+        while previous >= 0 and messages[previous].get("role") == "tool":
+            previous -= 1
+        if previous >= 0 and messages[previous].get("role") == "assistant":
+            return previous
+        start += 1
+        if start >= len(messages):
+            return len(messages)
+    return start
 
 
 def _summary(messages: List[Dict[str, Any]], session_events: List[Dict[str, Any]]) -> str:

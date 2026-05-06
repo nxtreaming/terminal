@@ -156,6 +156,26 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][3]["content"][1]["type"], "input_image")
         self.assertEqual(payload["input"][4]["content"][0]["text"], "answer")
 
+    def test_full_history_orphan_tool_output_is_recovered_as_user_context(self) -> None:
+        provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")
+        response = FakeResponse(200, {"id": "resp_1", "output": []})
+
+        with patch("llm_browser.provider.openai_responses.requests.post", return_value=response) as post:
+            list(
+                provider.start_turn(
+                    [
+                        {"role": "user", "content": "compacted summary"},
+                        {"role": "tool", "tool_call_id": "call_missing", "name": "python", "content": "late output"},
+                    ],
+                    [],
+                )
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["input"][1]["role"], "user")
+        self.assertIn("Recovered tool output", payload["input"][1]["content"][0]["text"])
+        self.assertNotIn("function_call_output", [item.get("type") for item in payload["input"]])
+
     def test_retries_transient_response_errors(self) -> None:
         provider = OpenAIResponsesProvider(api_key="test-key", model="test-model")
         transient = FakeResponse(500, {}, text="try again")

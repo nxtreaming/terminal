@@ -134,6 +134,26 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][3]["role"], "user")
         self.assertEqual(payload["input"][3]["content"][1]["type"], "input_image")
 
+    def test_orphan_tool_output_is_recovered_as_user_context(self) -> None:
+        provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
+        response = FakeResponse(200, [{"type": "response.completed", "response": {"id": "resp_2", "output": []}}])
+
+        with patch("llm_browser.provider.codex_responses.requests.post", return_value=response) as post:
+            list(
+                provider.start_turn(
+                    [
+                        {"role": "user", "content": "compacted summary"},
+                        {"role": "tool", "tool_call_id": "call_missing", "name": "python", "content": "late output"},
+                    ],
+                    [],
+                )
+            )
+
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["input"][1]["role"], "user")
+        self.assertIn("Recovered tool output", payload["input"][1]["content"][0]["text"])
+        self.assertNotIn("function_call_output", [item.get("type") for item in payload["input"]])
+
     def test_refreshes_auth_once_after_unauthorized_response(self) -> None:
         provider = CodexResponsesProvider(auth=fake_auth(), model="gpt-test")
         unauthorized = FakeResponse(401, [], text="expired")
