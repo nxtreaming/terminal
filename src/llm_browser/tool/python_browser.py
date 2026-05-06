@@ -546,6 +546,7 @@ class PythonBrowserTool:
                 "search_web": search_web,
             }
         )
+        _install_browser_helpers_module(namespace)
         return namespace
 
     def _runtime(self, ctx: ToolContext, headless: bool) -> "BrowserRuntime":
@@ -1151,3 +1152,75 @@ def _install_display_shim() -> None:
     display_module.HTML = str
     setattr(ipython_module, "display", display_module)
     sys.modules["IPython.display"] = display_module
+
+
+def _install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
+    module = types.ModuleType("browser_helpers")
+    export_names = [
+        "artifact_dir",
+        "download_dir",
+        "cwd",
+        "workspace_dir",
+        "output_dir",
+        "output_path",
+        "cdp",
+        "new_tab",
+        "navigate",
+        "tabs",
+        "attach_tab",
+        "js",
+        "wait_for_load",
+        "wait_until",
+        "wait_for_selector",
+        "wait_for_text",
+        "deep_text",
+        "click_text",
+        "dismiss_cookie_banners",
+        "screenshot",
+        "page_info",
+        "visible_text",
+        "links",
+        "click_at",
+        "type_text",
+        "press",
+        "scroll",
+        "load_helper",
+        "save_helper",
+        "save_artifact",
+        "upload_artifact",
+        "create_download_url",
+        "artifact_download_url",
+        "download_file",
+        "read_pdf_text",
+        "search_web",
+        "requests",
+        "http",
+        "BeautifulSoup",
+        "pd",
+        "PdfReader",
+        "Image",
+        "Path",
+        "json",
+        "os",
+        "time",
+    ]
+    for name in export_names:
+        if name in namespace:
+            setattr(module, name, namespace[name])
+
+    structured_fetch_text = namespace.get("fetch_text")
+    if callable(structured_fetch_text):
+        setattr(module, "fetch_text_result", structured_fetch_text)
+
+        def fetch_text(*args: Any, **kwargs: Any) -> str:
+            result = structured_fetch_text(*args, **kwargs)
+            if isinstance(result, dict):
+                return str(result.get("text") or "")
+            return str(result or "")
+
+        setattr(module, "fetch_text", fetch_text)
+        setattr(module, "read_url", fetch_text)
+        export_names.extend(["fetch_text", "fetch_text_result", "read_url"])
+
+    module.__all__ = [name for name in export_names if hasattr(module, name)]
+    sys.modules["browser_helpers"] = module

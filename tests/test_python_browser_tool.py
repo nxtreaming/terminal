@@ -513,6 +513,41 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["text"], "Title: reada")
             self.assertTrue(calls[1][0].startswith("https://r.jina.ai/http://https://blocked.example/page"))
 
+    def test_browser_helpers_module_exports_session_helpers(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", return_value=Response("hello from helper", "https://example.com")):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": (
+                            "from browser_helpers import *\n"
+                            "result = {"
+                            "'text': fetch_text('https://example.com')[:5], "
+                            "'structured': fetch_text_result('https://example.com')['source'], "
+                            "'title': js('document.title')"
+                            "}"
+                        ),
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["text"], "hello")
+            self.assertEqual(result.data["result"]["structured"], "direct")
+            self.assertEqual(result.data["result"]["title"], "Example Domain")
+
     def test_js_helper_awaits_promises_by_default(self) -> None:
         runtime_holder = {}
 
