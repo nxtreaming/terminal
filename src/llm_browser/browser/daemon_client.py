@@ -41,7 +41,6 @@ class DaemonBrowserRuntime:
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
         timeout: Optional[float] = None,
-        retry: bool = False,
     ) -> Dict[str, Any]:
         if timeout is not None:
             timeout_s = timeout
@@ -51,7 +50,6 @@ class DaemonBrowserRuntime:
             "params": params or {},
             "session_id": session_id,
             "timeout_s": timeout_s,
-            "retry": retry,
         }
         request_timeout_s = max(float(timeout_s or 30), 30)
         response = request(self.name, payload, timeout_s=request_timeout_s)

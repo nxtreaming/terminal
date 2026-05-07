@@ -82,7 +82,7 @@ class CdpClientTest(unittest.TestCase):
 
         self.assertEqual(ws.timeout, 30.0)
 
-    def test_call_treats_socket_timeout_as_connection_error(self) -> None:
+    def test_call_treats_socket_timeout_as_non_destructive_connection_error(self) -> None:
         ws = TimeoutWebSocket()
 
         with patch("llm_browser.browser.cdp.websocket.create_connection", return_value=ws):
@@ -90,7 +90,7 @@ class CdpClientTest(unittest.TestCase):
             with self.assertRaises(CdpConnectionError):
                 client.call("Runtime.evaluate")
 
-        self.assertTrue(ws.closed)
+        self.assertFalse(ws.closed)
 
     def test_call_times_out_even_when_events_keep_arriving(self) -> None:
         ws = EventFloodWebSocket()
@@ -102,7 +102,7 @@ class CdpClientTest(unittest.TestCase):
             with self.assertRaisesRegex(CdpConnectionError, "timed out waiting for Runtime.evaluate"):
                 client.call("Runtime.evaluate", timeout_s=0.25)
 
-        self.assertTrue(ws.closed)
+        self.assertFalse(ws.closed)
         self.assertGreaterEqual(ws.recv_count, 2)
 
     def test_call_can_return_when_specific_event_arrives(self) -> None:

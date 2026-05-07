@@ -75,17 +75,18 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
         timeout: Optional[float] = None,
-        retry: bool = False,
         **kwargs: Any,
     ) -> Dict[str, Any]:
         if timeout is not None:
             timeout_s = timeout
         api.check_cancel()
+        if "retry" in kwargs:
+            raise TypeError("cdp retry/reconnect was removed; handle connection state explicitly with CDP")
         if params is not None and not isinstance(params, dict):
             raise TypeError("cdp params must be a dict when provided")
         merged_params = dict(params or {})
         merged_params.update(kwargs)
-        return runtime.cdp(method, params=merged_params, session_id=session_id, timeout_s=timeout_s, retry=retry)
+        return runtime.cdp(method, params=merged_params, session_id=session_id, timeout_s=timeout_s)
 
     def new_tab(url: str = "about:blank") -> Dict[str, Any]:
         api.check_cancel()

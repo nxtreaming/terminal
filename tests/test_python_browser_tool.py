@@ -26,7 +26,6 @@ class FakeRuntime:
         self.last_await_promise = None
         self.last_js_expression = None
         self.last_cdp_timeout = None
-        self.last_cdp_retry = None
         self.last_navigate_timeout = None
         self.last_js_timeout_s = None
         self.last_screenshot_timeout = None
@@ -36,9 +35,8 @@ class FakeRuntime:
         self.target_id = "target-1"
         self.cdp_calls = []
 
-    def cdp(self, method: str, params=None, session_id=None, timeout_s=None, retry=False) -> Dict[str, Any]:
+    def cdp(self, method: str, params=None, session_id=None, timeout_s=None) -> Dict[str, Any]:
         self.last_cdp_timeout = timeout_s
-        self.last_cdp_retry = retry
         self.cdp_calls.append({"method": method, "params": params or {}, "session_id": session_id})
         if method == "DOM.getDocument":
             return {"root": {"nodeId": 1}}
@@ -71,8 +69,6 @@ class FakeRuntime:
         return {
             "mode": "fake",
             "target": self.current_tab(),
-            "reconnect_count": 0,
-            "last_reconnect_reason": None,
         }
 
     def navigate(self, url: str, wait: bool = True, timeout_s: float = 20.0) -> Dict[str, Any]:
@@ -194,27 +190,11 @@ class CloudRuntime(FakeRuntime):
         self.cloud_live_url = "https://live.example/session"
 
 
-class ReconnectedCloudRuntime(CloudRuntime):
-    def __init__(self, root_dir: Path, headless: bool) -> None:
-        super().__init__(root_dir, headless)
-        self.reconnect_count = 0
-        self.last_reconnect_reason = None
-
+class ChangedLiveUrlCloudRuntime(CloudRuntime):
     def page_info(self) -> Dict[str, Any]:
         self.cloud_browser_id = "browser-2"
-        self.cloud_live_url = "https://live.example/reconnected"
-        self.reconnect_count = 1
-        self.last_reconnect_reason = "started new Browser Use cloud browser"
+        self.cloud_live_url = "https://live.example/changed"
         return {"url": "https://example.com", "title": "Example"}
-
-    def connection_info(self) -> Dict[str, Any]:
-        return {
-            "mode": self.mode,
-            "cloud_browser_id": self.cloud_browser_id,
-            "cloud_live_url": self.cloud_live_url,
-            "reconnect_count": self.reconnect_count,
-            "last_reconnect_reason": self.last_reconnect_reason,
-        }
 
 
 class PythonBrowserToolTest(unittest.TestCase):
@@ -329,26 +309,22 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["ok"])
             self.assertEqual(result.data["result"], {"before": "session-1", "after": "attached-session", "target": "page-target"})
 
-    def test_cloud_runtime_emits_new_live_preview_after_reconnect(self) -> None:
+    def test_cloud_runtime_emits_new_live_preview_when_url_changes(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
             session = store.create(cwd=Path(tmp))
             ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
-            tool = PythonBrowserTool(runtime_factory=lambda root, headless: ReconnectedCloudRuntime(root, headless))
+            tool = PythonBrowserTool(runtime_factory=lambda root, headless: ChangedLiveUrlCloudRuntime(root, headless))
 
             result = tool(ctx, {"headless": True, "code": "page_info(); result = 1"})
 
             self.assertTrue(result.data["ok"])
             live_events = [event for event in store.events.read(session.id) if event.type == "browser.live_url"]
-            reconnect_events = [event for event in store.events.read(session.id) if event.type == "browser.reconnected"]
             self.assertEqual(len(live_events), 2)
             self.assertEqual(live_events[0].payload["live_url"], "https://live.example/session")
             self.assertEqual(live_events[1].payload["browser_id"], "browser-2")
-            self.assertEqual(live_events[1].payload["live_url"], "https://live.example/reconnected")
-            self.assertTrue(live_events[1].payload["reconnected"])
-            self.assertEqual(len(reconnect_events), 1)
-            self.assertEqual(reconnect_events[0].payload["reason"], "started new Browser Use cloud browser")
-            self.assertEqual(reconnect_events[0].payload["reconnect_count"], 1)
+            self.assertEqual(live_events[1].payload["live_url"], "https://live.example/changed")
+            self.assertEqual(set(live_events[1].payload), {"mode", "browser_id", "live_url"})
 
     def test_screenshot_element_captures_clipped_element(self) -> None:
         runtime_holder: Dict[str, FakeRuntime] = {}
@@ -904,7 +880,7 @@ class PythonBrowserToolTest(unittest.TestCase):
                 {
                     "headless": True,
                     "code": (
-                        "raw = cdp('Runtime.evaluate', {'expression': '1'}, timeout_s=2, retry=False)\n"
+                        "raw = cdp('Runtime.evaluate', {'expression': '1'}, timeout_s=2)\n"
                         "nav = navigate('https://example.com', timeout=4)\n"
                         "result = {'raw': raw, 'nav': nav}"
                     ),
@@ -913,7 +889,6 @@ class PythonBrowserToolTest(unittest.TestCase):
 
             self.assertTrue(result.data["ok"])
             self.assertEqual(runtime_holder["runtime"].last_cdp_timeout, 2)
-            self.assertFalse(runtime_holder["runtime"].last_cdp_retry)
             self.assertEqual(runtime_holder["runtime"].last_navigate_timeout, 4)
 
     def test_raw_cdp_accepts_timeout_alias_without_leaking_to_params(self) -> None:
@@ -942,6 +917,24 @@ class PythonBrowserToolTest(unittest.TestCase):
             runtime = runtime_holder["runtime"]
             self.assertEqual(runtime.last_cdp_timeout, 7)
             self.assertNotIn("timeout", runtime.cdp_calls[-1]["params"])
+
+    def test_raw_cdp_rejects_removed_retry_argument(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "cdp('Runtime.evaluate', expression='1', retry=False)",
+                },
+            )
+
+            self.assertFalse(result.data["ok"])
+            self.assertIn("cdp retry/reconnect was removed", result.data["stderr"])
 
     def test_wait_helpers_are_exposed(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

@@ -1288,8 +1288,6 @@ class BrowserUseTerminalApp(App[None]):
             _write_markdown(log, line, style="#e4e4e7")
         elif event_type == "browser.live_url":
             _write_markdown(log, line)
-        elif event_type == "browser.reconnected":
-            _write_markdown(log, line)
         elif event_type == "session.failed":
             log.write(f"[bold #e4e4e7]{escaped}[/bold #e4e4e7]")
         elif event_type == "session.deadline_warning":
@@ -2727,20 +2725,10 @@ def _format_event_for_transcript(event: Event) -> str:
     if event.type == "model.usage":
         return ""
     if event.type == "browser.live_url":
-        if payload.get("reconnected"):
-            return ""
         url = str(payload.get("live_url") or payload.get("url") or "").strip()
         if not url:
             return "browser live preview"
         return f"browser live preview: [open live preview]({url})"
-    if event.type == "browser.reconnected":
-        reason = str(payload.get("reason") or "connection restored").strip()
-        count = payload.get("reconnect_count")
-        live_url = str(payload.get("live_url") or "").strip()
-        suffix = f" ({count})" if count else ""
-        if live_url:
-            return f"browser reconnected{suffix}: {reason} · [open live preview]({live_url})"
-        return f"browser reconnected{suffix}: {reason}"
     if event.type == "tool.started":
         name = str(payload.get("name") or "tool")
         return _format_tool_started_summary(name, payload.get("arguments") or {})
@@ -3860,4 +3848,4 @@ def _textual_mouse_enabled() -> bool:
     configured = os.environ.get("LLM_BROWSER_TUI_MOUSE")
     if configured is not None:
         return configured.strip().lower() in {"1", "true", "yes", "on"}
-    return True
+    return bool(os.environ.get("TMUX"))

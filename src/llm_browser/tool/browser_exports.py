@@ -20,7 +20,7 @@ BROWSER_HELP_TEXT = (
     + """
 
 Core browser:
-  cdp(method, params=None, timeout_s=None, retry=False) or cdp("Page.navigate", url="...", timeout=30)
+  cdp(method, params=None, timeout_s=None) or cdp("Page.navigate", url="...", timeout=30)
   js(expr, await_promise=True, repl_mode=None, timeout_s=None) or js(expr, timeout=30)
   new_tab(url), goto_url(url), list_tabs(include_internal=True)
   switch_tab(target), current_tab(), current_cdp_session(), set_cdp_session(session_id, target_id=None)

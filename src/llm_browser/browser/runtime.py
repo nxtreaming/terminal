@@ -187,8 +187,6 @@ class BrowserRuntime:
         self.cloud_api_key: Optional[str] = None
         self.cloud_api_base: str = BROWSER_USE_CLOUD_API
         self._cloud_create_body: Optional[Dict[str, Any]] = None
-        self._reconnect_count = 0
-        self._last_reconnect_reason: Optional[str] = None
         self._screenshot_index = 0
         self._trace_index = 0
         self._event_log: List[Dict[str, Any]] = []
@@ -422,8 +420,6 @@ class BrowserRuntime:
             "cloud_browser_id": self.cloud_browser_id,
             "cloud_live_url": self.cloud_live_url,
             "downloads_dir": str(self.downloads_dir),
-            "reconnect_count": self._reconnect_count,
-            "last_reconnect_reason": self._last_reconnect_reason,
         }
 
     def set_cancel_check(self, cancel_check: Optional[Callable[[], None]]) -> None:
@@ -516,7 +512,7 @@ class BrowserRuntime:
         for page in self.tabs():
             if str(page.get("id") or page.get("targetId") or "") == target_id:
                 try:
-                    self.cdp("Target.activateTarget", {"targetId": target_id}, retry=False)
+                    self.cdp("Target.activateTarget", {"targetId": target_id})
                 except Exception:
                     pass
                 return self.attach_target(page)
@@ -598,7 +594,6 @@ class BrowserRuntime:
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
         timeout: Optional[float] = None,
-        retry: bool = False,
         return_on_event: Optional[str] = None,
     ) -> Dict[str, Any]:
         if timeout is not None:
@@ -616,169 +611,16 @@ class BrowserRuntime:
             result = self.client.call(method, **call_kwargs)
             self._check_cancel()
             return result
-        except (CdpConnectionError, requests.RequestException, OSError) as exc:
-            if not retry:
-                raise
-            self._self_heal_after_disconnect(exc)
-            assert self.client is not None
-            effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
-            call_kwargs = {"params": params, "session_id": effective_session_id, "timeout_s": timeout_s}
-            if return_on_event is not None:
-                call_kwargs["return_on_event"] = return_on_event
-            result = self.client.call(method, **call_kwargs)
-            self._check_cancel()
-            return result
-        except CdpError as exc:
-            if (
-                retry
-                and effective_session_id is not None
-                and effective_session_id == self.default_session_id
-                and "Session with given id not found" in str(exc)
-            ):
-                target_id = str((self.target or {}).get("id") or (self.target or {}).get("targetId") or "")
-                if target_id:
-                    self._attach_browser_target(target_id)
-                    effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
-                    call_kwargs = {"params": params, "session_id": effective_session_id, "timeout_s": timeout_s}
-                    if return_on_event is not None:
-                        call_kwargs["return_on_event"] = return_on_event
-                    result = self.client.call(method, **call_kwargs)
-                    self._check_cancel()
-                    return result
+        except (CdpConnectionError, requests.RequestException, OSError):
             raise
-
-    def _self_heal_after_disconnect(self, original: BaseException) -> None:
-        errors: List[BaseException] = []
-        try:
-            self._reattach_after_disconnect()
-            self._mark_reconnected("reattached existing CDP endpoint")
-            return
-        except BaseException as exc:
-            errors.append(exc)
-
-        try:
-            if self._restart_browser_after_disconnect():
-                return
-        except BaseException as exc:
-            errors.append(exc)
-
-        detail = "; ".join(f"{type(exc).__name__}: {exc}" for exc in errors) or str(original)
-        raise CdpConnectionError(f"CDP connection lost and browser self-heal failed: {detail}") from original
-
-    def _mark_reconnected(self, reason: str) -> None:
-        self._reconnect_count += 1
-        self._last_reconnect_reason = reason
-
-    def _reattach_after_disconnect(self) -> None:
-        if self.client is not None:
-            self.client.close()
-            self.client = None
-        target_id = str((self.target or {}).get("id") or "")
-        if self.http_url and target_id:
-            for page in self.tabs():
-                if page.get("id") == target_id:
-                    self.attach_target(page)
-                    return
-        if self.websocket_url:
-            self.client = CdpClient(self.websocket_url, **_cdp_client_kwargs(self.websocket_url, self.mode))
-            self.client.connect()
-            if self.browser_level_ws:
-                if target_id:
-                    self._attach_browser_target(target_id)
-                else:
-                    self._initialize_websocket_target()
-            else:
-                self._enable_page_domains()
-            return
-        self.attach_first_page()
-
-    def _restart_browser_after_disconnect(self) -> bool:
-        if self.mode == "cloud":
-            self._restart_cloud_browser()
-            self._mark_reconnected("started new Browser Use cloud browser")
-            return True
-        if self.mode == "chromium":
-            self._restart_owned_chromium()
-            self._mark_reconnected("restarted owned Chromium")
-            return True
-        if self.mode == "real":
-            self._rediscover_real_browser()
-            self._mark_reconnected("rediscovered real Chrome CDP endpoint")
-            return True
-        return False
-
-    def _clear_cdp_state(self) -> None:
-        if self.client is not None:
-            self.client.close()
-            self.client = None
-        self.target = None
-        self.default_session_id = None
-        self.browser_level_ws = False
-        self.pending_dialog = None
-
-    def _attach_websocket_in_place(self, websocket_url: str) -> None:
-        self._clear_cdp_state()
-        self.http_url = None
-        self.websocket_url = websocket_url
-        self.client = CdpClient(websocket_url, **_cdp_client_kwargs(websocket_url, self.mode))
-        self.client.connect()
-        self._initialize_websocket_target()
-
-    def _restart_cloud_browser(self) -> None:
-        if not self.cloud_api_key:
-            raise RuntimeError("cannot restart cloud browser without Browser Use API key")
-        old_browser_id = self.cloud_browser_id
-        if old_browser_id:
-            _stop_cloud_browser(self.cloud_api_base, self.cloud_api_key, old_browser_id)
-        body = dict(self._cloud_create_body or {})
-        browser = _browser_use_request(
-            api_base=self.cloud_api_base,
-            api_key=self.cloud_api_key,
-            path="/browsers",
-            method="POST",
-            body=body,
-        )
-        self.cloud_browser_id = str(browser.get("id") or "") or None
-        self.cloud_live_url = str(browser.get("liveUrl") or browser.get("live_url") or "") or None
-        self._attach_websocket_in_place(_cloud_browser_websocket_url(browser))
-        self.mode = "cloud"
-        self.preserve_profile = True
-
-    def _restart_owned_chromium(self) -> None:
-        if self.chrome is None:
-            raise RuntimeError("cannot restart owned Chromium because launch metadata is missing")
-        config = self.chrome.config
-        self._clear_cdp_state()
-        self.chrome.stop()
-        self.chrome = start_chrome(
-            root_dir=self.root_dir,
-            profile_template=config.profile_template,
-            chrome_path=config.chrome_path,
-            headless=config.headless,
-            width=config.width,
-            height=config.height,
-        )
-        self.downloads_dir = self.chrome.config.downloads_dir
-        self.http_url = self.chrome.http_url
-        self.websocket_url = None
-        self.mode = "chromium"
-        self.attach_first_page()
-
-    def _rediscover_real_browser(self) -> None:
-        endpoint = discover_real_browser_endpoint(timeout_s=3.0)
-        self._clear_cdp_state()
-        self.mode = "real"
-        self.preserve_profile = True
-        if endpoint.http_url:
-            self.http_url = endpoint.http_url.rstrip("/")
-            self.websocket_url = None
-            self.attach_first_page()
-            return
-        if endpoint.websocket_url:
-            self._attach_websocket_in_place(endpoint.websocket_url)
-            self.mode = "real"
-            return
-        raise RuntimeError("real browser discovery returned no CDP endpoint")
+        except CdpError as exc:
+            if effective_session_id is not None and "Session with given id not found" in str(exc):
+                raise CdpError(
+                    f"{exc} The active CDP session is stale. CDP session ids are websocket-scoped; "
+                    "reattach with Target.getTargets -> Target.attachToTarget -> "
+                    "set_cdp_session(sessionId, target_id=targetId)."
+                ) from exc
+            raise
 
     def _initialize_websocket_target(self) -> None:
         assert self.client is not None
@@ -849,7 +691,7 @@ class BrowserRuntime:
     def _enable_page_domains(self) -> None:
         for domain in ("Page", "DOM", "Runtime", "Network", "Log"):
             try:
-                self.cdp(f"{domain}.enable", retry=False)
+                self.cdp(f"{domain}.enable")
             except Exception:
                 pass
         self._configure_downloads()
@@ -862,7 +704,7 @@ class BrowserRuntime:
         )
         for method, params in attempts:
             try:
-                self.cdp(method, params, retry=False)
+                self.cdp(method, params)
                 return
             except Exception:
                 continue
@@ -1040,12 +882,12 @@ class BrowserRuntime:
             }
         elif full_page:
             params["captureBeyondViewport"] = True
-            metrics = self.cdp("Page.getLayoutMetrics", timeout_s=timeout_s, retry=False)
+            metrics = self.cdp("Page.getLayoutMetrics", timeout_s=timeout_s)
             size = metrics.get("cssContentSize") or metrics.get("contentSize") or {}
             width = max(1, int(math.ceil(float(size.get("width") or 1280))))
             height = max(1, int(math.ceil(float(size.get("height") or 900))))
             params["clip"] = {"x": 0, "y": 0, "width": width, "height": height, "scale": 1}
-        result = self.cdp("Page.captureScreenshot", params, timeout_s=timeout_s, retry=False)
+        result = self.cdp("Page.captureScreenshot", params, timeout_s=timeout_s)
         data = base64.b64decode(result["data"])
 
         self._screenshot_index += 1
@@ -1105,7 +947,6 @@ class BrowserRuntime:
                 "Input.dispatchMouseEvent",
                 params,
                 timeout_s=5,
-                retry=False,
                 return_on_event="Page.javascriptDialogOpening",
             )
             self.drain_events(timeout_s=0.02)
@@ -1517,7 +1358,7 @@ def _print_real_browser_allow_instructions() -> None:
         return
     print(
         'browser-use-terminal: opened chrome://inspect/#remote-debugging. '
-        'Tick "Allow remote debugging for this browser instance" and click Allow if Chrome asks, then the attach will retry.',
+        'Tick "Allow remote debugging for this browser instance" and click Allow if Chrome asks, then run the attach again.',
         file=sys.stderr,
     )
 

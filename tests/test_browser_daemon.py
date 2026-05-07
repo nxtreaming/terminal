@@ -63,6 +63,18 @@ class BrowserDaemonTest(unittest.TestCase):
         ensure.assert_not_called()
         self.assertEqual(request.call_count, 1)
 
+    def test_daemon_runtime_cdp_payload_has_no_retry_field(self) -> None:
+        runtime = DaemonBrowserRuntime("demo", Path("/tmp/demo"), headless=True, backend="chromium")
+
+        with patch("llm_browser.browser.daemon_client.request", return_value={"result": {"ok": True}}) as request:
+            result = runtime.cdp("Browser.getVersion", timeout_s=2)
+
+        self.assertEqual(result, {"ok": True})
+        payload = request.call_args.args[1]
+        self.assertEqual(payload["op"], "cdp")
+        self.assertEqual(payload["method"], "Browser.getVersion")
+        self.assertNotIn("retry", payload)
+
     def test_daemon_identity_match_includes_root_backend_and_headless(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             root = Path(tmp)

@@ -39,10 +39,8 @@ class ScreenshotRuntime(BrowserRuntime):
         params: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
-        retry: bool = True,
     ) -> Dict[str, Any]:
         self.last_timeout_s = timeout_s
-        self.last_retry = retry
         self.last_params = params or {}
         if method == "Page.captureScreenshot":
             return {"data": base64.b64encode(b"png-bytes").decode("ascii")}
@@ -97,7 +95,6 @@ class RecordingRuntime(BrowserRuntime):
         params: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
-        retry: bool = True,
     ) -> Dict[str, Any]:
         self.calls.append((method, params or {}))
         if method == "Runtime.evaluate":
@@ -111,7 +108,7 @@ class RecordingRuntime(BrowserRuntime):
 class DialogClickRuntime(BrowserRuntime):
     def __init__(self, root_dir: Path) -> None:
         super().__init__(root_dir=root_dir)
-        self.calls: list[tuple[str, Dict[str, Any], Optional[float], bool]] = []
+        self.calls: list[tuple[str, Dict[str, Any], Optional[float], Optional[str]]] = []
         self.dialog_already_closed = False
         self.client = DrainClient(
             [
@@ -128,10 +125,9 @@ class DialogClickRuntime(BrowserRuntime):
         params: Optional[Dict[str, Any]] = None,
         session_id: Optional[str] = None,
         timeout_s: Optional[float] = None,
-        retry: bool = True,
         return_on_event: Optional[str] = None,
     ) -> Dict[str, Any]:
-        self.calls.append((method, params or {}, timeout_s, retry))
+        self.calls.append((method, params or {}, timeout_s, return_on_event))
         if method == "Input.dispatchMouseEvent" and (params or {}).get("type") == "mouseReleased":
             raise CdpConnectionError("dialog blocked mouse release")
         if method == "Page.handleJavaScriptDialog" and self.dialog_already_closed:
@@ -164,41 +160,6 @@ class BrokenCdpClient:
 
     def close(self) -> None:
         self.closed = True
-
-
-class FailingConnectClient:
-    def connect(self) -> None:
-        raise CdpConnectionError("stale websocket")
-
-    def close(self) -> None:
-        return None
-
-
-class RecoveredBrowserClient:
-    def __init__(self) -> None:
-        self.calls: list[tuple[str, Optional[str]]] = []
-
-    def connect(self) -> None:
-        return None
-
-    def call(
-        self,
-        method: str,
-        params: Optional[Dict[str, Any]] = None,
-        session_id: Optional[str] = None,
-        timeout_s: Optional[float] = None,
-    ) -> Dict[str, Any]:
-        self.calls.append((method, session_id))
-        if method == "Target.getTargets":
-            return {"targetInfos": [{"targetId": "new-page", "type": "page", "url": "https://recovered.example"}]}
-        if method == "Target.attachToTarget":
-            return {"sessionId": "new-session"}
-        if method == "Browser.getVersion":
-            return {"product": "Recovered Chrome"}
-        return {}
-
-    def close(self) -> None:
-        return None
 
 
 class SequenceRuntime(BrowserRuntime):
@@ -245,7 +206,6 @@ class BrowserRuntimeTest(unittest.TestCase):
             self.assertEqual(image.url, "https://fallback.example")
             self.assertTrue(Path(image.path).with_suffix(".json").exists())
             self.assertEqual(runtime.last_timeout_s, 8.0)
-            self.assertFalse(runtime.last_retry)
 
     def test_screenshot_accepts_page_clip(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -443,65 +403,22 @@ class BrowserRuntimeTest(unittest.TestCase):
             headers={"X-Browser-Use-API-Key": "key", "Content-Type": "application/json"},
         )
 
-    def test_cloud_runtime_retry_true_creates_new_browser_when_websocket_is_dead(self) -> None:
-        broken = BrokenCdpClient()
-        recovered = RecoveredBrowserClient()
-
-        def cloud_request(
-            api_base: str,
-            api_key: str,
-            path: str,
-            method: str,
-            body: Optional[Dict[str, Any]] = None,
-        ) -> Dict[str, Any]:
-            if method == "PATCH":
-                return {}
-            if method == "POST":
-                return {"id": "browser-2", "wsUrl": "ws://cloud/new", "liveUrl": "https://live.example/new"}
-            raise AssertionError(method)
-
+    def test_cloud_runtime_cdp_has_no_retry_argument(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = BrowserRuntime(Path(tmp))
             runtime.mode = "cloud"
-            runtime.client = broken  # type: ignore[assignment]
+            runtime.client = BrokenCdpClient()  # type: ignore[assignment]
             runtime.websocket_url = "ws://cloud/old"
-            runtime.browser_level_ws = True
-            runtime.target = {"id": "old-page", "type": "page", "url": "https://old.example"}
-            runtime.default_session_id = "old-session"
             runtime.cloud_api_key = "key"
-            runtime.cloud_api_base = "https://api.example"
             runtime.cloud_browser_id = "browser-1"
-            runtime.cloud_live_url = "https://live.example/old"
-            runtime._cloud_create_body = {"timeout": 30}
 
-            with patch("llm_browser.browser.runtime.CdpClient", side_effect=[FailingConnectClient(), recovered]), patch(
-                "llm_browser.browser.runtime._browser_use_request", side_effect=cloud_request
-            ) as request:
-                result = runtime.cdp("Browser.getVersion", retry=True)
+            with patch("llm_browser.browser.runtime._browser_use_request") as request:
+                with self.assertRaises(TypeError):
+                    runtime.cdp("Browser.getVersion", retry=True)  # type: ignore[call-arg]
 
-        self.assertEqual(result, {"product": "Recovered Chrome"})
-        self.assertTrue(broken.closed)
-        self.assertEqual(runtime.cloud_browser_id, "browser-2")
-        self.assertEqual(runtime.cloud_live_url, "https://live.example/new")
-        self.assertEqual(runtime.websocket_url, "ws://cloud/new")
-        self.assertEqual(runtime.default_session_id, "new-session")
-        self.assertEqual(runtime.connection_info()["reconnect_count"], 1)
-        request.assert_any_call(
-            api_base="https://api.example",
-            api_key="key",
-            path="/browsers/browser-1",
-            method="PATCH",
-            body={"action": "stop"},
-        )
-        request.assert_any_call(
-            api_base="https://api.example",
-            api_key="key",
-            path="/browsers",
-            method="POST",
-            body={"timeout": 30},
-        )
+        request.assert_not_called()
 
-    def test_cloud_runtime_cdp_default_does_not_self_heal_dead_websocket(self) -> None:
+    def test_cloud_runtime_cdp_does_not_self_heal_dead_websocket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = BrowserRuntime(Path(tmp))
             runtime.mode = "cloud"
@@ -599,9 +516,9 @@ class BrowserRuntimeTest(unittest.TestCase):
             for call in runtime.calls
             if call[0] == "Input.dispatchMouseEvent" and call[1].get("type") == "mouseReleased"
         ]
-        self.assertFalse(move_calls[0][3])
+        self.assertEqual(move_calls[0][3], "Page.javascriptDialogOpening")
         self.assertEqual(release_calls[0][2], 5)
-        self.assertFalse(release_calls[0][3])
+        self.assertEqual(release_calls[0][3], "Page.javascriptDialogOpening")
 
     def test_handle_dialog_accepts_and_clears_pending_dialog(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -618,7 +535,7 @@ class BrowserRuntimeTest(unittest.TestCase):
                 "Page.handleJavaScriptDialog",
                 {"accept": True, "promptText": "ZEBRA"},
                 5,
-                True,
+                None,
             ),
             runtime.calls,
         )

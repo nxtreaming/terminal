@@ -90,13 +90,14 @@ class CdpClient:
                 while True:
                     remaining = deadline - time.monotonic()
                     if remaining <= 0:
-                        self.close()
                         raise CdpConnectionError(f"CDP websocket receive timed out waiting for {method}")
                     if timeout_changed:
                         self._ws.settimeout(max(0.001, remaining))
                     try:
                         raw = self._ws.recv()
-                    except (websocket.WebSocketException, TimeoutError, OSError) as exc:
+                    except (websocket.WebSocketTimeoutException, TimeoutError) as exc:
+                        raise CdpConnectionError(f"CDP websocket receive timed out waiting for {method}: {exc}") from exc
+                    except (websocket.WebSocketException, OSError) as exc:
                         self.close()
                         raise CdpConnectionError(f"CDP websocket receive failed: {exc}") from exc
                     if not raw:

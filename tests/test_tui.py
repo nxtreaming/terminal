@@ -249,22 +249,6 @@ json.dump(prices, open('/tmp/netflix_prices.json', 'w'))
             self.assertNotIn("file://", linked)
             self.assertEqual(_file_links_for_text(f"`{path}`"), [path.resolve()])
 
-    def test_browser_reconnect_event_renders_recovery_status(self) -> None:
-        event = Event(
-            type="browser.reconnected",
-            session_id="s1",
-            payload={
-                "reason": "started new Browser Use cloud browser",
-                "reconnect_count": 2,
-                "live_url": "https://live.example/new",
-            },
-        )
-
-        formatted = _format_event_for_transcript(event)
-
-        self.assertIn("browser reconnected (2): started new Browser Use cloud browser", formatted)
-        self.assertIn("[open live preview](https://live.example/new)", formatted)
-
     def test_browser_live_preview_event_renders_compact_link(self) -> None:
         event = Event(
             type="browser.live_url",
@@ -744,14 +728,14 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertEqual(transcript.scroll_y, scrolled_y)
                 self.assertLess(transcript.scroll_y, transcript.max_scroll_y)
 
-    def test_textual_tui_enables_mouse_reporting_by_default(self) -> None:
+    def test_textual_tui_disables_mouse_reporting_outside_tmux_for_terminal_selection(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             tui = TextualTui(SessionStore(Path(tmp)), provider_label="fake", model_label="fake-model")
 
             with patch.dict(os.environ, {}, clear=True), patch.object(tui.app, "run") as run_mock:
                 self.assertEqual(tui.run(), 0)
 
-            run_mock.assert_called_once_with(mouse=True)
+            run_mock.assert_called_once_with(mouse=False)
 
     def test_textual_tui_enables_mouse_reporting_inside_tmux_for_scroll_wheel(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

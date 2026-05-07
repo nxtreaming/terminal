@@ -109,7 +109,6 @@ class BrowserDaemon:
                     params=request.get("params"),
                     session_id=request.get("session_id"),
                     timeout_s=request.get("timeout_s"),
-                    retry=bool(request.get("retry", False)),
                 )
             return {"result": result}
 
