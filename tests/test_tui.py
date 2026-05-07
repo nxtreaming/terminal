@@ -132,12 +132,68 @@ class TuiTest(unittest.TestCase):
             ),
         ]
 
-        lines = _format_events_for_transcript(events)
+        lines = _format_events_for_transcript(events, show_tools=True)
 
         self.assertIn("print('hello')", lines[0][0])
         self.assertIn("1 lines", lines[1][0])
         self.assertIn("400 B", lines[1][0])
         self.assertNotIn('"ok": true', lines[1][0])
+
+    def test_default_transcript_hides_python_probe_tools(self) -> None:
+        events = [
+            Event(type="session.input", session_id="s1", payload={"text": "inspect the page"}),
+            Event(
+                type="tool.started",
+                session_id="s1",
+                payload={
+                    "name": "python",
+                    "tool_call_id": "call_1",
+                    "arguments": {"code": "from llm_browser import *\nprint('ready')"},
+                },
+            ),
+            Event(
+                type="tool.finished",
+                session_id="s1",
+                payload={"name": "python", "tool_call_id": "call_1", "output": {"text": "ready"}},
+            ),
+            Event(type="model.delta", session_id="s1", payload={"text": "Ready.\n"}),
+        ]
+
+        lines = _format_events_for_transcript(events)
+        rendered = "\n".join(line for line, _ in lines)
+
+        self.assertEqual([event_type for _, event_type in lines], ["session.input", "model.delta"])
+        self.assertNotIn("python", rendered)
+        self.assertNotIn("llm_browser", rendered)
+
+    def test_default_transcript_expands_browser_python_tools(self) -> None:
+        events = [
+            Event(
+                type="tool.started",
+                session_id="s1",
+                payload={
+                    "name": "python",
+                    "arguments": {
+                        "code": "\n".join(
+                            [
+                                "goto_url('https://example.com/search')",
+                                "fill_input('#q', 'banana plugs')",
+                                "click_text('Search')",
+                                "capture_screenshot('results')",
+                            ]
+                        )
+                    },
+                },
+            )
+        ]
+
+        lines = _format_events_for_transcript(events)
+
+        self.assertEqual([event_type for _, event_type in lines], ["browser.action"] * 4)
+        self.assertIn("browse open example.com/search", lines[0][0])
+        self.assertIn("browse type #q", lines[1][0])
+        self.assertIn('browse tap "Search"', lines[2][0])
+        self.assertIn("browse snap results screenshot", lines[3][0])
 
     def test_python_code_summary_describes_intent_instead_of_dumping_first_line(self) -> None:
         self.assertEqual(
@@ -176,13 +232,46 @@ html = requests.get(url).text
 for country in countries:
     prices[country] = extract_price(country, html)
 json.dump(prices, open('/tmp/netflix_prices.json', 'w'))
-"""
+        """
         self.assertEqual(_summarize_code(scraper), "5 lines · extract country pricing to JSON")
+
+    def test_browser_python_tool_starts_render_as_browser_actions(self) -> None:
+        navigate_event = Event(
+            type="tool.started",
+            session_id="s1",
+            payload={"name": "python", "arguments": {"code": "goto_url('https://help.netflix.com/en/node/24926')"}},
+        )
+        self.assertEqual(
+            _format_event_for_transcript(navigate_event),
+            "browse open help.netflix.com/en/node/24926",
+        )
+
+        action_event = Event(
+            type="tool.started",
+            session_id="s1",
+            payload={
+                "name": "python",
+                "arguments": {
+                    "code": "\n".join(
+                        [
+                            "goto_url('https://example.com/search')",
+                            "fill_input('#q', 'banana plugs')",
+                            "click_text('Search')",
+                            "capture_screenshot('results')",
+                        ]
+                    )
+                },
+            },
+        )
+        formatted = _format_event_for_transcript(action_event)
+
+        self.assertEqual(formatted, "browse steps 4 browser moves · open, type, tap, snap")
+        self.assertNotIn("python", formatted)
 
     def test_done_transcript_preserves_markdown(self) -> None:
         event = Event(type="session.done", session_id="s1", payload={"result": "**Done**\n- item"})
 
-        self.assertEqual(_format_event_for_transcript(event), "done:\n\n**Done**\n- item")
+        self.assertEqual(_format_event_for_transcript(event), "**Done**\n- item")
 
     def test_failed_transcript_compacts_provider_json_error(self) -> None:
         event = Event(
@@ -258,7 +347,7 @@ json.dump(prices, open('/tmp/netflix_prices.json', 'w'))
 
         formatted = _format_event_for_transcript(event)
 
-        self.assertEqual(formatted, "browser live preview: [open live preview](https://live.example/session)")
+        self.assertEqual(formatted, "browse live live.example/session")
 
     def test_session_followup_renders_text_not_raw_payload(self) -> None:
         event = Event(type="session.followup", session_id="s1", payload={"text": "where is the file?"})
@@ -282,7 +371,7 @@ json.dump(prices, open('/tmp/netflix_prices.json', 'w'))
             ),
         ]
 
-        lines = _format_events_for_transcript(events)
+        lines = _format_events_for_transcript(events, show_tools=True)
 
         self.assertEqual(len(lines), 1)
         self.assertEqual(lines[0][1], "tool.output")
@@ -488,6 +577,81 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 await pilot.pause()
                 self.assertFalse(sidebar.display)
 
+    async def test_session_log_loads_full_history_past_event_tail(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "first visible request"})
+            for index in range(430):
+                store.emit(
+                    session.id,
+                    "tool.started",
+                    {
+                        "name": "python",
+                        "tool_call_id": f"probe_{index}",
+                        "arguments": {"code": "from llm_browser import *\nprint('ready')"},
+                    },
+                )
+            store.emit(session.id, "model.delta", {"text": "final visible answer\n"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                await pilot.pause()
+                transcript = app.query_one("#transcript")
+
+                visual = "\n".join(line.text for line in transcript.lines)
+                self.assertIn("first visible request", visual)
+                self.assertIn("final visible answer", visual)
+
+    async def test_loaded_session_prompt_strip_uses_transcript_width(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "how many banana plugs do i actually need?"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                await pilot.pause()
+                transcript = app.query_one("#transcript")
+
+                self.assertGreaterEqual(transcript.lines[0].cell_length, 100)
+
+    async def test_loaded_session_separates_prompt_actions_and_answer(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create()
+            store.emit(session.id, "session.input", {"text": "go to google"})
+            store.emit(
+                session.id,
+                "tool.started",
+                {
+                    "name": "python",
+                    "arguments": {"code": "goto_url('https://www.google.com')"},
+                },
+            )
+            store.emit(session.id, "model.delta", {"text": "Opened google.com.\n"})
+            app = BrowserUseTerminalApp(store, provider_label="fake", model_label="fake-model")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app.selected_session_id = session.id
+                app._load_session_log(session.id)
+                await pilot.pause()
+                transcript = app.query_one("#transcript")
+
+                lines = [line.text.rstrip("\u00a0") for line in transcript.lines]
+                prompt_index = next(index for index, line in enumerate(lines) if "go to google" in line)
+                action_index = next(index for index, line in enumerate(lines) if "www.google.com" in line)
+                answer_index = next(index for index, line in enumerate(lines) if "Opened google.com." in line)
+
+                self.assertEqual(lines[prompt_index + 1], "")
+                self.assertEqual(action_index, prompt_index + 2)
+                self.assertEqual(lines[action_index + 1], "")
+                self.assertEqual(answer_index, action_index + 2)
+
     async def test_artifact_shortcut_opens_inspector(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
@@ -688,7 +852,7 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 app._scroll_transcript(lines=-1)
                 await pilot.pause()
                 event = store.events.append(
-                    Event(type="tool.started", session_id=session.id, payload={"name": "python", "tool_call_id": "call_1"})
+                    Event(type="model.delta", session_id=session.id, payload={"text": "visible update near bottom\n"})
                 )
                 app._handle_event(event)
                 await pilot.pause()
@@ -720,7 +884,7 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
                 self.assertLess(scrolled_y, bottom - app._transcript_follow_margin(transcript))
 
                 event = store.events.append(
-                    Event(type="tool.started", session_id=session.id, payload={"name": "python", "tool_call_id": "call_far"})
+                    Event(type="model.delta", session_id=session.id, payload={"text": "visible update far away\n"})
                 )
                 app._handle_event(event)
                 await pilot.pause()

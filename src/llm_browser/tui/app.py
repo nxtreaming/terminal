@@ -12,6 +12,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Any, Callable, Optional
+from urllib.parse import urlparse
 
 from rich.align import Align
 from rich.console import Group
@@ -99,6 +100,37 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
 _ACTIVITY_FRAMES = ("∙", "●", "∙", "·")
 _TRANSCRIPT_FOLLOW_MIN_MARGIN = 1
 _TRANSCRIPT_FOLLOW_MAX_MARGIN = 2
+_BROWSER_ACTION_PREFIX = "browse "
+_BROWSER_ACTION_STYLES = {
+    "live": "#5c9cf5",
+    "open": "#5c9cf5",
+    "wait": "#d7a84f",
+    "watch": "#d7a84f",
+    "tap": "#e0719b",
+    "type": "#59b879",
+    "key": "#59b879",
+    "scroll": "#a78bfa",
+    "snap": "#a78bfa",
+    "peek": "#8aa6a0",
+    "fetch": "#8aa6a0",
+    "tabs": "#8aa6a0",
+    "steps": "#9b9ca5",
+}
+_BROWSER_ACTION_ICONS = {
+    "live": "●",
+    "open": "↗",
+    "wait": "…",
+    "watch": "◌",
+    "tap": "•",
+    "type": "⌨",
+    "key": "⌘",
+    "scroll": "↕",
+    "snap": "▣",
+    "peek": "◇",
+    "fetch": "↓",
+    "tabs": "▤",
+    "steps": "›",
+}
 
 
 SHORTCUT_PALETTE: list[tuple[str, str, str]] = [
@@ -628,20 +660,20 @@ class SessionPalette(ModalScreen[Optional[str]]):
 class BrowserUseTerminalApp(App[None]):
     CSS = """
     Screen {
-        background: #15161a;
+        background: transparent;
         color: #e4e4e7;
     }
 
     #body {
         height: 1fr;
-        background: #0a0a0a;
+        background: transparent;
     }
 
     #main {
         width: 1fr;
         min-width: 52;
         padding: 1 2;
-        background: #0a0a0a;
+        background: transparent;
         align: center middle;
     }
 
@@ -666,7 +698,7 @@ class BrowserUseTerminalApp(App[None]):
         display: none;
         height: auto;
         margin-bottom: 2;
-        background: #0a0a0a;
+        background: transparent;
     }
 
     #main.home #home-logo {
@@ -677,10 +709,10 @@ class BrowserUseTerminalApp(App[None]):
     #transcript {
         height: 1fr;
         padding: 0 1;
-        background: #0a0a0a;
+        background: transparent;
         color: #e4e4e7;
         scrollbar-color: #6f727d;
-        scrollbar-background: #20222b;
+        scrollbar-background: transparent;
         scrollbar-gutter: stable;
         scrollbar-size-horizontal: 0;
         scrollbar-size-vertical: 1;
@@ -910,6 +942,7 @@ class BrowserUseTerminalApp(App[None]):
         self._recent_model_text: dict[str, str] = {}
         self._recent_tool_output_text: dict[tuple[str, str], str] = {}
         self._rendered_event_ids: set[str] = set()
+        self._last_transcript_event_type: Optional[str] = None
         self._home_mode = False
         self._inspector_visible = False
         self._tool_details_visible = False
@@ -1128,6 +1161,7 @@ class BrowserUseTerminalApp(App[None]):
         self._update_activity_strip()
         log = self.query_one("#transcript", RichLog)
         log.clear()
+        self._last_transcript_event_type = None
         logo = self.query_one("#home-logo", Static)
         available_width = int(logo.size.width or self.query_one("#workspace").size.width or self.size.width or 128)
         canvas_width = max(58, min(76, available_width))
@@ -1140,6 +1174,8 @@ class BrowserUseTerminalApp(App[None]):
     def _write_banner(self) -> None:
         self._set_home_mode(False)
         log = self.query_one("#transcript", RichLog)
+        self._sync_transcript_render_width_hint(log)
+        self._last_transcript_event_type = None
         log.write("[bold #e4e4e7]Slash commands[/bold #e4e4e7]")
         for name, command, description in SLASH_COMMANDS:
             command_label = f"/{command}".rstrip()
@@ -1159,10 +1195,11 @@ class BrowserUseTerminalApp(App[None]):
 
         if should_render:
             self._flush_model_delta(event.session_id)
-            line = self._format_event_for_live_transcript(event)
-            event_type = _transcript_event_type(event)
-            if self._should_render_transcript_line(event_type, line) and not self._is_duplicate_terminal_result(event, line):
-                self._write_log_line(line, event_type)
+            for line, event_type in self._format_event_items_for_live_transcript(event):
+                if self._should_render_transcript_line(event_type, line) and not self._is_duplicate_terminal_result(
+                    event, line
+                ):
+                    self._write_log_line(line, event_type)
         self.refresh_sessions()
         self.refresh_artifacts()
         self._update_statusbar()
@@ -1170,17 +1207,32 @@ class BrowserUseTerminalApp(App[None]):
         self._update_activity_strip()
 
     def _format_event_for_live_transcript(self, event: Event) -> str:
+        items = self._format_event_items_for_live_transcript(event)
+        return items[0][0] if items else ""
+
+    def _format_event_items_for_live_transcript(self, event: Event) -> list[tuple[str, str]]:
+        if event.type == "tool.output":
+            self._remember_tool_output(event)
+        if not self._tool_details_visible:
+            if event.type == "tool.finished" and self._tool_finished_repeats_stream(event):
+                payload = event.payload
+                line = _format_tool_finished_for_transcript(
+                    str(payload.get("name") or "tool"),
+                    payload.get("output") or {},
+                    omit_text=True,
+                )
+                return [(line, "tool.finished")] if line else []
+            return _format_default_transcript_event(event)
         if event.type == "tool.finished" and self._tool_finished_repeats_stream(event):
             payload = event.payload
-            return _format_tool_finished_for_transcript(
+            line = _format_tool_finished_for_transcript(
                 str(payload.get("name") or "tool"),
                 payload.get("output") or {},
                 omit_text=True,
             )
-        rendered = _format_event_for_transcript(event)
-        if event.type == "tool.output":
-            self._remember_tool_output(event)
-        return rendered
+            return [(line, "tool.finished")] if line else []
+        line = _format_event_for_transcript(event)
+        return [(line, _transcript_event_type(event))] if line else []
 
     def _remember_tool_output(self, event: Event) -> None:
         call_id = str(event.payload.get("tool_call_id") or "")
@@ -1207,6 +1259,10 @@ class BrowserUseTerminalApp(App[None]):
             return False
         if self._tool_details_visible:
             return True
+        if event_type in {"browser.action", "browser.live_url"}:
+            return True
+        if event_type == "tool.started":
+            return line.startswith(_BROWSER_ACTION_PREFIX)
         if event_type == "tool.output":
             return False
         if event_type == "tool.finished":
@@ -1265,15 +1321,16 @@ class BrowserUseTerminalApp(App[None]):
                 previous = self._recent_model_text.get(self.selected_session_id, "")
                 self._recent_model_text[self.selected_session_id] = _join_transcript_text(previous, line)
         log = self.query_one("#transcript", RichLog)
+        self._sync_transcript_render_width_hint(log)
         log.auto_scroll = self._should_follow_transcript_updates(log) if follow is None else follow
+        self._write_transcript_spacing(log, event_type)
         escaped = escape(line)
         if event_type == "session.input":
             log.write(_prompt_text(line, width=_prompt_width(log, fallback=self.size.width)))
         elif event_type == "session.followup":
-            log.write("")
             log.write(_prompt_text(line, width=_prompt_width(log, fallback=self.size.width)))
         elif event_type == "tool.started":
-            log.write(f"[#9b9ca5]{escaped}[/]")
+            _write_tool_started_line(log, line)
         elif event_type == "tool.failed":
             log.write(f"[#e4e4e7]{escaped}[/]")
         elif event_type == "tool.image":
@@ -1286,14 +1343,38 @@ class BrowserUseTerminalApp(App[None]):
             _write_markdown(log, line)
         elif event_type in {"session.done", "session.cancelled"}:
             _write_markdown(log, line, style="#e4e4e7")
-        elif event_type == "browser.live_url":
-            _write_markdown(log, line)
+        elif event_type in {"browser.action", "browser.live_url"}:
+            _write_browser_action_line(log, line)
         elif event_type == "session.failed":
             log.write(f"[bold #e4e4e7]{escaped}[/bold #e4e4e7]")
         elif event_type == "session.deadline_warning":
             log.write(f"[#9b9ca5]{escaped}[/]")
         else:
             log.write(escaped)
+        self._last_transcript_event_type = event_type
+
+    def _write_transcript_spacing(self, log: RichLog, event_type: str) -> None:
+        previous = self._last_transcript_event_type
+        if previous is None:
+            return
+        if event_type in {"session.input", "session.followup"}:
+            log.write("")
+            return
+        if previous in {"session.input", "session.followup"}:
+            log.write("")
+            return
+        tool_like = {
+            "browser.action",
+            "browser.live_url",
+            "tool.started",
+            "tool.image",
+            "tool.output",
+            "tool.finished",
+            "tool.failed",
+        }
+        answer_like = {"model.delta", "session.done", "session.failed", "session.cancelled"}
+        if previous in tool_like and event_type in answer_like:
+            log.write("")
 
     def _is_duplicate_terminal_result(self, event: Event, line: str) -> bool:
         if event.type != "session.done" or not self.selected_session_id:
@@ -1658,9 +1739,11 @@ class BrowserUseTerminalApp(App[None]):
     def _load_session_log(self, session_id: str, *, follow: Optional[bool] = True) -> None:
         self._set_home_mode(False)
         log = self.query_one("#transcript", RichLog)
+        self._sync_transcript_render_width_hint(log)
         follow_transcript = self._should_follow_transcript_updates(log) if follow is None else follow
         log.auto_scroll = follow_transcript
         log.clear()
+        self._last_transcript_event_type = None
         session = self.store.load(session_id)
         if session is None:
             log.write(f"[#e4e4e7]session not found: {escape(session_id)}[/]")
@@ -1671,15 +1754,35 @@ class BrowserUseTerminalApp(App[None]):
         self._recent_tool_output_text = {
             key: value for key, value in self._recent_tool_output_text.items() if key[0] != session.id
         }
-        events = self.store.events.read(session.id)[-400:]
+        events = self.store.events.read(session.id)
         self._rendered_event_ids = {event.id for event in events}
         self._last_transcript_text[session.id] = ""
         self._recent_model_text[session.id] = ""
-        for line, event_type in _format_events_for_transcript(events):
+        for line, event_type in _format_events_for_transcript(events, show_tools=self._tool_details_visible):
             if self._should_render_transcript_line(event_type, line):
                 self._write_log_line(line, event_type, follow=follow_transcript)
         self._update_session_detail()
         self._update_activity_strip()
+
+    def _sync_transcript_render_width_hint(self, log: RichLog) -> None:
+        widths = [
+            int(getattr(log.size, "width", 0) or 0),
+            int(getattr(log.content_region, "width", 0) or 0),
+            int(getattr(log, "min_width", 0) or 0),
+            int(self.size.width or 80) - 6,
+        ]
+        try:
+            workspace = self.query_one("#workspace")
+            widths.append(int(workspace.size.width or 0) - 2)
+        except Exception:
+            pass
+        try:
+            sidebar = self.query_one("#sidebar")
+            if bool(sidebar.display):
+                widths.append(int(self.size.width or 80) - int(sidebar.size.width or 44) - 8)
+        except Exception:
+            pass
+        log.min_width = max(78, *(width for width in widths if width > 0))
 
     def refresh_sessions(self) -> None:
         self._update_statusbar()
@@ -1732,6 +1835,7 @@ class BrowserUseTerminalApp(App[None]):
     def action_clear_log(self) -> None:
         self._model_buffers.clear()
         self.query_one("#transcript", RichLog).clear()
+        self._last_transcript_event_type = None
 
     def action_scroll_transcript_up(self) -> None:
         self._scroll_transcript(lines=-4)
@@ -2375,10 +2479,12 @@ class BrowserUseTerminalApp(App[None]):
             result_lines.append(_sidebar_image_line(latest_image))
         if final_line != "-" and session.status in {"done", "failed", "cancelled"}:
             result_lines.extend(_sidebar_result_lines(final_line))
-        if current_tool != "-" and session.status in {"created", "running"}:
+        if current_tool != "-" and session.status in {"created", "running"} and not current_tool.endswith(" done"):
             result_lines.append(f"[#9b9ca5]working: {escape(_compact_inline(current_tool, limit=46))}[/]")
         if not result_lines:
-            waiting = "waiting for browser output" if session.status in {"created", "running"} else "idle"
+            waiting = "browsing live preview" if session.status in {"created", "running"} and live_url else "idle"
+            if session.status in {"created", "running"} and not live_url:
+                waiting = "waiting for browser output"
             result_lines.append(f"[#9b9ca5]{waiting}[/]")
         result_markup = "\n".join(result_lines[:4])
         browser_markup = ""
@@ -2727,8 +2833,8 @@ def _format_event_for_transcript(event: Event) -> str:
     if event.type == "browser.live_url":
         url = str(payload.get("live_url") or payload.get("url") or "").strip()
         if not url:
-            return "browser live preview"
-        return f"browser live preview: [open live preview]({url})"
+            return _browser_action_line("live", "preview")
+        return _browser_action_line("live", _compact_live_preview_url(url))
     if event.type == "tool.started":
         name = str(payload.get("name") or "tool")
         return _format_tool_started_summary(name, payload.get("arguments") or {})
@@ -2752,8 +2858,7 @@ def _format_event_for_transcript(event: Event) -> str:
     if event.type == "tool.failed":
         return f"tool failed: {payload.get('name') or 'tool'} {_compact_error_text(payload.get('error') or '')}".strip()
     if event.type == "session.done":
-        text = str(payload.get("result") or "")
-        return f"done:\n\n{text}" if text else "done"
+        return str(payload.get("result") or "") or "done"
     if event.type == "session.failed":
         return f"failed: {_compact_error_text(payload.get('error') or '')}".strip()
     return f"{event.type}: {payload}"
@@ -2765,7 +2870,60 @@ def _transcript_event_type(event: Event) -> str:
     return event.type
 
 
-def _format_events_for_transcript(events: list[Event]) -> list[tuple[str, str]]:
+def _format_default_transcript_event(event: Event) -> list[tuple[str, str]]:
+    if event.type == "tool.started":
+        return _format_default_tool_started_event(event)
+    if event.type == "tool.output":
+        return []
+    if event.type == "tool.finished":
+        name = str(event.payload.get("name") or "tool")
+        if name == "done":
+            return []
+        line = _format_tool_finished_for_transcript(name, event.payload.get("output") or {})
+        return [(line, "tool.finished")] if line and line.startswith("✕") else []
+    line = _format_event_for_transcript(event)
+    if not line:
+        return []
+    event_type = "browser.action" if line.startswith(_BROWSER_ACTION_PREFIX) else _transcript_event_type(event)
+    return [(line, event_type)]
+
+
+def _format_default_tool_started_event(event: Event) -> list[tuple[str, str]]:
+    name = str(event.payload.get("name") or "tool")
+    arguments = event.payload.get("arguments") or {}
+    if isinstance(arguments, dict) and name == "python":
+        code = str(arguments.get("code") or "").strip()
+        browser_lines = _browser_action_lines_for_code(code)
+        if browser_lines:
+            return [(line, "browser.action") for line in browser_lines]
+        return []
+    line = _format_tool_started_summary(name, arguments)
+    if line.startswith(_BROWSER_ACTION_PREFIX):
+        return [(line, "browser.action")]
+    return []
+
+
+def _browser_action_lines_for_code(code: str) -> list[str]:
+    if not code:
+        return []
+    tree = _parse_python_code(code)
+    if tree is None:
+        return []
+    actions = _browser_actions_from_tree(tree)
+    if not actions:
+        return []
+    visible_actions = actions[:6]
+    lines = [_browser_action_line(*action) for action in visible_actions]
+    hidden_count = len(actions) - len(visible_actions)
+    if hidden_count > 0:
+        verbs = ", ".join(action[0] for action in actions[len(visible_actions) : len(visible_actions) + 4])
+        if len(actions) > len(visible_actions) + 4:
+            verbs += f", +{len(actions) - len(visible_actions) - 4}"
+        lines.append(_browser_action_line("steps", f"+{hidden_count} more browser moves", verbs))
+    return lines
+
+
+def _format_events_for_transcript(events: list[Event], *, show_tools: bool = False) -> list[tuple[str, str]]:
     lines: list[tuple[str, str]] = []
     model_buffers: dict[str, str] = {}
     last_by_session: dict[str, str] = {}
@@ -2794,7 +2952,7 @@ def _format_events_for_transcript(events: list[Event]) -> list[tuple[str, str]]:
                 flush(event.session_id)
             continue
         flush(event.session_id)
-        if event.type == "tool.finished":
+        if show_tools and event.type == "tool.finished":
             call_id = str(event.payload.get("tool_call_id") or "")
             output = event.payload.get("output") or {}
             text = str(output.get("text") or "") if isinstance(output, dict) else ""
@@ -2809,9 +2967,16 @@ def _format_events_for_transcript(events: list[Event]) -> list[tuple[str, str]]:
                 output,
                 omit_text=repeats_stream,
             )
+            formatted_items = [(line, _transcript_event_type(event))] if line else []
         else:
-            line = _format_event_for_transcript(event)
-        if line:
+            if show_tools:
+                line = _format_event_for_transcript(event)
+                formatted_items = [(line, _transcript_event_type(event))] if line else []
+            else:
+                formatted_items = _format_default_transcript_event(event)
+        for line, event_type in formatted_items:
+            if not line:
+                continue
             if event.type == "session.done":
                 result = str(event.payload.get("result") or "")
                 previous = last_by_session.get(event.session_id, "")
@@ -2824,7 +2989,7 @@ def _format_events_for_transcript(events: list[Event]) -> list[tuple[str, str]]:
                     or _canonical_transcript_text(recent_model).endswith(canonical_result)
                 ):
                     continue
-            lines.append((line, _transcript_event_type(event)))
+            lines.append((line, event_type))
             last_by_session[event.session_id] = _canonical_transcript_text(line)
             if event.type == "tool.output":
                 call_id = str(event.payload.get("tool_call_id") or "")
@@ -2889,6 +3054,35 @@ def _write_markdown(log: RichLog, text: str, style: str = "none") -> None:
     )
 
 
+def _write_tool_started_line(log: RichLog, line: str) -> None:
+    if not line.startswith(_BROWSER_ACTION_PREFIX):
+        log.write(f"[#9b9ca5]{escape(line)}[/]")
+        return
+    _write_browser_action_line(log, line)
+
+
+def _write_browser_action_line(log: RichLog, line: str) -> None:
+    if not line.startswith(_BROWSER_ACTION_PREFIX):
+        _write_markdown(log, line)
+        return
+    body, _, note = line.removeprefix(_BROWSER_ACTION_PREFIX).partition(" · ")
+    verb, _, detail = body.partition(" ")
+    detail = detail.strip()
+    row = Text("  ")
+    verb = verb or "work"
+    action_style = _BROWSER_ACTION_STYLES.get(verb, "#5c9cf5")
+    icon = _BROWSER_ACTION_ICONS.get(verb, "┃")
+    row.append(f"{icon} ", style=f"bold {action_style}")
+    row.append(f"{verb:<6}", style=f"bold {action_style}")
+    if detail:
+        row.append("  ")
+        row.append(detail, style="#e4e4e7")
+    if note:
+        row.append("  ·  ", style="#555963")
+        row.append(note, style="#8f929c")
+    log.write(row)
+
+
 def _fenced_json(value: object) -> str:
     try:
         rendered = json.dumps(value, ensure_ascii=False, indent=2, default=str)
@@ -2907,7 +3101,7 @@ def _format_tool_output_for_transcript(name: str, stream: str, text: str) -> str
 
 def _format_tool_finished_for_transcript(name: str, output: object, *, omit_text: bool = False) -> str:
     if not isinstance(output, dict):
-        return f"✓ {name}"
+        return f"✓ {_tool_display_name(name)}"
     text = str(output.get("text") or "")
     data = {
         key: value
@@ -2924,19 +3118,24 @@ def _format_tool_finished_for_transcript(name: str, output: object, *, omit_text
         data = {}
     icon = "✕" if data_summary.startswith("exit ") and not data_summary.endswith(" 0") else "✓"
     parts: list[str] = []
+    display_name = _tool_display_name(name)
     if text.strip() and not omit_text:
-        line = f"{icon} {name} · {_tool_transcript_snippet(text, max_lines=2, max_chars=320)}"
+        line = f"{icon} {display_name} · {_tool_transcript_snippet(text, max_lines=2, max_chars=320)}"
         if data_summary:
             line += f" · {data_summary}"
         parts.append(line)
     else:
-        parts.append(f"{icon} {name}" + (f" · {data_summary}" if data_summary else ""))
+        parts.append(f"{icon} {display_name}" + (f" · {data_summary}" if data_summary else ""))
     if data:
         parts.append(_fenced_json(data))
     if image_count and not omit_text:
         label = "image" if image_count == 1 else "images"
         parts.append(f"{image_count} {label} attached")
     return "\n\n".join(parts)
+
+
+def _tool_display_name(name: str) -> str:
+    return "result" if name == "python" else name
 
 
 def _format_tool_started_summary(name: str, arguments: object) -> str:
@@ -2952,6 +3151,9 @@ def _format_tool_started_summary(name: str, arguments: object) -> str:
             explicit_summary = _explicit_code_summary(code)
             if explicit_summary:
                 return f"→ {explicit_summary}"
+            browser_summary = _browser_action_summary(code)
+            if browser_summary:
+                return browser_summary
             return f"→ python {_summarize_code(code)}"
     keys = ", ".join(str(key) for key in list(arguments)[:4])
     return f"→ {name}" + (f" {keys}" if keys else "")
@@ -3013,6 +3215,99 @@ def _explicit_code_summary(code: str) -> str:
             return ""
         return _compact_inline(match.group(1).strip(), limit=120)
     return ""
+
+
+def _browser_action_summary(code: str) -> str:
+    tree = _parse_python_code(code)
+    if tree is None:
+        return ""
+    actions = _browser_actions_from_tree(tree)
+    if not actions:
+        helper_imports = _browser_helper_imports(tree)
+        if helper_imports and tree.body and all(isinstance(node, (ast.Import, ast.ImportFrom)) for node in tree.body):
+            return _browser_action_line("kit", "browser helpers", ", ".join(_browser_helper_roles(helper_imports)))
+        return ""
+    if len(actions) == 1:
+        return _browser_action_line(*actions[0])
+    verbs = ", ".join(action[0] for action in actions[:4])
+    if len(actions) > 4:
+        verbs += f", +{len(actions) - 4}"
+    return _browser_action_line("steps", f"{len(actions)} browser moves", verbs)
+
+
+def _browser_action_line(verb: str, detail: str = "", note: str = "") -> str:
+    line = f"{_BROWSER_ACTION_PREFIX}{verb}"
+    if detail:
+        line += f" {_compact_inline(detail, limit=88)}"
+    if note:
+        line += f" · {_compact_inline(note, limit=88)}"
+    return line
+
+
+def _browser_actions_from_tree(tree: ast.Module) -> list[tuple[str, str, str]]:
+    calls = sorted(
+        (node for node in ast.walk(tree) if isinstance(node, ast.Call)),
+        key=lambda node: (getattr(node, "lineno", 0), getattr(node, "col_offset", 0)),
+    )
+    actions: list[tuple[str, str, str]] = []
+    for call in calls:
+        action = _browser_action_from_call(call)
+        if action is not None:
+            actions.append(action)
+    return actions
+
+
+def _browser_action_from_call(call: ast.Call) -> Optional[tuple[str, str, str]]:
+    name = _call_name(call.func)
+    if name in {"goto_url", "navigate", "open_url", "new_tab"}:
+        target = _browser_target_label(_call_string_arg(call, 0))
+        return ("open", target or "new tab", "")
+    if name in {"wait_for_load", "wait_for_page_load"}:
+        return ("wait", "page load", "")
+    if name == "wait_for_network_idle":
+        return ("wait", "network idle", _timeout_note(call))
+    if name in {"wait_for_element", "wait_for_selector"}:
+        selector = _call_string_arg(call, 0) or "element"
+        note = "visible" if _call_bool_kw(call, "visible") else _timeout_note(call)
+        return ("watch", selector, note)
+    if name == "wait_for_text":
+        return ("watch", _quoted_preview(_call_string_arg(call, 0) or "text"), _timeout_note(call))
+    if name in {"capture_screenshot", "screenshot"}:
+        label = _call_string_arg(call, 0) or _call_string_kw(call, "label") or "page"
+        return ("snap", f"{label} screenshot", "")
+    if name == "screenshot_element":
+        selector = _call_string_arg(call, 0) or "element"
+        return ("snap", selector, "element")
+    if name == "click_text":
+        return ("tap", _quoted_preview(_call_string_arg(call, 0) or "text"), "")
+    if name in {"click_at_xy", "click_at", "coordinate_click"}:
+        x = _call_literal_arg(call, 0)
+        y = _call_literal_arg(call, 1)
+        detail = f"{x}, {y}" if x is not None and y is not None else "coordinates"
+        return ("tap", detail, "")
+    if name == "fill_input":
+        selector = _call_string_arg(call, 0) or "input"
+        typed = _call_string_arg(call, 1)
+        note = f"{len(typed)} chars" if typed else ""
+        return ("type", selector, note)
+    if name == "type_text":
+        typed = _call_string_arg(call, 0)
+        return ("type", _quoted_preview(typed or "text"), f"{len(typed)} chars" if typed else "")
+    if name in {"press_key", "press"}:
+        key = _call_string_arg(call, 0) or "key"
+        return ("key", key, "")
+    if name == "scroll":
+        return ("scroll", _scroll_action_detail(call), "")
+    if name in {"js", "evaluate"}:
+        return ("peek", _browser_js_action_detail(_call_string_arg(call, 0)), "")
+    if name == "http_get":
+        target = _browser_target_label(_call_string_arg(call, 0))
+        return ("fetch", target or "page", "")
+    if name == "load_skill":
+        return ("kit", _call_string_arg(call, 0) or "browser skill", "")
+    if name in {"list_tabs", "current_tab", "switch_tab", "ensure_real_tab"}:
+        return ("tabs", name.replace("_", " "), "")
+    return None
 
 
 def _parse_python_code(code: str) -> Optional[ast.Module]:
@@ -3102,6 +3397,89 @@ def _first_string_call_arg(tree: ast.Module, names: set[str]) -> str:
         if isinstance(first, ast.Constant) and isinstance(first.value, str):
             return first.value
     return ""
+
+
+def _call_literal_arg(call: ast.Call, index: int) -> object:
+    if index >= len(call.args):
+        return None
+    arg = call.args[index]
+    if isinstance(arg, ast.Constant):
+        return arg.value
+    return None
+
+
+def _call_literal_kw(call: ast.Call, name: str) -> object:
+    for keyword in call.keywords:
+        if keyword.arg != name:
+            continue
+        value = keyword.value
+        if isinstance(value, ast.Constant):
+            return value.value
+    return None
+
+
+def _call_string_arg(call: ast.Call, index: int) -> str:
+    value = _call_literal_arg(call, index)
+    return value if isinstance(value, str) else ""
+
+
+def _call_string_kw(call: ast.Call, name: str) -> str:
+    value = _call_literal_kw(call, name)
+    return value if isinstance(value, str) else ""
+
+
+def _call_bool_kw(call: ast.Call, name: str) -> bool:
+    value = _call_literal_kw(call, name)
+    return bool(value) if isinstance(value, bool) else False
+
+
+def _timeout_note(call: ast.Call) -> str:
+    value = _call_literal_kw(call, "timeout_s")
+    if value is None:
+        value = _call_literal_kw(call, "timeout")
+    if isinstance(value, (int, float)):
+        return f"{value:g}s"
+    return ""
+
+
+def _browser_target_label(url: str) -> str:
+    if not url:
+        return ""
+    parsed = urlparse(url)
+    if not parsed.netloc:
+        return _compact_inline(url, limit=84)
+    path = parsed.path.rstrip("/")
+    label = parsed.netloc + (path if path and path != "/" else "")
+    if parsed.query:
+        label += "?" + parsed.query
+    return _compact_inline(label, limit=84)
+
+
+def _quoted_preview(value: str) -> str:
+    if not value:
+        return ""
+    return f'"{_compact_inline(value, limit=48)}"'
+
+
+def _scroll_action_detail(call: ast.Call) -> str:
+    dy = _call_literal_kw(call, "dy")
+    dx = _call_literal_kw(call, "dx")
+    if isinstance(dy, (int, float)) and dy:
+        return "down" if dy > 0 else "up"
+    if isinstance(dx, (int, float)) and dx:
+        return "right" if dx > 0 else "left"
+    return "page"
+
+
+def _browser_js_action_detail(script: str) -> str:
+    script = script.lower()
+    if "queryselector" in script or "queryselectorall" in script:
+        return "DOM"
+    if "document.documentelement.innerhtml" in script or "outerhtml" in script:
+        return "page HTML"
+    if "window." in script:
+        return "app data"
+    return "JavaScript"
 
 
 def _summarize_browser_js(tree: ast.Module) -> str:
@@ -3424,22 +3802,27 @@ def _rich_text_with_file_links(text: str, style: str = "none") -> Text:
 
 
 def _prompt_width(log: RichLog, *, fallback: int = 100) -> int:
+    widths = [max(0, int(fallback or 0) - 2)]
+    min_width = int(getattr(log, "min_width", 0) or 0)
+    if min_width > 0:
+        widths.append(min_width - 2)
     for attr in ("content_region", "region", "size"):
         value = getattr(log, attr, None)
         width = int(getattr(value, "width", 0) or 0)
         if width > 0:
-            return max(24, width - 2)
-    return max(24, int(fallback or 100) - 2)
+            widths.append(width - 2)
+    return max(24, max(widths) if widths else int(fallback or 100) - 2)
 
 
 def _prompt_text(text: str, width: int = 100) -> Padding:
     width = max(24, int(width or 100))
     prefix_width = 2
-    horizontal_padding = 6
+    horizontal_padding = 2
     content_width = max(12, width - horizontal_padding - prefix_width)
     rendered = Text()
-    muted_style = "#9b9ca5"
-    text_style = "#e4e4e7"
+    muted_style = "bold #5c9cf5 on #1e1e1e"
+    text_style = "bold #e4e4e7 on #1e1e1e"
+    fill_style = "on #1e1e1e"
     source_lines = str(text or "").splitlines() or [""]
     visual_lines: list[str] = []
     for source_line in source_lines:
@@ -3450,7 +3833,8 @@ def _prompt_text(text: str, width: int = 100) -> Padding:
         prefix = "› " if index == 0 else "  "
         rendered.append(prefix, style=muted_style)
         rendered.append(line, style=text_style)
-    return Padding(rendered, (2, 3), style="on #20222b", expand=True)
+        rendered.append("\u00a0" * max(0, content_width - len(line)), style=fill_style)
+    return Padding(rendered, (0, 1), style="on #1e1e1e", expand=True)
 
 
 def _link_spans_for_text(text: str) -> list[tuple[int, int, str, str]]:
