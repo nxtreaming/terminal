@@ -543,6 +543,74 @@ class BrowserRuntime:
         self._enable_page_domains()
         return self.current_cdp_session()
 
+    def reattach_cdp(
+        self,
+        target_id: Optional[str] = None,
+        url_contains: Optional[str] = None,
+        index: int = 0,
+        include_internal: bool = False,
+    ) -> Dict[str, Any]:
+        """Reconnect the CDP websocket if needed and attach a fresh page session.
+
+        This is intentionally a thin wrapper around Target.* CDP operations. It
+        keeps reconnect recovery explicit for agents while avoiding repeated
+        boilerplate after remote-browser websocket drops.
+        """
+        self._check_cancel()
+        if self.client is None:
+            self.attach_first_page()
+        if self.client is None:
+            raise RuntimeError("reattach_cdp could not initialize a CDP client")
+
+        if not self.browser_level_ws and self.http_url:
+            if target_id is not None:
+                target = self.attach_tab(target_id=target_id)
+            elif url_contains is not None:
+                target = self.attach_tab(url_contains=url_contains)
+            else:
+                target = self.attach_tab(index=index)
+            state = self.current_cdp_session()
+            state["reattached"] = True
+            state["target"] = target
+            return state
+
+        if not self.browser_level_ws:
+            self.client.close()
+            self.client.connect()
+            self._enable_page_domains()
+            state = self.current_cdp_session()
+            state["reattached"] = True
+            return state
+
+        pages = self.list_tabs(include_internal=True)
+        if not include_internal:
+            pages = [page for page in pages if is_real_page_target(page)]
+        if not pages:
+            raise RuntimeError("reattach_cdp found no page targets")
+
+        target = None
+        if target_id is not None:
+            wanted = str(target_id)
+            target = next((page for page in pages if str(page.get("id") or page.get("targetId") or "") == wanted), None)
+            if target is None:
+                raise RuntimeError(f"reattach_cdp target_id not found: {target_id}")
+        elif url_contains is not None:
+            target = next((page for page in pages if url_contains in str(page.get("url") or "")), None)
+            if target is None:
+                raise RuntimeError(f"reattach_cdp page URL containing {url_contains!r} not found")
+        else:
+            current_id = str((self.target or {}).get("id") or (self.target or {}).get("targetId") or "")
+            target = next((page for page in pages if str(page.get("id") or page.get("targetId") or "") == current_id), None)
+            if target is None:
+                target = pages[int(index)]
+
+        target_id_value = str(target.get("id") or target.get("targetId") or "")
+        self._attach_browser_target(target_id_value)
+        state = self.current_cdp_session()
+        state["reattached"] = True
+        state["target"] = dict(target)
+        return state
+
     def target_id_from_session(self) -> Optional[str]:
         return str((self.target or {}).get("id") or (self.target or {}).get("targetId") or "") or None
 
@@ -599,28 +667,45 @@ class BrowserRuntime:
         if timeout is not None:
             timeout_s = timeout
         self._check_cancel()
+        last_connection_error: Exception | None = None
         effective_session_id: Optional[str] = None
+        for attempt in range(2):
+            try:
+                if self.client is None:
+                    self.attach_first_page()
+                assert self.client is not None
+                effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
+                call_kwargs: Dict[str, Any] = {"params": params, "session_id": effective_session_id, "timeout_s": timeout_s}
+                if return_on_event is not None:
+                    call_kwargs["return_on_event"] = return_on_event
+                result = self.client.call(method, **call_kwargs)
+                self._check_cancel()
+                return result
+            except (CdpConnectionError, requests.RequestException, OSError) as exc:
+                last_connection_error = exc
+                if attempt == 0 and session_id is None and self._recover_default_cdp_session():
+                    continue
+                raise
+            except CdpError as exc:
+                if effective_session_id is not None and "Session with given id not found" in str(exc):
+                    if attempt == 0 and session_id is None and self._recover_default_cdp_session():
+                        continue
+                    raise CdpError(
+                        f"{exc} The active CDP session is stale. CDP session ids are websocket-scoped; "
+                        "reattach with Target.getTargets -> Target.attachToTarget -> "
+                        "set_cdp_session(sessionId, target_id=targetId)."
+                    ) from exc
+                raise
+        if last_connection_error is not None:
+            raise last_connection_error
+        raise CdpError(f"{method} failed after CDP session recovery")
+
+    def _recover_default_cdp_session(self) -> bool:
         try:
-            if self.client is None:
-                self.attach_first_page()
-            assert self.client is not None
-            effective_session_id = session_id if session_id is not None else self._default_session_id_for_method(method)
-            call_kwargs: Dict[str, Any] = {"params": params, "session_id": effective_session_id, "timeout_s": timeout_s}
-            if return_on_event is not None:
-                call_kwargs["return_on_event"] = return_on_event
-            result = self.client.call(method, **call_kwargs)
-            self._check_cancel()
-            return result
-        except (CdpConnectionError, requests.RequestException, OSError):
-            raise
-        except CdpError as exc:
-            if effective_session_id is not None and "Session with given id not found" in str(exc):
-                raise CdpError(
-                    f"{exc} The active CDP session is stale. CDP session ids are websocket-scoped; "
-                    "reattach with Target.getTargets -> Target.attachToTarget -> "
-                    "set_cdp_session(sessionId, target_id=targetId)."
-                ) from exc
-            raise
+            self.reattach_cdp()
+            return True
+        except Exception:
+            return False
 
     def _initialize_websocket_target(self) -> None:
         assert self.client is not None

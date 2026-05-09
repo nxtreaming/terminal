@@ -79,6 +79,7 @@ def _base_url(provider: str, config: Optional[Dict[str, Any]]) -> Optional[str]:
         "anthropic": "LLM_BROWSER_ANTHROPIC_BASE_URL",
         "zai": "LLM_BROWSER_ZAI_BASE_URL",
         "qwen": "LLM_BROWSER_QWEN_BASE_URL",
+        "openrouter": "LLM_BROWSER_OPENROUTER_BASE_URL",
     }
     if not config:
         env_value = os.environ.get(env_map.get(provider, ""))

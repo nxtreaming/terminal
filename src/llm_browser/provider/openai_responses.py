@@ -39,6 +39,7 @@ class OpenAIResponsesProvider:
         self.max_retries = max(0, int(max_retries))
         self.previous_response_id: Optional[str] = None
         self._sent_tool_call_ids: Set[str] = set()
+        self.provider_label = "openai"
         self.instructions = instructions or BROWSER_AGENT_INSTRUCTIONS
 
     def set_instructions(self, instructions: str) -> None:

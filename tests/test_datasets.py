@@ -31,7 +31,8 @@ class DatasetTest(unittest.TestCase):
         self.assertIn("output_path('/home/user/outputs/name.ext')", prompt)
         self.assertIn("load_skill('research')", prompt)
         self.assertIn("fetch_many_text", prompt)
-        self.assertIn("fccid.io/<grantee-code>/", prompt)
+        self.assertIn("directory/listing tasks", prompt)
+        self.assertNotIn("Task-specific workflow", prompt)
 
     def test_summarize_manifest_uses_latest_attempt(self) -> None:
         manifest = {
@@ -82,6 +83,7 @@ class DatasetTest(unittest.TestCase):
 
             def run_session(self, session_id: str, prompt: str):
                 store.update_status(session_id, "done")
+                store.emit(session_id, "tool.started", {"name": "done", "arguments": {"result": "final answer"}})
                 store.emit(session_id, "session.done", {"result": "final answer"})
                 return store.load(session_id)
 
@@ -102,6 +104,96 @@ class DatasetTest(unittest.TestCase):
         self.assertTrue(result["ok"])
         self.assertEqual(result["final_result"], "final answer")
         self.assertEqual(result["final_result_chars"], len("final answer"))
+
+    def test_dataset_task_requires_done_tool(self) -> None:
+        class TextOnlyAgent:
+            def __init__(self, *args, **kwargs) -> None:
+                self.tools = Mock()
+
+            def run_session(self, session_id: str, prompt: str):
+                store.update_status(session_id, "done")
+                store.emit(session_id, "session.done", {"result": "I should inspect the page next."})
+                return store.load(session_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            with patch("llm_browser.cli.Agent", TextOnlyAgent):
+                result = _run_dataset_task(
+                    store=store,
+                    task_id="1",
+                    prompt="finish",
+                    workspace=Path(tmp) / "work",
+                    provider_name="fake",
+                    model=None,
+                    max_turns=1,
+                    timeout_s=0,
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "MissingDoneToolError")
+        self.assertEqual(result["final_result"], "I should inspect the page next.")
+
+    def test_dataset_task_rejects_interrupted_placeholder_result(self) -> None:
+        class DoneAgent:
+            def __init__(self, *args, **kwargs) -> None:
+                self.tools = Mock()
+
+            def run_session(self, session_id: str, prompt: str):
+                store.update_status(session_id, "done")
+                store.emit(session_id, "tool.started", {"name": "done", "arguments": {"result": "[Response interrupted]"}})
+                store.emit(session_id, "session.done", {"result": "[Response interrupted]"})
+                return store.load(session_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            with patch("llm_browser.cli.Agent", DoneAgent):
+                result = _run_dataset_task(
+                    store=store,
+                    task_id="1",
+                    prompt="finish",
+                    workspace=Path(tmp) / "work",
+                    provider_name="fake",
+                    model=None,
+                    max_turns=1,
+                    timeout_s=0,
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "InterruptedResponseError")
+        self.assertEqual(result["final_result"], "[Response interrupted]")
+
+    def test_dataset_task_rejects_tool_error_final_result(self) -> None:
+        class DoneAgent:
+            def __init__(self, *args, **kwargs) -> None:
+                self.tools = Mock()
+
+            def run_session(self, session_id: str, prompt: str):
+                store.update_status(session_id, "done")
+                store.emit(
+                    session_id,
+                    "tool.started",
+                    {"name": "done", "arguments": {"result": "[tool error: UnicodeDecodeError: binary]"}},
+                )
+                store.emit(session_id, "session.done", {"result": "[tool error: UnicodeDecodeError: binary]"})
+                return store.load(session_id)
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            with patch("llm_browser.cli.Agent", DoneAgent):
+                result = _run_dataset_task(
+                    store=store,
+                    task_id="1",
+                    prompt="finish",
+                    workspace=Path(tmp) / "work",
+                    provider_name="fake",
+                    model=None,
+                    max_turns=1,
+                    timeout_s=0,
+                )
+
+        self.assertFalse(result["ok"])
+        self.assertEqual(result["error_type"], "ToolErrorFinalResult")
+        self.assertEqual(result["final_result"], "[tool error: UnicodeDecodeError: binary]")
 
     def test_dataset_task_retries_transient_codex_overload(self) -> None:
         calls = 0
@@ -150,6 +242,7 @@ class DatasetTest(unittest.TestCase):
 
             def run_session(self, session_id: str, prompt: str):
                 store.update_status(session_id, "done")
+                store.emit(session_id, "tool.started", {"name": "done", "arguments": {"result": final}})
                 store.emit(session_id, "session.done", {"result": final})
                 return store.load(session_id)
 

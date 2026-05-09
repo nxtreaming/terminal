@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import ast
 import contextlib
 import json
 import os
@@ -11,9 +12,22 @@ from typing import Any, Callable, Dict, Iterator, Optional
 
 
 def execute_python(code: str, namespace: Dict[str, Any]) -> Any:
-    if looks_like_statements(code):
-        exec(compile(code, "<llm-browser-python>", "exec"), namespace, namespace)
-        return None
+    try:
+        module = ast.parse(code, mode="exec")
+    except SyntaxError:
+        module = None
+    if module is not None:
+        if module.body and isinstance(module.body[-1], ast.Expr):
+            prefix = ast.Module(body=module.body[:-1], type_ignores=module.type_ignores)
+            ast.fix_missing_locations(prefix)
+            if prefix.body:
+                exec(compile(prefix, "<llm-browser-python>", "exec"), namespace, namespace)
+            expression = ast.Expression(module.body[-1].value)
+            ast.fix_missing_locations(expression)
+            return eval(compile(expression, "<llm-browser-python>", "eval"), namespace, namespace)
+        if looks_like_statements(code):
+            exec(compile(module, "<llm-browser-python>", "exec"), namespace, namespace)
+            return None
     try:
         compiled = compile(code, "<llm-browser-python>", "eval")
     except SyntaxError:

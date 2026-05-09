@@ -62,19 +62,24 @@ def _fetch_text_with_curl_cffi(
         return None
 
     last_error: Optional[str] = None
+    total_timeout = _normalize_timeout(timeout, default=20.0)
+    deadline = time.monotonic() + total_timeout
     for impersonate in ("chrome136", "chrome124", "chrome120"):
         try:
-            response = curl_requests.get(url, headers=headers, timeout=timeout, impersonate=impersonate)
+            request_timeout = _remaining_timeout(deadline)
+            response = curl_requests.get(url, headers=headers, timeout=request_timeout, impersonate=impersonate)
             result = _fetch_text_result(url, response.url, response.status_code, response.text, "curl_cffi", max_chars)
             result["impersonate"] = impersonate
             return result
         except Exception as exc:
             last_error = str(exc)
+            if _deadline_expired(deadline):
+                break
     return {
         "ok": False,
         "url": url,
         "source": "curl_cffi",
-        "error": last_error or "curl_cffi request failed",
+        "error": last_error or f"curl_cffi request timed out after {total_timeout:.1f}s",
         "text": "",
         "truncated": False,
     }
@@ -95,12 +100,18 @@ def _fetch_text_with_jina_reader(
 
     reader_url = _jina_reader_url(url)
     last_error: Optional[str] = None
+    total_timeout = _normalize_timeout(timeout, default=20.0)
+    deadline = time.monotonic() + total_timeout
     for attempt in range(3):
         try:
-            response = requests.get(reader_url, headers=headers, timeout=max(timeout, 30.0))
+            response = requests.get(reader_url, headers=headers, timeout=_remaining_timeout(deadline))
             retry_delay = _jina_retry_delay(response.text)
             if retry_delay is not None and attempt < 2:
-                time.sleep(min(max(retry_delay, 1.0), 30.0))
+                sleep_for = min(max(retry_delay, 1.0), 30.0, max(deadline - time.monotonic(), 0.0))
+                if sleep_for <= 0:
+                    last_error = f"jina reader request timed out after {total_timeout:.1f}s"
+                    break
+                time.sleep(sleep_for)
                 continue
             result = _fetch_text_result(url, response.url, response.status_code, response.text, "jina", max_chars)
             if retry_delay is not None:
@@ -113,17 +124,38 @@ def _fetch_text_with_jina_reader(
         except Exception as exc:
             last_error = str(exc)
             if attempt < 2:
-                time.sleep(1.0 + attempt)
+                if _deadline_expired(deadline):
+                    break
+                time.sleep(min(1.0 + attempt, max(deadline - time.monotonic(), 0.0)))
     return {
         "ok": False,
         "url": url,
         "source": "jina",
         "reader_url": reader_url,
         "direct_error": direct_error,
-        "error": last_error or "jina reader request failed",
+        "error": last_error or f"jina reader request timed out after {total_timeout:.1f}s",
         "text": "",
         "truncated": False,
     }
+
+
+def _normalize_timeout(value: Any, *, default: float) -> float:
+    try:
+        timeout = float(value)
+    except (TypeError, ValueError):
+        timeout = default
+    return max(0.5, timeout)
+
+
+def _remaining_timeout(deadline: float) -> float:
+    remaining = deadline - time.monotonic()
+    if remaining <= 0:
+        raise TimeoutError("fetch source budget expired")
+    return max(0.5, remaining)
+
+
+def _deadline_expired(deadline: float) -> bool:
+    return time.monotonic() >= deadline
 
 
 def _jina_retry_delay(text: str) -> Optional[float]:
@@ -432,77 +464,6 @@ def _query_looks_scholarly(query: str) -> bool:
     return has_binomial and any(term in lowered for term in biology_context_terms)
 
 
-def _extract_cve_ids(text: str) -> List[str]:
-    seen: set[str] = set()
-    cve_ids: List[str] = []
-    for match in re.finditer(r"\bCVE-\d{4}-\d{4,}\b", text, flags=re.IGNORECASE):
-        cve_id = match.group(0).upper()
-        if cve_id not in seen:
-            seen.add(cve_id)
-            cve_ids.append(cve_id)
-    return cve_ids
-
-
-def _extract_fcc_grantee_codes(text: str) -> List[str]:
-    if not re.search(r"\b(fcc|fccid|grantee)\b", text or "", flags=re.I):
-        return []
-    stop_words = {
-        "FCC",
-        "FCCID",
-        "ID",
-        "IO",
-        "SITE",
-        "HTTP",
-        "HTML",
-        "THE",
-        "AND",
-        "FOR",
-        "CODE",
-        "CODES",
-        "QUERY",
-        "SEARCH",
-    }
-    seen: set[str] = set()
-    codes: List[str] = []
-    for token in re.findall(r"\b[A-Z0-9]{3,5}\b", (text or "").upper()):
-        if token in stop_words:
-            continue
-        if len(token) == 5 and not token.startswith("2"):
-            continue
-        if not any(ch.isdigit() for ch in token) and len(token) != 3:
-            continue
-        if token not in seen:
-            seen.add(token)
-            codes.append(token)
-    return codes
-
-
-def _search_fcc_grantee_records(codes: List[str], *, limit: int) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
-    if limit <= 0:
-        return [], {"source": "fcc_grantee_records", "skipped": True}
-    results: List[Dict[str, str]] = []
-    for code in codes:
-        candidates = [
-            {
-                "title": f"FCCID.io grantee page - {code}",
-                "url": f"https://fccid.io/{code}/",
-                "snippet": f"FCCID.io grantee page listing FCC ID applications for grantee code {code}.",
-                "source": "fcc_grantee_records",
-            },
-            {
-                "title": f"FCCID.io company lookup - {code}",
-                "url": f"https://fccid.io/company.php?grantee={code}",
-                "snippet": f"FCCID.io company lookup for FCC grantee code {code}.",
-                "source": "fcc_grantee_records",
-            },
-        ]
-        for candidate in candidates:
-            results.append(candidate)
-            if len(results) >= limit:
-                return results, {"source": "fcc_grantee_records", "fcc_grantee_codes": codes}
-    return results, {"source": "fcc_grantee_records", "fcc_grantee_codes": codes}
-
-
 def _normalize_email_domains(domains: Optional[Any]) -> Optional[set[str]]:
     if domains is None:
         return None
@@ -602,281 +563,6 @@ def _looks_like_noise_email(email: str) -> bool:
         "do-not-reply",
     }
     return local in blocked_locals
-
-
-def _extract_store_locator_locations(
-    target: str,
-    *,
-    provider: str = "auto",
-    country_ids: Optional[Any] = None,
-    max_locations: int = 10000,
-    timeout: float = 30.0,
-) -> Dict[str, Any]:
-    provider_name = str(provider or "auto").lower()
-    if provider_name not in {"auto", "bullseye"}:
-        return {"ok": False, "provider": provider, "error": f"unsupported provider: {provider}"}
-    try:
-        import requests
-    except Exception as exc:
-        raise RuntimeError("requests is not installed") from exc
-
-    attempts: List[Dict[str, Any]] = []
-    candidates = _discover_bullseye_interface_names(str(target or ""), requests=requests, timeout=timeout, attempts=attempts)
-    if not candidates:
-        return {
-            "ok": False,
-            "provider": "bullseye",
-            "target": target,
-            "error": "no Bullseye interface name discovered",
-            "attempts": attempts,
-        }
-
-    errors: List[str] = []
-    for interface_name in candidates:
-        config_url = "https://wswrapper.bullseyelocations.com/InterfaceConfiguration/GetInterfaceConfiguration"
-        try:
-            config_response = requests.get(
-                config_url,
-                params={"interfaceName": interface_name},
-                headers=_browser_headers(),
-                timeout=min(timeout, 30.0),
-            )
-            config_attempt: Dict[str, Any] = {
-                "source": "bullseye_config",
-                "interface_name": interface_name,
-                "status": getattr(config_response, "status_code", None),
-                "url": getattr(config_response, "url", config_url),
-                "chars": len(getattr(config_response, "text", "") or ""),
-            }
-            config = config_response.json()
-            if not isinstance(config, dict):
-                config_attempt["error"] = "configuration response was not an object"
-                attempts.append(config_attempt)
-                continue
-            client_id = config.get("clientId")
-            api_key = config.get("apiKey")
-            config_attempt["client_id"] = client_id
-            attempts.append(config_attempt)
-            if not client_id or not api_key:
-                errors.append(f"{interface_name}: missing clientId/apiKey")
-                continue
-            locations_result = _fetch_bullseye_location_list(
-                requests=requests,
-                client_id=client_id,
-                api_key=str(api_key),
-                config=config,
-                country_ids=country_ids,
-                max_locations=max_locations,
-                timeout=timeout,
-            )
-            attempts.append(locations_result.pop("attempt"))
-            if locations_result.get("ok"):
-                locations = locations_result.get("locations") or []
-                return {
-                    "ok": True,
-                    "provider": "bullseye",
-                    "target": target,
-                    "interface_name": interface_name,
-                    "client_id": client_id,
-                    "country_ids": locations_result.get("country_ids"),
-                    "count": len(locations),
-                    "sample": locations[:3],
-                    "locations": locations,
-                    "attempts": attempts,
-                }
-            errors.append(f"{interface_name}: {locations_result.get('error', 'location list failed')}")
-        except Exception as exc:
-            attempts.append({"source": "bullseye_config", "interface_name": interface_name, "error": str(exc)})
-            errors.append(f"{interface_name}: {exc}")
-
-    return {
-        "ok": False,
-        "provider": "bullseye",
-        "target": target,
-        "interfaces": candidates,
-        "error": "; ".join(errors[-5:]) or "all Bullseye attempts failed",
-        "attempts": attempts,
-    }
-
-
-def _discover_bullseye_interface_names(
-    target: str,
-    *,
-    requests: Any,
-    timeout: float,
-    attempts: List[Dict[str, Any]],
-) -> List[str]:
-    candidates: List[str] = []
-
-    def add(value: Any) -> None:
-        name = html.unescape(unquote(str(value or ""))).strip().strip("/?#&")
-        name = name.split("?", 1)[0].split("#", 1)[0].strip("/")
-        if not name:
-            return
-        if "/" in name:
-            name = name.rstrip("/").rsplit("/", 1)[-1]
-        name = name.lower()
-        if not re.fullmatch(r"[a-z0-9][a-z0-9_-]{1,140}", name):
-            return
-        blocked = {"local", "list", "citylist", "pages", "page", "static", "resources", "resource", "error", "ie", "index"}
-        if name in blocked or name.startswith("_next") or name.endswith(("-css", "-js")):
-            return
-        if name not in candidates:
-            candidates.append(name)
-
-    value = target.strip()
-    parsed = urlparse(value)
-    if parsed.query:
-        query = parse_qs(parsed.query)
-        for key in ("interfaceName", "interfacename", "interface_name"):
-            for item in query.get(key, []):
-                add(item)
-    if parsed.scheme in {"http", "https"}:
-        segments = [unquote(part) for part in parsed.path.split("/") if part]
-        for index, segment in enumerate(segments):
-            previous = segments[index - 1].lower() if index else ""
-            before_previous = segments[index - 2].lower() if index >= 2 else ""
-            if previous in {"list", "citylist", "pages"} or (before_previous == "local" and previous in {"list", "citylist"}):
-                add(segment)
-        if segments:
-            add(segments[-1])
-    elif value and "/" not in value and " " not in value:
-        add(value)
-
-    texts = [value]
-    if parsed.scheme in {"http", "https"}:
-        try:
-            response = requests.get(value, headers=_browser_headers(), timeout=min(timeout, 20.0))
-            text = getattr(response, "text", "") or ""
-            texts.append(text)
-            attempts.append(
-                {
-                    "source": "locator_page",
-                    "url": getattr(response, "url", value),
-                    "status": getattr(response, "status_code", None),
-                    "chars": len(text),
-                }
-            )
-        except Exception as exc:
-            attempts.append({"source": "locator_page", "url": value, "error": str(exc)})
-
-    for text in texts:
-        for pattern in (
-            r"GetInterfaceConfiguration\?[^\"'<>]*?interfaceName=([^&\"'<>]+)",
-            r"interfaceName[\"'\s:=]+([a-zA-Z0-9_-]{2,140})",
-            r"interface_name[\"'\s:=]+([a-zA-Z0-9_-]{2,140})",
-            r"/local/(?:list|citylist)/([a-zA-Z0-9][a-zA-Z0-9_-]{1,140})",
-            r"/local/(?!static/|list/|citylist/|error/|ie\.html)([a-zA-Z0-9][a-zA-Z0-9_-]{1,140})(?:[/?\"'<>#]|$)",
-            r"/pages/([a-zA-Z0-9][a-zA-Z0-9_-]{1,140})",
-        ):
-            for match in re.finditer(pattern, text):
-                add(match.group(1))
-    return candidates
-
-
-def _fetch_bullseye_location_list(
-    *,
-    requests: Any,
-    client_id: Any,
-    api_key: str,
-    config: Dict[str, Any],
-    country_ids: Optional[Any],
-    max_locations: int,
-    timeout: float,
-) -> Dict[str, Any]:
-    country_value = _bullseye_country_ids(country_ids, config)
-    location_identifier = config.get("locationIdentifier") or 1
-    params = {
-        "countryIds": country_value,
-        "action": "json",
-        "isSEO": "true",
-        "isProxy": "true",
-        "locationIdentifier": location_identifier,
-        "callback": "results",
-        "ClientId": client_id,
-        "ApiKey": api_key,
-    }
-    url = "https://ws.bullseyelocations.com/RestSearch.svc/GetLocationList"
-    try:
-        response = requests.get(url, params=params, headers=_browser_headers(), timeout=min(timeout, 60.0))
-        payload = _decode_bullseye_location_payload(response)
-        locations = payload.get("locations")
-        if not isinstance(locations, list):
-            locations = payload.get("Locations")
-        if not isinstance(locations, list):
-            return {
-                "ok": False,
-                "error": "location payload did not contain a locations list",
-                "country_ids": country_value,
-                "attempt": {
-                    "source": "bullseye_location_list",
-                    "status": getattr(response, "status_code", None),
-                    "url": getattr(response, "url", url),
-                    "chars": len(getattr(response, "text", "") or ""),
-                    "parsed": 0,
-                },
-            }
-        limit = max(0, min(int(max_locations), len(locations)))
-        trimmed = locations[:limit]
-        return {
-            "ok": True,
-            "country_ids": country_value,
-            "locations": trimmed,
-            "attempt": {
-                "source": "bullseye_location_list",
-                "status": getattr(response, "status_code", None),
-                "url": getattr(response, "url", url),
-                "chars": len(getattr(response, "text", "") or ""),
-                "parsed": len(trimmed),
-                "total": len(locations),
-            },
-        }
-    except Exception as exc:
-        return {
-            "ok": False,
-            "error": str(exc),
-            "country_ids": country_value,
-            "attempt": {"source": "bullseye_location_list", "url": url, "error": str(exc), "parsed": 0},
-        }
-
-
-def _bullseye_country_ids(country_ids: Optional[Any], config: Dict[str, Any]) -> str:
-    if country_ids is not None:
-        if isinstance(country_ids, str):
-            return country_ids
-        try:
-            return ",".join(str(item) for item in country_ids)
-        except TypeError:
-            return str(country_ids)
-    countries = config.get("countries")
-    if isinstance(countries, list):
-        ids = [str(item.get("id")) for item in countries if isinstance(item, dict) and item.get("id")]
-        if ids:
-            return ",".join(ids)
-    return "1"
-
-
-def _decode_bullseye_location_payload(response: Any) -> Dict[str, Any]:
-    try:
-        raw: Any = response.json()
-    except Exception:
-        raw = getattr(response, "text", "")
-    for _ in range(4):
-        if isinstance(raw, dict):
-            return raw
-        if isinstance(raw, list):
-            return {"locations": raw}
-        if not isinstance(raw, str):
-            break
-        text = raw.strip()
-        jsonp = re.match(r"^[a-zA-Z_$][\w$]*\((.*)\)\s*;?$", text, re.S)
-        if jsonp:
-            text = jsonp.group(1).strip()
-        try:
-            raw = json.loads(text)
-        except Exception:
-            break
-    return {}
 
 
 def _crawl_site(
@@ -1240,48 +926,6 @@ def _looks_like_social_url(url: str) -> bool:
         "crunchbase.com",
     )
     return any(host == item or host.endswith("." + item) for item in social_hosts)
-
-
-def _search_cve_records(cve_ids: List[str], *, limit: int) -> tuple[List[Dict[str, str]], Dict[str, Any]]:
-    if limit <= 0:
-        return [], {"source": "cve_records", "skipped": True}
-    results: List[Dict[str, str]] = []
-    for cve_id in cve_ids:
-        parts = cve_id.split("-")
-        year = parts[1]
-        number = parts[2]
-        prefix = f"{number[:-3]}xxx" if len(number) > 3 else "0xxx"
-        candidates = [
-            {
-                "title": f"NVD - {cve_id}",
-                "url": f"https://nvd.nist.gov/vuln/detail/{cve_id}",
-                "snippet": f"National Vulnerability Database detail page for {cve_id}.",
-                "source": "cve_records",
-            },
-            {
-                "title": f"CVE.org - {cve_id}",
-                "url": f"https://www.cve.org/CVERecord?id={cve_id}",
-                "snippet": f"Official CVE Program record for {cve_id}.",
-                "source": "cve_records",
-            },
-            {
-                "title": f"NVD API - {cve_id}",
-                "url": f"https://services.nvd.nist.gov/rest/json/cves/2.0?cveId={cve_id}",
-                "snippet": f"Machine-readable NVD JSON record for {cve_id}.",
-                "source": "cve_records",
-            },
-            {
-                "title": f"CVE List JSON - {cve_id}",
-                "url": f"https://raw.githubusercontent.com/CVEProject/cvelistV5/main/cves/{year}/{prefix}/{cve_id}.json",
-                "snippet": f"Machine-readable CVE List v5 JSON record for {cve_id}.",
-                "source": "cve_records",
-            },
-        ]
-        for candidate in candidates:
-            results.append(candidate)
-            if len(results) >= limit:
-                return results, {"source": "cve_records", "cve_ids": cve_ids}
-    return results, {"source": "cve_records", "cve_ids": cve_ids}
 
 
 def _search_wikipedia_api(query: str, *, limit: int, timeout: float) -> tuple[List[Dict[str, str]], Dict[str, Any]]:

@@ -6,7 +6,6 @@ from typing import Any, Dict, List
 from urllib.parse import quote_plus
 
 from llm_browser.harness.api import HelperAPI
-from llm_browser.harness_skills.public_records import _public_record_candidates
 from llm_browser.harness_skills.scholarly import _scholarly_candidates
 from llm_browser.tool.web_fetch import (
     _browser_headers,
@@ -24,7 +23,7 @@ from llm_browser.tool.web_fetch import (
 
 SKILL = {
     "name": "search",
-    "description": "General web search across search result pages, with optional public-record and scholarly fallbacks.",
+    "description": "General web search across search result pages, with optional scholarly fallbacks.",
     "exports": ["search_web"],
 }
 
@@ -79,12 +78,6 @@ def install(api: HelperAPI) -> Dict[str, Any]:
             path = search_dir / f"{int(time.time() * 1000)}-{source}-{slug}.html"
             path.write_text(text, encoding="utf-8", errors="replace")
             return str(path)
-
-        public_results, public_attempts = _public_record_candidates(query, limit=max_results)
-        added = add_results(public_results)
-        for attempt in public_attempts:
-            attempt["parsed"] = min(int(attempt.get("parsed") or 0), len(added) or max_results)
-            attempts.append(attempt)
 
         for source, search_url in urls:
             if len(results) >= max_results:

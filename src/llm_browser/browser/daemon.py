@@ -26,6 +26,7 @@ CALLABLES = {
     "current_tab",
     "current_cdp_session",
     "set_cdp_session",
+    "reattach_cdp",
     "ensure_real_tab",
     "iframe_target",
     "new_tab",

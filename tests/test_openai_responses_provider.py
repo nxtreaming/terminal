@@ -61,9 +61,10 @@ class OpenAIResponsesProviderTest(unittest.TestCase):
         self.assertEqual(payload["input"][0]["role"], "user")
         self.assertEqual(payload["tools"][0]["name"], "echo")
         self.assertTrue(payload["store"])
-        self.assertIn('cdp("Domain.method"', payload["instructions"])
-        self.assertIn("set_cdp_session", payload["instructions"])
         self.assertIn("CDP is the source of truth", payload["instructions"])
+        self.assertIn("Helpers are convenience wrappers", payload["instructions"])
+        self.assertIn("they are not top-level tools", payload["instructions"])
+        self.assertIn("Do not discover the browser through raw DevTools URLs", payload["instructions"])
 
     def test_emits_normalized_usage_event(self) -> None:
         provider = OpenAIResponsesProvider(api_key="test-key", model="gpt-5.5")

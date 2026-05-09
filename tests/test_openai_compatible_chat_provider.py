@@ -86,6 +86,31 @@ class OpenAICompatibleChatProviderTest(unittest.TestCase):
         self.assertIn("Image attached", user_content)
         self.assertNotIn("base64,abc", user_content)
 
+    def test_openrouter_payload_keeps_reasoning_config_and_images(self) -> None:
+        provider = OpenAICompatibleChatProvider(
+            api_key="test-key",
+            model="qwen/qwen3.6-plus",
+            provider_label="openrouter",
+            base_url="https://openrouter.ai/api/v1",
+            supports_images=True,
+            extra_body={"reasoning": {"enabled": True, "exclude": True}},
+        )
+        response = FakeResponse(200, {"choices": [{"message": {"content": "ok"}}]})
+        content = [
+            {"type": "input_text", "text": "frame"},
+            {"type": "input_image", "detail": "auto", "image_url": "data:image/png;base64,abc"},
+        ]
+
+        with patch("llm_browser.provider.openai_compatible_chat.requests.post", return_value=response) as post:
+            list(provider.start_turn([{"role": "user", "content": content}], []))
+
+        self.assertEqual(post.call_args.args[0], "https://openrouter.ai/api/v1/chat/completions")
+        payload = post.call_args.kwargs["json"]
+        self.assertEqual(payload["model"], "qwen/qwen3.6-plus")
+        self.assertEqual(payload["reasoning"], {"enabled": True, "exclude": True})
+        self.assertEqual(payload["messages"][1]["content"][1]["type"], "image_url")
+        self.assertEqual(payload["messages"][1]["content"][1]["image_url"]["url"], "data:image/png;base64,abc")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

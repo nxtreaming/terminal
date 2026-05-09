@@ -94,6 +94,18 @@ class ConfigCliTest(unittest.TestCase):
             self.assertEqual(os.environ["BROWSER_USE_API_KEY"], "bu_secret")
             self.assertEqual(redacted_config(config)["browser"]["cloud_api_key"], "<redacted>")
 
+    def test_openrouter_config_hydrates_env(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            path = Path(tmp) / "config.json"
+            _, config = write_config_value("providers.openrouter.api_key", "or_secret", path=path)
+            _, config = write_config_value("providers.openrouter.base_url", "https://openrouter.example/api/v1", path=path)
+
+            apply_config_environment(config)
+
+            self.assertEqual(os.environ["LLM_BROWSER_OPENROUTER_API_KEY"], "or_secret")
+            self.assertEqual(os.environ["LLM_BROWSER_OPENROUTER_BASE_URL"], "https://openrouter.example/api/v1")
+            self.assertEqual(redacted_config(config)["providers"]["openrouter"]["api_key"], "<redacted>")
+
 
 if __name__ == "__main__":
     raise SystemExit(unittest.main())

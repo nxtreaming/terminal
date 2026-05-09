@@ -162,6 +162,34 @@ class BrokenCdpClient:
         self.closed = True
 
 
+class RecoveringCdpClient:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, Optional[str]]] = []
+        self.failed_once = False
+
+    def call(
+        self,
+        method: str,
+        params: Optional[Dict[str, Any]] = None,
+        session_id: Optional[str] = None,
+        timeout_s: Optional[float] = None,
+    ) -> Dict[str, Any]:
+        self.calls.append((method, session_id))
+        if method == "Runtime.evaluate" and not self.failed_once:
+            self.failed_once = True
+            raise CdpConnectionError("connection lost")
+        if method == "Target.getTargets":
+            return {"targetInfos": [{"targetId": "target-1", "type": "page", "url": "https://example.com"}]}
+        if method == "Target.attachToTarget":
+            return {"sessionId": "fresh-session"}
+        if method == "Runtime.evaluate":
+            return {"result": {"value": "ok"}}
+        return {}
+
+    def close(self) -> None:
+        return None
+
+
 class SequenceRuntime(BrowserRuntime):
     def __init__(self, root_dir: Path, values: list[Any]) -> None:
         super().__init__(root_dir=root_dir)
@@ -418,20 +446,22 @@ class BrowserRuntimeTest(unittest.TestCase):
 
         request.assert_not_called()
 
-    def test_cloud_runtime_cdp_does_not_self_heal_dead_websocket(self) -> None:
+    def test_runtime_cdp_recovers_default_session_after_dead_websocket(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             runtime = BrowserRuntime(Path(tmp))
             runtime.mode = "cloud"
-            runtime.client = BrokenCdpClient()  # type: ignore[assignment]
+            client = RecoveringCdpClient()
+            runtime.client = client  # type: ignore[assignment]
             runtime.websocket_url = "ws://cloud/old"
-            runtime.cloud_api_key = "key"
-            runtime.cloud_browser_id = "browser-1"
+            runtime.browser_level_ws = True
+            runtime.target = {"id": "target-1", "type": "page", "url": "https://example.com"}
+            runtime.default_session_id = "stale-session"
 
-            with patch("llm_browser.browser.runtime._browser_use_request") as request:
-                with self.assertRaises(CdpConnectionError):
-                    runtime.cdp("Browser.getVersion")
+            result = runtime.cdp("Runtime.evaluate", {"expression": "1"})
 
-        request.assert_not_called()
+        self.assertEqual(result, {"result": {"value": "ok"}})
+        self.assertIn(("Target.attachToTarget", None), client.calls)
+        self.assertIn(("Runtime.evaluate", "fresh-session"), client.calls)
 
     def test_cloud_runtime_close_can_leave_remote_browser_running(self) -> None:
         client = Mock()
@@ -725,6 +755,42 @@ class BrowserRuntimeTest(unittest.TestCase):
             runtime.js("(async () => ({status: 200}))()", await_promise=True)
 
             self.assertFalse(runtime.last_params["replMode"])
+
+    def test_js_invokes_bare_zero_arg_arrow_function(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            runtime.js('() => "hello"', await_promise=True)
+
+            self.assertEqual(runtime.last_params["expression"], '(() => "hello")()')
+
+    def test_js_invokes_bare_zero_arg_async_function(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            runtime.js("async () => ({status: 200})", await_promise=True)
+
+            self.assertEqual(runtime.last_params["expression"], "(async () => ({status: 200}))()")
+            self.assertFalse(runtime.last_params["replMode"])
+
+    def test_js_captures_console_log_statement_output(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            runtime.js("const title = document.title; console.log('title', title)", await_promise=True)
+
+            expression = runtime.last_params["expression"]
+            self.assertIn("const __butLogs=[]", expression)
+            self.assertIn("console[__butLevel]", expression)
+            self.assertIn("return __butLogs.join", expression)
+
+    def test_js_keeps_explicit_return_snippets_direct(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            runtime = EvalRuntime(Path(tmp))
+
+            runtime.js("console.log('debug'); return 7", await_promise=True)
+
+            self.assertEqual(runtime.last_params["expression"], "(function(){console.log('debug'); return 7})()")
 
     def test_js_allows_forcing_repl_mode_for_promise_values(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:

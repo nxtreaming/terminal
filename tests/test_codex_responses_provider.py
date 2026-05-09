@@ -82,8 +82,10 @@ class CodexResponsesProviderTest(unittest.TestCase):
         self.assertTrue(payload["stream"])
         self.assertFalse(payload["store"])
         self.assertEqual(payload["model"], "gpt-test")
-        self.assertIn('cdp("Domain.method"', payload["instructions"])
-        self.assertIn("set_cdp_session", payload["instructions"])
+        self.assertIn("CDP is the source of truth", payload["instructions"])
+        self.assertIn("Helpers are convenience wrappers", payload["instructions"])
+        self.assertIn("they are not top-level tools", payload["instructions"])
+        self.assertIn("Do not discover the browser through raw DevTools URLs", payload["instructions"])
         self.assertTrue(post.call_args.kwargs["stream"])
         self.assertTrue(response.closed)
 

@@ -34,6 +34,7 @@ PRIMARY_CORE_HELPERS = [
     "switch_tab",
     "current_cdp_session",
     "set_cdp_session",
+    "reattach_cdp",
     "ensure_real_tab",
     "output_path",
     "agent_helpers_path",
@@ -277,6 +278,64 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
             raise RuntimeError("set_cdp_session is unavailable on this runtime")
         return handler(session_id, target_id=target_id)
 
+    def reattach_cdp(
+        target_id: Optional[str] = None,
+        url_contains: Optional[str] = None,
+        index: int = 0,
+        include_internal: bool = False,
+    ) -> Dict[str, Any]:
+        handler = getattr(runtime, "reattach_cdp", None)
+        if handler is not None:
+            return handler(
+                target_id=target_id,
+                url_contains=url_contains,
+                index=index,
+                include_internal=include_internal,
+            )
+        api.check_cancel()
+        result = cdp("Target.getTargets", session_id=None, timeout_s=5)
+        targets = result.get("targetInfos") or []
+        pages = [target for target in targets if target.get("type") == "page"]
+        if not include_internal:
+            pages = [target for target in pages if _is_real_page_target(target)]
+        if not pages:
+            raise RuntimeError("reattach_cdp found no page targets")
+
+        target = None
+        if target_id:
+            target = next((item for item in pages if str(item.get("targetId") or item.get("id") or "") == str(target_id)), None)
+            if target is None:
+                raise RuntimeError(f"reattach_cdp target_id not found: {target_id}")
+        elif url_contains:
+            target = next((item for item in pages if url_contains in str(item.get("url") or "")), None)
+            if target is None:
+                raise RuntimeError(f"reattach_cdp page URL containing {url_contains!r} not found")
+        else:
+            current = current_cdp_session().get("target") or {}
+            current_id = str(current.get("id") or current.get("targetId") or "")
+            target = next((item for item in pages if str(item.get("targetId") or item.get("id") or "") == current_id), None)
+            if target is None:
+                target = pages[int(index)]
+
+        resolved_target_id = str(target.get("targetId") or target.get("id") or "")
+        if not resolved_target_id:
+            raise RuntimeError(f"reattach_cdp target has no id: {target}")
+        try:
+            cdp("Target.activateTarget", targetId=resolved_target_id, session_id=None, timeout_s=5)
+        except Exception:
+            pass
+        attached = cdp("Target.attachToTarget", targetId=resolved_target_id, flatten=True, session_id=None, timeout_s=5)
+        session_id = str(attached["sessionId"])
+        state = set_cdp_session(session_id, target_id=resolved_target_id)
+        for domain in ("Page", "Runtime", "DOM", "Network"):
+            try:
+                cdp(f"{domain}.enable", timeout_s=3)
+            except Exception:
+                pass
+        state["reattached"] = True
+        state["target"] = target
+        return state
+
     def handle_dialog(accept: bool = True, prompt_text: Optional[str] = None) -> Dict[str, Any]:
         handler = getattr(runtime, "handle_dialog", None)
         if handler is None:
@@ -374,6 +433,7 @@ def install_core_helpers(api: HelperAPI) -> Dict[str, Any]:
         "switch_tab": getattr(runtime, "switch_tab", getattr(runtime, "attach_tab", lambda *args, **kwargs: None)),
         "current_cdp_session": current_cdp_session,
         "set_cdp_session": set_cdp_session,
+        "reattach_cdp": reattach_cdp,
         "ensure_real_tab": getattr(runtime, "ensure_real_tab", lambda: None),
         "iframe_target": getattr(runtime, "iframe_target", lambda url_substr=None: None),
         "agent_helpers_path": agent_helpers_path,
@@ -396,6 +456,18 @@ def auto_reload_agent_helpers(api: HelperAPI) -> None:
     reload_agent_helpers = api.namespace.get("reload_agent_helpers")
     if callable(reload_agent_helpers):
         reload_agent_helpers()
+
+
+def _is_real_page_target(target: Dict[str, Any]) -> bool:
+    url = str(target.get("url") or "")
+    if not url:
+        return False
+    return not (
+        url.startswith("about:")
+        or url.startswith("chrome:")
+        or url.startswith("devtools:")
+        or url.startswith("edge:")
+    )
 
 
 def _resize_image_max_dim(path: Path, max_dim: int) -> None:

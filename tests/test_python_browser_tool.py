@@ -1,11 +1,11 @@
 from __future__ import annotations
 
 import json
+import os
 import tempfile
 import threading
 import time
 import unittest
-import os
 from pathlib import Path
 from typing import Any, Dict, Optional
 from unittest.mock import Mock, patch
@@ -64,6 +64,23 @@ class FakeRuntime:
         if target_id is not None:
             self.target_id = str(target_id)
         return self.current_cdp_session()
+
+    def reattach_cdp(
+        self,
+        target_id: Optional[str] = None,
+        url_contains: Optional[str] = None,
+        index: int = 0,
+        include_internal: bool = False,
+    ) -> Dict[str, Any]:
+        if target_id is not None:
+            self.target_id = str(target_id)
+        self.session_id = "reattached-session"
+        state = self.current_cdp_session()
+        state["reattached"] = True
+        state["url_contains"] = url_contains
+        state["index"] = index
+        state["include_internal"] = include_internal
+        return state
 
     def connection_info(self) -> Dict[str, Any]:
         return {
@@ -198,6 +215,62 @@ class ChangedLiveUrlCloudRuntime(CloudRuntime):
 
 
 class PythonBrowserToolTest(unittest.TestCase):
+    def test_browser_contract_mistakes_are_regular_python_errors_not_tool_guards(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            runtime_started = False
+
+            def runtime_factory(root_dir: Path, headless: bool) -> FakeRuntime:
+                nonlocal runtime_started
+                runtime_started = True
+                return FakeRuntime(root_dir, headless)
+
+            tool = PythonBrowserTool(runtime_factory=runtime_factory)
+            result = tool(ctx, {"headless": True, "code": "from helpers import cdp\nresult = cdp('Browser.getVersion')"})
+
+            self.assertTrue(runtime_started)
+            self.assertFalse(result.data["ok"])
+            self.assertNotIn("harness_contract_error", result.data)
+            self.assertIn("ModuleNotFoundError", result.data["stderr"])
+
+    def test_allows_browser_helper_module_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root, headless: FakeRuntime(root, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "from browser import page_info\nresult = page_info()['title']",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"], "Example")
+
+    def test_multiline_trailing_expression_is_returned(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root, headless: FakeRuntime(root, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": "import json\n# inspect current page title\njs('document.title')",
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"], "Example Domain")
+
     def test_executes_code_and_emits_attached_screenshot(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             store = SessionStore(Path(tmp))
@@ -268,13 +341,14 @@ class PythonBrowserToolTest(unittest.TestCase):
                     "headless": True,
                     "code": "\n".join(
                         [
-                            "from browser import goto_url, js, pending_dialog, handle_dialog, current_cdp_session, set_cdp_session",
+                            "from browser import goto_url, js, pending_dialog, handle_dialog, current_cdp_session, set_cdp_session, reattach_cdp",
                             "from agent_browser import capture_screenshot",
                             "goto_url('https://example.com')",
                             "before = current_cdp_session()",
                             "after = set_cdp_session('session-2', target_id='target-2')",
+                            "reattached = reattach_cdp(target_id='target-3')",
                             "capture_screenshot('alias', attach=True)",
-                            "result = {'title': js('document.title'), 'dialog': pending_dialog is not None, 'handler': callable(handle_dialog), 'before': before['session_id'], 'after': after['session_id']}",
+                            "result = {'title': js('document.title'), 'dialog': pending_dialog is not None, 'handler': callable(handle_dialog), 'before': before['session_id'], 'after': after['session_id'], 'reattached': reattached['session_id'], 'target': reattached['target_id']}",
                         ]
                     ),
                 },
@@ -283,7 +357,15 @@ class PythonBrowserToolTest(unittest.TestCase):
         self.assertTrue(result.data["ok"])
         self.assertEqual(
             result.data["result"],
-            {"title": "Example Domain", "dialog": True, "handler": True, "before": "session-1", "after": "session-2"},
+            {
+                "title": "Example Domain",
+                "dialog": True,
+                "handler": True,
+                "before": "session-1",
+                "after": "session-2",
+                "reattached": "reattached-session",
+                "target": "target-3",
+            },
         )
         self.assertEqual(result.images[0].label, "alias")
 
@@ -669,6 +751,7 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertIn("click_at_xy", star)
             self.assertIn("current_cdp_session", star)
             self.assertIn("set_cdp_session", star)
+            self.assertIn("reattach_cdp", star)
             self.assertNotIn("navigate", star)
             self.assertNotIn("screenshot", star)
             self.assertNotIn("tabs", star)
@@ -676,6 +759,28 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertNotIn("wait_for_text", star)
             self.assertTrue(result.data["result"]["module_has_compat"])
             self.assertTrue(result.data["result"]["namespace_has_compat"])
+
+    def test_browser_helpers_lazy_loads_skill_exports_for_imports(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {}, clear=True):
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            result = tool(
+                ctx,
+                {
+                    "headless": True,
+                    "code": (
+                        "from browser_helpers import dismiss_cookie_banners\n"
+                        "result = {'callable': callable(dismiss_cookie_banners), 'loaded': loaded_skills()}"
+                    ),
+                },
+            )
+
+            self.assertTrue(result.data["ok"])
+            self.assertTrue(result.data["result"]["callable"])
+            self.assertEqual(result.data["result"]["loaded"], ["cookie_banners"])
 
     def test_legacy_autoload_can_restore_old_large_surface(self) -> None:
         with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "all"}, clear=True):
@@ -799,7 +904,6 @@ class PythonBrowserToolTest(unittest.TestCase):
                         "'has_banner': callable(dismiss_cookie_banners), "
                         "'has_upload': callable(upload_file), "
                         "'has_cloud_upload': callable(upload_artifact), "
-                        "'docs': 'Store Locators' in read_skill('store-locators'), "
                         "'loaded': loaded_skills()"
                         "}"
                     ),
@@ -813,34 +917,10 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertTrue(result.data["result"]["has_banner"])
             self.assertTrue(result.data["result"]["has_upload"])
             self.assertTrue(result.data["result"]["has_cloud_upload"])
-            self.assertTrue(result.data["result"]["docs"])
             self.assertEqual(
                 result.data["result"]["loaded"],
                 ["cloud_artifacts", "cookie_banners", "research", "search", "uploads"],
             )
-
-    def test_public_record_skill_can_be_loaded_with_dash_name(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp, patch.dict(os.environ, {"LLM_BROWSER_AUTOLOAD_SKILLS": "core"}, clear=False):
-            store = SessionStore(Path(tmp))
-            session = store.create(cwd=Path(tmp))
-            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
-            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
-
-            result = tool(
-                ctx,
-                {
-                    "headless": True,
-                    "code": (
-                        "load_skill('public-records')\n"
-                        "payload = search_cve_records('CVE-2020-8166 Rails details')\n"
-                        "result = {'url': payload['results'][0]['url'], 'loaded': loaded_skills()}"
-                    ),
-                },
-            )
-
-            self.assertTrue(result.data["ok"])
-            self.assertEqual(result.data["result"]["url"], "https://nvd.nist.gov/vuln/detail/CVE-2020-8166")
-            self.assertEqual(result.data["result"]["loaded"], ["public_records"])
 
     def test_wait_for_load_accepts_timeout_alias(self) -> None:
         runtime_holder = {}
@@ -1265,6 +1345,53 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["text"], "curl worked")
             self.assertEqual(result.data["result"]["direct_error"], "HTTP 403")
 
+    def test_fetch_text_timeout_is_total_budget_across_fallbacks(self) -> None:
+        class Response:
+            def __init__(self, text: str, url: str, status_code: int = 200) -> None:
+                self.text = text
+                self.url = url
+                self.status_code = status_code
+                self.ok = 200 <= status_code < 400
+
+        calls = []
+        curl_timeouts = []
+
+        def fake_get(url: str, **kwargs: Any) -> Response:
+            calls.append((url, kwargs.get("timeout")))
+            if url == "https://blocked.example/page":
+                return Response("Access Denied", url, status_code=403)
+            return Response("Title: readable page\n\nMarkdown Content:\nhello world", url)
+
+        def fake_curl(url: str, *, max_chars: int, timeout: float, headers: Dict[str, str]) -> None:
+            curl_timeouts.append(timeout)
+            return None
+
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            session = store.create(cwd=Path(tmp))
+            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
+            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
+
+            with patch("requests.get", side_effect=fake_get), patch(
+                "llm_browser.tool.python_browser._fetch_text_with_curl_cffi",
+                side_effect=fake_curl,
+            ):
+                result = tool(
+                    ctx,
+                    {
+                        "headless": True,
+                        "code": "load_skill('research')\nresult = fetch_text('https://blocked.example/page', timeout=5)",
+                    },
+                )
+
+            self.assertTrue(result.data["ok"])
+            self.assertEqual(result.data["result"]["source"], "jina")
+            self.assertGreaterEqual(len(calls), 2)
+            self.assertLessEqual(calls[0][1], 5)
+            self.assertLessEqual(curl_timeouts[0], 5)
+            self.assertLessEqual(calls[1][1], 5)
+            self.assertNotEqual(calls[1][1], 30)
+
     def test_fetch_readable_text_cleans_html_chrome(self) -> None:
         class Response:
             def __init__(self, text: str, url: str) -> None:
@@ -1598,88 +1725,6 @@ class PythonBrowserToolTest(unittest.TestCase):
             contact_page = next(page for page in payload["pages"] if page["requested_url"] == "https://example.com/contact")
             self.assertEqual(contact_page["title"], "Contact")
 
-    def test_extract_store_locator_locations_drains_bullseye_json_list(self) -> None:
-        class Response:
-            def __init__(self, text: str, url: str, status_code: int = 200, json_value: Any = None) -> None:
-                self.text = text
-                self.content = text.encode("utf-8")
-                self.url = url
-                self.status_code = status_code
-                self.ok = 200 <= status_code < 400
-                self._json_value = json_value
-
-            def json(self) -> Any:
-                if self._json_value is not None:
-                    return self._json_value
-                return json.loads(self.text)
-
-        locations = [
-            {"Name": "Alpha - PA", "Address1": "10 MAIN ST", "City": "ERIE", "StateAbbr": "PA", "PostCode": "16501"},
-            {"Name": "Beta - OH", "Address1": "20 MARKET ST", "City": "AKRON", "StateAbbr": "OH", "PostCode": "44308"},
-        ]
-        location_payload = json.dumps({"locations": locations})
-
-        def fake_get(url: str, **kwargs: Any) -> Response:
-            if url == "https://brand.example/locations":
-                return Response(
-                    '<a href="https://stores.example.com/local/list/example-store-near-me">Find a store</a>',
-                    url,
-                )
-            if "GetInterfaceConfiguration" in url:
-                if (kwargs.get("params") or {}).get("interfaceName") != "example-store-near-me":
-                    return Response("", url, json_value={"clientId": None, "apiKey": None})
-                return Response(
-                    "",
-                    "https://wswrapper.bullseyelocations.com/InterfaceConfiguration/GetInterfaceConfiguration?interfaceName=example-store-near-me",
-                    json_value={
-                        "clientId": 123,
-                        "apiKey": "public-key",
-                        "locationIdentifier": 1,
-                        "countries": [{"id": 1, "name": "United States"}],
-                    },
-                )
-            if "GetLocationList" in url:
-                params = kwargs.get("params") or {}
-                self.assertEqual(params["action"], "json")
-                self.assertEqual(params["isSEO"], "true")
-                self.assertEqual(params["isProxy"], "true")
-                return Response(
-                    json.dumps(location_payload),
-                    "https://ws.bullseyelocations.com/RestSearch.svc/GetLocationList",
-                    json_value=location_payload,
-                )
-            return Response("", url, status_code=404)
-
-        with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp))
-            session = store.create(cwd=Path(tmp))
-            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
-            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
-
-            with patch("requests.get", side_effect=fake_get):
-                result = tool(
-                    ctx,
-                    {
-                        "headless": True,
-                        "code": (
-                            "load_skill('store_locators')\n"
-                            "result = extract_store_locator_locations("
-                            "'https://brand.example/locations', save_to='stores.json', include_locations=False)"
-                        ),
-                    },
-                )
-
-            self.assertTrue(result.data["ok"])
-            payload = result.data["result"]
-            self.assertTrue(payload["ok"])
-            self.assertEqual(payload["provider"], "bullseye")
-            self.assertEqual(payload["interface_name"], "example-store-near-me")
-            self.assertEqual(payload["count"], 2)
-            self.assertEqual(payload["sample"][0]["Name"], "Alpha - PA")
-            self.assertNotIn("locations", payload)
-            saved = Path(payload["path"])
-            self.assertEqual(json.loads(saved.read_text(encoding="utf-8"))[1]["City"], "AKRON")
-
     def test_search_web_parses_duckduckgo_redirects_and_saves_empty_pages(self) -> None:
         class Response:
             def __init__(self, text: str, url: str, status_code: int = 200) -> None:
@@ -1806,50 +1851,6 @@ class PythonBrowserToolTest(unittest.TestCase):
 
             self.assertTrue(result.data["ok"])
             self.assertEqual([item["url"] for item in result.data["result"]["results"]], ["https://example.com/useful"])
-
-    def test_search_web_prioritizes_exact_cve_records(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp))
-            session = store.create(cwd=Path(tmp))
-            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
-            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
-
-            result = tool(
-                ctx,
-                {
-                    "headless": True,
-                    "code": "load_skill('search')\nresult = search_web('CVE-2020-8166 Rails details', max_results=4, include_specialized=False)",
-                },
-            )
-
-            self.assertTrue(result.data["ok"])
-            payload = result.data["result"]
-            urls = [item["url"] for item in payload["results"]]
-            self.assertEqual(urls[0], "https://nvd.nist.gov/vuln/detail/CVE-2020-8166")
-            self.assertEqual(urls[1], "https://www.cve.org/CVERecord?id=CVE-2020-8166")
-            self.assertIn("/cves/2020/8xxx/CVE-2020-8166.json", urls[3])
-            self.assertEqual(payload["attempts"][0]["source"], "cve_records")
-
-    def test_search_web_prioritizes_fcc_grantee_records(self) -> None:
-        with tempfile.TemporaryDirectory() as tmp:
-            store = SessionStore(Path(tmp))
-            session = store.create(cwd=Path(tmp))
-            ctx = ToolContext(session=session, store=store, tool_call_id="call_1", tool_name="python")
-            tool = PythonBrowserTool(runtime_factory=lambda root_dir, headless: FakeRuntime(root_dir, headless))
-
-            result = tool(
-                ctx,
-                {
-                    "headless": True,
-                    "code": "load_skill('search')\nresult = search_web('site:fccid.io 2ACAH BCE FCC grantee code', max_results=4, include_specialized=False)",
-                },
-            )
-
-            self.assertTrue(result.data["ok"])
-            payload = result.data["result"]
-            urls = [item["url"] for item in payload["results"]]
-            self.assertEqual(urls[:4], ["https://fccid.io/2ACAH/", "https://fccid.io/company.php?grantee=2ACAH", "https://fccid.io/BCE/", "https://fccid.io/company.php?grantee=BCE"])
-            self.assertEqual(payload["attempts"][0]["source"], "fcc_grantee_records")
 
     def test_search_web_uses_pubmed_fallback_when_page_search_is_empty(self) -> None:
         class Response:
@@ -2045,7 +2046,6 @@ class PythonBrowserToolTest(unittest.TestCase):
                         "code": (
                             "load_skill('research')\n"
                             "load_skill('extraction')\n"
-                            "load_skill('store_locators')\n"
                             "from browser_helpers import *\n"
                             "result = {"
                             "'text': fetch_text('https://example.com')[:5], "
@@ -2054,7 +2054,6 @@ class PythonBrowserToolTest(unittest.TestCase):
                             "'structured_readable': fetch_readable_text_result('https://example.com')['source'], "
                             "'many': fetch_many_text(['https://example.com'], save_to='bulk.json')['count'], "
                             "'blocks': extract_markdown_link_blocks('[A](https://example.com/a)')[0]['title'], "
-                            "'locator': callable(extract_store_locator_locations), "
                             "'title': js('document.title')"
                             "}"
                         ),
@@ -2068,7 +2067,6 @@ class PythonBrowserToolTest(unittest.TestCase):
             self.assertEqual(result.data["result"]["structured_readable"], "direct")
             self.assertEqual(result.data["result"]["many"], 1)
             self.assertEqual(result.data["result"]["blocks"], "A")
-            self.assertTrue(result.data["result"]["locator"])
             self.assertEqual(result.data["result"]["title"], "Example Domain")
 
     def test_browser_helpers_search_web_is_sliceable_dict(self) -> None:

@@ -9,9 +9,20 @@ from llm_browser.browser.instructions import BROWSER_HELP_PLAYBOOK
 
 BROWSER_TOOL_DESCRIPTION = (
     "Run Python in a browser-connected environment. "
-    "Use any appropriate approach: raw CDP, JavaScript, browser input events, HTTP, files, or helper code. "
+    "CDP is the source of truth: use cdp(\"Domain.method\", **params) for browser state and debugging. "
+    "Helpers such as page_info(), goto_url(), js(), capture_screenshot(), click_at_xy(), fill_input(), and press_key() "
+    "are Python functions inside this tool's code string and convenience wrappers you may use when clearer. "
+    "The harness owns Chrome lifecycle and the active CDP connection; "
+    "avoid raw localhost DevTools discovery URLs or relaunching Chrome. "
     "Set result or _result for structured output."
 )
+
+LAZY_IMPORT_EXPORT_NAMES = {
+    "click_text",
+    "deep_text",
+    "dismiss_cookie_banners",
+    "screenshot_element",
+}
 
 
 BROWSER_HELP_TEXT = (
@@ -21,10 +32,10 @@ BROWSER_HELP_TEXT = (
 
 Core browser:
   cdp(method, params=None, timeout_s=None) or cdp("Page.navigate", url="...", timeout=30)
-  js(expr, await_promise=True, repl_mode=None, timeout_s=None) or js(expr, timeout=30)
   new_tab(url), goto_url(url), list_tabs(include_internal=True)
-  switch_tab(target), current_tab(), current_cdp_session(), set_cdp_session(session_id, target_id=None)
+  switch_tab(target), current_tab(), current_cdp_session(), set_cdp_session(session_id, target_id=None), reattach_cdp(...)
   ensure_real_tab()
+  js(expr, await_promise=True, repl_mode=None, timeout_s=None) or js(expr, timeout=30)
 
 Waiting and observation:
   wait_for_load(), wait_for_element(selector)
@@ -84,6 +95,7 @@ PRIMARY_CORE_EXPORT_NAMES = [
     "switch_tab",
     "current_cdp_session",
     "set_cdp_session",
+    "reattach_cdp",
     "ensure_real_tab",
     "output_path",
     "agent_helpers_path",
@@ -188,6 +200,18 @@ def install_browser_helpers_module(namespace: Dict[str, Any]) -> None:
         setattr(module, "search_web", search_web)
         star_names.extend(["search_web", "search_web_result"])
 
+    lazy_exports = _lazy_skill_export_map(namespace)
+
+    def __getattr__(name: str) -> Any:
+        skill_name = lazy_exports.get(name)
+        load_skill = namespace.get("load_skill")
+        if skill_name and callable(load_skill):
+            load_skill(skill_name)
+            if name in namespace:
+                return namespace[name]
+        raise AttributeError(f"module 'browser_helpers' has no attribute {name!r}")
+
+    module.__getattr__ = __getattr__  # type: ignore[attr-defined]
     module.help_browser = namespace.get("help_browser", help_browser)
     module.__all__ = _unique_names([name for name in star_names if hasattr(module, name)])
     sys.modules["browser_helpers"] = module
@@ -209,6 +233,26 @@ def _browser_helper_export_names(namespace: Dict[str, Any], include_compat: bool
                     names.append(export)
     names.extend(PYTHON_AFFORDANCE_EXPORT_NAMES)
     return _unique_names(names)
+
+
+def _lazy_skill_export_map(namespace: Dict[str, Any]) -> Dict[str, str]:
+    list_skills = namespace.get("list_skills")
+    if not callable(list_skills):
+        return {}
+    exports: Dict[str, str] = {}
+    try:
+        skills = list_skills()
+    except Exception:
+        return {}
+    for skill in skills:
+        if not isinstance(skill, dict) or skill.get("kind") != "python":
+            continue
+        name = str(skill.get("name") or "")
+        for export in skill.get("exports") or []:
+            if isinstance(export, str) and export:
+                if export in LAZY_IMPORT_EXPORT_NAMES:
+                    exports.setdefault(export, name)
+    return exports
 
 
 def _unique_names(names: list[str]) -> list[str]:

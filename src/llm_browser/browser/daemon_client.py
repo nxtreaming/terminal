@@ -85,6 +85,21 @@ class DaemonBrowserRuntime:
     def set_cdp_session(self, session_id: Optional[str], target_id: Optional[str] = None) -> Dict[str, Any]:
         return self._call("set_cdp_session", session_id, target_id=target_id)
 
+    def reattach_cdp(
+        self,
+        target_id: Optional[str] = None,
+        url_contains: Optional[str] = None,
+        index: int = 0,
+        include_internal: bool = False,
+    ) -> Dict[str, Any]:
+        return self._call(
+            "reattach_cdp",
+            target_id=target_id,
+            url_contains=url_contains,
+            index=index,
+            include_internal=include_internal,
+        )
+
     def ensure_real_tab(self) -> Optional[Dict[str, Any]]:
         return self._call("ensure_real_tab")
 

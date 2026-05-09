@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import math
+import re
 import sys
 from pathlib import Path
 from typing import Any, Dict, Optional, Tuple
@@ -29,9 +30,54 @@ def is_real_page_target(target: Dict[str, Any]) -> bool:
 
 
 def wrap_js_if_return_statement(expression: str) -> str:
+    if _is_bare_zero_arg_js_function(expression):
+        return f"({expression})()"
     if _has_return_statement(expression) and not expression.lstrip().startswith("("):
         return f"(function(){{{expression}}})()"
+    if _has_console_call(expression) and not expression.lstrip().startswith("("):
+        return _wrap_console_capture(expression)
     return expression
+
+
+def _is_bare_zero_arg_js_function(expression: str) -> bool:
+    stripped = expression.strip()
+    if not stripped:
+        return False
+    if re.search(r"\)\s*\(\s*\)\s*;?\s*$", stripped):
+        return False
+    return bool(
+        re.match(r"^(async\s+)?\(\s*\)\s*=>", stripped)
+        or re.match(r"^(\(\s*)?(async\s+)?function\s*\(\s*\)", stripped)
+    )
+
+
+def _has_console_call(expression: str) -> bool:
+    return bool(re.search(r"\bconsole\.(?:log|warn|error|info|debug)\s*\(", expression))
+
+
+def _wrap_console_capture(expression: str) -> str:
+    async_prefix = "async " if re.search(r"\bawait\b", expression) else ""
+    return (
+        f"({async_prefix}function(){{"
+        "const __butLogs=[];"
+        "const __butConsole={log:console.log,warn:console.warn,error:console.error,info:console.info,debug:console.debug};"
+        "const __butFormat=(value)=>{"
+        "if(typeof value==='string')return value;"
+        "if(value instanceof Error)return value.stack||value.message||String(value);"
+        "try{return JSON.stringify(value);}catch(_){return String(value);}"
+        "};"
+        "for(const __butLevel of Object.keys(__butConsole)){"
+        "console[__butLevel]=(...args)=>{"
+        "__butLogs.push(args.map(__butFormat).join(' '));"
+        "return __butConsole[__butLevel].apply(console,args);"
+        "};"
+        "}"
+        "try{\n"
+        f"{expression}\n"
+        "}finally{Object.assign(console,__butConsole);}"
+        "return __butLogs.join('\\n');"
+        "})()"
+    )
 
 
 def decode_unserializable_js_value(value: str) -> Any:

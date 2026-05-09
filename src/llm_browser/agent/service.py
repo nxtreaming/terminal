@@ -115,6 +115,7 @@ class Agent:
         self.store.emit(session.id, "session.input", {"text": task})
         self.store.update_status(session.id, "running")
 
+        self._emit_model_config(session.id)
         self._set_provider_instructions(select_agent_instructions(task, self.mode))
         messages: List[Dict[str, Any]] = [{"role": "user", "content": task}]
         return self._run_with_messages(session, messages)
@@ -140,6 +141,7 @@ class Agent:
             },
         )
         self.store.update_status(session.id, "running")
+        self._emit_model_config(session.id)
         self._set_provider_instructions(select_agent_instructions(task, self.mode))
         return self._run_with_messages(session, copy.deepcopy(messages))
 
@@ -156,6 +158,7 @@ class Agent:
         messages.append({"role": "user", "content": instruction})
         self.store.emit(session.id, "session.input", {"text": instruction, "resumed": True})
         self.store.update_status(session.id, "running")
+        self._emit_model_config(session.id)
         self._set_provider_instructions(select_agent_instructions(instruction, self.mode))
         return self._run_with_messages(session, messages)
 
@@ -168,6 +171,7 @@ class Agent:
             messages = self._messages_from_events(session.id)
         except ValueError:
             messages = []
+        self._emit_model_config(session.id)
         self._set_provider_instructions(select_agent_instructions("compact session history", self.mode))
         self._run_compaction(
             session,
@@ -184,6 +188,7 @@ class Agent:
         self.store.begin_run(session.id, pid=runner_pid)
 
         try:
+            empty_turns = 0
             for _ in range(self.max_turns):
                 self._check_cancel(session.id)
                 messages = self._maybe_add_deadline_warning(session, messages)
@@ -220,8 +225,23 @@ class Agent:
                 if not tool_calls:
                     if text_parts:
                         final_result = "".join(text_parts).strip()
-                    break
+                        empty_turns = 0
+                        break
+                    empty_turns += 1
+                    self.store.emit(session.id, "model.empty_turn", {"count": empty_turns})
+                    messages.append(
+                        {
+                            "role": "user",
+                            "content": (
+                                "Your previous turn produced no visible text, no tool call, and no final answer. "
+                                "Continue from the latest browser/tool state. Use python/CDP to inspect state, "
+                                "or call done with the final answer if the task is complete."
+                            ),
+                        }
+                    )
+                    continue
 
+                empty_turns = 0
                 messages.append(
                     {
                         "role": "assistant",
@@ -562,6 +582,17 @@ class Agent:
             payload["cost"] = cost.to_dict()
         self.store.emit(session_id, "model.usage", payload)
 
+    def _emit_model_config(self, session_id: str) -> None:
+        self.store.emit(
+            session_id,
+            "model.config",
+            {
+                "provider": _provider_label(self.provider),
+                "model": str(getattr(self.provider, "model", "") or "unknown"),
+                "mode": self.mode,
+            },
+        )
+
     def _reset_provider_session(self) -> None:
         reset = getattr(self.provider, "reset_session", None)
         if callable(reset):
@@ -709,6 +740,7 @@ class Agent:
         return False
 
     def _set_provider_instructions(self, instructions: str) -> None:
+        instructions = _with_runtime_identity(self.provider, instructions)
         setter = getattr(self.provider, "set_instructions", None)
         if callable(setter):
             setter(instructions)
@@ -777,6 +809,32 @@ def _is_parallel_safe_command_segment(segment: str) -> bool:
     if len(parts) < 2:
         return False
     return parts[1] in PARALLEL_SAFE_GIT_SUBCOMMANDS
+
+
+def _with_runtime_identity(provider: Provider, instructions: str) -> str:
+    provider_label = _provider_label(provider)
+    model = str(getattr(provider, "model", "") or "unknown")
+    return (
+        "Runtime identity for this session:\n"
+        f"- Runtime provider: {provider_label}\n"
+        f"- Runtime model: {model}\n"
+        "- If asked which model/provider you are, answer with these runtime values and do not infer another identity.\n\n"
+        + instructions
+    )
+
+
+def _provider_label(provider: Provider) -> str:
+    explicit = str(getattr(provider, "provider_label", "") or "").strip()
+    if explicit:
+        return explicit
+    class_name = provider.__class__.__name__
+    known = {
+        "OpenAIResponsesProvider": "openai",
+        "CodexResponsesProvider": "codex",
+        "AnthropicMessagesProvider": "anthropic",
+        "FakeProvider": "fake",
+    }
+    return known.get(class_name, class_name)
 
 
 def _is_parallel_safe_find_parts(parts: List[str]) -> bool:

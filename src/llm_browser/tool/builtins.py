@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import mimetypes
 from pathlib import Path
 from typing import Any, Dict
 
@@ -20,12 +21,45 @@ def echo(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
 def done(ctx: ToolContext, arguments: Dict[str, Any]) -> ToolResult:
     path_value = arguments.get("path")
     if path_value:
-        path = Path(str(path_value)).expanduser()
-        if not path.is_absolute():
-            path = ctx.session.cwd / path
-        text = path.read_text(encoding="utf-8")
-        return ToolResult(text=text, data={"ok": True, "path": str(path), "chars": len(text)})
+        path = _resolve_done_path(ctx, str(path_value))
+        try:
+            text = path.read_text(encoding="utf-8")
+        except UnicodeDecodeError:
+            size = path.stat().st_size
+            mime_type = mimetypes.guess_type(str(path))[0] or "application/octet-stream"
+            return ToolResult(
+                text=str(path),
+                data={"ok": True, "path": str(path), "bytes": size, "mime_type": mime_type, "binary": True},
+            )
+        return ToolResult(text=text, data={"ok": True, "path": str(path), "chars": len(text), "binary": False})
     return ToolResult(text=str(arguments.get("result", "")))
+
+
+def _resolve_done_path(ctx: ToolContext, path_value: str) -> Path:
+    path = Path(path_value).expanduser()
+    if not path.is_absolute():
+        return ctx.session.cwd / path
+    if path.exists():
+        return path
+
+    candidates: list[Path] = []
+    parts = path.parts
+    if ".browser-use-terminal" in parts:
+        index = parts.index(".browser-use-terminal")
+        suffix = Path(*parts[index + 1 :])
+        if str(suffix):
+            candidates.append(ctx.session.state_dir / suffix)
+    if "dataset-runs" in parts:
+        index = parts.index("dataset-runs")
+        suffix = Path(*parts[index:])
+        if str(suffix):
+            candidates.append(ctx.session.state_dir / suffix)
+    candidates.append(ctx.session.cwd / path.name)
+
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    return path
 
 
 def build_builtin_registry() -> ToolRegistry:

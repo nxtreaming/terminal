@@ -41,6 +41,7 @@ MAX_INLINE_DATASET_RESULT = 20_000
 BROWSER_MODE_CHOICES = ["auto", "chromium", "headless-chromium", "real", "cdp", "cloud", "remote", "daemon"]
 AGENT_MODE_CHOICES = ["auto", "browser", "codex"]
 PROVIDER_CHOICES = provider_names()
+API_KEY_PROVIDER_CHOICES = ["openai", "anthropic", "zai", "qwen", "openrouter"]
 TOP_LEVEL_COMMANDS = {"doctor", "provider", "run", "sessions", "browser", "datasets", "tui", "config", "auth"}
 
 
@@ -343,12 +344,12 @@ def build_parser(config: Optional[Dict[str, Any]] = None) -> argparse.ArgumentPa
     auth_api_key_sub = auth_api_key.add_subparsers(dest="api_key_command", required=True)
 
     auth_api_key_set = auth_api_key_sub.add_parser("set", help="Store an API key for a provider.")
-    auth_api_key_set.add_argument("provider", choices=["openai", "anthropic", "zai", "qwen"])
+    auth_api_key_set.add_argument("provider", choices=API_KEY_PROVIDER_CHOICES)
     auth_api_key_set.add_argument("--key", default=None, help="API key. If omitted, prompts securely.")
     auth_api_key_set.set_defaults(func=cmd_auth_api_key_set)
 
     auth_api_key_remove = auth_api_key_sub.add_parser("remove", help="Remove a stored API key/OAuth credential.")
-    auth_api_key_remove.add_argument("provider", choices=["openai", "anthropic", "zai", "qwen"])
+    auth_api_key_remove.add_argument("provider", choices=API_KEY_PROVIDER_CHOICES)
     auth_api_key_remove.set_defaults(func=cmd_auth_api_key_remove)
 
     auth_anthropic = auth_sub.add_parser("anthropic", help="Anthropic API key and Claude Code login commands.")
@@ -976,6 +977,7 @@ def _run_dataset_task(
     if error:
         result.update({"ok": False, **error})
     _attach_dataset_final_result(store, result, session.id, workspace)
+    _reject_placeholder_dataset_result(store, result, session.id)
     result.setdefault("ok", False)
     return result
 
@@ -998,6 +1000,26 @@ def _attach_dataset_final_result(
     path.write_text(final_result, encoding="utf-8")
     result["final_result_preview"] = final_result[:MAX_INLINE_DATASET_RESULT]
     result["final_result_path"] = str(path)
+
+
+def _reject_placeholder_dataset_result(store: SessionStore, result: Dict[str, Any], session_id: str) -> None:
+    final_result = str(result.get("final_result") or result.get("final_result_preview") or "").strip()
+    if result.get("ok") and not _session_called_done_tool(store, session_id):
+        result["ok"] = False
+        result["error"] = "dataset task ended without calling the done tool"
+        result["error_type"] = "MissingDoneToolError"
+    if final_result in {"[Response interrupted]", "[response interrupted]"}:
+        result["ok"] = False
+        result["error"] = "model returned placeholder interrupted response"
+        result["error_type"] = "InterruptedResponseError"
+    if final_result.startswith("[tool error:"):
+        result["ok"] = False
+        result["error"] = "model finished with a tool error instead of a task result"
+        result["error_type"] = "ToolErrorFinalResult"
+
+
+def _session_called_done_tool(store: SessionStore, session_id: str) -> bool:
+    return any(event.type == "tool.started" and event.payload.get("name") == "done" for event in store.events.read(session_id))
 
 
 def _session_done_result(store: SessionStore, session_id: str) -> Optional[str]:

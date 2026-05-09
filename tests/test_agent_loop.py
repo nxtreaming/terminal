@@ -63,6 +63,19 @@ class TextOnlyProvider:
         yield ModelEvent.text("direct final")
 
 
+class EmptyThenDoneProvider:
+    def __init__(self):
+        self.turn = 0
+        self.messages = []
+
+    def start_turn(self, messages, tools):
+        self.turn += 1
+        self.messages.append(list(messages))
+        if self.turn == 1:
+            return
+        yield ModelEvent.text("recovered final")
+
+
 class UsageProvider:
     model = "gpt-5.5"
 
@@ -144,6 +157,8 @@ class ForkContextChildProvider:
 class InstructionCaptureProvider:
     def __init__(self):
         self.instructions = ""
+        self.provider_label = "test-provider"
+        self.model = "test-model"
 
     def set_instructions(self, instructions: str) -> None:
         self.instructions = instructions
@@ -180,10 +195,14 @@ class AgentLoopTest(unittest.TestCase):
             event_types = [event.type for event in events]
             self.assertIn("session.created", event_types)
             self.assertIn("session.input", event_types)
+            self.assertIn("model.config", event_types)
             self.assertIn("model.delta", event_types)
             self.assertEqual(event_types.count("tool.started"), 2)
             self.assertEqual(event_types.count("tool.finished"), 2)
             self.assertIn("session.done", event_types)
+            config_event = [event for event in events if event.type == "model.config"][0]
+            self.assertEqual(config_event.payload["provider"], "fake")
+            self.assertEqual(config_event.payload["model"], "unknown")
 
             tool_names = [
                 event.payload["name"]
@@ -220,6 +239,8 @@ class AgentLoopTest(unittest.TestCase):
 
             Agent(store, provider=provider).run("what is in this repo", cwd=Path(tmp))
 
+            self.assertIn("Runtime provider: test-provider", provider.instructions)
+            self.assertIn("Runtime model: test-model", provider.instructions)
             self.assertIn("You are Browser Use", provider.instructions)
             self.assertIn("rg --files", provider.instructions)
 
@@ -230,10 +251,26 @@ class AgentLoopTest(unittest.TestCase):
 
             Agent(store, provider=provider).run("Open example.com", cwd=Path(tmp))
 
-            self.assertIn("You control Chrome through Python", provider.instructions)
-            self.assertIn('cdp("Domain.method"', provider.instructions)
-            self.assertIn("set_cdp_session", provider.instructions)
+            self.assertIn("Runtime provider: test-provider", provider.instructions)
+            self.assertIn("Runtime model: test-model", provider.instructions)
+            self.assertIn("You control the harness-owned Chrome browser through Python and CDP", provider.instructions)
+            self.assertIn("CDP is the source of truth", provider.instructions)
+            self.assertIn("Helpers are convenience wrappers", provider.instructions)
+            self.assertIn("they are not top-level tools", provider.instructions)
+            self.assertIn("Do not discover the browser through raw DevTools URLs", provider.instructions)
             self.assertNotIn("reconnect_browser", provider.instructions)
+
+    def test_runtime_identity_uses_provider_attributes(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            provider = InstructionCaptureProvider()
+            provider.provider_label = "openrouter"
+            provider.model = "qwen/qwen3.6-plus"
+
+            Agent(store, provider=provider).run("which model are you", cwd=Path(tmp))
+
+            self.assertIn("Runtime provider: openrouter", provider.instructions)
+            self.assertIn("Runtime model: qwen/qwen3.6-plus", provider.instructions)
 
     def test_browser_prompts_load_from_markdown_resources(self) -> None:
         prompt_root = resources.files("llm_browser.browser").joinpath("prompts")
@@ -291,6 +328,18 @@ class AgentLoopTest(unittest.TestCase):
             events = store.events.read(session.id)
             self.assertEqual(events[-1].type, "session.done")
             self.assertEqual(events[-1].payload["result"], "direct final")
+
+    def test_empty_model_turn_is_reprompted(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            store = SessionStore(Path(tmp))
+            provider = EmptyThenDoneProvider()
+            session = Agent(store, provider=provider, max_turns=3).run("answer directly", cwd=Path(tmp))
+
+            self.assertEqual(session.status, "done")
+            events = store.events.read(session.id)
+            self.assertEqual([event.type for event in events].count("model.empty_turn"), 1)
+            self.assertEqual(events[-1].payload["result"], "recovered final")
+            self.assertIn("no visible text", provider.messages[-1][-1]["content"])
 
     def test_model_usage_event_is_persisted_with_cost(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -369,6 +418,48 @@ class AgentLoopTest(unittest.TestCase):
             done_event = [event for event in events if event.type == "session.done"][-1]
 
             self.assertEqual(done_event.payload["result"], final_text)
+
+    def test_done_recovers_session_file_from_stale_absolute_path(self) -> None:
+        final_text = "**1 - recovered record**\nsummary"
+
+        class DonePathProvider:
+            def start_turn(self, messages, tools):
+                stale_path = "/Users/greg/Documents/browser-use/llm-browser/.browser-use-terminal/dataset-runs/run/task/final.md"
+                yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"path": stale_path}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            workspace = Path(tmp) / "dataset-runs" / "run" / "task"
+            workspace.mkdir(parents=True)
+            workspace.joinpath("final.md").write_text(final_text, encoding="utf-8")
+            store = SessionStore(Path(tmp))
+            Agent(store, provider=DonePathProvider()).run("large final file", cwd=workspace)
+            events = store.events.read(store.list()[0].id)
+            done_event = [event for event in events if event.type == "session.done"][-1]
+
+            self.assertEqual(done_event.payload["result"], final_text)
+
+    def test_done_can_use_binary_workspace_file_as_final_artifact(self) -> None:
+        class DonePathProvider:
+            def start_turn(self, messages, tools):
+                yield ModelEvent.call(ToolCall(id="call_done", name="done", arguments={"path": "table.jpg"}))
+
+        with tempfile.TemporaryDirectory() as tmp:
+            image_path = Path(tmp, "table.jpg")
+            image_path.write_bytes(b"\xff\xd8\xff\xe0binary-jpeg")
+            store = SessionStore(Path(tmp))
+            Agent(store, provider=DonePathProvider()).run("return image", cwd=Path(tmp))
+            events = store.events.read(store.list()[0].id)
+            done_event = [event for event in events if event.type == "session.done"][-1]
+            done_output = [
+                event.payload["output"]
+                for event in events
+                if event.type == "tool.finished" and event.payload["name"] == "done"
+            ][0]
+
+            self.assertEqual(Path(done_event.payload["result"]).resolve(), image_path.resolve())
+            self.assertTrue(done_output["data"]["binary"])
+            self.assertEqual(done_output["data"]["mime_type"], "image/jpeg")
+            self.assertEqual(done_output["data"]["bytes"], image_path.stat().st_size)
 
     def test_large_tool_data_spills_without_reinlining_data(self) -> None:
         class LargeDataProvider:

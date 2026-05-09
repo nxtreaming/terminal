@@ -17,6 +17,8 @@ from llm_browser.tool.web_fetch import (
     _fetch_text_with_curl_cffi,
     _fetch_text_with_jina_reader,
     _html_to_readable_text,
+    _normalize_timeout,
+    _remaining_timeout,
 )
 
 
@@ -118,12 +120,14 @@ def make_fetch_text(api: HelperAPI):
         request_headers = _browser_headers()
         if headers:
             request_headers.update(headers)
+        total_timeout = _normalize_timeout(timeout, default=20.0)
+        deadline = time.monotonic() + total_timeout
 
         direct_error: Optional[str] = None
         if not force_jina:
             try:
                 api.check_cancel()
-                response = requests.get(url, headers=request_headers, timeout=timeout)
+                response = requests.get(url, headers=request_headers, timeout=_remaining_timeout(deadline))
                 api.check_cancel()
                 text = response.text
                 result = _fetch_text_result(url, response.url, response.status_code, text, "direct", max_chars)
@@ -145,7 +149,11 @@ def make_fetch_text(api: HelperAPI):
                     }
 
             api.check_cancel()
-            curl_result = _compat_fetch_text_with_curl_cffi(url, max_chars=max_chars, timeout=timeout, headers=request_headers)
+            try:
+                curl_timeout = _remaining_timeout(deadline)
+            except TimeoutError:
+                return _fetch_timeout_result(url, "direct", direct_error, total_timeout)
+            curl_result = _compat_fetch_text_with_curl_cffi(url, max_chars=max_chars, timeout=curl_timeout, headers=request_headers)
             api.check_cancel()
             if curl_result is not None:
                 if direct_error:
@@ -156,15 +164,33 @@ def make_fetch_text(api: HelperAPI):
                     direct_error = f"curl_cffi HTTP {curl_result.get('status')}"
 
         api.check_cancel()
+        try:
+            jina_timeout = _remaining_timeout(deadline)
+        except TimeoutError:
+            return _fetch_timeout_result(url, "curl_cffi" if not force_jina else "jina", direct_error, total_timeout)
         return _fetch_text_with_jina_reader(
             url,
             max_chars=max_chars,
-            timeout=timeout,
+            timeout=jina_timeout,
             headers=request_headers,
             direct_error=direct_error,
         )
 
     return fetch_text
+
+
+def _fetch_timeout_result(url: str, source: str, direct_error: Optional[str], timeout: float) -> Dict[str, Any]:
+    result: Dict[str, Any] = {
+        "ok": False,
+        "url": url,
+        "source": source,
+        "error": f"fetch_text timed out after {timeout:.1f}s",
+        "text": "",
+        "truncated": False,
+    }
+    if direct_error:
+        result["direct_error"] = direct_error
+    return result
 
 
 def make_fetch_many_text(api: HelperAPI, fetch_text):

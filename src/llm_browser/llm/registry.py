@@ -129,6 +129,97 @@ _MODELS: tuple[ModelSpec, ...] = (
         supports_images=False,
         extra_body={"enable_thinking": True},
     ),
+    ModelSpec(
+        "openrouter",
+        "z-ai/glm-5.1",
+        "openai_compatible_chat",
+        "GLM-5.1",
+        "OpenRouter Z.ai latest GLM coding model",
+        default=True,
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=False,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
+    ModelSpec(
+        "openrouter",
+        "z-ai/glm-5",
+        "openai_compatible_chat",
+        "GLM-5",
+        "OpenRouter Z.ai GLM flagship fallback",
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=False,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
+    ModelSpec(
+        "openrouter",
+        "z-ai/glm-5-turbo",
+        "openai_compatible_chat",
+        "GLM-5 Turbo",
+        "OpenRouter Z.ai faster GLM fallback",
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=False,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
+    ModelSpec(
+        "openrouter",
+        "z-ai/glm-5v-turbo",
+        "openai_compatible_chat",
+        "GLM-5V Turbo",
+        "OpenRouter Z.ai vision-capable GLM model",
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=True,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
+    ModelSpec(
+        "openrouter",
+        "qwen/qwen3.6-plus",
+        "openai_compatible_chat",
+        "Qwen 3.6 Plus",
+        "OpenRouter Qwen high-capability agentic model",
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=True,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
+    ModelSpec(
+        "openrouter",
+        "qwen/qwen3.6-flash",
+        "openai_compatible_chat",
+        "Qwen 3.6 Flash",
+        "OpenRouter Qwen fast 1M-context model",
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=True,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
+    ModelSpec(
+        "openrouter",
+        "qwen/qwen3.6-35b-a3b",
+        "openai_compatible_chat",
+        "Qwen 3.6 35B A3B",
+        "OpenRouter Qwen compact open-weight model",
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=True,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
+    ModelSpec(
+        "openrouter",
+        "qwen/qwen3.6-27b",
+        "openai_compatible_chat",
+        "Qwen 3.6 27B",
+        "OpenRouter Qwen compact model",
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=True,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
+    ModelSpec(
+        "openrouter",
+        "qwen/qwen3.6-max-preview",
+        "openai_compatible_chat",
+        "Qwen 3.6 Max Preview",
+        "OpenRouter experimental Qwen max preview",
+        base_url="https://openrouter.ai/api/v1",
+        supports_images=False,
+        extra_body={"reasoning": {"enabled": True, "exclude": True}},
+    ),
 )
 
 _PROVIDER_LABELS = {
@@ -138,6 +229,7 @@ _PROVIDER_LABELS = {
     "anthropic": ("Anthropic", "Use Claude API key or Claude Code login"),
     "zai": ("Z.ai", "Use Z.ai GLM models"),
     "qwen": ("Qwen", "Use Qwen OpenAI-compatible API"),
+    "openrouter": ("OpenRouter", "Use OpenRouter-hosted GLM and Qwen models"),
 }
 
 
@@ -180,13 +272,15 @@ def get_model_spec(provider: str, model: Optional[str]) -> ModelSpec:
         requested_model = maybe_model.strip()
     if normalized_provider == "auto":
         normalized_provider = infer_provider_from_model(requested_model)
+    if normalized_provider == "openrouter":
+        requested_model = _openrouter_model_alias(requested_model)
 
     exact = _find_model_spec(normalized_provider, requested_model)
     if exact is not None:
         return exact
 
     prefix_provider = _provider_from_known_model_prefix(requested_model)
-    if prefix_provider is not None and prefix_provider != normalized_provider:
+    if normalized_provider != "openrouter" and prefix_provider is not None and prefix_provider != normalized_provider:
         default_model = default_model_for_provider(normalized_provider)
         if default_model:
             requested_model = default_model
@@ -229,6 +323,22 @@ def _provider_from_known_model_prefix(model: str) -> Optional[str]:
     return None
 
 
+def _openrouter_model_alias(model: str) -> str:
+    value = model.strip()
+    aliases = {
+        "glm-5.1": "z-ai/glm-5.1",
+        "glm-5": "z-ai/glm-5",
+        "glm-5-turbo": "z-ai/glm-5-turbo",
+        "glm-5v-turbo": "z-ai/glm-5v-turbo",
+        "qwen3.6-plus": "qwen/qwen3.6-plus",
+        "qwen3.6-flash": "qwen/qwen3.6-flash",
+        "qwen3.6-35b-a3b": "qwen/qwen3.6-35b-a3b",
+        "qwen3.6-27b": "qwen/qwen3.6-27b",
+        "qwen3.6-max-preview": "qwen/qwen3.6-max-preview",
+    }
+    return aliases.get(value.lower(), value)
+
+
 def _find_model_spec(provider: str, model: str) -> Optional[ModelSpec]:
     for spec in _MODELS:
         if spec.provider == provider and spec.model == model:
@@ -248,7 +358,7 @@ def _transport_for_provider(provider: str) -> Optional[str]:
         return "openai_responses"
     if provider == "anthropic":
         return "anthropic_messages"
-    if provider in {"zai", "qwen"}:
+    if provider in {"zai", "qwen", "openrouter"}:
         return "openai_compatible_chat"
     if provider == "fake":
         return "fake"
@@ -260,6 +370,8 @@ def _default_base_url(provider: str) -> Optional[str]:
         return "https://api.z.ai/api/paas/v4"
     if provider == "qwen":
         return "https://dashscope-intl.aliyuncs.com/compatible-mode/v1"
+    if provider == "openrouter":
+        return "https://openrouter.ai/api/v1"
     return None
 
 
@@ -268,4 +380,6 @@ def _default_extra_body(provider: str) -> Dict[str, Any]:
         return {"thinking": {"type": "enabled", "clear_thinking": False}}
     if provider == "qwen":
         return {"enable_thinking": True}
+    if provider == "openrouter":
+        return {"reasoning": {"enabled": True, "exclude": True}}
     return {}

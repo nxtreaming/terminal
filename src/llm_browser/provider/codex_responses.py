@@ -39,6 +39,7 @@ class CodexResponsesProvider:
         self.base_url = base_url or os.environ.get("LLM_BROWSER_CODEX_BASE_URL") or DEFAULT_CODEX_BASE_URL
         self.timeout_s = timeout_s
         self.max_retries = max(0, int(max_retries))
+        self.provider_label = "codex"
         self.instructions = instructions or BROWSER_AGENT_INSTRUCTIONS
 
     def set_instructions(self, instructions: str) -> None:

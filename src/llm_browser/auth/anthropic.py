@@ -11,7 +11,7 @@ import time
 import urllib.parse
 import webbrowser
 from http.server import BaseHTTPRequestHandler, HTTPServer
-from typing import Any, Dict, Optional
+from typing import Any, Callable, Dict, Optional
 
 import requests
 
@@ -26,7 +26,15 @@ REDIRECT_URI = f"http://localhost:{CALLBACK_PORT}{CALLBACK_PATH}"
 SCOPES = "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload"
 
 
-def login_anthropic_oauth(*, open_browser: bool = True, code: Optional[str] = None, timeout_s: float = 900.0) -> Dict[str, Any]:
+def login_anthropic_oauth(
+    *,
+    open_browser: bool = True,
+    code: Optional[str] = None,
+    timeout_s: float = 900.0,
+    on_url: Optional[Callable[[str], None]] = None,
+    on_status: Optional[Callable[[str], None]] = None,
+    prompt_on_timeout: bool = True,
+) -> Dict[str, Any]:
     verifier, challenge = _generate_pkce()
     parsed = _parse_authorization_input(code or "")
     if parsed.get("code"):
@@ -48,13 +56,21 @@ def login_anthropic_oauth(*, open_browser: bool = True, code: Optional[str] = No
             }
         )
         url = f"{AUTHORIZE_URL}?{params}"
-        print("Open this URL to login with Anthropic Claude Code:\n")
-        print(url)
-        print("\nWaiting for browser callback...")
+        if on_url is not None:
+            on_url(url)
+        else:
+            print("Open this URL to login with Anthropic Claude Code:\n")
+            print(url)
+        if on_status is not None:
+            on_status("Waiting for Anthropic browser callback...")
+        else:
+            print("\nWaiting for browser callback...")
         if open_browser:
             webbrowser.open(url)
         result = callback.wait(timeout_s=timeout_s)
         if result is None:
+            if not prompt_on_timeout:
+                raise TimeoutError("Anthropic OAuth login timed out waiting for browser callback")
             manual = input("Paste the authorization code or final redirect URL: ")
             result = _parse_authorization_input(manual)
         auth_code = result.get("code")

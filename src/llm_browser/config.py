@@ -96,6 +96,8 @@ def apply_config_environment(config: Dict[str, Any], *, override: bool = False) 
         "providers.zai.base_url": "LLM_BROWSER_ZAI_BASE_URL",
         "providers.qwen.api_key": "LLM_BROWSER_QWEN_API_KEY",
         "providers.qwen.base_url": "LLM_BROWSER_QWEN_BASE_URL",
+        "providers.openrouter.api_key": "LLM_BROWSER_OPENROUTER_API_KEY",
+        "providers.openrouter.base_url": "LLM_BROWSER_OPENROUTER_BASE_URL",
         "codex.base_url": "LLM_BROWSER_CODEX_BASE_URL",
         "browser.cloud_api_key": "BROWSER_USE_API_KEY",
         "browser.cloud_api_base": "LLM_BROWSER_CLOUD_API_BASE",
@@ -187,6 +189,10 @@ def example_config() -> Dict[str, Any]:
             "qwen": {
                 "api_key": None,
                 "base_url": "https://dashscope-intl.aliyuncs.com/compatible-mode/v1",
+            },
+            "openrouter": {
+                "api_key": None,
+                "base_url": "https://openrouter.ai/api/v1",
             },
         },
     }

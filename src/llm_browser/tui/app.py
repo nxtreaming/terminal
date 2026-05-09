@@ -62,7 +62,7 @@ COMMAND_PALETTE: list[tuple[str, str, str]] = [
     ("Clear transcript", "clear", "Clear the visible transcript"),
     ("Browser config", "browser", "Show browser runtime details"),
     ("Browser mode", "browser-mode", "Choose auto, chromium, real, or remote browser"),
-    ("Auth status", "auth", "Show provider authentication status"),
+    ("Authentication", "auth", "Manage provider login and API keys"),
     ("Config", "config", "Show redacted app configuration"),
 ]
 
@@ -88,7 +88,7 @@ SLASH_COMMANDS: list[tuple[str, str, str]] = [
     ("artifacts", "artifacts", "Show artifacts"),
     ("tools", "tools", "Toggle tool output"),
     ("open", "open", "Open selected artifact"),
-    ("auth", "auth", "Show auth status"),
+    ("auth", "auth", "Manage auth"),
     ("config", "config", "Show redacted config"),
     ("set", "set ", "Persist a setting"),
     ("dataset", "dataset ", "Run dataset task"),
@@ -162,6 +162,27 @@ BROWSER_MODE_PALETTE: list[tuple[str, str, str]] = [
 PROVIDER_PALETTE: list[tuple[str, str, str]] = [
     *provider_palette(),
 ]
+
+
+API_KEY_PROVIDERS = ("openai", "anthropic", "zai", "qwen", "openrouter")
+AUTH_PROVIDER_ALIASES = {
+    "openai": "openai",
+    "anthropic": "anthropic",
+    "claude": "anthropic",
+    "zai": "zai",
+    "z.ai": "zai",
+    "glm": "zai",
+    "qwen": "qwen",
+    "openrouter": "openrouter",
+    "or": "openrouter",
+}
+AUTH_PROVIDER_LABELS = {
+    "openai": "OpenAI",
+    "anthropic": "Anthropic",
+    "zai": "Z.ai",
+    "qwen": "Qwen",
+    "openrouter": "OpenRouter",
+}
 
 
 BROWSER_USE_WORDMARK = [
@@ -502,6 +523,70 @@ class CommandPalette(ModalScreen[Optional[str]]):
             table.add_row(row, key=f"command-{len(self._visible_commands) - 1}")
 
 
+class SecretInputScreen(ModalScreen[Optional[str]]):
+    CSS = """
+    SecretInputScreen {
+        align: center middle;
+        background: #15161a 94%;
+    }
+
+    #secret-dialog {
+        width: 76;
+        max-width: 92%;
+        height: auto;
+        padding: 1 2;
+        background: #20222b;
+        border: round #6f727d;
+    }
+
+    #secret-title {
+        color: #e4e4e7;
+        text-style: bold;
+        margin-bottom: 1;
+    }
+
+    #secret-prompt {
+        color: #9b9ca5;
+        margin-bottom: 1;
+    }
+
+    #secret-input {
+        height: 1;
+        padding: 0 1;
+        background: #191b22;
+        color: #e4e4e7;
+        border: none;
+    }
+    """
+
+    BINDINGS = [
+        Binding("escape", "close", "Close", priority=True),
+        Binding("ctrl+c", "close", "Close", priority=True),
+    ]
+
+    def __init__(self, title: str, prompt: str, placeholder: str = "Paste key") -> None:
+        super().__init__()
+        self.title_text = title
+        self.prompt = prompt
+        self.placeholder = placeholder
+
+    def compose(self) -> ComposeResult:
+        with Container(id="secret-dialog"):
+            yield Static(self.title_text, id="secret-title")
+            yield Static(self.prompt, id="secret-prompt")
+            yield Input(placeholder=self.placeholder, password=True, id="secret-input", compact=True)
+
+    def on_mount(self) -> None:
+        self.query_one("#secret-input", Input).focus()
+
+    def on_input_submitted(self, event: Input.Submitted) -> None:
+        event.stop()
+        self.dismiss(event.value.strip())
+
+    def action_close(self) -> None:
+        self.dismiss(None)
+
+
 class SessionPalette(ModalScreen[Optional[str]]):
     CSS = """
     SessionPalette {
@@ -766,12 +851,12 @@ class BrowserUseTerminalApp(App[None]):
         height: 3;
         margin-top: 2;
         padding: 1 2;
-        background: #1e1e1e;
+        background: #1c1d22;
         border: none;
     }
 
     #composer:focus-within {
-        background: #1e1e1e;
+        background: #20222a;
     }
 
     #main.home #composer {
@@ -794,9 +879,11 @@ class BrowserUseTerminalApp(App[None]):
     }
 
     #hintbar {
-        height: 1;
+        height: 2;
+        margin-top: 1;
         color: #9b9ca5;
-        padding: 0 1 0 0;
+        padding: 0 1 0 1;
+        content-align-vertical: middle;
     }
 
     #main.home #hintbar {
@@ -940,6 +1027,7 @@ class BrowserUseTerminalApp(App[None]):
         self._model_buffers: dict[str, str] = {}
         self._last_transcript_text: dict[str, str] = {}
         self._recent_model_text: dict[str, str] = {}
+        self._recent_model_stream_text: dict[str, str] = {}
         self._recent_tool_output_text: dict[tuple[str, str], str] = {}
         self._rendered_event_ids: set[str] = set()
         self._last_transcript_event_type: Optional[str] = None
@@ -951,6 +1039,7 @@ class BrowserUseTerminalApp(App[None]):
         self._activity_frame = 0
         self._stop = threading.Event()
         self._listener: Optional[threading.Thread] = None
+        self._pending_secret: Optional[tuple[str, str]] = None
 
     def compose(self) -> ComposeResult:
         with Horizontal(id="body"):
@@ -1170,6 +1259,7 @@ class BrowserUseTerminalApp(App[None]):
             for line in BROWSER_USE_WORDMARK
         ]
         logo.update(Group(*renderables))
+        self._update_statusbar()
 
     def _write_banner(self) -> None:
         self._set_home_mode(False)
@@ -1181,7 +1271,7 @@ class BrowserUseTerminalApp(App[None]):
             command_label = f"/{command}".rstrip()
             log.write(f"[#e4e4e7]{escape(command_label):<18}[/] [#9b9ca5]{escape(description)}[/]")
         log.write("[#9b9ca5]Use /settings for model, provider, browser, API keys, viewport, cloud, CDP, and max-turns settings.[/]")
-        log.write("[#9b9ca5]Paste keys with /auth browser-use <key> or /auth openai <key>; values are saved redacted in config output.[/]")
+        log.write("[#9b9ca5]Use /auth for provider API keys, Codex login, Anthropic Claude Code login, and auth status.[/]")
 
     def _handle_event(self, event: Event) -> None:
         should_render = event.session_id == self.selected_session_id and event.id not in self._rendered_event_ids
@@ -1273,6 +1363,8 @@ class BrowserUseTerminalApp(App[None]):
         text = str(event.payload.get("text") or "")
         if not text:
             return
+        previous_stream = self._recent_model_stream_text.get(event.session_id, "")
+        self._recent_model_stream_text[event.session_id] = (previous_stream + text)[-12000:]
         buffered = self._model_buffers.get(event.session_id, "") + text
         self._model_buffers[event.session_id] = buffered
         if "\n" in buffered or len(buffered) >= 700:
@@ -1340,9 +1432,9 @@ class BrowserUseTerminalApp(App[None]):
         elif event_type == "tool.finished":
             log.write(f"[#9b9ca5]{escaped}[/]")
         elif event_type == "model.delta":
-            _write_markdown(log, line)
+            _write_transcript_markdown(log, line)
         elif event_type in {"session.done", "session.cancelled"}:
-            _write_markdown(log, line, style="#e4e4e7")
+            _write_transcript_markdown(log, line, style="#e4e4e7")
         elif event_type in {"browser.action", "browser.live_url"}:
             _write_browser_action_line(log, line)
         elif event_type == "session.failed":
@@ -1384,12 +1476,15 @@ class BrowserUseTerminalApp(App[None]):
             return False
         previous = self._last_transcript_text.get(self.selected_session_id, "")
         recent_model = self._recent_model_text.get(self.selected_session_id, "")
+        recent_stream = self._recent_model_stream_text.get(self.selected_session_id, "")
         canonical_result = _canonical_transcript_text(result)
         return (
             previous == canonical_result
             or previous == _canonical_transcript_text(line)
             or _canonical_transcript_text(recent_model) == canonical_result
             or _canonical_transcript_text(recent_model).endswith(canonical_result)
+            or _canonical_transcript_text(recent_stream) == canonical_result
+            or _canonical_transcript_text(recent_stream).endswith(canonical_result)
         )
 
     def _slash_panel_visible(self) -> bool:
@@ -1460,6 +1555,8 @@ class BrowserUseTerminalApp(App[None]):
         self.hide_slash_panel()
         if not line:
             return
+        if self._consume_pending_secret(line):
+            return
         self._handle_command(line)
 
     def on_input_changed(self, event: Input.Changed) -> None:
@@ -1484,6 +1581,8 @@ class BrowserUseTerminalApp(App[None]):
         self._set_composer_text("")
         self.hide_slash_panel()
         if not line:
+            return
+        if self._consume_pending_secret(line):
             return
         if "\n" in line and not line.startswith("/"):
             self._start_or_resume_task(line)
@@ -1621,27 +1720,7 @@ class BrowserUseTerminalApp(App[None]):
             }
             log.write(escape(json.dumps(payload, indent=2)))
         elif command == "auth":
-            if len(args) >= 3 and args[1] in {"browser-use", "browseruse", "cloud", "remote"}:
-                self._set_config_value(["browser-use-api-key", *args[2:]])
-            elif len(args) >= 3 and args[1] == "openai":
-                self._set_config_value(["openai-api-key", *args[2:]])
-            else:
-                from llm_browser.auth import auth_status
-
-                log.write(
-                    escape(
-                        json.dumps(
-                            {
-                                "codex": auth_status(),
-                                "openai_api_key": bool(
-                                    os.environ.get("LLM_BROWSER_OPENAI_API_KEY") or os.environ.get("OPENAI_API_KEY")
-                                ),
-                                "browser_use_api_key": bool(os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("BU_API_KEY")),
-                            },
-                            indent=2,
-                        )
-                    )
-                )
+            self._handle_auth_command(args[1:])
         elif command == "report":
             run_id = args[1] if len(args) >= 2 else self._selected_dataset_run_id()
             if not run_id:
@@ -1758,6 +1837,7 @@ class BrowserUseTerminalApp(App[None]):
         self._rendered_event_ids = {event.id for event in events}
         self._last_transcript_text[session.id] = ""
         self._recent_model_text[session.id] = ""
+        self._recent_model_stream_text[session.id] = ""
         for line, event_type in _format_events_for_transcript(events, show_tools=self._tool_details_visible):
             if self._should_render_transcript_line(event_type, line):
                 self._write_log_line(line, event_type, follow=follow_transcript)
@@ -1834,6 +1914,7 @@ class BrowserUseTerminalApp(App[None]):
 
     def action_clear_log(self) -> None:
         self._model_buffers.clear()
+        self._recent_model_stream_text.clear()
         self.query_one("#transcript", RichLog).clear()
         self._last_transcript_event_type = None
 
@@ -1969,6 +2050,9 @@ class BrowserUseTerminalApp(App[None]):
 
     def action_show_settings(self) -> None:
         self._open_command_selector("Settings", "Search settings", self._settings_palette())
+
+    def action_show_auth(self) -> None:
+        self._open_command_selector("Authentication", "Search auth actions", self._auth_palette())
 
     def _open_command_selector(
         self,
@@ -2248,6 +2332,260 @@ class BrowserUseTerminalApp(App[None]):
         self._update_statusbar()
         self._update_session_detail()
 
+    def _handle_auth_command(self, args: list[str]) -> None:
+        log = self.query_one("#transcript", RichLog)
+        if not args:
+            self.action_show_auth()
+            return
+
+        subcommand = args[0].strip().lower()
+        rest = args[1:]
+        if subcommand in {"status", "show"}:
+            self._write_auth_status()
+            return
+        if subcommand in {"browser-use", "browseruse", "cloud", "remote"}:
+            if rest:
+                self._save_browser_use_api_key(" ".join(rest))
+            else:
+                self._prompt_browser_use_api_key()
+            return
+        if subcommand in {"api-key", "apikey", "key"}:
+            if not rest:
+                self.action_show_auth()
+                return
+            provider = _normalize_auth_provider(rest[0])
+            if provider is None:
+                log.write(f"[#e4e4e7]unknown API-key provider: {escape(rest[0])}[/]")
+                return
+            if len(rest) > 1:
+                self._save_provider_api_key(provider, " ".join(rest[1:]))
+            else:
+                self._prompt_provider_api_key(provider)
+            return
+        if subcommand == "remove":
+            if not rest:
+                log.write("[#e4e4e7]auth remove expects a provider[/]")
+                return
+            provider = _normalize_auth_provider(rest[0])
+            if provider is None:
+                log.write(f"[#e4e4e7]unknown provider: {escape(rest[0])}[/]")
+                return
+            self._remove_provider_auth(provider)
+            return
+        if subcommand == "codex":
+            self._handle_codex_auth_command(rest)
+            return
+
+        provider = _normalize_auth_provider(subcommand)
+        if provider is None:
+            log.write(f"[#e4e4e7]unknown auth command: {escape(subcommand)}[/]")
+            log.write("[#7a7d86]try /auth, /auth status, /auth api-key openrouter, or /auth anthropic login[/]")
+            return
+        if rest and rest[0].strip().lower() in {"remove", "logout"}:
+            self._remove_provider_auth(provider)
+            return
+        if provider == "anthropic" and rest and rest[0].strip().lower() in {"login", "oauth", "claude-code", "claudecode"}:
+            self._start_anthropic_oauth_login()
+            return
+        if rest and rest[0].strip().lower() in {"api-key", "apikey", "key"}:
+            if len(rest) > 1:
+                self._save_provider_api_key(provider, " ".join(rest[1:]))
+            else:
+                self._prompt_provider_api_key(provider)
+            return
+        if rest:
+            self._save_provider_api_key(provider, " ".join(rest))
+        else:
+            self._prompt_provider_api_key(provider)
+
+    def _handle_codex_auth_command(self, args: list[str]) -> None:
+        log = self.query_one("#transcript", RichLog)
+        action = args[0].strip().lower() if args else "status"
+        if action == "status":
+            self._write_auth_status()
+            return
+        if action == "login":
+            self._start_codex_login()
+            return
+        if action == "import":
+            try:
+                from llm_browser.auth import import_codex_cli_auth
+
+                auth = import_codex_cli_auth()
+            except Exception as exc:
+                log.write(f"[#e4e4e7]Codex import failed: {escape(str(exc))}[/]")
+                return
+            log.write(f"[#e4e4e7]Codex auth imported[/] [#7a7d86]{escape(str(auth.source_path))}[/]")
+            return
+        if action in {"logout", "remove"}:
+            from llm_browser.auth import logout_codex_auth
+
+            removed = logout_codex_auth()
+            log.write(f"[#e4e4e7]Codex auth removed[/] [#7a7d86]{'yes' if removed else 'no stored auth'}[/]")
+            return
+        log.write(f"[#e4e4e7]unknown Codex auth command: {escape(action)}[/]")
+
+    def _prompt_provider_api_key(self, provider: str) -> None:
+        label = _auth_provider_label(provider)
+        self._pending_secret = ("provider", provider)
+
+        def selected(value: Optional[str]) -> None:
+            self._pending_secret = None
+            if value:
+                self._save_provider_api_key(provider, value)
+            self.query_one("#command", ComposerInput).focus()
+
+        self.push_screen(
+            SecretInputScreen(
+                f"{label} API key",
+                f"Paste a {label} API key. It will be stored in the local provider auth store.",
+                placeholder=f"{label} API key",
+            ),
+            selected,
+        )
+
+    def _prompt_browser_use_api_key(self) -> None:
+        self._pending_secret = ("browser-use", "")
+
+        def selected(value: Optional[str]) -> None:
+            self._pending_secret = None
+            if value:
+                self._save_browser_use_api_key(value)
+            self.query_one("#command", ComposerInput).focus()
+
+        self.push_screen(
+            SecretInputScreen(
+                "Browser Use API key",
+                "Paste a Browser Use cloud API key. It will be saved redacted in config output.",
+                placeholder="Browser Use API key",
+            ),
+            selected,
+        )
+
+    def _consume_pending_secret(self, value: str) -> bool:
+        pending = self._pending_secret
+        if pending is None:
+            return False
+        self._pending_secret = None
+        kind, provider = pending
+        if isinstance(self.screen, SecretInputScreen):
+            self.screen.dismiss(None)
+        if kind == "provider":
+            self._save_provider_api_key(provider, value)
+        elif kind == "browser-use":
+            self._save_browser_use_api_key(value)
+        else:
+            self.query_one("#transcript", RichLog).write(f"[#e4e4e7]unknown secret prompt: {escape(kind)}[/]")
+        return True
+
+    def _save_browser_use_api_key(self, key: str) -> None:
+        self._set_config_value(["browser-use-api-key", key])
+
+    def _save_provider_api_key(self, provider: str, key: str) -> None:
+        log = self.query_one("#transcript", RichLog)
+        key = key.strip()
+        if not key:
+            log.write("[#e4e4e7]API key cannot be empty[/]")
+            return
+        if provider not in API_KEY_PROVIDERS:
+            log.write(f"[#e4e4e7]provider does not use API keys here: {escape(provider)}[/]")
+            return
+        from llm_browser.auth.store import ProviderAuthStore
+
+        ProviderAuthStore().set_api_key(provider, key)
+        env_name = _auth_provider_env_name(provider)
+        if env_name:
+            os.environ[env_name] = key
+        log.write(f"[#e4e4e7]{escape(_auth_provider_label(provider))} API key[/] <redacted> [#7a7d86]saved[/]")
+        self._update_statusbar()
+        self._update_session_detail()
+
+    def _remove_provider_auth(self, provider: str) -> None:
+        from llm_browser.auth.store import ProviderAuthStore
+
+        removed = ProviderAuthStore().remove(provider)
+        env_name = _auth_provider_env_name(provider)
+        if env_name:
+            os.environ.pop(env_name, None)
+        self.query_one("#transcript", RichLog).write(
+            f"[#e4e4e7]{escape(_auth_provider_label(provider))} auth removed[/] [#7a7d86]{'yes' if removed else 'no stored auth'}[/]"
+        )
+
+    def _write_auth_status(self) -> None:
+        from llm_browser.auth import auth_status
+        from llm_browser.auth.store import provider_auth_status
+
+        browser_use_env = os.environ.get("BROWSER_USE_API_KEY") or os.environ.get("BU_API_KEY")
+        payload = {
+            "codex": auth_status(),
+            "providers": provider_auth_status(),
+            "browser_use": {"available": bool(browser_use_env), "source": "environment" if browser_use_env else "missing"},
+        }
+        self.query_one("#transcript", RichLog).write(escape(json.dumps(payload, indent=2)))
+
+    def _start_codex_login(self) -> None:
+        log = self.query_one("#transcript", RichLog)
+        log.write("[#9b9ca5]starting Codex login...[/]")
+
+        def run() -> None:
+            try:
+                import webbrowser
+
+                from llm_browser.auth import complete_device_code_login, request_device_code
+
+                device = request_device_code()
+                webbrowser.open(device.verification_url)
+                self.call_from_thread(
+                    self._write_auth_line,
+                    (
+                        "Codex login opened in your browser.\n"
+                        f"URL: {device.verification_url}\n"
+                        f"Code: {device.user_code}\n"
+                        "Waiting for authorization..."
+                    ),
+                )
+                auth = complete_device_code_login(device)
+                self.call_from_thread(self._write_auth_line, f"Codex login complete. Account {auth.account_id}")
+            except Exception as exc:
+                self.call_from_thread(self._write_auth_line, f"Codex login failed: {exc}", error=True)
+
+        threading.Thread(target=run, name="browser-use-terminal-codex-login", daemon=True).start()
+
+    def _start_anthropic_oauth_login(self) -> None:
+        log = self.query_one("#transcript", RichLog)
+        log.write("[#9b9ca5]starting Anthropic Claude Code login...[/]")
+
+        def run() -> None:
+            try:
+                from llm_browser.auth.anthropic import login_anthropic_oauth
+                from llm_browser.auth.store import ProviderAuthStore
+
+                credentials = login_anthropic_oauth(
+                    open_browser=True,
+                    timeout_s=900,
+                    on_url=lambda url: self.call_from_thread(
+                        self._write_auth_line,
+                        f"Anthropic login opened in your browser.\nURL: {url}",
+                    ),
+                    on_status=lambda text: self.call_from_thread(self._write_auth_line, text),
+                    prompt_on_timeout=False,
+                )
+                ProviderAuthStore().set_oauth(
+                    "anthropic",
+                    access=str(credentials["access"]),
+                    refresh=str(credentials["refresh"]),
+                    expires=int(credentials["expires"]),
+                )
+                self.call_from_thread(self._write_auth_line, "Anthropic Claude Code login complete.")
+            except Exception as exc:
+                self.call_from_thread(self._write_auth_line, f"Anthropic login failed: {exc}", error=True)
+
+        threading.Thread(target=run, name="browser-use-terminal-anthropic-login", daemon=True).start()
+
+    def _write_auth_line(self, text: str, *, error: bool = False) -> None:
+        style = "#e4e4e7" if error else "#9b9ca5"
+        self.query_one("#transcript", RichLog).write(f"[{style}]{escape(text)}[/]")
+
     def _model_palette(self) -> list[tuple[str, str, str]]:
         current = self.model_label
         rows = []
@@ -2267,12 +2605,26 @@ class BrowserUseTerminalApp(App[None]):
     def _settings_palette(self) -> list[tuple[str, str, str]]:
         width = os.environ.get("LLM_BROWSER_WIDTH") or "1280"
         height = os.environ.get("LLM_BROWSER_HEIGHT") or "900"
+        current_auth_provider = _normalize_auth_provider(self.provider_label)
+        current_auth_command = f"auth api-key {current_auth_provider}" if current_auth_provider else "auth"
+        current_auth_detail = (
+            f"Set key for {_auth_provider_label(current_auth_provider)}"
+            if current_auth_provider
+            else "Open auth actions for this provider"
+        )
         return [
             ("Provider", "provider", f"Current {self.provider_label}"),
             ("Model", "model", f"Current {self.model_label or '-'}"),
+            ("Authentication", "auth", "Manage provider API keys and logins"),
+            ("Current provider auth", current_auth_command, current_auth_detail),
             ("Browser", "browser", f"Current {_browser_runtime_label()}"),
             ("Browser Use API key", "auth browser-use ", "Paste and save remote browser API key"),
-            ("OpenAI API key", "auth openai ", "Paste and save OpenAI API key"),
+            ("OpenRouter API key", "auth api-key openrouter", "Prompt and save OpenRouter API key"),
+            ("OpenAI API key", "auth api-key openai", "Prompt and save OpenAI API key"),
+            ("Anthropic API key", "auth api-key anthropic", "Prompt and save Anthropic API key"),
+            ("Claude Code login", "auth anthropic login", "Login to Anthropic through Claude Code OAuth"),
+            ("Z.ai API key", "auth api-key zai", "Prompt and save Z.ai API key"),
+            ("Qwen API key", "auth api-key qwen", "Prompt and save Qwen API key"),
             ("Headless on", "headless on", "Run owned Chromium headless"),
             ("Headless off", "headless off", "Show owned Chromium window"),
             ("Viewport", "viewport ", f"Current {width}x{height}"),
@@ -2298,6 +2650,35 @@ class BrowserUseTerminalApp(App[None]):
             ("Daemon backend", "set daemon-backend ", "Daemon backend: chromium, cdp, real, cloud"),
             ("Config", "config", "Show redacted loaded config"),
         ]
+
+    def _auth_palette(self) -> list[tuple[str, str, str]]:
+        rows: list[tuple[str, str, str]] = [
+            ("Auth status", "auth status", "Show redacted auth status"),
+            ("Codex login", "auth codex login", "Open browser device login for Codex subscription auth"),
+            ("Import Codex CLI auth", "auth codex import", "Copy existing Codex CLI auth into this app"),
+            ("Anthropic Claude Code login", "auth anthropic login", "Open browser OAuth login for Claude Code"),
+            ("Browser Use API key", "auth browser-use", "Prompt and save Browser Use cloud API key"),
+        ]
+        current_provider = _normalize_auth_provider(self.provider_label)
+        if current_provider is not None:
+            rows.append(
+                (
+                    "Current provider API key",
+                    f"auth api-key {current_provider}",
+                    f"Prompt and save {_auth_provider_label(current_provider)} API key",
+                )
+            )
+            rows.append(
+                (
+                    "Remove current provider auth",
+                    f"auth remove {current_provider}",
+                    f"Remove stored {_auth_provider_label(current_provider)} API key or OAuth token",
+                )
+            )
+        for provider in API_KEY_PROVIDERS:
+            label = _auth_provider_label(provider)
+            rows.append((f"{label} API key", f"auth api-key {provider}", f"Prompt and save {label} API key"))
+        return rows
 
     def _session_rows(self) -> list[tuple[str, str, str, str, str]]:
         rows = []
@@ -2401,17 +2782,27 @@ class BrowserUseTerminalApp(App[None]):
             selected = self.store.load(self.selected_session_id)
             selected_running = bool(selected and selected.status in {"created", "running"})
         if time.monotonic() < self._quit_hint_until:
-            hint_segments = ["[#e4e4e7]press ctrl+c again to quit[/]"]
+            hint_items = [("ctrl+c", "again to quit", True)]
         else:
-            hint_segments = [f"[#e4e4e7]{'esc interrupt' if selected_running else 'tab sessions'}[/]"]
+            if selected_running:
+                hint_items = [("esc", "interrupt", True)]
+            else:
+                hint_items = [("tab", "sessions", True)]
             if not self._home_mode:
-                hint_segments.append(f"[#9b9ca5]f2 {'hide inspector' if self._inspector_visible else 'inspector'}[/]")
+                hint_items.append(("f2", "hide inspector" if self._inspector_visible else "inspector", False))
                 if self._inspector_visible:
-                    hint_segments.append("[#9b9ca5]f3 artifacts[/]")
-            hint_segments.extend(
-                ["[#9b9ca5]/ settings[/]", "[#9b9ca5]ctrl+p commands[/]", "[#9b9ca5]f1 keys[/]", "[#9b9ca5]ctrl+q quit[/]"]
+                    hint_items.append(("f3", "artifacts", False))
+            hint_items.extend(
+                [
+                    ("/", "settings", False),
+                    ("ctrl+p", "commands", False),
+                    ("f1", "keys", False),
+                    ("ctrl+q", "quit", False),
+                ]
             )
-        self.query_one("#hintbar", Static).update("   ".join(hint_segments))
+        hintbar = self.query_one("#hintbar", Static)
+        hint_width = int(hintbar.size.width or self.query_one("#workspace").size.width or self.size.width or 80)
+        hintbar.update(_footer_hintbar_markup(hint_items, width=hint_width))
 
         cwd = "-"
         if self.selected_session_id:
@@ -2728,6 +3119,25 @@ def _normalize_browser_mode(mode: str) -> Optional[str]:
     return aliases.get(normalized)
 
 
+def _normalize_auth_provider(provider: str) -> Optional[str]:
+    normalized = provider.strip().lower().replace("_", "-")
+    return AUTH_PROVIDER_ALIASES.get(normalized)
+
+
+def _auth_provider_label(provider: str) -> str:
+    return AUTH_PROVIDER_LABELS.get(provider, provider)
+
+
+def _auth_provider_env_name(provider: str) -> str:
+    return {
+        "openai": "LLM_BROWSER_OPENAI_API_KEY",
+        "anthropic": "LLM_BROWSER_ANTHROPIC_API_KEY",
+        "zai": "LLM_BROWSER_ZAI_API_KEY",
+        "qwen": "LLM_BROWSER_QWEN_API_KEY",
+        "openrouter": "LLM_BROWSER_OPENROUTER_API_KEY",
+    }.get(provider, "")
+
+
 def _browser_mode_label(mode: str) -> str:
     labels = {
         "auto": "auto",
@@ -2928,6 +3338,7 @@ def _format_events_for_transcript(events: list[Event], *, show_tools: bool = Fal
     model_buffers: dict[str, str] = {}
     last_by_session: dict[str, str] = {}
     recent_model_by_session: dict[str, str] = {}
+    streamed_model_by_session: dict[str, str] = {}
     streamed_tool_output: dict[tuple[str, str], str] = {}
 
     def flush(session_id: str) -> None:
@@ -2946,6 +3357,9 @@ def _format_events_for_transcript(events: list[Event], *, show_tools: bool = Fal
             text = str(event.payload.get("text") or "")
             if not text:
                 continue
+            streamed_model_by_session[event.session_id] = (
+                streamed_model_by_session.get(event.session_id, "") + text
+            )[-12000:]
             buffered = model_buffers.get(event.session_id, "") + text
             model_buffers[event.session_id] = buffered
             if "\n" in buffered or len(buffered) >= 700:
@@ -2981,12 +3395,15 @@ def _format_events_for_transcript(events: list[Event], *, show_tools: bool = Fal
                 result = str(event.payload.get("result") or "")
                 previous = last_by_session.get(event.session_id, "")
                 recent_model = recent_model_by_session.get(event.session_id, "")
+                streamed_model = streamed_model_by_session.get(event.session_id, "")
                 canonical_result = _canonical_transcript_text(result)
                 if (
                     previous == canonical_result
                     or previous == _canonical_transcript_text(line)
                     or _canonical_transcript_text(recent_model) == canonical_result
                     or _canonical_transcript_text(recent_model).endswith(canonical_result)
+                    or _canonical_transcript_text(streamed_model) == canonical_result
+                    or _canonical_transcript_text(streamed_model).endswith(canonical_result)
                 ):
                     continue
             lines.append((line, event_type))
@@ -3052,6 +3469,142 @@ def _write_markdown(log: RichLog, text: str, style: str = "none") -> None:
             style=style,
         )
     )
+
+
+def _write_transcript_markdown(log: RichLog, text: str, style: str = "none") -> None:
+    if _needs_block_markdown(text):
+        _write_markdown(log, text, style=style)
+        return
+    lines = _compact_transcript_markdown_lines(text)
+    for line in lines:
+        if not line:
+            log.write("")
+            continue
+        log.write(_compact_markdown_line_text(line, style=style))
+
+
+def _needs_block_markdown(text: str) -> bool:
+    return (
+        "```" in text
+        or "~~~" in text
+        or re.search(r"(?m)^\|.+\|$", text) is not None
+    )
+
+
+def _compact_transcript_markdown_lines(text: str) -> list[str]:
+    source_lines = str(text or "").splitlines()
+    if not source_lines:
+        return []
+    lines: list[str] = []
+    for index, line in enumerate(source_lines):
+        stripped = line.rstrip()
+        if stripped:
+            lines.append(stripped)
+            continue
+        previous = _nearest_nonempty_line(source_lines, index, -1)
+        next_line = _nearest_nonempty_line(source_lines, index, 1)
+        if previous and next_line and _is_markdown_list_line(previous) and _is_markdown_list_line(next_line):
+            continue
+        if not lines or lines[-1] == "":
+            continue
+        lines.append("")
+    return lines
+
+
+def _nearest_nonempty_line(lines: list[str], index: int, step: int) -> str:
+    cursor = index + step
+    while 0 <= cursor < len(lines):
+        if lines[cursor].strip():
+            return lines[cursor]
+        cursor += step
+    return ""
+
+
+def _is_markdown_list_line(line: str) -> bool:
+    return bool(_UNORDERED_LIST_LINE_RE.match(line) or _ORDERED_LIST_LINE_RE.match(line))
+
+
+def _compact_markdown_line_text(line: str, style: str = "none") -> Text:
+    base_style = None if style == "none" else style
+    heading_match = _HEADING_LINE_RE.match(line)
+    if heading_match:
+        rendered = Text(style=base_style)
+        _append_compact_inline(rendered, heading_match.group(1).strip(), style=_inline_style(style, bold=True))
+        return rendered
+
+    unordered_match = _UNORDERED_LIST_LINE_RE.match(line)
+    if unordered_match:
+        rendered = Text(style=base_style)
+        rendered.append(unordered_match.group(1))
+        rendered.append("• ", style="#9b9ca5")
+        _append_compact_inline(rendered, unordered_match.group(3), style=style)
+        return rendered
+
+    ordered_match = _ORDERED_LIST_LINE_RE.match(line)
+    if ordered_match:
+        rendered = Text(style=base_style)
+        rendered.append(ordered_match.group(1))
+        rendered.append(f"{ordered_match.group(2).rjust(2)} ", style="bold #55d7ee")
+        _append_compact_inline(rendered, ordered_match.group(3), style=style)
+        return rendered
+
+    rendered = Text(style=base_style)
+    _append_compact_inline(rendered, line, style=style)
+    return rendered
+
+
+def _append_compact_inline(rendered: Text, text: str, style: str = "none") -> None:
+    cursor = 0
+    for match in _COMPACT_INLINE_MARKDOWN_RE.finditer(text):
+        if match.start() < cursor:
+            continue
+        if match.start() > cursor:
+            _append_linkified_segment(rendered, text[cursor : match.start()], style=style)
+        trailing_space_count = len(text[match.end() :]) - len(text[match.end() :].lstrip(" "))
+        trailing_spaces = "\u00a0" * trailing_space_count
+        if match.group("bold") is not None:
+            _append_linkified_segment(
+                rendered,
+                match.group("bold") + trailing_spaces,
+                style=_inline_style(style, bold=True),
+            )
+        elif match.group("code") is not None:
+            _append_linkified_segment(rendered, match.group("code") + trailing_spaces, style="#d7a84f")
+        else:
+            target = (match.group("target") or "").strip()
+            if target.startswith("<") and target.endswith(">"):
+                target = target[1:-1]
+            rendered.append((match.group("label") or target) + trailing_spaces, style=f"#8aa6a0 underline link {target}")
+        cursor = match.end() + trailing_space_count
+    if cursor < len(text):
+        _append_linkified_segment(rendered, text[cursor:], style=style)
+
+
+def _append_linkified_segment(rendered: Text, text: str, style: str = "none") -> None:
+    if not text:
+        return
+    base_style = None if style == "none" else style
+    leading_space_count = len(text) - len(text.lstrip(" "))
+    if leading_space_count and rendered.plain:
+        rendered.append("\u00a0" * leading_space_count, style=base_style)
+        text = text[leading_space_count:]
+        if not text:
+            return
+    cursor = 0
+    for start, end, label, target in _link_spans_for_text(text):
+        if start < cursor:
+            continue
+        if start > cursor:
+            rendered.append(text[cursor:start], style=base_style)
+        rendered.append(label, style=f"#8aa6a0 underline link {target}")
+        cursor = end
+    if cursor < len(text):
+        rendered.append(text[cursor:], style=base_style)
+
+
+def _inline_style(style: str, *, bold: bool = False) -> str:
+    color = "#e4e4e7" if style == "none" else style
+    return f"bold {color}" if bold else color
 
 
 def _write_tool_started_line(log: RichLog, line: str) -> None:
@@ -3743,6 +4296,12 @@ def _linkify_markdown(text: str) -> str:
 
 
 _INLINE_ABS_PATH_CODE_RE = re.compile(r"`(/[^`]+)`")
+_HEADING_LINE_RE = re.compile(r"^\s{0,3}#{1,6}\s+(.*)$")
+_UNORDERED_LIST_LINE_RE = re.compile(r"^(\s*)([-*])\s+(.+)$")
+_ORDERED_LIST_LINE_RE = re.compile(r"^(\s*)(\d+)[.)]\s+(.+)$")
+_COMPACT_INLINE_MARKDOWN_RE = re.compile(
+    r"\*\*(?P<bold>[^*\n]+)\*\*|`(?P<code>[^`\n]+)`|\[(?P<label>[^\]\n]+)\]\((?P<target>[^)\n]+)\)"
+)
 _BARE_URL_RE = re.compile(r"(?<![<(])(https?://[^\s<>()]+)")
 _ABS_PATH_RE = re.compile(r"(?<![\w`\\])(/(?!/)(?:[^\s`\]\),;]+/?)+)")
 _LINK_CHUNK_SIZE = 74
@@ -3955,6 +4514,34 @@ def _sidebar_result_lines(value: object) -> list[str]:
     if text.startswith("failed:"):
         text = _compact_error_text(text.removeprefix("failed:").strip(), limit=96)
     return [f"[#9b9ca5]{escape(_compact_result_text(text, limit=64))}[/]"]
+
+
+def _footer_hint(key: str, label: str, *, active: bool = False) -> str:
+    key_bg = "#2c3040" if active else "#23252d"
+    key_fg = "#e4e4e7" if active else "#b8bac3"
+    label_fg = "#e4e4e7" if active else "#8f929c"
+    return (
+        f"[bold {key_fg} on {key_bg}] {escape(key)} [/]"
+        f" [#{label_fg.lstrip('#')}]{escape(label)}[/]"
+    )
+
+
+def _footer_hintbar_markup(items: list[tuple[str, str, bool]], *, width: int) -> str:
+    visible_items = list(items)
+    available = max(24, int(width or 80) - 2)
+    while len(visible_items) > 1 and _footer_hintbar_visible_width(visible_items) > available:
+        visible_items.pop()
+    return "  [#3f424c]│[/]  ".join(
+        _footer_hint(key, label, active=active) for key, label, active in visible_items
+    )
+
+
+def _footer_hintbar_visible_width(items: list[tuple[str, str, bool]]) -> int:
+    if not items:
+        return 0
+    item_width = sum(len(key) + len(label) + 3 for key, label, _active in items)
+    separator_width = 5 * (len(items) - 1)
+    return item_width + separator_width
 
 
 def _sidebar_image_line(value: str) -> str:

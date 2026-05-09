@@ -15,10 +15,13 @@ from llm_browser.tui.app import (
     BrowserUseTerminalApp,
     ComposerInput,
     CommandPalette,
+    SecretInputScreen,
     SessionPalette,
     TextualTui,
     _artifact_kind,
     _artifact_paths,
+    _compact_markdown_line_text,
+    _compact_transcript_markdown_lines,
     _composer_visible_line_count,
     _current_tool,
     _dataset_run_id_from_path,
@@ -26,6 +29,8 @@ from llm_browser.tui.app import (
     _dataset_task_id_from_path,
     _final_line,
     _file_links_for_text,
+    _footer_hintbar_markup,
+    _footer_hintbar_visible_width,
     _format_event_for_transcript,
     _format_events_for_log,
     _format_events_for_transcript,
@@ -87,6 +92,22 @@ class TuiTest(unittest.TestCase):
         formatted = format_event(event)
         self.assertIn("[s1] tool output: shell stdout", formatted)
         self.assertLess(len(formatted), 230)
+
+    def test_footer_hintbar_drops_low_priority_items_before_wrapping(self) -> None:
+        items = [
+            ("tab", "sessions", True),
+            ("/", "settings", False),
+            ("ctrl+p", "commands", False),
+            ("f1", "keys", False),
+            ("ctrl+q", "quit", False),
+        ]
+
+        rendered = _footer_hintbar_markup(items, width=76)
+
+        self.assertIn("tab", rendered)
+        self.assertIn("ctrl+p", rendered)
+        self.assertNotIn("ctrl+q", rendered)
+        self.assertLessEqual(_footer_hintbar_visible_width(items[:-1]), 74)
 
     def test_format_events_for_log_coalesces_model_deltas(self) -> None:
         events = [
@@ -306,6 +327,48 @@ json.dump(prices, open('/tmp/netflix_prices.json', 'w'))
 
         self.assertEqual([event_type for _, event_type in lines], ["model.delta", "model.delta"])
         self.assertNotIn("session.done", [event_type for _, event_type in lines])
+
+    def test_transcript_dedupes_token_streamed_markdown_final_answer(self) -> None:
+        result = (
+            "For your 5.1 speaker setup:\n\n"
+            "- You need **2 banana plugs per speaker wire run** if you only use them on the AVR side.\n"
+            "- You need **4 banana plugs per speaker wire run** if you use them on both AVR and speaker ends."
+        )
+        events = [
+            Event(type="model.delta", session_id="s1", payload={"text": "For your 5.1 speaker setup:\n\n"}),
+            Event(type="model.delta", session_id="s1", payload={"text": "- You need **2 banana"}),
+            Event(type="model.delta", session_id="s1", payload={"text": " plugs per speaker wire run** if"}),
+            Event(type="model.delta", session_id="s1", payload={"text": " you only use them on the AVR side.\n"}),
+            Event(type="model.delta", session_id="s1", payload={"text": "- You need **4 banana plugs per speaker wire run**"}),
+            Event(type="model.delta", session_id="s1", payload={"text": " if you use them on both AVR and speaker ends."}),
+            Event(type="session.status", session_id="s1", payload={"status": "done"}),
+            Event(type="session.done", session_id="s1", payload={"result": result}),
+        ]
+
+        lines = _format_events_for_transcript(events)
+
+        self.assertNotIn("session.done", [event_type for _, event_type in lines])
+
+    def test_compact_markdown_keeps_inline_spaces(self) -> None:
+        rendered = _compact_markdown_line_text(
+            "- You need **2 banana plugs per speaker wire run** if you only use them."
+        )
+
+        self.assertEqual(
+            rendered.plain.replace("\u00a0", " "),
+            "• You need 2 banana plugs per speaker wire run if you only use them.",
+        )
+        bold_segments = [
+            rendered.plain[span.start : span.end]
+            for span in rendered.spans
+            if "bold" in str(span.style)
+        ]
+        self.assertIn("2 banana plugs per speaker wire run\u00a0", bold_segments)
+
+    def test_compact_markdown_collapses_blank_lines_between_list_items(self) -> None:
+        lines = _compact_transcript_markdown_lines("- one\n\n- two\n\nParagraph\n\nNext")
+
+        self.assertEqual(lines, ["- one", "- two", "", "Paragraph", "", "Next"])
 
     def test_done_tool_result_is_not_rendered_as_extra_final_answer(self) -> None:
         event = Event(
@@ -683,7 +746,9 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
 
                     self.assertFalse(exit_mock.called)
                     self.assertEqual(app.query_one("#command", ComposerInput).text, "")
-                    self.assertIn("press ctrl+c again to quit", str(app.query_one("#hintbar").visual))
+                    hintbar = str(app.query_one("#hintbar").visual)
+                    self.assertIn("ctrl+c", hintbar)
+                    self.assertIn("again to quit", hintbar)
 
                     await pilot.press("ctrl+c")
                     await pilot.pause()
@@ -1385,6 +1450,121 @@ class TuiInteractionTest(unittest.IsolatedAsyncioTestCase):
             config = json.loads(config_path.read_text(encoding="utf-8"))
             self.assertEqual(config["browser"]["cloud_api_key"], "bu_test_key")
             self.assertEqual(os.environ["BROWSER_USE_API_KEY"], "bu_test_key")
+
+    async def test_auth_command_persists_provider_api_key_to_auth_store(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"LLM_BROWSER_PROVIDER_AUTH_PATH": str(Path(tmp) / "provider-auth.json")},
+            clear=False,
+        ):
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp) / "state"), provider_label="openrouter", model_label="glm-5.1")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/auth openrouter or_test_key")
+                await pilot.pause()
+
+            auth_payload = json.loads((Path(tmp) / "provider-auth.json").read_text(encoding="utf-8"))
+            self.assertEqual(auth_payload["openrouter"]["type"], "api_key")
+            self.assertEqual(auth_payload["openrouter"]["key"], "or_test_key")
+            self.assertEqual(os.environ["LLM_BROWSER_OPENROUTER_API_KEY"], "or_test_key")
+
+    async def test_auth_without_args_opens_auth_palette(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="openrouter", model_label="glm-5.1")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/auth")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, CommandPalette)
+
+    async def test_auth_api_key_without_value_opens_secret_prompt(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="openrouter", model_label="glm-5.1")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/auth api-key openrouter")
+                await pilot.pause()
+
+                self.assertIsInstance(app.screen, SecretInputScreen)
+
+    async def test_auth_secret_prompt_consumes_key_submission(self) -> None:
+        class FakeManager:
+            def __init__(self) -> None:
+                self.started: list[str] = []
+
+            def start(self, task: str):
+                self.started.append(task)
+                raise AssertionError(f"unexpected task start: {task}")
+
+            def reap(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"LLM_BROWSER_PROVIDER_AUTH_PATH": str(Path(tmp) / "provider-auth.json")},
+            clear=False,
+        ):
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp) / "state"), provider_label="openrouter", model_label="glm-5.1")
+            fake_manager = FakeManager()
+            app.manager = fake_manager  # type: ignore[assignment]
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/auth api-key openrouter")
+                await pilot.pause()
+                await pilot.press("o", "r", "-", "t", "e", "s", "t", "enter")
+                await pilot.pause()
+                composer_text = app.query_one("#command", ComposerInput).text
+
+            auth_payload = json.loads((Path(tmp) / "provider-auth.json").read_text(encoding="utf-8"))
+            self.assertEqual(auth_payload["openrouter"]["key"], "or-test")
+            self.assertEqual(fake_manager.started, [])
+            self.assertEqual(composer_text, "")
+
+    async def test_pending_auth_secret_handles_composer_submission_fallback(self) -> None:
+        class FakeManager:
+            def __init__(self) -> None:
+                self.started: list[str] = []
+
+            def start(self, task: str):
+                self.started.append(task)
+                raise AssertionError(f"unexpected task start: {task}")
+
+            def reap(self) -> None:
+                pass
+
+        with tempfile.TemporaryDirectory() as tmp, patch.dict(
+            os.environ,
+            {"LLM_BROWSER_PROVIDER_AUTH_PATH": str(Path(tmp) / "provider-auth.json")},
+            clear=False,
+        ):
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp) / "state"), provider_label="openrouter", model_label="glm-5.1")
+            fake_manager = FakeManager()
+            app.manager = fake_manager  # type: ignore[assignment]
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                app._handle_command("/auth api-key openrouter")
+                await pilot.pause()
+                app.query_one("#command", ComposerInput).load_text("or-fallback")
+                app.submit_composer()
+                await pilot.pause()
+
+            auth_payload = json.loads((Path(tmp) / "provider-auth.json").read_text(encoding="utf-8"))
+            self.assertEqual(auth_payload["openrouter"]["key"], "or-fallback")
+            self.assertEqual(fake_manager.started, [])
+
+    async def test_auth_palette_includes_openrouter_and_claude_code_login(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            app = BrowserUseTerminalApp(SessionStore(Path(tmp)), provider_label="openrouter", model_label="glm-5.1")
+
+            async with app.run_test(size=(120, 36)) as pilot:
+                await pilot.pause()
+                rows = app._auth_palette()
+
+            commands = [row[1] for row in rows]
+            self.assertIn("auth api-key openrouter", commands)
+            self.assertIn("auth anthropic login", commands)
+            self.assertIn("auth codex login", commands)
 
     async def test_plain_text_with_selected_done_session_resumes_in_place(self) -> None:
         class FakeManager:

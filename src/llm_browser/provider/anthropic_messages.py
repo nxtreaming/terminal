@@ -55,6 +55,7 @@ class AnthropicMessagesProvider:
         self.timeout_s = timeout_s
         self.max_retries = max(0, int(max_retries))
         self.max_tokens = max_tokens
+        self.provider_label = "anthropic"
         self.instructions = instructions or BROWSER_AGENT_INSTRUCTIONS
         self.thinking_mode = thinking_mode
         self.effort = effort
