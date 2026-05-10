@@ -222,7 +222,7 @@ Use mature Rust crates where they fit. Current package checks for this branch fo
 - `ratatui 0.30.0` for TUI rendering
 - `rusqlite 0.39.0` for SQLite
 - `crossterm 0.29.0` for terminal IO
-- `async-openai 0.34.0` worth evaluating for OpenAI-compatible providers
+- `async-openai 0.38.0` worth evaluating for OpenAI-compatible providers
 - `reqwest-eventsource 0.6.0` worth evaluating for SSE if provider streaming needs a helper crate
 - Anthropic Rust SDKs exist, but the ecosystem appears weaker; prefer a thin `reqwest` adapter unless a crate cleanly supports streaming, tools, vision, and auth needs
 

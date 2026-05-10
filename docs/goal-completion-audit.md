@@ -28,7 +28,7 @@ Objective audited:
 | Terminal UI running/result/history/actions/browser behavior works. | Unit tests plus manual PTY runs cover task entry, running, result, follow-up, history, actions, help, browser overlay, browser picker, and quit. | Done |
 | Browser overlay actions do what they say. | Fixed and tested: `Open browser` records `browser.open_requested`, `Reconnect` records `browser.reconnect_requested`, `Change browser` opens browser picker without accidental backend mutation; live browser state now projects tab count and viewport details instead of hardcoded unknowns. | Done |
 | Terminal UI was manually tested. | `/tmp/but-goal-final-tui` and `/tmp/but-goal-browser-overlay-tui` PTY runs inspected; SQLite evidence recorded in `docs/rewrite-verification.md`. | Done |
-| Rust package choices are current/reasonable. | Current checks found `ratatui 0.30.0`, `rusqlite 0.39.0`, `reqwest 0.12.x`, `sqlx 0.8.6`, `async-openai v0.37.0`, and `eventsource-client` as available options. The implementation uses Ratatui, rusqlite, and thin reqwest adapters where SDK coverage is not worth extra complexity. | Done |
+| Rust package choices are current/reasonable. | Current checks found `ratatui 0.30.0`, `rusqlite 0.39.0`, `reqwest 0.12.x`, `sqlx 0.8.6`, `async-openai v0.38.0`, and `eventsource-client 0.17.3` as available options. The implementation uses Ratatui, rusqlite, and thin reqwest adapters where SDK coverage is not worth extra complexity. | Done |
 | Provider failures leave durable failed state. | Core records `session.failed` and closes the run row when a provider stream errors; regression test `provider_stream_errors_mark_session_failed_and_finish_run` covers the path exposed by a live Codex `cyber_policy` stream error. | Done |
 | Python tool execution is bounded. | Core passes a Python timeout to the worker; worker uses an alarm around snippet execution and preserves the session namespace after timeout; tests cover timeout recovery and model continuation. | Done |
 
@@ -76,6 +76,6 @@ These are not implementation gaps in the local rewrite, but they prevent a stric
 - Ratatui latest docs show `0.30.0`: https://docs.rs/crate/ratatui/latest
 - Rusqlite latest docs show `0.39.0`: https://docs.rs/crate/rusqlite/latest
 - SQLx docs show SQLite migrations support, but the current synchronous local app shape favors smaller `rusqlite`: https://docs.rs/sqlx/latest/sqlx/migrate/index.html
-- `async-openai` latest release is available, but the implementation keeps thin `reqwest` adapters to support Codex/Responses differences directly: https://github.com/64bit/async-openai
+- `async-openai` latest docs show `0.38.0`, but the implementation keeps thin `reqwest` adapters to support Codex/Responses differences directly: https://docs.rs/crate/async-openai/latest
 - Anthropic Messages API is simple enough for a thin adapter and supports tool/message usage directly: https://docs.claude.com/en/api/messages
-- `eventsource-client` exists for SSE, but the current blocking provider adapter uses a small local SSE parser to avoid pulling async transport into the v1 runtime: https://docs.rs/eventsource-client/latest/eventsource_client/
+- `eventsource-client` latest docs show `0.17.3`, but the current blocking provider adapter uses a small local SSE parser to avoid pulling async transport into the v1 runtime: https://docs.rs/eventsource-client/latest/eventsource_client/
