@@ -21,6 +21,7 @@ pub struct AgentRunOptions {
     pub max_turns: usize,
     pub max_context_chars: usize,
     pub browser_mode: Option<String>,
+    pub python_tool_timeout_seconds: u64,
 }
 
 impl Default for AgentRunOptions {
@@ -29,6 +30,7 @@ impl Default for AgentRunOptions {
             max_turns: 80,
             max_context_chars: 240_000,
             browser_mode: None,
+            python_tool_timeout_seconds: 120,
         }
     }
 }
@@ -36,6 +38,11 @@ impl Default for AgentRunOptions {
 impl AgentRunOptions {
     pub fn with_browser_mode(mut self, mode: impl Into<String>) -> Self {
         self.browser_mode = Some(mode.into());
+        self
+    }
+
+    pub fn with_python_tool_timeout_seconds(mut self, timeout_seconds: u64) -> Self {
+        self.python_tool_timeout_seconds = timeout_seconds;
         self
     }
 }
@@ -212,7 +219,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
 
             for call in tool_calls {
                 ensure_not_cancelled(store, &session.id)?;
-                let outcome = dispatch_tool_call(store, &session, &mut worker, &call)?;
+                let outcome = dispatch_tool_call(store, &session, &mut worker, &call, &options)?;
                 messages.extend(outcome.messages);
                 maybe_compact_messages(
                     store,
@@ -603,10 +610,17 @@ fn dispatch_tool_call(
     session: &browser_use_protocol::SessionMeta,
     worker: &mut PythonWorker,
     call: &ToolCall,
+    options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
     match call.name.as_str() {
         "done" => dispatch_done_tool(store, session, call),
-        "python" => dispatch_python_tool(store, session, worker, call),
+        "python" => dispatch_python_tool(
+            store,
+            session,
+            worker,
+            call,
+            options.python_tool_timeout_seconds,
+        ),
         "spawn_agent" => dispatch_spawn_agent_tool(store, session, call),
         "wait_agent" => dispatch_wait_agent_tool(store, session, call),
         "send_message" => dispatch_agent_message_tool(store, session, call, false),
@@ -659,6 +673,7 @@ fn dispatch_python_tool(
     session: &browser_use_protocol::SessionMeta,
     worker: &mut PythonWorker,
     call: &ToolCall,
+    timeout_seconds: u64,
 ) -> Result<ToolDispatchOutcome> {
     let code = call
         .arguments
@@ -675,11 +690,12 @@ fn dispatch_python_tool(
         }),
     )?;
     let mut stream_error = None;
-    let response = worker.run_with_events(
+    let response = worker.run_with_events_and_timeout(
         &session.id,
         &session.cwd,
         &session.artifact_root,
         code,
+        Some(timeout_seconds as f64),
         |event| {
             if stream_error.is_none() {
                 if let Err(err) = record_python_worker_event(store, &session.id, &event) {
@@ -1718,6 +1734,55 @@ mod tests {
     }
 
     #[test]
+    fn provider_loop_records_python_tool_timeout_and_continues() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_timeout".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "import time\ntime.sleep(5)",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_timeout".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({"result": "timeout recovered"}),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "timeout then recover",
+            temp.path(),
+            AgentRunOptions::default().with_python_tool_timeout_seconds(1),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["name"] == "python"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("timed out"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "timeout recovered"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn provider_messages_are_compacted_when_context_gets_large() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -1755,6 +1820,7 @@ mod tests {
                 max_turns: 4,
                 max_context_chars: 500,
                 browser_mode: None,
+                python_tool_timeout_seconds: 120,
             },
         )?;
         let events = store.events_for_session(&session_id)?;
@@ -1844,6 +1910,7 @@ mod tests {
                 max_turns: 2,
                 max_context_chars: 80_000,
                 browser_mode: None,
+                python_tool_timeout_seconds: 120,
             },
         )?;
         let events = store.events_for_session(&session_id)?;

@@ -168,6 +168,10 @@ enum Command {
         count: usize,
         #[arg(long, default_value = "gpt-5.5")]
         model: String,
+        #[arg(long, default_value_t = 80)]
+        max_turns: usize,
+        #[arg(long, default_value_t = 120)]
+        python_timeout_seconds: u64,
     },
     DatasetRunCodex {
         dataset: String,
@@ -175,6 +179,10 @@ enum Command {
         count: usize,
         #[arg(long, default_value = "gpt-5.5")]
         model: String,
+        #[arg(long, default_value_t = 80)]
+        max_turns: usize,
+        #[arg(long, default_value_t = 120)]
+        python_timeout_seconds: u64,
     },
     DatasetRunAnthropic {
         dataset: String,
@@ -182,6 +190,10 @@ enum Command {
         count: usize,
         #[arg(long, default_value = "claude-sonnet-4-6")]
         model: String,
+        #[arg(long, default_value_t = 80)]
+        max_turns: usize,
+        #[arg(long, default_value_t = 120)]
+        python_timeout_seconds: u64,
     },
     DatasetRunOpenrouter {
         dataset: String,
@@ -189,6 +201,10 @@ enum Command {
         count: usize,
         #[arg(long, default_value = "openai/gpt-5.5")]
         model: String,
+        #[arg(long, default_value_t = 80)]
+        max_turns: usize,
+        #[arg(long, default_value_t = 120)]
+        python_timeout_seconds: u64,
     },
 }
 
@@ -291,22 +307,58 @@ fn main() -> Result<()> {
             dataset,
             count,
             model,
-        } => dataset_run_openai(&store, &dataset, count, model),
+            max_turns,
+            python_timeout_seconds,
+        } => dataset_run_openai(
+            &store,
+            &dataset,
+            count,
+            model,
+            max_turns,
+            python_timeout_seconds,
+        ),
         Command::DatasetRunCodex {
             dataset,
             count,
             model,
-        } => dataset_run_codex(&store, &dataset, count, model),
+            max_turns,
+            python_timeout_seconds,
+        } => dataset_run_codex(
+            &store,
+            &dataset,
+            count,
+            model,
+            max_turns,
+            python_timeout_seconds,
+        ),
         Command::DatasetRunAnthropic {
             dataset,
             count,
             model,
-        } => dataset_run_anthropic(&store, &dataset, count, model),
+            max_turns,
+            python_timeout_seconds,
+        } => dataset_run_anthropic(
+            &store,
+            &dataset,
+            count,
+            model,
+            max_turns,
+            python_timeout_seconds,
+        ),
         Command::DatasetRunOpenrouter {
             dataset,
             count,
             model,
-        } => dataset_run_openrouter(&store, &dataset, count, model),
+            max_turns,
+            python_timeout_seconds,
+        } => dataset_run_openrouter(
+            &store,
+            &dataset,
+            count,
+            model,
+            max_turns,
+            python_timeout_seconds,
+        ),
     }
 }
 
@@ -336,6 +388,13 @@ fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<
 
 fn cli_agent_options() -> AgentRunOptions {
     AgentRunOptions::default().with_browser_mode("headless")
+}
+
+fn cli_agent_options_with(max_turns: usize, python_timeout_seconds: u64) -> AgentRunOptions {
+    let mut options = cli_agent_options();
+    options.max_turns = max_turns;
+    options.python_tool_timeout_seconds = python_timeout_seconds;
+    options
 }
 
 fn run_openai(store: &Store, text: String, model: String) -> Result<()> {
@@ -1271,7 +1330,32 @@ fn dataset_run_fake(store: &Store, dataset: &str, count: usize) -> Result<()> {
     Ok(())
 }
 
-fn dataset_run_openai(store: &Store, dataset: &str, count: usize, model: String) -> Result<()> {
+fn create_dataset_session(store: &Store, dataset: &str, case: &DatasetCase) -> Result<String> {
+    let session = store.create_session(None, std::env::current_dir()?)?;
+    store.append_event(
+        &session.id,
+        "session.input",
+        serde_json::json!({ "text": case.confirmed_task }),
+    )?;
+    store.append_event(
+        &session.id,
+        "dataset.case",
+        serde_json::json!({
+            "dataset": dataset,
+            "task_id": case.task_id,
+        }),
+    )?;
+    Ok(session.id)
+}
+
+fn dataset_run_openai(
+    store: &Store,
+    dataset: &str,
+    count: usize,
+    model: String,
+    max_turns: usize,
+    python_timeout_seconds: u64,
+) -> Result<()> {
     let cases = load_dataset_cases(dataset)?;
     if cases.is_empty() || count == 0 {
         println!("No dataset cases selected.");
@@ -1279,27 +1363,27 @@ fn dataset_run_openai(store: &Store, dataset: &str, count: usize, model: String)
     }
     let provider = openai_provider(store, model)?;
     for case in cases.into_iter().take(count) {
-        let session_id = run_agent_with_provider(
+        let session_id = create_dataset_session(store, dataset, &case)?;
+        println!("{}  {}", case.task_id, session_id);
+        io::stdout().flush()?;
+        run_existing_session_with_provider(
             store,
             &provider,
-            &case.confirmed_task,
-            std::env::current_dir()?,
-            cli_agent_options(),
-        )?;
-        store.append_event(
             &session_id,
-            "dataset.case",
-            serde_json::json!({
-                "dataset": dataset,
-                "task_id": case.task_id,
-            }),
+            cli_agent_options_with(max_turns, python_timeout_seconds),
         )?;
-        println!("{}  {}", case.task_id, session_id);
     }
     Ok(())
 }
 
-fn dataset_run_codex(store: &Store, dataset: &str, count: usize, model: String) -> Result<()> {
+fn dataset_run_codex(
+    store: &Store,
+    dataset: &str,
+    count: usize,
+    model: String,
+    max_turns: usize,
+    python_timeout_seconds: u64,
+) -> Result<()> {
     let cases = load_dataset_cases(dataset)?;
     if cases.is_empty() || count == 0 {
         println!("No dataset cases selected.");
@@ -1307,27 +1391,27 @@ fn dataset_run_codex(store: &Store, dataset: &str, count: usize, model: String) 
     }
     let provider = codex_provider(store, model)?;
     for case in cases.into_iter().take(count) {
-        let session_id = run_agent_with_provider(
+        let session_id = create_dataset_session(store, dataset, &case)?;
+        println!("{}  {}", case.task_id, session_id);
+        io::stdout().flush()?;
+        run_existing_session_with_provider(
             store,
             &provider,
-            &case.confirmed_task,
-            std::env::current_dir()?,
-            cli_agent_options(),
-        )?;
-        store.append_event(
             &session_id,
-            "dataset.case",
-            serde_json::json!({
-                "dataset": dataset,
-                "task_id": case.task_id,
-            }),
+            cli_agent_options_with(max_turns, python_timeout_seconds),
         )?;
-        println!("{}  {}", case.task_id, session_id);
     }
     Ok(())
 }
 
-fn dataset_run_anthropic(store: &Store, dataset: &str, count: usize, model: String) -> Result<()> {
+fn dataset_run_anthropic(
+    store: &Store,
+    dataset: &str,
+    count: usize,
+    model: String,
+    max_turns: usize,
+    python_timeout_seconds: u64,
+) -> Result<()> {
     let cases = load_dataset_cases(dataset)?;
     if cases.is_empty() || count == 0 {
         println!("No dataset cases selected.");
@@ -1335,27 +1419,27 @@ fn dataset_run_anthropic(store: &Store, dataset: &str, count: usize, model: Stri
     }
     let provider = anthropic_provider(store, model)?;
     for case in cases.into_iter().take(count) {
-        let session_id = run_agent_with_provider(
+        let session_id = create_dataset_session(store, dataset, &case)?;
+        println!("{}  {}", case.task_id, session_id);
+        io::stdout().flush()?;
+        run_existing_session_with_provider(
             store,
             &provider,
-            &case.confirmed_task,
-            std::env::current_dir()?,
-            cli_agent_options(),
-        )?;
-        store.append_event(
             &session_id,
-            "dataset.case",
-            serde_json::json!({
-                "dataset": dataset,
-                "task_id": case.task_id,
-            }),
+            cli_agent_options_with(max_turns, python_timeout_seconds),
         )?;
-        println!("{}  {}", case.task_id, session_id);
     }
     Ok(())
 }
 
-fn dataset_run_openrouter(store: &Store, dataset: &str, count: usize, model: String) -> Result<()> {
+fn dataset_run_openrouter(
+    store: &Store,
+    dataset: &str,
+    count: usize,
+    model: String,
+    max_turns: usize,
+    python_timeout_seconds: u64,
+) -> Result<()> {
     let cases = load_dataset_cases(dataset)?;
     if cases.is_empty() || count == 0 {
         println!("No dataset cases selected.");
@@ -1363,22 +1447,15 @@ fn dataset_run_openrouter(store: &Store, dataset: &str, count: usize, model: Str
     }
     let provider = openrouter_provider(store, model)?;
     for case in cases.into_iter().take(count) {
-        let session_id = run_agent_with_provider(
+        let session_id = create_dataset_session(store, dataset, &case)?;
+        println!("{}  {}", case.task_id, session_id);
+        io::stdout().flush()?;
+        run_existing_session_with_provider(
             store,
             &provider,
-            &case.confirmed_task,
-            std::env::current_dir()?,
-            cli_agent_options(),
-        )?;
-        store.append_event(
             &session_id,
-            "dataset.case",
-            serde_json::json!({
-                "dataset": dataset,
-                "task_id": case.task_id,
-            }),
+            cli_agent_options_with(max_turns, python_timeout_seconds),
         )?;
-        println!("{}  {}", case.task_id, session_id);
     }
     Ok(())
 }

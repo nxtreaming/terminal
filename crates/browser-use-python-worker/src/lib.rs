@@ -22,6 +22,7 @@ struct RunPythonRequest {
     artifact_dir: String,
     code: String,
     cancel_requested: bool,
+    timeout_seconds: Option<f64>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -178,12 +179,42 @@ impl PythonWorker {
         self.run_with_events(session_id, cwd, artifact_dir, code, |_| {})
     }
 
+    pub fn run_with_timeout(
+        &mut self,
+        session_id: &str,
+        cwd: impl AsRef<Path>,
+        artifact_dir: impl AsRef<Path>,
+        code: &str,
+        timeout_seconds: Option<f64>,
+    ) -> Result<RunPythonResponse> {
+        self.run_with_events_and_timeout(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_seconds,
+            |_| {},
+        )
+    }
+
     pub fn run_with_events(
         &mut self,
         session_id: &str,
         cwd: impl AsRef<Path>,
         artifact_dir: impl AsRef<Path>,
         code: &str,
+        on_event: impl FnMut(PythonWorkerEvent),
+    ) -> Result<RunPythonResponse> {
+        self.run_with_events_and_timeout(session_id, cwd, artifact_dir, code, None, on_event)
+    }
+
+    pub fn run_with_events_and_timeout(
+        &mut self,
+        session_id: &str,
+        cwd: impl AsRef<Path>,
+        artifact_dir: impl AsRef<Path>,
+        code: &str,
+        timeout_seconds: Option<f64>,
         mut on_event: impl FnMut(PythonWorkerEvent),
     ) -> Result<RunPythonResponse> {
         let request = RunPythonRequest {
@@ -193,6 +224,7 @@ impl PythonWorker {
             artifact_dir: artifact_dir.as_ref().display().to_string(),
             code: code.to_string(),
             cancel_requested: false,
+            timeout_seconds,
         };
         self.next_id += 1;
         let line = serde_json::to_string(&request)?;
@@ -259,6 +291,43 @@ mod tests {
         assert!(second.ok, "{second:?}");
         assert!(second.text.contains("42"));
         assert_eq!(second.data["value"], 42);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_times_out_snippets_without_losing_namespace() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", repo_root.join("python"))?;
+        let response = worker.run_with_timeout(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "x = 7\nimport time\ntime.sleep(5)",
+            Some(0.2),
+        )?;
+        assert!(!response.ok, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out"),
+            "{response:?}"
+        );
+
+        let second = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "print(x)\nresult = {'value': x}",
+        )?;
+        assert!(second.ok, "{second:?}");
+        assert_eq!(second.data["value"], 7);
         Ok(())
     }
 

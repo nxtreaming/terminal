@@ -7,6 +7,7 @@ import io
 import json
 import os
 import shutil
+import signal
 import socket
 import subprocess
 import sys
@@ -22,6 +23,14 @@ from typing import Any, Dict
 _namespaces: Dict[str, Dict[str, Any]] = {}
 _managed_chrome: subprocess.Popen[Any] | None = None
 _managed_chrome_profile: Path | None = None
+
+
+class _ToolTimeoutError(TimeoutError):
+    pass
+
+
+def _raise_tool_timeout(signum: int, frame: Any) -> None:
+    raise _ToolTimeoutError("python tool timed out")
 
 
 def _jsonable(value: Any) -> Any:
@@ -406,13 +415,21 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
     artifact_dir = Path(str(request.get("artifact_dir") or cwd / "artifacts")).expanduser().resolve()
     code = str(request.get("code") or "")
     cancel_requested = bool(request.get("cancel_requested"))
+    timeout_seconds = float(request.get("timeout_seconds") or 0)
     ns = _namespace(session_id, cwd, artifact_dir)
     _install_host_helpers(ns, request_id, cancel_requested)
     stdout = io.StringIO()
     old_cwd = Path.cwd()
+    old_alarm_handler: Any = None
+    alarm_armed = False
     try:
         cwd.mkdir(parents=True, exist_ok=True)
         os.chdir(cwd)
+        if timeout_seconds > 0 and hasattr(signal, "SIGALRM"):
+            old_alarm_handler = signal.getsignal(signal.SIGALRM)
+            signal.signal(signal.SIGALRM, _raise_tool_timeout)
+            signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
+            alarm_armed = True
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
             exec(compile(code, "<browser-use-python-worker>", "exec"), ns)
         _auto_emit_browser_state(ns, request_id)
@@ -444,6 +461,9 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
             "browser_harness_error": ns.get("browser_harness_error"),
         }
     finally:
+        if alarm_armed:
+            signal.setitimer(signal.ITIMER_REAL, 0)
+            signal.signal(signal.SIGALRM, old_alarm_handler)
         os.chdir(old_cwd)
 
 
