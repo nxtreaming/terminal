@@ -6,6 +6,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 
 - Rust workspace split into protocol, store, core, providers, Python-worker supervisor, CLI, and TUI crates.
 - SQLite is the durable state boundary for sessions, events, artifacts, runs, agent graph, mailbox, and app settings.
+- Checked-in golden legacy events under `tests/golden-events/legacy-session` verify import compatibility for old session/event JSONL shape.
 - Old Python product runtime is removed from the package surface; Python is now the browser worker island.
 - Python worker loads local browser harness helpers, preserves per-session namespaces, exposes host helpers such as `artifact_root()` and `session_metadata()`, streams host events, and emits browser state/images/artifacts, tab count, and viewport details back to Rust.
 - Rust agent loop dispatches the tiny model-visible tool surface: `python`, `done`, `spawn_agent`, `wait_agent`, `send_message`, `followup_task`, `list_agents`, and `close_agent`.
@@ -35,6 +36,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - fake dataset runner, including full `real_v14_short` count-10 and `real_v8` count-100 fake paths
 - fake dataset manifest/report/resume smoke under `/tmp/but-dataset-manifest-smoke`
 - fake dataset isolated-workspace smoke under `/tmp/but-dataset-workspace-smoke`
+- checked-in legacy event fixture import test
 - live Codex no-browser smoke with a `done` tool call
 - config/auth/diagnostics/trace CLI smoke tests
 - stored auth CLI smoke for API-key login, Codex token login/import, logout, status, and `config show` secret redaction

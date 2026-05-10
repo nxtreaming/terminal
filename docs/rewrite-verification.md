@@ -6,6 +6,7 @@ Last verified in this branch:
 cargo fmt --check
 cargo test
 uv run --with pytest python -m pytest -q
+cargo test -p browser-use-store
 uv run browser-use-terminal --help
 uv run but --help
 uv run browser-use-terminal --state-dir /tmp/but-rust-final-smoke run-fake "Open example.com and return ok"
@@ -199,6 +200,7 @@ Provider coverage:
 - Anthropic Messages also has mocked bearer-token coverage for the Claude Code OAuth-token path. The CLI stores `auth.claude_code.auth_token`, redacts it in `config show`, detects `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN`, and reports external Claude Code CLI login status without scraping Keychain tokens.
 - Python worker tests cover browser-harness download-style artifacts and refreshed browser target identity across calls.
 - Store/core/TUI tests cover run lifecycle rows, model config events, deadline warning events, cancellation checks before finalization, compaction events, large Python output spillover to artifacts, recursive sub-agent close, configurable spawn fork modes, isolated sub-agent provider execution with compact parent completion events, persistent TUI setup choices, browser overlay action routing, and result follow-up execution on the existing task.
+- Store tests include checked-in golden legacy session/event fixture import from `tests/golden-events/legacy-session`.
 - Core tests cover canonical `/root/...` sub-agent path addressing for send, follow-up, wait, list, and close.
 - Live Anthropic/OpenRouter smokes were not run in this branch because they require live credentials.
 

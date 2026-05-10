@@ -1,0 +1,4 @@
+{"version":1,"id":"legacy-event-001","session_id":"legacy-golden-001","ts_ms":1778440001000,"type":"session.input","payload":{"text":"Find the top Hacker News post"}}
+{"version":1,"id":"legacy-event-002","session_id":"legacy-golden-001","ts_ms":1778440002000,"type":"browser.page","payload":{"url":"https://news.ycombinator.com/","title":"Hacker News","tabs":1,"viewport":{"w":1440,"h":900}}}
+{"version":1,"id":"legacy-event-003","session_id":"legacy-golden-001","ts_ms":1778440003000,"type":"tool.output","payload":{"name":"python","text":"Top story found","text_truncated":false}}
+{"version":1,"id":"legacy-event-004","session_id":"legacy-golden-001","ts_ms":1778440004000,"type":"session.done","payload":{"result":"Top story found"}}

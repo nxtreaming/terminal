@@ -972,6 +972,28 @@ mod tests {
     }
 
     #[test]
+    fn imports_checked_in_golden_legacy_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
+            .join("../../tests/golden-events/legacy-session");
+
+        let session = store.import_legacy_session(&fixture)?;
+        assert_eq!(session.id, "legacy-golden-001");
+        assert_eq!(session.status, SessionStatus::Done);
+        assert_eq!(session.cwd, "/tmp/browser-use-legacy-golden");
+
+        let events = store.events_for_session(&session.id)?;
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0].event_type, "session.input");
+        assert_eq!(events[1].event_type, "browser.page");
+        assert_eq!(events[1].payload["viewport"]["w"], 1440);
+        assert_eq!(events[2].event_type, "tool.output");
+        assert_eq!(events[3].payload["result"], "Top story found");
+        Ok(())
+    }
+
+    #[test]
     fn records_artifact_index_rows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;

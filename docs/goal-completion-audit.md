@@ -42,6 +42,7 @@ cargo test
 uv run --with pytest python -m pytest -q
 cargo test -p browser-use-core -p browser-use-tui
 cargo test -p browser-use-cli -p browser-use-protocol -p browser-use-tui -p browser-use-python-worker
+cargo test -p browser-use-store
 uv run --with pytest python -m pytest -q
 cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-list
 cargo run -q -p browser-use-cli -- --state-dir /tmp/but-dataset-manifest-smoke dataset-sample real_v14_short --count 2
