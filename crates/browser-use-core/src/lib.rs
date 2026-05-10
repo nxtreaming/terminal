@@ -1227,6 +1227,22 @@ fn resolve_child_agent(
     }))
 }
 
+fn display_agent_path_for_session(store: &Store, session_id: &str) -> Result<String> {
+    if let Some(path) = store.agent_path_for_session(session_id)? {
+        if !path.trim().is_empty() {
+            return Ok(path);
+        }
+    }
+    let session = store
+        .load_session(session_id)?
+        .with_context(|| format!("unknown session id: {session_id}"))?;
+    if session.parent_id.is_none() {
+        Ok("/root".to_string())
+    } else {
+        Ok(session_id.to_string())
+    }
+}
+
 fn dispatch_wait_agent_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
@@ -1284,19 +1300,19 @@ fn dispatch_wait_agent_tool(
         thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())));
     };
     let child_events = store.events_for_session(&child_session_id)?;
-    let messages = store
-        .messages_for_agent(&child_session_id)?
-        .into_iter()
-        .map(|message| {
-            serde_json::json!({
-                "id": message.id,
-                "author_session_id": message.author_session_id,
-                "content": message.content,
-                "trigger_turn": message.trigger_turn,
-                "created_ms": message.created_ms,
-            })
-        })
-        .collect::<Vec<_>>();
+    let mut messages = Vec::new();
+    for message in store.messages_for_agent(&child_session_id)? {
+        messages.push(serde_json::json!({
+            "id": message.id,
+            "author_session_id": message.author_session_id,
+            "target_session_id": message.target_session_id,
+            "author_path": display_agent_path_for_session(store, &message.author_session_id)?,
+            "recipient_path": display_agent_path_for_session(store, &message.target_session_id)?,
+            "content": message.content,
+            "trigger_turn": message.trigger_turn,
+            "created_ms": message.created_ms,
+        }));
+    }
     store.append_event(
         &session.id,
         "tool.finished",
@@ -1386,6 +1402,11 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
         .with_context(|| format!("unknown child session id: {child_session_id}"))?;
     debug_assert_eq!(child.parent_id.as_deref(), Some(session.id.as_str()));
     let mail = store.send_agent_message(&session.id, &child_session_id, message, trigger_turn)?;
+    let author_path = display_agent_path_for_session(store, &session.id)?;
+    let recipient_path = match agent_path.clone() {
+        Some(path) => path,
+        None => display_agent_path_for_session(store, &child_session_id)?,
+    };
     if trigger_turn {
         store.append_event(
             &child_session_id,
@@ -1398,6 +1419,10 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
         "agent.message",
         serde_json::json!({
             "id": mail.id,
+            "author_session_id": session.id,
+            "target_session_id": child_session_id,
+            "author_path": author_path.clone(),
+            "recipient_path": recipient_path.clone(),
             "child_session_id": child_session_id,
             "content": message,
             "trigger_turn": trigger_turn,
@@ -1434,6 +1459,8 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
                 "message_id": mail.id,
                 "child_session_id": child_session_id,
                 "agent_path": agent_path,
+                "author_path": author_path,
+                "recipient_path": recipient_path,
                 "trigger_turn": trigger_turn,
                 "status": child_result
                     .as_ref()
@@ -2365,7 +2392,9 @@ mod tests {
         assert!(parent_events
             .iter()
             .any(|event| event.event_type == "agent.message"
-                && event.payload["trigger_turn"] == true));
+                && event.payload["trigger_turn"] == true
+                && event.payload["author_path"] == "/root"
+                && event.payload["recipient_path"] == "/root/flight-search"));
         assert!(parent_events
             .iter()
             .any(|event| event.event_type == "model.tool_call"

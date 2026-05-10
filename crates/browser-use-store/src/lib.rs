@@ -429,6 +429,18 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn agent_path_for_session(&self, session_id: &str) -> Result<Option<String>> {
+        self.conn
+            .query_row(
+                "SELECT agent_path FROM sessions WHERE id = ?1",
+                params![session_id],
+                |row| row.get::<_, Option<String>>(0),
+            )
+            .optional()
+            .map(|value| value.flatten())
+            .map_err(Into::into)
+    }
+
     pub fn close_child_agent(&self, child_session_id: &str, reason: &str) -> Result<()> {
         self.load_session(child_session_id)?
             .with_context(|| format!("unknown child session id: {child_session_id}"))?;
@@ -1109,6 +1121,13 @@ mod tests {
         let duplicate =
             store.create_child_session(&parent.id, "/tmp", Some("/root/research"), None, None);
         assert!(duplicate.is_err());
+        let child = store.list_child_agents(&parent.id)?.remove(0);
+        assert_eq!(
+            store
+                .agent_path_for_session(&child.child_session_id)?
+                .as_deref(),
+            Some("/root/research")
+        );
 
         let other_parent = store.create_session(None, "/tmp")?;
         store.create_child_session(&other_parent.id, "/tmp", Some("/root/research"), None, None)?;
