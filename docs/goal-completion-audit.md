@@ -22,7 +22,7 @@ Objective audited:
 | Providers cover fake, Codex, OpenAI, Anthropic, and OpenRouter. | Provider crate has fake, OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter adapters with mocked HTTP/SSE tests. | Done |
 | Claude Code path exists. | `auth login claude-code --access-token ...`, `CLAUDE_CODE_OAUTH_TOKEN`, and `ANTHROPIC_AUTH_TOKEN` route to Anthropic bearer-token auth with redaction and tests. | Done |
 | Cancellation is runtime-visible. | Store records cancel events/status; core now checks cancellation before finalizing model/tool turns and records cancelled run rows; `provider_loop_respects_external_cancel_before_finalizing` covers this. | Done |
-| Dataset runner is ported. | Fake/OpenAI/Codex/Anthropic/OpenRouter dataset runner commands exist; fake dataset smoke passed; Codex count-1 `real_v14_short` passed. | Mostly done |
+| Dataset runner is ported. | Fake/OpenAI/Codex/Anthropic/OpenRouter dataset runner commands exist; fake `real_v14_short` count-10 and fake `real_v8` count-100 passed; Codex count-1 `real_v14_short` passed. | Mostly done |
 | Terminal UI first-run setup matches the UX doc. | TUI has setup, sign-in, model, browser choice, setup-complete, persisted choices, and tests for setup flow. | Done |
 | Terminal UI workbench matches the UX doc vocabulary. | Normal TUI uses `task/browser/account/model/result/history/setup` vocabulary and hides artifact/trace/provider/event concepts behind developer overlay. | Done |
 | Terminal UI running/result/history/actions/browser behavior works. | Unit tests plus manual PTY runs cover task entry, running, result, follow-up, history, actions, help, browser overlay, browser picker, and quit. | Done |
@@ -39,6 +39,8 @@ cargo fmt --check
 cargo test
 uv run --with pytest python -m pytest -q
 cargo test -p browser-use-core -p browser-use-tui
+uv run browser-use-terminal --state-dir /tmp/but-fake-real-v14-full dataset-run-fake real_v14_short --count 10
+uv run browser-use-terminal --state-dir /tmp/but-fake-real-v8-full dataset-run-fake real_v8 --count 100
 ```
 
 Previously recorded live/browser verification:

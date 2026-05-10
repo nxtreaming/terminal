@@ -30,7 +30,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - `uv run browser-use-terminal --help`
 - `uv run but --help`
 - fake CLI task runner
-- fake dataset runner
+- fake dataset runner, including full `real_v14_short` count-10 and `real_v8` count-100 fake paths
 - live Codex no-browser smoke with a `done` tool call
 - config/auth/diagnostics/trace CLI smoke tests
 - stored auth CLI smoke for API-key login, Codex token login/import, logout, status, and `config show` secret redaction

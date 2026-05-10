@@ -10,6 +10,8 @@ uv run browser-use-terminal --help
 uv run but --help
 uv run browser-use-terminal --state-dir /tmp/but-rust-final-smoke run-fake "Open example.com and return ok"
 uv run browser-use-terminal --state-dir /tmp/but-rust-dataset-final dataset-run-fake real_v14_short --count 1
+uv run browser-use-terminal --state-dir /tmp/but-fake-real-v14-full dataset-run-fake real_v14_short --count 10
+uv run browser-use-terminal --state-dir /tmp/but-fake-real-v8-full dataset-run-fake real_v8 --count 100
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-live-smoke run-codex --model gpt-5.5 \
   "Do not use the browser. Call the done tool with result exactly 'ok'."
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-dataset-smoke-cft dataset-run-codex real_v14_short --count 1 --model gpt-5.5
@@ -255,5 +257,6 @@ Earlier failed runs were still useful:
 Known gaps before calling the whole migration fully complete:
 
 - User-facing config, auth status/login/import/logout, diagnostics, trace commands, API-key auth, Codex import, and Claude Code OAuth-token import exist.
+- Full fake dataset path verified: `/tmp/but-fake-real-v14-full` has 10 done sessions and 10 `dataset.case` events; `/tmp/but-fake-real-v8-full` has 100 done sessions and 100 `dataset.case` events.
 - Browser Use cloud mode is now owned by the Python island when `LLM_BROWSER_BROWSER_MODE=cloud` and `BROWSER_USE_API_KEY` is set, but it was not live-tested in this branch because no key was available in the environment.
 - Full real-provider dataset regression has not been run. The count-1 Codex smoke on `real_v14_short` now passes.
