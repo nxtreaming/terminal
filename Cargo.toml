@@ -33,4 +33,5 @@ opentelemetry = { version = "0.32", features = ["trace"] }
 opentelemetry-otlp = { version = "0.32", default-features = false, features = ["trace", "http-proto", "reqwest-blocking-client", "reqwest-rustls"] }
 opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 open = "5.3"
+portable-pty = "0.9"
 pulldown-cmark = "0.10"

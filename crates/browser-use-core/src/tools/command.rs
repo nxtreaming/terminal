@@ -1,7 +1,7 @@
 use std::collections::HashMap;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child, ChildStdin, Command, Stdio};
+use std::process::{Child as StdChild, ChildStdin, Command, Stdio};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -9,6 +9,7 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use browser_use_protocol::{SessionMeta, ToolCall};
 use browser_use_store::Store;
+use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 
 const DEFAULT_YIELD_TIME_MS: u64 = 1000;
@@ -27,15 +28,31 @@ struct OutputChunk {
     text: String,
 }
 
-#[derive(Debug)]
 struct ManagedCommand {
     session_id: String,
-    child: Child,
-    stdin: Option<ChildStdin>,
+    process: ManagedProcess,
     output: Arc<Mutex<Vec<OutputChunk>>>,
     read_index: usize,
     started_at: Instant,
     readers: Vec<JoinHandle<()>>,
+}
+
+enum ManagedProcess {
+    Pipes {
+        child: StdChild,
+        stdin: Option<ChildStdin>,
+    },
+    Pty {
+        child: Box<dyn portable_pty::Child + Send + Sync>,
+        writer: Box<dyn Write + Send>,
+        _master: Box<dyn MasterPty + Send>,
+    },
+}
+
+#[derive(Clone, Debug)]
+struct ProcessExit {
+    exit_code: Option<i32>,
+    success: bool,
 }
 
 static COMMANDS: OnceLock<Mutex<HashMap<String, ManagedCommand>>> = OnceLock::new();
@@ -102,36 +119,19 @@ pub(crate) fn exec_command(
 
     let process_id = format!("cmd_{}", &call.id.replace('-', "_"));
     let output = Arc::new(Mutex::new(Vec::new()));
-    let mut command = Command::new(&shell);
-    command
-        .args(shell_args(&shell, login, cmd))
-        .current_dir(&workdir)
-        .stdin(Stdio::piped())
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn command via shell {} in {}", shell, workdir.display()))?;
-    let stdin = child.stdin.take();
-    let mut readers = Vec::new();
-    if let Some(stdout) = child.stdout.take() {
-        readers.push(spawn_reader(stdout, "stdout", output.clone()));
-    }
-    if let Some(stderr) = child.stderr.take() {
-        readers.push(spawn_reader(stderr, "stderr", output.clone()));
-    }
+    let (process, readers, tty_allocated) =
+        spawn_process(&shell, login, cmd, &workdir, tty_requested, output.clone())?;
     let mut managed = ManagedCommand {
         session_id: session.id.clone(),
-        child,
-        stdin,
+        process,
         output,
         read_index: 0,
         started_at: Instant::now(),
         readers,
     };
 
-    wait_for_output(yield_time, || managed.child.try_wait().map_err(Into::into))?;
-    if let Some(status) = managed.child.try_wait()? {
+    wait_for_output(yield_time, || managed.process.try_wait())?;
+    if let Some(status) = managed.process.try_wait()? {
         finish_readers(&mut managed);
         let text = managed.read_recent_output();
         emit_command_output(store, &session.id, &process_id, &text)?;
@@ -141,8 +141,8 @@ pub(crate) fn exec_command(
             json!({
                 "tool_call_id": call.id,
                 "session_id": process_id,
-                "exit_code": status.code(),
-                "success": status.success(),
+                "exit_code": status.exit_code,
+                "success": status.success,
                 "duration_ms": managed.started_at.elapsed().as_millis() as u64,
             }),
         )?;
@@ -151,9 +151,10 @@ pub(crate) fn exec_command(
             false,
             &text,
             max_chars,
-            status.code(),
+            status.exit_code,
             managed.started_at.elapsed(),
             tty_requested,
+            tty_allocated,
         );
         store.append_event(
             &session.id,
@@ -186,6 +187,7 @@ pub(crate) fn exec_command(
         None,
         managed.started_at.elapsed(),
         tty_requested,
+        tty_allocated,
     );
     commands()
         .lock()
@@ -248,15 +250,10 @@ pub(crate) fn write_stdin(
         bail!("command session belongs to another task: {process_id}");
     }
     if !chars.is_empty() {
-        let stdin = command
-            .stdin
-            .as_mut()
-            .with_context(|| format!("command session has no stdin: {process_id}"))?;
-        stdin.write_all(chars.as_bytes())?;
-        stdin.flush()?;
+        command.process.write_all(chars.as_bytes())?;
     }
-    wait_for_output(yield_time, || command.child.try_wait().map_err(Into::into))?;
-    let status = command.child.try_wait()?;
+    wait_for_output(yield_time, || command.process.try_wait())?;
+    let status = command.process.try_wait()?;
     if status.is_some() {
         finish_readers(&mut command);
     }
@@ -264,14 +261,16 @@ pub(crate) fn write_stdin(
     emit_command_output(store, &session.id, process_id, &text)?;
 
     let running = status.is_none();
+    let tty_allocated = command.process.tty_allocated();
     let content = command_output(
         Some(process_id.to_string()),
         running,
         &text,
         max_chars,
-        status.and_then(|status| status.code()),
+        status.as_ref().and_then(|status| status.exit_code),
         command.started_at.elapsed(),
-        false,
+        tty_allocated,
+        tty_allocated,
     );
     if let Some(status) = status {
         store.append_event(
@@ -280,8 +279,8 @@ pub(crate) fn write_stdin(
             json!({
                 "tool_call_id": call.id,
                 "session_id": process_id,
-                "exit_code": status.code(),
-                "success": status.success(),
+                "exit_code": status.exit_code,
+                "success": status.success,
                 "duration_ms": command.started_at.elapsed().as_millis() as u64,
             }),
         )?;
@@ -305,6 +304,148 @@ pub(crate) fn write_stdin(
 
 fn commands() -> &'static Mutex<HashMap<String, ManagedCommand>> {
     COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn spawn_process(
+    shell: &str,
+    login: bool,
+    cmd: &str,
+    workdir: &Path,
+    tty_requested: bool,
+    output: Arc<Mutex<Vec<OutputChunk>>>,
+) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
+    if tty_requested {
+        return spawn_pty_process(shell, login, cmd, workdir, output);
+    }
+    spawn_pipe_process(shell, login, cmd, workdir, output)
+}
+
+fn spawn_pipe_process(
+    shell: &str,
+    login: bool,
+    cmd: &str,
+    workdir: &Path,
+    output: Arc<Mutex<Vec<OutputChunk>>>,
+) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
+    let mut command = Command::new(shell);
+    command
+        .args(shell_args(shell, login, cmd))
+        .current_dir(workdir)
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    let mut child = command
+        .spawn()
+        .with_context(|| format!("spawn command via shell {} in {}", shell, workdir.display()))?;
+    let stdin = child.stdin.take();
+    let mut readers = Vec::new();
+    if let Some(stdout) = child.stdout.take() {
+        readers.push(spawn_reader(stdout, "stdout", output.clone()));
+    }
+    if let Some(stderr) = child.stderr.take() {
+        readers.push(spawn_reader(stderr, "stderr", output));
+    }
+    Ok((ManagedProcess::Pipes { child, stdin }, readers, false))
+}
+
+fn spawn_pty_process(
+    shell: &str,
+    login: bool,
+    cmd: &str,
+    workdir: &Path,
+    output: Arc<Mutex<Vec<OutputChunk>>>,
+) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
+    let pty_system = native_pty_system();
+    let pair = pty_system.openpty(PtySize {
+        rows: 30,
+        cols: 120,
+        pixel_width: 0,
+        pixel_height: 0,
+    })?;
+    let reader = pair.master.try_clone_reader()?;
+    let writer = pair.master.take_writer()?;
+    let mut command = CommandBuilder::new(shell);
+    command.args(shell_args(shell, login, cmd));
+    command.cwd(workdir.as_os_str());
+    let child = pair.slave.spawn_command(command).with_context(|| {
+        format!(
+            "spawn pty command via shell {} in {}",
+            shell,
+            workdir.display()
+        )
+    })?;
+    let readers = vec![spawn_reader(reader, "pty", output)];
+    Ok((
+        ManagedProcess::Pty {
+            child,
+            writer,
+            _master: pair.master,
+        },
+        readers,
+        true,
+    ))
+}
+
+impl ManagedProcess {
+    fn try_wait(&mut self) -> Result<Option<ProcessExit>> {
+        match self {
+            Self::Pipes { child, .. } => Ok(child.try_wait()?.map(|status| ProcessExit {
+                exit_code: status.code(),
+                success: status.success(),
+            })),
+            Self::Pty { child, .. } => Ok(child.try_wait()?.map(|status| ProcessExit {
+                exit_code: i32::try_from(status.exit_code()).ok(),
+                success: status.success(),
+            })),
+        }
+    }
+
+    #[cfg(test)]
+    fn wait(&mut self) -> Result<ProcessExit> {
+        match self {
+            Self::Pipes { child, .. } => {
+                let status = child.wait()?;
+                Ok(ProcessExit {
+                    exit_code: status.code(),
+                    success: status.success(),
+                })
+            }
+            Self::Pty { child, .. } => {
+                let status = child.wait()?;
+                Ok(ProcessExit {
+                    exit_code: i32::try_from(status.exit_code()).ok(),
+                    success: status.success(),
+                })
+            }
+        }
+    }
+
+    #[cfg(test)]
+    fn kill(&mut self) -> Result<()> {
+        match self {
+            Self::Pipes { child, .. } => child.kill().map_err(Into::into),
+            Self::Pty { child, .. } => child.kill().map_err(Into::into),
+        }
+    }
+
+    fn write_all(&mut self, bytes: &[u8]) -> Result<()> {
+        match self {
+            Self::Pipes { stdin, .. } => {
+                let stdin = stdin.as_mut().context("command session has no stdin")?;
+                stdin.write_all(bytes)?;
+                stdin.flush()?;
+            }
+            Self::Pty { writer, .. } => {
+                writer.write_all(bytes)?;
+                writer.flush()?;
+            }
+        }
+        Ok(())
+    }
+
+    fn tty_allocated(&self) -> bool {
+        matches!(self, Self::Pty { .. })
+    }
 }
 
 fn spawn_reader<R>(
@@ -370,7 +511,7 @@ impl ManagedCommand {
 
 fn wait_for_output(
     yield_time: Duration,
-    mut exited: impl FnMut() -> Result<Option<std::process::ExitStatus>>,
+    mut exited: impl FnMut() -> Result<Option<ProcessExit>>,
 ) -> Result<()> {
     let start = Instant::now();
     while start.elapsed() < yield_time {
@@ -411,6 +552,7 @@ fn command_output(
     exit_code: Option<i32>,
     duration: Duration,
     tty_requested: bool,
+    tty_allocated: bool,
 ) -> Value {
     let (output, truncated) = cap_output(output, max_chars);
     json!({
@@ -422,7 +564,7 @@ fn command_output(
             "duration_ms": duration.as_millis() as u64,
             "truncated": truncated,
             "tty_requested": tty_requested,
-            "tty_allocated": false,
+            "tty_allocated": tty_allocated,
         }
     })
 }
@@ -539,6 +681,33 @@ mod tests {
     }
 
     #[test]
+    fn exec_command_can_allocate_pty() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_pty".to_string(),
+                name: "exec_command".to_string(),
+                arguments: json!({
+                    "cmd": "printf pty-ok",
+                    "tty": true,
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("exec");
+
+        assert_eq!(result.content["running"], false);
+        assert!(result.content["output"]
+            .as_str()
+            .expect("output")
+            .contains("pty-ok"));
+        assert_eq!(result.content["metadata"]["tty_allocated"], true);
+    }
+
+    #[test]
     fn exec_command_can_be_polled_with_write_stdin() {
         let tmp = TempDir::new().expect("tmp");
         let (store, session) = test_session(&tmp);
@@ -626,8 +795,8 @@ mod tests {
             .expect("command registry poisoned")
             .remove(process_id)
         {
-            let _ = command.child.kill();
-            let _ = command.child.wait();
+            let _ = command.process.kill();
+            let _ = command.process.wait();
             finish_readers(&mut command);
         }
     }
