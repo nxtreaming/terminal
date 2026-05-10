@@ -240,7 +240,17 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         )?;
         bail!("agent exceeded maximum provider turns");
     })();
-    let run_status = if is_cancelled(store, &session.id)? {
+    let cancelled = is_cancelled(store, &session.id)?;
+    if let Err(error) = &result {
+        if !cancelled && !has_terminal_session_event(store, &session.id)? {
+            store.append_event(
+                &session.id,
+                "session.failed",
+                serde_json::json!({ "error": error.to_string() }),
+            )?;
+        }
+    }
+    let run_status = if cancelled {
         "cancelled"
     } else if result.is_ok() {
         "done"
@@ -256,6 +266,15 @@ fn ensure_not_cancelled(store: &Store, session_id: &str) -> Result<()> {
         bail!("agent cancelled");
     }
     Ok(())
+}
+
+fn has_terminal_session_event(store: &Store, session_id: &str) -> Result<bool> {
+    Ok(store.events_for_session(session_id)?.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "session.done" | "session.failed" | "session.cancelled"
+        )
+    }))
 }
 
 fn is_cancelled(store: &Store, session_id: &str) -> Result<bool> {
@@ -1730,6 +1749,53 @@ mod tests {
                 },
                 ModelEvent::Done,
             ])
+        }
+    }
+
+    #[test]
+    fn provider_stream_errors_mark_session_failed_and_finish_run() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = FailingProvider;
+
+        let result = run_agent_with_provider(
+            &store,
+            &provider,
+            "provider should fail",
+            temp.path(),
+            AgentRunOptions::default(),
+        );
+
+        assert!(result.is_err());
+        let session = store.list_sessions()?.remove(0);
+        assert_eq!(session.status, SessionStatus::Failed);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.failed"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("provider stream exploded"))
+        }));
+        let runs = store.runs_for_session(&session.id)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "failed");
+        assert!(runs[0].ended_ms.is_some());
+        Ok(())
+    }
+
+    struct FailingProvider;
+
+    impl ModelProvider for FailingProvider {
+        fn provider_name(&self) -> &'static str {
+            "failing"
+        }
+
+        fn model_name(&self) -> &str {
+            "failing"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            anyhow::bail!("provider stream exploded")
         }
     }
 
