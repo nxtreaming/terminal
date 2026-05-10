@@ -101,6 +101,11 @@ enum Command {
         #[arg(long, default_value = "user requested cancellation")]
         reason: String,
     },
+    #[command(alias = "session")]
+    Sessions {
+        #[command(subcommand)]
+        command: SessionsCommand,
+    },
     History,
     Show {
         task_id: String,
@@ -322,6 +327,33 @@ enum AuthCommand {
     },
 }
 
+#[derive(Debug, Subcommand)]
+enum SessionsCommand {
+    List,
+    Show {
+        task_id: String,
+    },
+    Cancel {
+        task_id: String,
+        #[arg(long, default_value = "user requested cancellation")]
+        reason: String,
+    },
+    Trace {
+        task_id: String,
+        output: Option<PathBuf>,
+    },
+    Export {
+        task_id: String,
+        output_dir: PathBuf,
+    },
+    Import {
+        input: PathBuf,
+    },
+    Events {
+        task_id: String,
+    },
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum AuthAccount {
     Codex,
@@ -382,6 +414,7 @@ fn main() -> Result<()> {
         Command::Finish { task_id, result } => finish(&store, &task_id, result),
         Command::Fail { task_id, error } => fail(&store, &task_id, error),
         Command::Cancel { task_id, reason } => cancel(&store, &task_id, &reason),
+        Command::Sessions { command } => sessions(&store, command),
         Command::History => history(&store),
         Command::Show { task_id } => show(&store, &task_id),
         Command::Events { task_id } => events(&store, &task_id),
@@ -563,6 +596,21 @@ fn main() -> Result<()> {
             max_turns,
             python_timeout_seconds,
         ),
+    }
+}
+
+fn sessions(store: &Store, command: SessionsCommand) -> Result<()> {
+    match command {
+        SessionsCommand::List => history(store),
+        SessionsCommand::Show { task_id } => show(store, &task_id),
+        SessionsCommand::Cancel { task_id, reason } => cancel(store, &task_id, &reason),
+        SessionsCommand::Trace { task_id, output } => trace(store, &task_id, output),
+        SessionsCommand::Export {
+            task_id,
+            output_dir,
+        } => export(store, &task_id, output_dir),
+        SessionsCommand::Import { input } => import(store, input),
+        SessionsCommand::Events { task_id } => events(store, &task_id),
     }
 }
 

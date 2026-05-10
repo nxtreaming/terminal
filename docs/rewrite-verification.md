@@ -6,7 +6,13 @@ Last verified in this branch:
 cargo fmt --check
 cargo test
 uv run --with pytest python -m pytest -q
+cargo test -p browser-use-cli
+cargo test -p browser-use-tui
 cargo test -p browser-use-store
+tentative_session=$(cargo run -q -p browser-use-cli -- --state-dir /tmp/but-sessions-alias-smoke start "alias smoke")
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-sessions-alias-smoke sessions list
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-sessions-alias-smoke session show "$tentative_session"
+cargo run -q -p browser-use-cli -- --state-dir /tmp/but-sessions-alias-smoke sessions trace "$tentative_session" /tmp/but-sessions-alias-trace
 uv run browser-use-terminal --help
 uv run but --help
 uv run browser-use-terminal --state-dir /tmp/but-rust-final-smoke run-fake "Open example.com and return ok"
@@ -225,6 +231,8 @@ Provider coverage:
 - Store and TUI tests include checked-in golden event fixture import and projection from `tests/golden-events/`, covering legacy done, running/browser-live, artifact/image, and sub-agent/follow-up shapes.
 - Core tests cover canonical `/root/...` sub-agent path addressing for send, follow-up, wait, list, and close, author/recipient path envelopes on mailbox events, plus bounded `wait_agent` timeout behavior for active helpers.
 - TUI settings, runtime launching, and theme helpers are split into separate modules; `browser-use-tui` does not depend directly on `browser-use-providers`.
+- TUI rendering is split into `crates/browser-use-tui/src/render.rs`; the main TUI file now holds app state, input handling, setup/actions, and runtime coordination while render-specific helpers live with the renderer.
+- CLI session management is available both through the existing top-level commands and through `sessions` / `session` aliases with `list`, `show`, `cancel`, `trace`, `export`, `import`, and `events`.
 - Live Anthropic/OpenRouter smokes were not run in this branch because they require live credentials.
 
 Trace export smoke:
