@@ -131,6 +131,14 @@ cargo run -q -p browser-use-tui -- --state-dir /tmp/but-goal-browser-overlay-tui
 
 Checked stored settings, task submission, completed result rendering, F2 browser overlay, `Open browser` recording `browser.open_requested`, `Reconnect` recording `browser.reconnect_requested`, `Change browser` opening the browser picker instead of mutating the backend directly, selecting `Browser Use cloud`, and clean quit with `ctrl+q`. Evidence is in `/tmp/but-goal-browser-overlay-tui`: app setting `browser=Browser Use cloud`, event `browser.open_requested {"target":"about:blank"}`, and event `browser.reconnect_requested {"browser":"Headless Chromium"}`.
 
+Current branch PTY pass after system-browser avoidance:
+
+```bash
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-current-final-pty --agent fake
+```
+
+Checked stored fake-agent settings, task entry, completed result rendering, follow-up execution on the same task, history overlay via `tab`, history `r` resume, browser overlay, and clean quit with `ctrl+q`. Evidence is in session `003d4e98ee60`: it records `session.input`, `browser.page`, `model.config`, `model.delta`, `session.done`, `session.followup`, a second `model.config`, a second `model.delta`, and a second `session.done`. The browser overlay dump reports backend `Headless Chromium`, avoiding both the personal Chrome remote-debug prompt and the quarantined Homebrew Chromium app.
+
 Browser-harness boundary smoke:
 
 ```bash
@@ -325,4 +333,4 @@ Known gaps before calling the whole migration fully complete:
 - User-facing config, auth status/login/import/logout, diagnostics, trace commands, API-key auth, Codex import, and Claude Code OAuth-token import exist.
 - Full fake dataset path verified: `/tmp/but-fake-real-v14-full` has 10 done sessions and 10 `dataset.case` events; `/tmp/but-fake-real-v8-full` has 100 done sessions and 100 `dataset.case` events.
 - Browser Use cloud mode is now owned by the Python island when `LLM_BROWSER_BROWSER_MODE=cloud` and `BROWSER_USE_API_KEY` is set, but it was not live-tested in this branch because no key was available in the environment.
-- Full real-provider dataset regression has not been run. The count-1 Codex smoke on `real_v14_short` now passes.
+- Full real-provider dataset regression is not green yet. The count-1 Codex smoke on `real_v14_short` passes; a bounded count-2 Codex run made forward progress through the Python/browser path, then stopped on a provider-side `cyber_policy` stream error before completing both cases.
