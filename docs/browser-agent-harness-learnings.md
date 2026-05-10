@@ -330,18 +330,21 @@ For this browser harness, that means the TUI should subscribe to session/tool/br
 
 ## Main Design Decisions
 
-### Build in Python
+### Build Rust-First, With One Python Island
 
-Python is the best fit because:
+The final rewrite decision is not "build the product in Python." Python remains the right place for the browser-connected worker because browser-harness, CDP helpers, scraping libraries, PDF/table/image tools, and model-editable helper code all fit naturally there.
 
-- harnesless and BU are Python
-- browser helpers are easy for the model to edit
-- CDP over websockets is straightforward
-- a persistent Python REPL is the main product primitive
-- Textual/Rich can provide a terminal UI
-- eval scripts and extraction helpers are natural in Python
+Rust should own the durable product runtime:
 
-Rust would be better for a polished terminal executable, but worse for agent self-improvement. TypeScript would match opencode/pi, but this repo's browser lineage is Python.
+- TUI and CLI
+- SQLite state
+- event log
+- agent loop
+- provider adapters
+- cancellation/resume
+- sub-agent graph
+
+This keeps the product simple while preserving the browser-harness property that the code touching CDP also understands connection/session/target identity.
 
 ### Keep Tools Few
 
@@ -424,7 +427,7 @@ The TUI should not be the runtime. It should render sessions/events/artifacts an
 - tests/evals
 - future API server
 
-For MVP, use the simplest UI that preserves this event boundary. A Rich live view is acceptable if it subscribes to the same events the future Textual app will use. Do not block the core runtime on the UI choice.
+For this rewrite, use the Rust/Ratatui workbench that subscribes to the same event projection as the CLI. Do not reintroduce a Python Textual app.
 
 ## What a Browser Agent Needs That Coding Agents Usually Do Not
 
@@ -519,10 +522,10 @@ Can start as prompting or editable helpers:
 
 ## Decisions From Current Feedback
 
-1. MVP TUI: use whatever is fastest, but preserve an event boundary. Rich is fine for MVP; Textual can come later.
+1. MVP TUI: Rust/Ratatui, event-projection only. No Python Textual app.
 2. Screenshots: attach only when the model asks through `screenshot(..., attach=True)`, but allow multiple ordered images in one tool result.
 3. Python runtime: use one persistent interpreter per session. This matches model expectations and supports self-improving helpers.
 4. Browser profiles: use a copied harness profile directory per top-level task/run. Do not use the real Chrome folder directly. Shared copied profile is fine.
 5. Child sessions/tabs: allow child sessions to control the same tabs by default for freedom. Use text instructions and minimal internal serialization for coordination.
-6. File tools: copy opencode/Codex basics closely: `read`, `glob`, `grep`, `edit`, `write`, `apply_patch`.
+6. File tools: do not expose coding-agent file tools by default. Add them later only if browser tasks prove they need them.
 7. Eval: use LLM-based self-eval from the beginning, preferably by spawning normal evaluator sessions over trace bundles.

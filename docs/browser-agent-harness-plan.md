@@ -974,7 +974,7 @@ Artifact types:
 
 Build the TUI last enough that the core is real, but early enough that debugging is pleasant.
 
-Use Textual or Rich. Textual is likely better once sessions/background runs matter.
+Current rewrite decision: use Rust/Ratatui. The old Textual/Rich recommendation was for the Python prototype and should not guide this branch.
 
 TUI layout:
 

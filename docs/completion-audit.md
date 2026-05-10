@@ -1,58 +1,48 @@
-# Completion Audit
+# Rust Rewrite Completion Audit
 
-Objective: make all tasks in both bundled datasets pass, make the TUI highly usable, and implement the features described in `docs/browser-agent-harness-plan.md` and `docs/implementation-roadmap.md`.
+This branch is a working Rust-first rewrite foundation, not a claim that every production hardening item is finished.
 
-## Evidence Collected
+## Implemented
 
-- Unit suite: `uv run python -m unittest discover -s tests` passes with 162 tests.
-- Browser smoke: `uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com` passes.
-- Daemon browser smoke: `uv run browser-use-terminal browser smoke --browser daemon --headless --daemon-name smoke-test --url https://example.com` passes.
-- Codex GPT-5.5 provider image smoke: `uv run browser-use-terminal provider image-smoke --provider codex --model gpt-5.5` passes and returns `red then blue`.
-- Fake dataset smoke: `uv run browser-use-terminal datasets run real_v8 --provider fake --count 1 --seed 3` passes.
-- Real `gpt-5.5` dataset runs completed:
-  - `real_v8` task 34, session `940ce19a2ef4`.
-  - `real_v14_short` task 9, session `a4c4517fd58d`.
-  - `real_v8` task 22, session `eedd29928174`.
-  - `real_v14_short` full run `real-v14-gpt55-full`: 10 selected, 10 passed, 0 failed. Task 11 has one old timeout plus a successful latest attempt, and report/exit-code semantics now use latest attempts.
-- Real visual verification:
-  - `real_v14_short` task 9 output image at `.browser-use-terminal/dataset-runs/1d61bfc0b56b/task-9-workspace/home_home_related_loan_interest_rate_table.png` visibly contains the full `HOME & HOME RELATED LOAN INTEREST RATE` table.
-- Self-eval path:
-  - `sessions self-eval a4c4517fd58d --provider codex --model gpt-5.5` completed as child session `80e4ee958f20`.
+- Rust workspace split into protocol, store, core, providers, Python-worker supervisor, CLI, and TUI crates.
+- SQLite is the durable state boundary for sessions, events, artifacts, runs, agent graph, mailbox, and app settings.
+- Old Python product runtime is removed from the package surface; Python is now the browser worker island.
+- Python worker loads local browser harness helpers, preserves per-session namespaces, exposes host helpers such as `artifact_root()` and `session_metadata()`, streams host events, and emits browser state/images/artifacts back to Rust.
+- Rust agent loop dispatches the tiny model-visible tool surface: `python`, `done`, `spawn_agent`, `wait_agent`, `send_message`, `followup_task`, `list_agents`, and `close_agent`.
+- Child agents are separate sessions with canonical `/root/...` paths, configurable sanitized fork modes, durable graph edges, recursive close/cancel, and mailbox messages.
+- Provider adapters exist for fake, OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter.
+- CLI has task runners, session runners, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, and dataset runners.
+- TUI implements the product workbench vocabulary from `docs/terminal-ui-product-ux.md`, including first-run setup, persistent account/model/browser choices, setup-complete, ready, running, result follow-ups, stopped, browser, history, actions, help, and hidden developer views.
+- Core emits run lifecycle rows, `session.status`, `model.config`, `session.deadline_warning`, compaction events, compact model contexts, and artifact-backed spillover for huge Python outputs.
+- Default provider runs allow up to 80 turns; compacted Responses input converts summarized system context to user context and avoids replaying stale historical function-call outputs.
+- Managed headless browser mode is owned by the Python island and prefers Playwright's bundled testing browser, avoiding the user's personal Chrome remote-debugging prompt and quarantined system Chromium apps.
+- Browser Use cloud mode is also owned by the Python island when selected and `BROWSER_USE_API_KEY` is available.
 
-## Implemented Checklist
+## Verified
 
-- Raw CDP first-class browser control.
-- Persistent Python browser tool.
-- Multiple ordered screenshots per tool result.
-- Synthetic visual context fallback for screenshot tool outputs.
-- Browser artifact screenshots plus metadata.
-- Shell, read/write/edit/glob/grep, unified diff patch tool.
-- Recoverable tool errors.
-- Large output spillover.
-- Trace compaction.
-- Background session manager.
-- Cancellation markers and cancellable shell.
-- Cooperative Python cancellation via trace checks and cancellable `sleep`/`time.sleep` helper.
-- Cancellation-aware parallel read-only tool scheduling with serialized mutation tools.
-- Streamed shell output events for long commands.
-- Session resume from trace with screenshot/tool-image rehydration where artifact files still exist.
-- Trace bundle export and trace-aware compaction references for screenshots/artifacts.
-- Browser daemon backend/root/headless identity checks and stale-daemon retry.
-- Browser helpers for cookies, storage, permissions, and download waiting.
-- LLM self-eval as child session.
-- Dataset list/sample/run commands.
-- Isolated dataset workspaces.
-- Absolute state paths immune to tool cwd changes.
-- Owned Chrome profile cleanup on close.
-- Textual TUI with session, event, artifact panes, selected-session details, artifact size/preview, dataset starts, cancellation, trace export, self-eval, resume child sessions, and artifact opening.
+- `cargo fmt --check`
+- `cargo test`
+- `uv run --with pytest python -m pytest -q`
+- `scripts/live-browser-boundary-smoke.sh`
+- `uv run --with pytest --with pillow --with websockets --with cdp-use --with fetch-use python -m pytest tests/unit/test_daemon.py -q` in `/Users/greg/Developer/browser-harness`
+- `uv run browser-use-terminal --help`
+- `uv run but --help`
+- fake CLI task runner
+- fake dataset runner
+- live Codex no-browser smoke with a `done` tool call
+- config/auth/diagnostics/trace CLI smoke tests
+- stored auth CLI smoke for API-key login, Codex token login/import, logout, status, and `config show` secret redaction
+- deterministic TUI dumps for the main product states
+- manual PTY setup, model/browser selection, task submission, result follow-up, history resume, actions/help, clear input, and quit with the hidden fake backend
+- browser-harness navigation, page inspection, screenshot artifact, image event, and browser-state emission through the Rust/Python boundary
+- worker-boundary tests for browser-harness download-style file artifacts and refreshed browser target identity across calls
+- live dedicated-Chrome boundary smoke for download artifact indexing and stale-session recovery preserving the same target id
+- real Codex count-1 dataset smoke on `real_v14_short` passed through the Rust provider loop, Python tool, SQLite store, testing-browser CDP path, FERC search, FERC file download API, PDF/DOCX extraction, and final `session.done`
+- earlier real Codex count-1 dataset attempts exposed two compaction protocol bugs and browser-harness input/timeout issues that are now covered by focused tests
 
-## Not Yet Proven Complete
+## Remaining Gaps
 
-- All 100 `real_v8` tasks have not been executed and reviewed.
-- All 10 `real_v14_short` tasks have been executed and reached latest-attempt pass status, but several high-scrape outputs still deserve deeper semantic review beyond harness `done` status.
-- TUI has not been visually reviewed in a real terminal screenshot loop after every change.
-- Resume is useful for trace continuation, but arbitrary mid-provider/mid-tool resume is not fully solved.
-- Python tool cancellation is cooperative. It interrupts normal Python execution and the provided sleep helper, but it cannot preempt arbitrary blocking C extensions or external libraries.
-- Provider credential refresh/retry is improved but still not a complete provider-state replay system.
-
-Conclusion: the harness is substantially implemented and `real_v14_short` is green on latest attempts. The objective is not fully achieved until the `real_v8` full batch finishes and any remaining task-specific failures are fixed.
+- API-key and Codex credential login/import/logout are implemented, but true Claude Code OAuth/import is still not implemented.
+- Live Anthropic/OpenRouter smokes were not run.
+- Browser Use cloud mode was not live-tested because no `BROWSER_USE_API_KEY` was available in the environment.
+- Full real-provider dataset regression has not been run. The count-1 Codex run on `real_v14_short` now passes.

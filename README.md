@@ -1,146 +1,149 @@
-# browser use terminal
+# browser-use terminal
 
-A browser-specific LLM harness built around raw Chrome DevTools Protocol access, durable sessions, editable helpers, and screenshot timelines.
+Rust-first browser agent workbench.
 
-Current status: vertical MVP is implemented and being hardened against the bundled datasets. The current runtime has:
+The repository is now shaped around one rule:
 
-- append-only session/event logs
-- fake, OpenAI Responses, and Codex Responses provider paths
-- harness-owned Codex auth with import, device-code login, refresh, and read-only Codex CLI fallback
-- browser backends for owned Chromium/Chrome, Browser Use cloud browsers, explicit CDP endpoints, and real Chrome profile attach
-- persistent Python browser tool with raw `cdp(...)`, console/network/download helpers, network-idle waits, dialog tracking, and browser trace export
-- model-visible screenshot tool outputs with ordered image timelines
-- shell streaming, long-running shell processes, optional PTY processes, cancellation, and Codex-style file tools
-- event-driven Textual terminal UI with session detail, artifact table, artifact preview, trace, eval, resume, cancel, auth, and config commands
-- background sessions, cancellation, trace replay, resume, and self-eval commands
-- dataset sampling/running for `real_v8` and `real_v14_short`
-- JSON config defaults for provider, model, browser backend, profile, cloud, and viewport settings
+```text
+Rust owns durable product state.
+Python owns volatile browser state.
+Events are the contract.
+```
 
-- `docs/browser-agent-harness-plan.md`
-- `docs/browser-agent-harness-learnings.md`
-- `docs/implementation-roadmap.md`
+## What Runs Where
 
-## Local Commands
+Rust owns:
+
+- terminal UI and CLI
+- SQLite state and migrations
+- append-only event log
+- agent loop, cancellation, resume, and sub-agent graph
+- provider adapters
+- dataset runner
+
+Python owns:
+
+- the browser-connected execution namespace
+- browser-harness helper loading
+- CDP/session/target identity through browser harness
+- scraping, image, PDF, table, and browser helper libraries
+
+The old Python product runtime has been removed from the package surface. The only Python package left is `llm_browser_worker`, which is launched by Rust for browser/tool execution.
+
+## Repository Shape
+
+```text
+crates/
+  browser-use-protocol/       shared event/tool/model types and projections
+  browser-use-store/          SQLite store, migrations, artifacts, agent graph
+  browser-use-core/           provider-driven agent loop and tool dispatch
+  browser-use-providers/      fake, OpenAI, Codex, Anthropic, OpenRouter
+  browser-use-python-worker/  Rust supervisor for the Python worker process
+  browser-use-cli/            CLI, datasets, diagnostics
+  browser-use-tui/            Ratatui product workbench
+
+python/
+  llm_browser_worker/         persistent browser Python worker island
+```
+
+Runtime state lives under:
+
+```text
+.browser-use-terminal/
+  state.db
+  artifacts/
+```
+
+## Common Commands
 
 ```bash
-uv run browser-use-terminal doctor
-uv run browser-use-terminal auth status
-uv run browser-use-terminal auth codex import
-uv run browser-use-terminal config show
+cargo test
+uv run --with pytest python -m pytest -q
+
+uv run but --help
+uv run browser-use-terminal --help
+
+uv run but --seed-demo done
+uv run browser-use-terminal run-fake "Open example.com and report the title"
+uv run browser-use-terminal run-openai "Open example.com and report the title"
+uv run browser-use-terminal run-codex "Open example.com and report the title"
+uv run browser-use-terminal run-anthropic "Open example.com and report the title"
+uv run browser-use-terminal run-openrouter "Open example.com and report the title"
+
 uv run browser-use-terminal config init
-uv run browser-use-terminal run --provider fake "Open example.com"
-uv run browser-use-terminal run --provider codex --model gpt-5.5 "Call the done tool with result ok."
-uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
-uv run browser-use-terminal browser smoke --browser daemon --headless --daemon-name smoke-test --url https://example.com
-uv run browser-use-terminal tui --browser chromium
-uv run but
-uv run but --provider fake
-uv run browser-use-terminal sessions list
-uv run browser-use-terminal datasets sample real_v8 --count 1 --seed 21
-uv run browser-use-terminal datasets run real_v8 --provider codex --model gpt-5.5 --count 1 --seed 21
-uv run browser-use-terminal sessions self-eval <session-id> --provider codex --model gpt-5.5
+uv run browser-use-terminal config show
+uv run browser-use-terminal auth status
+uv run browser-use-terminal auth login openai --api-key "$OPENAI_API_KEY"
+uv run browser-use-terminal auth import-codex --from ~/.codex/auth.json
+uv run browser-use-terminal auth logout openai
+uv run browser-use-terminal diagnostics
+uv run browser-use-terminal trace <task-id> /tmp/browser-use-trace
+scripts/live-browser-boundary-smoke.sh
 ```
 
-By default runtime state is stored under `.browser-use-terminal/`. Config is loaded from `~/.browser-use-terminal/config.json` and then `./.browser-use-terminal/config.json`; local config overrides global config, and explicit CLI flags override both.
+Provider auth:
 
-For headless browser tool runs:
+- OpenAI Responses uses stored `auth login openai`, `LLM_BROWSER_OPENAI_API_KEY`, or `OPENAI_API_KEY`.
+- Codex Responses uses stored `auth login codex` / `auth import-codex`, `LLM_BROWSER_CODEX_ACCESS_TOKEN` + `LLM_BROWSER_CODEX_ACCOUNT_ID`, or `~/.codex/auth.json`.
+- Anthropic Messages uses stored `auth login anthropic`, `LLM_BROWSER_ANTHROPIC_API_KEY`, or `ANTHROPIC_API_KEY`.
+- OpenRouter/OpenAI-compatible chat uses stored `auth login openrouter`, `LLM_BROWSER_OPENAI_COMPAT_API_KEY`, or `OPENROUTER_API_KEY`.
+
+`auth status` reports the currently usable auth paths. `config show` redacts stored API keys and access tokens.
+
+## Product UI
+
+The TUI follows `docs/terminal-ui-product-ux.md`.
+
+Normal users should see:
+
+```text
+task
+browser
+account
+model
+result
+history
+setup
+```
+
+Developer details such as raw events, tools, provider internals, and artifacts stay behind the hidden developer/debug surface.
+
+Deterministic TUI dump examples:
 
 ```bash
-uv run browser-use-terminal run --browser chromium --headless --provider codex --model gpt-5.5 \
-  "Use python headless true. Open https://example.com, screenshot('loaded', attach=True), then call done with the title."
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-ui --dump-screen
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-ui --seed-demo running --select-latest --dump-screen
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-ui --seed-demo done --select-latest --overlay browser --dump-screen
 ```
 
-## Browser Backends
+## Browser Boundary
 
-The browser primitive is still raw CDP. The backend only decides where the CDP websocket comes from.
+The Python worker tries to load local browser-harness helpers from:
 
-Owned Chromium/Chrome launches an isolated non-default profile, so it works with current Chrome remote-debugging restrictions:
+```text
+/Users/greg/Developer/browser-harness/src
+```
+
+or from `BROWSER_HARNESS_SRC`.
+
+When browser harness is available, browser actions run through that Python daemon shape. Rust records browser-visible facts as events, but Rust does not own CDP target ids, session ids, runtime object ids, or reconnect recovery.
+
+The current smoke path verifies browser-harness navigation, page inspection, screenshot capture, image artifact indexing, and `browser.state` emission through the Rust CLI/Python worker boundary.
+
+For a live browser boundary regression with an isolated headless Chrome:
 
 ```bash
-uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
-uv run browser-use-terminal tui --browser chromium --headless --provider codex --model gpt-5.5
+scripts/live-browser-boundary-smoke.sh
 ```
 
-Real Chrome attaches to your already-running profile. In Chrome, open `chrome://inspect/#remote-debugging`, enable remote debugging for this browser instance, and click Allow if Chrome asks:
+That smoke covers browser download artifact indexing and stale-session recovery preserving the same browser target id.
 
-```bash
-uv run browser-use-terminal tui --browser real --provider codex --model gpt-5.5
-uv run browser-use-terminal browser smoke --browser real --url https://example.com
-```
+## Migration Docs
 
-Explicit CDP is the raw escape hatch. This also keeps compatibility with browser harness env vars `BU_CDP_URL` and `BU_CDP_WS`:
-
-```bash
-/Applications/Google\ Chrome.app/Contents/MacOS/Google\ Chrome \
-  --remote-debugging-port=9222 \
-  --user-data-dir=/tmp/browser-use-terminal-profile
-
-uv run browser-use-terminal tui --browser cdp --cdp-url http://127.0.0.1:9222
-uv run browser-use-terminal tui --browser cdp --cdp-ws ws://127.0.0.1:9222/devtools/browser/<id>
-```
-
-Browser Use cloud provisions a browser, attaches to its CDP websocket, records the live URL in runtime output, and stops the cloud browser on close:
-
-```bash
-uv run but
-# inside the TUI: /auth browser-use <api-key>
-# or: /settings -> Browser Use API key
-
-uv run but --browser remote --cloud-profile-id <uuid> --provider codex --model gpt-5.5
-uv run browser-use-terminal browser smoke --browser cloud --cloud-timeout 60 --cloud-proxy-country us
-```
-
-Useful shared options: `--browser-width`, `--browser-height`, `--chrome-path`, `--profile-template`, `--keep-profile`, `--cloud-profile-name`, `--cloud-recording`, and `--cloud-custom-proxy-json`.
-
-Settings saved from the TUI are persisted in `~/.browser-use-terminal/config.json`. Secrets such as `browser.cloud_api_key` and `openai.api_key` are redacted by `config show` and `/config`.
-
-Daemon mode runs a local browser owner process behind the same runtime facade. Use it when you want harnesless-style CDP ownership while keeping this harness's sessions, screenshots, and artifacts:
-
-```bash
-uv run browser-use-terminal tui --browser daemon --headless --daemon-name default --provider codex --model gpt-5.5
-uv run browser-use-terminal browser daemon status --name default
-uv run browser-use-terminal browser daemon stop --name default
-```
-
-Daemon mode defaults to an owned Chromium backend. Pass `--daemon-backend cdp`, `real`, or `cloud` to make the daemon attach to that backend instead.
-
-## Browser Python Helpers
-
-The main browser tool is still an editable Python runtime. Useful built-ins include:
-
-```python
-cdp("Runtime.evaluate", {"expression": "document.title", "returnByValue": True})
-fill_input("#email", "me@example.com")
-wait_for_network_idle()
-screenshot("after_click", attach=True)
-recent_console()
-recent_network_failures()
-download_info()
-save_browser_trace("checkout")
-Path(agent_helpers_path()).write_text("from browser_helpers import *\n\ndef page_title():\n    return js('document.title')\n")
-reload_agent_helpers()
-```
-
-Downloads land under each session's `browser/downloads/`, screenshots under `browser/screenshots/`, browser traces under `browser/traces/`, and oversized tool output under `tool-output/`.
-
-For interactive terminal programs, use the `shell_start` tool with `pty=true`, then `shell_poll`, `shell_stdin`, and `shell_stop`.
-
-## Recent Verification
-
-```bash
-uv run python -m unittest discover -s tests
-uv run browser-use-terminal browser smoke --browser chromium --headless --url https://example.com
-uv run browser-use-terminal browser smoke --browser daemon --headless --daemon-name smoke-test --url https://example.com
-uv run browser-use-terminal datasets run real_v8 --provider fake --count 1 --seed 3
-```
-
-Real `gpt-5.5` dataset runs completed:
-
-- `real_v8` task 34, session `940ce19a2ef4`: Shopify app contact extraction with screenshot artifact.
-- `real_v14_short` task 9, session `a4c4517fd58d`: SBI home loan rate table screenshot, verified image output in isolated workspace.
-- `real_v8` task 22, session `eedd29928174`: DNA/Telia package extraction after workspace isolation fixes.
-- `real_v14_short` full run `real-v14-gpt55-full`: 10 selected, 10 passed. Task 11 required a second latest attempt after the FCC origin stalled; the successful attempt used the `fccid.io` mirror and returned all seven grantee-code counts.
-
-Current long run:
-
-- `real_v8` full run `real-v8-gpt55-full` is in progress with `gpt-5.5`, `--all`, `--resume`, and per-task timeout.
+- `docs/rust-migration-one-page-summary.md`
+- `docs/rust-core-migration-plan.md`
+- `docs/terminal-ui-product-ux.md`
+- `docs/browser-agent-harness-learnings.md`
+- `docs/browser-agent-harness-plan.md`
+- `docs/rewrite-verification.md`
+- `docs/completion-audit.md`
