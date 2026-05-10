@@ -36,6 +36,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - stored Claude Code OAuth-token smoke for login, status, provider credential routing, and `config show` secret redaction
 - deterministic TUI dumps for the main product states
 - manual PTY setup, model/browser selection, task submission, result follow-up, history resume, actions/help, clear input, and quit with the hidden fake backend
+- final manual 80x24 PTY smoke with stored settings, task submission, result rendering, history overlay, browser overlay, and clean quit; evidence is in `/tmp/but-goal-final-tui`, session `5f401d3d9a4f`
 - browser-harness navigation, page inspection, screenshot artifact, image event, and browser-state emission through the Rust/Python boundary
 - worker-boundary tests for browser-harness download-style file artifacts and refreshed browser target identity across calls
 - live dedicated-Chrome boundary smoke for download artifact indexing and stale-session recovery preserving the same target id

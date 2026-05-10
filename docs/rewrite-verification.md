@@ -103,6 +103,14 @@ cargo run -q -p browser-use-tui -- --state-dir /tmp/but-tui-pty-run
 
 Checked an actual 80x24 terminal workbench with stored settings, typed a task into the composer, ran the hidden fake backend, rendered the running state, rendered the done/result state, and exited with `ctrl+q`. Evidence is in session `909304bf92f9`, status `done`, with `session.input`, `model.config`, `model.delta`, and `session.done`.
 
+Final goal PTY pass:
+
+```bash
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-goal-final-tui
+```
+
+Checked stored setup settings, 80x24 workbench rendering, task entry, running state, completed result state, history overlay via `tab`, browser overlay via F2 escape sequence, `esc` back to the result, and clean quit with `ctrl+q`. Evidence is in session `5f401d3d9a4f`, status `done`, with `session.input`, `browser.page`, `model.config`, `model.delta`, and `session.done`.
+
 Browser-harness boundary smoke:
 
 ```bash
