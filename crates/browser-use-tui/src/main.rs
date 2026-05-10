@@ -540,15 +540,11 @@ impl App {
             self.move_input_cursor(1);
             return true;
         }
-        if key_pressed(key, KeyCode::Up, KeyModifiers::NONE)
-            || key_pressed(key, KeyCode::Char('p'), KeyModifiers::CONTROL)
-        {
+        if key_pressed(key, KeyCode::Char('p'), KeyModifiers::CONTROL) {
             self.move_input_line_up();
             return true;
         }
-        if key_pressed(key, KeyCode::Down, KeyModifiers::NONE)
-            || key_pressed(key, KeyCode::Char('n'), KeyModifiers::CONTROL)
-        {
+        if key_pressed(key, KeyCode::Char('n'), KeyModifiers::CONTROL) {
             self.move_input_line_down();
             return true;
         }
@@ -1474,6 +1470,16 @@ mod tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE))?);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))?);
         assert_eq!(app.input, "a\nb\nc");
+
+        app.input_cursor = "a\n".chars().count();
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert_eq!(app.input_cursor, "a\n".chars().count());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        assert_eq!(app.input_cursor, "a\n".chars().count());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('n'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.input_cursor, "a\nb\n".chars().count());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('p'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.input_cursor, "a\n".chars().count());
 
         let long_input = (0..20)
             .map(|idx| format!("line {idx}"))
