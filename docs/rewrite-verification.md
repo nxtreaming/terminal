@@ -15,6 +15,8 @@ uv run browser-use-terminal --state-dir /tmp/but-fake-real-v8-full dataset-run-f
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-live-smoke run-codex --model gpt-5.5 \
   "Do not use the browser. Call the done tool with result exactly 'ok'."
 uv run browser-use-terminal --state-dir /tmp/but-rust-codex-dataset-smoke-cft dataset-run-codex real_v14_short --count 1 --model gpt-5.5
+uv run browser-use-terminal --state-dir /tmp/but-rust-codex-real-v14-count2-bounded \
+  dataset-run-codex real_v14_short --count 2 --model gpt-5.5 --max-turns 120 --python-timeout-seconds 60
 uv run browser-use-terminal --state-dir /tmp/but-rust-cli-config config init
 uv run browser-use-terminal --state-dir /tmp/but-rust-cli-config config show
 uv run browser-use-terminal auth status
@@ -143,6 +145,14 @@ Latest live Codex smoke:
 - session `dcc8d353b2e9`
 - model emitted a `done` tool call
 - final `session.done` payload was `{"result":"ok"}`
+
+Latest bounded real Codex dataset attempt:
+
+- state dir `/tmp/but-rust-codex-real-v14-count2-bounded`
+- case `2` pre-created session `8b0c0fa17f59` and recorded `dataset.case` before provider execution
+- Python calls were bounded with `--python-timeout-seconds 60`; tool failures were recorded and the agent continued through 114 Python calls
+- the attempt stopped on a Codex provider stream error: `cyber_policy`
+- the stale-running state exposed by that provider error is now covered by `provider_stream_errors_mark_session_failed_and_finish_run`
 
 Provider coverage:
 

@@ -16,6 +16,8 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - TUI implements the product workbench vocabulary from `docs/terminal-ui-product-ux.md`, including first-run setup, persistent account/model/browser choices, setup-complete, ready, running, result follow-ups, stopped, browser, history, actions, help, and hidden developer views.
 - Core emits run lifecycle rows, `session.status`, `model.config`, `session.deadline_warning`, compaction events, compact model contexts, and artifact-backed spillover for huge Python outputs.
 - Core checks for external cancellation between provider/tool turns, avoids finalizing cancelled sessions as done, and records cancelled run rows.
+- Core records provider stream failures as `session.failed` and closes run rows instead of leaving stale `running` sessions.
+- Python tool calls have a configurable timeout; timed-out snippets produce `tool.failed` and the worker namespace remains usable for later calls.
 - Default provider runs allow up to 80 turns; compacted Responses input converts summarized system context to user context and avoids replaying stale historical function-call outputs.
 - Managed headless browser mode is owned by the Python island and prefers Playwright's bundled testing browser, avoiding the user's personal Chrome remote-debugging prompt and quarantined system Chromium apps.
 - Browser Use cloud mode is also owned by the Python island when selected and `BROWSER_USE_API_KEY` is available.
@@ -43,10 +45,11 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - worker-boundary tests for browser-harness download-style file artifacts and refreshed browser target identity across calls
 - live testing-browser boundary smoke for download artifact indexing and stale-session recovery preserving the same target id
 - real Codex count-1 dataset smoke on `real_v14_short` passed through the Rust provider loop, Python tool, SQLite store, testing-browser CDP path, FERC search, FERC file download API, PDF/DOCX extraction, and final `session.done`
+- bounded real Codex count-2 dataset attempt pre-created durable dataset sessions and exercised timeout/error continuation, then stopped on a Codex `cyber_policy` stream error before the first case finished
 - earlier real Codex count-1 dataset attempts exposed two compaction protocol bugs and browser-harness input/timeout issues that are now covered by focused tests
 
 ## Remaining Gaps
 
 - Live Anthropic/OpenRouter smokes were not run.
 - Browser Use cloud mode was not live-tested because no `BROWSER_USE_API_KEY` was available in the environment.
-- Full real-provider dataset regression has not been run. The count-1 Codex run on `real_v14_short` now passes.
+- Full real-provider dataset regression is not green yet. The count-1 Codex run on `real_v14_short` passes; the count-2 Codex attempt is blocked by a provider-side `cyber_policy` stream error rather than a local Rust/Python deadlock.

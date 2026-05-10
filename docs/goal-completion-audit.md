@@ -29,6 +29,8 @@ Objective audited:
 | Browser overlay actions do what they say. | Fixed and tested: `Open browser` records `browser.open_requested`, `Reconnect` records `browser.reconnect_requested`, `Change browser` opens browser picker without accidental backend mutation. | Done |
 | Terminal UI was manually tested. | `/tmp/but-goal-final-tui` and `/tmp/but-goal-browser-overlay-tui` PTY runs inspected; SQLite evidence recorded in `docs/rewrite-verification.md`. | Done |
 | Rust package choices are current/reasonable. | Current checks found `ratatui 0.30.0`, `rusqlite 0.39.0`, `reqwest 0.12.x`, `sqlx 0.8.6`, `async-openai v0.37.0`, and `eventsource-client` as available options. The implementation uses Ratatui, rusqlite, and thin reqwest adapters where SDK coverage is not worth extra complexity. | Done |
+| Provider failures leave durable failed state. | Core records `session.failed` and closes the run row when a provider stream errors; regression test `provider_stream_errors_mark_session_failed_and_finish_run` covers the path exposed by a live Codex `cyber_policy` stream error. | Done |
+| Python tool execution is bounded. | Core passes a Python timeout to the worker; worker uses an alarm around snippet execution and preserves the session namespace after timeout; tests cover timeout recovery and model continuation. | Done |
 
 ## Verification Commands
 
@@ -41,6 +43,8 @@ uv run --with pytest python -m pytest -q
 cargo test -p browser-use-core -p browser-use-tui
 uv run browser-use-terminal --state-dir /tmp/but-fake-real-v14-full dataset-run-fake real_v14_short --count 10
 uv run browser-use-terminal --state-dir /tmp/but-fake-real-v8-full dataset-run-fake real_v8 --count 100
+uv run browser-use-terminal --state-dir /tmp/but-rust-codex-real-v14-count2-bounded \
+  dataset-run-codex real_v14_short --count 2 --model gpt-5.5 --max-turns 120 --python-timeout-seconds 60
 ```
 
 Previously recorded live/browser verification:
@@ -58,7 +62,7 @@ These are not implementation gaps in the local rewrite, but they prevent a stric
 
 - Live Anthropic and OpenRouter smokes were not run because live credentials were not available.
 - Browser Use cloud mode was not live-tested because `BROWSER_USE_API_KEY` was not available.
-- Full real-provider dataset regression has not been run; only the count-1 Codex `real_v14_short` smoke passed.
+- Full real-provider dataset regression is not green yet. The count-1 Codex `real_v14_short` smoke passed; a count-2 Codex attempt with bounded Python tools recorded forward progress and durable `dataset.case` metadata, then stopped on a Codex `cyber_policy` stream error before case 1 completed.
 
 ## Package Research Notes
 
