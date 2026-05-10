@@ -15,6 +15,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - Claude Code account selection can run Anthropic Messages through a stored or environment OAuth bearer token from `claude setup-token`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN`.
 - CLI has task runners, session runners, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, dataset list/sample/report, and resumable dataset runners with isolated per-case workspaces.
 - TUI implements the product workbench vocabulary from `docs/terminal-ui-product-ux.md`, including first-run setup, persistent account/model/browser choices, setup-complete, ready, running, result follow-ups, stopped, browser, history, actions, help, and hidden developer views.
+- Failed tasks expose a working Enter-to-retry path, and successful retries clear old failure projections from the normal workbench.
 - Core emits run lifecycle rows, `session.status`, `model.config`, `session.deadline_warning`, compaction events, compact model contexts, and artifact-backed spillover for huge Python outputs.
 - Core checks for external cancellation between provider/tool turns, avoids finalizing cancelled sessions as done, and records cancelled run rows.
 - Core records provider stream failures as `session.failed` and closes run rows instead of leaving stale `running` sessions.
@@ -42,6 +43,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - stored auth CLI smoke for API-key login, Codex token login/import, logout, status, and `config show` secret redaction
 - stored Claude Code OAuth-token smoke for login, status, provider credential routing, and `config show` secret redaction
 - deterministic TUI dumps for the main product states
+- focused TUI regression for retrying a failed task from the failure screen
 - manual PTY setup, model/browser selection, task submission, result follow-up, history resume, actions/help, clear input, and quit with the hidden fake backend
 - final manual 80x24 PTY smoke with stored settings, task submission, result rendering, history overlay, browser overlay, and clean quit; evidence is in `/tmp/but-goal-final-tui`, session `5f401d3d9a4f`
 - final browser-overlay PTY smoke with `Open browser`, `Reconnect`, `Change browser`, browser-picker selection, and clean quit; evidence is in `/tmp/but-goal-browser-overlay-tui`

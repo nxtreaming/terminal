@@ -332,6 +332,15 @@ impl App {
         let text = self.input.trim().to_string();
         self.input.clear();
         if text.is_empty() {
+            if let Some(session) = self
+                .selected_session_id
+                .as_deref()
+                .and_then(|id| self.store.load_session(id).ok().flatten())
+            {
+                if session.status == SessionStatus::Failed {
+                    self.start_agent_for_session(session.id)?;
+                }
+            }
             return Ok(());
         }
         if text == "/" {
@@ -2054,6 +2063,55 @@ mod tests {
             std::thread::sleep(Duration::from_millis(20));
         }
         anyhow::bail!("follow-up fake agent did not finish");
+    }
+
+    #[test]
+    fn enter_retries_failed_task_and_clears_old_failure_projection() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let args = Args {
+            state_dir: temp.path().to_path_buf(),
+            model: "GPT-5.5".to_string(),
+            account: "Codex login".to_string(),
+            browser: "Local Chrome".to_string(),
+            dump_screen: true,
+            width: 120,
+            height: 34,
+            select_latest: false,
+            seed_demo: None,
+            overlay: None,
+            agent: AgentBackend::Fake,
+        };
+        let mut app = App::new(args)?;
+        app.setup_complete = true;
+        app.store.set_setting("setup.complete", "1")?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "retry this task"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.failed",
+            serde_json::json!({"error": "temporary failure"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Retry"));
+        assert!(screen.contains("temporary failure"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        for _ in 0..50 {
+            let session = app.store.load_session(&session.id)?.context("session")?;
+            if session.status == SessionStatus::Done {
+                let screen = render_dump(&mut app)?;
+                assert!(screen.contains("Fake result from the Rust TUI agent loop."));
+                assert!(!screen.contains("temporary failure"));
+                return Ok(());
+            }
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        anyhow::bail!("retry fake agent did not finish");
     }
 
     #[test]

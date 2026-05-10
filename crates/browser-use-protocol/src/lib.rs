@@ -404,12 +404,29 @@ pub fn project_workbench(
         .collect::<Vec<_>>();
     history.sort_by(|a, b| b.updated_ms.cmp(&a.updated_ms));
 
+    let result = if current_session
+        .as_ref()
+        .is_some_and(|session| session.status == SessionStatus::Done)
+    {
+        result_from_events(events_for_current)
+    } else {
+        None
+    };
+    let failure = if current_session
+        .as_ref()
+        .is_some_and(|session| session.status == SessionStatus::Failed)
+    {
+        failure_from_events(events_for_current)
+    } else {
+        None
+    };
+
     WorkbenchState {
         setup_complete: false,
         current_session,
         task: task_from_events(events_for_current),
-        result: result_from_events(events_for_current),
-        failure: failure_from_events(events_for_current),
+        result,
+        failure,
         activity: activity_from_events(events_for_current),
         browser: browser_summary_from_events(events_for_current, browser_backend),
         history,
@@ -545,6 +562,54 @@ mod tests {
         assert_eq!(context["task"], "Book a hotel");
         assert_eq!(context["browser"]["url"], "https://example.com");
         assert!(!context.to_string().contains("SECRET"));
+    }
+
+    #[test]
+    fn workbench_uses_latest_projected_status_for_result_or_failure() {
+        let session = SessionMeta {
+            id: "s1".to_string(),
+            parent_id: None,
+            cwd: "/tmp".to_string(),
+            artifact_root: "/tmp/artifacts/s1".to_string(),
+            status: SessionStatus::Done,
+            created_ms: 1,
+            updated_ms: 4,
+        };
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: json!({"text": "retry task"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 2,
+                event_type: "session.failed".to_string(),
+                payload: json!({"error": "first failure"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "e3".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 3,
+                event_type: "session.done".to_string(),
+                payload: json!({"result": "retry succeeded"}),
+            },
+        ];
+        let state = project_workbench(
+            &[session],
+            &events,
+            &[("s1".to_string(), events.clone())],
+            Some("s1"),
+            "local chrome",
+        );
+        assert_eq!(state.result.as_deref(), Some("retry succeeded"));
+        assert!(state.failure.is_none());
     }
 
     #[test]
