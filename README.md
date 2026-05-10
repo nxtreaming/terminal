@@ -60,26 +60,34 @@ Runtime state lives under:
 cargo test
 uv run --with pytest python -m pytest -q
 
-uv run but --help
-uv run browser-use-terminal --help
+cargo run -p browser-use-tui -- --help
+cargo run -p browser-use-cli -- --help
 
-uv run but --seed-demo done
-uv run browser-use-terminal run-fake "Open example.com and report the title"
-uv run browser-use-terminal run-openai "Open example.com and report the title"
-uv run browser-use-terminal run-codex "Open example.com and report the title"
-uv run browser-use-terminal run-anthropic "Open example.com and report the title"
-uv run browser-use-terminal run-openrouter "Open example.com and report the title"
+cargo run -p browser-use-tui -- --seed-demo done
+cargo run -p browser-use-cli -- run-fake "Open example.com and report the title"
+cargo run -p browser-use-cli -- run-openai "Open example.com and report the title"
+cargo run -p browser-use-cli -- run-codex "Open example.com and report the title"
+cargo run -p browser-use-cli -- run-anthropic "Open example.com and report the title"
+cargo run -p browser-use-cli -- run-openrouter "Open example.com and report the title"
 
-uv run browser-use-terminal config init
-uv run browser-use-terminal config show
-uv run browser-use-terminal auth status
-uv run browser-use-terminal auth login openai --api-key "$OPENAI_API_KEY"
-uv run browser-use-terminal auth import-codex --from ~/.codex/auth.json
-uv run browser-use-terminal auth login claude-code --access-token "$CLAUDE_CODE_OAUTH_TOKEN"
-uv run browser-use-terminal auth logout openai
-uv run browser-use-terminal diagnostics
-uv run browser-use-terminal trace <task-id> /tmp/browser-use-trace
+cargo run -p browser-use-cli -- config init
+cargo run -p browser-use-cli -- config show
+cargo run -p browser-use-cli -- auth status
+cargo run -p browser-use-cli -- auth login openai --api-key "$OPENAI_API_KEY"
+cargo run -p browser-use-cli -- auth import-codex --from ~/.codex/auth.json
+cargo run -p browser-use-cli -- auth login claude-code --access-token "$CLAUDE_CODE_OAUTH_TOKEN"
+cargo run -p browser-use-cli -- auth logout openai
+cargo run -p browser-use-cli -- diagnostics
+cargo run -p browser-use-cli -- trace <task-id> /tmp/browser-use-trace
 scripts/live-browser-boundary-smoke.sh
+```
+
+For the clean binary names locally:
+
+```bash
+cargo build
+./target/debug/but
+./target/debug/browser-use-terminal auth status
 ```
 
 Provider auth:

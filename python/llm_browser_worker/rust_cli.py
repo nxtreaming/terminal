@@ -7,19 +7,19 @@ from pathlib import Path
 
 
 def main() -> None:
-    _exec_rust_binary("browser-use-cli", sys.argv[1:])
+    _exec_rust_binary("browser-use-cli", "browser-use-terminal", sys.argv[1:])
 
 
 def tui_main() -> None:
-    _exec_rust_binary("browser-use-tui", sys.argv[1:])
+    _exec_rust_binary("browser-use-tui", "but", sys.argv[1:])
 
 
-def _exec_rust_binary(package: str, args: list[str]) -> None:
+def _exec_rust_binary(package: str, binary: str, args: list[str]) -> None:
     repo_root = Path(__file__).resolve().parents[2]
     if (repo_root / "Cargo.toml").exists():
         os.chdir(repo_root)
         raise SystemExit(subprocess.call(["cargo", "run", "-q", "-p", package, "--", *args]))
-    binary = repo_root / "target" / "debug" / package
-    if binary.exists():
-        os.execv(str(binary), [str(binary), *args])
+    binary_path = repo_root / "target" / "debug" / binary
+    if binary_path.exists():
+        os.execv(str(binary_path), [str(binary_path), *args])
     raise SystemExit(f"could not find Rust binary for {package}")

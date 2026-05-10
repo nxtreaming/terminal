@@ -4,6 +4,10 @@ edition.workspace = true
 license.workspace = true
 version.workspace = true
 
+[[bin]]
+name = "but"
+path = "src/main.rs"
+
 [dependencies]
 anyhow.workspace = true
 browser-use-core = { path = "../browser-use-core" }
