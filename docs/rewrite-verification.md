@@ -347,7 +347,7 @@ Earlier failed runs were still useful:
 - A later run exposed and fixed compaction retaining old function-call outputs without live matching calls.
 - The browser path exposed and fixed Chrome prompt avoidance, printable input event synthesis, and millisecond-style timeout normalization.
 
-Known gaps before calling the whole migration fully complete:
+Additional live-validation gaps:
 
 - User-facing config, auth status/login/import/logout, diagnostics, trace commands, API-key auth, Codex import, and Claude Code OAuth-token import exist.
 - Full fake dataset path verified: `/tmp/but-fake-real-v14-full` has 10 done sessions and 10 `dataset.case` events; `/tmp/but-fake-real-v8-full` has 100 done sessions and 100 `dataset.case` events.
