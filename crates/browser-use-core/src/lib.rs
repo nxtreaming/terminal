@@ -4,7 +4,7 @@ use anyhow::{bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{
     failure_from_events, result_from_events, sanitized_agent_context_from_events, ModelEvent,
-    SessionMeta, ToolCall, ToolSpec,
+    SessionMeta, SessionStatus, ToolCall, ToolSpec,
 };
 use browser_use_providers::{ModelProvider, ProviderTurn, ScriptedProvider};
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
@@ -145,6 +145,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
 
         let mut deadline_warning_emitted = false;
         for turn_idx in 0..options.max_turns {
+            ensure_not_cancelled(store, &session.id)?;
             maybe_emit_deadline_warning(
                 store,
                 &session.id,
@@ -186,6 +187,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     ModelEvent::Done => {}
                 }
             }
+            ensure_not_cancelled(store, &session.id)?;
 
             if !assistant_text.is_empty() || !tool_calls.is_empty() {
                 messages.push(serde_json::json!({
@@ -203,12 +205,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         "session.done",
                         serde_json::json!({ "result": assistant_text.trim_end() }),
                     )?;
-                    return Ok(session.id);
+                    return Ok(session.id.clone());
                 }
                 continue;
             }
 
             for call in tool_calls {
+                ensure_not_cancelled(store, &session.id)?;
                 let outcome = dispatch_tool_call(store, &session, &mut worker, &call)?;
                 messages.extend(outcome.messages);
                 maybe_compact_messages(
@@ -218,7 +221,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     options.max_context_chars,
                 )?;
                 if outcome.finished {
-                    return Ok(session.id);
+                    return Ok(session.id.clone());
                 }
             }
         }
@@ -230,8 +233,28 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         )?;
         bail!("agent exceeded maximum provider turns");
     })();
-    store.finish_run(&run_id, if result.is_ok() { "done" } else { "failed" })?;
+    let run_status = if is_cancelled(store, &session.id)? {
+        "cancelled"
+    } else if result.is_ok() {
+        "done"
+    } else {
+        "failed"
+    };
+    store.finish_run(&run_id, run_status)?;
     result
+}
+
+fn ensure_not_cancelled(store: &Store, session_id: &str) -> Result<()> {
+    if is_cancelled(store, session_id)? {
+        bail!("agent cancelled");
+    }
+    Ok(())
+}
+
+fn is_cancelled(store: &Store, session_id: &str) -> Result<bool> {
+    Ok(store
+        .load_session(session_id)?
+        .is_some_and(|session| session.status == SessionStatus::Cancelled))
 }
 
 fn maybe_emit_deadline_warning(
@@ -1629,6 +1652,69 @@ mod tests {
         assert_eq!(runs[0].status, "done");
         assert!(runs[0].ended_ms.is_some());
         Ok(())
+    }
+
+    #[test]
+    fn provider_loop_respects_external_cancel_before_finalizing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "cancel me"}),
+        )?;
+        let provider = CancellingProvider {
+            state_dir: temp.path().to_path_buf(),
+            session_id: session.id.clone(),
+        };
+
+        let result = run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        );
+
+        assert!(result.is_err());
+        let session = store.load_session(&session.id)?.context("session")?;
+        assert_eq!(session.status, SessionStatus::Cancelled);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.cancelled"));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.done"));
+        let runs = store.runs_for_session(&session.id)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "cancelled");
+        Ok(())
+    }
+
+    struct CancellingProvider {
+        state_dir: std::path::PathBuf,
+        session_id: String,
+    }
+
+    impl ModelProvider for CancellingProvider {
+        fn provider_name(&self) -> &'static str {
+            "cancelling"
+        }
+
+        fn model_name(&self) -> &str {
+            "cancelling"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            Store::open(&self.state_dir)?.request_cancel(&self.session_id, "test cancel")?;
+            Ok(vec![
+                ModelEvent::TextDelta {
+                    text: "this should not become the final answer".to_string(),
+                },
+                ModelEvent::Done,
+            ])
+        }
     }
 
     #[test]

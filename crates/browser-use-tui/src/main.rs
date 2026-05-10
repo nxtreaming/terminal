@@ -95,6 +95,7 @@ enum Overlay {
     Account,
     Model,
     Browser,
+    BrowserChoice,
     SetupComplete,
     History,
     Actions,
@@ -142,6 +143,7 @@ struct App {
     model_configured: bool,
     provider_model: String,
     browser: String,
+    browser_notice: Option<String>,
     agent_backend: AgentBackend,
     quit_hint_until: Option<Instant>,
 }
@@ -282,6 +284,7 @@ impl App {
             model_configured,
             provider_model,
             browser,
+            browser_notice: None,
             agent_backend,
             quit_hint_until: None,
         })
@@ -314,11 +317,15 @@ impl App {
     fn open_overlay(&mut self, overlay: Overlay) {
         self.overlay = overlay;
         self.selected_row = 0;
+        if overlay != Overlay::Browser {
+            self.browser_notice = None;
+        }
     }
 
     fn close_overlay(&mut self) {
         self.overlay = Overlay::None;
         self.selected_row = 0;
+        self.browser_notice = None;
     }
 
     fn submit(&mut self) -> Result<()> {
@@ -549,7 +556,7 @@ impl App {
             Overlay::Setup => match self.selected_row.min(2) {
                 0 => self.open_overlay(Overlay::Account),
                 1 => self.open_overlay(Overlay::Model),
-                _ => self.open_overlay(Overlay::Browser),
+                _ => self.open_overlay(Overlay::BrowserChoice),
             },
             Overlay::Account => {
                 self.account = ACCOUNT_CHOICES
@@ -572,9 +579,14 @@ impl App {
                 self.agent_backend = choice.backend;
                 self.model_configured = true;
                 self.persist_runtime_settings()?;
-                self.open_overlay(Overlay::Browser);
+                self.open_overlay(Overlay::BrowserChoice);
             }
-            Overlay::Browser => {
+            Overlay::Browser => match self.selected_row.min(2) {
+                0 => self.request_open_browser()?,
+                1 => self.request_reconnect_browser()?,
+                _ => self.open_overlay(Overlay::BrowserChoice),
+            },
+            Overlay::BrowserChoice => {
                 let choice = BROWSER_CHOICES
                     .get(
                         self.selected_row
@@ -597,6 +609,41 @@ impl App {
             }
             Overlay::Help | Overlay::Developer | Overlay::None => self.close_overlay(),
         }
+        Ok(())
+    }
+
+    fn request_open_browser(&mut self) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            self.browser_notice = Some("No current browser task yet.".to_string());
+            return Ok(());
+        };
+        let state = self.workbench_state()?;
+        let target = state
+            .browser
+            .live_url
+            .as_deref()
+            .or(state.browser.url.as_deref())
+            .unwrap_or("about:blank");
+        self.store.append_event(
+            &session_id,
+            "browser.open_requested",
+            serde_json::json!({ "target": target }),
+        )?;
+        self.browser_notice = Some(format!("Open requested for {target}"));
+        Ok(())
+    }
+
+    fn request_reconnect_browser(&mut self) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            self.browser_notice = Some("No current browser task yet.".to_string());
+            return Ok(());
+        };
+        self.store.append_event(
+            &session_id,
+            "browser.reconnect_requested",
+            serde_json::json!({ "browser": self.browser }),
+        )?;
+        self.browser_notice = Some("Reconnect requested.".to_string());
         Ok(())
     }
 
@@ -868,7 +915,7 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
     } else if is_first_run
         && matches!(
             app.overlay,
-            Overlay::Account | Overlay::Model | Overlay::Browser | Overlay::SetupComplete
+            Overlay::Account | Overlay::Model | Overlay::BrowserChoice | Overlay::SetupComplete
         )
     {
         // Setup steps are full-screen product states, not modals over a workbench.
@@ -882,6 +929,9 @@ fn render(frame: &mut Frame<'_>, app: &mut App) {
         Overlay::Account => render_account_overlay(frame, centered_rect(78, 18, area), app),
         Overlay::Model => render_model_overlay(frame, centered_rect(92, 22, area), app),
         Overlay::Browser => render_browser_overlay(frame, centered_rect(84, 18, area), app, &state),
+        Overlay::BrowserChoice => {
+            render_browser_choice_overlay(frame, centered_rect(84, 18, area), app)
+        }
         Overlay::SetupComplete => render_setup_complete(frame, centered_rect(78, 16, area), app),
         Overlay::History => render_history_overlay(frame, centered_rect(94, 20, area), app, &state),
         Overlay::Actions => render_actions_overlay(frame, centered_rect(72, 16, area), app),
@@ -1242,44 +1292,8 @@ fn render_model_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
 
 fn render_browser_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
     frame.render_widget(Clear, area);
-    let first_run_setup =
-        !app.setup_complete && state.history.is_empty() && state.current_session.is_none();
-    let inner = modal(
-        frame,
-        area,
-        if first_run_setup {
-            "Choose browser"
-        } else {
-            "Browser"
-        },
-    );
-    if first_run_setup {
-        let lines = vec![
-            selected(
-                "Local Chrome                 visible browser on this machine",
-                0,
-                app.selected_row,
-            ),
-            selected(
-                "Browser Use cloud            remote browser with live view",
-                1,
-                app.selected_row,
-            ),
-            selected(
-                "Headless Chromium            background browser",
-                2,
-                app.selected_row,
-            ),
-            Line::from(""),
-            Line::from(Span::styled("Current", muted())),
-            Line::from(format!("  {} available", app.browser)),
-            Line::from(""),
-            Line::from(Span::styled("enter select     esc back", muted())),
-        ];
-        frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
-        return;
-    }
-    let lines = vec![
+    let inner = modal(frame, area, "Browser");
+    let mut lines = vec![
         Line::from(Span::styled("Current", bold())),
         kv_line("backend", &app.browser),
         kv_line("title", state.browser.title.as_deref().unwrap_or("unknown")),
@@ -1300,6 +1314,41 @@ fn render_browser_overlay(frame: &mut Frame<'_>, area: Rect, app: &App, state: &
         selected("Change browser", 2, app.selected_row),
         Line::from(""),
         Line::from(Span::styled("enter select     esc close", muted())),
+    ];
+    if let Some(notice) = app.browser_notice.as_ref() {
+        lines.insert(lines.len().saturating_sub(1), Line::from(""));
+        lines.insert(
+            lines.len().saturating_sub(1),
+            Line::from(Span::styled(notice.clone(), muted())),
+        );
+    }
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn render_browser_choice_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Clear, area);
+    let inner = modal(frame, area, "Choose browser");
+    let lines = vec![
+        selected(
+            "Local Chrome                 visible browser on this machine",
+            0,
+            app.selected_row,
+        ),
+        selected(
+            "Browser Use cloud            remote browser with live view",
+            1,
+            app.selected_row,
+        ),
+        selected(
+            "Headless Chromium            background browser",
+            2,
+            app.selected_row,
+        ),
+        Line::from(""),
+        Line::from(Span::styled("Current", muted())),
+        Line::from(format!("  {} available", app.browser)),
+        Line::from(""),
+        Line::from(Span::styled("enter select     esc back", muted())),
     ];
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
@@ -1663,7 +1712,7 @@ mod tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.overlay, Overlay::Model);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.overlay, Overlay::Browser);
+        assert_eq!(app.overlay, Overlay::BrowserChoice);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.overlay, Overlay::SetupComplete);
         let screen = render_dump(&mut app)?;
@@ -1732,6 +1781,7 @@ mod tests {
         assert_eq!(app.account, "OpenRouter API key");
         assert_eq!(app.agent_backend, AgentBackend::Openrouter);
         assert_eq!(app.provider_model, "qwen/qwen3.6-plus");
+        assert_eq!(app.overlay, Overlay::BrowserChoice);
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
@@ -1757,6 +1807,66 @@ mod tests {
         assert_eq!(restarted.account, "OpenRouter API key");
         assert_eq!(restarted.browser, "Browser Use cloud");
         assert_eq!(restarted.agent_backend, AgentBackend::Openrouter);
+        Ok(())
+    }
+
+    #[test]
+    fn browser_overlay_actions_do_not_mutate_backend_choice() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let args = Args {
+            state_dir: temp.path().to_path_buf(),
+            model: "GPT-5.5".to_string(),
+            account: "Codex login".to_string(),
+            browser: "Headless Chromium".to_string(),
+            dump_screen: true,
+            width: 120,
+            height: 34,
+            select_latest: false,
+            seed_demo: None,
+            overlay: None,
+            agent: AgentBackend::None,
+        };
+        let mut app = App::new(args)?;
+        app.setup_complete = true;
+        app.store.set_setting("setup.complete", "1")?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect current page"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.open_overlay(Overlay::Browser);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.browser, "Headless Chromium");
+        assert_eq!(app.overlay, Overlay::Browser);
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "browser.open_requested"
+                && event.payload["target"] == "https://live.browser-use.com/?wss=example"
+        }));
+
+        app.selected_row = 1;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.browser, "Headless Chromium");
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "browser.reconnect_requested"));
+
+        app.selected_row = 2;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.overlay, Overlay::BrowserChoice);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.browser, "Browser Use cloud");
+        assert_eq!(app.overlay, Overlay::None);
         Ok(())
     }
 

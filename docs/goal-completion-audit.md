@@ -1,0 +1,68 @@
+# Goal Completion Audit
+
+Date: 2026-05-10
+
+Objective audited:
+
+- Implement the Rust-first migration plan from `/Users/greg/Documents/browser-use/experiments/llm-browser-rust-tui/docs/rust-core-migration-plan.md`.
+- Implement the terminal UI product UX from `/Users/greg/Documents/browser-use/experiments/llm-browser-rust-tui/docs/terminal-ui-product-ux.md`.
+- Test the terminal UI manually end to end.
+
+## Checklist
+
+| Requirement | Evidence | Status |
+| --- | --- | --- |
+| Rust owns durable state, orchestration, providers, model/tool scheduling, CLI, and TUI. | Workspace crates `browser-use-protocol`, `browser-use-store`, `browser-use-core`, `browser-use-providers`, `browser-use-cli`, and `browser-use-tui`; old Python product runtime removed from package surface. | Done |
+| Python remains the browser island and understands live browser reconnect/identity. | `python/llm_browser_worker/worker.py` loads browser-harness helpers, emits browser state/artifacts, supports managed testing-browser and Browser Use cloud modes; browser-harness fixes committed in `/Users/greg/Developer/browser-harness`. | Done |
+| SQLite replaces per-session JSON files as primary state. | `crates/browser-use-store` migrations create `sessions`, `events`, `artifacts`, `runs`, `agent_edges`, `agent_messages`, and `app_settings`; tests cover store/session/events/import/export. | Done |
+| Append-only events are the integration contract. | Core/store append normalized `session.*`, `model.*`, `tool.*`, `browser.*`, `agent.*`, artifact, and compaction events; TUI projects `WorkbenchState` from events. | Done |
+| Tool surface stays small and browser-agent shaped. | Core exposes model tools `python`, `done`, `spawn_agent`, `wait_agent`, `send_message`, `followup_task`, `list_agents`, and `close_agent`; no model-visible file editing or shell tools. | Done |
+| Codex-shaped sub-agents prevent parent context blowups. | Durable `agent_edges` and `agent_messages`; canonical `/root/...` paths; sanitized fork modes; wait/list/message/followup/close tools; tests cover no child transcript copying. | Done |
+| Browser mutations go through Python browser harness, not Rust CDP. | Rust supervises the Python worker only; worker uses browser-harness/admin/helpers for browser operations; Rust records events and artifacts. | Done |
+| Providers cover fake, Codex, OpenAI, Anthropic, and OpenRouter. | Provider crate has fake, OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter adapters with mocked HTTP/SSE tests. | Done |
+| Claude Code path exists. | `auth login claude-code --access-token ...`, `CLAUDE_CODE_OAUTH_TOKEN`, and `ANTHROPIC_AUTH_TOKEN` route to Anthropic bearer-token auth with redaction and tests. | Done |
+| Cancellation is runtime-visible. | Store records cancel events/status; core now checks cancellation before finalizing model/tool turns and records cancelled run rows; `provider_loop_respects_external_cancel_before_finalizing` covers this. | Done |
+| Dataset runner is ported. | Fake/OpenAI/Codex/Anthropic/OpenRouter dataset runner commands exist; fake dataset smoke passed; Codex count-1 `real_v14_short` passed. | Mostly done |
+| Terminal UI first-run setup matches the UX doc. | TUI has setup, sign-in, model, browser choice, setup-complete, persisted choices, and tests for setup flow. | Done |
+| Terminal UI workbench matches the UX doc vocabulary. | Normal TUI uses `task/browser/account/model/result/history/setup` vocabulary and hides artifact/trace/provider/event concepts behind developer overlay. | Done |
+| Terminal UI running/result/history/actions/browser behavior works. | Unit tests plus manual PTY runs cover task entry, running, result, follow-up, history, actions, help, browser overlay, browser picker, and quit. | Done |
+| Browser overlay actions do what they say. | Fixed and tested: `Open browser` records `browser.open_requested`, `Reconnect` records `browser.reconnect_requested`, `Change browser` opens browser picker without accidental backend mutation. | Done |
+| Terminal UI was manually tested. | `/tmp/but-goal-final-tui` and `/tmp/but-goal-browser-overlay-tui` PTY runs inspected; SQLite evidence recorded in `docs/rewrite-verification.md`. | Done |
+| Rust package choices are current/reasonable. | Current checks found `ratatui 0.30.0`, `rusqlite 0.39.0`, `reqwest 0.12.x`, `sqlx 0.8.6`, `async-openai v0.37.0`, and `eventsource-client` as available options. The implementation uses Ratatui, rusqlite, and thin reqwest adapters where SDK coverage is not worth extra complexity. | Done |
+
+## Verification Commands
+
+Latest local verification:
+
+```bash
+cargo fmt --check
+cargo test
+uv run --with pytest python -m pytest -q
+cargo test -p browser-use-core -p browser-use-tui
+```
+
+Previously recorded live/browser verification:
+
+```bash
+scripts/live-browser-boundary-smoke.sh
+uv run browser-use-terminal --state-dir /tmp/but-rust-codex-live-smoke-final run-codex --model gpt-5.5 \
+  "Do not use the browser. Call the done tool with result exactly 'ok'."
+uv run browser-use-terminal --state-dir /tmp/but-rust-codex-dataset-smoke-cft dataset-run-codex real_v14_short --count 1 --model gpt-5.5
+```
+
+## Remaining Gaps
+
+These are not implementation gaps in the local rewrite, but they prevent a strict claim that every production path has been live-validated:
+
+- Live Anthropic and OpenRouter smokes were not run because live credentials were not available.
+- Browser Use cloud mode was not live-tested because `BROWSER_USE_API_KEY` was not available.
+- Full real-provider dataset regression has not been run; only the count-1 Codex `real_v14_short` smoke passed.
+
+## Package Research Notes
+
+- Ratatui latest docs show `0.30.0`: https://docs.rs/crate/ratatui/latest
+- Rusqlite latest docs show `0.39.0`: https://docs.rs/crate/rusqlite/latest
+- SQLx docs show SQLite migrations support, but the current synchronous local app shape favors smaller `rusqlite`: https://docs.rs/sqlx/latest/sqlx/migrate/index.html
+- `async-openai` latest release is available, but the implementation keeps thin `reqwest` adapters to support Codex/Responses differences directly: https://github.com/64bit/async-openai
+- Anthropic Messages API is simple enough for a thin adapter and supports tool/message usage directly: https://docs.claude.com/en/api/messages
+- `eventsource-client` exists for SSE, but the current blocking provider adapter uses a small local SSE parser to avoid pulling async transport into the v1 runtime: https://docs.rs/eventsource-client/latest/eventsource_client/

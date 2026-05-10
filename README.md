@@ -149,3 +149,4 @@ That smoke covers browser download artifact indexing and stale-session recovery 
 - `docs/browser-agent-harness-plan.md`
 - `docs/rewrite-verification.md`
 - `docs/completion-audit.md`
+- `docs/goal-completion-audit.md`

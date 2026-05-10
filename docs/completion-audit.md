@@ -15,6 +15,7 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - CLI has task runners, session runners, agent graph commands, import/export, Python tool execution, config, auth status/login/import/logout, diagnostics, trace export, and dataset runners.
 - TUI implements the product workbench vocabulary from `docs/terminal-ui-product-ux.md`, including first-run setup, persistent account/model/browser choices, setup-complete, ready, running, result follow-ups, stopped, browser, history, actions, help, and hidden developer views.
 - Core emits run lifecycle rows, `session.status`, `model.config`, `session.deadline_warning`, compaction events, compact model contexts, and artifact-backed spillover for huge Python outputs.
+- Core checks for external cancellation between provider/tool turns, avoids finalizing cancelled sessions as done, and records cancelled run rows.
 - Default provider runs allow up to 80 turns; compacted Responses input converts summarized system context to user context and avoids replaying stale historical function-call outputs.
 - Managed headless browser mode is owned by the Python island and prefers Playwright's bundled testing browser, avoiding the user's personal Chrome remote-debugging prompt and quarantined system Chromium apps.
 - Browser Use cloud mode is also owned by the Python island when selected and `BROWSER_USE_API_KEY` is available.
@@ -37,9 +38,10 @@ This branch is a working Rust-first rewrite foundation, not a claim that every p
 - deterministic TUI dumps for the main product states
 - manual PTY setup, model/browser selection, task submission, result follow-up, history resume, actions/help, clear input, and quit with the hidden fake backend
 - final manual 80x24 PTY smoke with stored settings, task submission, result rendering, history overlay, browser overlay, and clean quit; evidence is in `/tmp/but-goal-final-tui`, session `5f401d3d9a4f`
+- final browser-overlay PTY smoke with `Open browser`, `Reconnect`, `Change browser`, browser-picker selection, and clean quit; evidence is in `/tmp/but-goal-browser-overlay-tui`
 - browser-harness navigation, page inspection, screenshot artifact, image event, and browser-state emission through the Rust/Python boundary
 - worker-boundary tests for browser-harness download-style file artifacts and refreshed browser target identity across calls
-- live dedicated-Chrome boundary smoke for download artifact indexing and stale-session recovery preserving the same target id
+- live testing-browser boundary smoke for download artifact indexing and stale-session recovery preserving the same target id
 - real Codex count-1 dataset smoke on `real_v14_short` passed through the Rust provider loop, Python tool, SQLite store, testing-browser CDP path, FERC search, FERC file download API, PDF/DOCX extraction, and final `session.done`
 - earlier real Codex count-1 dataset attempts exposed two compaction protocol bugs and browser-harness input/timeout issues that are now covered by focused tests
 

@@ -111,6 +111,14 @@ cargo run -q -p browser-use-tui -- --state-dir /tmp/but-goal-final-tui
 
 Checked stored setup settings, 80x24 workbench rendering, task entry, running state, completed result state, history overlay via `tab`, browser overlay via F2 escape sequence, `esc` back to the result, and clean quit with `ctrl+q`. Evidence is in session `5f401d3d9a4f`, status `done`, with `session.input`, `browser.page`, `model.config`, `model.delta`, and `session.done`.
 
+Final browser overlay behavior pass after fixing browser action routing:
+
+```bash
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-goal-browser-overlay-tui
+```
+
+Checked stored settings, task submission, completed result rendering, F2 browser overlay, `Open browser` recording `browser.open_requested`, `Reconnect` recording `browser.reconnect_requested`, `Change browser` opening the browser picker instead of mutating the backend directly, selecting `Browser Use cloud`, and clean quit with `ctrl+q`. Evidence is in `/tmp/but-goal-browser-overlay-tui`: app setting `browser=Browser Use cloud`, event `browser.open_requested {"target":"about:blank"}`, and event `browser.reconnect_requested {"browser":"Headless Chromium"}`.
+
 Browser-harness boundary smoke:
 
 ```bash
@@ -139,7 +147,7 @@ Provider coverage:
 - OpenAI Responses, Codex Responses, Anthropic Messages, and OpenAI-compatible chat/OpenRouter paths have mocked HTTP/SSE tests in Rust.
 - Anthropic Messages also has mocked bearer-token coverage for the Claude Code OAuth-token path. The CLI stores `auth.claude_code.auth_token`, redacts it in `config show`, detects `CLAUDE_CODE_OAUTH_TOKEN` / `ANTHROPIC_AUTH_TOKEN`, and reports external Claude Code CLI login status without scraping Keychain tokens.
 - Python worker tests cover browser-harness download-style artifacts and refreshed browser target identity across calls.
-- Store/core/TUI tests cover run lifecycle rows, model config events, deadline warning events, compaction events, large Python output spillover to artifacts, recursive sub-agent close, configurable spawn fork modes, persistent TUI setup choices, and result follow-up execution on the existing task.
+- Store/core/TUI tests cover run lifecycle rows, model config events, deadline warning events, cancellation checks before finalization, compaction events, large Python output spillover to artifacts, recursive sub-agent close, configurable spawn fork modes, persistent TUI setup choices, browser overlay action routing, and result follow-up execution on the existing task.
 - Core tests cover canonical `/root/...` sub-agent path addressing for send, follow-up, wait, list, and close.
 - Live Anthropic/OpenRouter smokes were not run in this branch because they require live credentials.
 
