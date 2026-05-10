@@ -145,6 +145,17 @@ cargo run -q -p browser-use-tui -- --state-dir /tmp/but-current-final-pty --agen
 
 Checked stored fake-agent settings, task entry, completed result rendering, follow-up execution on the same task, history overlay via `tab`, history `r` resume, browser overlay, and clean quit with `ctrl+q`. Evidence is in session `003d4e98ee60`: it records `session.input`, `browser.page`, `model.config`, `model.delta`, `session.done`, `session.followup`, a second `model.config`, a second `model.delta`, and a second `session.done`. The browser overlay dump reports backend `Headless Chromium`, avoiding both the personal Chrome remote-debug prompt and the quarantined Homebrew Chromium app.
 
+Current branch deterministic TUI dumps after splitting the renderer:
+
+```bash
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-render-split-tui --dump-screen --width 100 --height 28
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-render-split-result --seed-demo done --select-latest --dump-screen --width 100 --height 28
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-render-split-result --seed-demo done --select-latest --overlay browser --dump-screen --width 100 --height 28
+cargo run -q -p browser-use-tui -- --state-dir /tmp/but-render-split-result --seed-demo done --select-latest --overlay history --dump-screen --width 100 --height 28
+```
+
+Inspected `/tmp/but-render-split-setup.txt`, `/tmp/but-render-split-result.txt`, `/tmp/but-render-split-browser.txt`, and `/tmp/but-render-split-history.txt`. They cover first-run setup, result, browser overlay with `tabs 1 open` and `viewport 1440 x 900`, and history overlay after the render-module extraction.
+
 Browser-harness boundary smoke:
 
 ```bash
