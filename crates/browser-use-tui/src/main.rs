@@ -4,9 +4,6 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use browser_use_core::{
-    run_existing_session_from_config, AgentRunOptions, ProviderBackend, ProviderRunConfig,
-};
 use browser_use_protocol::{
     project_workbench, HistoryRow, SessionMeta, SessionStatus, WorkbenchState,
 };
@@ -19,10 +16,20 @@ use crossterm::terminal::{
 };
 use ratatui::backend::{CrosstermBackend, TestBackend};
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Rect};
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, Clear, List, ListItem, Paragraph, Wrap};
 use ratatui::{Frame, Terminal};
+
+mod runtime;
+mod settings;
+mod theme;
+
+use runtime::run_agent_thread;
+use settings::{
+    provider_model_for_display, AgentBackend, ACCOUNT_CHOICES, BROWSER_CHOICES, MODEL_CHOICES,
+};
+use theme::*;
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -49,54 +56,6 @@ struct Args {
     overlay: Option<OverlayArg>,
     #[arg(long, value_enum, default_value = "codex", hide = true)]
     agent: AgentBackend,
-}
-
-#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
-enum AgentBackend {
-    Codex,
-    Openai,
-    Anthropic,
-    Openrouter,
-    Fake,
-    None,
-}
-
-impl AgentBackend {
-    fn as_setting(self) -> &'static str {
-        match self {
-            Self::Codex => "codex",
-            Self::Openai => "openai",
-            Self::Anthropic => "anthropic",
-            Self::Openrouter => "openrouter",
-            Self::Fake => "fake",
-            Self::None => "none",
-        }
-    }
-
-    fn from_setting(value: &str) -> Option<Self> {
-        match value {
-            "codex" => Some(Self::Codex),
-            "openai" => Some(Self::Openai),
-            "anthropic" => Some(Self::Anthropic),
-            "openrouter" => Some(Self::Openrouter),
-            "fake" => Some(Self::Fake),
-            "none" => Some(Self::None),
-            _ => None,
-        }
-    }
-}
-
-impl From<AgentBackend> for ProviderBackend {
-    fn from(value: AgentBackend) -> Self {
-        match value {
-            AgentBackend::Codex => Self::Codex,
-            AgentBackend::Openai => Self::Openai,
-            AgentBackend::Anthropic => Self::Anthropic,
-            AgentBackend::Openrouter => Self::Openrouter,
-            AgentBackend::Fake => Self::Fake,
-            AgentBackend::None => Self::None,
-        }
-    }
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -157,99 +116,6 @@ struct App {
     browser_notice: Option<String>,
     agent_backend: AgentBackend,
     quit_hint_until: Option<Instant>,
-}
-
-#[derive(Clone, Copy)]
-struct ModelChoice {
-    display: &'static str,
-    account: &'static str,
-    backend: AgentBackend,
-    provider_model: &'static str,
-    row: &'static str,
-}
-
-const ACCOUNT_CHOICES: [&str; 5] = [
-    "Codex login",
-    "Claude Code login",
-    "OpenAI API key",
-    "Anthropic API key",
-    "OpenRouter API key",
-];
-
-const BROWSER_CHOICES: [&str; 3] = ["Local Chrome", "Browser Use cloud", "Headless Chromium"];
-
-const MODEL_CHOICES: [ModelChoice; 9] = [
-    ModelChoice {
-        display: "GPT-5.5",
-        account: "Codex login",
-        backend: AgentBackend::Codex,
-        provider_model: "gpt-5.5",
-        row: "GPT-5.5                         Codex login             best default",
-    },
-    ModelChoice {
-        display: "GPT-5.5",
-        account: "OpenAI API key",
-        backend: AgentBackend::Openai,
-        provider_model: "gpt-5.5",
-        row: "GPT-5.5                         OpenAI API key          sign in required",
-    },
-    ModelChoice {
-        display: "Claude Opus 4.7",
-        account: "Claude Code login",
-        backend: AgentBackend::Anthropic,
-        provider_model: "claude-opus-4-7",
-        row: "Claude Opus 4.7                 Claude Code login       sign in required",
-    },
-    ModelChoice {
-        display: "Claude Opus 4.7",
-        account: "Anthropic API key",
-        backend: AgentBackend::Anthropic,
-        provider_model: "claude-opus-4-7",
-        row: "Claude Opus 4.7                 Anthropic API key       sign in required",
-    },
-    ModelChoice {
-        display: "Claude Sonnet 4.6",
-        account: "Claude Code login",
-        backend: AgentBackend::Anthropic,
-        provider_model: "claude-sonnet-4-6",
-        row: "Claude Sonnet 4.6               Claude Code login       sign in required",
-    },
-    ModelChoice {
-        display: "Claude Sonnet 4.6",
-        account: "Anthropic API key",
-        backend: AgentBackend::Anthropic,
-        provider_model: "claude-sonnet-4-6",
-        row: "Claude Sonnet 4.6               Anthropic API key       sign in required",
-    },
-    ModelChoice {
-        display: "Qwen3.6 Plus",
-        account: "OpenRouter API key",
-        backend: AgentBackend::Openrouter,
-        provider_model: "qwen/qwen3.6-plus",
-        row: "Qwen3.6 Plus                    OpenRouter API key      sign in required",
-    },
-    ModelChoice {
-        display: "GLM-5.1",
-        account: "OpenRouter API key",
-        backend: AgentBackend::Openrouter,
-        provider_model: "z-ai/glm-5.1",
-        row: "GLM-5.1                         OpenRouter API key      sign in required",
-    },
-    ModelChoice {
-        display: "DeepSeek V4 Pro",
-        account: "OpenRouter API key",
-        backend: AgentBackend::Openrouter,
-        provider_model: "deepseek/deepseek-v4-pro",
-        row: "DeepSeek V4 Pro                 OpenRouter API key      sign in required",
-    },
-];
-
-fn provider_model_for_display(display: &str) -> &str {
-    MODEL_CHOICES
-        .iter()
-        .find(|choice| choice.display == display)
-        .map(|choice| choice.provider_model)
-        .unwrap_or(display)
 }
 
 impl App {
@@ -676,37 +542,6 @@ impl App {
         self.store
             .set_setting("agent.backend", self.agent_backend.as_setting())?;
         Ok(())
-    }
-}
-
-fn run_agent_thread(
-    state_dir: PathBuf,
-    session_id: String,
-    backend: AgentBackend,
-    model: String,
-    browser: String,
-) -> Result<()> {
-    let store = Store::open(&state_dir)?;
-    let config = ProviderRunConfig::new(backend.into(), model)
-        .with_options(tui_agent_options(&browser))
-        .with_fake_result("Fake result from the Rust TUI agent loop.");
-    let result = run_existing_session_from_config(&store, &session_id, config);
-    if let Err(error) = result {
-        let _ = store.append_event(
-            &session_id,
-            "session.failed",
-            serde_json::json!({ "error": error.to_string() }),
-        );
-        return Err(error);
-    }
-    Ok(())
-}
-
-fn tui_agent_options(browser: &str) -> AgentRunOptions {
-    match browser {
-        "Headless Chromium" => AgentRunOptions::default().with_browser_mode("headless"),
-        "Browser Use cloud" => AgentRunOptions::default().with_browser_mode("cloud"),
-        _ => AgentRunOptions::default(),
     }
 }
 
@@ -1480,69 +1315,6 @@ fn truncate(value: &str, max: usize) -> String {
 
 fn first_line(value: &str) -> String {
     value.lines().next().unwrap_or(value).to_string()
-}
-
-fn text() -> Color {
-    Color::Rgb(230, 230, 235)
-}
-
-fn muted_color() -> Color {
-    Color::Rgb(156, 158, 168)
-}
-
-fn dim_color() -> Color {
-    Color::Rgb(102, 105, 116)
-}
-
-fn accent_color() -> Color {
-    Color::Rgb(92, 156, 245)
-}
-
-fn panel() -> Color {
-    Color::Rgb(30, 32, 38)
-}
-
-fn background() -> Color {
-    Color::Rgb(18, 19, 23)
-}
-
-fn composer_bg() -> Color {
-    Color::Rgb(28, 30, 36)
-}
-
-fn text_style() -> Style {
-    Style::default().fg(text())
-}
-
-fn bold() -> Style {
-    text_style().add_modifier(Modifier::BOLD)
-}
-
-fn muted() -> Style {
-    Style::default().fg(muted_color())
-}
-
-fn dim() -> Style {
-    Style::default().fg(dim_color())
-}
-
-fn accent() -> Style {
-    Style::default()
-        .fg(accent_color())
-        .add_modifier(Modifier::BOLD)
-}
-
-fn link() -> Style {
-    Style::default().fg(Color::Rgb(125, 180, 255))
-}
-
-fn status_style(status: &str) -> Style {
-    match status {
-        "done" => Style::default().fg(Color::Rgb(126, 192, 143)),
-        "failed" => Style::default().fg(Color::Rgb(230, 126, 126)),
-        "running" | "created" => Style::default().fg(Color::Rgb(215, 168, 79)),
-        _ => muted(),
-    }
 }
 
 #[cfg(test)]
