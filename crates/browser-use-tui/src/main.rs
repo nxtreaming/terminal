@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 use std::path::PathBuf;
 use std::thread;
@@ -8,13 +9,15 @@ use browser_use_protocol::{project_workbench, SessionStatus, WorkbenchState};
 use browser_use_store::Store;
 use clap::{Parser, ValueEnum};
 use crossterm::event::{
-    self, Event as TermEvent, KeyCode, KeyEvent, KeyModifiers, KeyboardEnhancementFlags,
-    PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
+    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
+    PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{
     disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
 };
+use crossterm::Command;
 use ratatui::backend::CrosstermBackend;
 use ratatui::Terminal;
 
@@ -104,6 +107,7 @@ struct App {
     selected_session_id: Option<String>,
     input: String,
     input_cursor: usize,
+    input_kill_buffer: String,
     overlay: Overlay,
     selected_row: usize,
     setup_complete: bool,
@@ -154,6 +158,7 @@ impl App {
             selected_session_id,
             input: String::new(),
             input_cursor: 0,
+            input_kill_buffer: String::new(),
             overlay,
             selected_row: 0,
             setup_complete,
@@ -329,6 +334,9 @@ impl App {
     }
 
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+            return Ok(false);
+        }
         match key {
             KeyEvent {
                 code: KeyCode::Char('q'),
@@ -383,10 +391,16 @@ impl App {
                 ..
             } if self.overlay == Overlay::History => self.execute_overlay_selection()?,
             KeyEvent {
-                code: KeyCode::Char('d'),
-                modifiers: KeyModifiers::CONTROL,
+                code: KeyCode::Up, ..
+            } if self.overlay != Overlay::None || self.is_first_run_setup_visible()? => {
+                self.move_selection(-1)?
+            }
+            KeyEvent {
+                code: KeyCode::Down,
                 ..
-            } => self.complete_demo_result()?,
+            } if self.overlay != Overlay::None || self.is_first_run_setup_visible()? => {
+                self.move_selection(1)?
+            }
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
@@ -402,143 +416,169 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.submit()?,
+            _ if self.overlay == Overlay::None && self.handle_composer_key(key) => {}
             KeyEvent {
-                code: KeyCode::Enter,
-                modifiers,
-                ..
-            } if self.overlay == Overlay::None
-                && modifiers.intersects(
-                    KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL,
-                ) =>
-            {
-                self.insert_input_char('\n');
-            }
-            KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers,
-                ..
-            } if self.overlay == Overlay::None
-                && modifiers.intersects(KeyModifiers::META | KeyModifiers::SUPER) =>
-            {
-                self.clear_input_current_line_before_cursor();
-            }
-            KeyEvent {
-                code: KeyCode::Backspace,
-                modifiers,
-                ..
-            } if self.overlay == Overlay::None
-                && modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-            {
-                self.delete_input_word_backward();
-            }
-            KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            } if self.overlay == Overlay::None => self.delete_input_backward(),
-            KeyEvent {
-                code: KeyCode::Delete,
-                modifiers,
-                ..
-            } if self.overlay == Overlay::None
-                && modifiers.intersects(KeyModifiers::META | KeyModifiers::SUPER) =>
-            {
-                self.clear_input_current_line_after_cursor();
-            }
-            KeyEvent {
-                code: KeyCode::Delete,
-                modifiers,
-                ..
-            } if self.overlay == Overlay::None
-                && modifiers.intersects(KeyModifiers::ALT | KeyModifiers::CONTROL) =>
-            {
-                self.clear_input_after_cursor();
-            }
-            KeyEvent {
-                code: KeyCode::Delete,
-                ..
-            } if self.overlay == Overlay::None => self.delete_input_forward(),
-            KeyEvent {
-                code: KeyCode::Char('a'),
+                code: KeyCode::Char('d'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
-            } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                self.input_cursor = 0;
-            }
-            KeyEvent {
-                code: KeyCode::Char('e'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                self.input_cursor = self.input_len();
-            }
-            KeyEvent {
-                code: KeyCode::Char('u'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                self.clear_input_current_line_before_cursor();
-            }
-            KeyEvent {
-                code: KeyCode::Char('k'),
-                modifiers: KeyModifiers::CONTROL,
-                ..
-            } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                self.clear_input_current_line_after_cursor();
-            }
-            KeyEvent {
-                code: KeyCode::Home,
-                ..
-            } if self.overlay == Overlay::None && !self.input.is_empty() => self.input_cursor = 0,
-            KeyEvent {
-                code: KeyCode::End, ..
-            } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                self.input_cursor = self.input_len();
-            }
-            KeyEvent {
-                code: KeyCode::Left,
-                modifiers,
-                ..
-            } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                if modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER)
-                {
-                    self.move_input_word_left();
-                } else {
-                    self.move_input_cursor(-1);
-                }
-            }
-            KeyEvent {
-                code: KeyCode::Right,
-                modifiers,
-                ..
-            } if self.overlay == Overlay::None && !self.input.is_empty() => {
-                if modifiers
-                    .intersects(KeyModifiers::ALT | KeyModifiers::META | KeyModifiers::SUPER)
-                {
-                    self.move_input_word_right();
-                } else {
-                    self.move_input_cursor(1);
-                }
-            }
-            KeyEvent {
-                code: KeyCode::Up, ..
-            } if self.overlay != Overlay::None || self.is_first_run_setup_visible()? => {
-                self.move_selection(-1)?
-            }
-            KeyEvent {
-                code: KeyCode::Down,
-                ..
-            } if self.overlay != Overlay::None || self.is_first_run_setup_visible()? => {
-                self.move_selection(1)?
-            }
-            KeyEvent {
-                code: KeyCode::Char(ch),
-                modifiers: KeyModifiers::NONE | KeyModifiers::SHIFT,
-                ..
-            } if self.overlay == Overlay::None => self.insert_input_char(ch),
+            } => self.complete_demo_result()?,
             _ => {}
         }
         Ok(false)
+    }
+
+    fn handle_composer_key(&mut self, key: KeyEvent) -> bool {
+        if key.code == KeyCode::Backspace
+            && key
+                .modifiers
+                .intersects(KeyModifiers::META | KeyModifiers::SUPER)
+        {
+            self.kill_input_current_line();
+            return true;
+        }
+        if key.code == KeyCode::Delete
+            && key
+                .modifiers
+                .intersects(KeyModifiers::META | KeyModifiers::SUPER)
+        {
+            self.kill_input_current_line();
+            return true;
+        }
+        if (key.code == KeyCode::Enter
+            && key
+                .modifiers
+                .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL))
+            || (matches!(key.code, KeyCode::Char('\n' | '\r'))
+                && key
+                    .modifiers
+                    .intersects(KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL))
+            || key_pressed(key, KeyCode::Char('j'), KeyModifiers::CONTROL)
+            || key_pressed(key, KeyCode::Char('m'), KeyModifiers::CONTROL)
+        {
+            self.insert_input_char('\n');
+            return true;
+        }
+        if key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT)
+            || key_pressed(key, KeyCode::Backspace, KeyModifiers::CONTROL)
+            || key_pressed(
+                key,
+                KeyCode::Backspace,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )
+            || key_pressed(key, KeyCode::Char('w'), KeyModifiers::CONTROL)
+            || key_pressed(
+                key,
+                KeyCode::Char('h'),
+                KeyModifiers::CONTROL | KeyModifiers::ALT,
+            )
+        {
+            self.delete_input_word_backward();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Backspace, KeyModifiers::NONE)
+            || key_pressed(key, KeyCode::Backspace, KeyModifiers::SHIFT)
+            || key_pressed(key, KeyCode::Char('h'), KeyModifiers::CONTROL)
+        {
+            self.delete_input_backward();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Delete, KeyModifiers::ALT)
+            || key_pressed(key, KeyCode::Delete, KeyModifiers::CONTROL)
+            || key_pressed(
+                key,
+                KeyCode::Delete,
+                KeyModifiers::CONTROL | KeyModifiers::SHIFT,
+            )
+            || key_pressed(key, KeyCode::Char('d'), KeyModifiers::ALT)
+        {
+            self.delete_input_word_forward();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Delete, KeyModifiers::NONE)
+            || key_pressed(key, KeyCode::Delete, KeyModifiers::SHIFT)
+            || (key_pressed(key, KeyCode::Char('d'), KeyModifiers::CONTROL)
+                && !self.input.is_empty())
+        {
+            self.delete_input_forward();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Char('u'), KeyModifiers::CONTROL) {
+            self.clear_input_current_line_before_cursor();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Char('k'), KeyModifiers::CONTROL) {
+            self.clear_input_current_line_after_cursor();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Char('y'), KeyModifiers::CONTROL) {
+            self.yank_input_kill_buffer();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Left, KeyModifiers::ALT)
+            || key_pressed(key, KeyCode::Left, KeyModifiers::CONTROL)
+            || key_pressed(key, KeyCode::Char('b'), KeyModifiers::ALT)
+        {
+            self.move_input_word_left();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Right, KeyModifiers::ALT)
+            || key_pressed(key, KeyCode::Right, KeyModifiers::CONTROL)
+            || key_pressed(key, KeyCode::Char('f'), KeyModifiers::ALT)
+        {
+            self.move_input_word_right();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Left, KeyModifiers::NONE)
+            || key_pressed(key, KeyCode::Char('b'), KeyModifiers::CONTROL)
+        {
+            self.move_input_cursor(-1);
+            return true;
+        }
+        if key_pressed(key, KeyCode::Right, KeyModifiers::NONE)
+            || key_pressed(key, KeyCode::Char('f'), KeyModifiers::CONTROL)
+        {
+            self.move_input_cursor(1);
+            return true;
+        }
+        if key_pressed(key, KeyCode::Up, KeyModifiers::NONE)
+            || key_pressed(key, KeyCode::Char('p'), KeyModifiers::CONTROL)
+        {
+            self.move_input_line_up();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Down, KeyModifiers::NONE)
+            || key_pressed(key, KeyCode::Char('n'), KeyModifiers::CONTROL)
+        {
+            self.move_input_line_down();
+            return true;
+        }
+        if key_pressed(key, KeyCode::Home, KeyModifiers::NONE)
+            || key_pressed(key, KeyCode::Char('a'), KeyModifiers::CONTROL)
+        {
+            self.move_input_line_start();
+            return true;
+        }
+        if key_pressed(key, KeyCode::End, KeyModifiers::NONE)
+            || key_pressed(key, KeyCode::Char('e'), KeyModifiers::CONTROL)
+        {
+            self.move_input_line_end();
+            return true;
+        }
+        if let KeyEvent {
+            code: KeyCode::Char(ch),
+            modifiers,
+            ..
+        } = key
+        {
+            let (_, normalized_modifiers) = normalize_key_parts(KeyCode::Char(ch), modifiers);
+            if normalized_modifiers == KeyModifiers::NONE
+                || normalized_modifiers == KeyModifiers::SHIFT
+            {
+                self.insert_input_char(ch);
+                return true;
+            }
+        }
+        false
     }
 
     fn is_first_run_setup_visible(&self) -> Result<bool> {
@@ -723,6 +763,10 @@ impl App {
         self.input.chars().count()
     }
 
+    fn input_chars(&self) -> Vec<char> {
+        self.input.chars().collect()
+    }
+
     fn composer_height(&self) -> u16 {
         let input_lines = if self.input.is_empty() {
             1
@@ -786,19 +830,21 @@ impl App {
         if self.input_cursor == 0 {
             return;
         }
-        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let mut chars = self.input_chars();
         self.input_cursor = self.input_cursor.min(chars.len());
+        self.store_input_kill(chars[self.input_cursor - 1].to_string());
         chars.remove(self.input_cursor - 1);
         self.input_cursor -= 1;
         self.input = chars.into_iter().collect();
     }
 
     fn delete_input_forward(&mut self) {
-        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let mut chars = self.input_chars();
         self.input_cursor = self.input_cursor.min(chars.len());
         if self.input_cursor >= chars.len() {
             return;
         }
+        self.store_input_kill(chars[self.input_cursor].to_string());
         chars.remove(self.input_cursor);
         self.input = chars.into_iter().collect();
     }
@@ -807,7 +853,7 @@ impl App {
         if self.input_cursor == 0 {
             return;
         }
-        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let mut chars = self.input_chars();
         self.input_cursor = self.input_cursor.min(chars.len());
         let mut start = self.input_cursor;
         while start > 0 && chars[start - 1].is_whitespace() {
@@ -816,42 +862,155 @@ impl App {
         while start > 0 && !chars[start - 1].is_whitespace() {
             start -= 1;
         }
+        self.store_input_kill(chars[start..self.input_cursor].iter().collect());
         chars.drain(start..self.input_cursor);
         self.input_cursor = start;
         self.input = chars.into_iter().collect();
     }
 
-    fn clear_input_after_cursor(&mut self) {
-        let mut chars = self.input.chars().collect::<Vec<_>>();
+    fn delete_input_word_forward(&mut self) {
+        let mut chars = self.input_chars();
         let cursor = self.input_cursor.min(chars.len());
-        chars.truncate(cursor);
+        let mut end = cursor;
+        while end < chars.len() && chars[end].is_whitespace() {
+            end += 1;
+        }
+        while end < chars.len() && !chars[end].is_whitespace() {
+            end += 1;
+        }
+        if end == cursor {
+            return;
+        }
+        self.store_input_kill(chars[cursor..end].iter().collect());
+        chars.drain(cursor..end);
         self.input = chars.into_iter().collect();
+        self.input_cursor = cursor;
     }
 
     fn clear_input_current_line_before_cursor(&mut self) {
-        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let mut chars = self.input_chars();
         let cursor = self.input_cursor.min(chars.len());
-        let line_start = chars[..cursor]
-            .iter()
-            .rposition(|ch| *ch == '\n')
-            .map(|idx| idx + 1)
-            .unwrap_or(0);
-        chars.drain(line_start..cursor);
+        let line_start = line_start_for(&chars, cursor);
+        let range = if cursor == line_start {
+            if line_start > 0 {
+                Some(line_start - 1..line_start)
+            } else {
+                None
+            }
+        } else {
+            Some(line_start..cursor)
+        };
+        let Some(range) = range else {
+            return;
+        };
+        self.store_input_kill(chars[range.clone()].iter().collect());
+        let new_cursor = range.start;
+        chars.drain(range);
         self.input = chars.into_iter().collect();
-        self.input_cursor = line_start;
+        self.input_cursor = new_cursor;
     }
 
     fn clear_input_current_line_after_cursor(&mut self) {
-        let mut chars = self.input.chars().collect::<Vec<_>>();
+        let mut chars = self.input_chars();
         let cursor = self.input_cursor.min(chars.len());
-        let line_end = chars[cursor..]
-            .iter()
-            .position(|ch| *ch == '\n')
-            .map(|idx| cursor + idx)
-            .unwrap_or(chars.len());
-        chars.drain(cursor..line_end);
+        let line_end = line_end_for(&chars, cursor);
+        let range = if cursor == line_end {
+            if line_end < chars.len() {
+                Some(cursor..line_end + 1)
+            } else {
+                None
+            }
+        } else {
+            Some(cursor..line_end)
+        };
+        let Some(range) = range else {
+            return;
+        };
+        self.store_input_kill(chars[range.clone()].iter().collect());
+        chars.drain(range);
         self.input = chars.into_iter().collect();
         self.input_cursor = cursor;
+    }
+
+    fn kill_input_current_line(&mut self) {
+        let mut chars = self.input_chars();
+        if chars.is_empty() {
+            return;
+        }
+        let cursor = self.input_cursor.min(chars.len());
+        let line_start = line_start_for(&chars, cursor);
+        let line_end = line_end_for(&chars, cursor);
+        let start = if line_end == chars.len() && line_start > 0 {
+            line_start - 1
+        } else {
+            line_start
+        };
+        let end = if line_end < chars.len() {
+            line_end + 1
+        } else {
+            line_end
+        };
+        if start >= end {
+            return;
+        }
+        self.store_input_kill(chars[start..end].iter().collect());
+        chars.drain(start..end);
+        self.input = chars.into_iter().collect();
+        self.input_cursor = start.min(self.input_len());
+    }
+
+    fn yank_input_kill_buffer(&mut self) {
+        if self.input_kill_buffer.is_empty() {
+            return;
+        }
+        let text = self.input_kill_buffer.clone();
+        for ch in text.chars() {
+            self.insert_input_char(ch);
+        }
+    }
+
+    fn store_input_kill(&mut self, text: String) {
+        if !text.is_empty() {
+            self.input_kill_buffer = text;
+        }
+    }
+
+    fn move_input_line_start(&mut self) {
+        let chars = self.input_chars();
+        self.input_cursor = line_start_for(&chars, self.input_cursor.min(chars.len()));
+    }
+
+    fn move_input_line_end(&mut self) {
+        let chars = self.input_chars();
+        self.input_cursor = line_end_for(&chars, self.input_cursor.min(chars.len()));
+    }
+
+    fn move_input_line_up(&mut self) {
+        let chars = self.input_chars();
+        let cursor = self.input_cursor.min(chars.len());
+        let line_start = line_start_for(&chars, cursor);
+        if line_start == 0 {
+            return;
+        }
+        let column = cursor - line_start;
+        let previous_line_end = line_start - 1;
+        let previous_line_start = line_start_for(&chars, previous_line_end);
+        self.input_cursor =
+            previous_line_start + column.min(previous_line_end - previous_line_start);
+    }
+
+    fn move_input_line_down(&mut self) {
+        let chars = self.input_chars();
+        let cursor = self.input_cursor.min(chars.len());
+        let line_start = line_start_for(&chars, cursor);
+        let line_end = line_end_for(&chars, cursor);
+        if line_end >= chars.len() {
+            return;
+        }
+        let column = cursor - line_start;
+        let next_line_start = line_end + 1;
+        let next_line_end = line_end_for(&chars, next_line_start);
+        self.input_cursor = next_line_start + column.min(next_line_end - next_line_start);
     }
 
     fn auth_notice(&self) -> Result<Option<String>> {
@@ -953,6 +1112,116 @@ impl App {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct KeyBinding {
+    code: KeyCode,
+    modifiers: KeyModifiers,
+}
+
+impl KeyBinding {
+    const fn new(code: KeyCode, modifiers: KeyModifiers) -> Self {
+        Self { code, modifiers }
+    }
+
+    fn is_press(self, event: KeyEvent) -> bool {
+        normalize_key_parts(self.code, self.modifiers)
+            == normalize_key_parts(event.code, event.modifiers)
+            && matches!(event.kind, KeyEventKind::Press | KeyEventKind::Repeat)
+    }
+}
+
+fn key_pressed(event: KeyEvent, code: KeyCode, modifiers: KeyModifiers) -> bool {
+    KeyBinding::new(code, modifiers).is_press(event)
+}
+
+fn normalize_key_parts(code: KeyCode, mut modifiers: KeyModifiers) -> (KeyCode, KeyModifiers) {
+    let KeyCode::Char(ch) = code else {
+        return (code, modifiers);
+    };
+    if modifiers.is_empty() {
+        if let Some(ctrl_char) = c0_control_char_to_ctrl_char(ch) {
+            return (KeyCode::Char(ctrl_char), KeyModifiers::CONTROL);
+        }
+    }
+    if ch.is_ascii_uppercase() {
+        modifiers.insert(KeyModifiers::SHIFT);
+        return (KeyCode::Char(ch.to_ascii_lowercase()), modifiers);
+    }
+    (code, modifiers)
+}
+
+fn c0_control_char_to_ctrl_char(ch: char) -> Option<char> {
+    let code = u32::from(ch);
+    match code {
+        0x00 => Some(' '),
+        0x01..=0x1a => char::from_u32(code - 0x01 + u32::from('a')),
+        0x1c..=0x1f => char::from_u32(code - 0x1c + u32::from('4')),
+        _ => None,
+    }
+}
+
+fn line_start_for(chars: &[char], cursor: usize) -> usize {
+    let cursor = cursor.min(chars.len());
+    chars[..cursor]
+        .iter()
+        .rposition(|ch| *ch == '\n')
+        .map(|idx| idx + 1)
+        .unwrap_or(0)
+}
+
+fn line_end_for(chars: &[char], cursor: usize) -> usize {
+    let cursor = cursor.min(chars.len());
+    chars[cursor..]
+        .iter()
+        .position(|ch| *ch == '\n')
+        .map(|idx| cursor + idx)
+        .unwrap_or(chars.len())
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct ResetKeyboardEnhancementFlags;
+
+impl Command for ResetKeyboardEnhancementFlags {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[<u")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "keyboard enhancement reset is not implemented for legacy Windows terminals",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct DisableModifyOtherKeys;
+
+impl Command for DisableModifyOtherKeys {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        f.write_str("\x1b[>4;0m")
+    }
+
+    #[cfg(windows)]
+    fn execute_winapi(&self) -> io::Result<()> {
+        Err(io::Error::new(
+            io::ErrorKind::Unsupported,
+            "modifyOtherKeys reset is not implemented for legacy Windows terminals",
+        ))
+    }
+
+    #[cfg(windows)]
+    fn is_ansi_code_supported(&self) -> bool {
+        false
+    }
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     if args.dump_screen {
@@ -970,9 +1239,11 @@ fn run_terminal(mut app: App) -> Result<()> {
     execute!(
         stdout,
         EnterAlternateScreen,
+        EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
                 | KeyboardEnhancementFlags::REPORT_EVENT_TYPES
+                | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     )?;
     let backend = CrosstermBackend::new(stdout);
@@ -991,6 +1262,9 @@ fn run_terminal(mut app: App) -> Result<()> {
     execute!(
         terminal.backend_mut(),
         PopKeyboardEnhancementFlags,
+        ResetKeyboardEnhancementFlags,
+        DisableModifyOtherKeys,
+        DisableBracketedPaste,
         LeaveAlternateScreen
     )?;
     terminal.show_cursor()?;
@@ -1160,9 +1434,17 @@ mod tests {
 
         app.set_input("first line\nprefix suffix".to_string());
         app.input_cursor = "first line\nprefix ".chars().count();
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER))?);
-        assert_eq!(app.input, "first line\nsuffix");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL))?);
         assert_eq!(app.input_cursor, "first line\n".chars().count());
+
+        app.set_input("first line\nprefix suffix".to_string());
+        app.input_cursor = "first line\nprefix ".chars().count();
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER))?);
+        assert_eq!(app.input, "first line");
+        assert_eq!(app.input_cursor, "first line".chars().count());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER))?);
+        assert_eq!(app.input, "");
+        assert_eq!(app.input_cursor, 0);
 
         app.set_input("first line\nprefix suffix".to_string());
         app.input_cursor = "first line\nprefix ".chars().count();
@@ -1173,8 +1455,8 @@ mod tests {
         app.set_input("first line\nprefix suffix\nlast line".to_string());
         app.input_cursor = "first line\nprefix".chars().count();
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::SUPER))?);
-        assert_eq!(app.input, "first line\nprefix\nlast line");
-        assert_eq!(app.input_cursor, "first line\nprefix".chars().count());
+        assert_eq!(app.input, "first line\nlast line");
+        assert_eq!(app.input_cursor, "first line\n".chars().count());
 
         app.set_input("first line\nprefix suffix\nlast line".to_string());
         app.input_cursor = "first line\nprefix".chars().count();
@@ -1189,6 +1471,9 @@ mod tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('b'), KeyModifiers::NONE))?);
         assert_eq!(app.input, "a\nb");
         assert_eq!(app.composer_height(), 4);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\n'), KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::NONE))?);
+        assert_eq!(app.input, "a\nb\nc");
 
         let long_input = (0..20)
             .map(|idx| format!("line {idx}"))
