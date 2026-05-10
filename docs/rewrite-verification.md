@@ -216,6 +216,7 @@ Provider coverage:
 - Store/core/TUI tests cover run lifecycle rows, model config events, deadline warning events, cancellation checks before finalization, compaction events, large Python output spillover to artifacts, recursive sub-agent close, per-parent sub-agent path uniqueness, configurable spawn fork modes, isolated sub-agent provider execution with compact parent completion events, provider-config execution from core, persistent TUI setup choices, browser overlay action routing, result follow-up execution on the existing task, and Enter-to-retry behavior for failed tasks.
 - Store and TUI tests include checked-in golden legacy session/event fixture import and projection from `tests/golden-events/legacy-session`.
 - Core tests cover canonical `/root/...` sub-agent path addressing for send, follow-up, wait, list, and close, plus bounded `wait_agent` timeout behavior for active helpers.
+- TUI settings, runtime launching, and theme helpers are split into separate modules; `browser-use-tui` does not depend directly on `browser-use-providers`.
 - Live Anthropic/OpenRouter smokes were not run in this branch because they require live credentials.
 
 Trace export smoke:
