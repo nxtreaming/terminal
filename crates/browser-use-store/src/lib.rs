@@ -988,8 +988,9 @@ mod tests {
     fn imports_checked_in_golden_legacy_session() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
-        let fixture = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../../tests/golden-events/legacy-session");
+        let fixture_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden-events");
+        let fixture = fixture_root.join("legacy-session");
 
         let session = store.import_legacy_session(&fixture)?;
         assert_eq!(session.id, "legacy-golden-001");
@@ -1003,6 +1004,39 @@ mod tests {
         assert_eq!(events[1].payload["viewport"]["w"], 1440);
         assert_eq!(events[2].event_type, "tool.output");
         assert_eq!(events[3].payload["result"], "Top story found");
+        Ok(())
+    }
+
+    #[test]
+    fn imports_all_checked_in_golden_event_fixtures() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let fixture_root =
+            std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../tests/golden-events");
+        let mut imported = Vec::new();
+        for entry in std::fs::read_dir(&fixture_root)? {
+            let path = entry?.path();
+            if path.is_dir() {
+                let session = store.import_legacy_session(&path)?;
+                let events = store.events_for_session(&session.id)?;
+                assert!(
+                    !events.is_empty(),
+                    "fixture {} has no events",
+                    path.display()
+                );
+                imported.push(session.id);
+            }
+        }
+        imported.sort();
+        assert_eq!(
+            imported,
+            vec![
+                "golden-artifact-image-001",
+                "golden-running-browser-001",
+                "golden-subagent-followup-001",
+                "legacy-golden-001",
+            ]
+        );
         Ok(())
     }
 

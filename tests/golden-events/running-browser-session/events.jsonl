@@ -1,0 +1,4 @@
+{"version":1,"id":"running-browser-event-001","session_id":"golden-running-browser-001","ts_ms":1778440101000,"type":"session.input","payload":{"text":"Open the live browser and inspect the page"}}
+{"version":1,"id":"running-browser-event-002","session_id":"golden-running-browser-001","ts_ms":1778440102000,"type":"browser.live_url","payload":{"live_url":"https://live.browser-use.com/?wss=golden"}}
+{"version":1,"id":"running-browser-event-003","session_id":"golden-running-browser-001","ts_ms":1778440103000,"type":"browser.state","payload":{"status":"connected","url":"https://example.com/","title":"Example Domain","tabs":2,"viewport":{"w":1280,"h":720}}}
+{"version":1,"id":"running-browser-event-004","session_id":"golden-running-browser-001","ts_ms":1778440104000,"type":"tool.started","payload":{"name":"python","tool_call_id":"call-running","arguments":{"code":"page_info()"}}}
