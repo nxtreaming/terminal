@@ -335,6 +335,63 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
                     activity.push("using browser".to_string());
                 }
             }
+            "plan.updated" => activity.push("updated plan".to_string()),
+            "command.started" => {
+                if let Some(cmd) = event.payload.get("cmd").and_then(Value::as_str) {
+                    activity.push(format!("ran {}", truncate_activity(cmd, 72)));
+                } else {
+                    activity.push("ran command".to_string());
+                }
+            }
+            "command.finished" => {
+                if event
+                    .payload
+                    .get("success")
+                    .and_then(Value::as_bool)
+                    .is_some_and(|success| !success)
+                {
+                    let code = event
+                        .payload
+                        .get("exit_code")
+                        .and_then(Value::as_i64)
+                        .map(|code| code.to_string())
+                        .unwrap_or_else(|| "unknown".to_string());
+                    activity.push(format!("command failed with exit {code}"));
+                }
+            }
+            "patch.file_changed" => {
+                let kind = event
+                    .payload
+                    .get("kind")
+                    .and_then(Value::as_str)
+                    .unwrap_or("changed");
+                let path = event
+                    .payload
+                    .get("path")
+                    .and_then(Value::as_str)
+                    .map(compact_path)
+                    .unwrap_or_else(|| "file".to_string());
+                activity.push(format!("{kind} {path}"));
+            }
+            "file.read" => {
+                if let Some(path) = event.payload.get("path").and_then(Value::as_str) {
+                    activity.push(format!("read {}", compact_path(path)));
+                }
+            }
+            "file.search" => {
+                let query = event
+                    .payload
+                    .get("query")
+                    .and_then(Value::as_str)
+                    .unwrap_or("files");
+                let matches = event
+                    .payload
+                    .get("matches")
+                    .and_then(Value::as_u64)
+                    .unwrap_or(0);
+                activity.push(format!("searched {query:?} ({matches} matches)"));
+            }
+            "file.list" => activity.push("listed files".to_string()),
             "agent.spawned" => activity.push(agent_started_text(&event.payload)),
             "agent.completed" => activity.push(agent_completed_text(&event.payload)),
             "agent.failed" => activity.push(agent_failed_text(&event.payload)),
@@ -344,6 +401,28 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
         }
     }
     activity
+}
+
+fn compact_path(path: &str) -> String {
+    let trimmed = path.trim();
+    trimmed
+        .rsplit_once('/')
+        .map(|(_, tail)| tail)
+        .filter(|tail| !tail.is_empty())
+        .unwrap_or(trimmed)
+        .to_string()
+}
+
+fn truncate_activity(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    let mut out = value
+        .chars()
+        .take(max.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 pub fn sanitized_agent_context_from_events(events: &[EventRecord]) -> Value {
@@ -516,6 +595,22 @@ mod tests {
                 id: "e3".to_string(),
                 session_id: "s1".to_string(),
                 ts_ms: 3,
+                event_type: "command.started".to_string(),
+                payload: json!({"cmd": "cargo test -p browser-use-core"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "e4".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 4,
+                event_type: "patch.file_changed".to_string(),
+                payload: json!({"kind": "modified", "path": "/repo/src/main.rs"}),
+            },
+            EventRecord {
+                seq: 5,
+                id: "e5".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 5,
                 event_type: "session.done".to_string(),
                 payload: json!({"result": "Done"}),
             },
@@ -527,7 +622,14 @@ mod tests {
         assert_eq!(browser.title.as_deref(), Some("Example"));
         assert_eq!(browser.tabs, Some(2));
         assert_eq!(browser.viewport.as_deref(), Some("1440 x 900"));
-        assert_eq!(activity_from_events(&events), vec!["browsing example.com"]);
+        assert_eq!(
+            activity_from_events(&events),
+            vec![
+                "browsing example.com",
+                "ran cargo test -p browser-use-core",
+                "modified main.rs",
+            ]
+        );
     }
 
     #[test]
