@@ -24,7 +24,6 @@ pub(crate) struct CommandToolResult {
 
 #[derive(Clone, Debug)]
 struct OutputChunk {
-    stream: &'static str,
     text: String,
 }
 
@@ -146,16 +145,16 @@ pub(crate) fn exec_command(
                 "duration_ms": managed.started_at.elapsed().as_millis() as u64,
             }),
         )?;
-        let content = command_output(
-            None,
-            false,
-            &text,
+        let content = command_output(CommandOutputPayload {
+            session_id: None,
+            running: false,
+            output: &text,
             max_chars,
-            status.exit_code,
-            managed.started_at.elapsed(),
+            exit_code: status.exit_code,
+            duration: managed.started_at.elapsed(),
             tty_requested,
             tty_allocated,
-        );
+        });
         store.append_event(
             &session.id,
             "tool.finished",
@@ -179,16 +178,16 @@ pub(crate) fn exec_command(
             "running": true,
         }),
     )?;
-    let content = command_output(
-        Some(process_id.clone()),
-        true,
-        &text,
+    let content = command_output(CommandOutputPayload {
+        session_id: Some(process_id.clone()),
+        running: true,
+        output: &text,
         max_chars,
-        None,
-        managed.started_at.elapsed(),
+        exit_code: None,
+        duration: managed.started_at.elapsed(),
         tty_requested,
         tty_allocated,
-    );
+    });
     commands()
         .lock()
         .expect("command registry poisoned")
@@ -262,16 +261,16 @@ pub(crate) fn write_stdin(
 
     let running = status.is_none();
     let tty_allocated = command.process.tty_allocated();
-    let content = command_output(
-        Some(process_id.to_string()),
+    let content = command_output(CommandOutputPayload {
+        session_id: Some(process_id.to_string()),
         running,
-        &text,
+        output: &text,
         max_chars,
-        status.as_ref().and_then(|status| status.exit_code),
-        command.started_at.elapsed(),
+        exit_code: status.as_ref().and_then(|status| status.exit_code),
+        duration: command.started_at.elapsed(),
+        tty_requested: tty_allocated,
         tty_allocated,
-        tty_allocated,
-    );
+    });
     if let Some(status) = status {
         store.append_event(
             &session.id,
@@ -340,10 +339,10 @@ fn spawn_pipe_process(
     let stdin = child.stdin.take();
     let mut readers = Vec::new();
     if let Some(stdout) = child.stdout.take() {
-        readers.push(spawn_reader(stdout, "stdout", output.clone()));
+        readers.push(spawn_reader(stdout, output.clone()));
     }
     if let Some(stderr) = child.stderr.take() {
-        readers.push(spawn_reader(stderr, "stderr", output));
+        readers.push(spawn_reader(stderr, output));
     }
     Ok((ManagedProcess::Pipes { child, stdin }, readers, false))
 }
@@ -374,7 +373,7 @@ fn spawn_pty_process(
             workdir.display()
         )
     })?;
-    let readers = vec![spawn_reader(reader, "pty", output)];
+    let readers = vec![spawn_reader(reader, output)];
     Ok((
         ManagedProcess::Pty {
             child,
@@ -448,11 +447,7 @@ impl ManagedProcess {
     }
 }
 
-fn spawn_reader<R>(
-    reader: R,
-    stream: &'static str,
-    output: Arc<Mutex<Vec<OutputChunk>>>,
-) -> JoinHandle<()>
+fn spawn_reader<R>(reader: R, output: Arc<Mutex<Vec<OutputChunk>>>) -> JoinHandle<()>
 where
     R: std::io::Read + Send + 'static,
 {
@@ -466,7 +461,6 @@ where
                     .lock()
                     .expect("command output poisoned")
                     .push(OutputChunk {
-                        stream,
                         text: String::from_utf8_lossy(&bytes).into_owned(),
                     }),
                 Err(error) => {
@@ -474,7 +468,6 @@ where
                         .lock()
                         .expect("command output poisoned")
                         .push(OutputChunk {
-                            stream: "stderr",
                             text: format!("[command output read failed: {error}]\n"),
                         });
                     break;
@@ -496,13 +489,7 @@ impl ManagedCommand {
         let chunks = output
             .iter()
             .skip(self.read_index)
-            .map(|chunk| {
-                if chunk.stream == "stderr" {
-                    format!("{}", chunk.text)
-                } else {
-                    chunk.text.clone()
-                }
-            })
+            .map(|chunk| chunk.text.clone())
             .collect::<String>();
         self.read_index = output.len();
         chunks
@@ -544,27 +531,29 @@ fn emit_command_output(
     Ok(())
 }
 
-fn command_output(
+struct CommandOutputPayload<'a> {
     session_id: Option<String>,
     running: bool,
-    output: &str,
+    output: &'a str,
     max_chars: usize,
     exit_code: Option<i32>,
     duration: Duration,
     tty_requested: bool,
     tty_allocated: bool,
-) -> Value {
-    let (output, truncated) = cap_output(output, max_chars);
+}
+
+fn command_output(payload: CommandOutputPayload<'_>) -> Value {
+    let (output, truncated) = cap_output(payload.output, payload.max_chars);
     json!({
-        "session_id": session_id,
-        "running": running,
+        "session_id": payload.session_id,
+        "running": payload.running,
         "output": output,
         "metadata": {
-            "exit_code": exit_code,
-            "duration_ms": duration.as_millis() as u64,
+            "exit_code": payload.exit_code,
+            "duration_ms": payload.duration.as_millis() as u64,
             "truncated": truncated,
-            "tty_requested": tty_requested,
-            "tty_allocated": tty_allocated,
+            "tty_requested": payload.tty_requested,
+            "tty_allocated": payload.tty_allocated,
         }
     })
 }

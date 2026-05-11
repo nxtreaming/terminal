@@ -115,8 +115,14 @@ pub struct ToolResult {
 #[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq)]
 pub struct ModelUsage {
     pub input_tokens: Option<i64>,
+    pub input_cached_tokens: Option<i64>,
+    pub input_cache_creation_tokens: Option<i64>,
     pub output_tokens: Option<i64>,
     pub total_tokens: Option<i64>,
+    pub input_cost_usd: Option<f64>,
+    pub input_cached_cost_usd: Option<f64>,
+    pub input_cache_creation_cost_usd: Option<f64>,
+    pub output_cost_usd: Option<f64>,
     pub cost_usd: Option<f64>,
 }
 
@@ -164,9 +170,19 @@ pub struct WorkbenchState {
     pub result: Option<String>,
     pub failure: Option<String>,
     pub activity: Vec<String>,
+    pub transcript: Vec<TranscriptTurn>,
     pub browser: BrowserSummary,
     pub telemetry: TelemetrySummary,
     pub history: Vec<HistoryRow>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct TranscriptTurn {
+    pub prompt: String,
+    pub is_followup: bool,
+    pub activity: Vec<String>,
+    pub result: Option<String>,
+    pub failure: Option<String>,
 }
 
 pub fn task_from_events(events: &[EventRecord]) -> Option<String> {
@@ -185,18 +201,122 @@ pub fn task_from_events(events: &[EventRecord]) -> Option<String> {
     })
 }
 
+pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
+    let mut starts = Vec::new();
+    for (idx, event) in events.iter().enumerate() {
+        let is_followup = match event.event_type.as_str() {
+            "session.input" => false,
+            "session.followup" => true,
+            _ => continue,
+        };
+        let Some(prompt) = event
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        starts.push((idx, prompt.to_string(), is_followup));
+    }
+
+    starts
+        .iter()
+        .enumerate()
+        .map(|(turn_idx, (event_idx, prompt, is_followup))| {
+            let next_idx = starts
+                .get(turn_idx + 1)
+                .map(|(idx, _, _)| *idx)
+                .unwrap_or(events.len());
+            let segment = events
+                .get(event_idx.saturating_add(1)..next_idx)
+                .unwrap_or_default();
+            TranscriptTurn {
+                prompt: prompt.clone(),
+                is_followup: *is_followup,
+                activity: activity_from_events(segment),
+                result: turn_result_from_events(segment),
+                failure: turn_failure_from_events(segment),
+            }
+        })
+        .collect()
+}
+
 pub fn result_from_events(events: &[EventRecord]) -> Option<String> {
-    events.iter().rev().find_map(|event| {
-        if event.event_type == "session.done" {
-            event
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event.event_type.as_str() {
+            "session.done" => event
                 .payload
                 .get("result")
                 .and_then(Value::as_str)
-                .map(ToOwned::to_owned)
-        } else {
-            None
-        }
-    })
+                .map(clean_result_text),
+            "agent.completed" => event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("result"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|result| !result.is_empty())
+                .map(clean_result_text),
+            _ => None,
+        })
+}
+
+fn clean_result_text(text: &str) -> String {
+    let mut cleaned = text.trim_end().to_string();
+    loop {
+        let chars = cleaned.chars().collect::<Vec<_>>();
+        let len = chars.len();
+        let Some(repeated_len) = (24..=len / 2).rev().find(|candidate| {
+            let start = len.saturating_sub(candidate * 2);
+            chars[start..start + candidate] == chars[start + candidate..]
+        }) else {
+            break;
+        };
+        let keep = len.saturating_sub(repeated_len);
+        cleaned = chars[..keep]
+            .iter()
+            .collect::<String>()
+            .trim_end()
+            .to_string();
+    }
+    cleaned
+}
+
+pub fn helper_failure_from_events(events: &[EventRecord]) -> Option<String> {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| match event.event_type.as_str() {
+            "agent.failed" => event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("error"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|error| !error.is_empty())
+                .map(ToOwned::to_owned),
+            "agent.cancelled" => event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("reason"))
+                .and_then(Value::as_str)
+                .map(str::trim)
+                .filter(|reason| !reason.is_empty())
+                .map(ToOwned::to_owned),
+            _ => None,
+        })
+}
+
+pub fn turn_failure_from_events(events: &[EventRecord]) -> Option<String> {
+    failure_from_events(events).or_else(|| helper_failure_from_events(events))
+}
+
+pub fn turn_result_from_events(events: &[EventRecord]) -> Option<String> {
+    result_from_events(events)
 }
 
 pub fn failure_from_events(events: &[EventRecord]) -> Option<String> {
@@ -336,27 +456,22 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
     let mut activity = Vec::new();
     for event in events {
         match event.event_type.as_str() {
-            "browser.connected" => activity.push("browser connected".to_string()),
-            "browser.reconnected" => activity.push("browser reconnected".to_string()),
-            "browser.target_changed" => activity.push("browser target changed".to_string()),
-            "browser.disconnected" => activity.push("browser disconnected".to_string()),
-            "browser.live_url" => activity.push("connected live browser".to_string()),
+            "browser.connected" => push_activity(&mut activity, "browser connected"),
+            "browser.reconnected" => push_activity(&mut activity, "browser reconnected"),
+            "browser.target_changed" => push_activity(&mut activity, "browser target changed"),
+            "browser.disconnected" => push_activity(&mut activity, "browser disconnected"),
+            "browser.live_url" => push_activity(&mut activity, "connected live browser"),
             "browser.page" | "browser.state" => {
                 if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
-                    activity.push(format!("browsing {}", compact_url(url)));
+                    push_activity(&mut activity, format!("browsing {}", compact_url(url)));
                 }
             }
-            "tool.started" => {
-                if event.payload.get("name").and_then(Value::as_str) == Some("python") {
-                    activity.push("using browser".to_string());
-                }
-            }
-            "plan.updated" => activity.push("updated plan".to_string()),
+            "plan.updated" => push_activity(&mut activity, "updated plan"),
             "command.started" => {
                 if let Some(cmd) = event.payload.get("cmd").and_then(Value::as_str) {
-                    activity.push(format!("ran {}", truncate_activity(cmd, 72)));
+                    push_activity(&mut activity, format!("ran {}", truncate_activity(cmd, 72)));
                 } else {
-                    activity.push("ran command".to_string());
+                    push_activity(&mut activity, "ran command");
                 }
             }
             "command.finished" => {
@@ -372,7 +487,7 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
                         .and_then(Value::as_i64)
                         .map(|code| code.to_string())
                         .unwrap_or_else(|| "unknown".to_string());
-                    activity.push(format!("command failed with exit {code}"));
+                    push_activity(&mut activity, format!("command failed with exit {code}"));
                 }
             }
             "patch.file_changed" => {
@@ -387,11 +502,11 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
                     .and_then(Value::as_str)
                     .map(compact_path)
                     .unwrap_or_else(|| "file".to_string());
-                activity.push(format!("{kind} {path}"));
+                push_activity(&mut activity, format!("{kind} {path}"));
             }
             "file.read" => {
                 if let Some(path) = event.payload.get("path").and_then(Value::as_str) {
-                    activity.push(format!("read {}", compact_path(path)));
+                    push_activity(&mut activity, format!("read {}", compact_path(path)));
                 }
             }
             "file.search" => {
@@ -405,18 +520,28 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
                     .get("matches")
                     .and_then(Value::as_u64)
                     .unwrap_or(0);
-                activity.push(format!("searched {query:?} ({matches} matches)"));
+                push_activity(
+                    &mut activity,
+                    format!("searched {query:?} ({matches} matches)"),
+                );
             }
-            "file.list" => activity.push("listed files".to_string()),
-            "agent.spawned" => activity.push(agent_started_text(&event.payload)),
-            "agent.completed" => activity.push(agent_completed_text(&event.payload)),
-            "agent.failed" => activity.push(agent_failed_text(&event.payload)),
-            "agent.cancelled" => activity.push(agent_cancelled_text(&event.payload)),
-            "model.delta" => activity.push("writing result".to_string()),
+            "file.list" => push_activity(&mut activity, "listed files"),
+            "agent.spawned" => push_activity(&mut activity, agent_started_text(&event.payload)),
+            "agent.completed" => push_activity(&mut activity, "helper finished"),
+            "agent.failed" => push_activity(&mut activity, "helper failed"),
+            "agent.cancelled" => push_activity(&mut activity, "helper stopped"),
             _ => {}
         }
     }
     activity
+}
+
+fn push_activity(activity: &mut Vec<String>, item: impl Into<String>) {
+    let item = item.into();
+    if activity.last().is_some_and(|last| last == &item) {
+        return;
+    }
+    activity.push(item);
 }
 
 fn compact_path(path: &str) -> String {
@@ -479,45 +604,6 @@ fn agent_started_text(payload: &Value) -> String {
     format!("started {label} helper")
 }
 
-fn agent_completed_text(payload: &Value) -> String {
-    let result = payload
-        .get("payload")
-        .and_then(|payload| payload.get("result"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|result| !result.is_empty());
-    match result {
-        Some(result) => format!("helper finished: {result}"),
-        None => "helper finished".to_string(),
-    }
-}
-
-fn agent_failed_text(payload: &Value) -> String {
-    let error = payload
-        .get("payload")
-        .and_then(|payload| payload.get("error"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|error| !error.is_empty());
-    match error {
-        Some(error) => format!("helper failed: {error}"),
-        None => "helper failed".to_string(),
-    }
-}
-
-fn agent_cancelled_text(payload: &Value) -> String {
-    let reason = payload
-        .get("payload")
-        .and_then(|payload| payload.get("reason"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|reason| !reason.is_empty());
-    match reason {
-        Some(reason) => format!("helper stopped: {reason}"),
-        None => "helper stopped".to_string(),
-    }
-}
-
 pub fn project_workbench(
     sessions: &[SessionMeta],
     events_for_current: &[EventRecord],
@@ -571,6 +657,7 @@ pub fn project_workbench(
         result,
         failure,
         activity: activity_from_events(events_for_current),
+        transcript: transcript_from_events(events_for_current),
         browser: browser_summary_from_events(events_for_current, browser_backend),
         telemetry: telemetry_summary_from_events(events_for_current),
         history,
@@ -649,6 +736,20 @@ mod tests {
     }
 
     #[test]
+    fn result_projection_dedupes_repeated_full_text_delta_artifacts() {
+        let answer = "Your callback has been scheduled.\n\nThey will call you tomorrow.";
+        let events = vec![EventRecord {
+            seq: 1,
+            id: "e1".to_string(),
+            session_id: "s1".to_string(),
+            ts_ms: 1,
+            event_type: "session.done".to_string(),
+            payload: json!({"result": format!("{answer}{answer}")}),
+        }];
+        assert_eq!(result_from_events(&events).as_deref(), Some(answer));
+    }
+
+    #[test]
     fn projects_browser_identity_events() {
         let events = vec![
             EventRecord {
@@ -705,6 +806,65 @@ mod tests {
                 "browser connected",
                 "browser reconnected",
                 "browser target changed",
+            ]
+        );
+    }
+
+    #[test]
+    fn ignores_internal_python_tool_start_activity() {
+        let events = vec![EventRecord {
+            seq: 1,
+            id: "e1".to_string(),
+            session_id: "s1".to_string(),
+            ts_ms: 1,
+            event_type: "tool.started".to_string(),
+            payload: json!({"name": "python", "call_id": "call-1"}),
+        }];
+        assert!(activity_from_events(&events).is_empty());
+    }
+
+    #[test]
+    fn collapses_consecutive_duplicate_activity_pings() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 1,
+                event_type: "browser.state".to_string(),
+                payload: json!({"url": "https://example.com/dashboard"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 2,
+                event_type: "browser.state".to_string(),
+                payload: json!({"url": "https://example.com/dashboard"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "e3".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 3,
+                event_type: "browser.state".to_string(),
+                payload: json!({"url": "https://example.com/settings"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "e4".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 4,
+                event_type: "browser.state".to_string(),
+                payload: json!({"url": "https://example.com/dashboard"}),
+            },
+        ];
+        assert_eq!(
+            activity_from_events(&events),
+            vec![
+                "browsing example.com/dashboard",
+                "browsing example.com/settings",
+                "browsing example.com/dashboard",
             ]
         );
     }
@@ -785,10 +945,11 @@ mod tests {
         ];
         assert_eq!(
             activity_from_events(&events),
-            vec![
-                "started checkout helper",
-                "helper finished: checkout flow documented",
-            ]
+            vec!["started checkout helper", "helper finished"]
+        );
+        assert_eq!(
+            result_from_events(&events).as_deref(),
+            Some("checkout flow documented"),
         );
     }
 

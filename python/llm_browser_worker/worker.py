@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import contextlib
 import atexit
+import base64
 import importlib
 import io
 import json
@@ -299,6 +300,10 @@ def _safe_name(name: str) -> str:
 
 def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested: bool) -> None:
     artifact_dir = Path(ns["artifact_dir"])
+    if "__browser_harness_capture_screenshot__" not in ns:
+        ns["__browser_harness_capture_screenshot__"] = ns.get("capture_screenshot")
+    if "__browser_harness_page_info__" not in ns:
+        ns["__browser_harness_page_info__"] = ns.get("page_info")
 
     def emit_output(text: Any) -> None:
         record = {"text": str(text)}
@@ -344,6 +349,30 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
     def copy_artifact(path: Any, kind: str = "file", name: str | None = None, mime: str | None = None) -> Dict[str, Any]:
         return _copy_artifact(path, kind=kind, name=name, mime=mime, emit_event=True)
 
+    def _write_artifact(name: str, content: str, mime: str) -> Dict[str, Any]:
+        target_dir = artifact_dir / "files"
+        target_dir.mkdir(parents=True, exist_ok=True)
+        target_name = _safe_name(name)
+        target = target_dir / target_name
+        if target.exists():
+            stem = target.stem
+            suffix = target.suffix
+            idx = 2
+            while target.exists():
+                target = target_dir / f"{stem}-{idx}{suffix}"
+                idx += 1
+        target.write_text(content, encoding="utf-8")
+        record = {
+            "kind": "file",
+            "path": str(target),
+            "source_path": str(target),
+            "mime": mime,
+            "bytes": target.stat().st_size,
+        }
+        ns.setdefault("artifacts", []).append(record)
+        _emit_protocol_event(request_id, "artifact", record)
+        return record
+
     def emit_image(path: Any, label: str | None = None, detail: str = "auto", mime_type: str | None = None) -> Dict[str, Any]:
         record = _copy_artifact(path, kind="image", mime=mime_type, emit_event=False)
         image = {
@@ -355,6 +384,223 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         ns.setdefault("images", []).append(image)
         _emit_protocol_event(request_id, "image", image)
         return image
+
+    def _screenshot_label(label: str | None = None, path: Any | None = None) -> str:
+        if label:
+            return str(label)
+        if path:
+            stem = Path(str(path)).expanduser().stem
+            if stem:
+                return stem
+        return "screenshot"
+
+    def capture_screenshot(
+        path: Any | None = None,
+        full: bool = False,
+        max_dim: int | None = None,
+        attach: bool = True,
+        label: str | None = None,
+        detail: str = "auto",
+        mime_type: str | None = None,
+        timeout: float | None = None,
+        timeout_s: float | None = None,
+    ) -> str:
+        """Browser-harness capture_screenshot plus direct image attachment.
+
+        Browser-harness itself returns a PNG path. The Rust browser agent keeps
+        that contract while defaulting to attach=True so the next model turn
+        receives the pixels directly in the tool result.
+        """
+        _ = timeout, timeout_s  # Accepted for compatibility with the main Python implementation.
+        original = ns.get("__browser_harness_capture_screenshot__")
+        if not callable(original):
+            raise RuntimeError("browser_harness capture_screenshot is not available")
+        shot_path = original(path=path, full=full, max_dim=max_dim)
+        if attach:
+            emit_image(
+                shot_path,
+                label=_screenshot_label(label=label, path=path),
+                detail=detail,
+                mime_type=mime_type,
+            )
+        return str(shot_path)
+
+    def _apply_max_dim(path: Any, max_dim: int | None = None) -> None:
+        if not max_dim:
+            return
+        from PIL import Image
+
+        img = Image.open(path)
+        if max(img.size) > max_dim:
+            img.thumbnail((max_dim, max_dim))
+            img.save(path)
+
+    def screenshot_clip(
+        label: str = "screenshot_clip",
+        x: float = 0,
+        y: float = 0,
+        width: float = 1,
+        height: float = 1,
+        path: Any | None = None,
+        scale: float = 1,
+        capture_beyond_viewport: bool = False,
+        max_dim: int | None = None,
+        attach: bool = True,
+        detail: str = "auto",
+        mime_type: str | None = None,
+    ) -> Dict[str, Any] | str:
+        """Capture a CSS-pixel viewport/page clip via CDP and optionally attach it.
+
+        This is intentionally CDP-native instead of post-cropping a full PNG.
+        Coordinates are CSS pixels, matching `click_at_xy`, not device pixels.
+        """
+        cdp_fn = ns.get("cdp")
+        if not callable(cdp_fn):
+            raise RuntimeError("browser_harness cdp is not available")
+        if width <= 0 or height <= 0:
+            raise ValueError("screenshot_clip width and height must be positive")
+        shot_path = Path(str(path)).expanduser() if path is not None else artifact_dir / f"{_safe_name(label)}.png"
+        if not shot_path.is_absolute():
+            shot_path = Path.cwd() / shot_path
+        shot_path.parent.mkdir(parents=True, exist_ok=True)
+        response = cdp_fn(
+            "Page.captureScreenshot",
+            format="png",
+            captureBeyondViewport=bool(capture_beyond_viewport),
+            clip={
+                "x": float(x),
+                "y": float(y),
+                "width": float(width),
+                "height": float(height),
+                "scale": float(scale),
+            },
+        )
+        shot_path.write_bytes(base64.b64decode(response["data"]))
+        _apply_max_dim(shot_path, max_dim=max_dim)
+        if not attach:
+            return str(shot_path)
+        return emit_image(
+            shot_path,
+            label=label,
+            detail=detail,
+            mime_type=mime_type,
+        )
+
+    def screenshot(
+        label: str = "screenshot",
+        path: Any | None = None,
+        full: bool = False,
+        max_dim: int | None = None,
+        attach: bool = True,
+        detail: str = "auto",
+        mime_type: str | None = None,
+        timeout: float | None = None,
+        timeout_s: float | None = None,
+    ) -> Dict[str, Any] | str:
+        """Capture and attach a screenshot in one call."""
+        shot_path = capture_screenshot(
+            path=path,
+            full=full,
+            max_dim=max_dim,
+            attach=False,
+            timeout=timeout,
+            timeout_s=timeout_s,
+        )
+        if not attach:
+            return shot_path
+        return emit_image(
+            shot_path,
+            label=label,
+            detail=detail,
+            mime_type=mime_type,
+        )
+
+    def page_info() -> Dict[str, Any]:
+        """Browser-harness page_info with a CDP-only fallback for wedged page JS."""
+        original = ns.get("__browser_harness_page_info__")
+        if callable(original):
+            try:
+                return original()
+            except Exception as exc:
+                fallback = _page_info_cdp_fallback(ns, exc)
+                if fallback:
+                    return fallback
+                raise
+        fallback = _page_info_cdp_fallback(ns, None)
+        if fallback:
+            return fallback
+        raise RuntimeError("browser_harness page_info is not available")
+
+    def _final_answer_count(data: Any) -> int | None:
+        if isinstance(data, list):
+            return len(data)
+        if isinstance(data, dict):
+            list_lengths = [len(value) for value in data.values() if isinstance(value, list)]
+            if list_lengths:
+                return sum(list_lengths)
+        return None
+
+    def _final_answer_preview(data: Any) -> Any:
+        if isinstance(data, list):
+            return data[:3]
+        if isinstance(data, dict):
+            preview: Dict[str, Any] = {}
+            for key, value in data.items():
+                preview[key] = value[:3] if isinstance(value, list) else value
+            return preview
+        text = str(data)
+        return text[:1000] + ("..." if len(text) > 1000 else "")
+
+    def set_final_answer(
+        data: Any,
+        artifact_name: str | None = None,
+        mime_type: str | None = None,
+    ) -> Dict[str, Any]:
+        """Persist the final user-facing answer for a later `done` call.
+
+        The full answer is written to `.final_answer.json` for the host and,
+        when `artifact_name` is supplied, copied as a user-visible artifact.
+        The Python `result` is only a compact readiness summary, avoiding huge
+        transcript prints as the source of truth.
+        """
+        nonlocal artifact_dir
+        if isinstance(data, str):
+            result_text = data
+            default_mime = "text/plain"
+            default_name = "final_answer.txt"
+        else:
+            result_text = json.dumps(data, ensure_ascii=False, indent=2, default=str)
+            default_mime = "application/json"
+            default_name = "final_answer.json"
+        artifact = None
+        if artifact_name:
+            artifact = _write_artifact(artifact_name, result_text, mime_type or default_mime)
+        count = _final_answer_count(data)
+        summary = {
+            "ready": True,
+            "count": count,
+            "artifact": artifact,
+            "preview": _final_answer_preview(data),
+        }
+        metadata = {
+            "result": result_text,
+            "summary": summary,
+            "artifact": artifact,
+        }
+        (artifact_dir / ".final_answer.json").write_text(
+            json.dumps(metadata, ensure_ascii=False, indent=2, default=str),
+            encoding="utf-8",
+        )
+        ns["final_answer"] = data
+        ns["final_answer_text"] = result_text
+        ns["result"] = {"final_answer": summary}
+        count_text = f" count={count}" if count is not None else ""
+        artifact_text = f" artifact={artifact['path']}" if artifact else ""
+        emit_output(f"final answer ready:{count_text}{artifact_text}")
+        return summary
+
+    def get_final_answer() -> Any:
+        return ns.get("final_answer")
 
     def emit_browser_live_url(live_url: str) -> None:
         _record_browser_event(ns, request_id, "browser.live_url", {"live_url": str(live_url)})
@@ -398,6 +644,12 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "emit_output": emit_output,
             "copy_artifact": copy_artifact,
             "emit_image": emit_image,
+            "capture_screenshot": capture_screenshot,
+            "screenshot_clip": screenshot_clip,
+            "screenshot": screenshot,
+            "page_info": page_info,
+            "set_final_answer": set_final_answer,
+            "get_final_answer": get_final_answer,
             "emit_browser_live_url": emit_browser_live_url,
             "emit_browser_state": emit_browser_state,
             "check_cancel": check_cancel,
@@ -405,6 +657,49 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "session_metadata": session_metadata,
         }
     )
+
+
+def _page_info_cdp_fallback(ns: Dict[str, Any], error: Exception | None) -> Dict[str, Any] | None:
+    helpers = ns.get("__browser_harness_helpers__")
+    if helpers is None:
+        return None
+    payload: Dict[str, Any] = {}
+    try:
+        tab = helpers.current_tab()
+        if isinstance(tab, dict):
+            if tab.get("url"):
+                payload["url"] = str(tab["url"])
+            if tab.get("title"):
+                payload["title"] = str(tab["title"])
+    except Exception:
+        pass
+    try:
+        metrics = helpers.cdp("Page.getLayoutMetrics")
+        viewport = metrics.get("cssVisualViewport") or metrics.get("cssLayoutViewport") or {}
+        layout = metrics.get("cssLayoutViewport") or {}
+        content = metrics.get("cssContentSize") or {}
+        width = viewport.get("clientWidth") or layout.get("clientWidth")
+        height = viewport.get("clientHeight") or layout.get("clientHeight")
+        page_x = viewport.get("pageX") or viewport.get("offsetX") or 0
+        page_y = viewport.get("pageY") or viewport.get("offsetY") or 0
+        page_width = content.get("width") or width
+        page_height = content.get("height") or height
+        if width is not None:
+            payload["w"] = round(float(width))
+        if height is not None:
+            payload["h"] = round(float(height))
+        payload["sx"] = round(float(page_x))
+        payload["sy"] = round(float(page_y))
+        if page_width is not None:
+            payload["pw"] = round(float(page_width))
+        if page_height is not None:
+            payload["ph"] = round(float(page_height))
+    except Exception:
+        pass
+    if error is not None:
+        payload["fallback"] = "cdp"
+        payload["page_info_error"] = str(error)
+    return payload or None
 
 
 def _auto_emit_browser_state(ns: Dict[str, Any], request_id: str) -> None:
@@ -535,13 +830,15 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
     code = str(request.get("code") or "")
     cancel_requested = bool(request.get("cancel_requested"))
     timeout_seconds = float(request.get("timeout_seconds") or 0)
-    ns = _namespace(session_id, cwd, artifact_dir)
-    _install_host_helpers(ns, request_id, cancel_requested)
     stdout = io.StringIO()
+    ns: Dict[str, Any] | None = None
     old_cwd = Path.cwd()
     old_alarm_handler: Any = None
     alarm_armed = False
     try:
+        with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
+            ns = _namespace(session_id, cwd, artifact_dir)
+            _install_host_helpers(ns, request_id, cancel_requested)
         cwd.mkdir(parents=True, exist_ok=True)
         os.chdir(cwd)
         if timeout_seconds > 0 and hasattr(signal, "SIGALRM"):
@@ -549,6 +846,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
             signal.signal(signal.SIGALRM, _raise_tool_timeout)
             signal.setitimer(signal.ITIMER_REAL, timeout_seconds)
             alarm_armed = True
+        assert ns is not None
         with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stdout):
             exec(compile(code, "<browser-use-python-worker>", "exec"), ns)
         _auto_emit_browser_state(ns, request_id)
@@ -567,19 +865,20 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
             "browser_harness_error": ns.get("browser_harness_error"),
         }
     except BaseException as exc:
-        _emit_browser_identity_events(ns, request_id)
+        if ns is not None:
+            _emit_browser_identity_events(ns, request_id)
         return {
             "id": request_id,
             "ok": False,
             "text": stdout.getvalue(),
             "error": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
             "data": None,
-            "outputs": _jsonable(ns.get("outputs") or []),
-            "artifacts": _jsonable(ns.get("artifacts") or []),
+            "outputs": _jsonable((ns or {}).get("outputs") or []),
+            "artifacts": _jsonable((ns or {}).get("artifacts") or []),
             "images": [],
-            "browser_events": _jsonable(ns.get("browser_events") or []),
-            "browser_harness_available": bool(ns.get("browser_harness_available")),
-            "browser_harness_error": ns.get("browser_harness_error"),
+            "browser_events": _jsonable((ns or {}).get("browser_events") or []),
+            "browser_harness_available": bool((ns or {}).get("browser_harness_available")),
+            "browser_harness_error": (ns or {}).get("browser_harness_error"),
         }
     finally:
         if alarm_armed:

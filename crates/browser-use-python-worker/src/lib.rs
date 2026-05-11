@@ -237,8 +237,20 @@ impl PythonWorker {
             if bytes == 0 {
                 bail!("python worker exited before responding");
             }
-            let value: Value =
-                serde_json::from_str(response.trim()).context("parse python worker line")?;
+            let trimmed = response.trim();
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(_) => {
+                    if !trimmed.is_empty() {
+                        on_event(PythonWorkerEvent {
+                            id: request.id.clone(),
+                            event: "worker.stdout".to_string(),
+                            payload: serde_json::json!({ "text": trimmed }),
+                        });
+                    }
+                    continue;
+                }
+            };
             if value.get("event").is_some() {
                 let event: PythonWorkerEvent =
                     serde_json::from_value(value).context("parse python worker event")?;
@@ -352,6 +364,54 @@ mod tests {
         assert_eq!(response.outputs[0]["text"], "chunk");
         assert_eq!(response.artifacts[0]["kind"], "file");
         assert_eq!(response.browser_events[0]["type"], "browser.live_url");
+        Ok(())
+    }
+
+    #[test]
+    fn worker_tolerates_non_json_stdout_lines() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let package = temp.path().join("llm_browser_worker");
+        std::fs::create_dir_all(&package)?;
+        std::fs::write(package.join("__init__.py"), "")?;
+        std::fs::write(
+            package.join("worker.py"),
+            r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    print("cloud startup chatter", flush=True)
+    print(json.dumps({
+        "id": request["id"],
+        "ok": True,
+        "text": "done",
+        "error": None,
+        "data": None,
+        "outputs": [],
+        "artifacts": [],
+        "images": [],
+        "browser_events": [],
+        "browser_harness_available": True,
+        "browser_harness_error": None,
+    }), flush=True)
+"#,
+        )?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", temp.path())?;
+        let mut events = Vec::new();
+        let response = worker.run_with_events(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "result = None",
+            |event| events.push(event),
+        )?;
+
+        assert!(response.ok, "{response:?}");
+        assert_eq!(response.text, "done");
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].event, "worker.stdout");
+        assert_eq!(events[0].payload["text"], "cloud startup chatter");
         Ok(())
     }
 

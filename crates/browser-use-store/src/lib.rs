@@ -813,6 +813,7 @@ fn row_to_run_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<RunSummary> {
 fn status_for_event(event_type: &str, payload: &Value) -> Option<SessionStatus> {
     match event_type {
         "session.input" => Some(SessionStatus::Running),
+        "session.followup" => Some(SessionStatus::Running),
         "session.done" => Some(SessionStatus::Done),
         "session.failed" => Some(SessionStatus::Failed),
         "session.cancelled" => Some(SessionStatus::Cancelled),
@@ -904,6 +905,36 @@ mod tests {
         assert_eq!(events.len(), 3);
         assert_eq!(events[1].event_type, "session.input");
         assert_eq!(events[2].payload["result"], "complete");
+        Ok(())
+    }
+
+    #[test]
+    fn followup_marks_session_running() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "open example"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "complete"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "continue"}),
+        )?;
+
+        assert_eq!(
+            store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
         Ok(())
     }
 
