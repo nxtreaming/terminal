@@ -587,7 +587,7 @@ impl App {
 
     fn execute_overlay_selection(&mut self) -> Result<()> {
         match self.overlay {
-            Overlay::Actions => match self.selected_row.min(6) {
+            Overlay::Actions => match self.selected_row.min(5) {
                 0 => {
                     self.selected_session_id = None;
                     self.close_overlay();
@@ -596,8 +596,7 @@ impl App {
                 2 => self.open_overlay(Overlay::History),
                 3 => self.open_overlay(Overlay::Setup),
                 4 => self.open_overlay(Overlay::Model),
-                5 => self.open_overlay(Overlay::Account),
-                _ => self.open_overlay(Overlay::Developer),
+                _ => self.open_overlay(Overlay::Account),
             },
             Overlay::History => {
                 let sessions = self.store.list_sessions()?;
@@ -743,7 +742,7 @@ impl App {
             Overlay::BrowserChoice => BROWSER_CHOICES.len(),
             Overlay::SetupComplete => 1,
             Overlay::History => self.store.list_sessions()?.len(),
-            Overlay::Actions => 7,
+            Overlay::Actions => 6,
             Overlay::Help | Overlay::Developer => 0,
         })
     }
@@ -1543,7 +1542,7 @@ mod tests {
         for _ in 0..50 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, 6);
+        assert_eq!(app.selected_row, 5);
 
         app.open_overlay(Overlay::BrowserChoice);
         for _ in 0..50 {

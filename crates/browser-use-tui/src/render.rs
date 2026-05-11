@@ -204,7 +204,7 @@ fn result_lines(state: &WorkbenchState) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     append_task_section(&mut lines, "Task", state);
     lines.push(Line::from(""));
-    append_activity_section(&mut lines, "What ran", state, false);
+    append_activity_section(&mut lines, "Steps", state, false);
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("Result", bold())));
     lines.push(Line::from(""));
@@ -414,7 +414,7 @@ fn render_setup(frame: &mut Frame<'_>, area: Rect, app: &App, first_run: bool) {
         lines.extend([
             selected(
                 &format!(
-                    "Sign in                  {}",
+                    "[1] Sign in              {}",
                     app.auth_status_for_account(&app.account)
                 ),
                 0,
@@ -423,7 +423,7 @@ fn render_setup(frame: &mut Frame<'_>, area: Rect, app: &App, first_run: bool) {
             Line::from(""),
             selected(
                 &format!(
-                    "Choose model             {}",
+                    "[2] Choose model         {}",
                     if app.model_configured {
                         app.model.as_str()
                     } else {
@@ -435,13 +435,13 @@ fn render_setup(frame: &mut Frame<'_>, area: Rect, app: &App, first_run: bool) {
             ),
             Line::from(""),
             selected(
-                &format!("Choose browser           {}", app.browser),
+                &format!("[3] Choose browser       {}", app.browser),
                 2,
                 app.selected_row,
             ),
             Line::from(""),
             Line::from(Span::styled(
-                "enter select     tab history     / actions",
+                "enter continue     tab history     / actions",
                 muted(),
             )),
         ]);
@@ -642,7 +642,6 @@ fn render_actions_overlay(frame: &mut Frame<'_>, area: Rect, app: &App) {
         "Setup",
         "Choose model",
         "Sign in",
-        "Developer trace",
     ];
     let rows = items
         .iter()
@@ -668,7 +667,6 @@ fn render_help_overlay(frame: &mut Frame<'_>, area: Rect) {
         ("tab", "previous work"),
         ("f2", "browser"),
         ("/", "actions"),
-        ("ctrl+e", "developer trace"),
         ("ctrl+c", "clear input, stop task, or quit"),
         ("esc", "close overlay"),
     ];
