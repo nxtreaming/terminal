@@ -3,10 +3,12 @@ use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{ModelEvent, ModelUsage, ToolCall, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
-use std::sync::Mutex;
+use std::sync::{Mutex, OnceLock};
+use std::time::{Duration, SystemTime};
 
 #[derive(Clone, Debug, Default)]
 pub struct ProviderTurn {
@@ -121,7 +123,7 @@ impl OpenAIResponsesProvider {
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            instructions: default_instructions().to_string(),
+            instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -179,7 +181,7 @@ impl ModelProvider for OpenAIResponsesProvider {
                 openai_error_message(&body)
             );
         }
-        parse_responses_output(&body)
+        parse_responses_output(&body, &self.model)
     }
 }
 
@@ -206,7 +208,7 @@ impl OpenAICompatibleChatProvider {
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            instructions: default_instructions().to_string(),
+            instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -269,7 +271,7 @@ impl ModelProvider for OpenAICompatibleChatProvider {
                 openai_error_message(&body)
             );
         }
-        parse_chat_completion_output(&body)
+        parse_chat_completion_output(&body, &self.model)
     }
 }
 
@@ -322,7 +324,7 @@ impl AnthropicMessagesProvider {
             credential,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            instructions: default_instructions().to_string(),
+            instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -397,7 +399,7 @@ impl ModelProvider for AnthropicMessagesProvider {
                 anthropic_error_message(&body)
             );
         }
-        parse_anthropic_messages_output(&body)
+        parse_anthropic_messages_output(&body, &self.model)
     }
 }
 
@@ -430,7 +432,7 @@ impl CodexResponsesProvider {
             auth,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
-            instructions: default_instructions().to_string(),
+            instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
         }
     }
@@ -493,7 +495,7 @@ impl ModelProvider for CodexResponsesProvider {
                 body.chars().take(1000).collect::<String>()
             );
         }
-        parse_codex_sse(response)
+        parse_codex_sse(response, &self.model)
     }
 }
 
@@ -590,19 +592,19 @@ fn account_id_from_id_token(id_token: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn parse_codex_sse(response: reqwest::blocking::Response) -> Result<Vec<ModelEvent>> {
+fn parse_codex_sse(response: reqwest::blocking::Response, model: &str) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
     let mut data_lines = Vec::new();
     let mut seen_tool_calls = std::collections::HashSet::new();
     for line in BufReader::new(response).lines() {
         let line = line.context("read Codex SSE line")?;
         if line.is_empty() {
-            flush_sse_event(&mut data_lines, &mut seen_tool_calls, &mut events)?;
+            flush_sse_event(&mut data_lines, &mut seen_tool_calls, &mut events, model)?;
         } else if let Some(data) = line.strip_prefix("data:") {
             data_lines.push(data.trim().to_string());
         }
     }
-    flush_sse_event(&mut data_lines, &mut seen_tool_calls, &mut events)?;
+    flush_sse_event(&mut data_lines, &mut seen_tool_calls, &mut events, model)?;
     if !events.iter().any(|event| matches!(event, ModelEvent::Done)) {
         events.push(ModelEvent::Done);
     }
@@ -613,6 +615,7 @@ fn flush_sse_event(
     data_lines: &mut Vec<String>,
     seen_tool_calls: &mut std::collections::HashSet<String>,
     events: &mut Vec<ModelEvent>,
+    model: &str,
 ) -> Result<()> {
     if data_lines.is_empty() {
         return Ok(());
@@ -643,7 +646,7 @@ fn flush_sse_event(
                         maybe_push_codex_output_item(item, seen_tool_calls, events)?;
                     }
                 }
-                if let Some(usage) = parse_usage(response.get("usage")) {
+                if let Some(usage) = parse_usage(response.get("usage"), model) {
                     events.push(ModelEvent::Usage { usage });
                 }
             }
@@ -676,18 +679,94 @@ fn maybe_push_codex_output_item(
     Ok(())
 }
 
-fn default_instructions() -> &'static str {
-    concat!(
-        "You are a browser-use agent. Use the python tool for browser work and call done when the user-facing task is complete.\n",
-        "\n",
-        "The python tool runs in a persistent namespace with browser-harness helpers already imported when available. ",
-        "For browser tasks, start with goto_url(url), then use wait_for_load(), wait_for_element(), page_info(), js(...), ",
-        "fill_input(selector, text), click_at_xy(x, y), press_key(key), scroll(...), wait_for_network_idle(), ",
-        "capture_screenshot(...), current_tab(), list_tabs(), switch_tab(...), new_tab(...), cdp(...), and drain_events(). ",
-        "Do not import or install Playwright, Selenium, or Pyppeteer; the browser connection is already provided by these helpers. ",
-        "Use requests/http_get only after the browser path reveals a stable static endpoint or for downloaded files. ",
-        "Use copy_artifact() and emit_image() for user-visible files and screenshots."
-    )
+fn default_instructions() -> String {
+    let mut instructions = include_str!("../../../prompts/browser-agent-system.md")
+        .trim()
+        .to_string();
+    instructions.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
+    instructions.push_str(
+        "\n\nThese are the same interaction-skill playbooks from browser-harness. Apply the relevant section when the page mechanic appears.",
+    );
+    for (path, content) in browser_harness_interaction_skills() {
+        instructions.push_str("\n\n### ");
+        instructions.push_str(path);
+        instructions.push_str("\n\n");
+        instructions.push_str(content.trim());
+    }
+    instructions
+}
+
+fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "interaction-skills/connection.md",
+            include_str!("../../../prompts/interaction-skills/connection.md"),
+        ),
+        (
+            "interaction-skills/cookies.md",
+            include_str!("../../../prompts/interaction-skills/cookies.md"),
+        ),
+        (
+            "interaction-skills/cross-origin-iframes.md",
+            include_str!("../../../prompts/interaction-skills/cross-origin-iframes.md"),
+        ),
+        (
+            "interaction-skills/dialogs.md",
+            include_str!("../../../prompts/interaction-skills/dialogs.md"),
+        ),
+        (
+            "interaction-skills/downloads.md",
+            include_str!("../../../prompts/interaction-skills/downloads.md"),
+        ),
+        (
+            "interaction-skills/drag-and-drop.md",
+            include_str!("../../../prompts/interaction-skills/drag-and-drop.md"),
+        ),
+        (
+            "interaction-skills/dropdowns.md",
+            include_str!("../../../prompts/interaction-skills/dropdowns.md"),
+        ),
+        (
+            "interaction-skills/iframes.md",
+            include_str!("../../../prompts/interaction-skills/iframes.md"),
+        ),
+        (
+            "interaction-skills/network-requests.md",
+            include_str!("../../../prompts/interaction-skills/network-requests.md"),
+        ),
+        (
+            "interaction-skills/print-as-pdf.md",
+            include_str!("../../../prompts/interaction-skills/print-as-pdf.md"),
+        ),
+        (
+            "interaction-skills/profile-sync.md",
+            include_str!("../../../prompts/interaction-skills/profile-sync.md"),
+        ),
+        (
+            "interaction-skills/screenshots.md",
+            include_str!("../../../prompts/interaction-skills/screenshots.md"),
+        ),
+        (
+            "interaction-skills/scrolling.md",
+            include_str!("../../../prompts/interaction-skills/scrolling.md"),
+        ),
+        (
+            "interaction-skills/shadow-dom.md",
+            include_str!("../../../prompts/interaction-skills/shadow-dom.md"),
+        ),
+        (
+            "interaction-skills/tabs.md",
+            include_str!("../../../prompts/interaction-skills/tabs.md"),
+        ),
+        (
+            "interaction-skills/uploads.md",
+            include_str!("../../../prompts/interaction-skills/uploads.md"),
+        ),
+        (
+            "interaction-skills/viewport.md",
+            include_str!("../../../prompts/interaction-skills/viewport.md"),
+        ),
+    ]
 }
 
 fn tool_specs_to_responses_tools(tools: &[ToolSpec]) -> Vec<Value> {
@@ -735,6 +814,7 @@ fn tool_specs_to_anthropic_tools(tools: &[ToolSpec]) -> Vec<Value> {
 
 fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
     let mut input = Vec::new();
+    let mut seen_tool_calls = HashSet::new();
     for message in messages {
         let role = message
             .get("role")
@@ -746,11 +826,21 @@ fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .context("tool message missing tool_call_id")?;
-                input.push(json!({
-                    "type": "function_call_output",
-                    "call_id": call_id,
-                    "output": message_content_as_responses_output(message),
-                }));
+                if seen_tool_calls.contains(call_id) {
+                    input.push(json!({
+                        "type": "function_call_output",
+                        "call_id": call_id,
+                        "output": tool_output_text(message),
+                    }));
+                    if let Some(visual_context) = responses_visual_context_message(message, call_id)
+                    {
+                        input.push(visual_context);
+                    }
+                } else if let Some(orphan_context) =
+                    responses_orphan_tool_context_message(message, call_id)
+                {
+                    input.push(orphan_context);
+                }
             }
             "system" => {
                 let content = message_content_as_text(message);
@@ -781,6 +871,13 @@ fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
                         .into_iter()
                         .flatten()
                     {
+                        if let Some(call_id) = call
+                            .get("id")
+                            .or_else(|| call.get("call_id"))
+                            .and_then(Value::as_str)
+                        {
+                            seen_tool_calls.insert(call_id.to_string());
+                        }
                         input.push(tool_call_to_responses_input(call)?);
                     }
                 }
@@ -788,6 +885,28 @@ fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
         }
     }
     Ok(input)
+}
+
+fn responses_orphan_tool_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let text = tool_output_text(message);
+    let images = tool_output_images(message);
+    if text.trim().is_empty() && images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": format!(
+            "Tool output retained as context after history compaction. Original tool call {call_id} ({}):\n{}",
+            tool_name(message),
+            text,
+        ),
+    })];
+    content.extend(images);
+    Some(json!({
+        "type": "message",
+        "role": "user",
+        "content": content,
+    }))
 }
 
 fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
@@ -798,14 +917,20 @@ fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
             .and_then(Value::as_str)
             .unwrap_or("user");
         match role {
-            "tool" => out.push(json!({
-                "role": "tool",
-                "tool_call_id": message
+            "tool" => {
+                let call_id = message
                     .get("tool_call_id")
                     .and_then(Value::as_str)
-                    .context("tool message missing tool_call_id")?,
-                "content": message_content_as_text(message),
-            })),
+                    .context("tool message missing tool_call_id")?;
+                out.push(json!({
+                    "role": "tool",
+                    "tool_call_id": call_id,
+                    "content": tool_output_text(message),
+                }));
+                if let Some(visual_context) = chat_visual_context_message(message, call_id) {
+                    out.push(visual_context);
+                }
+            }
             "assistant" => {
                 let mut item = json!({
                     "role": "assistant",
@@ -895,17 +1020,23 @@ fn messages_to_anthropic_messages(messages: &[Value]) -> Result<Vec<Value>> {
                 "role": "assistant",
                 "content": anthropic_assistant_content(message)?,
             })),
-            "tool" => out.push(json!({
-                "role": "user",
-                "content": [{
-                    "type": "tool_result",
-                    "tool_use_id": message
-                        .get("tool_call_id")
-                        .and_then(Value::as_str)
-                        .context("tool message missing tool_call_id")?,
-                    "content": message_content_as_text(message),
-                }],
-            })),
+            "tool" => {
+                let call_id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .context("tool message missing tool_call_id")?;
+                out.push(json!({
+                    "role": "user",
+                    "content": [{
+                        "type": "tool_result",
+                        "tool_use_id": call_id,
+                        "content": tool_output_text(message),
+                    }],
+                }));
+                if let Some(visual_context) = anthropic_visual_context_message(message, call_id) {
+                    out.push(visual_context);
+                }
+            }
             "system" => out.push(json!({
                 "role": "user",
                 "content": [{
@@ -1064,43 +1195,117 @@ fn message_content_as_text(message: &Value) -> String {
     }
 }
 
-fn message_content_as_responses_output(message: &Value) -> Value {
+fn tool_output_text(message: &Value) -> String {
+    let Some(Value::Array(parts)) = message.get("content") else {
+        return message_content_as_text(message);
+    };
+    let mut text_parts = Vec::new();
+    let mut image_count = 0;
+    for part in parts {
+        match part.get("type").and_then(Value::as_str) {
+            Some("input_image") => image_count += 1,
+            Some("output_text") | Some("input_text") | Some("text") | None => {
+                if let Some(text) = part.get("text").and_then(Value::as_str) {
+                    if !text.is_empty() {
+                        text_parts.push(text.to_string());
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+    if image_count > 0 {
+        text_parts.push(format!(
+            "[{image_count} screenshot image(s) attached in the following visual context message]"
+        ));
+    }
+    text_parts.join("\n")
+}
+
+fn tool_output_images(message: &Value) -> Vec<Value> {
     match message.get("content") {
-        Some(Value::Array(parts)) => Value::Array(
-            parts
-                .iter()
-                .filter_map(|part| normalize_tool_output_part(part))
-                .collect(),
-        ),
-        _ => Value::String(message_content_as_text(message)),
+        Some(Value::Array(parts)) => parts.iter().filter_map(normalize_tool_image_part).collect(),
+        _ => Vec::new(),
     }
 }
 
-fn normalize_tool_output_part(part: &Value) -> Option<Value> {
-    match part.get("type").and_then(Value::as_str) {
-        Some("input_image") => {
-            let image_url = part.get("image_url").and_then(Value::as_str)?;
-            let mut out = json!({
-                "type": "input_image",
-                "image_url": image_url,
-            });
-            if let Some(detail) = part.get("detail").and_then(Value::as_str) {
-                out["detail"] = json!(detail);
-            }
-            Some(out)
-        }
-        Some("output_text") | Some("input_text") | Some("text") | None => part
-            .get("text")
-            .and_then(Value::as_str)
-            .filter(|text| !text.is_empty())
-            .map(|text| {
-                json!({
-                    "type": "input_text",
-                    "text": text,
-                })
-            }),
-        _ => None,
+fn normalize_tool_image_part(part: &Value) -> Option<Value> {
+    if part.get("type").and_then(Value::as_str) != Some("input_image") {
+        return None;
     }
+    let image_url = part.get("image_url").and_then(Value::as_str)?;
+    let mut out = json!({
+        "type": "input_image",
+        "image_url": image_url,
+    });
+    if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+        out["detail"] = json!(detail);
+    }
+    Some(out)
+}
+
+fn visual_context_text(call_id: &str, tool_name: &str) -> String {
+    format!(
+        "Visual context from tool call {call_id} ({tool_name}). Use these screenshots to verify the browser state before continuing. Do not call screenshot again unless the page changed or you need a different visual region."
+    )
+}
+
+fn tool_name(message: &Value) -> &str {
+    message
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+}
+
+fn responses_visual_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let images = tool_output_images(message);
+    if images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": visual_context_text(call_id, tool_name(message)),
+    })];
+    content.extend(images);
+    Some(json!({
+        "type": "message",
+        "role": "user",
+        "content": content,
+    }))
+}
+
+fn chat_visual_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let images = tool_output_images(message);
+    if images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": visual_context_text(call_id, tool_name(message)),
+    })];
+    content.extend(images);
+    let visual_message = json!({ "content": content });
+    Some(json!({
+        "role": "user",
+        "content": chat_content(&visual_message),
+    }))
+}
+
+fn anthropic_visual_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let images = tool_output_images(message);
+    if images.is_empty() {
+        return None;
+    }
+    let mut content = vec![json!({
+        "type": "input_text",
+        "text": visual_context_text(call_id, tool_name(message)),
+    })];
+    content.extend(images);
+    let visual_message = json!({ "content": content });
+    Some(json!({
+        "role": "user",
+        "content": anthropic_user_content(&visual_message),
+    }))
 }
 
 fn tool_call_to_responses_input(call: &Value) -> Result<Value> {
@@ -1129,7 +1334,7 @@ fn json_string(value: Value) -> Result<String> {
     }
 }
 
-fn parse_responses_output(body: &Value) -> Result<Vec<ModelEvent>> {
+fn parse_responses_output(body: &Value, model: &str) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
     if let Some(items) = body.get("output").and_then(Value::as_array) {
         for item in items {
@@ -1148,14 +1353,14 @@ fn parse_responses_output(body: &Value) -> Result<Vec<ModelEvent>> {
             }
         }
     }
-    if let Some(usage) = parse_usage(body.get("usage")) {
+    if let Some(usage) = parse_usage(body.get("usage"), model) {
         events.push(ModelEvent::Usage { usage });
     }
     events.push(ModelEvent::Done);
     Ok(events)
 }
 
-fn parse_chat_completion_output(body: &Value) -> Result<Vec<ModelEvent>> {
+fn parse_chat_completion_output(body: &Value, model: &str) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
     let Some(message) = body
         .get("choices")
@@ -1202,14 +1407,14 @@ fn parse_chat_completion_output(body: &Value) -> Result<Vec<ModelEvent>> {
             },
         });
     }
-    if let Some(usage) = parse_chat_usage(body.get("usage")) {
+    if let Some(usage) = parse_chat_usage(body.get("usage"), model) {
         events.push(ModelEvent::Usage { usage });
     }
     events.push(ModelEvent::Done);
     Ok(events)
 }
 
-fn parse_anthropic_messages_output(body: &Value) -> Result<Vec<ModelEvent>> {
+fn parse_anthropic_messages_output(body: &Value, model: &str) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
     for block in body
         .get("content")
@@ -1245,7 +1450,7 @@ fn parse_anthropic_messages_output(body: &Value) -> Result<Vec<ModelEvent>> {
             _ => {}
         }
     }
-    if let Some(usage) = parse_usage(body.get("usage")) {
+    if let Some(usage) = parse_usage(body.get("usage"), model) {
         events.push(ModelEvent::Usage { usage });
     }
     events.push(ModelEvent::Done);
@@ -1298,30 +1503,259 @@ fn parse_response_output_item(item: &Value, events: &mut Vec<ModelEvent>) -> Res
     Ok(())
 }
 
-fn parse_usage(usage: Option<&Value>) -> Option<ModelUsage> {
+fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
     let usage = usage?;
-    Some(ModelUsage {
-        input_tokens: usage.get("input_tokens").and_then(Value::as_i64),
-        output_tokens: usage.get("output_tokens").and_then(Value::as_i64),
-        total_tokens: usage.get("total_tokens").and_then(Value::as_i64),
+    let input_tokens = usage
+        .get("input_tokens")
+        .or_else(|| usage.get("prompt_tokens"))
+        .and_then(Value::as_i64);
+    let output_tokens = usage
+        .get("output_tokens")
+        .or_else(|| usage.get("completion_tokens"))
+        .and_then(Value::as_i64);
+    let total_tokens = usage
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .or_else(|| Some(input_tokens? + output_tokens?));
+    let usage = ModelUsage {
+        input_tokens,
+        input_cached_tokens: usage
+            .get("input_tokens_details")
+            .and_then(|details| details.get("cached_tokens"))
+            .or_else(|| {
+                usage
+                    .get("prompt_tokens_details")
+                    .and_then(|details| details.get("cached_tokens"))
+            })
+            .or_else(|| usage.get("cache_read_input_tokens"))
+            .and_then(Value::as_i64),
+        input_cache_creation_tokens: usage
+            .get("cache_creation_input_tokens")
+            .or_else(|| usage.get("prompt_cache_creation_tokens"))
+            .and_then(Value::as_i64),
+        output_tokens,
+        total_tokens,
+        input_cost_usd: None,
+        input_cached_cost_usd: None,
+        input_cache_creation_cost_usd: None,
+        output_cost_usd: None,
         cost_usd: None,
+    };
+    Some(add_usage_cost(model, usage))
+}
+
+fn parse_chat_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
+    parse_usage(usage, model)
+}
+
+#[derive(Clone, Debug, Default)]
+struct ModelPricing {
+    input_cost_per_token: Option<f64>,
+    output_cost_per_token: Option<f64>,
+    cache_read_input_token_cost: Option<f64>,
+    cache_creation_input_token_cost: Option<f64>,
+}
+
+fn add_usage_cost(model: &str, mut usage: ModelUsage) -> ModelUsage {
+    if !calculate_cost_enabled() {
+        return usage;
+    }
+    let Some(pricing) = model_pricing(model) else {
+        return usage;
+    };
+    let input_tokens = usage.input_tokens.unwrap_or(0).max(0);
+    let cached_tokens = usage.input_cached_tokens.unwrap_or(0).max(0);
+    let cache_creation_tokens = usage.input_cache_creation_tokens.unwrap_or(0).max(0);
+    let output_tokens = usage.output_tokens.unwrap_or(0).max(0);
+    let uncached_input_tokens = input_tokens.saturating_sub(cached_tokens);
+
+    usage.input_cost_usd = pricing
+        .input_cost_per_token
+        .map(|price| uncached_input_tokens as f64 * price);
+    usage.input_cached_cost_usd = if cached_tokens > 0 {
+        pricing
+            .cache_read_input_token_cost
+            .map(|price| cached_tokens as f64 * price)
+    } else {
+        None
+    };
+    usage.input_cache_creation_cost_usd = if cache_creation_tokens > 0 {
+        pricing
+            .cache_creation_input_token_cost
+            .map(|price| cache_creation_tokens as f64 * price)
+    } else {
+        None
+    };
+    usage.output_cost_usd = pricing
+        .output_cost_per_token
+        .map(|price| output_tokens as f64 * price);
+
+    let total = usage.input_cost_usd.unwrap_or(0.0)
+        + usage.input_cached_cost_usd.unwrap_or(0.0)
+        + usage.input_cache_creation_cost_usd.unwrap_or(0.0)
+        + usage.output_cost_usd.unwrap_or(0.0);
+    if total > 0.0 {
+        usage.cost_usd = Some(total);
+    }
+    usage
+}
+
+fn calculate_cost_enabled() -> bool {
+    std::env::var("BU_USE_CALCULATE_COST")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
+}
+
+fn model_pricing(model: &str) -> Option<ModelPricing> {
+    custom_model_pricing(model).or_else(|| pricing_from_litellm(model))
+}
+
+fn custom_model_pricing(model: &str) -> Option<ModelPricing> {
+    let pricing = match model {
+        "accounts/fireworks/models/glm-4p7" => ModelPricing {
+            input_cost_per_token: Some(0.60 / 1_000_000.0),
+            output_cost_per_token: Some(2.20 / 1_000_000.0),
+            ..Default::default()
+        },
+        "accounts/fireworks/models/glm-4p7-flash" => ModelPricing {
+            input_cost_per_token: Some(0.07 / 1_000_000.0),
+            output_cost_per_token: Some(0.40 / 1_000_000.0),
+            ..Default::default()
+        },
+        "accounts/fireworks/models/glm-5" => ModelPricing {
+            input_cost_per_token: Some(1.00 / 1_000_000.0),
+            output_cost_per_token: Some(3.20 / 1_000_000.0),
+            cache_read_input_token_cost: Some(0.20 / 1_000_000.0),
+            ..Default::default()
+        },
+        "accounts/fireworks/models/kimi-k2p5" | "kimi-k2.5" => ModelPricing {
+            input_cost_per_token: Some(0.60 / 1_000_000.0),
+            output_cost_per_token: Some(3.00 / 1_000_000.0),
+            cache_read_input_token_cost: Some(0.10 / 1_000_000.0),
+            ..Default::default()
+        },
+        "accounts/fireworks/models/minimax-m2p5" => ModelPricing {
+            input_cost_per_token: Some(0.30 / 1_000_000.0),
+            output_cost_per_token: Some(1.20 / 1_000_000.0),
+            cache_read_input_token_cost: Some(0.029 / 1_000_000.0),
+            ..Default::default()
+        },
+        _ => return None,
+    };
+    Some(pricing)
+}
+
+fn pricing_from_litellm(model: &str) -> Option<ModelPricing> {
+    let pricing_data = litellm_pricing_data()?;
+    let model_data = find_model_pricing_data(pricing_data, model)?;
+    Some(ModelPricing {
+        input_cost_per_token: model_data
+            .get("input_cost_per_token")
+            .and_then(Value::as_f64),
+        output_cost_per_token: model_data
+            .get("output_cost_per_token")
+            .and_then(Value::as_f64),
+        cache_read_input_token_cost: model_data
+            .get("cache_read_input_token_cost")
+            .and_then(Value::as_f64),
+        cache_creation_input_token_cost: model_data
+            .get("cache_creation_input_token_cost")
+            .and_then(Value::as_f64),
     })
 }
 
-fn parse_chat_usage(usage: Option<&Value>) -> Option<ModelUsage> {
-    let usage = usage?;
-    Some(ModelUsage {
-        input_tokens: usage
-            .get("prompt_tokens")
-            .or_else(|| usage.get("input_tokens"))
-            .and_then(Value::as_i64),
-        output_tokens: usage
-            .get("completion_tokens")
-            .or_else(|| usage.get("output_tokens"))
-            .and_then(Value::as_i64),
-        total_tokens: usage.get("total_tokens").and_then(Value::as_i64),
-        cost_usd: None,
-    })
+fn find_model_pricing_data<'a>(
+    pricing_data: &'a HashMap<String, Value>,
+    model: &str,
+) -> Option<&'a Value> {
+    if let Some(data) = pricing_data.get(model) {
+        return Some(data);
+    }
+    if let Some(mapped) = model_to_litellm(model) {
+        if let Some(data) = pricing_data.get(mapped) {
+            return Some(data);
+        }
+    }
+    for prefix in ["anthropic/", "openai/", "google/", "azure/", "bedrock/"] {
+        let prefixed = format!("{prefix}{model}");
+        if let Some(data) = pricing_data.get(&prefixed) {
+            return Some(data);
+        }
+    }
+    if let Some((_, bare)) = model.split_once('/') {
+        if let Some(data) = pricing_data.get(bare) {
+            return Some(data);
+        }
+    }
+    None
+}
+
+fn model_to_litellm(model: &str) -> Option<&'static str> {
+    match model {
+        "gemini-flash-latest" => Some("gemini/gemini-flash-latest"),
+        _ => None,
+    }
+}
+
+fn litellm_pricing_data() -> Option<&'static HashMap<String, Value>> {
+    static PRICING_DATA: OnceLock<Option<HashMap<String, Value>>> = OnceLock::new();
+    PRICING_DATA.get_or_init(load_litellm_pricing_data).as_ref()
+}
+
+fn load_litellm_pricing_data() -> Option<HashMap<String, Value>> {
+    let cache_path = pricing_cache_dir().join("model_prices_and_context_window.json");
+    if cache_path.exists() && cache_file_fresh(&cache_path) {
+        if let Ok(raw) = fs::read_to_string(&cache_path) {
+            if let Ok(data) = serde_json::from_str::<HashMap<String, Value>>(&raw) {
+                return Some(data);
+            }
+        }
+    }
+
+    let response = reqwest::blocking::Client::new()
+        .get("https://raw.githubusercontent.com/BerriAI/litellm/main/model_prices_and_context_window.json")
+        .send()
+        .ok()?;
+    if !response.status().is_success() {
+        return None;
+    }
+    let raw = response.text().ok()?;
+    let data = serde_json::from_str::<HashMap<String, Value>>(&raw).ok()?;
+    if let Some(parent) = cache_path.parent() {
+        let _ = fs::create_dir_all(parent);
+    }
+    let _ = fs::write(cache_path, raw);
+    Some(data)
+}
+
+fn pricing_cache_dir() -> PathBuf {
+    if let Ok(path) = std::env::var("XDG_CACHE_HOME") {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            return path.join("bu_use").join("token_cost");
+        }
+    }
+    std::env::var("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|_| PathBuf::from("."))
+        .join(".cache")
+        .join("bu_use")
+        .join("token_cost")
+}
+
+fn cache_file_fresh(path: &Path) -> bool {
+    let Ok(modified) = path.metadata().and_then(|metadata| metadata.modified()) else {
+        return false;
+    };
+    SystemTime::now()
+        .duration_since(modified)
+        .unwrap_or(Duration::MAX)
+        < Duration::from_secs(24 * 60 * 60)
 }
 
 fn openai_error_message(body: &Value) -> String {
@@ -1408,19 +1842,75 @@ mod tests {
     }
 
     #[test]
-    fn responses_input_preserves_tool_output_image_parts() -> Result<()> {
-        let input = messages_to_responses_input(&[json!({
-            "role": "tool",
-            "tool_call_id": "call_1",
-            "content": [
-                {"type": "output_text", "text": "screenshot"},
-                {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
-            ]
-        })])?;
-        assert_eq!(input[0]["type"], "function_call_output");
-        assert_eq!(input[0]["call_id"], "call_1");
-        assert_eq!(input[0]["output"][0]["type"], "input_text");
-        assert_eq!(input[0]["output"][1]["type"], "input_image");
+    fn responses_input_moves_tool_output_images_to_visual_context_message() -> Result<()> {
+        let input = messages_to_responses_input(&[
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_1",
+                    "name": "python",
+                    "arguments": {"code": "screenshot('x')"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_1",
+                "name": "python",
+                "content": [
+                    {"type": "output_text", "text": "screenshot"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
+                ]
+            }),
+        ])?;
+        assert_eq!(input[0]["type"], "function_call");
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_1");
+        assert!(input[1]["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("following visual context message"));
+        assert_eq!(input[2]["type"], "message");
+        assert_eq!(input[2]["role"], "user");
+        assert_eq!(input[2]["content"][0]["type"], "input_text");
+        assert_eq!(input[2]["content"][1]["type"], "input_image");
+        assert_eq!(
+            input[2]["content"][1]["image_url"],
+            "data:image/png;base64,abc"
+        );
+        assert_eq!(input[2]["content"][1]["detail"], "auto");
+        Ok(())
+    }
+
+    #[test]
+    fn responses_input_converts_orphan_tool_output_to_context_message() -> Result<()> {
+        let input = messages_to_responses_input(&[
+            json!({
+                "role": "system",
+                "content": "compacted context"
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "missing_call",
+                "name": "python",
+                "content": [
+                    {"type": "output_text", "text": "screenshot"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
+                ]
+            }),
+        ])?;
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["type"], "message");
+        assert_eq!(input[1]["role"], "user");
+        assert_eq!(input[1]["content"][0]["type"], "input_text");
+        assert!(input[1]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Tool output retained as context"));
+        assert_eq!(input[1]["content"][1]["type"], "input_image");
+        assert!(!input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("function_call_output")
+                && item.get("call_id").and_then(Value::as_str) == Some("missing_call")
+        }));
         Ok(())
     }
 
@@ -1511,6 +2001,7 @@ mod tests {
                 output_tokens: Some(4),
                 total_tokens: Some(7),
                 cost_usd: None,
+                ..Default::default()
             },
         }));
         assert!(events.contains(&ModelEvent::Done));
@@ -1587,6 +2078,7 @@ mod tests {
                 output_tokens: Some(7),
                 total_tokens: Some(18),
                 cost_usd: None,
+                ..Default::default()
             }
         }));
         assert!(events.contains(&ModelEvent::Done));
@@ -1653,6 +2145,7 @@ mod tests {
                 output_tokens: Some(6),
                 total_tokens: Some(11),
                 cost_usd: None,
+                ..Default::default()
             }
         }));
         Ok(())
@@ -1712,8 +2205,9 @@ mod tests {
             usage: ModelUsage {
                 input_tokens: Some(7),
                 output_tokens: Some(8),
-                total_tokens: None,
+                total_tokens: Some(15),
                 cost_usd: None,
+                ..Default::default()
             }
         }));
         Ok(())
@@ -1749,11 +2243,41 @@ mod tests {
             usage: ModelUsage {
                 input_tokens: Some(1),
                 output_tokens: Some(2),
-                total_tokens: None,
+                total_tokens: Some(3),
                 cost_usd: None,
+                ..Default::default()
             }
         }));
         Ok(())
+    }
+
+    #[test]
+    fn default_instructions_preserve_bitter_cdp_browser_harness_contract() {
+        let instructions = default_instructions();
+        for expected in [
+            "bitter lesson",
+            "Raw CDP is the center",
+            "source of truth",
+            "new_tab(url)",
+            "not `goto_url(url)`",
+            "Prefer coordinate clicks",
+            "Chrome hit-testing handles iframes",
+            "screenshot(\"label\")",
+            "input_image",
+            "agent_helpers.py",
+            "Browser interaction tool",
+            "Loaded Browser-Harness Interaction Skills",
+            "interaction-skills/screenshots.md",
+            "interaction-skills/tabs.md",
+            "interaction-skills/dialogs.md",
+            "Do not build manager layers",
+            "Do not import or install Playwright",
+        ] {
+            assert!(
+                instructions.contains(expected),
+                "missing {expected:?} from default instructions:\n{instructions}"
+            );
+        }
     }
 
     fn spawn_mock_server(

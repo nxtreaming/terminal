@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::io::{self, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
@@ -393,6 +393,7 @@ struct DatasetProviderConfig<'a> {
 }
 
 fn main() -> Result<()> {
+    load_dotenv()?;
     let args = Args::parse();
     let store = Store::open(&args.state_dir)?;
     match args.command {
@@ -599,6 +600,44 @@ fn main() -> Result<()> {
     }
 }
 
+fn load_dotenv() -> Result<()> {
+    let path = Path::new(".env");
+    if !path.exists() {
+        return Ok(());
+    }
+    let contents =
+        std::fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    for line in contents.lines() {
+        let line = line.trim();
+        if line.is_empty() || line.starts_with('#') {
+            continue;
+        }
+        let Some((key, value)) = line.split_once('=') else {
+            continue;
+        };
+        let key = key.trim();
+        if key.is_empty() || std::env::var_os(key).is_some() {
+            continue;
+        }
+        let value = unquote_env_value(value.trim());
+        unsafe {
+            std::env::set_var(key, value);
+        }
+    }
+    Ok(())
+}
+
+fn unquote_env_value(value: &str) -> String {
+    if value.len() >= 2
+        && ((value.starts_with('"') && value.ends_with('"'))
+            || (value.starts_with('\'') && value.ends_with('\'')))
+    {
+        value[1..value.len() - 1].to_string()
+    } else {
+        value.to_string()
+    }
+}
+
 fn sessions(store: &Store, command: SessionsCommand) -> Result<()> {
     match command {
         SessionsCommand::List => history(store),
@@ -639,7 +678,14 @@ fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<
 }
 
 fn cli_agent_options() -> AgentRunOptions {
-    AgentRunOptions::default().with_browser_mode("headless")
+    AgentRunOptions::default().with_browser_mode(cli_browser_mode())
+}
+
+fn cli_browser_mode() -> String {
+    std::env::var("LLM_BROWSER_BROWSER_MODE")
+        .ok()
+        .filter(|mode| !mode.trim().is_empty())
+        .unwrap_or_else(|| "headless".to_string())
 }
 
 fn cli_agent_options_with(max_turns: usize, python_timeout_seconds: u64) -> AgentRunOptions {
@@ -952,7 +998,7 @@ fn default_settings() -> Vec<(&'static str, &'static str)> {
         ("account", "Codex login"),
         ("model", "GPT-5.5"),
         ("provider.model", "gpt-5.5"),
-        ("browser", "Local Chrome"),
+        ("browser", "Browser Use cloud"),
         ("agent.backend", "codex"),
         ("setup.complete", "0"),
     ]
@@ -1890,7 +1936,7 @@ fn run_dataset_case_with_provider<P: ModelProvider>(
         cli_agent_options_with(config.max_turns, config.python_timeout_seconds),
     )
     .err()
-    .map(|error| error.to_string());
+    .map(|error| format!("{error:#}"));
     dataset_attempt_result(store, case, &session_id, config, attempt, run_error)
 }
 
@@ -1906,6 +1952,7 @@ fn dataset_attempt_result(
     let events = store.events_for_session(session_id)?;
     let final_result = result_from_events(&events);
     let final_result_chars = final_result.as_deref().map(str::len).unwrap_or(0);
+    let usage = usage_summary_from_events(&events);
     let session_failure = failure_from_events(&events);
     let error = run_error.clone().or(session_failure.clone());
     let error_type = if run_error.is_some() {
@@ -1927,6 +1974,7 @@ fn dataset_attempt_result(
         "attempt_number": attempt,
         "provider": config.provider,
         "model": config.model,
+        "usage": usage,
         "final_result": final_result,
         "final_result_chars": final_result_chars,
         "error_type": error_type,
@@ -2079,10 +2127,11 @@ fn cases_from_manifest_selection(
 }
 
 fn build_dataset_prompt(case: &DatasetCase) -> String {
-    format!(
-        "You are running a browser-use dataset case.\n\nDataset: {}\nTask ID: {}\n\nTask:\n{}\n\nUse the python tool for browser interaction. The python tool owns the browser connection and exposes browser-harness helpers plus raw CDP access when needed. Prefer robust DOM/CDP observations over guessing. Attach screenshots after meaningful visual transitions when they help audit the run. Return the final answer with the done tool only when the task is complete.",
-        case.dataset, case.task_id, case.confirmed_task
-    )
+    include_str!("../../../prompts/dataset-case-user.md")
+        .trim()
+        .replace("{{dataset}}", &case.dataset)
+        .replace("{{task_id}}", &case.task_id)
+        .replace("{{task}}", &case.confirmed_task)
 }
 
 fn dataset_case_manifest(case: &DatasetCase) -> Value {
@@ -2111,8 +2160,8 @@ fn new_dataset_manifest(
         "created_ms": now_ms(),
         "provider": config.provider,
         "model": config.model,
-        "headless": true,
-        "browser": "headless",
+        "headless": cli_browser_mode() != "cloud",
+        "browser": cli_browser_mode(),
         "selection": cases.iter().map(dataset_case_manifest).collect::<Vec<_>>(),
         "summary": {
             "count": cases.len(),
@@ -2120,6 +2169,7 @@ fn new_dataset_manifest(
             "passed": 0,
             "failed": 0,
             "pending": cases.len(),
+            "usage": empty_usage_summary(),
         },
         "sessions": [],
     })
@@ -2276,7 +2326,109 @@ fn summarize_dataset_manifest(manifest: &Value) -> Value {
         "failed_ids": failed_ids,
         "pending_ids": pending_ids,
         "attempts_by_task": attempts,
+        "usage": usage_summary_from_manifest(manifest),
     })
+}
+
+fn usage_summary_from_events(events: &[browser_use_protocol::EventRecord]) -> Value {
+    let mut input_tokens = 0_i64;
+    let mut input_cached_tokens = 0_i64;
+    let mut input_cache_creation_tokens = 0_i64;
+    let mut output_tokens = 0_i64;
+    let mut total_tokens = 0_i64;
+    let mut input_cost_usd = 0.0_f64;
+    let mut input_cached_cost_usd = 0.0_f64;
+    let mut input_cache_creation_cost_usd = 0.0_f64;
+    let mut output_cost_usd = 0.0_f64;
+    let mut cost_usd = 0.0_f64;
+    let mut invocation_count = 0_i64;
+
+    for event in events {
+        if event.event_type != "model.usage" {
+            continue;
+        }
+        invocation_count += 1;
+        input_tokens += json_i64(&event.payload, "input_tokens");
+        input_cached_tokens += json_i64(&event.payload, "input_cached_tokens");
+        input_cache_creation_tokens += json_i64(&event.payload, "input_cache_creation_tokens");
+        output_tokens += json_i64(&event.payload, "output_tokens");
+        total_tokens += json_i64(&event.payload, "total_tokens");
+        input_cost_usd += json_f64(&event.payload, "input_cost_usd");
+        input_cached_cost_usd += json_f64(&event.payload, "input_cached_cost_usd");
+        input_cache_creation_cost_usd += json_f64(&event.payload, "input_cache_creation_cost_usd");
+        output_cost_usd += json_f64(&event.payload, "output_cost_usd");
+        cost_usd += json_f64(&event.payload, "cost_usd");
+    }
+
+    serde_json::json!({
+        "input_tokens": input_tokens,
+        "input_cached_tokens": input_cached_tokens,
+        "input_cache_creation_tokens": input_cache_creation_tokens,
+        "output_tokens": output_tokens,
+        "total_tokens": total_tokens,
+        "input_cost_usd": input_cost_usd,
+        "input_cached_cost_usd": input_cached_cost_usd,
+        "input_cache_creation_cost_usd": input_cache_creation_cost_usd,
+        "output_cost_usd": output_cost_usd,
+        "cost_usd": cost_usd,
+        "invocation_count": invocation_count,
+    })
+}
+
+fn usage_summary_from_manifest(manifest: &Value) -> Value {
+    let mut summary = empty_usage_summary();
+    for session in manifest
+        .get("sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        let usage = session.get("usage").unwrap_or(&Value::Null);
+        for key in [
+            "input_tokens",
+            "input_cached_tokens",
+            "input_cache_creation_tokens",
+            "output_tokens",
+            "total_tokens",
+            "invocation_count",
+        ] {
+            summary[key] = Value::from(json_i64(&summary, key) + json_i64(usage, key));
+        }
+        for key in [
+            "input_cost_usd",
+            "input_cached_cost_usd",
+            "input_cache_creation_cost_usd",
+            "output_cost_usd",
+            "cost_usd",
+        ] {
+            summary[key] = Value::from(json_f64(&summary, key) + json_f64(usage, key));
+        }
+    }
+    summary
+}
+
+fn empty_usage_summary() -> Value {
+    serde_json::json!({
+        "input_tokens": 0,
+        "input_cached_tokens": 0,
+        "input_cache_creation_tokens": 0,
+        "output_tokens": 0,
+        "total_tokens": 0,
+        "input_cost_usd": 0.0,
+        "input_cached_cost_usd": 0.0,
+        "input_cache_creation_cost_usd": 0.0,
+        "output_cost_usd": 0.0,
+        "cost_usd": 0.0,
+        "invocation_count": 0,
+    })
+}
+
+fn json_i64(value: &Value, key: &str) -> i64 {
+    value.get(key).and_then(Value::as_i64).unwrap_or(0)
+}
+
+fn json_f64(value: &Value, key: &str) -> f64 {
+    value.get(key).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
 fn resume_skip_ids(manifest: &Value, skip_failed: bool) -> HashSet<String> {
@@ -2309,13 +2461,36 @@ fn is_transient_provider_failure(result: &Value) -> bool {
         return false;
     };
     let error = error.to_ascii_lowercase();
+    if [
+        "incorrect api key",
+        "401 unauthorized",
+        "403 forbidden",
+        "400 bad request",
+        "content was flagged",
+        "cybersecurity risk",
+        "invalid_request_error",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+    {
+        return false;
+    }
     [
+        "read codex sse line",
         "stream error",
+        "stream disconnected",
+        "connection reset",
+        "connection closed",
+        "connection aborted",
+        "operation timed out",
         "rate limit",
+        "too many requests",
         "overloaded",
         "temporarily",
         "timeout",
         "timed out",
+        "eof",
+        "gateway",
         "502",
         "503",
         "504",

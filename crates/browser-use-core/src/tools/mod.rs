@@ -301,14 +301,7 @@ fn view_image_tool_spec() -> ToolSpec {
 fn python_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "python".to_string(),
-        description: concat!(
-            "Run Python in the persistent browser session. Browser-harness helpers are already imported when available: ",
-            "goto_url, page_info, js, fill_input, click_at_xy, type_text, press_key, scroll, wait_for_load, ",
-            "wait_for_element, wait_for_network_idle, capture_screenshot, current_tab, list_tabs, switch_tab, ",
-            "new_tab, cdp, drain_events, and http_get. Do not import Playwright, Selenium, or Pyppeteer. ",
-            "Use copy_artifact and emit_image for files and screenshots."
-        )
-        .to_string(),
+        description: browser_harness_python_tool_description().to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -323,6 +316,10 @@ fn python_tool_spec() -> ToolSpec {
     }
 }
 
+fn browser_harness_python_tool_description() -> &'static str {
+    include_str!("../../../../prompts/python-tool-description.md").trim()
+}
+
 fn done_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "done".to_string(),
@@ -332,7 +329,11 @@ fn done_tool_spec() -> ToolSpec {
             "properties": {
                 "result": {
                     "type": "string",
-                    "description": "Final answer for the user."
+                    "description": "Final answer for the user. If Python set_final_answer(...) was used, pass \"__use_final_answer__\" or set use_final_answer=true to finish with that persisted answer."
+                },
+                "use_final_answer": {
+                    "type": "boolean",
+                    "description": "Use the final answer persisted by Python set_final_answer(...)."
                 }
             },
             "required": ["result"],
@@ -383,8 +384,12 @@ fn update_plan_tool_spec() -> ToolSpec {
 fn spawn_agent_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "spawn_agent".to_string(),
-        description: "Create a separate helper session for bounded background exploration."
-            .to_string(),
+        description: concat!(
+            "Create a separate helper session for bounded background exploration. ",
+            "For repository, codebase, or directory analysis, spawn a read-only helper with role \"explorer\" before answering unless you are already inside an explorer/helper session or the user asks not to. ",
+            "Explorer helpers should inspect directly with local tools and must not spawn nested explorers for the same analysis."
+        )
+        .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -402,7 +407,7 @@ fn spawn_agent_tool_spec() -> ToolSpec {
                 },
                 "role": {
                     "type": "string",
-                    "description": "Optional helper role label."
+                    "description": "Optional helper role label. Use \"explorer\" for read-only repository/codebase questions and \"worker\" for implementation or editing tasks."
                 },
                 "fork_mode": {
                     "type": "string",
@@ -556,5 +561,33 @@ fn close_agent_tool_spec() -> ToolSpec {
             "required": ["child_session_id"],
             "additionalProperties": false
         }),
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn python_tool_description_preserves_browser_harness_cdp_contract() {
+        let description = browser_harness_python_tool_description();
+        for expected in [
+            "raw-CDP",
+            "browser interaction tool",
+            "CDP is the source of truth",
+            "new_tab(url)",
+            "not `goto_url(url)`",
+            "coordinate clicks",
+            "click_at_xy",
+            "screenshot(label)",
+            "attach=True",
+            "raw `cdp",
+            "Do not import Playwright",
+        ] {
+            assert!(
+                description.contains(expected),
+                "missing {expected:?} from python tool description:\n{description}"
+            );
+        }
     }
 }
