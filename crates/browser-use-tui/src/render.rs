@@ -53,8 +53,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     let is_first_run =
         !app.setup_complete && state.history.is_empty() && state.current_session.is_none();
+    let surface = app_surface(area);
+
     if is_first_run && app.overlay == Overlay::None {
-        render_setup(frame, area, app, true);
+        render_setup(frame, surface, app, true);
     } else if is_first_run
         && matches!(
             app.overlay,
@@ -68,28 +70,30 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.overlay {
         Overlay::None => {}
-        Overlay::Setup => render_setup(frame, centered_rect(78, 20, area), app, false),
-        Overlay::Account => render_account_overlay(frame, centered_rect(78, 18, area), app),
-        Overlay::Model => render_model_overlay(frame, centered_rect(92, 22, area), app),
-        Overlay::Browser => render_browser_overlay(frame, centered_rect(84, 18, area), app, &state),
-        Overlay::BrowserChoice => {
-            render_browser_choice_overlay(frame, centered_rect(84, 18, area), app)
-        }
-        Overlay::SetupComplete => render_setup_complete(frame, centered_rect(78, 16, area), app),
-        Overlay::History => render_history_overlay(frame, centered_rect(94, 20, area), app, &state),
-        Overlay::Actions => render_actions_overlay(frame, centered_rect(72, 16, area), app),
-        Overlay::Help => render_help_overlay(frame, centered_rect(78, 14, area)),
+        Overlay::Setup => render_setup(frame, surface, app, false),
+        Overlay::Account => render_account_overlay(frame, surface, app),
+        Overlay::Model => render_model_overlay(frame, surface, app),
+        Overlay::Browser => render_browser_overlay(frame, surface, app, &state),
+        Overlay::BrowserChoice => render_browser_choice_overlay(frame, surface, app),
+        Overlay::SetupComplete => render_setup_complete(frame, surface, app),
+        Overlay::History => render_history_overlay(frame, surface, app, &state),
+        Overlay::Actions => render_actions_overlay(frame, surface, app),
+        Overlay::Help => render_help_overlay(frame, surface),
         Overlay::Developer => {
             render_developer_overlay(frame, centered_rect(96, 24, area), app, &state)
         }
     }
 }
 
-fn render_workbench(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
-    let outer = area.inner(Margin {
+fn app_surface(area: Rect) -> Rect {
+    area.inner(Margin {
         vertical: 0,
         horizontal: 2,
-    });
+    })
+}
+
+fn render_workbench(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
+    let outer = app_surface(area);
     let composer_h = app.composer_height();
     let footer_h = 1u16;
     let chunks = Layout::default()
@@ -391,7 +395,7 @@ fn render_setup(frame: &mut Frame<'_>, area: Rect, app: &App, first_run: bool) {
         frame.render_widget(Clear, area);
     }
     let inner = if first_run {
-        modal(frame, centered_rect(80, 18, area), "browser-use")
+        modal(frame, area, "browser-use")
     } else {
         modal(frame, area, "Setup")
     };
