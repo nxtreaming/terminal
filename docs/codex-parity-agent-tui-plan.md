@@ -1,6 +1,31 @@
 # Codex-Parity Agent and TUI Rewrite Plan
 
-Status: active implementation plan.
+Status: implemented locally with live-validation caveats.
+
+## Implementation Status
+
+As of 2026-05-10, the local rewrite implements the plan's core shape:
+
+- SQLite is the durable session/event/artifact store.
+- The agent loop routes model calls through a Rust `ToolRegistry`.
+- The model-facing tool surface includes Codex-style `exec_command`, `write_stdin`, `apply_patch`, `read_file`, `search_files`, `list_files`, `view_image`, `update_plan`, `spawn_agent`, `send_input`, `wait_agent`, and `close_agent`.
+- The Python tool remains the browser island and records browser state, live URLs, artifacts, screenshots/images, and explicit browser identity changes: `browser.connected`, `browser.reconnected`, `browser.disconnected`, and `browser.target_changed`.
+- The TUI renders from typed events, uses `pulldown-cmark` for result markdown, has a multiline composer, clamps menu navigation, keeps follow-ups in the current task, and renders setup/actions/history/browser as product screens instead of debug modals.
+- Deterministic screen dumps were generated under `/tmp/but-design-loop/rust-tui-final/`.
+
+Latest verification:
+
+```bash
+cargo fmt --check
+cargo test --workspace
+uv run --with pytest python -m pytest -q
+```
+
+Known caveats:
+
+- `apply_patch` accepts a raw patch string internally and a `{ "patch": "..." }` object through JSON function-call providers. True provider-level freeform patches still depend on provider/tool-call support.
+- Browser Use cloud mode and full live-provider dataset regression require live credentials and were not re-run in this final local pass.
+- The hidden developer trace still exists for diagnostics, but it is removed from the default actions/help product surface.
 
 This plan merges two goals:
 
