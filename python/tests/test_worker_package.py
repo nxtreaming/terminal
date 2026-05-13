@@ -202,7 +202,160 @@ def test_worker_screenshot_clip_uses_cdp_clip_and_attaches_image(
         "scale": 1.0,
     }
     assert response["images"][0]["label"] == "table"
+    assert len(response["images"]) == 1
     assert Path(response["images"][0]["path"]).exists()
+
+
+def test_worker_raw_cdp_capture_screenshot_attaches_image(
+    tmp_path: Path, monkeypatch
+) -> None:
+    def fake_load_browser_harness(ns):
+        def fake_cdp(method, session_id=None, **kwargs):
+            assert session_id is None
+            if method == "Page.captureScreenshot":
+                return {"data": "cG5n"}
+            return {}
+
+        ns["cdp"] = fake_cdp
+        ns["browser_harness_available"] = True
+        ns["browser_harness_error"] = None
+
+    monkeypatch.setattr(worker, "_load_browser_harness", fake_load_browser_harness)
+
+    response = worker._run(
+        {
+            "id": "raw-cdp-screenshot",
+            "session_id": "task-raw-cdp-screenshot",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": "result = cdp('Page.captureScreenshot', format='png')",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"] == {"data": "cG5n"}
+    assert len(response["images"]) == 1
+    assert response["images"][0]["label"] == "cdp_screenshot_1"
+    assert Path(response["images"][0]["path"]).exists()
+
+
+def test_worker_page_info_fallback_reads_target_url_and_title(
+    tmp_path: Path, monkeypatch
+) -> None:
+    class FakeHelpers:
+        def current_tab(self):
+            return {"targetId": "target-2"}
+
+        def cdp(self, method, **kwargs):
+            if method == "Target.getTargets":
+                return {
+                    "targetInfos": [
+                        {
+                            "targetId": "target-1",
+                            "type": "page",
+                            "attached": True,
+                            "url": "https://old.example/",
+                            "title": "Old",
+                        },
+                        {
+                            "targetId": "target-2",
+                            "type": "page",
+                            "attached": True,
+                            "url": "https://example.com/",
+                            "title": "Example",
+                        },
+                    ]
+                }
+            if method == "Page.getLayoutMetrics":
+                return {"cssVisualViewport": {"clientWidth": 800, "clientHeight": 600}}
+            raise AssertionError(method)
+
+    def fake_load_browser_harness(ns):
+        ns["page_info"] = lambda: (_ for _ in ()).throw(RuntimeError("page JS wedged"))
+        ns["__browser_harness_helpers__"] = FakeHelpers()
+        ns["browser_harness_available"] = True
+        ns["browser_harness_error"] = None
+
+    monkeypatch.setattr(worker, "_load_browser_harness", fake_load_browser_harness)
+
+    response = worker._run(
+        {
+            "id": "page-info-fallback",
+            "session_id": "task-page-info-fallback",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": "result = page_info()",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["url"] == "https://example.com/"
+    assert response["data"]["title"] == "Example"
+    assert response["data"]["w"] == 800
+    assert response["data"]["h"] == 600
+    assert response["data"]["fallback"] == "cdp"
+
+
+def test_worker_autoloads_agent_workspace_helpers(tmp_path: Path) -> None:
+    workspace = tmp_path / ".browser-use" / "agent-workspace"
+    workspace.mkdir(parents=True)
+    (workspace / "agent_helpers.py").write_text(
+        "def helper_value():\n    return 42\n",
+        encoding="utf-8",
+    )
+
+    response = worker._run(
+        {
+            "id": "agent-helpers",
+            "session_id": "task-agent-helpers",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": "result = {'workspace': agent_workspace(create=False), 'value': helper_value()}",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["workspace"] == str(workspace)
+    assert response["data"]["value"] == 42
+
+
+def test_worker_error_hints_are_appended(tmp_path: Path) -> None:
+    cases = [
+        (
+            "raise RuntimeError(\"':contains' is not a valid CSS selector\")",
+            "':contains' is jQuery, not CSS.",
+        ),
+        (
+            "raise RuntimeError(\"Identifier 'buttons' has already been declared\")",
+            "execution contexts persist",
+        ),
+        (
+            "raise RuntimeError('Blocked a frame with origin https://a from accessing a cross-origin frame')",
+            "Cross-origin iframe DOM access",
+        ),
+        (
+            "raise RuntimeError('-32602 No target with given id found')",
+            "target closed or was replaced",
+        ),
+        (
+            "raise RuntimeError(\"Runtime.getExecutionContexts wasn't found\")",
+            "Runtime.getExecutionContexts is not a CDP method",
+        ),
+    ]
+
+    for idx, (code, expected_hint) in enumerate(cases):
+        response = worker._run(
+            {
+                "id": f"hint-{idx}",
+                "session_id": f"task-hint-{idx}",
+                "cwd": str(tmp_path),
+                "artifact_dir": str(tmp_path / "artifacts"),
+                "code": code,
+            }
+        )
+        assert response["ok"] is False
+        assert "Hint:" in response["error"]
+        assert expected_hint in response["error"]
 
 
 def test_worker_set_final_answer_persists_metadata_and_compact_result(tmp_path: Path) -> None:

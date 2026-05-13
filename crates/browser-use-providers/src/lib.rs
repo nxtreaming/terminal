@@ -255,6 +255,9 @@ impl ModelProvider for OpenAICompatibleChatProvider {
             "messages": messages,
             "parallel_tool_calls": true,
         });
+        if self.base_url.contains("openrouter.ai") || include_openai_compatible_usage() {
+            body["usage"] = json!({ "include": true });
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = json!("auto");
@@ -1819,6 +1822,11 @@ fn parse_response_output_item(item: &Value, events: &mut Vec<ModelEvent>) -> Res
 
 fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
     let usage = usage?;
+    let native_cost = usage
+        .get("cost")
+        .or_else(|| usage.get("total_cost"))
+        .or_else(|| usage.get("cost_usd"))
+        .and_then(value_f64);
     let input_tokens = usage
         .get("input_tokens")
         .or_else(|| usage.get("prompt_tokens"))
@@ -1853,9 +1861,16 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
         input_cached_cost_usd: None,
         input_cache_creation_cost_usd: None,
         output_cost_usd: None,
-        cost_usd: None,
+        cost_usd: native_cost,
+        cost_source: native_cost.map(|_| "native".to_string()),
     };
     Some(add_usage_cost(model, usage))
+}
+
+fn value_f64(value: &Value) -> Option<f64> {
+    value
+        .as_f64()
+        .or_else(|| value.as_str().and_then(|raw| raw.parse::<f64>().ok()))
 }
 
 fn parse_chat_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
@@ -1871,6 +1886,12 @@ struct ModelPricing {
 }
 
 fn add_usage_cost(model: &str, mut usage: ModelUsage) -> ModelUsage {
+    if usage.cost_usd.is_some() {
+        usage
+            .cost_source
+            .get_or_insert_with(|| "native".to_string());
+        return usage;
+    }
     if !calculate_cost_enabled() {
         return usage;
     }
@@ -1910,8 +1931,20 @@ fn add_usage_cost(model: &str, mut usage: ModelUsage) -> ModelUsage {
         + usage.output_cost_usd.unwrap_or(0.0);
     if total > 0.0 {
         usage.cost_usd = Some(total);
+        usage.cost_source = Some("estimated".to_string());
     }
     usage
+}
+
+fn include_openai_compatible_usage() -> bool {
+    std::env::var("LLM_BROWSER_OPENAI_COMPAT_INCLUDE_USAGE")
+        .map(|value| {
+            matches!(
+                value.to_ascii_lowercase().as_str(),
+                "1" | "true" | "yes" | "on"
+            )
+        })
+        .unwrap_or(false)
 }
 
 fn calculate_cost_enabled() -> bool {
@@ -2421,7 +2454,8 @@ mod tests {
                 "usage": {
                     "prompt_tokens": 5,
                     "completion_tokens": 6,
-                    "total_tokens": 11
+                    "total_tokens": 11,
+                    "cost": 0.0123
                 }
             })
             .to_string(),
@@ -2458,7 +2492,8 @@ mod tests {
                 input_tokens: Some(5),
                 output_tokens: Some(6),
                 total_tokens: Some(11),
-                cost_usd: None,
+                cost_usd: Some(0.0123),
+                cost_source: Some("native".to_string()),
                 ..Default::default()
             }
         }));

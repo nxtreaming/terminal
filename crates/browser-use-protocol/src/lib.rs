@@ -124,6 +124,7 @@ pub struct ModelUsage {
     pub input_cache_creation_cost_usd: Option<f64>,
     pub output_cost_usd: Option<f64>,
     pub cost_usd: Option<f64>,
+    pub cost_source: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]

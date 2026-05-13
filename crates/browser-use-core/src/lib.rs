@@ -105,6 +105,14 @@ impl AgentRunOptions {
     }
 }
 
+fn is_cloud_browser_mode(mode: Option<&str>) -> bool {
+    mode.map(|value| {
+        let normalized = value.to_ascii_lowercase().replace(['_', ' '], "-");
+        normalized == "cloud"
+    })
+    .unwrap_or(false)
+}
+
 pub fn run_fake_agent(
     store: &Store,
     task_text: &str,
@@ -446,187 +454,222 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     }
     let result = (|| -> Result<String> {
         let mut worker = PythonWorker::start_with_browser_mode(options.browser_mode.as_deref())?;
-        store.append_event(
-            &session.id,
-            "session.status",
-            serde_json::json!({ "status": "running" }),
-        )?;
-        store.append_event(
-            &session.id,
-            "model.config",
-            serde_json::json!({
-                "provider": provider.provider_name(),
-                "model": provider.model_name(),
-            }),
-        )?;
-
-        let mut deadline_warning_emitted = false;
-        for turn_idx in 0..options.max_turns {
-            ensure_not_cancelled(store, &session.id)?;
-            normalize_provider_messages(&mut messages);
-            maybe_compact_messages(store, &session.id, &mut messages, options.max_context_chars)?;
-            normalize_provider_messages(&mut messages);
-            maybe_emit_deadline_warning(
-                store,
+        let run_result = (|| -> Result<String> {
+            store.append_event(
                 &session.id,
-                turn_idx,
-                options.max_turns,
-                &mut deadline_warning_emitted,
+                "session.status",
+                serde_json::json!({ "status": "running" }),
             )?;
-            let mut assistant_text = String::new();
-            let mut tool_calls = Vec::new();
-            let step_span =
-                telemetry.start_step_span(&agent_span, &session.id, turn_idx, options.max_turns);
-
-            let turn_messages = messages.clone();
-            let turn_tools = browser_tool_specs();
-            let model_span = telemetry.start_model_turn_span(ModelTurnSpanInput {
-                parent: &step_span,
-                session_id: &session.id,
-                turn_idx,
-                provider_name: provider.provider_name(),
-                model_name: provider.model_name(),
-                messages: &turn_messages,
-                tools: &turn_tools,
-            });
-            let provider_events = match start_provider_turn_with_retries(
-                store,
+            store.append_event(
                 &session.id,
-                provider,
-                ProviderTurn {
-                    messages: turn_messages,
-                    tools: turn_tools,
-                },
-                turn_idx,
-            ) {
-                Ok(events) => {
-                    telemetry.record_model_events(
-                        &model_span,
-                        provider.provider_name(),
-                        turn_idx,
-                        &events,
-                    );
-                    events
-                }
-                Err(error) => {
-                    model_span.record_error(error.as_ref());
-                    step_span.record_error(error.as_ref());
-                    return Err(error);
-                }
-            };
-            drop(model_span);
+                "model.config",
+                serde_json::json!({
+                    "provider": provider.provider_name(),
+                    "model": provider.model_name(),
+                }),
+            )?;
 
-            for event in provider_events {
-                match event {
-                    ModelEvent::TextDelta { text } => {
-                        if let Some(delta) = assistant_delta_to_append(&assistant_text, &text) {
-                            store.append_event(
-                                &session.id,
-                                "model.delta",
-                                serde_json::json!({ "text": delta }),
-                            )?;
-                            assistant_text.push_str(&delta);
-                        }
-                    }
-                    ModelEvent::Usage { usage } => {
-                        store.append_event(
-                            &session.id,
-                            "model.usage",
-                            serde_json::to_value(usage)?,
-                        )?;
-                    }
-                    ModelEvent::ToolCall { call } => {
-                        store.append_event(
-                            &session.id,
-                            "model.tool_call",
-                            serde_json::to_value(&call)?,
-                        )?;
-                        tool_calls.push(call);
-                    }
-                    ModelEvent::Done => {}
-                }
-            }
-            ensure_not_cancelled(store, &session.id)?;
-
-            if !assistant_text.is_empty() || !tool_calls.is_empty() {
-                messages.push(serde_json::json!({
-                    "role": "assistant",
-                    "content": assistant_text,
-                    "tool_calls": tool_calls.iter().map(tool_call_message).collect::<Vec<_>>(),
-                }));
-            }
-            maybe_compact_messages(store, &session.id, &mut messages, options.max_context_chars)?;
-
-            if tool_calls.is_empty() {
-                if !assistant_text.trim().is_empty() {
-                    store.append_event(
-                        &session.id,
-                        "session.done",
-                        serde_json::json!({ "result": assistant_text.trim_end() }),
-                    )?;
-                    step_span.set_ok();
-                    return Ok(session.id.clone());
-                }
-                step_span.set_ok();
-                continue;
-            }
-
-            for call in tool_calls {
+            let mut deadline_warning_emitted = false;
+            for turn_idx in 0..options.max_turns {
                 ensure_not_cancelled(store, &session.id)?;
-                let tool_span = telemetry.start_tool_span(&step_span, &session.id, turn_idx, &call);
-                let outcome = match dispatch_tool_call(
-                    store,
-                    provider,
-                    &session,
-                    &mut worker,
-                    &call,
-                    &options,
-                ) {
-                    Ok(outcome) => {
-                        telemetry.record_tool_outcome(
-                            &tool_span,
-                            &outcome.messages,
-                            outcome.finished,
-                        );
-                        tool_span.set_attribute(KeyValue::new(
-                            "browser_use.tool.finished_session",
-                            outcome.finished,
-                        ));
-                        tool_span.set_attribute(KeyValue::new(
-                            "browser_use.tool.message_count",
-                            outcome.messages.len() as i64,
-                        ));
-                        tool_span.set_ok();
-                        outcome
-                    }
-                    Err(error) => {
-                        tool_span.record_error(error.as_ref());
-                        step_span.record_error(error.as_ref());
-                        return Err(error);
-                    }
-                };
-                drop(tool_span);
-                messages.extend(outcome.messages);
+                normalize_provider_messages(&mut messages);
                 maybe_compact_messages(
                     store,
                     &session.id,
                     &mut messages,
                     options.max_context_chars,
                 )?;
-                if outcome.finished {
+                normalize_provider_messages(&mut messages);
+                maybe_emit_deadline_warning(
+                    store,
+                    &session.id,
+                    turn_idx,
+                    options.max_turns,
+                    &mut deadline_warning_emitted,
+                )?;
+                let mut assistant_text = String::new();
+                let mut tool_calls = Vec::new();
+                let step_span = telemetry.start_step_span(
+                    &agent_span,
+                    &session.id,
+                    turn_idx,
+                    options.max_turns,
+                );
+
+                let turn_messages = messages.clone();
+                let turn_tools = browser_tool_specs();
+                let model_span = telemetry.start_model_turn_span(ModelTurnSpanInput {
+                    parent: &step_span,
+                    session_id: &session.id,
+                    turn_idx,
+                    provider_name: provider.provider_name(),
+                    model_name: provider.model_name(),
+                    messages: &turn_messages,
+                    tools: &turn_tools,
+                });
+                let provider_events = match start_provider_turn_with_retries(
+                    store,
+                    &session.id,
+                    provider,
+                    ProviderTurn {
+                        messages: turn_messages,
+                        tools: turn_tools,
+                    },
+                    turn_idx,
+                ) {
+                    Ok(events) => {
+                        telemetry.record_model_events(
+                            &model_span,
+                            provider.provider_name(),
+                            turn_idx,
+                            &events,
+                        );
+                        events
+                    }
+                    Err(error) => {
+                        model_span.record_error(error.as_ref());
+                        step_span.record_error(error.as_ref());
+                        return Err(error);
+                    }
+                };
+                drop(model_span);
+
+                for event in provider_events {
+                    match event {
+                        ModelEvent::TextDelta { text } => {
+                            if let Some(delta) = assistant_delta_to_append(&assistant_text, &text) {
+                                store.append_event(
+                                    &session.id,
+                                    "model.delta",
+                                    serde_json::json!({ "text": delta }),
+                                )?;
+                                assistant_text.push_str(&delta);
+                            }
+                        }
+                        ModelEvent::Usage { usage } => {
+                            store.append_event(
+                                &session.id,
+                                "model.usage",
+                                serde_json::to_value(usage)?,
+                            )?;
+                        }
+                        ModelEvent::ToolCall { call } => {
+                            store.append_event(
+                                &session.id,
+                                "model.tool_call",
+                                serde_json::to_value(&call)?,
+                            )?;
+                            tool_calls.push(call);
+                        }
+                        ModelEvent::Done => {}
+                    }
+                }
+                ensure_not_cancelled(store, &session.id)?;
+
+                if !assistant_text.is_empty() || !tool_calls.is_empty() {
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": assistant_text,
+                        "tool_calls": tool_calls.iter().map(tool_call_message).collect::<Vec<_>>(),
+                    }));
+                }
+                maybe_compact_messages(
+                    store,
+                    &session.id,
+                    &mut messages,
+                    options.max_context_chars,
+                )?;
+
+                if tool_calls.is_empty() {
+                    if !assistant_text.trim().is_empty() {
+                        store.append_event(
+                            &session.id,
+                            "session.done",
+                            serde_json::json!({ "result": assistant_text.trim_end() }),
+                        )?;
+                        step_span.set_ok();
+                        return Ok(session.id.clone());
+                    }
                     step_span.set_ok();
-                    return Ok(session.id.clone());
+                    continue;
+                }
+
+                for call in tool_calls {
+                    ensure_not_cancelled(store, &session.id)?;
+                    let tool_span =
+                        telemetry.start_tool_span(&step_span, &session.id, turn_idx, &call);
+                    let outcome = match dispatch_tool_call(
+                        store,
+                        provider,
+                        &session,
+                        &mut worker,
+                        &call,
+                        &options,
+                    ) {
+                        Ok(outcome) => {
+                            telemetry.record_tool_outcome(
+                                &tool_span,
+                                &outcome.messages,
+                                outcome.finished,
+                            );
+                            tool_span.set_attribute(KeyValue::new(
+                                "browser_use.tool.finished_session",
+                                outcome.finished,
+                            ));
+                            tool_span.set_attribute(KeyValue::new(
+                                "browser_use.tool.message_count",
+                                outcome.messages.len() as i64,
+                            ));
+                            tool_span.set_ok();
+                            outcome
+                        }
+                        Err(error) => {
+                            tool_span.record_error(error.as_ref());
+                            step_span.record_error(error.as_ref());
+                            return Err(error);
+                        }
+                    };
+                    drop(tool_span);
+                    messages.extend(outcome.messages);
+                    maybe_compact_messages(
+                        store,
+                        &session.id,
+                        &mut messages,
+                        options.max_context_chars,
+                    )?;
+                    if outcome.finished {
+                        step_span.set_ok();
+                        return Ok(session.id.clone());
+                    }
+                }
+                step_span.set_ok();
+            }
+
+            store.append_event(
+                &session.id,
+                "session.failed",
+                serde_json::json!({ "error": "agent exceeded maximum provider turns" }),
+            )?;
+            bail!("agent exceeded maximum provider turns");
+        })();
+        if is_cloud_browser_mode(options.browser_mode.as_deref()) {
+            match worker.shutdown_owned_cloud_browser() {
+                Ok(Some(summary)) => {
+                    if summary.get("stopped").and_then(Value::as_bool) == Some(true) {
+                        store.append_event(&session.id, "browser.cloud_shutdown", summary)?;
+                    }
+                }
+                Ok(None) => {}
+                Err(error) => {
+                    store.append_event(
+                        &session.id,
+                        "browser.cloud_shutdown_failed",
+                        serde_json::json!({ "error": format!("{error:#}") }),
+                    )?;
                 }
             }
-            step_span.set_ok();
         }
-
-        store.append_event(
-            &session.id,
-            "session.failed",
-            serde_json::json!({ "error": "agent exceeded maximum provider turns" }),
-        )?;
-        bail!("agent exceeded maximum provider turns");
+        run_result
     })();
     let cancelled = is_cancelled(store, &session.id)?;
     let final_events = store.events_for_session(&session.id).unwrap_or_default();

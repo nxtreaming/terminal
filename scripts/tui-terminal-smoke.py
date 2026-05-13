@@ -300,6 +300,23 @@ def smoke_tall_terminal_keeps_running_controls_attached_to_content(binary: Path)
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
+def smoke_double_escape_stops_running_task(binary: Path) -> None:
+    session = f"but-smoke-esc-stop-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-stop-"))
+    try:
+        start_session(session, binary, state_dir)
+        wait_for(session, "● working", "double-escape-running")
+        tmux_send(session, "Escape")
+        armed = wait_for(session, "esc again to stop", "double-escape-armed")
+        assert_contains(armed, "● working", "first escape should keep the task running")
+        tmux_send(session, "Escape")
+        stopped = wait_for(session, "stopped", "double-escape-stopped")
+        assert_not_contains(stopped, "^[[", "double escape should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
 def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
     session = f"but-smoke-long-history-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-long-history-"))
@@ -552,6 +569,7 @@ def main() -> int:
     smoke_interactive_terminal(binary)
     smoke_history_selection_emits_native_transcript(binary)
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
+    smoke_double_escape_stops_running_task(binary)
     smoke_completed_history_uses_native_scrollback(binary)
     smoke_short_completed_history_has_live_preview(binary)
     smoke_main_resize_does_not_duplicate_transcript(binary)

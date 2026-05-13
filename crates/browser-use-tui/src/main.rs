@@ -40,6 +40,8 @@ use settings::{
     MODEL_CHOICES,
 };
 
+const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
+
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
 struct Args {
@@ -169,6 +171,7 @@ struct App {
     status_notice: Option<String>,
     agent_backend: AgentBackend,
     quit_hint_until: Option<Instant>,
+    escape_stop_until: Option<Instant>,
     native_history: NativeHistoryState,
 }
 
@@ -263,6 +266,7 @@ impl App {
             status_notice: None,
             agent_backend,
             quit_hint_until: None,
+            escape_stop_until: None,
             native_history: NativeHistoryState::default(),
         })
     }
@@ -471,19 +475,51 @@ impl App {
         let Some(id) = self.selected_session_id.clone() else {
             return Ok(false);
         };
-        let Some(session) = self.store.load_session(&id)? else {
-            return Ok(false);
-        };
-        if !session.status.is_active() {
+        if !self.current_task_is_active()? {
             return Ok(false);
         }
         self.store.request_cancel(&id, "stopped from terminal")?;
         Ok(true)
     }
 
+    fn current_task_is_active(&self) -> Result<bool> {
+        let Some(id) = self.selected_session_id.as_deref() else {
+            return Ok(false);
+        };
+        Ok(self
+            .store
+            .load_session(id)?
+            .is_some_and(|session| session.status.is_active()))
+    }
+
+    fn escape_stop_is_pending(&self) -> bool {
+        self.escape_stop_until
+            .is_some_and(|until| Instant::now() <= until)
+    }
+
+    fn handle_main_escape(&mut self) -> Result<()> {
+        if self.escape_stop_is_pending() {
+            if self.cancel_current_task()? {
+                self.escape_stop_until = None;
+                self.quit_hint_until = None;
+                return Ok(());
+            }
+        }
+        self.escape_stop_until = if self.current_task_is_active()? {
+            Some(Instant::now() + DOUBLE_ESCAPE_STOP_WINDOW)
+        } else {
+            None
+        };
+        self.close_surface();
+        Ok(())
+    }
+
     fn handle_key(&mut self, key: KeyEvent) -> Result<bool> {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Ok(false);
+        }
+        if key.code != KeyCode::Esc || !key.modifiers.is_empty() {
+            self.escape_stop_until = None;
         }
         match key {
             KeyEvent {
@@ -512,22 +548,31 @@ impl App {
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.is_slash_palette_active() => {
+                self.escape_stop_until = None;
                 self.composer.clear();
                 self.selected_row = 0;
             }
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::ApiKey => {
+                self.escape_stop_until = None;
                 self.cancel_auth_entry();
             }
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::Telemetry => {
+                self.escape_stop_until = None;
                 self.cancel_secret_entry();
             }
             KeyEvent {
                 code: KeyCode::Esc, ..
-            } => self.close_surface(),
+            } if self.surface == Surface::Main => self.handle_main_escape()?,
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                self.escape_stop_until = None;
+                self.close_surface();
+            }
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => self.open_surface(Surface::History),
@@ -2467,6 +2512,40 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("developer"));
         assert!(screen.contains("Events"));
+        Ok(())
+    }
+
+    #[test]
+    fn escape_twice_stops_running_task() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert!(app.escape_stop_is_pending());
+        assert_eq!(
+            app.store
+                .load_session(&running.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("esc again to stop"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert!(!app.escape_stop_is_pending());
+        assert_eq!(
+            app.store
+                .load_session(&running.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Cancelled)
+        );
         Ok(())
     }
 }

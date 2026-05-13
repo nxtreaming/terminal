@@ -23,6 +23,8 @@ struct RunPythonRequest {
     code: String,
     cancel_requested: bool,
     timeout_seconds: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    control: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq)]
@@ -225,6 +227,7 @@ impl PythonWorker {
             code: code.to_string(),
             cancel_requested: false,
             timeout_seconds,
+            control: None,
         };
         self.next_id += 1;
         let line = serde_json::to_string(&request)?;
@@ -260,6 +263,45 @@ impl PythonWorker {
                 continue;
             }
             return serde_json::from_value(value).context("parse python worker response");
+        }
+    }
+
+    pub fn shutdown_owned_cloud_browser(&mut self) -> Result<Option<Value>> {
+        let cwd = std::env::current_dir()?;
+        let request = RunPythonRequest {
+            id: format!("py-{}", self.next_id),
+            session_id: "__worker_control__".to_string(),
+            cwd: cwd.display().to_string(),
+            artifact_dir: cwd
+                .join(".browser-use")
+                .join("control-artifacts")
+                .display()
+                .to_string(),
+            code: String::new(),
+            cancel_requested: false,
+            timeout_seconds: Some(5.0),
+            control: Some("shutdown_owned_cloud_browser".to_string()),
+        };
+        self.next_id += 1;
+        let line = serde_json::to_string(&request)?;
+        writeln!(self.stdin, "{line}")?;
+        self.stdin.flush()?;
+
+        loop {
+            let mut response = String::new();
+            let bytes = self.stdout.read_line(&mut response)?;
+            if bytes == 0 {
+                return Ok(None);
+            }
+            let trimmed = response.trim();
+            let value: Value = match serde_json::from_str(trimmed) {
+                Ok(value) => value,
+                Err(_) => continue,
+            };
+            if value.get("event").is_some() {
+                continue;
+            }
+            return Ok(value.get("data").cloned());
         }
     }
 }

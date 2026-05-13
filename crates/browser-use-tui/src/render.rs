@@ -817,12 +817,14 @@ fn render_footer(
         .is_some_and(|until| std::time::Instant::now() <= until)
     {
         "ctrl+c again to quit"
+    } else if app.escape_stop_is_pending() {
+        "esc again to stop"
     } else if app.surface.is_bottom_pane() {
         surface_footer(app.surface)
     } else {
         match product_state {
             ProductState::Running => {
-                "enter send   shift+enter newline   ctrl+c stop   f2 browser   / actions"
+                "enter send   shift+enter newline   ctrl+c stop   esc esc stop   f2 browser   / actions"
             }
             ProductState::Ready | ProductState::SetupNeeded => {
                 "enter run   tab history   / actions"

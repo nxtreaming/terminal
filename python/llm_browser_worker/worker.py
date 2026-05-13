@@ -4,6 +4,7 @@ import contextlib
 import atexit
 import base64
 import importlib
+import importlib.util
 import io
 import json
 import os
@@ -14,6 +15,7 @@ import subprocess
 import sys
 import traceback
 import mimetypes
+import re
 import tempfile
 import time
 import urllib.request
@@ -24,6 +26,31 @@ from typing import Any, Dict
 _namespaces: Dict[str, Dict[str, Any]] = {}
 _managed_chrome: subprocess.Popen[Any] | None = None
 _managed_chrome_profile: Path | None = None
+_explicit_agent_workspace = os.environ.get("BH_AGENT_WORKSPACE")
+
+
+_HINT_PATTERNS = [
+    (
+        re.compile(r"':contains' is not a valid (CSS )?selector"),
+        "':contains' is jQuery, not CSS. Use Array.from(document.querySelectorAll(sel)).filter(el => el.textContent.includes('X')).",
+    ),
+    (
+        re.compile(r"Identifier '[^']+' has already been declared"),
+        "Browser JS execution contexts persist. Wrap repeated const/let/class declarations in an IIFE like (()=>{...})() or use var.",
+    ),
+    (
+        re.compile(r"Blocked a frame with origin .+ from accessing a cross-origin frame"),
+        "Cross-origin iframe DOM access is blocked by the browser. Use iframe_target() or target-level CDP instead.",
+    ),
+    (
+        re.compile(r"-32602.*No target with given id found"),
+        "The target closed or was replaced. Call Target.getTargets/list_tabs() and use a fresh targetId.",
+    ),
+    (
+        re.compile(r"Runtime\.getExecutionContexts.*wasn't found"),
+        "Runtime.getExecutionContexts is not a CDP method. Use Target.getTargets/list_tabs(), then attach to the target you need.",
+    ),
+]
 
 
 class _ToolTimeoutError(TimeoutError):
@@ -44,6 +71,19 @@ def _jsonable(value: Any) -> Any:
 
 def _browser_mode() -> str:
     return os.environ.get("LLM_BROWSER_BROWSER_MODE", "").lower().replace("_", "-").replace(" ", "-")
+
+
+def _annotate_error(msg: str) -> str:
+    for pattern, hint in _HINT_PATTERNS:
+        if pattern.search(msg):
+            return f"{msg}\nHint: {hint}"
+    return msg
+
+
+def _agent_workspace_path(cwd: Path) -> Path:
+    if _explicit_agent_workspace:
+        return Path(_explicit_agent_workspace).expanduser()
+    return (cwd / ".browser-use" / "agent-workspace").expanduser()
 
 
 def _pick_chromium_path() -> str:
@@ -204,9 +244,25 @@ def _ensure_cloud_browser(admin: Any) -> None:
     if admin.daemon_alive(name):
         return
     browser = admin.start_remote_daemon(name=name)
+    os.environ["LLM_BROWSER_OWN_REMOTE_DAEMON"] = "1"
+    os.environ["LLM_BROWSER_OWN_REMOTE_DAEMON_NAME"] = name
     live_url = browser.get("liveUrl")
     if live_url:
         os.environ["LLM_BROWSER_LIVE_URL"] = str(live_url)
+
+
+def _shutdown_owned_cloud_browser() -> Dict[str, Any]:
+    if _browser_mode() != "cloud" or os.environ.get("LLM_BROWSER_OWN_REMOTE_DAEMON") != "1":
+        return {"stopped": False, "reason": "not_owned"}
+    name = os.environ.get("LLM_BROWSER_OWN_REMOTE_DAEMON_NAME") or os.environ.get("BU_NAME", "default")
+    try:
+        admin = importlib.import_module("browser_harness.admin")
+        admin.stop_remote_daemon(name)
+    except Exception as exc:
+        return {"stopped": False, "name": name, "error": str(exc)}
+    os.environ.pop("LLM_BROWSER_OWN_REMOTE_DAEMON", None)
+    os.environ.pop("LLM_BROWSER_OWN_REMOTE_DAEMON_NAME", None)
+    return {"stopped": True, "name": name}
 
 
 def _load_browser_harness(ns: Dict[str, Any]) -> None:
@@ -214,6 +270,8 @@ def _load_browser_harness(ns: Dict[str, Any]) -> None:
         return
     ns["__browser_harness_checked__"] = True
     try:
+        cwd = Path(str(ns.get("cwd") or ".")).expanduser()
+        os.environ.setdefault("BH_AGENT_WORKSPACE", str(_agent_workspace_path(cwd)))
         _ensure_managed_chrome()
         admin = importlib.import_module("browser_harness.admin")
         _ensure_cloud_browser(admin)
@@ -298,12 +356,50 @@ def _safe_name(name: str) -> str:
     return "".join(ch if ch.isalnum() or ch in "._-" else "_" for ch in name).strip("._") or "artifact"
 
 
+def _load_agent_helpers_into_ns(
+    ns: Dict[str, Any],
+    path: Any | None = None,
+    force: bool = False,
+) -> Dict[str, Any]:
+    cwd = Path(str(ns.get("cwd") or ".")).expanduser()
+    workspace = _agent_workspace_path(cwd)
+    helper_path = Path(str(path)).expanduser() if path is not None else workspace / "agent_helpers.py"
+    if not helper_path.is_absolute():
+        helper_path = cwd / helper_path
+    if not helper_path.exists():
+        return {"loaded": False, "path": str(helper_path), "reason": "missing"}
+    stat = helper_path.stat()
+    cache_key = str(helper_path.resolve())
+    stamp = (stat.st_mtime_ns, stat.st_size)
+    loaded_cache = ns.setdefault("__agent_helpers_loaded__", {})
+    if not force and loaded_cache.get(cache_key) == stamp:
+        return {"loaded": False, "path": str(helper_path), "reason": "unchanged"}
+    spec = importlib.util.spec_from_file_location(
+        f"browser_use_agent_helpers_{_safe_name(str(ns.get('session_id') or 'default'))}",
+        helper_path,
+    )
+    if spec is None or spec.loader is None:
+        raise RuntimeError(f"cannot load agent helper module from {helper_path}")
+    module = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(module)
+    names = []
+    for name, value in vars(module).items():
+        if name.startswith("_"):
+            continue
+        ns[name] = value
+        names.append(name)
+    loaded_cache[cache_key] = stamp
+    return {"loaded": True, "path": str(helper_path), "names": sorted(names)}
+
+
 def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested: bool) -> None:
     artifact_dir = Path(ns["artifact_dir"])
     if "__browser_harness_capture_screenshot__" not in ns:
         ns["__browser_harness_capture_screenshot__"] = ns.get("capture_screenshot")
     if "__browser_harness_page_info__" not in ns:
         ns["__browser_harness_page_info__"] = ns.get("page_info")
+    if "__browser_harness_cdp__" not in ns:
+        ns["__browser_harness_cdp__"] = ns.get("cdp")
 
     def emit_output(text: Any) -> None:
         record = {"text": str(text)}
@@ -385,6 +481,53 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         _emit_protocol_event(request_id, "image", image)
         return image
 
+    def _cdp_screenshot_extension(params: Dict[str, Any]) -> str:
+        fmt = str(params.get("format") or "png").lower()
+        if fmt in {"jpeg", "jpg"}:
+            return ".jpg"
+        if fmt == "webp":
+            return ".webp"
+        return ".png"
+
+    def _attach_cdp_screenshot(result: Any, params: Dict[str, Any]) -> None:
+        if ns.get("__suppress_cdp_screenshot_attach__"):
+            return
+        if not isinstance(result, dict) or not result.get("data"):
+            return
+        raw_dir = artifact_dir / ".raw-cdp-screenshots"
+        raw_dir.mkdir(parents=True, exist_ok=True)
+        idx = int(ns.get("__raw_cdp_screenshot_counter__", 0)) + 1
+        ns["__raw_cdp_screenshot_counter__"] = idx
+        path = raw_dir / f"cdp-screenshot-{idx}{_cdp_screenshot_extension(params)}"
+        path.write_bytes(base64.b64decode(str(result["data"])))
+        emit_image(
+            path,
+            label=f"cdp_screenshot_{idx}",
+            detail="auto",
+            mime_type=mimetypes.guess_type(str(path))[0] or "image/png",
+        )
+
+    @contextlib.contextmanager
+    def _suppress_cdp_screenshot_attach():
+        previous = ns.get("__suppress_cdp_screenshot_attach__")
+        ns["__suppress_cdp_screenshot_attach__"] = True
+        try:
+            yield
+        finally:
+            if previous is None:
+                ns.pop("__suppress_cdp_screenshot_attach__", None)
+            else:
+                ns["__suppress_cdp_screenshot_attach__"] = previous
+
+    def cdp(method: str, session_id: Any = None, **params: Any) -> Any:
+        original = ns.get("__browser_harness_cdp__")
+        if not callable(original):
+            raise RuntimeError("browser_harness cdp is not available")
+        result = original(method, session_id=session_id, **params)
+        if method == "Page.captureScreenshot":
+            _attach_cdp_screenshot(result, params)
+        return result
+
     def _screenshot_label(label: str | None = None, path: Any | None = None) -> str:
         if label:
             return str(label)
@@ -463,18 +606,19 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
         if not shot_path.is_absolute():
             shot_path = Path.cwd() / shot_path
         shot_path.parent.mkdir(parents=True, exist_ok=True)
-        response = cdp_fn(
-            "Page.captureScreenshot",
-            format="png",
-            captureBeyondViewport=bool(capture_beyond_viewport),
-            clip={
-                "x": float(x),
-                "y": float(y),
-                "width": float(width),
-                "height": float(height),
-                "scale": float(scale),
-            },
-        )
+        with _suppress_cdp_screenshot_attach():
+            response = cdp_fn(
+                "Page.captureScreenshot",
+                format="png",
+                captureBeyondViewport=bool(capture_beyond_viewport),
+                clip={
+                    "x": float(x),
+                    "y": float(y),
+                    "width": float(width),
+                    "height": float(height),
+                    "scale": float(scale),
+                },
+            )
         shot_path.write_bytes(base64.b64decode(response["data"]))
         _apply_max_dim(shot_path, max_dim=max_dim)
         if not attach:
@@ -637,10 +781,24 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "session_id": str(ns.get("session_id")),
             "cwd": str(ns.get("cwd")),
             "artifact_root": str(artifact_dir),
+            "agent_workspace": str(_agent_workspace_path(Path(str(ns.get("cwd") or ".")))),
         }
+
+    def agent_workspace(create: bool = True) -> str:
+        workspace = _agent_workspace_path(Path(str(ns.get("cwd") or ".")))
+        if create:
+            workspace.mkdir(parents=True, exist_ok=True)
+        return str(workspace)
+
+    def load_agent_helpers(path: Any | None = None, force: bool = True) -> Dict[str, Any]:
+        return _load_agent_helpers_into_ns(ns, path=path, force=force)
+
+    def shutdown_owned_cloud_browser() -> Dict[str, Any]:
+        return _shutdown_owned_cloud_browser()
 
     ns.update(
         {
+            "cdp": cdp,
             "emit_output": emit_output,
             "copy_artifact": copy_artifact,
             "emit_image": emit_image,
@@ -655,8 +813,12 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "check_cancel": check_cancel,
             "artifact_root": artifact_root,
             "session_metadata": session_metadata,
+            "agent_workspace": agent_workspace,
+            "load_agent_helpers": load_agent_helpers,
+            "shutdown_owned_cloud_browser": shutdown_owned_cloud_browser,
         }
     )
+    _load_agent_helpers_into_ns(ns)
 
 
 def _page_info_cdp_fallback(ns: Dict[str, Any], error: Exception | None) -> Dict[str, Any] | None:
@@ -664,15 +826,39 @@ def _page_info_cdp_fallback(ns: Dict[str, Any], error: Exception | None) -> Dict
     if helpers is None:
         return None
     payload: Dict[str, Any] = {}
+    current_target_id: str | None = None
     try:
         tab = helpers.current_tab()
         if isinstance(tab, dict):
+            if tab.get("targetId"):
+                current_target_id = str(tab["targetId"])
             if tab.get("url"):
                 payload["url"] = str(tab["url"])
             if tab.get("title"):
                 payload["title"] = str(tab["title"])
     except Exception:
         pass
+    if "url" not in payload or "title" not in payload:
+        try:
+            targets = helpers.cdp("Target.getTargets").get("targetInfos", [])
+            page_targets = [target for target in targets if target.get("type") == "page"]
+            active = None
+            if current_target_id:
+                active = next(
+                    (target for target in page_targets if str(target.get("targetId")) == current_target_id),
+                    None,
+                )
+            if active is None:
+                active = next((target for target in reversed(page_targets) if target.get("attached")), None)
+            if active is None and page_targets:
+                active = page_targets[-1]
+            if active:
+                if "url" not in payload and active.get("url"):
+                    payload["url"] = str(active["url"])
+                if "title" not in payload and active.get("title"):
+                    payload["title"] = str(active["title"])
+        except Exception:
+            pass
     try:
         metrics = helpers.cdp("Page.getLayoutMetrics")
         viewport = metrics.get("cssVisualViewport") or metrics.get("cssLayoutViewport") or {}
@@ -824,6 +1010,20 @@ def _emit_browser_identity_events(ns: Dict[str, Any], request_id: str) -> None:
 
 def _run(request: Dict[str, Any]) -> Dict[str, Any]:
     request_id = str(request.get("id") or "")
+    if request.get("control") == "shutdown_owned_cloud_browser":
+        return {
+            "id": request_id,
+            "ok": True,
+            "text": "",
+            "error": None,
+            "data": _jsonable(_shutdown_owned_cloud_browser()),
+            "outputs": [],
+            "artifacts": [],
+            "images": [],
+            "browser_events": [],
+            "browser_harness_available": False,
+            "browser_harness_error": None,
+        }
     session_id = str(request.get("session_id") or "default")
     cwd = Path(str(request.get("cwd") or ".")).expanduser().resolve()
     artifact_dir = Path(str(request.get("artifact_dir") or cwd / "artifacts")).expanduser().resolve()
@@ -871,7 +1071,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
             "id": request_id,
             "ok": False,
             "text": stdout.getvalue(),
-            "error": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
+            "error": _annotate_error("".join(traceback.format_exception_only(type(exc), exc)).strip()),
             "data": None,
             "outputs": _jsonable((ns or {}).get("outputs") or []),
             "artifacts": _jsonable((ns or {}).get("artifacts") or []),
@@ -896,11 +1096,12 @@ def main() -> None:
             request = json.loads(line)
             response = _run(request)
         except BaseException as exc:
+            error = _annotate_error("".join(traceback.format_exception_only(type(exc), exc)).strip())
             response = {
                 "id": "",
                 "ok": False,
                 "text": "",
-                "error": "".join(traceback.format_exception_only(type(exc), exc)).strip(),
+                "error": error,
                 "data": None,
                 "images": [],
             }

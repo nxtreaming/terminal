@@ -225,7 +225,7 @@ enum Command {
         skip_failed: bool,
         #[arg(long)]
         stop_on_failure: bool,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 2)]
         max_attempts: usize,
     },
     DatasetRunCodex {
@@ -250,7 +250,7 @@ enum Command {
         skip_failed: bool,
         #[arg(long)]
         stop_on_failure: bool,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 2)]
         max_attempts: usize,
     },
     DatasetRunAnthropic {
@@ -275,7 +275,7 @@ enum Command {
         skip_failed: bool,
         #[arg(long)]
         stop_on_failure: bool,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 2)]
         max_attempts: usize,
     },
     DatasetRunOpenrouter {
@@ -300,7 +300,7 @@ enum Command {
         skip_failed: bool,
         #[arg(long)]
         stop_on_failure: bool,
-        #[arg(long, default_value_t = 1)]
+        #[arg(long, default_value_t = 2)]
         max_attempts: usize,
     },
 }
@@ -2119,6 +2119,11 @@ fn run_dataset_case_with_attempts<P: ModelProvider>(
         }
         let should_retry = attempt < max_attempts && is_transient_provider_failure(&result);
         if !should_retry {
+            if is_permanent_provider_failure(&result) {
+                result["retry_classification"] = Value::String("permanent".to_string());
+            } else if attempt < max_attempts {
+                result["retry_classification"] = Value::String("not_transient".to_string());
+            }
             if !retry_history.is_empty() {
                 result["retry_history"] = Value::Array(retry_history);
             }
@@ -2553,12 +2558,28 @@ fn usage_summary_from_events(events: &[browser_use_protocol::EventRecord]) -> Va
     let mut output_cost_usd = 0.0_f64;
     let mut cost_usd = 0.0_f64;
     let mut invocation_count = 0_i64;
+    let mut cost_known_invocation_count = 0_i64;
+    let mut cost_estimated_invocation_count = 0_i64;
+    let mut cost_missing_invocation_count = 0_i64;
 
     for event in events {
         if event.event_type != "model.usage" {
             continue;
         }
         invocation_count += 1;
+        if event
+            .payload
+            .get("cost_usd")
+            .and_then(Value::as_f64)
+            .is_some()
+        {
+            cost_known_invocation_count += 1;
+            if event.payload.get("cost_source").and_then(Value::as_str) == Some("estimated") {
+                cost_estimated_invocation_count += 1;
+            }
+        } else {
+            cost_missing_invocation_count += 1;
+        }
         input_tokens += json_i64(&event.payload, "input_tokens");
         input_cached_tokens += json_i64(&event.payload, "input_cached_tokens");
         input_cache_creation_tokens += json_i64(&event.payload, "input_cache_creation_tokens");
@@ -2582,6 +2603,10 @@ fn usage_summary_from_events(events: &[browser_use_protocol::EventRecord]) -> Va
         "input_cache_creation_cost_usd": input_cache_creation_cost_usd,
         "output_cost_usd": output_cost_usd,
         "cost_usd": cost_usd,
+        "cost_known_invocation_count": cost_known_invocation_count,
+        "cost_estimated_invocation_count": cost_estimated_invocation_count,
+        "cost_missing_invocation_count": cost_missing_invocation_count,
+        "cost_status": usage_cost_status(invocation_count, cost_known_invocation_count, cost_missing_invocation_count),
         "invocation_count": invocation_count,
     })
 }
@@ -2614,7 +2639,22 @@ fn usage_summary_from_manifest(manifest: &Value) -> Value {
         ] {
             summary[key] = Value::from(json_f64(&summary, key) + json_f64(usage, key));
         }
+        for key in [
+            "cost_known_invocation_count",
+            "cost_estimated_invocation_count",
+            "cost_missing_invocation_count",
+        ] {
+            summary[key] = Value::from(json_i64(&summary, key) + json_i64(usage, key));
+        }
     }
+    let invocation_count = json_i64(&summary, "invocation_count");
+    let known_count = json_i64(&summary, "cost_known_invocation_count");
+    let missing_count = json_i64(&summary, "cost_missing_invocation_count");
+    summary["cost_status"] = Value::String(usage_cost_status(
+        invocation_count,
+        known_count,
+        missing_count,
+    ));
     summary
 }
 
@@ -2630,8 +2670,25 @@ fn empty_usage_summary() -> Value {
         "input_cache_creation_cost_usd": 0.0,
         "output_cost_usd": 0.0,
         "cost_usd": 0.0,
+        "cost_known_invocation_count": 0,
+        "cost_estimated_invocation_count": 0,
+        "cost_missing_invocation_count": 0,
+        "cost_status": "missing",
         "invocation_count": 0,
     })
+}
+
+fn usage_cost_status(invocation_count: i64, known_count: i64, missing_count: i64) -> String {
+    if invocation_count <= 0 {
+        return "missing".to_string();
+    }
+    if known_count == invocation_count {
+        return "known".to_string();
+    }
+    if missing_count == invocation_count {
+        return "missing".to_string();
+    }
+    "partial".to_string()
 }
 
 fn json_i64(value: &Value, key: &str) -> i64 {
@@ -2672,6 +2729,9 @@ fn is_transient_provider_failure(result: &Value) -> bool {
         return false;
     };
     let error = error.to_ascii_lowercase();
+    if is_permanent_provider_error(&error) {
+        return false;
+    }
     if [
         "incorrect api key",
         "401 unauthorized",
@@ -2705,6 +2765,32 @@ fn is_transient_provider_failure(result: &Value) -> bool {
         "502",
         "503",
         "504",
+    ]
+    .iter()
+    .any(|needle| error.contains(needle))
+}
+
+fn is_permanent_provider_failure(result: &Value) -> bool {
+    result
+        .get("error")
+        .and_then(Value::as_str)
+        .map(is_permanent_provider_error)
+        .unwrap_or(false)
+}
+
+fn is_permanent_provider_error(error: &str) -> bool {
+    let error = error.to_ascii_lowercase();
+    [
+        "no endpoints found that support image input",
+        "context length exceeded",
+        "maximum context length",
+        "context_length_exceeded",
+        "tool schema",
+        "schema mismatch",
+        "invalid_request_error",
+        "incorrect api key",
+        "401 unauthorized",
+        "403 forbidden",
     ]
     .iter()
     .any(|needle| error.contains(needle))
