@@ -116,7 +116,7 @@ This is not a generic settings page. It is the activation funnel.
 | Choose how the agent should connect to a model.                                 |
 |                                                                                |
 | > Codex login                                                                  |
-|   Claude Code login                                                            |
+|   Claude Code subscription                                                     |
 |   OpenAI API key                                                               |
 |   Anthropic API key                                                            |
 |   OpenRouter API key                                                           |
@@ -142,12 +142,12 @@ Model selection should combine model and provider. Provider is implementation de
 |                                                                                |
 | > GPT-5.5                         Codex login             best default         |
 |   GPT-5.5                         OpenAI API key          sign in required     |
-|   Claude Opus 4.7                 Claude Code login       sign in required     |
+|   Claude Opus 4.7                 Claude Code sub         sign in required     |
 |   Claude Opus 4.7                 Anthropic API key       sign in required     |
-|   Claude Sonnet 4.6               Claude Code login       sign in required     |
+|   Claude Sonnet 4.6               Claude Code sub         sign in required     |
 |   Claude Sonnet 4.6               Anthropic API key       sign in required     |
 |   Qwen3.6 Plus                    OpenRouter API key      sign in required     |
-|   GLM-5.1                         OpenRouter API key      sign in required     |
+|   Kimi K2.5                       OpenRouter API key      sign in required     |
 |   DeepSeek V4 Pro                 OpenRouter API key      sign in required     |
 |                                                                                |
 | Current                                                                        |
@@ -176,14 +176,14 @@ OpenAI
   GPT-5.5 via OpenAI API key
 
 Anthropic
-  Claude Opus 4.7 via Claude Code login
+  Claude Opus 4.7 via Claude Code subscription
   Claude Opus 4.7 via Anthropic API key
-  Claude Sonnet 4.6 via Claude Code login
+  Claude Sonnet 4.6 via Claude Code subscription
   Claude Sonnet 4.6 via Anthropic API key
 
 OpenRouter
   Qwen3.6 Plus
-  GLM-5.1
+  Kimi K2.5
   DeepSeek V4 Pro
 ```
 

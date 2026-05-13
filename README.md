@@ -95,7 +95,7 @@ Provider auth:
 - OpenAI Responses uses stored `auth login openai`, `LLM_BROWSER_OPENAI_API_KEY`, or `OPENAI_API_KEY`.
 - Codex Responses uses stored `auth login codex` / `auth import-codex`, `LLM_BROWSER_CODEX_ACCESS_TOKEN` + `LLM_BROWSER_CODEX_ACCOUNT_ID`, or `~/.codex/auth.json`.
 - Anthropic Messages uses stored `auth login anthropic`, `LLM_BROWSER_ANTHROPIC_API_KEY`, or `ANTHROPIC_API_KEY`.
-- Claude Code login uses a stored OAuth token from `auth login claude-code --access-token ...`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN`. Use `claude setup-token` to create a long-lived token.
+- Claude Code subscription uses a stored OAuth token from `auth login claude-code --access-token ...`, `CLAUDE_CODE_OAUTH_TOKEN`, or `ANTHROPIC_AUTH_TOKEN`. Use `claude setup-token` to create a long-lived token.
 - OpenRouter/OpenAI-compatible chat uses stored `auth login openrouter`, `LLM_BROWSER_OPENAI_COMPAT_API_KEY`, or `OPENROUTER_API_KEY`.
 
 `auth status` reports the currently usable auth paths. `config show` redacts stored API keys and access tokens.

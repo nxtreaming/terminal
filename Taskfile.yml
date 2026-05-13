@@ -1,0 +1,77 @@
+version: '3'
+
+tasks:
+  cli:dev:
+    desc: Run the browser-use CLI from source, forwarding args after --
+    silent: true
+    cmds:
+      - cargo run -p browser-use-cli -- {{.CLI_ARGS}}
+
+  tui:dev:
+    desc: Run the browser-use TUI from source, forwarding args after --
+    silent: true
+    cmds:
+      - cargo run -p browser-use-tui -- {{.CLI_ARGS}}
+
+  auth:clear:
+    aliases:
+      - clear-auth
+    desc: Clear project-local stored auth and reset the TUI onboarding state
+    silent: true
+    cmds:
+      - |
+        set -eu
+
+        state_dir="${STATE_DIR:-.browser-use-terminal}"
+        backup_root="${BACKUP_ROOT:-/tmp}"
+        timestamp="$(date +%Y%m%d-%H%M%S)"
+        backup_dir="$backup_root/but-onboarding-reset-$timestamp"
+
+        case "$state_dir" in
+          ""|"."|"./"|"/")
+            echo "refusing unsafe STATE_DIR: $state_dir" >&2
+            exit 1
+            ;;
+        esac
+
+        if [ -d "$state_dir" ]; then
+          project_root="$(pwd -P)"
+          state_real="$(cd "$state_dir" && pwd -P)"
+          if [ "$state_real" = "$project_root" ]; then
+            echo "refusing to clear project root as STATE_DIR: $state_dir" >&2
+            exit 1
+          fi
+          if [ -f "$state_dir/.env" ]; then
+            echo "refusing to clear state dir containing .env: $state_dir" >&2
+            exit 1
+          fi
+        fi
+
+        echo "leaving .env unchanged"
+
+        if [ -d "$state_dir" ]; then
+          if [ -f "$state_dir/state.db" ]; then
+            sqlite3 "$state_dir/state.db" "DELETE FROM app_settings WHERE key LIKE 'auth.%' OR key='telemetry.laminar.api_key'; UPDATE app_settings SET value='0', updated_ms=(strftime('%s','now') * 1000) WHERE key='setup.complete';"
+          fi
+          mkdir -p "$backup_dir"
+          cp -a "$state_dir" "$backup_dir/"
+          rm -rf "$state_dir"
+          echo "archived scrubbed state: $backup_dir/$(basename "$state_dir")"
+        else
+          echo "no existing state dir: $state_dir"
+        fi
+
+        cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set account "OpenAI API key" >/dev/null
+        cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set agent.backend openai >/dev/null
+        cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set setup.complete 0 >/dev/null
+
+        echo "local TUI auth cleared"
+        echo "launch onboarding: cargo run -q -p browser-use-tui -- --state-dir \"$state_dir\""
+
+  auth:status:
+    aliases:
+      - auth-status
+    desc: Show provider auth status for the project-local TUI state
+    silent: true
+    cmds:
+      - cargo run -q -p browser-use-cli -- --state-dir "${STATE_DIR:-.browser-use-terminal}" auth status

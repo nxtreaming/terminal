@@ -55,83 +55,84 @@ pub(crate) struct ModelChoice {
     pub(crate) account: &'static str,
     pub(crate) backend: AgentBackend,
     pub(crate) provider_model: &'static str,
-    pub(crate) row: &'static str,
 }
 
+pub(crate) const ACCOUNT_CODEX: &str = "Codex login";
+pub(crate) const ACCOUNT_CLAUDE_CODE: &str = "Claude Code subscription";
+pub(crate) const ACCOUNT_CLAUDE_CODE_LEGACY: &str = "Claude Code login";
+pub(crate) const ACCOUNT_OPENAI: &str = "OpenAI API key";
+pub(crate) const ACCOUNT_ANTHROPIC: &str = "Anthropic API key";
+pub(crate) const ACCOUNT_OPENROUTER: &str = "OpenRouter API key";
+
 pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
-    "Codex login",
-    "Claude Code login",
-    "OpenAI API key",
-    "Anthropic API key",
-    "OpenRouter API key",
+    ACCOUNT_CODEX,
+    ACCOUNT_CLAUDE_CODE,
+    ACCOUNT_OPENAI,
+    ACCOUNT_ANTHROPIC,
+    ACCOUNT_OPENROUTER,
 ];
 
 pub(crate) const BROWSER_CHOICES: [&str; 3] =
     ["Browser Use cloud", "Local Chrome", "Headless Chromium"];
 
+pub(crate) fn is_claude_code_account(account: &str) -> bool {
+    account == ACCOUNT_CLAUDE_CODE || account == ACCOUNT_CLAUDE_CODE_LEGACY
+}
+
 pub(crate) const MODEL_CHOICES: [ModelChoice; 9] = [
     ModelChoice {
         display: "GPT-5.5",
-        account: "Codex login",
+        account: ACCOUNT_CODEX,
         backend: AgentBackend::Codex,
         provider_model: "gpt-5.5",
-        row: "GPT-5.5                         Codex login             best default",
     },
     ModelChoice {
         display: "Claude Sonnet 4.6",
-        account: "Claude Code login",
+        account: ACCOUNT_CLAUDE_CODE,
         backend: AgentBackend::Anthropic,
         provider_model: "claude-sonnet-4-6",
-        row: "Claude Sonnet 4.6               Claude Code login       good browser agent",
     },
     ModelChoice {
         display: "Claude Opus 4.7",
-        account: "Claude Code login",
+        account: ACCOUNT_CLAUDE_CODE,
         backend: AgentBackend::Anthropic,
         provider_model: "claude-opus-4-7",
-        row: "Claude Opus 4.7                 Claude Code login       strongest reasoning",
     },
     ModelChoice {
         display: "GPT-5.5",
-        account: "OpenAI API key",
+        account: ACCOUNT_OPENAI,
         backend: AgentBackend::Openai,
         provider_model: "gpt-5.5",
-        row: "GPT-5.5                         OpenAI API key          needs key",
     },
     ModelChoice {
         display: "Claude Sonnet 4.6",
-        account: "Anthropic API key",
+        account: ACCOUNT_ANTHROPIC,
         backend: AgentBackend::Anthropic,
         provider_model: "claude-sonnet-4-6",
-        row: "Claude Sonnet 4.6               Anthropic API key       needs key",
     },
     ModelChoice {
         display: "Claude Opus 4.7",
-        account: "Anthropic API key",
+        account: ACCOUNT_ANTHROPIC,
         backend: AgentBackend::Anthropic,
         provider_model: "claude-opus-4-7",
-        row: "Claude Opus 4.7                 Anthropic API key       needs key",
     },
     ModelChoice {
         display: "Qwen3.6 Plus",
-        account: "OpenRouter API key",
+        account: ACCOUNT_OPENROUTER,
         backend: AgentBackend::Openrouter,
         provider_model: "qwen/qwen3.6-plus",
-        row: "Qwen3.6 Plus                    OpenRouter API key      needs key",
     },
     ModelChoice {
-        display: "GLM-5.1",
-        account: "OpenRouter API key",
+        display: "Kimi K2.5",
+        account: ACCOUNT_OPENROUTER,
         backend: AgentBackend::Openrouter,
-        provider_model: "z-ai/glm-5.1",
-        row: "GLM-5.1                         OpenRouter API key      needs key",
+        provider_model: "moonshotai/kimi-k2.5",
     },
     ModelChoice {
         display: "DeepSeek V4 Pro",
-        account: "OpenRouter API key",
+        account: ACCOUNT_OPENROUTER,
         backend: AgentBackend::Openrouter,
         provider_model: "deepseek/deepseek-v4-pro",
-        row: "DeepSeek V4 Pro                 OpenRouter API key      needs key",
     },
 ];
 

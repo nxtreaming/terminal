@@ -29,13 +29,15 @@ mod settings;
 mod theme;
 
 use composer::Composer;
-use palette::{Palette, PaletteAction};
+use palette::PaletteAction;
 use render::{
     lines_plain_text, native_scrollback_event_lines, native_scrollback_lines, render, render_dump,
 };
 use runtime::run_agent_thread;
 use settings::{
-    provider_model_for_display, AgentBackend, ACCOUNT_CHOICES, BROWSER_CHOICES, MODEL_CHOICES,
+    is_claude_code_account, provider_model_for_display, AgentBackend, ACCOUNT_ANTHROPIC,
+    ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES,
+    MODEL_CHOICES,
 };
 
 #[derive(Debug, Parser)]
@@ -76,8 +78,20 @@ enum Surface {
     Browser,
     BrowserSelect,
     History,
-    Actions,
     Developer,
+}
+
+impl Surface {
+    fn is_bottom_pane(self) -> bool {
+        matches!(
+            self,
+            Self::Browser | Self::BrowserSelect | Self::Developer | Self::History | Self::Model
+        )
+    }
+
+    fn uses_main_view(self) -> bool {
+        self == Self::Main || self.is_bottom_pane()
+    }
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -88,7 +102,6 @@ enum ScreenArg {
     Model,
     Browser,
     History,
-    Actions,
     Developer,
 }
 
@@ -101,7 +114,6 @@ impl From<ScreenArg> for Surface {
             ScreenArg::Model => Self::Model,
             ScreenArg::Browser => Self::Browser,
             ScreenArg::History => Self::History,
-            ScreenArg::Actions => Self::Actions,
             ScreenArg::Developer => Self::Developer,
         }
     }
@@ -144,7 +156,6 @@ struct App {
     selected_session_id: Option<String>,
     composer: Composer,
     surface: Surface,
-    palette: Palette,
     selected_row: usize,
     setup_complete: bool,
     account: String,
@@ -231,23 +242,14 @@ impl App {
             .get_setting("agent.backend")?
             .and_then(|value| AgentBackend::from_setting(&value))
             .unwrap_or(args.agent);
-        let selected_row = if surface == Surface::Main
-            && !setup_complete
-            && !had_stored_model
-            && selected_session_id.is_none()
-            && store.list_sessions()?.is_empty()
-        {
-            1
-        } else {
-            0
-        };
+        let selected_row = 0;
+        let _ = had_stored_model;
         Ok(Self {
             store,
             args,
             selected_session_id,
             composer: Composer::default(),
             surface,
-            palette: Palette::default(),
             selected_row,
             setup_complete,
             account,
@@ -305,16 +307,12 @@ impl App {
         if surface != Surface::Browser {
             self.browser_notice = None;
         }
-        if surface != Surface::Actions {
-            self.palette.clear();
-        }
     }
 
     fn close_surface(&mut self) {
         self.surface = Surface::Main;
         self.selected_row = 0;
         self.browser_notice = None;
-        self.palette.clear();
     }
 
     fn submit(&mut self) -> Result<()> {
@@ -331,10 +329,6 @@ impl App {
                     self.execute_cancelled_selection()?;
                 }
             }
-            return Ok(());
-        }
-        if text == "/" {
-            self.open_surface(Surface::Actions);
             return Ok(());
         }
         if let Some(session) = self
@@ -517,6 +511,22 @@ impl App {
             }
             KeyEvent {
                 code: KeyCode::Esc, ..
+            } if self.is_slash_palette_active() => {
+                self.composer.clear();
+                self.selected_row = 0;
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::ApiKey => {
+                self.cancel_auth_entry();
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::Telemetry => {
+                self.cancel_secret_entry();
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
             } => self.close_surface(),
             KeyEvent {
                 code: KeyCode::Tab, ..
@@ -535,27 +545,40 @@ impl App {
                 ..
             } if self.composer.is_empty() => self.open_surface(Surface::Developer),
             KeyEvent {
-                code: KeyCode::Char('/'),
-                modifiers: KeyModifiers::NONE,
-                ..
-            } if self.composer.is_empty() => self.open_surface(Surface::Actions),
-            KeyEvent {
                 code: KeyCode::Char('r'),
                 modifiers: KeyModifiers::NONE,
                 ..
             } if self.surface == Surface::History => self.resume_selected_history()?,
             KeyEvent {
                 code: KeyCode::Up, ..
-            } if self.surface == Surface::Main && self.composer.handle_key(key) => {}
+            } if self.is_first_run_setup_visible()? => self.move_selection(-1)?,
             KeyEvent {
                 code: KeyCode::Down,
                 ..
-            } if self.surface == Surface::Main && self.composer.handle_key(key) => {}
+            } if self.is_first_run_setup_visible()? => self.move_selection(1)?,
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } if self.is_slash_palette_active() => self.move_slash_palette_selection(-1),
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } if self.is_slash_palette_active() => self.move_slash_palette_selection(1),
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } if self.surface == Surface::Main
+                && !(self.composer.is_empty() && self.main_selection_count()? > 0)
+                && self.composer.handle_key(key) => {}
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } if self.surface == Surface::Main
+                && !(self.composer.is_empty() && self.main_selection_count()? > 0)
+                && self.composer.handle_key(key) => {}
             KeyEvent {
                 code: KeyCode::Up, ..
             } if self.surface != Surface::Main
                 || self.is_first_run_setup_visible()?
-                || self.main_selection_count()? > 0 =>
+                || (self.composer.is_empty() && self.main_selection_count()? > 0) =>
             {
                 self.move_selection(-1)?
             }
@@ -564,7 +587,7 @@ impl App {
                 ..
             } if self.surface != Surface::Main
                 || self.is_first_run_setup_visible()?
-                || self.main_selection_count()? > 0 =>
+                || (self.composer.is_empty() && self.main_selection_count()? > 0) =>
             {
                 self.move_selection(1)?
             }
@@ -575,6 +598,11 @@ impl App {
                 code: KeyCode::Down,
                 ..
             } if self.surface == Surface::Main => {}
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.is_slash_palette_active() => self.execute_slash_palette_selection()?,
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
@@ -590,12 +618,13 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.submit()?,
-            _ if self.surface == Surface::Actions && self.palette.handle_filter_key(key) => {
-                self.selected_row = 0;
-            }
             _ if matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
                 && self.handle_api_key_key(key) => {}
-            _ if self.surface == Surface::Main && self.composer.handle_key(key) => {}
+            _ if self.surface == Surface::Main && self.composer.handle_key(key) => {
+                if self.is_slash_palette_active() {
+                    self.clamp_slash_palette_selection();
+                }
+            }
             KeyEvent {
                 code: KeyCode::Char('d'),
                 modifiers: KeyModifiers::CONTROL,
@@ -608,11 +637,14 @@ impl App {
 
     fn handle_paste(&mut self, text: &str) {
         match self.surface {
-            Surface::Main | Surface::ApiKey | Surface::Telemetry => {
+            Surface::Main => {
                 self.composer.insert_paste(text);
+                if self.is_slash_palette_active() {
+                    self.clamp_slash_palette_selection();
+                }
             }
-            Surface::Actions => {
-                self.palette.push_filter_str(text);
+            Surface::ApiKey | Surface::Telemetry => {
+                self.composer.insert_paste(text);
                 self.selected_row = 0;
             }
             _ => {}
@@ -629,11 +661,6 @@ impl App {
 
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
-            Surface::Actions => {
-                if let Some(action) = self.palette.selected_action(self.selected_row) {
-                    self.execute_palette_action(action)?;
-                }
-            }
             Surface::History => {
                 let sessions = self.store.list_sessions()?;
                 if let Some(session) =
@@ -642,20 +669,7 @@ impl App {
                     self.dispatch(AppCommand::SelectHistory(session.id.clone()))?;
                 }
             }
-            Surface::Setup => match self
-                .selected_row
-                .min(self.setup_row_count().saturating_sub(1))
-            {
-                0 => self.dispatch(AppCommand::SignIn)?,
-                1 => self.dispatch(AppCommand::ChangeModel)?,
-                2 => self.dispatch(AppCommand::ChangeBrowser)?,
-                _ => {
-                    self.setup_complete = true;
-                    self.store.set_setting("setup.complete", "1")?;
-                    self.persist_runtime_settings()?;
-                    self.close_surface();
-                }
-            },
+            Surface::Setup => self.execute_first_run_setup_selection()?,
             Surface::Account => {
                 let account = ACCOUNT_CHOICES
                     .get(
@@ -666,14 +680,20 @@ impl App {
                     .to_string();
                 self.dispatch(AppCommand::SaveAccount(account))?;
             }
-            Surface::ApiKey => {
-                let secret = self.composer.take_trimmed();
-                self.dispatch(AppCommand::SaveAuth(secret))?;
-            }
-            Surface::Telemetry => {
-                let secret = self.composer.take_trimmed();
-                self.dispatch(AppCommand::SaveTelemetry(secret))?;
-            }
+            Surface::ApiKey => match self.selected_row.min(1) {
+                0 => {
+                    let secret = self.composer.take_trimmed();
+                    self.dispatch(AppCommand::SaveAuth(secret))?;
+                }
+                _ => self.cancel_auth_entry(),
+            },
+            Surface::Telemetry => match self.selected_row.min(1) {
+                0 => {
+                    let secret = self.composer.take_trimmed();
+                    self.dispatch(AppCommand::SaveTelemetry(secret))?;
+                }
+                _ => self.cancel_secret_entry(),
+            },
             Surface::Model => {
                 self.dispatch(AppCommand::SaveModel(self.selected_row))?;
             }
@@ -697,21 +717,11 @@ impl App {
     }
 
     fn execute_first_run_setup_selection(&mut self) -> Result<()> {
-        match self
+        let idx = self
             .selected_row
-            .min(self.setup_row_count().saturating_sub(1))
-        {
-            0 => self.dispatch(AppCommand::SignIn)?,
-            1 => self.dispatch(AppCommand::ChangeModel)?,
-            2 => self.dispatch(AppCommand::ChangeBrowser)?,
-            _ => {
-                self.setup_complete = true;
-                self.store.set_setting("setup.complete", "1")?;
-                self.persist_runtime_settings()?;
-                self.close_surface();
-            }
-        }
-        Ok(())
+            .min(ACCOUNT_CHOICES.len().saturating_sub(1));
+        let account = ACCOUNT_CHOICES[idx].to_string();
+        self.dispatch(AppCommand::SaveAccount(account))
     }
 
     fn resume_selected_history(&mut self) -> Result<()> {
@@ -754,11 +764,10 @@ impl App {
     fn execute_palette_action(&mut self, action: PaletteAction) -> Result<()> {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
-            PaletteAction::OpenBrowser => self.dispatch(AppCommand::OpenBrowser)?,
-            PaletteAction::ReconnectBrowser => self.dispatch(AppCommand::ReconnectBrowser)?,
+            PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
-            PaletteAction::SignIn => self.dispatch(AppCommand::SignIn)?,
+            PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
             PaletteAction::ConfigureLaminar => self.dispatch(AppCommand::ConfigureTelemetry)?,
         }
         Ok(())
@@ -766,13 +775,32 @@ impl App {
 
     fn save_account(&mut self, account: String) -> Result<()> {
         self.account = account.clone();
-        if self.account == "Codex login" {
+        if self.account == ACCOUNT_CODEX {
             self.persist_runtime_settings()?;
             self.status_notice = Some("Codex login selected.".to_string());
-            self.open_surface(Surface::Model);
+            self.advance_after_auth()?;
             return Ok(());
         }
         self.start_auth_entry(account);
+        Ok(())
+    }
+
+    fn models_for_account(account: &str) -> Vec<usize> {
+        MODEL_CHOICES
+            .iter()
+            .enumerate()
+            .filter(|(_, choice)| choice.account == account)
+            .map(|(idx, _)| idx)
+            .collect()
+    }
+
+    fn advance_after_auth(&mut self) -> Result<()> {
+        let indices = Self::models_for_account(&self.account);
+        if indices.len() == 1 {
+            return self.save_model(indices[0]);
+        }
+        self.selected_row = 0;
+        self.open_surface(Surface::Model);
         Ok(())
     }
 
@@ -793,10 +821,11 @@ impl App {
         }
         self.status_notice = Some(format!("Model set to {}.", self.model));
         if !self.setup_complete {
-            self.open_surface(Surface::BrowserSelect);
-        } else {
-            self.close_surface();
+            self.setup_complete = true;
+            self.store.set_setting("setup.complete", "1")?;
+            self.persist_runtime_settings()?;
         }
+        self.close_surface();
         Ok(())
     }
 
@@ -836,12 +865,9 @@ impl App {
         self.api_key_account = None;
         self.status_notice = Some(format!("Saved {}.", auth_secret_label(&account)));
         if let Some(index) = self.pending_model_after_auth.take() {
-            self.selected_row = index;
-            self.open_surface(Surface::Model);
-        } else {
-            self.open_surface(Surface::Model);
+            return self.save_model(index);
         }
-        Ok(())
+        self.advance_after_auth()
     }
 
     fn start_auth_entry(&mut self, account: String) {
@@ -850,9 +876,20 @@ impl App {
         self.open_surface(Surface::ApiKey);
     }
 
+    fn cancel_auth_entry(&mut self) {
+        self.api_key_account = None;
+        self.pending_model_after_auth = None;
+        self.cancel_secret_entry();
+    }
+
     fn start_telemetry_entry(&mut self) {
         self.composer.clear();
         self.open_surface(Surface::Telemetry);
+    }
+
+    fn cancel_secret_entry(&mut self) {
+        self.composer.clear();
+        self.close_surface();
     }
 
     fn save_telemetry(&mut self, secret: String) -> Result<()> {
@@ -869,15 +906,15 @@ impl App {
     }
 
     fn handle_api_key_key(&mut self, key: KeyEvent) -> bool {
-        self.composer.handle_key(key)
+        let handled = self.composer.handle_key(key);
+        if handled {
+            self.selected_row = 0;
+        }
+        handled
     }
 
     fn setup_row_count(&self) -> usize {
-        if self.model_configured {
-            4
-        } else {
-            3
-        }
+        ACCOUNT_CHOICES.len()
     }
 
     fn request_open_browser(&mut self) -> Result<()> {
@@ -940,15 +977,50 @@ impl App {
             }
             Surface::Setup => self.setup_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
-            Surface::ApiKey => 0,
-            Surface::Telemetry => 0,
+            Surface::ApiKey | Surface::Telemetry => 2,
             Surface::Model => MODEL_CHOICES.len(),
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::History => self.store.list_sessions()?.len(),
-            Surface::Actions => self.palette.items().len(),
             Surface::Developer => 1,
         })
+    }
+
+    fn is_slash_palette_active(&self) -> bool {
+        self.surface == Surface::Main && palette::is_slash_input(self.composer.input())
+    }
+
+    fn slash_palette_items(&self) -> Vec<palette::PaletteItem> {
+        palette::items_filtered(self.composer.input())
+    }
+
+    fn move_slash_palette_selection(&mut self, delta: isize) {
+        let count = self.slash_palette_items().len();
+        if count == 0 {
+            self.selected_row = 0;
+            return;
+        }
+        let max = count.saturating_sub(1) as isize;
+        self.selected_row = (self.selected_row as isize + delta).clamp(0, max) as usize;
+    }
+
+    fn clamp_slash_palette_selection(&mut self) {
+        let count = self.slash_palette_items().len();
+        if count == 0 {
+            self.selected_row = 0;
+        } else if self.selected_row >= count {
+            self.selected_row = count - 1;
+        }
+    }
+
+    fn execute_slash_palette_selection(&mut self) -> Result<()> {
+        let action = palette::selected_action(self.composer.input(), self.selected_row);
+        if let Some(action) = action {
+            self.composer.clear();
+            self.selected_row = 0;
+            self.execute_palette_action(action)?;
+        }
+        Ok(())
     }
 
     fn main_selection_count(&self) -> Result<usize> {
@@ -971,6 +1043,7 @@ impl App {
         Ok(())
     }
 
+    #[cfg(test)]
     fn composer_height(&self) -> u16 {
         self.composer.height()
     }
@@ -980,7 +1053,7 @@ impl App {
     }
 
     fn native_scrollback_is_active(&self) -> bool {
-        self.surface == Surface::Main
+        self.surface.uses_main_view()
             && self
                 .native_history
                 .is_active_for(self.selected_session_id.as_deref())
@@ -1027,27 +1100,20 @@ impl App {
 
     fn account_ready(&self, account: &str) -> Result<bool> {
         Ok(match account {
-            "OpenAI API key" => self.has_stored_or_env(
+            ACCOUNT_OPENAI => self.has_stored_or_env(
                 "auth.openai.api_key",
                 &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
             )?,
-            "OpenRouter API key" => self.has_stored_or_env(
+            ACCOUNT_OPENROUTER => self.has_stored_or_env(
                 "auth.openrouter.api_key",
                 &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
             )?,
-            "Anthropic API key" => self.has_stored_or_env(
+            ACCOUNT_ANTHROPIC => self.has_stored_or_env(
                 "auth.anthropic.api_key",
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             )?,
-            "Claude Code login" => self.has_stored_or_env(
-                "auth.claude_code.auth_token",
-                &[
-                    "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-                    "CLAUDE_CODE_OAUTH_TOKEN",
-                    "ANTHROPIC_AUTH_TOKEN",
-                ],
-            )?,
-            "Codex login" => true,
+            account if is_claude_code_account(account) => self.has_claude_code_oauth()?,
+            ACCOUNT_CODEX => true,
             _ => false,
         })
     }
@@ -1060,7 +1126,7 @@ impl App {
                     &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
                 )? =>
             {
-                Some("OpenAI API key is missing. Sign in here before retrying.")
+                Some("OpenAI API key is missing. Authenticate here before retrying.")
             }
             AgentBackend::Openrouter
                 if !self.has_stored_or_env(
@@ -1068,29 +1134,22 @@ impl App {
                     &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
                 )? =>
             {
-                Some("OpenRouter API key is missing. Sign in here before retrying.")
+                Some("OpenRouter API key is missing. Authenticate here before retrying.")
             }
             AgentBackend::Anthropic
-                if self.account == "Claude Code login"
-                    && !self.has_stored_or_env(
-                        "auth.claude_code.auth_token",
-                        &[
-                            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-                            "CLAUDE_CODE_OAUTH_TOKEN",
-                            "ANTHROPIC_AUTH_TOKEN",
-                        ],
-                    )? =>
+                if is_claude_code_account(&self.account)
+                    && !self.has_claude_code_oauth()? =>
             {
-                Some("Claude Code OAuth token is missing. Paste it here before retrying.")
+                Some("Claude Code login is missing. Run `browser-use-terminal auth login claude-code`.")
             }
             AgentBackend::Anthropic
-                if self.account != "Claude Code login"
+                if !is_claude_code_account(&self.account)
                     && !self.has_stored_or_env(
                         "auth.anthropic.api_key",
                         &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
                     )? =>
             {
-                Some("Anthropic API key is missing. Sign in here before retrying.")
+                Some("Anthropic API key is missing. Authenticate here before retrying.")
             }
             _ => None,
         };
@@ -1108,6 +1167,19 @@ impl App {
         Ok(env_names
             .iter()
             .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty())))
+    }
+
+    fn has_claude_code_oauth(&self) -> Result<bool> {
+        Ok(self.has_stored_or_env(
+            "auth.claude_code.access_token",
+            &[
+                "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+                "CLAUDE_CODE_OAUTH_TOKEN",
+                "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
+                "ANTHROPIC_OAUTH_TOKEN",
+                "ANTHROPIC_AUTH_TOKEN",
+            ],
+        )? || self.has_stored_or_env("auth.claude_code.auth_token", &[])?)
     }
 
     fn laminar_status(&self) -> Result<String> {
@@ -1129,20 +1201,20 @@ const LAMINAR_API_KEY_SETTING: &str = "telemetry.laminar.api_key";
 
 fn auth_setting_key(account: &str) -> &'static str {
     match account {
-        "OpenAI API key" => "auth.openai.api_key",
-        "OpenRouter API key" => "auth.openrouter.api_key",
-        "Anthropic API key" => "auth.anthropic.api_key",
-        "Claude Code login" => "auth.claude_code.auth_token",
+        ACCOUNT_OPENAI => "auth.openai.api_key",
+        ACCOUNT_OPENROUTER => "auth.openrouter.api_key",
+        ACCOUNT_ANTHROPIC => "auth.anthropic.api_key",
+        account if is_claude_code_account(account) => "auth.claude_code.access_token",
         _ => "auth.codex.placeholder",
     }
 }
 
 fn auth_secret_label(account: &str) -> &'static str {
     match account {
-        "OpenAI API key" => "OpenAI API key",
-        "OpenRouter API key" => "OpenRouter API key",
-        "Anthropic API key" => "Anthropic API key",
-        "Claude Code login" => "Claude Code OAuth token",
+        ACCOUNT_OPENAI => "OpenAI API key",
+        ACCOUNT_OPENROUTER => "OpenRouter API key",
+        ACCOUNT_ANTHROPIC => "Anthropic API key",
+        account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "credential",
     }
 }
@@ -1279,7 +1351,9 @@ fn print_native_transcript(app: &mut App) -> Result<()> {
 fn run_terminal(mut app: App) -> Result<()> {
     const MAX_INPUT_EVENTS_PER_FRAME: usize = 16;
 
-    let live_height = app.live_viewport_height();
+    let live_height = crossterm::terminal::size()
+        .map(|(_, height)| height.saturating_sub(1).max(12))
+        .unwrap_or_else(|_| app.live_viewport_height());
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -1343,10 +1417,8 @@ fn handle_terminal_event(
         }
         TermEvent::Resize(_, _) => {
             terminal.autoresize()?;
-            if app.surface != Surface::Main {
-                execute!(terminal.backend_mut(), Clear(ClearType::All), MoveTo(0, 0))?;
-            }
-            terminal.clear()?;
+            app.native_history.reset_with_clear();
+            clear_native_transcript_screen(terminal)?;
             Ok(false)
         }
         _ => Ok(false),
@@ -1406,7 +1478,7 @@ fn maybe_emit_native_transcript(
 ) -> Result<()> {
     let size = terminal.size()?;
     let state = app.workbench_state()?;
-    if app.surface != Surface::Main || app.is_first_run_setup_visible()? {
+    if !app.surface.uses_main_view() || app.is_first_run_setup_visible()? {
         return Ok(());
     }
     let should_clear = app.native_history.take_clear_before_replay();
@@ -1421,6 +1493,10 @@ fn maybe_emit_native_transcript(
         let events = app.store.events_for_session(&session.id)?;
         let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
         let lines = native_scrollback_lines(app, size.width)?;
+        if !should_use_native_scrollback(size.height, lines.len()) {
+            app.native_history.reset();
+            return Ok(());
+        }
         insert_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session(session.id.clone(), last_seq);
@@ -1445,6 +1521,14 @@ fn maybe_emit_native_transcript(
         .unwrap_or(app.native_history.last_seq);
     insert_native_lines(terminal, lines)?;
     Ok(())
+}
+
+fn should_use_native_scrollback(viewport_height: u16, line_count: usize) -> bool {
+    let inline_chrome_rows = 8usize;
+    let visible_budget = (viewport_height as usize)
+        .saturating_sub(inline_chrome_rows)
+        .max(8);
+    line_count > visible_budget
 }
 
 fn clear_native_transcript_screen(
@@ -1582,6 +1666,13 @@ mod redesign_tests {
         Ok(app)
     }
 
+    fn row_containing(screen: &str, needle: &str) -> usize {
+        screen
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("screen did not contain {needle:?}\n{screen}"))
+    }
+
     #[test]
     fn dotenv_loader_sets_missing_env_vars_without_overriding_existing_values() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -1621,20 +1712,32 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("browser-use setup"));
-        assert!(screen.contains("[needs] Model"));
-        assert!(screen.contains("> Choose model"));
-        assert!(!screen.contains("complete modal"));
+        assert!(screen.contains("step 1 of 2"));
+        assert!(screen.contains("how do you want to sign in?"));
+        assert!(screen.contains("Codex login"));
+        assert!(screen.contains("Claude Code subscription"));
+        assert!(screen.contains("OpenRouter API key"));
+        assert!(!screen.contains("[needs]"));
 
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::Model);
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::BrowserSelect);
+        // Up/Down must navigate the 5 onboarding rows and clamp at edges.
+        assert_eq!(app.selected_row, 0);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, 0);
+
+        // Default row 0 = Codex login → single-model account → auto-pick GPT-5.5 and finish setup.
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
+        assert_eq!(app.account, "Codex login");
+        assert_eq!(app.model, "GPT-5.5");
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("What should the browser do?"));
+        assert!(screen.contains("Tell the browser what to do..."));
         assert!(screen.contains("Browser Use cloud"));
         Ok(())
     }
@@ -1673,7 +1776,7 @@ mod redesign_tests {
             app.open_surface(Surface::Model);
             app.selected_row = 7;
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-            assert_eq!(app.model, "GLM-5.1");
+            assert_eq!(app.model, "Kimi K2.5");
             assert_eq!(app.account, "OpenRouter API key");
             assert_eq!(app.surface, Surface::ApiKey);
             Ok(())
@@ -1707,15 +1810,65 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("> inspect cart"));
-        assert!(screen.contains("+- browser"));
-        assert!(screen.contains("+- result"));
-        assert!(screen.contains("+- source"));
+        assert!(screen.contains("browser"));
+        assert!(screen.contains("result"));
+        assert!(screen.contains("source"));
         assert!(screen.contains("Your cart has 14 items."));
         assert!(screen.contains("Example item (https://example.com/item)"));
         assert!(screen.contains("/tmp/cart.json"));
         assert!(!screen.contains("**14 items**"));
         assert!(!screen.contains("`coupon.json`"));
         assert!(!screen.contains("┌"));
+        Ok(())
+    }
+
+    #[test]
+    fn idle_and_completed_screens_stay_top_aligned() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 44;
+        let running_session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running_session.id,
+            "session.input",
+            serde_json::json!({"text": "run near the top"}),
+        )?;
+        app.store.append_event(
+            &running_session.id,
+            "browser.state",
+            serde_json::json!({"url": "https://example.com", "title": "Example"}),
+        )?;
+        app.selected_session_id = Some(running_session.id);
+        let running_screen = render_dump(&mut app)?;
+        assert!(row_containing(&running_screen, "working") <= 2);
+        let running_composer_row = row_containing(&running_screen, "Type to steer the agent...");
+        let running_activity_row = row_containing(&running_screen, "opened example.com");
+        assert!(running_composer_row.saturating_sub(running_activity_row) <= 5);
+
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect top alignment"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Everything should sit near the top."}),
+        )?;
+
+        app.selected_session_id = None;
+        let ready_screen = render_dump(&mut app)?;
+        assert!(ready_screen.contains("█▀▀▄ █▀▀█"));
+        assert!(row_containing(&ready_screen, "recent") <= 8);
+        assert!(row_containing(&ready_screen, "Tell the browser what to do...") <= 22);
+
+        app.selected_session_id = Some(session.id);
+        let completed_screen = render_dump(&mut app)?;
+        assert!(row_containing(&completed_screen, "> inspect top alignment") <= 2);
+        let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
+        let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
+        assert!(composer_row.saturating_sub(result_row) <= 5);
         Ok(())
     }
 
@@ -1752,7 +1905,7 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("> whats happening"));
-        assert!(screen.contains("+- result"));
+        assert!(screen.contains("result"));
         assert!(screen.contains("Purpose: Rust-first terminal workbench"));
         assert!(screen.contains("crates/browser-use-tui"));
         assert!(screen.contains("helper finished"));
@@ -1765,17 +1918,234 @@ mod redesign_tests {
     fn command_palette_filters_and_exposes_only_product_actions() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
-        app.open_surface(Surface::Actions);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        assert!(app.is_slash_palette_active());
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Reconnect browser"));
-        assert!(!screen.contains("Setup"));
-        assert!(!screen.contains("Developer"));
-        for ch in "model".chars() {
+        assert!(screen.contains("/task"));
+        assert!(screen.contains("/history"));
+        assert!(screen.contains("/browser"));
+        assert!(screen.contains("/model"));
+        assert!(screen.contains("/auth"));
+        assert!(screen.contains("/laminar"));
+        assert!(screen.contains("start a new task"));
+        assert!(screen.contains("change browser backend"));
+        assert!(!screen.contains("Open browser"));
+        assert!(!screen.contains("Reconnect browser"));
+        for ch in "mo".chars() {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
         }
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Choose model"));
-        assert!(!screen.contains("Open browser"));
+        assert!(screen.contains("/model"));
+        assert!(!screen.contains("/browser"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_auth_surfaces_explain_required_credentials() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.start_auth_entry(settings::ACCOUNT_OPENROUTER.to_string());
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENROUTER)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("OpenRouter API key"));
+
+        app.start_auth_entry(settings::ACCOUNT_CLAUDE_CODE.to_string());
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_CLAUDE_CODE)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Claude Code OAuth token"));
+        assert!(screen.contains("Claude Code uses Browser Use's Anthropic OAuth login"));
+        assert!(screen.contains("browser-use-terminal auth login claude-code"));
+        assert!(screen.contains("refreshable Claude Code credential"));
+        assert!(screen.contains("optional legacy access token"));
+        Ok(())
+    }
+
+    #[test]
+    fn credential_action_rows_are_real_menu_choices() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.start_auth_entry(settings::ACCOUNT_CLAUDE_CODE.to_string());
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(app.selected_row, 0);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("> Save key"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, 1);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("> Cancel"));
+        assert!(!screen.contains("> Save key"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, 0);
+        app.selected_row = 1;
+        app.handle_paste("legacy_token");
+        assert_eq!(app.selected_row, 0);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Main);
+        assert_eq!(app.api_key_account, None);
+        assert!(app.composer.is_empty());
+        assert_eq!(
+            app.store.get_setting("auth.claude_code.access_token")?,
+            None
+        );
+
+        app.open_surface(Surface::Developer);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Telemetry);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("> Cancel"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Main);
+        assert_eq!(app.store.get_setting(LAMINAR_API_KEY_SETTING)?, None);
+        Ok(())
+    }
+
+    #[test]
+    fn setup_surface_enter_matches_visible_account_choice() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_surface(Surface::Setup);
+        app.selected_row = 1;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Claude Code subscription"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_CLAUDE_CODE)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn up_down_keys_navigate_every_choice_menu() -> Result<()> {
+        fn assert_nav(app: &mut App, expected_count: usize) -> Result<()> {
+            app.selected_row = 0;
+            for _ in 0..50 {
+                assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+            }
+            assert_eq!(app.selected_row, expected_count - 1);
+            for _ in 0..50 {
+                assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            }
+            assert_eq!(app.selected_row, 0);
+            Ok(())
+        }
+
+        let first_run_temp = tempfile::tempdir()?;
+        let mut first_run_app = App::new(args(&first_run_temp))?;
+        assert_nav(&mut first_run_app, ACCOUNT_CHOICES.len())?;
+
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        for surface in [
+            Surface::Setup,
+            Surface::Account,
+            Surface::Model,
+            Surface::Browser,
+            Surface::BrowserSelect,
+        ] {
+            app.open_surface(surface);
+            let count = match surface {
+                Surface::Setup | Surface::Account => ACCOUNT_CHOICES.len(),
+                Surface::Model => MODEL_CHOICES.len(),
+                Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
+                _ => unreachable!(),
+            };
+            assert_nav(&mut app, count)?;
+        }
+
+        app.start_auth_entry(settings::ACCOUNT_CLAUDE_CODE.to_string());
+        assert_nav(&mut app, 2)?;
+        app.cancel_auth_entry();
+        app.start_telemetry_entry();
+        assert_nav(&mut app, 2)?;
+        app.cancel_secret_entry();
+
+        for idx in 0..3 {
+            let session = app.store.create_session(None, std::env::current_dir()?)?;
+            app.store.append_event(
+                &session.id,
+                "session.input",
+                serde_json::json!({"text": format!("history task {idx}")}),
+            )?;
+        }
+        app.open_surface(Surface::History);
+        assert_nav(&mut app, 3)?;
+        app.close_surface();
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        let slash_palette_count = app.slash_palette_items().len();
+        assert_nav(&mut app, slash_palette_count)?;
+        app.composer.clear();
+        app.selected_row = 0;
+
+        let failed = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &failed.id,
+            "session.input",
+            serde_json::json!({"text": "failed task"}),
+        )?;
+        app.store.append_event(
+            &failed.id,
+            "session.failed",
+            serde_json::json!({"error": "OpenRouter API key is missing"}),
+        )?;
+        app.selected_session_id = Some(failed.id);
+        assert_nav(&mut app, 4)?;
+
+        let cancelled = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &cancelled.id,
+            "session.input",
+            serde_json::json!({"text": "cancelled task"}),
+        )?;
+        app.store.request_cancel(&cancelled.id, "test cancel")?;
+        app.selected_session_id = Some(cancelled.id);
+        assert_nav(&mut app, 3)?;
+        Ok(())
+    }
+
+    #[test]
+    fn action_and_model_selection_clamp_at_edges() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, app.slash_palette_items().len() - 1);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, 0);
+        app.composer.clear();
+        app.selected_row = 0;
+
+        app.open_surface(Surface::Model);
+        for _ in 0..50 {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("▸ DeepSeek V4 Pro"));
         Ok(())
     }
 
@@ -1940,7 +2310,6 @@ mod redesign_tests {
         assert!(lines.len() > app.args.height as usize);
         assert!(text.contains("line 1"));
         assert!(text.contains("line 40"));
-        assert!(!app.native_scrollback_is_active());
         Ok(())
     }
 

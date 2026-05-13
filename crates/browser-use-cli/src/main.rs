@@ -1,6 +1,9 @@
 use std::collections::{HashMap, HashSet};
-use std::io::{self, Write};
+use std::io::{self, Read, Write};
+use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
@@ -12,9 +15,12 @@ use browser_use_protocol::{
     sanitized_agent_context_from_events, task_from_events,
 };
 use browser_use_providers::{
-    load_codex_auth, load_codex_auth_file, AnthropicMessagesProvider, CodexAuth,
-    CodexResponsesProvider, FakeProvider, ModelProvider, OpenAICompatibleChatProvider,
-    OpenAIResponsesProvider,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce,
+    exchange_claude_code_authorization_code, load_codex_auth, load_codex_auth_file,
+    parse_claude_code_authorization_input, refresh_claude_code_oauth, AnthropicMessagesProvider,
+    ClaudeCodeOAuthCredential, CodexAuth, CodexResponsesProvider, FakeProvider, ModelProvider,
+    OpenAICompatibleChatProvider, OpenAIResponsesProvider, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
 use browser_use_store::{now_ms, Store};
@@ -317,6 +323,10 @@ enum AuthCommand {
         access_token: Option<String>,
         #[arg(long)]
         account_id: Option<String>,
+        #[arg(long)]
+        code: Option<String>,
+        #[arg(long)]
+        no_browser: bool,
     },
     ImportCodex {
         #[arg(long = "from")]
@@ -1008,6 +1018,7 @@ fn is_secret_setting(key: &str) -> bool {
     key.starts_with("auth.")
         && (key.ends_with(".api_key")
             || key.ends_with(".access_token")
+            || key.ends_with(".refresh_token")
             || key.ends_with(".auth_token"))
 }
 
@@ -1041,7 +1052,17 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
             api_key,
             access_token,
             account_id,
-        } => auth_login(store, account, api_key, access_token, account_id),
+            code,
+            no_browser,
+        } => auth_login(
+            store,
+            account,
+            api_key,
+            access_token,
+            account_id,
+            code,
+            no_browser,
+        ),
         AuthCommand::ImportCodex { input } => {
             let auth = if let Some(input) = input {
                 load_codex_auth_file(input)?
@@ -1081,6 +1102,8 @@ fn auth_login(
     api_key: Option<String>,
     access_token: Option<String>,
     account_id: Option<String>,
+    code: Option<String>,
+    no_browser: bool,
 ) -> Result<()> {
     match account {
         AuthAccount::Openai | AuthAccount::Anthropic | AuthAccount::Openrouter => {
@@ -1109,18 +1132,10 @@ fn auth_login(
             Ok(())
         }
         AuthAccount::ClaudeCode => {
-            let auth_token = read_optional_secret_from_env(
-                access_token,
-                &[
-                    "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-                    "CLAUDE_CODE_OAUTH_TOKEN",
-                    "ANTHROPIC_AUTH_TOKEN",
-                ],
-                "Claude Code OAuth token",
-            )?;
-            store.set_setting("auth.claude_code.auth_token", auth_token.trim())?;
+            let credential = claude_code_login(access_token, code, !no_browser)?;
+            store_claude_code_oauth(store, &credential)?;
             store.set_setting("account", "Claude Code login")?;
-            println!("Claude Code login: connected (stored OAuth token)");
+            println!("Claude Code login: connected (stored OAuth credential)");
             Ok(())
         }
     }
@@ -1138,6 +1153,9 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
             }
         }
         AuthAccount::ClaudeCode => {
+            store.delete_setting("auth.claude_code.access_token")?;
+            store.delete_setting("auth.claude_code.refresh_token")?;
+            store.delete_setting("auth.claude_code.expires_ms")?;
             store.delete_setting("auth.claude_code.auth_token")?;
         }
     }
@@ -1163,34 +1181,181 @@ fn read_required_secret(value: Option<String>, prompt: &str) -> Result<String> {
     Ok(trimmed)
 }
 
-fn read_optional_secret_from_env(
-    value: Option<String>,
-    env_names: &[&str],
-    prompt: &str,
-) -> Result<String> {
-    if let Some(value) = value {
-        let trimmed = value.trim().to_string();
-        if trimmed.is_empty() {
-            bail!("{prompt} cannot be empty");
+fn claude_code_login(
+    access_token: Option<String>,
+    code: Option<String>,
+    open_browser: bool,
+) -> Result<ClaudeCodeOAuthCredential> {
+    let (verifier, challenge) = claude_code_oauth_pkce();
+    if let Some(access_token) = access_token {
+        let access_token = access_token.trim().to_string();
+        if access_token.is_empty() {
+            bail!("Claude Code OAuth token cannot be empty");
         }
-        return Ok(trimmed);
+        return Ok(ClaudeCodeOAuthCredential {
+            access_token,
+            refresh_token: String::new(),
+            expires_ms: 0,
+        });
     }
-    for name in env_names {
-        if let Ok(value) = std::env::var(name) {
-            let trimmed = value.trim().to_string();
-            if !trimmed.is_empty() {
-                return Ok(trimmed);
+
+    if let Some(input) = code {
+        let parsed = parse_claude_code_authorization_input(&input);
+        let auth_code = parsed
+            .code
+            .context("Claude Code authorization code was missing")?;
+        let state = parsed.state.unwrap_or_else(|| verifier.clone());
+        return exchange_claude_code_authorization_code(&auth_code, &state, &verifier);
+    }
+
+    let (tx, rx) = mpsc::channel();
+    let _callback = start_claude_code_callback_server(verifier.clone(), tx)?;
+    let url = claude_code_oauth_authorize_url(&verifier, &challenge);
+    println!("Open this URL to login with Anthropic Claude Code:\n");
+    println!("{url}");
+    println!("\nWaiting for browser callback on http://localhost:{CLAUDE_CODE_CALLBACK_PORT}{CLAUDE_CODE_CALLBACK_PATH} ...");
+    if open_browser {
+        if let Err(error) = open::that(&url) {
+            eprintln!("Could not open browser automatically: {error}");
+        }
+    }
+    let parsed = rx
+        .recv_timeout(Duration::from_secs(900))
+        .context("timed out waiting for Anthropic browser callback")??;
+    let auth_code = parsed
+        .code
+        .context("Claude Code authorization code was missing")?;
+    let state = parsed.state.unwrap_or_default();
+    if state != verifier {
+        bail!("Claude Code OAuth state mismatch");
+    }
+    exchange_claude_code_authorization_code(&auth_code, &state, &verifier)
+}
+
+struct CallbackServerHandle {
+    stop: mpsc::Sender<()>,
+    thread: Option<std::thread::JoinHandle<()>>,
+}
+
+impl Drop for CallbackServerHandle {
+    fn drop(&mut self) {
+        let _ = self.stop.send(());
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+fn start_claude_code_callback_server(
+    expected_state: String,
+    sender: mpsc::Sender<Result<browser_use_providers::ClaudeCodeAuthorization>>,
+) -> Result<CallbackServerHandle> {
+    let listener = TcpListener::bind((CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PORT))
+        .with_context(|| {
+            format!(
+                "bind Claude Code OAuth callback on {CLAUDE_CODE_CALLBACK_HOST}:{CLAUDE_CODE_CALLBACK_PORT}"
+            )
+        })?;
+    listener
+        .set_nonblocking(true)
+        .context("configure Claude Code OAuth callback listener")?;
+    let (stop_tx, stop_rx) = mpsc::channel::<()>();
+    let thread = std::thread::spawn(move || {
+        let deadline = Instant::now() + Duration::from_secs(900);
+        loop {
+            if stop_rx.try_recv().is_ok() || Instant::now() >= deadline {
+                break;
+            }
+            match listener.accept() {
+                Ok((mut stream, _)) => {
+                    let result = handle_claude_code_callback(&mut stream, &expected_state);
+                    let _ = sender.send(result);
+                    break;
+                }
+                Err(error) if error.kind() == io::ErrorKind::WouldBlock => {
+                    std::thread::sleep(Duration::from_millis(50));
+                }
+                Err(error) => {
+                    let _ = sender.send(Err(error).context("accept Claude Code OAuth callback"));
+                    break;
+                }
             }
         }
+    });
+    Ok(CallbackServerHandle {
+        stop: stop_tx,
+        thread: Some(thread),
+    })
+}
+
+fn handle_claude_code_callback(
+    stream: &mut TcpStream,
+    expected_state: &str,
+) -> Result<browser_use_providers::ClaudeCodeAuthorization> {
+    let mut request = [0_u8; 4096];
+    let read = stream
+        .read(&mut request)
+        .context("read Claude Code OAuth callback")?;
+    let request = String::from_utf8_lossy(&request[..read]);
+    let path = request
+        .lines()
+        .next()
+        .and_then(|line| line.split_whitespace().nth(1))
+        .context("parse Claude Code OAuth callback request")?;
+    let parsed = parse_claude_code_authorization_input(path);
+    let status = if !path.starts_with(CLAUDE_CODE_CALLBACK_PATH) {
+        404
+    } else if parsed.code.is_none() || parsed.state.as_deref() != Some(expected_state) {
+        400
+    } else {
+        200
+    };
+    let text = match status {
+        200 => "Anthropic authentication completed. You can close this window.",
+        400 => "Anthropic authentication failed: missing code or state mismatch.",
+        _ => "Anthropic callback route not found.",
+    };
+    let body = format!("<html><body><p>{text}</p></body></html>");
+    let response = format!(
+        "HTTP/1.1 {status} OK\r\nContent-Type: text/html; charset=utf-8\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    );
+    stream.write_all(response.as_bytes()).ok();
+    if status == 200 {
+        Ok(parsed)
+    } else {
+        bail!("{text}")
     }
-    bail!(
-        "{prompt} not found; run `claude setup-token` and pass it with --access-token, or set CLAUDE_CODE_OAUTH_TOKEN"
-    )
 }
 
 fn store_codex_auth(store: &Store, auth: &CodexAuth) -> Result<()> {
     store.set_setting("auth.codex.access_token", auth.access_token.trim())?;
     store.set_setting("auth.codex.account_id", auth.account_id.trim())?;
+    Ok(())
+}
+
+fn store_claude_code_oauth(store: &Store, credential: &ClaudeCodeOAuthCredential) -> Result<()> {
+    store.set_setting(
+        "auth.claude_code.access_token",
+        credential.access_token.trim(),
+    )?;
+    if credential.refresh_token.trim().is_empty() {
+        store.delete_setting("auth.claude_code.refresh_token")?;
+    } else {
+        store.set_setting(
+            "auth.claude_code.refresh_token",
+            credential.refresh_token.trim(),
+        )?;
+    }
+    if credential.expires_ms > 0 {
+        store.set_setting(
+            "auth.claude_code.expires_ms",
+            &credential.expires_ms.to_string(),
+        )?;
+    } else {
+        store.delete_setting("auth.claude_code.expires_ms")?;
+    }
+    store.delete_setting("auth.claude_code.auth_token")?;
     Ok(())
 }
 
@@ -1233,24 +1398,31 @@ fn print_codex_status(store: &Store) -> Result<()> {
 
 fn print_claude_code_status(store: &Store) -> Result<()> {
     if store
+        .get_setting("auth.claude_code.access_token")?
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        println!("Claude Code login: connected (stored OAuth credential)");
+        return Ok(());
+    }
+    if store
         .get_setting("auth.claude_code.auth_token")?
         .is_some_and(|value| !value.trim().is_empty())
     {
-        println!("Claude Code login: connected (stored OAuth token)");
+        println!("Claude Code login: connected (stored legacy OAuth token)");
         return Ok(());
     }
     if env_any(&[
         "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
         "CLAUDE_CODE_OAUTH_TOKEN",
+        "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
+        "ANTHROPIC_OAUTH_TOKEN",
         "ANTHROPIC_AUTH_TOKEN",
     ]) {
         println!("Claude Code login: connected (environment OAuth token)");
         return Ok(());
     }
     match claude_code_cli_status() {
-        Ok(Some(summary)) => println!(
-            "Claude Code login: connected in Claude Code CLI ({summary}; run `claude setup-token` to make it usable here)"
-        ),
+        Ok(Some(summary)) => println!("Claude Code CLI: connected ({summary})"),
         Ok(None) => print_auth_line("Claude Code login", false),
         Err(error) => println!("Claude Code login: not connected ({error})"),
     }
@@ -1361,19 +1533,12 @@ fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesP
         &["LLM_BROWSER_ANTHROPIC_BASE_URL"],
         "https://api.anthropic.com/v1",
     )?;
-    if store.get_setting("account")?.as_deref() == Some("Claude Code login") {
-        let auth_token = stored_or_env(
-            store,
-            "auth.claude_code.auth_token",
-            &[
-                "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-                "CLAUDE_CODE_OAUTH_TOKEN",
-                "ANTHROPIC_AUTH_TOKEN",
-            ],
-        )?
-        .context(
-            "run `claude setup-token`, then `auth login claude-code --access-token ...`, or set CLAUDE_CODE_OAUTH_TOKEN",
-        )?;
+    if store
+        .get_setting("account")?
+        .as_deref()
+        .is_some_and(is_claude_code_account)
+    {
+        let auth_token = claude_code_access_token(store)?;
         return Ok(AnthropicMessagesProvider::with_auth_token(
             auth_token, model, base_url,
         ));
@@ -1387,6 +1552,52 @@ fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesP
     Ok(AnthropicMessagesProvider::with_base_url(
         api_key, model, base_url,
     ))
+}
+
+fn claude_code_access_token(store: &Store) -> Result<String> {
+    if let Some(refresh_token) = store.get_setting("auth.claude_code.refresh_token")? {
+        let expires_ms = store
+            .get_setting("auth.claude_code.expires_ms")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if !refresh_token.trim().is_empty() && expires_ms <= now_ms() + 60_000 {
+            let credential = refresh_claude_code_oauth(refresh_token.trim())
+                .context("refresh Claude Code OAuth token")?;
+            store_claude_code_oauth(store, &credential)?;
+            return Ok(credential.access_token);
+        }
+    }
+    if let Some(access_token) = stored_or_env(
+        store,
+        "auth.claude_code.access_token",
+        &[
+            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+        ],
+    )? {
+        return Ok(access_token);
+    }
+    stored_or_env(
+        store,
+        "auth.claude_code.auth_token",
+        &[
+            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+        ],
+    )?
+    .context(
+        "run `auth login claude-code` to sign in with Claude Code, or set CLAUDE_CODE_OAUTH_TOKEN",
+    )
+}
+
+fn is_claude_code_account(account: &str) -> bool {
+    matches!(account, "Claude Code login" | "Claude Code subscription")
 }
 
 fn openrouter_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {

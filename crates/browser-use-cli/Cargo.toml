@@ -16,5 +16,6 @@ browser-use-protocol = { path = "../browser-use-protocol" }
 browser-use-python-worker = { path = "../browser-use-python-worker" }
 browser-use-store = { path = "../browser-use-store" }
 clap.workspace = true
+open.workspace = true
 serde.workspace = true
 serde_json.workspace = true

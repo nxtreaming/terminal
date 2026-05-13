@@ -1,14 +1,19 @@
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose, Engine as _};
+use base64::{
+    engine::general_purpose::{self, URL_SAFE_NO_PAD},
+    Engine as _,
+};
 use browser_use_protocol::{ModelEvent, ModelUsage, ToolCall, ToolSpec};
 use serde::Deserialize;
 use serde_json::{json, Value};
+use sha2::{Digest, Sha256};
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader};
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, OnceLock};
 use std::time::{Duration, SystemTime};
+use uuid::Uuid;
 
 #[derive(Clone, Debug, Default)]
 pub struct ProviderTurn {
@@ -290,6 +295,41 @@ enum AnthropicCredential {
     AuthToken(String),
 }
 
+const CLAUDE_CODE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
+const CLAUDE_CODE_AUTHORIZE_URL: &str = "https://claude.ai/oauth/authorize";
+const CLAUDE_CODE_TOKEN_URL: &str = "https://platform.claude.com/v1/oauth/token";
+pub const CLAUDE_CODE_CALLBACK_HOST: &str = "127.0.0.1";
+pub const CLAUDE_CODE_CALLBACK_PORT: u16 = 53692;
+pub const CLAUDE_CODE_CALLBACK_PATH: &str = "/callback";
+pub const CLAUDE_CODE_REDIRECT_URI: &str = "http://localhost:53692/callback";
+const CLAUDE_CODE_SCOPES: &str =
+    "org:create_api_key user:profile user:inference user:sessions:claude_code user:mcp_servers user:file_upload";
+const CLAUDE_CODE_VERSION: &str = "2.1.75";
+const ANTHROPIC_BETA_FEATURES: &[&str] = &[
+    "fine-grained-tool-streaming-2025-05-14",
+    "interleaved-thinking-2025-05-14",
+];
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ClaudeCodeOAuthCredential {
+    pub access_token: String,
+    pub refresh_token: String,
+    pub expires_ms: i64,
+}
+
+#[derive(Debug, Deserialize)]
+struct ClaudeCodeTokenResponse {
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+    expires_in: Option<i64>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ClaudeCodeAuthorization {
+    pub code: Option<String>,
+    pub state: Option<String>,
+}
+
 impl AnthropicMessagesProvider {
     pub fn new(api_key: impl Into<String>, model: impl Into<String>) -> Self {
         Self::with_base_url(api_key, model, "https://api.anthropic.com/v1")
@@ -341,6 +381,8 @@ impl AnthropicMessagesProvider {
         }
         if let Ok(auth_token) = std::env::var("LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN")
             .or_else(|_| std::env::var("CLAUDE_CODE_OAUTH_TOKEN"))
+            .or_else(|_| std::env::var("LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN"))
+            .or_else(|_| std::env::var("ANTHROPIC_OAUTH_TOKEN"))
             .or_else(|_| std::env::var("ANTHROPIC_AUTH_TOKEN"))
         {
             if !auth_token.trim().is_empty() {
@@ -354,6 +396,13 @@ impl AnthropicMessagesProvider {
         self.instructions = instructions.into();
         self
     }
+
+    fn is_oauth(&self) -> bool {
+        match &self.credential {
+            AnthropicCredential::AuthToken(_) => true,
+            AnthropicCredential::ApiKey(value) => is_claude_code_oauth_token(value),
+        }
+    }
 }
 
 impl ModelProvider for AnthropicMessagesProvider {
@@ -366,12 +415,13 @@ impl ModelProvider for AnthropicMessagesProvider {
     }
 
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
-        let tools = tool_specs_to_anthropic_tools(&turn.tools);
+        let is_oauth = self.is_oauth();
+        let tools = tool_specs_to_anthropic_tools(&turn.tools, is_oauth);
         let mut body = json!({
             "model": self.model,
-            "max_tokens": 4096,
-            "system": self.instructions,
-            "messages": messages_to_anthropic_messages(&turn.messages)?,
+            "max_tokens": 16000,
+            "system": anthropic_system_blocks(&self.instructions, is_oauth),
+            "messages": messages_to_anthropic_messages(&turn.messages, is_oauth)?,
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
@@ -380,12 +430,24 @@ impl ModelProvider for AnthropicMessagesProvider {
         let mut request = self
             .client
             .post(format!("{}/messages", self.base_url))
-            .header("anthropic-version", "2023-06-01");
+            .header("accept", "application/json")
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-dangerous-direct-browser-access", "true");
         request = match &self.credential {
-            AnthropicCredential::ApiKey(api_key) => request.header("x-api-key", api_key),
-            AnthropicCredential::AuthToken(auth_token) => request
-                .bearer_auth(auth_token)
-                .header("anthropic-beta", "oauth-2025-04-20"),
+            AnthropicCredential::ApiKey(api_key) if !is_oauth => request
+                .header("x-api-key", api_key)
+                .header("anthropic-beta", ANTHROPIC_BETA_FEATURES.join(",")),
+            AnthropicCredential::ApiKey(auth_token)
+            | AnthropicCredential::AuthToken(auth_token) => {
+                let mut beta = vec!["claude-code-20250219", "oauth-2025-04-20"];
+                beta.extend_from_slice(ANTHROPIC_BETA_FEATURES);
+                request
+                    .bearer_auth(auth_token)
+                    .header("anthropic-beta", beta.join(","))
+                    .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
+                    .header("x-app", "cli")
+            }
         };
         let response = request
             .json(&body)
@@ -399,8 +461,202 @@ impl ModelProvider for AnthropicMessagesProvider {
                 anthropic_error_message(&body)
             );
         }
-        parse_anthropic_messages_output(&body, &self.model)
+        parse_anthropic_messages_output(&body, &self.model, &turn.tools, is_oauth)
     }
+}
+
+pub fn claude_code_oauth_pkce() -> (String, String) {
+    let mut verifier_bytes = Vec::with_capacity(32);
+    verifier_bytes.extend_from_slice(Uuid::new_v4().as_bytes());
+    verifier_bytes.extend_from_slice(Uuid::new_v4().as_bytes());
+    let verifier = URL_SAFE_NO_PAD.encode(verifier_bytes);
+    let challenge = URL_SAFE_NO_PAD.encode(Sha256::digest(verifier.as_bytes()));
+    (verifier, challenge)
+}
+
+pub fn claude_code_oauth_authorize_url(verifier: &str, challenge: &str) -> String {
+    form_url(
+        CLAUDE_CODE_AUTHORIZE_URL,
+        &[
+            ("code", "true"),
+            ("client_id", CLAUDE_CODE_CLIENT_ID),
+            ("response_type", "code"),
+            ("redirect_uri", CLAUDE_CODE_REDIRECT_URI),
+            ("scope", CLAUDE_CODE_SCOPES),
+            ("code_challenge", challenge),
+            ("code_challenge_method", "S256"),
+            ("state", verifier),
+        ],
+    )
+}
+
+pub fn parse_claude_code_authorization_input(value: &str) -> ClaudeCodeAuthorization {
+    let mut stripped = value.trim();
+    if stripped.is_empty() {
+        return ClaudeCodeAuthorization::default();
+    }
+    if let Some((_, query)) = stripped.split_once('?') {
+        stripped = query.split('#').next().unwrap_or(query);
+    }
+    if stripped.contains("code=") || stripped.contains("state=") {
+        let mut authorization = ClaudeCodeAuthorization::default();
+        for (key, value) in parse_form_pairs(stripped) {
+            match key.as_str() {
+                "code" => authorization.code = Some(value),
+                "state" => authorization.state = Some(value),
+                _ => {}
+            }
+        }
+        return authorization;
+    }
+    if let Some((code, state)) = stripped.split_once('#') {
+        return ClaudeCodeAuthorization {
+            code: Some(code.trim().to_string()),
+            state: Some(state.trim().to_string()),
+        };
+    }
+    ClaudeCodeAuthorization {
+        code: Some(stripped.to_string()),
+        state: None,
+    }
+}
+
+pub fn exchange_claude_code_authorization_code(
+    code: &str,
+    state: &str,
+    verifier: &str,
+) -> Result<ClaudeCodeOAuthCredential> {
+    post_claude_code_oauth_token(json!({
+        "grant_type": "authorization_code",
+        "client_id": CLAUDE_CODE_CLIENT_ID,
+        "code": code,
+        "state": state,
+        "redirect_uri": CLAUDE_CODE_REDIRECT_URI,
+        "code_verifier": verifier,
+    }))
+}
+
+pub fn refresh_claude_code_oauth(refresh_token: &str) -> Result<ClaudeCodeOAuthCredential> {
+    if refresh_token.trim().is_empty() {
+        bail!("missing Claude Code refresh token");
+    }
+    post_claude_code_oauth_token(json!({
+        "grant_type": "refresh_token",
+        "client_id": CLAUDE_CODE_CLIENT_ID,
+        "refresh_token": refresh_token.trim(),
+    }))
+}
+
+pub fn is_claude_code_oauth_token(token: &str) -> bool {
+    token.starts_with("sk-ant-oat") || token.contains("sk-ant-oat")
+}
+
+fn post_claude_code_oauth_token(body: Value) -> Result<ClaudeCodeOAuthCredential> {
+    let client = reqwest::blocking::Client::new();
+    let response = client
+        .post(CLAUDE_CODE_TOKEN_URL)
+        .header("content-type", "application/json")
+        .header("accept", "application/json")
+        .json(&body)
+        .send()
+        .context("send Anthropic OAuth token request")?;
+    let status = response.status();
+    let text = response
+        .text()
+        .context("read Anthropic OAuth token response")?;
+    if !status.is_success() {
+        bail!(
+            "Anthropic OAuth token request failed ({status}): {}",
+            truncate_error_body(&text)
+        );
+    }
+    let payload: ClaudeCodeTokenResponse =
+        serde_json::from_str(&text).context("parse Anthropic OAuth token response")?;
+    let access_token = payload
+        .access_token
+        .filter(|value| !value.trim().is_empty())
+        .context("Anthropic OAuth response missing access_token")?;
+    let refresh_token = payload
+        .refresh_token
+        .filter(|value| !value.trim().is_empty())
+        .context("Anthropic OAuth response missing refresh_token")?;
+    let expires_in = payload
+        .expires_in
+        .filter(|value| *value > 0)
+        .context("Anthropic OAuth response missing expires_in")?;
+    Ok(ClaudeCodeOAuthCredential {
+        access_token,
+        refresh_token,
+        expires_ms: unix_ms_now() + expires_in.saturating_mul(1000) - 5 * 60 * 1000,
+    })
+}
+
+fn unix_ms_now() -> i64 {
+    SystemTime::now()
+        .duration_since(SystemTime::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_millis()
+        .min(i64::MAX as u128) as i64
+}
+
+fn form_url(base: &str, params: &[(&str, &str)]) -> String {
+    let query = params
+        .iter()
+        .map(|(key, value)| format!("{}={}", percent_encode(key), percent_encode(value)))
+        .collect::<Vec<_>>()
+        .join("&");
+    format!("{base}?{query}")
+}
+
+fn parse_form_pairs(value: &str) -> Vec<(String, String)> {
+    value
+        .split('&')
+        .filter_map(|pair| {
+            let (key, value) = pair.split_once('=').unwrap_or((pair, ""));
+            Some((percent_decode(key)?, percent_decode(value)?))
+        })
+        .collect()
+}
+
+fn percent_encode(value: &str) -> String {
+    let mut encoded = String::new();
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'.' | b'_' | b'~' => {
+                encoded.push(byte as char)
+            }
+            b' ' => encoded.push('+'),
+            _ => encoded.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    encoded
+}
+
+fn percent_decode(value: &str) -> Option<String> {
+    let mut bytes = Vec::with_capacity(value.len());
+    let mut iter = value.as_bytes().iter().copied();
+    while let Some(byte) = iter.next() {
+        match byte {
+            b'+' => bytes.push(b' '),
+            b'%' => {
+                let hi = iter.next()?;
+                let lo = iter.next()?;
+                let hex = [hi, lo];
+                let hex = std::str::from_utf8(&hex).ok()?;
+                bytes.push(u8::from_str_radix(hex, 16).ok()?);
+            }
+            _ => bytes.push(byte),
+        }
+    }
+    String::from_utf8(bytes).ok()
+}
+
+fn truncate_error_body(value: &str) -> String {
+    let mut out = value.chars().take(1000).collect::<String>();
+    if value.chars().count() > 1000 {
+        out.push_str("...");
+    }
+    out
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -799,12 +1055,12 @@ fn tool_specs_to_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
         .collect()
 }
 
-fn tool_specs_to_anthropic_tools(tools: &[ToolSpec]) -> Vec<Value> {
+fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Value> {
     tools
         .iter()
         .map(|tool| {
             json!({
-                "name": tool.name,
+                "name": anthropic_request_tool_name(&tool.name, is_oauth),
                 "description": tool.description,
                 "input_schema": tool.input_schema,
             })
@@ -1008,7 +1264,7 @@ fn chat_tool_call(call: &Value) -> Result<Value> {
     }))
 }
 
-fn messages_to_anthropic_messages(messages: &[Value]) -> Result<Vec<Value>> {
+fn messages_to_anthropic_messages(messages: &[Value], is_oauth: bool) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for message in messages {
         let role = message
@@ -1018,7 +1274,7 @@ fn messages_to_anthropic_messages(messages: &[Value]) -> Result<Vec<Value>> {
         match role {
             "assistant" => out.push(json!({
                 "role": "assistant",
-                "content": anthropic_assistant_content(message)?,
+                "content": anthropic_assistant_content(message, is_oauth)?,
             })),
             "tool" => {
                 let call_id = message
@@ -1086,7 +1342,7 @@ fn anthropic_user_content(message: &Value) -> Vec<Value> {
     }
 }
 
-fn anthropic_assistant_content(message: &Value) -> Result<Vec<Value>> {
+fn anthropic_assistant_content(message: &Value, is_oauth: bool) -> Result<Vec<Value>> {
     let mut blocks = Vec::new();
     let text = message_content_as_text(message);
     if !text.is_empty() {
@@ -1098,12 +1354,12 @@ fn anthropic_assistant_content(message: &Value) -> Result<Vec<Value>> {
         .into_iter()
         .flatten()
     {
-        blocks.push(anthropic_tool_use_block(call)?);
+        blocks.push(anthropic_tool_use_block(call, is_oauth)?);
     }
     Ok(blocks)
 }
 
-fn anthropic_tool_use_block(call: &Value) -> Result<Value> {
+fn anthropic_tool_use_block(call: &Value, is_oauth: bool) -> Result<Value> {
     let call_id = call
         .get("id")
         .or_else(|| call.get("call_id"))
@@ -1117,9 +1373,62 @@ fn anthropic_tool_use_block(call: &Value) -> Result<Value> {
     Ok(json!({
         "type": "tool_use",
         "id": call_id,
-        "name": name,
+        "name": anthropic_request_tool_name(name, is_oauth),
         "input": input,
     }))
+}
+
+fn anthropic_system_blocks(instructions: &str, is_oauth: bool) -> Value {
+    let mut blocks = Vec::new();
+    if is_oauth {
+        blocks.push(json!({
+            "type": "text",
+            "text": "You are Claude Code, Anthropic's official CLI for Claude.",
+            "cache_control": { "type": "ephemeral" },
+        }));
+    }
+    blocks.push(json!({
+        "type": "text",
+        "text": instructions,
+        "cache_control": { "type": "ephemeral" },
+    }));
+    Value::Array(blocks)
+}
+
+fn anthropic_request_tool_name(name: &str, is_oauth: bool) -> String {
+    if !is_oauth {
+        return name.to_string();
+    }
+    match name.to_ascii_lowercase().as_str() {
+        "read" => "Read".to_string(),
+        "write" => "Write".to_string(),
+        "edit" => "Edit".to_string(),
+        "shell" | "bash" => "Bash".to_string(),
+        "grep" => "Grep".to_string(),
+        "glob" => "Glob".to_string(),
+        "todo_write" | "todowrite" => "TodoWrite".to_string(),
+        "web_fetch" | "webfetch" => "WebFetch".to_string(),
+        "web_search" | "websearch" => "WebSearch".to_string(),
+        _ => name.to_string(),
+    }
+}
+
+fn anthropic_response_tool_name(name: &str, tools: &[ToolSpec], is_oauth: bool) -> String {
+    if !is_oauth {
+        return name.to_string();
+    }
+    let lower = name.to_ascii_lowercase();
+    for tool in tools {
+        if lower == tool.name.to_ascii_lowercase()
+            || lower == anthropic_request_tool_name(&tool.name, true).to_ascii_lowercase()
+        {
+            return tool.name.clone();
+        }
+    }
+    if lower == "bash" {
+        return "shell".to_string();
+    }
+    name.to_string()
 }
 
 fn data_url_source(image_url: &str) -> Option<(String, String)> {
@@ -1414,7 +1723,12 @@ fn parse_chat_completion_output(body: &Value, model: &str) -> Result<Vec<ModelEv
     Ok(events)
 }
 
-fn parse_anthropic_messages_output(body: &Value, model: &str) -> Result<Vec<ModelEvent>> {
+fn parse_anthropic_messages_output(
+    body: &Value,
+    model: &str,
+    tools: &[ToolSpec],
+    is_oauth: bool,
+) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
     for block in body
         .get("content")
@@ -1442,7 +1756,7 @@ fn parse_anthropic_messages_output(body: &Value, model: &str) -> Result<Vec<Mode
                 events.push(ModelEvent::ToolCall {
                     call: ToolCall {
                         id: call_id.to_string(),
-                        name: name.to_string(),
+                        name: anthropic_response_tool_name(name, tools, is_oauth),
                         arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
                     },
                 });
@@ -2220,7 +2534,15 @@ mod tests {
                 "id": "msg_123",
                 "type": "message",
                 "role": "assistant",
-                "content": [{ "type": "text", "text": "OAuth ok." }],
+                "content": [
+                    { "type": "text", "text": "OAuth ok." },
+                    {
+                        "type": "tool_use",
+                        "id": "toolu_bash",
+                        "name": "Bash",
+                        "input": { "cmd": "pwd" }
+                    }
+                ],
                 "usage": { "input_tokens": 1, "output_tokens": 2 }
             })
             .to_string(),
@@ -2233,11 +2555,27 @@ mod tests {
         );
         let events = provider.start_turn(ProviderTurn {
             messages: vec![json!({"role": "user", "content": "finish"})],
-            tools: Vec::new(),
+            tools: vec![ToolSpec {
+                name: "shell".to_string(),
+                description: "run shell".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": { "cmd": { "type": "string" } },
+                    "required": ["cmd"],
+                    "additionalProperties": false
+                }),
+            }],
         })?;
         handle.join().expect("mock server thread");
         assert!(events.contains(&ModelEvent::TextDelta {
             text: "OAuth ok.".to_string()
+        }));
+        assert!(events.contains(&ModelEvent::ToolCall {
+            call: ToolCall {
+                id: "toolu_bash".to_string(),
+                name: "shell".to_string(),
+                arguments: json!({"cmd": "pwd"}),
+            }
         }));
         assert!(events.contains(&ModelEvent::Usage {
             usage: ModelUsage {
@@ -2249,6 +2587,25 @@ mod tests {
             }
         }));
         Ok(())
+    }
+
+    #[test]
+    fn claude_code_oauth_url_and_callback_parser_match_main_contract() {
+        let (verifier, challenge) = claude_code_oauth_pkce();
+        let url = claude_code_oauth_authorize_url(&verifier, &challenge);
+        assert!(url.starts_with("https://claude.ai/oauth/authorize?"));
+        assert!(url.contains("client_id=9d1c250a-e61b-44d9-88ed-5944d1962f5e"));
+        assert!(url.contains("response_type=code"));
+        assert!(url.contains("code_challenge_method=S256"));
+        assert!(url.contains("user%3Asessions%3Aclaude_code"));
+        let parsed = parse_claude_code_authorization_input(&format!(
+            "http://localhost:53692/callback?code=abc123&state={verifier}"
+        ));
+        assert_eq!(parsed.code.as_deref(), Some("abc123"));
+        assert_eq!(parsed.state.as_deref(), Some(verifier.as_str()));
+        let parsed = parse_claude_code_authorization_input("abc123#state456");
+        assert_eq!(parsed.code.as_deref(), Some("abc123"));
+        assert_eq!(parsed.state.as_deref(), Some("state456"));
     }
 
     #[test]

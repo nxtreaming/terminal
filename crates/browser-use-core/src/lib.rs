@@ -1,6 +1,7 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -14,19 +15,21 @@ use browser_use_protocol::{
     SessionMeta, SessionStatus, ToolCall, ToolSpec,
 };
 use browser_use_providers::{
-    load_codex_auth, AnthropicMessagesProvider, CodexAuth, CodexResponsesProvider, FakeProvider,
-    ModelProvider, OpenAICompatibleChatProvider, OpenAIResponsesProvider, ProviderTurn,
-    ScriptedProvider,
+    load_codex_auth, refresh_claude_code_oauth, AnthropicMessagesProvider,
+    ClaudeCodeOAuthCredential, CodexAuth, CodexResponsesProvider, FakeProvider, ModelProvider,
+    OpenAICompatibleChatProvider, OpenAIResponsesProvider, ProviderTurn, ScriptedProvider,
 };
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
-use browser_use_store::{AgentSummary, Store};
+use browser_use_store::{now_ms, AgentSummary, Store};
 use opentelemetry::KeyValue;
 use serde_json::{Map, Value};
 use telemetry::{AgentTelemetry, ModelTurnSpanInput};
 use tools::{ToolHandlerKind, ToolRegistry};
 
-const MAX_TOOL_OUTPUT_TEXT_CHARS: usize = 16_000;
-const IMAGE_CONTEXT_BUDGET_CHARS: usize = 8_000;
+const APPROX_CHARS_PER_TOKEN: usize = 4;
+const MAX_TOOL_OUTPUT_TEXT_TOKENS: usize = 4_000;
+const IMAGE_CONTEXT_BUDGET_TOKENS: usize = 2_000;
+static TOOL_OUTPUT_ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
@@ -255,19 +258,12 @@ fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesP
         &["LLM_BROWSER_ANTHROPIC_BASE_URL"],
         "https://api.anthropic.com/v1",
     )?;
-    if store.get_setting("account")?.as_deref() == Some("Claude Code login") {
-        let auth_token = stored_or_env(
-            store,
-            "auth.claude_code.auth_token",
-            &[
-                "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-                "CLAUDE_CODE_OAUTH_TOKEN",
-                "ANTHROPIC_AUTH_TOKEN",
-            ],
-        )?
-        .context(
-            "run `claude setup-token`, then `auth login claude-code --access-token ...`, or set CLAUDE_CODE_OAUTH_TOKEN",
-        )?;
+    if store
+        .get_setting("account")?
+        .as_deref()
+        .is_some_and(is_claude_code_account)
+    {
+        let auth_token = claude_code_access_token(store)?;
         return Ok(AnthropicMessagesProvider::with_auth_token(
             auth_token, model, base_url,
         ));
@@ -281,6 +277,75 @@ fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesP
     Ok(AnthropicMessagesProvider::with_base_url(
         api_key, model, base_url,
     ))
+}
+
+fn claude_code_access_token(store: &Store) -> Result<String> {
+    if let Some(refresh_token) = store.get_setting("auth.claude_code.refresh_token")? {
+        let expires_ms = store
+            .get_setting("auth.claude_code.expires_ms")?
+            .and_then(|value| value.parse::<i64>().ok())
+            .unwrap_or(0);
+        if !refresh_token.trim().is_empty() && expires_ms <= now_ms() + 60_000 {
+            let credential = refresh_claude_code_oauth(refresh_token.trim())
+                .context("refresh Claude Code OAuth token")?;
+            store_claude_code_oauth(store, &credential)?;
+            return Ok(credential.access_token);
+        }
+    }
+    if let Some(access_token) = stored_or_env(
+        store,
+        "auth.claude_code.access_token",
+        &[
+            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+        ],
+    )? {
+        return Ok(access_token);
+    }
+    stored_or_env(
+        store,
+        "auth.claude_code.auth_token",
+        &[
+            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
+            "CLAUDE_CODE_OAUTH_TOKEN",
+            "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_OAUTH_TOKEN",
+            "ANTHROPIC_AUTH_TOKEN",
+        ],
+    )?
+    .context(
+        "run `auth login claude-code` to sign in with Claude Code, or set CLAUDE_CODE_OAUTH_TOKEN",
+    )
+}
+
+fn store_claude_code_oauth(store: &Store, credential: &ClaudeCodeOAuthCredential) -> Result<()> {
+    store.set_setting(
+        "auth.claude_code.access_token",
+        credential.access_token.trim(),
+    )?;
+    if credential.refresh_token.trim().is_empty() {
+        store.delete_setting("auth.claude_code.refresh_token")?;
+    } else {
+        store.set_setting(
+            "auth.claude_code.refresh_token",
+            credential.refresh_token.trim(),
+        )?;
+    }
+    if credential.expires_ms > 0 {
+        store.set_setting(
+            "auth.claude_code.expires_ms",
+            &credential.expires_ms.to_string(),
+        )?;
+    }
+    store.delete_setting("auth.claude_code.auth_token")?;
+    Ok(())
+}
+
+fn is_claude_code_account(account: &str) -> bool {
+    matches!(account, "Claude Code login" | "Claude Code subscription")
 }
 
 fn openrouter_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
@@ -398,6 +463,9 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         let mut deadline_warning_emitted = false;
         for turn_idx in 0..options.max_turns {
             ensure_not_cancelled(store, &session.id)?;
+            normalize_provider_messages(&mut messages);
+            maybe_compact_messages(store, &session.id, &mut messages, options.max_context_chars)?;
+            normalize_provider_messages(&mut messages);
             maybe_emit_deadline_warning(
                 store,
                 &session.id,
@@ -724,6 +792,7 @@ fn record_model_turn_request<P: ModelProvider>(
         "message_count": turn.messages.len(),
         "tool_count": turn.tools.len(),
         "estimated_context_chars": estimated_context_chars(&turn.messages)?,
+        "estimated_context_tokens": estimated_context_tokens(&turn.messages)?,
         "input_image_count": count_input_images(&messages_value),
         "messages_fingerprint": value_fingerprint(&messages_value)?,
         "tools_fingerprint": value_fingerprint(&tools_value)?,
@@ -871,8 +940,10 @@ fn maybe_compact_messages(
     if max_context_chars == 0 {
         return Ok(());
     }
+    let max_context_tokens = approx_token_count_from_chars(max_context_chars);
     let before_chars = estimated_context_chars(messages)?;
-    if before_chars <= max_context_chars {
+    let before_tokens = estimated_context_tokens(messages)?;
+    if before_tokens <= max_context_tokens {
         return Ok(());
     }
     store.append_event(
@@ -881,7 +952,9 @@ fn maybe_compact_messages(
         serde_json::json!({
             "message_count": messages.len(),
             "chars": before_chars,
+            "tokens": before_tokens,
             "max_chars": max_context_chars,
+            "max_tokens": max_context_tokens,
         }),
     )?;
     let result = (|| -> Result<()> {
@@ -893,10 +966,10 @@ fn maybe_compact_messages(
         })];
         let recent_messages = recent_messages_to_preserve(messages);
         for recent_message in recent_messages {
-            let max_recent_content_chars = (max_context_chars / 4).max(200);
+            let max_recent_content_tokens = (max_context_tokens / 4).max(50);
             compacted.push(compact_recent_message(
                 recent_message,
-                max_recent_content_chars,
+                max_recent_content_tokens,
             ));
         }
         *messages = compacted;
@@ -916,6 +989,7 @@ fn maybe_compact_messages(
         serde_json::json!({
             "message_count": messages.len(),
             "chars": estimated_context_chars(messages)?,
+            "tokens": estimated_context_tokens(messages)?,
         }),
     )?;
     Ok(())
@@ -923,6 +997,30 @@ fn maybe_compact_messages(
 
 fn estimated_context_chars(messages: &[Value]) -> Result<usize> {
     Ok(serde_json::to_string(&context_budget_value(&Value::Array(messages.to_vec())))?.len())
+}
+
+fn estimated_context_tokens(messages: &[Value]) -> Result<usize> {
+    let text = serde_json::to_string(&context_budget_value(&Value::Array(messages.to_vec())))?;
+    Ok(approx_token_count(&text))
+}
+
+fn approx_token_count_from_chars(chars: usize) -> usize {
+    chars.div_ceil(APPROX_CHARS_PER_TOKEN).max(1)
+}
+
+fn approx_token_count(text: &str) -> usize {
+    let char_tokens = approx_token_count_from_chars(text.chars().count());
+    let wordish_tokens = text
+        .split(|ch: char| ch.is_whitespace() || ch.is_ascii_punctuation())
+        .filter(|part| !part.is_empty())
+        .count();
+    char_tokens
+        .max(wordish_tokens)
+        .max(usize::from(!text.is_empty()))
+}
+
+fn token_budget_to_char_budget(tokens: usize) -> usize {
+    tokens.saturating_mul(APPROX_CHARS_PER_TOKEN)
 }
 
 fn context_budget_value(value: &Value) -> Value {
@@ -940,7 +1038,7 @@ fn context_budget_value(value: &Value) -> Value {
                         key.clone(),
                         Value::String(format!(
                             "[image data omitted from text budget]{}",
-                            ".".repeat(IMAGE_CONTEXT_BUDGET_CHARS)
+                            ".".repeat(token_budget_to_char_budget(IMAGE_CONTEXT_BUDGET_TOKENS))
                         )),
                     );
                 } else {
@@ -997,28 +1095,29 @@ fn matching_assistant_tool_call<'a>(messages: &'a [Value], call_id: &str) -> Opt
     })
 }
 
-fn compact_recent_message(mut message: Value, max_content_chars: usize) -> Value {
+fn compact_recent_message(mut message: Value, max_content_tokens: usize) -> Value {
     let Some(object) = message.as_object_mut() else {
         return message;
     };
     if let Some(content) = object.get_mut("content") {
-        compact_content_value(content, max_content_chars);
+        compact_content_value(content, max_content_tokens);
     }
     message
 }
 
-fn compact_content_value(value: &mut Value, max_content_chars: usize) {
+fn compact_content_value(value: &mut Value, max_content_tokens: usize) {
     match value {
         Value::String(text) => {
-            if text.chars().count() > max_content_chars {
-                *text = truncate_for_context(text, max_content_chars);
+            if approx_token_count(text) > max_content_tokens {
+                *text = truncate_for_context_tokens(text, max_content_tokens);
             }
         }
         Value::Array(parts) => {
             for part in parts {
                 if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    if text.chars().count() > max_content_chars {
-                        part["text"] = Value::String(truncate_for_context(text, max_content_chars));
+                    if approx_token_count(text) > max_content_tokens {
+                        part["text"] =
+                            Value::String(truncate_for_context_tokens(text, max_content_tokens));
                     }
                 }
             }
@@ -1027,11 +1126,31 @@ fn compact_content_value(value: &mut Value, max_content_chars: usize) {
     }
 }
 
+fn truncate_for_context_tokens(text: &str, max_tokens: usize) -> String {
+    truncate_for_context(text, token_budget_to_char_budget(max_tokens))
+}
+
 fn truncate_for_context(text: &str, max_chars: usize) -> String {
-    let keep = max_chars.saturating_sub(48).max(32);
-    let mut out = text.chars().take(keep).collect::<String>();
-    out.push_str("\n[truncated]");
-    out
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    let keep = max_chars.saturating_sub(96).max(32);
+    let head = keep / 2;
+    let tail = keep.saturating_sub(head);
+    let head_text = text.chars().take(head).collect::<String>();
+    let tail_text = text
+        .chars()
+        .rev()
+        .take(tail)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect::<String>();
+    format!(
+        "{head_text}\n[truncated]\nomitted {} chars\n{tail_text}",
+        char_count.saturating_sub(keep)
+    )
 }
 
 fn compacted_context_system_message(context: &Value) -> Result<String> {
@@ -1308,7 +1427,222 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
         &mut assistant_text,
         &mut assistant_tool_calls,
     );
+    normalize_provider_messages(&mut messages);
     messages
+}
+
+#[derive(Clone, Debug)]
+struct PendingToolCall {
+    id: String,
+    name: String,
+}
+
+fn normalize_provider_messages(messages: &mut Vec<Value>) {
+    let mut normalized = Vec::with_capacity(messages.len());
+    let mut pending = Vec::<PendingToolCall>::new();
+    let mut emitted_outputs = HashSet::<String>::new();
+
+    for message in std::mem::take(messages) {
+        match message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user")
+        {
+            "assistant" => {
+                append_synthetic_outputs_for_pending(
+                    &mut normalized,
+                    &mut pending,
+                    &mut emitted_outputs,
+                );
+                if let Some((assistant, calls)) = normalized_assistant_message(message) {
+                    for call in calls {
+                        pending.push(call);
+                    }
+                    normalized.push(assistant);
+                }
+            }
+            "tool" => {
+                let call_id = message
+                    .get("tool_call_id")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned);
+                let Some(call_id) = call_id else {
+                    if let Some(context) = orphan_tool_output_context_message(&message, "<missing>")
+                    {
+                        normalized.push(context);
+                    }
+                    continue;
+                };
+                if let Some(index) = pending.iter().position(|call| call.id == call_id) {
+                    let call = pending.remove(index);
+                    normalized.push(normalized_tool_message(message, &call.id, &call.name));
+                    emitted_outputs.insert(call.id);
+                } else if let Some(context) = orphan_tool_output_context_message(&message, &call_id)
+                {
+                    normalized.push(context);
+                }
+            }
+            _ => {
+                append_synthetic_outputs_for_pending(
+                    &mut normalized,
+                    &mut pending,
+                    &mut emitted_outputs,
+                );
+                normalized.push(message);
+            }
+        }
+    }
+
+    append_synthetic_outputs_for_pending(&mut normalized, &mut pending, &mut emitted_outputs);
+    *messages = normalized;
+}
+
+fn append_synthetic_outputs_for_pending(
+    messages: &mut Vec<Value>,
+    pending: &mut Vec<PendingToolCall>,
+    emitted_outputs: &mut HashSet<String>,
+) {
+    for call in pending.drain(..) {
+        if emitted_outputs.insert(call.id.clone()) {
+            messages.push(serde_json::json!({
+                "role": "tool",
+                "tool_call_id": call.id,
+                "name": call.name,
+                "content": format!(
+                    "{} output was unavailable after history normalization; continue with the available context.",
+                    call.name
+                ),
+            }));
+        }
+    }
+}
+
+fn normalized_assistant_message(mut message: Value) -> Option<(Value, Vec<PendingToolCall>)> {
+    let calls = normalized_assistant_tool_calls(&message);
+    let text = message_content_text(&message);
+    if text.trim().is_empty() && calls.is_empty() {
+        return None;
+    }
+    let pending = calls
+        .iter()
+        .filter_map(|call| {
+            Some(PendingToolCall {
+                id: call.get("id").and_then(Value::as_str)?.to_string(),
+                name: call.get("name").and_then(Value::as_str)?.to_string(),
+            })
+        })
+        .collect::<Vec<_>>();
+    let Some(object) = message.as_object_mut() else {
+        return None;
+    };
+    object.insert("role".to_string(), Value::String("assistant".to_string()));
+    if calls.is_empty() {
+        object.remove("tool_calls");
+    } else {
+        object.insert("tool_calls".to_string(), Value::Array(calls));
+    }
+    Some((message, pending))
+}
+
+fn normalized_assistant_tool_calls(message: &Value) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    message
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|call| {
+            let id = call
+                .get("id")
+                .or_else(|| call.get("call_id"))
+                .and_then(Value::as_str)?
+                .to_string();
+            if !seen.insert(id.clone()) {
+                return None;
+            }
+            let name = call
+                .get("name")
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    call.get("function")
+                        .and_then(|function| function.get("name"))
+                        .and_then(Value::as_str)
+                })?
+                .to_string();
+            let arguments = call
+                .get("arguments")
+                .cloned()
+                .or_else(|| {
+                    call.get("function")
+                        .and_then(|function| function.get("arguments"))
+                        .and_then(Value::as_str)
+                        .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+                })
+                .unwrap_or_else(|| serde_json::json!({}));
+            Some(serde_json::json!({
+                "id": id,
+                "name": name,
+                "arguments": arguments,
+            }))
+        })
+        .collect()
+}
+
+fn normalized_tool_message(mut message: Value, call_id: &str, name: &str) -> Value {
+    let object = message
+        .as_object_mut()
+        .expect("tool message should be a JSON object");
+    object.insert("role".to_string(), Value::String("tool".to_string()));
+    object.insert(
+        "tool_call_id".to_string(),
+        Value::String(call_id.to_string()),
+    );
+    if !object
+        .get("name")
+        .and_then(Value::as_str)
+        .is_some_and(|value| !value.trim().is_empty())
+    {
+        object.insert("name".to_string(), Value::String(name.to_string()));
+    }
+    if !object.contains_key("content") {
+        object.insert(
+            "content".to_string(),
+            Value::String(synthetic_tool_result_text(name)),
+        );
+    }
+    message
+}
+
+fn orphan_tool_output_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    let text = message_content_text(message);
+    let images = tool_message_input_images(message);
+    if text.trim().is_empty() && images.is_empty() {
+        return None;
+    }
+    let mut content = vec![serde_json::json!({
+        "type": "input_text",
+        "text": format!(
+            "Tool output retained as context after history normalization. Original tool call {call_id} ({}):\n{}",
+            message.get("name").and_then(Value::as_str).unwrap_or("tool"),
+            text,
+        ),
+    })];
+    content.extend(images);
+    Some(serde_json::json!({
+        "role": "user",
+        "content": content,
+    }))
+}
+
+fn tool_message_input_images(message: &Value) -> Vec<Value> {
+    message
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+        .cloned()
+        .collect()
 }
 
 fn tool_message_from_output_event(payload: &Value, call_id: &str) -> Value {
@@ -1492,7 +1826,13 @@ fn dispatch_exec_command_tool(
     let result = tools::command::exec_command(store, session, call)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_json_message(call, "exec_command", result.content)?],
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "exec_command",
+            result.content,
+        )?],
     })
 }
 
@@ -1504,7 +1844,13 @@ fn dispatch_write_stdin_tool(
     let result = tools::command::write_stdin(store, session, call)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_json_message(call, "write_stdin", result.content)?],
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "write_stdin",
+            result.content,
+        )?],
     })
 }
 
@@ -1516,7 +1862,13 @@ fn dispatch_apply_patch_tool(
     let result = tools::files::apply_patch_tool(store, session, call)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_content_message(call, "apply_patch", result.content)],
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "apply_patch",
+            result.content,
+        )?],
     })
 }
 
@@ -1528,7 +1880,13 @@ fn dispatch_read_file_tool(
     let result = tools::files::read_file(store, session, call)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_content_message(call, "read_file", result.content)],
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "read_file",
+            result.content,
+        )?],
     })
 }
 
@@ -1540,7 +1898,13 @@ fn dispatch_search_files_tool(
     let result = tools::files::search_files(store, session, call)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_content_message(call, "search_files", result.content)],
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "search_files",
+            result.content,
+        )?],
     })
 }
 
@@ -1552,7 +1916,13 @@ fn dispatch_list_files_tool(
     let result = tools::files::list_files(store, session, call)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_content_message(call, "list_files", result.content)],
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "list_files",
+            result.content,
+        )?],
     })
 }
 
@@ -1564,7 +1934,13 @@ fn dispatch_view_image_tool(
     let result = tools::files::view_image(store, session, call)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_content_message(call, "view_image", result.content)],
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "view_image",
+            result.content,
+        )?],
     })
 }
 
@@ -1650,6 +2026,8 @@ fn dispatch_update_plan_tool(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
+            store,
+            session,
             call,
             "update_plan",
             serde_json::json!({
@@ -1811,7 +2189,7 @@ fn dispatch_python_tool(
     if let Some(err) = stream_error {
         return Err(err);
     }
-    record_python_response_final_event(store, &session.id, &response)?;
+    let text_artifact = record_python_response_final_event(store, &session.id, &response)?;
     if response.ok {
         store.append_event(
             &session.id,
@@ -1832,12 +2210,13 @@ fn dispatch_python_tool(
             }),
         )?;
     }
-    let messages = vec![serde_json::json!({
-        "role": "tool",
-        "tool_call_id": call.id,
-        "name": "python",
-        "content": python_tool_message_content_value(&response)?,
-    })];
+    let messages = vec![tool_content_message(
+        store,
+        session,
+        call,
+        "python",
+        python_tool_message_content_value(&response, text_artifact.as_ref())?,
+    )?];
     Ok(ToolDispatchOutcome {
         finished: false,
         messages,
@@ -1938,6 +2317,8 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
+            store,
+            session,
             call,
             "spawn_agent",
             serde_json::json!({
@@ -2198,6 +2579,8 @@ fn dispatch_wait_agent_tool(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
+            store,
+            session,
             call,
             "wait_agent",
             serde_json::json!({
@@ -2325,6 +2708,8 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
+            store,
+            session,
             call,
             tool_name,
             serde_json::json!({
@@ -2405,6 +2790,8 @@ fn dispatch_list_agents_tool(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
+            store,
+            session,
             call,
             "list_agents",
             serde_json::json!({ "agents": agents }),
@@ -2478,6 +2865,8 @@ fn dispatch_close_agent_tool(
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
+            store,
+            session,
             call,
             "close_agent",
             serde_json::json!({
@@ -2506,12 +2895,7 @@ fn dispatch_tool_validation_error(
     )?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![serde_json::json!({
-            "role": "tool",
-            "tool_call_id": call.id,
-            "name": call.name,
-            "content": error,
-        })],
+        messages: vec![tool_text_message(store, session, call, &call.name, error)?],
     })
 }
 
@@ -2532,43 +2916,238 @@ fn dispatch_unknown_tool(
     )?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![serde_json::json!({
-            "role": "tool",
-            "tool_call_id": call.id,
-            "name": call.name,
-            "content": error,
-        })],
+        messages: vec![tool_text_message(store, session, call, &call.name, &error)?],
     })
 }
 
-fn tool_json_message(call: &ToolCall, name: &str, content: Value) -> Result<Value> {
+fn tool_json_message(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    name: &str,
+    content: Value,
+) -> Result<Value> {
+    let content = serde_json::to_string(&content)?;
+    tool_text_message(store, session, call, name, &content)
+}
+
+fn tool_text_message(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    name: &str,
+    content: &str,
+) -> Result<Value> {
+    let content = spill_large_tool_text(store, &session.id, Some(&call.id), name, content)?;
     Ok(serde_json::json!({
         "role": "tool",
         "tool_call_id": call.id,
         "name": name,
-        "content": serde_json::to_string(&content)?,
+        "content": content,
     }))
 }
 
-fn tool_content_message(call: &ToolCall, name: &str, content: Value) -> Value {
-    serde_json::json!({
+fn tool_content_message(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    name: &str,
+    content: Value,
+) -> Result<Value> {
+    let content = spill_large_tool_content(store, &session.id, Some(&call.id), name, content)?;
+    Ok(serde_json::json!({
         "role": "tool",
         "tool_call_id": call.id,
         "name": name,
         "content": content,
-    })
+    }))
 }
 
-fn python_tool_message_content(response: &RunPythonResponse) -> String {
+fn spill_large_tool_content(
+    store: &Store,
+    session_id: &str,
+    call_id: Option<&str>,
+    tool_name: &str,
+    content: Value,
+) -> Result<Value> {
+    match content {
+        Value::String(text) => Ok(Value::String(spill_large_tool_text(
+            store, session_id, call_id, tool_name, &text,
+        )?)),
+        Value::Array(items) => {
+            spill_large_tool_content_items(store, session_id, call_id, tool_name, items)
+        }
+        other => {
+            let serialized = serde_json::to_string(&other)?;
+            if approx_token_count(&serialized) <= MAX_TOOL_OUTPUT_TEXT_TOKENS {
+                Ok(other)
+            } else {
+                Ok(Value::String(spill_large_tool_text(
+                    store,
+                    session_id,
+                    call_id,
+                    tool_name,
+                    &serialized,
+                )?))
+            }
+        }
+    }
+}
+
+fn spill_large_tool_content_items(
+    store: &Store,
+    session_id: &str,
+    call_id: Option<&str>,
+    tool_name: &str,
+    items: Vec<Value>,
+) -> Result<Value> {
+    let mut text_segments = Vec::new();
+    let mut non_text_items = Vec::new();
+    for item in &items {
+        if let Some(text) = item
+            .get("text")
+            .and_then(Value::as_str)
+            .or_else(|| item.as_str())
+        {
+            text_segments.push(text.to_string());
+        } else {
+            non_text_items.push(item.clone());
+        }
+    }
+    let combined_text = text_segments.join("\n");
+    if approx_token_count(&combined_text) <= MAX_TOOL_OUTPUT_TEXT_TOKENS {
+        return Ok(Value::Array(items));
+    }
+
+    let preview = spill_large_tool_text(store, session_id, call_id, tool_name, &combined_text)?;
+    let mut compacted = vec![serde_json::json!({
+        "type": "output_text",
+        "text": preview,
+    })];
+    compacted.extend(non_text_items);
+    Ok(Value::Array(compacted))
+}
+
+fn spill_large_tool_text(
+    store: &Store,
+    session_id: &str,
+    call_id: Option<&str>,
+    tool_name: &str,
+    text: &str,
+) -> Result<String> {
+    if approx_token_count(text) <= MAX_TOOL_OUTPUT_TEXT_TOKENS {
+        return Ok(text.to_string());
+    }
+    let artifact = write_tool_output_artifact(store, session_id, tool_name, call_id, text)?;
+    Ok(spilled_tool_output_preview(text, &artifact))
+}
+
+fn spilled_tool_output_preview(text: &str, artifact: &Value) -> String {
+    let path = artifact
+        .get("path")
+        .and_then(Value::as_str)
+        .unwrap_or("<unknown>");
+    let footer = format!("\n\nFull tool output saved to: {path}");
+    let footer_tokens = approx_token_count(&footer);
+    let preview_budget = MAX_TOOL_OUTPUT_TEXT_TOKENS
+        .saturating_sub(footer_tokens)
+        .max(32);
+    format!(
+        "{}{footer}",
+        truncate_for_context_tokens(text, preview_budget)
+    )
+}
+
+fn write_tool_output_artifact(
+    store: &Store,
+    session_id: &str,
+    tool_name: &str,
+    call_id: Option<&str>,
+    text: &str,
+) -> Result<Value> {
+    let session = store
+        .load_session(session_id)?
+        .with_context(|| format!("unknown session id: {session_id}"))?;
+    let output_dir = Path::new(&session.artifact_root).join("tool-output");
+    std::fs::create_dir_all(&output_dir)
+        .with_context(|| format!("create {}", output_dir.display()))?;
+    let tool_component = sanitize_artifact_filename_component(tool_name);
+    let call_component = call_id
+        .map(sanitize_artifact_filename_component)
+        .filter(|component| !component.is_empty());
+    let unique = TOOL_OUTPUT_ARTIFACT_COUNTER.fetch_add(1, Ordering::Relaxed);
+    let filename = match call_component {
+        Some(call_component) => format!(
+            "{tool_component}-{call_component}-{}-{unique}.txt",
+            now_ms()
+        ),
+        None => format!("{tool_component}-output-{}-{unique}.txt", now_ms()),
+    };
+    let path = output_dir.join(filename);
+    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    let artifact = serde_json::json!({
+        "kind": "tool-output",
+        "path": path.display().to_string(),
+        "mime": "text/plain",
+        "bytes": std::fs::metadata(&path).ok().and_then(|metadata| i64::try_from(metadata.len()).ok()),
+        "original_chars": text.chars().count(),
+        "original_tokens_estimate": approx_token_count(text),
+        "truncated_tokens": MAX_TOOL_OUTPUT_TEXT_TOKENS,
+        "tool_name": tool_name,
+        "tool_call_id": call_id,
+    });
+    let event = store.append_event(
+        session_id,
+        "tool.output_spilled",
+        serde_json::json!({
+            "name": tool_name,
+            "tool_call_id": call_id,
+            "artifact": artifact,
+        }),
+    )?;
+    store.record_artifact(
+        session_id,
+        Some(event.seq),
+        "tool-output",
+        &path,
+        Some("text/plain"),
+        artifact.clone(),
+    )?;
+    Ok(artifact)
+}
+
+fn sanitize_artifact_filename_component(value: &str) -> String {
+    let mut out = String::new();
+    for ch in value.chars().take(80) {
+        if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+            out.push(ch);
+        } else {
+            out.push('_');
+        }
+    }
+    if out.is_empty() {
+        "tool".to_string()
+    } else {
+        out
+    }
+}
+
+fn python_tool_message_content(
+    response: &RunPythonResponse,
+    text_artifact: Option<&Value>,
+) -> String {
     if response.ok {
         let mut parts = Vec::new();
         if !response.text.trim().is_empty() {
             let text = response.text.trim();
-            if text.chars().count() > MAX_TOOL_OUTPUT_TEXT_CHARS {
-                parts.push(truncate_for_context(text, MAX_TOOL_OUTPUT_TEXT_CHARS));
+            let text = if approx_token_count(text) > MAX_TOOL_OUTPUT_TEXT_TOKENS {
+                text_artifact
+                    .map(|artifact| spilled_tool_output_preview(text, artifact))
+                    .unwrap_or_else(|| text.to_string())
             } else {
-                parts.push(text.to_string());
-            }
+                text.to_string()
+            };
+            parts.push(text);
         }
         if !response.data.is_null() {
             parts.push(format!("data: {}", response.data));
@@ -2589,8 +3168,11 @@ fn python_tool_message_content(response: &RunPythonResponse) -> String {
     }
 }
 
-fn python_tool_message_content_value(response: &RunPythonResponse) -> Result<Value> {
-    let text = python_tool_message_content(response);
+fn python_tool_message_content_value(
+    response: &RunPythonResponse,
+    text_artifact: Option<&Value>,
+) -> Result<Value> {
+    let text = python_tool_message_content(response, text_artifact);
     let Some(image_parts) = python_tool_image_output_parts(response)? else {
         return Ok(Value::String(text));
     };
@@ -2636,7 +3218,7 @@ pub fn record_python_response_events(
     store: &Store,
     session_id: &str,
     response: &RunPythonResponse,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     record_python_response_events_inner(store, session_id, response, true)
 }
 
@@ -2644,7 +3226,7 @@ pub fn record_python_response_final_event(
     store: &Store,
     session_id: &str,
     response: &RunPythonResponse,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     record_python_response_events_inner(store, session_id, response, false)
 }
 
@@ -2667,7 +3249,7 @@ fn record_python_response_events_inner(
     session_id: &str,
     response: &RunPythonResponse,
     include_host_records: bool,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     if include_host_records {
         for output in &response.outputs {
             record_python_output(store, session_id, output)?;
@@ -2712,24 +3294,8 @@ fn record_python_response_events_inner(
         payload["text_truncated"] = Value::Bool(true);
         payload["text_artifact"] = artifact.clone();
     }
-    let event = store.append_event(session_id, "tool.output", payload)?;
-    if let Some(artifact) = text_artifact {
-        if let Some(path) = artifact
-            .get("path")
-            .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
-        {
-            store.record_artifact(
-                session_id,
-                Some(event.seq),
-                "tool-output",
-                &path,
-                Some("text/plain"),
-                artifact,
-            )?;
-        }
-    }
-    Ok(())
+    store.append_event(session_id, "tool.output", payload)?;
+    Ok(text_artifact)
 }
 
 fn spill_large_text_output(
@@ -2737,25 +3303,13 @@ fn spill_large_text_output(
     session_id: &str,
     text: &str,
 ) -> Result<(String, Option<Value>)> {
-    if text.chars().count() <= MAX_TOOL_OUTPUT_TEXT_CHARS {
+    if approx_token_count(text) <= MAX_TOOL_OUTPUT_TEXT_TOKENS {
         return Ok((text.to_string(), None));
     }
-    let session = store
-        .load_session(session_id)?
-        .with_context(|| format!("unknown session id: {session_id}"))?;
-    let output_dir = Path::new(&session.artifact_root).join("tool-output");
-    std::fs::create_dir_all(&output_dir)
-        .with_context(|| format!("create {}", output_dir.display()))?;
-    let path = output_dir.join(format!("python-output-{}.txt", browser_use_store::now_ms()));
-    std::fs::write(&path, text).with_context(|| format!("write {}", path.display()))?;
+    let artifact = write_tool_output_artifact(store, session_id, "python", None, text)?;
     Ok((
-        truncate_for_context(text, MAX_TOOL_OUTPUT_TEXT_CHARS),
-        Some(serde_json::json!({
-            "kind": "tool-output",
-            "path": path.display().to_string(),
-            "mime": "text/plain",
-            "bytes": std::fs::metadata(&path).ok().and_then(|metadata| i64::try_from(metadata.len()).ok()),
-        })),
+        truncate_for_context_tokens(text, MAX_TOOL_OUTPUT_TEXT_TOKENS),
+        Some(artifact),
     ))
 }
 
@@ -3656,7 +4210,83 @@ mod tests {
         assert!(messages[2]["content"]
             .as_str()
             .unwrap_or_default()
-            .ends_with("[truncated]"));
+            .contains("[truncated]"));
+        Ok(())
+    }
+
+    #[test]
+    fn history_normalization_adds_missing_tool_outputs() -> Result<()> {
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": "do work",
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [
+                    {
+                        "id": "call_missing",
+                        "name": "python",
+                        "arguments": {"code": "print('lost')"},
+                    },
+                    {
+                        "id": "call_done",
+                        "name": "update_plan",
+                        "arguments": {"plan": [{"step": "done", "status": "completed"}]},
+                    }
+                ],
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_done",
+                "name": "update_plan",
+                "content": "plan updated",
+            }),
+        ];
+
+        normalize_provider_messages(&mut messages);
+
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[2]["tool_call_id"], "call_done");
+        assert_eq!(messages[3]["tool_call_id"], "call_missing");
+        assert!(messages[3]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("history normalization"));
+        Ok(())
+    }
+
+    #[test]
+    fn history_normalization_converts_orphan_tool_output_to_context() -> Result<()> {
+        let mut messages = vec![serde_json::json!({
+            "role": "tool",
+            "tool_call_id": "orphan_call",
+            "name": "python",
+            "content": [
+                {
+                    "type": "output_text",
+                    "text": "orphan output",
+                },
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,ZmFrZQ==",
+                    "detail": "auto",
+                }
+            ],
+        })];
+
+        normalize_provider_messages(&mut messages);
+
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["role"], "user");
+        let content = messages[0]["content"].as_array().context("content array")?;
+        assert!(content[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("orphan output"));
+        assert_eq!(content[1]["type"], "input_image");
         Ok(())
     }
 
@@ -4010,6 +4640,92 @@ mod tests {
         Ok(())
     }
 
+    #[test]
+    fn generic_tool_text_spill_preserves_image_parts() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let huge_len = token_budget_to_char_budget(MAX_TOOL_OUTPUT_TEXT_TOKENS) + 1024;
+        let huge_text = "x".repeat(huge_len);
+        let call = ToolCall {
+            id: "view_huge".to_string(),
+            name: "view_image".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let message = tool_content_message(
+            &store,
+            &session,
+            &call,
+            "view_image",
+            serde_json::json!([
+                {
+                    "type": "output_text",
+                    "text": huge_text,
+                },
+                {
+                    "type": "input_image",
+                    "image_url": "data:image/png;base64,ZmFrZQ==",
+                    "detail": "auto",
+                }
+            ]),
+        )?;
+
+        let content = message["content"].as_array().context("content array")?;
+        assert_eq!(content.len(), 2);
+        let preview = content[0]["text"].as_str().context("preview text")?;
+        assert!(preview.contains("[truncated]"));
+        assert!(preview.contains("Full tool output saved to:"));
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["image_url"], "data:image/png;base64,ZmFrZQ==");
+        let artifact_path = preview
+            .lines()
+            .find_map(|line| line.strip_prefix("Full tool output saved to: "))
+            .context("artifact path")?;
+        let spilled = std::fs::read_to_string(artifact_path)?;
+        assert_eq!(spilled.len(), huge_len);
+        assert!(store
+            .artifacts_for_session(&session.id)?
+            .iter()
+            .any(|artifact| artifact.kind == "tool-output"));
+        Ok(())
+    }
+
+    #[test]
+    fn json_tool_outputs_spill_to_artifact() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let call = ToolCall {
+            id: "exec_huge".to_string(),
+            name: "exec_command".to_string(),
+            arguments: serde_json::json!({}),
+        };
+
+        let message = tool_json_message(
+            &store,
+            &session,
+            &call,
+            "exec_command",
+            serde_json::json!({
+                "output": "z".repeat(token_budget_to_char_budget(MAX_TOOL_OUTPUT_TEXT_TOKENS) + 1024),
+                "metadata": {"truncated": true},
+            }),
+        )?;
+
+        let content = message["content"].as_str().context("tool content")?;
+        assert!(content.contains("[truncated]"));
+        assert!(content.contains("Full tool output saved to:"));
+        let artifact_path = content
+            .lines()
+            .find_map(|line| line.strip_prefix("Full tool output saved to: "))
+            .context("artifact path")?;
+        let spilled = std::fs::read_to_string(artifact_path)?;
+        assert!(spilled.contains("\"metadata\":{\"truncated\":true}"));
+        assert!(spilled.contains(&"z".repeat(1024)));
+        Ok(())
+    }
+
     #[derive(Default)]
     struct ImageInspectingProvider {
         step: std::sync::Mutex<usize>,
@@ -4279,9 +4995,13 @@ mod tests {
             .unwrap_or_default()
             .contains("[truncated]"));
         let artifacts = store.artifacts_for_session(&session_id)?;
-        assert!(artifacts
-            .iter()
-            .any(|artifact| artifact.kind == "tool-output"));
+        assert_eq!(
+            artifacts
+                .iter()
+                .filter(|artifact| artifact.kind == "tool-output")
+                .count(),
+            1
+        );
         Ok(())
     }
 }

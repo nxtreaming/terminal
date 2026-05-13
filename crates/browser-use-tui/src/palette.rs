@@ -1,106 +1,71 @@
-use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
-
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum PaletteAction {
     NewTask,
-    OpenBrowser,
-    ReconnectBrowser,
     PreviousWork,
+    ChangeBrowser,
     ChooseModel,
-    SignIn,
+    Authenticate,
     ConfigureLaminar,
 }
 
 #[derive(Clone, Copy, Debug)]
 pub(crate) struct PaletteItem {
-    pub(crate) label: &'static str,
+    pub(crate) command: &'static str,
+    pub(crate) description: &'static str,
     pub(crate) action: PaletteAction,
 }
 
-const ITEMS: [PaletteItem; 7] = [
+const ITEMS: [PaletteItem; 6] = [
     PaletteItem {
-        label: "New task",
+        command: "/task",
+        description: "start a new task",
         action: PaletteAction::NewTask,
     },
     PaletteItem {
-        label: "Open browser",
-        action: PaletteAction::OpenBrowser,
-    },
-    PaletteItem {
-        label: "Reconnect browser",
-        action: PaletteAction::ReconnectBrowser,
-    },
-    PaletteItem {
-        label: "Previous work",
+        command: "/history",
+        description: "browse previous tasks",
         action: PaletteAction::PreviousWork,
     },
     PaletteItem {
-        label: "Choose model",
+        command: "/browser",
+        description: "change browser backend",
+        action: PaletteAction::ChangeBrowser,
+    },
+    PaletteItem {
+        command: "/model",
+        description: "choose model and provider",
         action: PaletteAction::ChooseModel,
     },
     PaletteItem {
-        label: "Sign in",
-        action: PaletteAction::SignIn,
+        command: "/auth",
+        description: "sign in to a provider",
+        action: PaletteAction::Authenticate,
     },
     PaletteItem {
-        label: "Configure Laminar",
+        command: "/laminar",
+        description: "configure Laminar telemetry",
         action: PaletteAction::ConfigureLaminar,
     },
 ];
 
-#[derive(Debug, Default)]
-pub(crate) struct Palette {
-    filter: String,
+pub(crate) fn items_filtered(filter: &str) -> Vec<PaletteItem> {
+    let trimmed = filter.trim_start_matches('/').to_ascii_lowercase();
+    if trimmed.is_empty() {
+        return ITEMS.to_vec();
+    }
+    ITEMS
+        .iter()
+        .copied()
+        .filter(|item| item.command[1..].to_ascii_lowercase().contains(&trimmed))
+        .collect()
 }
 
-impl Palette {
-    pub(crate) fn clear(&mut self) {
-        self.filter.clear();
-    }
+pub(crate) fn selected_action(filter: &str, selected_row: usize) -> Option<PaletteAction> {
+    items_filtered(filter)
+        .get(selected_row)
+        .map(|item| item.action)
+}
 
-    pub(crate) fn filter(&self) -> &str {
-        &self.filter
-    }
-
-    pub(crate) fn push_filter_str(&mut self, text: &str) {
-        self.filter
-            .extend(text.chars().filter(|ch| !ch.is_control()));
-    }
-
-    pub(crate) fn items(&self) -> Vec<PaletteItem> {
-        let filter = self.filter.trim().to_ascii_lowercase();
-        if filter.is_empty() {
-            return ITEMS.to_vec();
-        }
-        ITEMS
-            .iter()
-            .copied()
-            .filter(|item| item.label.to_ascii_lowercase().contains(&filter))
-            .collect()
-    }
-
-    pub(crate) fn selected_action(&self, selected_row: usize) -> Option<PaletteAction> {
-        self.items().get(selected_row).map(|item| item.action)
-    }
-
-    pub(crate) fn handle_filter_key(&mut self, key: KeyEvent) -> bool {
-        match key {
-            KeyEvent {
-                code: KeyCode::Backspace,
-                ..
-            } => {
-                self.filter.pop();
-                true
-            }
-            KeyEvent {
-                code: KeyCode::Char(ch),
-                modifiers,
-                ..
-            } if modifiers.is_empty() || modifiers == KeyModifiers::SHIFT => {
-                self.filter.push(ch);
-                true
-            }
-            _ => false,
-        }
-    }
+pub(crate) fn is_slash_input(input: &str) -> bool {
+    input.starts_with('/') && !input.contains('\n')
 }

@@ -576,7 +576,7 @@ Model and account path are selected together.
 |   Claude Opus 4.7                 Claude Code login       sign in required     |
 |   Claude Sonnet 4.6               Claude Code login       sign in required     |
 |   Qwen3.6 Plus                    OpenRouter API key      sign in required     |
-|   GLM-5.1                         OpenRouter API key      sign in required     |
+|   Kimi K2.5                       OpenRouter API key      sign in required     |
 |   DeepSeek V4 Pro                 OpenRouter API key      sign in required     |
 |                                                                                |
 | Current                                                                        |

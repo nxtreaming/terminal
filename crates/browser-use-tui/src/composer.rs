@@ -66,6 +66,7 @@ impl Composer {
         self.text.chars().count()
     }
 
+    #[cfg(test)]
     pub(crate) fn height(&self) -> u16 {
         self.line_count().clamp(1, 10) as u16 + 2
     }
@@ -84,15 +85,38 @@ impl Composer {
         )
     }
 
-    pub(crate) fn cursor_position(&self, max_lines: usize) -> (u16, u16) {
+    pub(crate) fn render_lines_wrapped(
+        &self,
+        max_lines: usize,
+        width: usize,
+        placeholder: &str,
+    ) -> Vec<Line<'static>> {
+        if self.is_empty() {
+            return self.render_lines(max_lines, placeholder);
+        }
+        let lines = self.wrapped_composer_input_lines(width);
+        visible_composer_lines(
+            lines,
+            self.visible_wrapped_line_start(max_lines, width),
+            max_lines,
+        )
+    }
+
+    pub(crate) fn cursor_position_wrapped(&self, max_lines: usize, width: usize) -> (u16, u16) {
         if self.is_empty() {
             return (2, 0);
         }
-        let (row, col) = self.cursor_row_col();
-        let visible_start = self.visible_line_start(max_lines);
+        let content_width = width.saturating_sub(2).max(1);
+        let (cursor_row, cursor_col) = self.cursor_row_col();
+        let mut visual_row = 0usize;
+        for line in self.text.split('\n').take(cursor_row) {
+            visual_row += wrapped_line_count(line, content_width);
+        }
+        visual_row += cursor_col / content_width;
+        let visible_start = self.visible_wrapped_line_start(max_lines, width);
         (
-            col.saturating_add(2) as u16,
-            row.saturating_sub(visible_start) as u16,
+            cursor_col.rem_euclid(content_width).saturating_add(2) as u16,
+            visual_row.saturating_sub(visible_start) as u16,
         )
     }
 
@@ -184,6 +208,29 @@ impl Composer {
             .collect()
     }
 
+    fn wrapped_composer_input_lines(&self, width: usize) -> Vec<Line<'static>> {
+        let content_width = width.saturating_sub(2).max(1);
+        let mut lines = Vec::new();
+        for (logical_idx, source_line) in self.text.split('\n').enumerate() {
+            let mut chunks = hard_wrap_line(source_line, content_width);
+            if chunks.is_empty() {
+                chunks.push(String::new());
+            }
+            for (chunk_idx, chunk) in chunks.into_iter().enumerate() {
+                let prefix = if logical_idx == 0 && chunk_idx == 0 {
+                    "> "
+                } else {
+                    "  "
+                };
+                lines.push(Line::from(vec![
+                    Span::styled(prefix, accent()),
+                    Span::styled(chunk, bold()),
+                ]));
+            }
+        }
+        lines
+    }
+
     fn visible_line_start(&self, max_lines: usize) -> usize {
         if max_lines == 0 {
             return 0;
@@ -197,6 +244,35 @@ impl Composer {
         cursor_row
             .saturating_sub(max_lines.saturating_sub(1))
             .min(max_start)
+    }
+
+    fn visible_wrapped_line_start(&self, max_lines: usize, width: usize) -> usize {
+        if max_lines == 0 {
+            return 0;
+        }
+        let content_width = width.saturating_sub(2).max(1);
+        let line_count = self.wrapped_line_count(content_width);
+        if line_count <= max_lines {
+            return 0;
+        }
+        let (cursor_row, cursor_col) = self.cursor_row_col();
+        let mut cursor_visual_row = 0usize;
+        for line in self.text.split('\n').take(cursor_row) {
+            cursor_visual_row += wrapped_line_count(line, content_width);
+        }
+        cursor_visual_row += cursor_col / content_width;
+        let max_start = line_count.saturating_sub(max_lines);
+        cursor_visual_row
+            .saturating_sub(max_lines.saturating_sub(1))
+            .min(max_start)
+    }
+
+    fn wrapped_line_count(&self, content_width: usize) -> usize {
+        self.text
+            .split('\n')
+            .map(|line| wrapped_line_count(line, content_width))
+            .sum::<usize>()
+            .max(1)
     }
 
     fn should_swallow_unmodified_key(&self, key: KeyEvent) -> bool {
@@ -405,6 +481,26 @@ fn visible_composer_lines(
     lines.drain(0..start.min(lines.len()));
     lines.truncate(max_lines);
     lines
+}
+
+fn hard_wrap_line(line: &str, width: usize) -> Vec<String> {
+    if line.is_empty() {
+        return vec![String::new()];
+    }
+    let width = width.max(1);
+    line.chars()
+        .collect::<Vec<_>>()
+        .chunks(width)
+        .map(|chunk| chunk.iter().collect::<String>())
+        .collect()
+}
+
+fn wrapped_line_count(line: &str, width: usize) -> usize {
+    if line.is_empty() {
+        return 1;
+    }
+    let width = width.max(1);
+    line.chars().count().saturating_add(width.saturating_sub(1)) / width
 }
 
 fn normalize_pasted_text(value: &str) -> String {

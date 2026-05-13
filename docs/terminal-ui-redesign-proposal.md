@@ -1,1136 +1,725 @@
 # Terminal UI Redesign Proposal
 
-## CURRENT DESIGN
+## Goal
 
-The current Rust TUI is a full-screen alternate-screen app with one main workbench and a set of modal overlays.
+Make the Rust terminal UI feel like a modern coding assistant while keeping the
+current product simple:
 
 ```text
-Terminal
-+----------------------------------------------------------------------------------+
-| App runtime                                                                       |
-| - raw mode                                                                        |
-| - alternate screen                                                                |
-| - bracketed paste                                                                 |
-| - enhanced keyboard reporting                                                     |
-| - key events only                                                                 |
-|                                                                                  |
-| State                                                                            |
-| - SQLite store                                                                    |
-| - sessions                                                                        |
-| - append-only events                                                              |
-| - artifacts                                                                       |
-| - app settings                                                                    |
-| - selected_session_id                                                             |
-| - selected overlay row                                                            |
-| - composer input/cursor/kill buffer                                               |
-|                                                                                  |
-| Projection                                                                        |
-| - Store sessions + events -> WorkbenchState                                       |
-| - WorkbenchState -> current task/result/failure/activity/browser/history          |
-|                                                                                  |
-| Render                                                                            |
-| - first-run setup                                                                 |
-| - workbench                                                                       |
-| - composer                                                                        |
-| - footer                                                                          |
-| - overlays                                                                        |
-+----------------------------------------------------------------------------------+
+plain transcript
+strong prompt box
+compact status
+small command surfaces
+native terminal scrollback
+browser-first language
 ```
 
-Current state tree:
+This is not a proposal to add more screens. It is a proposal to make the existing
+interaction model feel intentional.
+
+## Current Problem
+
+The current app works, but it looks and behaves like a debug log with a prompt
+attached.
+
+The biggest visible failure is the real terminal layout:
 
 ```text
-App
-|-- Workbench
-|   |-- Ready
-|   |-- Running
-|   |-- Result
-|   |-- Failed
-|   `-- Cancelled
-|
-|-- Composer
-|   |-- single or multiline input
-|   |-- up to 10 visible lines
-|   |-- custom cursor rendering
-|   |-- custom readline-like key handling
-|   `-- no real terminal text cursor
-|
-`-- Overlays
-    |-- Setup
-    |-- Account
-    |-- Model
-    |-- Browser
-    |-- BrowserChoice
-    |-- SetupComplete
-    |-- History
-    |-- Actions
-    |-- Help
-    `-- Developer
-```
+large blank terminal area
 
-Current first-run setup:
 
-```text
-+--------------------------------------------------------------------------------+
-|                                                                                |
-|               +--browser-use------------------------------------------------+  |
-|               | Set up the browser agent                                    |  |
-|               |                                                             |  |
-|               | > Sign in                  uses Codex auth                  |  |
-|               |                                                             |  |
-|               |   Choose model             No model selected                |  |
-|               |                                                             |  |
-|               |   Choose browser           Local Chrome                     |  |
-|               |                                                             |  |
-|               | enter select     tab history     / actions                  |  |
-|               +-------------------------------------------------------------+  |
-|                                                                                |
-+--------------------------------------------------------------------------------+
-```
 
-Current ready workbench:
 
-```text
-+-- browser-use                                      Local Chrome  GPT-5.5 -------+
-| What should the browser do?                                                     |
-|                                                                                |
-| Recent                                                                         |
-|                                                                                |
-|   > found Hacker News top posts                                  recent         |
-|   > compared pricing pages                                      recent          |
-|                                                                                |
-| Ready  ready      browser connected                                             |
-|                                                                                |
-|                                                                                |
-| +----------------------------------------------------------------------------+ |
-| | > Tell the browser what to do...                                            | |
-| +----------------------------------------------------------------------------+ |
-|                                      enter run     tab history     / actions    |
-+--------------------------------------------------------------------------------+
-```
 
-Current running task:
 
-```text
-+-- find the top 5 Hacker News posts  running -----------------------------------+
-|                                                                                |
-| * browsing news.ycombinator.com                                                 |
-| * connected live browser                                                        |
-| * using browser                                                                 |
-| * writing result                                                                |
-|                                                                                |
-| Browser                                                                        |
-| page      https://news.ycombinator.com                                          |
-| open      live browser                                                          |
-|                                                                                |
-|                                                                                |
-| +----------------------------------------------------------------------------+ |
-| | > Type to steer the agent...                                                | |
-| +----------------------------------------------------------------------------+ |
-|                                      enter steer     ctrl+c stop     f2 browser |
-+--------------------------------------------------------------------------------+
-```
 
-Current result:
 
-```text
-+-- find the top 5 Hacker News posts  done --------------------------------------+
-| Result                                                                         |
-|                                                                                |
-| Top 5 Hacker News posts                                                        |
-|                                                                                |
-| 1. Example story                                                               |
-| 2. Another story                                                               |
-| 3. Browser agents in practice                                                  |
-|                                                                                |
-| Source                                                                         |
-| https://news.ycombinator.com                                                   |
-|                                                                                |
-|                                                                                |
-| +----------------------------------------------------------------------------+ |
-| | > Ask a follow-up...                                                        | |
-| +----------------------------------------------------------------------------+ |
-|                             enter follow-up     f2 browser     tab history     |
-+--------------------------------------------------------------------------------+
-```
-
-Current failure:
-
-```text
-+-- current task  failed --------------------------------------------------------+
-| The agent could not finish the task.                                            |
-|                                                                                |
-| OpenRouter API key is missing. Sign in before retrying.                         |
-|                                                                                |
-| > Retry                                                                        |
-|   Sign in                                                                      |
-|   Choose model                                                                 |
-|   Change browser                                                               |
-|                                                                                |
-| Work preserved in history.                                                     |
-|                                                                                |
-| +----------------------------------------------------------------------------+ |
-| | > Ask a follow-up...                                                        | |
-| +----------------------------------------------------------------------------+ |
-|                             enter follow-up     f2 browser     tab history     |
-+--------------------------------------------------------------------------------+
-```
-
-Current browser overlay:
-
-```text
-+-- current task  done ----------------------------------------------------------+
-| Result                                                                         |
-|                                                                                |
-|          +--Browser--------------------------------------------------------+   |
-|          | Current                                                        |   |
-|          | backend   Local Chrome                                         |   |
-|          | title     Hacker News                                          |   |
-|          | page      https://news.ycombinator.com                         |   |
-|          | status    connected                                            |   |
-|          | live      https://live.browser-use.com/?wss=example            |   |
-|          | tabs      1 open                                               |   |
-|          | viewport  1440 x 900                                           |   |
-|          |                                                                |   |
-|          | > Open browser                                                 |   |
-|          |   Reconnect                                                    |   |
-|          |   Change browser                                               |   |
-|          |                                                                |   |
-|          | enter select     esc close                                     |   |
-|          +----------------------------------------------------------------+   |
-|                                                                                |
-| +----------------------------------------------------------------------------+ |
-| | > Ask a follow-up...                                                        | |
-| +----------------------------------------------------------------------------+ |
-+--------------------------------------------------------------------------------+
-```
-
-Current history overlay:
-
-```text
-+-- current task  done ----------------------------------------------------------+
-| Result                                                                         |
-|                                                                                |
-|       +--Previous work-----------------------------------------------------+   |
-|       | > Find the top 5 Hacker News posts              done      recent   |   |
-|       |   Compare browser automation tools              done      recent   |   |
-|       |   Analyse repository structure                  failed    recent   |   |
-|       |                                                                |      |
-|       | enter open     r resume     esc close                         |      |
-|       +---------------------------------------------------------------+      |
-|                                                                                |
-| +----------------------------------------------------------------------------+ |
-| | > Ask a follow-up...                                                        | |
-| +----------------------------------------------------------------------------+ |
-+--------------------------------------------------------------------------------+
-```
-
-Current actions overlay:
-
-```text
-+-- current task  done ----------------------------------------------------------+
-| Result                                                                         |
-|                                                                                |
-|                  +--Actions-----------------------------------------------+    |
-|                  | > New task                                             |    |
-|                  |   Open browser                                         |    |
-|                  |   Previous work                                        |    |
-|                  |   Setup                                                |    |
-|                  |   Choose model                                         |    |
-|                  |   Sign in                                              |    |
-|                  |                                                        |    |
-|                  | enter select     esc close                             |    |
-|                  +--------------------------------------------------------+    |
-|                                                                                |
-| +----------------------------------------------------------------------------+ |
-| | > Ask a follow-up...                                                        | |
-| +----------------------------------------------------------------------------+ |
-+--------------------------------------------------------------------------------+
-```
-
-Current key model:
-
-```text
-enter      run, follow up, steer, confirm overlay
-shift+enter newline in composer
-tab        previous work
-f1         keyboard help
-f2         browser
-/          actions
-esc        close overlay
-ctrl+c     clear input, stop task, quit on second press
-ctrl+d     hidden demo completion
-ctrl+e     hidden developer overlay
-arrows     overlay selection only
-```
-
-Current functionality:
-
-```text
-Task
-- create a new task from composer
-- follow up on a selected completed task
-- steer a running task
-- retry a failed task by pressing enter on empty composer
-- cancel running task
-
-Setup
-- choose account
-- choose model
-- choose browser
-- persist settings in SQLite
-- show auth missing notice
-
-Browser
-- show current browser summary projected from events
-- request open browser
-- request reconnect browser
-- change browser mode
-
-History
-- list previous work
-- open previous work
-- resume selected work with r
-
-Developer
-- show recent raw events for selected task
-```
-
-## WHATS WRONG
-
-The underlying event-driven model is good. The UI model is overgrown.
-
-Keep:
-
-```text
-append-only events
-SQLite store
-WorkbenchState projection
-task/follow-up/retry/cancel lifecycle
-browser summary events
-curated model choices
-deterministic dump-screen tests
-Python owning browser connection/lifecycle
-Rust owning TUI/state/model orchestration
-```
-
-Be brutal about the rest:
-
-```text
-The full-screen boxed dashboard fights the terminal.
-The app owns scroll, cursor rendering, selection, and text editing in ways users do not expect.
-The composer is custom editor code, so every terminal edge case becomes our bug.
-The overlay list is too large for the actual product.
-Setup, account, model, browser choice, setup complete, actions, help, history, and developer
-are all competing for the same modal system.
-Browser state is too important to hide behind F2.
-The result is the product, but it is rendered as a small block inside a dashboard.
-The result view drops context: it should show the task, what ran, then the final result.
-Markdown rendering is too shallow. Strong markers like `**14 items**` leak into the UI.
-History still behaves like internal session selection.
-The model/account flow exposes implementation details at the wrong time.
-Auth failure copy tells users to run commands instead of letting them fix it in place.
-Onboarding screens are currently mostly selection screens. They must actually complete setup.
-Open live browser must actually open the live browser, not just record that opening was requested.
-Developer events are useful, but they leak implementation vocabulary into product code.
-The UI says "browser agent cockpit" but behaves like a settings-heavy CLI dashboard.
-```
-
-Specific complexity to remove:
-
-```text
-SetupComplete overlay
-  Kill it. Show "ready" inline and move on.
-
-Help overlay
-  Kill it. Footer hints should be enough.
-
-Developer overlay
-  Keep only behind --debug or a hidden command.
-
-BrowserChoice overlay
-  Fold into setup/browser panel.
-
-Actions overlay as a destination
-  Keep a tiny command palette, but do not make it a second navigation system.
-
-Outer border around everything
-  Remove it. It makes the app feel fake and causes terminal behavior surprises.
-
-Raw session vocabulary
-  Never expose it. Use task, previous work, result, browser.
-
-Custom composer sprawl
-  Isolate it hard or copy Codex behavior more directly.
-```
-
-Screen contract:
-
-```text
-Every visible screen must have real behavior behind every visible action.
-
-If the UI says "Sign in", it must let the user sign in or store the needed key.
-If the UI says "Open live browser", it must launch the live browser.
-If the UI says "Reconnect", it must cause a browser reconnect and show the outcome.
-If the UI says "Choose model", the chosen model must be runnable or route to the missing setup.
-If the UI says "Result", it must show what was asked, what happened, and what the answer is.
-If the UI renders markdown, common markdown syntax must disappear into styling, not leak as text.
-```
-
-The current state shape is this:
-
-```text
-             +----------------+
-             |    Overlay     |
-             +----------------+
-                     ^
-                     |
-                     v
-+---------+   +--------------+   +------------+
-| Store   |-->| Workbench    |-->| Renderer   |
-| events  |   | projection   |   | dashboard  |
-+---------+   +--------------+   +------------+
-      ^              ^                 ^
-      |              |                 |
-      +--------+-----+---------+-------+
-               |
-          +----------+
-          | Composer |
-          +----------+
-```
-
-That is too tangled. The renderer should not feel like everything depends on everything.
-
-The target shape should be:
-
-```text
-+-------------+       +----------------+       +-----------------+
-| Event Store | ----> | Product State  | ----> | Transcript View |
-+-------------+       +----------------+       +-----------------+
-       ^                       |                         |
-       |                       v                         v
-       |              +----------------+       +-----------------+
-       +------------- | Commands       | <---- | Composer        |
-                      +----------------+       +-----------------+
-                               |
-                               v
-                      +----------------+
-                      | Agent/Browser  |
-                      +----------------+
-```
-
-The TUI should not be a dashboard with modals. It should be a transcript with a composer and tiny command surfaces.
-
-## PROPOSED DESIGN (and behaviour)
-
-The perfect terminal UI is transcript-first, Codex-like, and browser-agent-specific.
-
-Principles:
-
-```text
-1. The result is the product.
-2. Browser state is always visible enough to trust.
-3. Setup appears only when needed.
-4. The composer behaves like a normal terminal text input.
-5. Scroll scrolls transcript/history, never the composer cursor.
-6. The command palette is tiny.
-7. Debug tools are hidden.
-8. Internal words stay internal.
-9. Every visible action must actually work.
-```
-
-Product vocabulary:
-
-```text
-Use:
-task
-browser
-account
-model
-result
-history
-setup
-
-Avoid in main UI:
-session
-artifact
-trace
-provider
-event
-tool output
-agent graph
-raw payload
-```
-
-Proposed top-level UI:
-
-```text
-+--------------------------------------------------------------------------------+
-| browser-use                         Local Chrome connected        GPT-5.5       |
-|--------------------------------------------------------------------------------|
-|                                                                                |
-| Transcript                                                                     |
-| - user task                                                                    |
-| - agent progress                                                               |
-| - browser state                                                                |
-| - result                                                                       |
-| - follow-ups                                                                   |
-|                                                                                |
-|--------------------------------------------------------------------------------|
-| Composer                                                                       |
-| >                                                                              |
-|--------------------------------------------------------------------------------|
-| Footer hints                                                                   |
-+--------------------------------------------------------------------------------+
-```
-
-This is the conceptual frame, but the real visual should avoid a heavy outer box. It should feel like a native terminal app:
-
-```text
-browser-use                                      Local Chrome connected   GPT-5.5
+browser-use
 --------------------------------------------------------------------------------
-
-You
-  go to hackernews and save the top 5 posts to json
-
-What ran
-  * connected browser
-  * opened news.ycombinator.com
-  * read front page
-  * saved hackernews_top5.json
-
-Result
-  Done, saved the top 5 Hacker News posts to:
-
-  /Users/greg/project/hackernews_top5.json
-
-  Source
-  https://news.ycombinator.com/news
-
-Browser
-  Hacker News
-  https://news.ycombinator.com/news
-  open live browser
-
---------------------------------------------------------------------------------
+> prompt
+  +- result
+  |  ...
 > Ask a follow-up...
-enter send   shift+enter newline   ctrl+c stop   / actions   tab history
 ```
 
-### Proposed App States
-
-State machine:
+Root cause:
 
 ```text
-FIRST RUN
-   |
-   v
-SETUP NEEDED ------+
-   |               |
-   v               |
-READY <------------+
-   |
-   v
-RUNNING <---- user follow-up / steer
-   |
-   +----> RESULT ----> follow-up ----> RUNNING
-   |
-   +----> FAILED ----> retry/fix ----> RUNNING
-   |
-   +----> CANCELLED -> follow-up/new task
+The live TUI only owns a tiny inline viewport.
+Completed transcript content is inserted into terminal scrollback.
+On tall terminals, the live app gets pinned near the bottom of a mostly empty
+terminal surface.
 ```
 
-### First Run Setup
+That architecture was useful for proving native scrollback, but it is not good
+enough for the product UI.
 
-Goal: activation, not settings.
+## What To Keep
+
+Keep these decisions:
 
 ```text
-browser-use setup
---------------------------------------------------------------------------------
-
-Set up the browser agent
-
-  [needs] Sign in        No account connected
-  [needs] Model          No model selected
-  [ok]    Browser        Local Chrome available
-
-> Sign in
-  Choose model
-  Change browser
-
---------------------------------------------------------------------------------
-enter continue   esc quit
+append-only event store
+WorkbenchState projection
+native selectable transcript output
+plain terminal text for completed work
+simple keyboard model
+history, browser, actions, setup, model surfaces
+follow-up flow on completed tasks
+ctrl+c clears input, stops running task, then quits with confirmation
 ```
 
-Behavior:
+The current app has the right product bones. The redesign should not turn it
+into a dashboard.
+
+## What To Change
+
+Change these:
 
 ```text
-If no usable account exists, select Sign in by default.
-If account exists but no model exists, select Choose model by default.
-If both exist, select Start using browser-use.
-No empty workbench before setup.
-No setup-complete modal.
+live viewport should own the visible terminal
+composer should become the primary visual object
+native transcript should not render live controls
+remove "+-" block styling
+remove duplicated next/action menus
+move status into the composer/status strip
+use a wide right rail only when space allows
 ```
 
-### Sign In
+## Non-Goals
+
+Do not add these in this pass:
 
 ```text
-browser-use setup / sign in
---------------------------------------------------------------------------------
-
-Choose an account
-
-> Codex login             connected
-  Claude Code login       needs sign in
-  OpenAI API key          needs key
-  Anthropic API key       needs key
-  OpenRouter API key      needs key
-
---------------------------------------------------------------------------------
-enter select   esc back
+mouse support
+artifact browser
+full model marketplace
+trace viewer
+CDP/network debugger
+rich devtools panel
+per-tool event firehose
+decorative logo screen
+startup marketing screen
 ```
 
-Behavior:
+## Architecture Direction
+
+Use two renderers.
 
 ```text
-Selecting an API-key account should open an inline key entry state.
-Do not tell users to run a separate command if we can collect the key here.
-Codex login can use existing auth and should be the default.
+1. Live UI renderer
+   Owns the visible terminal area.
+   Contains current task state, composer, status strip, overlays, and actions.
+
+2. Native transcript renderer
+   Emits plain selectable scrollback.
+   Contains prompts, activity summaries, results, errors, and sources.
+   Contains no footer, composer, headers, or selectable menus.
 ```
 
-Inline API key entry:
+This split is the main design decision.
+
+Current mixed model:
 
 ```text
-browser-use setup / openrouter
---------------------------------------------------------------------------------
-
-OpenRouter API key
-
-  sk-or-v1-****************************************
-
-  This key is stored locally in browser-use state.
-
-> Save key
-  Cancel
-
---------------------------------------------------------------------------------
-enter save   esc cancel
+native scrollback renderer sometimes reuses full UI state renderers
+full UI state renderers include recovery menus and footer/composer context
+therefore scrollback and live controls get mixed together
 ```
 
-### Choose Model
-
-Do not make users pick provider first. A model row should explain which account it uses.
+Desired model:
 
 ```text
-browser-use setup / model
---------------------------------------------------------------------------------
-
-Recommended
-
-> GPT-5.5             Codex login          best default
-  Claude Sonnet 4.6   Claude Code login    good browser agent
-  Claude Opus 4.7     Claude Code login    strongest reasoning
-
-API keys
-
-  GPT-5.5             OpenAI API key        needs key
-  Claude Sonnet 4.6   Anthropic API key     needs key
-  Qwen3.6 Plus        OpenRouter API key    needs key
-  GLM-5.1             OpenRouter API key    needs key
-  DeepSeek V4 Pro     OpenRouter API key    needs key
-
-Current
-  none
-
---------------------------------------------------------------------------------
-enter select   a sign in for selected   esc back
+native transcript = history of what happened
+live viewport = what the user can do now
 ```
 
-Behavior:
+## Terminal Layout
+
+The live UI should fill the visible terminal height.
 
 ```text
-Curated list only.
-No model zoo.
-No raw provider IDs in the main row.
-If selected model requires auth, route directly into the needed sign-in flow.
-After sign-in, return to the selected model.
++------------------------------------------------------------------------------+
+| current transcript preview / current state                                    |
+|                                                                              |
+| optional wide right rail                                                       |
+|                                                                              |
+|                                                                              |
+| composer                                                                      |
+| status and key hints                                                           |
++------------------------------------------------------------------------------+
 ```
 
-### Choose Browser
+Native transcript can still be inserted above the live UI, but the live UI should
+not be a 10-row island at the bottom of the terminal.
+
+## Visual Language
+
+Use plain labels, indentation, and a strong composer.
+
+Avoid this:
 
 ```text
-browser-use setup / browser
---------------------------------------------------------------------------------
-
-Choose browser
-
-> Browser Use cloud       remote browser with live view
-  Local Chrome            visible browser on this machine
-  Headless Chromium       background browser
-
-Current
-  Browser Use cloud
-
---------------------------------------------------------------------------------
-enter select   esc back
+  +- browser
+  |  opened news.ycombinator.com
+  |  connected live browser
+  +- done
 ```
 
-Behavior:
+Use this:
 
 ```text
-Default to remote/cloud for painless testing.
-Local Chrome is optional because macOS permission dialogs are hostile.
-Do not expose CDP endpoints, target IDs, or protocol details here.
+browser
+  opened news.ycombinator.com
+  live view connected
 ```
 
-### Ready
+Avoid this:
 
 ```text
-browser-use                                      Browser Use cloud       GPT-5.5
+browser-use                                                                    Browser Use cloud connected   GPT-5.5
 --------------------------------------------------------------------------------
-
-What should the browser do?
-
-Recent
-  find the top 5 Hacker News posts                            done      12m ago
-  compare browser automation tools                            done      1h ago
-  analyse repository structure                                failed    2h ago
-
-Ready
-  account    Codex login
-  browser    connected
-
---------------------------------------------------------------------------------
-> Tell the browser what to do...
-enter run   tab history   / actions
 ```
 
-Behavior:
+Use status in the composer:
 
 ```text
-Typing starts a task.
-Tab opens previous work.
-/ opens command palette.
-No giant onboarding text.
-No hidden setup if the app is not ready. Route to setup repair instead.
++------------------------------------------------------------------------------+
+| Ask a follow-up...                                                            |
+|                                                                              |
+| Done  GPT-5.5  Codex login        Browser Use cloud connected                 |
++------------------------------------------------------------------------------+
+```
+
+## Color Roles
+
+Keep color sparse.
+
+```text
+blue     active prompt, selected row, browser/open link affordance
+green    connected, done
+amber    running, warning
+red      failed, destructive/error
+muted    metadata, status values, keyboard hints
+white    prompt and result text
+```
+
+Most headings should be muted or plain. Only the active row and live state need
+color.
+
+## Empty-State Wordmark
+
+Use a one-line block wordmark on the ready workbench, even when previous work is
+shown underneath. This borrows the recognizable coding-assistant launch feel
+without turning selected task views into branded splash screens.
+
+```text
+▄
+█▀▀▄ █▀▀█ █▀▀█ █   █ █▀▀ █▀▀ █▀▀█   █  █ █▀▀ █▀▀
+█▀▀▄ █▄▄▀ █  █ █▄█▄█ ▀▀█ █▀▀ █▄▄▀   █  █ ▀▀█ █▀▀
+▀▀▀  ▀ ▀▀ ▀▀▀▀  ▀ ▀  ▀▀▀ ▀▀▀ ▀ ▀▀   ▀▀▀▀ ▀▀▀ ▀▀▀
+```
+
+Rules:
+
+```text
+show on the ready workbench, including when previous work exists
+hide as soon as there is a selected task, setup repair, or an overlay
+keep it one line conceptually: "Browser Use", not separate brand panels
+do not show it in scrollback
+do not show it above completed results
+```
+
+## Main Screens
+
+### Empty Ready
+
+```text
+               █▀▀▄ █▀▀█ █▀▀█ █   █ █▀▀ █▀▀ █▀▀█   █  █ █▀▀ █▀▀
+               █▀▀▄ █▄▄▀ █  █ █▄█▄█ ▀▀█ █▀▀ █▄▄▀   █  █ ▀▀█ █▀▀
+               ▀▀▀  ▀ ▀▀ ▀▀▀▀  ▀ ▀  ▀▀▀ ▀▀▀ ▀ ▀▀   ▀▀▀▀ ▀▀▀ ▀▀▀
+
+
+
++------------------------------------------------------------------------------+
+| Ask the browser to do anything...                                             |
+|                                                                              |
+| Build  GPT-5.5  Codex login        Browser Use cloud ready                    |
++------------------------------------------------------------------------------+
+                                      tab history   / actions   f2 browser
+```
+
+Notes:
+
+```text
+No giant logo.
+No setup copy unless setup is actually incomplete.
+No recent section if there is no history.
+The prompt box is the anchor.
+```
+
+### Ready With History
+
+```text
+browser-use
+
+previous work
+  Find the top 5 Hacker News posts                         done      3m ago
+  Compare Azure billing requirements                       done      1h ago
+  Inspect checkout flow                                    stopped   2h ago
+
+
++------------------------------------------------------------------------------+
+| Tell the browser what to do...                                                |
+|                                                                              |
+| Build  GPT-5.5  Codex login        Browser Use cloud ready                    |
++------------------------------------------------------------------------------+
+                                      tab history   / actions   f2 browser
 ```
 
 ### Running
 
 ```text
-browser-use                                      Browser Use cloud       GPT-5.5
---------------------------------------------------------------------------------
+> Find the top 5 Hacker News posts
 
-You
-  find the top 5 Hacker News posts and save them to json
+working
+  running browser task
 
-Agent is working                                            48s
-
-  * connected browser
-  * opened news.ycombinator.com
-  * reading front page
-  * extracting posts
-
-Browser
-  Hacker News
-  https://news.ycombinator.com/news
+browser
+  news.ycombinator.com
   live view available
 
---------------------------------------------------------------------------------
-> Type to steer the agent...
-enter steer   shift+enter newline   ctrl+c stop   f2 browser   / actions
-```
 
-Behavior:
-
-```text
-Show compact human activity, not raw tool calls.
-Show current browser URL/title inline.
-Follow-up text while running is steering.
-Ctrl+c stops once. Second ctrl+c quits only if nothing is running.
-Loading indicator should be subtle and native-feeling.
++------------------------------------------------------------------------------+
+| Type to steer the agent...                                                    |
+|                                                                              |
+| Working  GPT-5.5  Codex login      Browser Use cloud connected                |
++------------------------------------------------------------------------------+
+                         enter send   shift+enter newline   ctrl+c stop
 ```
 
 ### Result
 
 ```text
-browser-use                                      Browser Use cloud       GPT-5.5
---------------------------------------------------------------------------------
+> Find the top 5 Hacker News posts
 
-Task
-  find the top 5 Hacker News posts and save them to json
+browser
+  opened news.ycombinator.com
+  live view connected
 
-What ran
-  * connected browser
-  * opened news.ycombinator.com/news
-  * read front page
-  * extracted 5 posts
-  * saved hackernews_top5.json
-
-Result
-
-  Saved the top 5 Hacker News posts to:
-
-  /Users/greg/project/hackernews_top5.json
+result
+  Top 5 Hacker News posts
 
   1. Example story
-     382 points, 128 comments
-     https://example.com/story
-
   2. Another story
-     214 points, 76 comments
-     https://example.com/another
+  3. Browser agents in practice
 
-Source
-  https://news.ycombinator.com/news
+source
+  https://news.ycombinator.com
 
---------------------------------------------------------------------------------
-> Ask a follow-up...
-enter follow-up   shift+enter newline   f2 browser   tab history   / actions
+
++------------------------------------------------------------------------------+
+| Ask a follow-up...                                                            |
+|                                                                              |
+| Done  GPT-5.5  Codex login        Browser Use cloud connected                 |
++------------------------------------------------------------------------------+
+                                      tab history   / actions   f2 browser
 ```
 
-Behavior:
+### Failed
 
 ```text
-Render markdown properly.
-Always show the task, completed steps, and result together.
-The completed steps should be the frozen final version of the running activity.
-Strong emphasis, inline code, headings, ordered lists, unordered lists, links, and bare URLs
-must render as terminal text, not raw markdown syntax.
-Long list items need hanging indentation so continuation lines still belong to the item.
-Links should be visually distinct and terminal-clickable where supported.
-Saved paths should be visible inline.
-Do not create a separate artifact browser for v1.
-If the result is long, terminal scroll should review it naturally.
+> Read-only exploration: summarize this repository.
+
+error
+  The agent could not start.
+  spawn command via shell bash in /root/repo-explorer
+
+next
+  > Retry
+    Choose a different model
+    New task
+
+
++------------------------------------------------------------------------------+
+| Ask a follow-up...                                                            |
+|                                                                              |
+| Failed  GPT-5.5  Codex login      Browser Use cloud ready                     |
++------------------------------------------------------------------------------+
+                                                        enter choose   / actions
 ```
 
-Good result rendering:
+Auth-specific failed state:
 
 ```text
-Result
+error
+  OpenRouter API key is missing.
 
-  Your Amazon cart currently has 14 items with a subtotal of $1,240.70:
-
-  * Moso Natural Air Purifying Bag 600g
-    qty 1, $24.95
-
-  * AE0CKY 4500 Sq.Ft Dehumidifier, 80 Pint/Day
-    qty 1, $239.97
-
-  * MIULEE Velvet Curtains, 108", Olive Green, 2 Panels
-    qty 4, $55.99 each, coupon price shown $44.79
+next
+  > Sign in to OpenRouter
+    Choose a different model
+    Retry
+    New task
 ```
 
-Bad result rendering:
+Browser-specific failed state:
 
 ```text
-Result
+error
+  Could not connect to Local Chrome.
 
-  Your Amazon cart currently has **14 items** with a subtotal of **$1,240.70**:
-
-  • **MIULEE Velvet Curtains, 108", Olive Green, 2 Panels** – qty 4 –
-  **$55.99 each** / coupon price shown **$44.79**
+next
+  > Open browser settings
+    Choose a different browser
+    Retry
+    New task
 ```
 
-### Failure
+### Stopped
 
 ```text
-browser-use                                      Browser Use cloud       GPT-5.5
---------------------------------------------------------------------------------
+> Find the top 5 Hacker News posts
 
-You
-  use GLM-5.1 to summarize this page
+stopped
+  Progress is saved in history.
 
-The agent could not start.
+next
+  > Continue with a follow-up
+    Start a new task
+    Previous work
 
-OpenRouter API key is missing.
 
-> Sign in to OpenRouter
-  Choose a different model
-  Retry
-  New task
-
-Work is saved in history.
-
---------------------------------------------------------------------------------
-enter select   esc back
++------------------------------------------------------------------------------+
+| Ask a follow-up...                                                            |
+|                                                                              |
+| Stopped  GPT-5.5  Codex login     Browser Use cloud connected                 |
++------------------------------------------------------------------------------+
+                                                        enter choose   / actions
 ```
 
-Behavior:
+## Wide Layout
+
+For wide terminals, add a right rail. Do not add it on narrow terminals.
+
+Suggested threshold:
 
 ```text
-Failure always gives a useful next step.
-The default selection should fix the actual problem.
-For auth failures, route to sign-in.
-For model failures, route to model selection.
-For browser failures, route to browser panel.
-Do not dump raw exception text as the main message.
+width >= 120
 ```
 
-### Cancelled
+Running wide layout:
 
 ```text
-browser-use                                      Browser Use cloud       GPT-5.5
---------------------------------------------------------------------------------
+> Find the top 5 Hacker News posts                         | Browser
+                                                           | connected
+working                                                    | Hacker News
+  running browser task                                     | news.ycombinator.com
+                                                           | live view available
+browser                                                    |
+  opened news.ycombinator.com                              | Task
+  live view connected                                      | running
+                                                           | 1 tab
+                                                           | 1440 x 900
 
-You
-  compare three pricing pages
 
-Stopped.
-
-Progress is saved in history.
-
-> Continue with a follow-up
-  Start a new task
-  Previous work
-
---------------------------------------------------------------------------------
-enter select   / actions
++----------------------------------------------------------+
+| Type to steer the agent...                               |
+|                                                          |
+| Working  GPT-5.5  Codex login                            |
++----------------------------------------------------------+
+                         enter send   ctrl+c stop          tab history   / actions
 ```
 
-Behavior:
+Rail rules:
 
 ```text
-Cancelled is not an error.
-Make continuing or starting fresh obvious.
+show browser status, title, page, live view, tabs, viewport
+show task status and elapsed/updated time if available
+do not show raw event payloads
+do not show trace/debug details
+hide the rail before wrapping important transcript content badly
 ```
 
-### Browser Panel
+## Overlays
 
-This should be the only place with detailed browser status. It should still avoid protocol internals.
-
-```text
-browser-use / browser
---------------------------------------------------------------------------------
-
-Current browser
-
-  backend     Browser Use cloud
-  status      connected
-  title       Hacker News
-  page        https://news.ycombinator.com/news
-  live view   available
-  tabs        1 open
-  viewport    1440 x 900
-
-> Open live browser
-  Reconnect
-  Change browser
-
---------------------------------------------------------------------------------
-enter select   esc back
-```
-
-Behavior:
-
-```text
-Browser state is projected from browser events.
-Open live browser launches the live URL in the OS browser immediately.
-Reconnect should emit one clear reconnect command.
-Python browser tool should own or be fully aware of reconnect state.
-Never show tab IDs, target IDs, object IDs, or CDP internals in the product UI.
-```
-
-### Previous Work
-
-```text
-browser-use / previous work
---------------------------------------------------------------------------------
-
-> find the top 5 Hacker News posts                         done        12m ago
-  compare browser automation tools                         done        1h ago
-  analyse repository structure                             failed      2h ago
-  book a one-way flight from Ljubljana to Zurich            stopped     yesterday
-
---------------------------------------------------------------------------------
-enter open   r resume   / actions   esc back
-```
-
-Behavior:
-
-```text
-Call it previous work or history, never sessions.
-Opening shows the transcript/result.
-Resuming appends a follow-up or restarts from the previous task context.
-```
+Overlays should feel like command surfaces, not separate applications.
 
 ### Actions
 
-Keep it tiny.
-
 ```text
-Actions
---------------------------------------------------------------------------------
+actions
 
-> New task
-  Open browser
-  Reconnect browser
-  Previous work
-  Choose model
-  Sign in
+  > New task
+    Open browser
+    Reconnect browser
+    Previous work
+    Choose model
+    Use Claude Code subscription
+    OpenRouter models
+    Sign in to Claude Code
+    Sign in to OpenRouter
+    Sign in
+    Configure Laminar
 
---------------------------------------------------------------------------------
-type to filter   enter select   esc close
+                                      type filter   enter choose   esc close
 ```
 
-Behavior:
+Filtered:
 
 ```text
-Actions is a command palette, not an app navigation system.
-No debug items unless debug mode is enabled.
-No generic "Continue"; the composer already does that.
-No generic "Stop"; running state already has ctrl+c stop.
+actions
+
+filter  router
+
+  > OpenRouter models
+    Sign in to OpenRouter
+
+                                      type filter   enter choose   esc close
 ```
 
-### Multiline Composer
+### History
 
 ```text
---------------------------------------------------------------------------------
-> find flights from ljubljana to zurich
-  one way
-  tomorrow morning
---------------------------------------------------------------------------------
-enter send   shift+enter newline   option+delete word   cmd+delete line
+previous work
+
+  > Find the top 5 Hacker News posts                         done      3m ago
+    Compare Azure billing requirements                       done      1h ago
+    Inspect checkout flow                                    stopped   2h ago
+
+                                          enter open   r resume   esc back
 ```
 
-Behavior:
+### Browser
 
 ```text
-Normal typing must feel boring and native.
-Shift+enter inserts newline.
-Enter sends.
-Cmd+delete deletes the current line.
-Repeated cmd+delete deletes one line at a time.
-Option+delete deletes a word.
-Ctrl+a/e move to line start/end.
-Scroll never moves the composer cursor.
-Plain up/down should not be composer navigation unless we implement full shell history intentionally.
-Maximum visible height is about 10 lines.
-Longer input scrolls inside composer without moving page scroll.
+Browser Use cloud
+
+status    connected
+page      https://news.ycombinator.com
+title     Hacker News
+live      available
+tabs      1
+viewport  1440 x 900
+
+  > Open live browser
+    Reconnect
+    Change browser
+
+                                                        enter choose   esc back
 ```
 
-### Rendering Architecture
-
-Proposed code shape:
+### Setup
 
 ```text
-crates/browser-use-tui
-|-- app.rs
-|   |-- AppState
-|   |-- AppCommand
-|   `-- state transitions
-|
-|-- composer.rs
-|   |-- input buffer
-|   |-- cursor
-|   |-- key handling
-|   `-- tests copied from Codex-like behavior
-|
-|-- screens.rs
-|   |-- ReadyScreen
-|   |-- RunningScreen
-|   |-- ResultScreen
-|   |-- FailureScreen
-|   `-- SetupScreen
-|
-|-- palette.rs
-|   |-- action list
-|   |-- filtering
-|   `-- selection
-|
-|-- browser_panel.rs
-|   |-- browser summary
-|   `-- browser commands
-|
-|-- render.rs
-|   `-- pure rendering only
-|
-`-- runtime.rs
-    `-- agent thread integration
+browser-use setup
+
+account     Codex login connected
+model       not selected
+browser     Browser Use cloud
+
+  > Choose model
+    Sign in
+    Change browser
+
+                                                        enter choose   esc back
 ```
 
-Proposed event flow:
+Setup is only for first-run activation and repair. It should not become a normal
+destination.
+
+### Model
 
 ```text
-composer submit
-   |
-   v
-AppCommand
-   |
-   +-- StartTask(text)
-   +-- SendFollowup(text)
-   +-- StopTask
-   +-- RetryTask
-   +-- OpenBrowser
-   +-- ReconnectBrowser
-   +-- ChangeModel
-   +-- SaveAuth
-   |
-   v
-Store event / setting mutation
-   |
-   v
-WorkbenchState projection
-   |
-   v
-Render transcript
+choose model
+
+recommended
+  > GPT-5.5                         Codex login             best default
+    Claude Opus 4.7                 Claude Code login       strongest reasoning
+    Claude Sonnet 4.6               Claude Code login       good browser agent
+
+api keys
+    GPT-5.5                         OpenAI API key          needs key
+    Claude Sonnet 4.6               Anthropic API key       needs key
+    Claude Opus 4.7                 Anthropic API key       needs key
+
+openrouter
+    Qwen3.6 Plus                    OpenRouter API key      needs key
+    Kimi K2.5                       OpenRouter API key      vision + tools
+    DeepSeek V4 Pro                 OpenRouter API key      needs key
+
+current
+  GPT-5.5 via Codex login
+
+                                                        enter choose   esc back
 ```
 
-### Migration Plan
+## Keyboard Model
 
-Do this as a UI rewrite, not a whole-system rewrite.
+Keep it small:
 
 ```text
-Phase 1: Lock product states
-  - keep SQLite/events
-  - define ProductState enum
-  - define AppCommand enum
-  - define a screen contract for every visible action
-  - write ASCII snapshot tests for every state in this document
-
-Phase 2: Extract composer
-  - move composer into composer.rs
-  - copy Codex behavior where it actually fits
-  - explicitly reject scroll/up/down cursor bugs
-  - add terminal key regression tests
-
-Phase 3: Replace dashboard with transcript
-  - remove giant outer border
-  - render header + transcript + composer
-  - result markdown becomes first-class
-  - links/paths get proper styling
-
-Phase 4: Collapse overlays
-  - remove SetupComplete
-  - remove Help overlay
-  - hide Developer overlay behind debug
-  - merge BrowserChoice into Browser/Setup
-  - make Actions a tiny command palette
-
-Phase 5: Fix setup
-  - sign-in state collects keys where possible
-  - model selection routes to required sign-in
-  - no setup screen can be cosmetic only
-  - remote browser/cloud is painless default
-
-Phase 6: Polish browser trust
-  - browser status always visible
-  - open live browser actually launches the browser
-  - browser panel is useful but not a debugger
-  - reconnect semantics are explicit
-  - Python browser tool owns or tracks browser lifecycle
+enter          submit or choose
+shift+enter    newline
+tab            previous work
+f2             browser
+/              actions
+esc            close surface
+ctrl+c         clear input, stop task, then quit with confirmation
+ctrl+e         developer, if we keep it
 ```
 
-Final target:
+Do not add more global shortcuts until the main layout is stable.
+
+## Implementation Order
+
+### PR 1: Fix Space Ownership
 
 ```text
-The app should feel like:
-
-  "tell the browser what to do, watch enough to trust it, steer when needed,
-   then receive a useful result"
-
-Not:
-
-  "manage sessions, providers, artifacts, settings, traces, and terminal widgets"
+1. Make live terminal UI own the visible terminal height.
+2. Keep native scrollback, but stop treating the live viewport as 8-10 rows.
+3. Add smoke tests for large blank gaps.
+4. Add smoke tests for selecting history from a scrolled/tall terminal.
 ```
 
+Acceptance:
+
+```text
+No screenshot should show a huge empty terminal with the app pinned to the bottom.
+Composer remains visible.
+Native output remains selectable.
+No raw escape sequences appear.
+```
+
+### PR 2: Split Native Transcript And Live Controls
+
+```text
+1. Add transcript-only render functions.
+2. Remove headers, footers, composer, and next menus from native transcript replay.
+3. Keep next actions in the live renderer only.
+4. Verify failed/stopped selected sessions show one next menu.
+```
+
+Acceptance:
+
+```text
+Native scrollback reads like a plain task transcript.
+Live viewport reads like the current interactive app.
+No duplicated "next" blocks.
+```
+
+### PR 3: Composer Surface
+
+```text
+1. Replace prompt line plus dashed footer with a composer box.
+2. Move model/account/browser state into the composer status strip.
+3. Preserve multiline editing and paste behavior.
+4. Preserve cursor correctness in real tmux tests.
+```
+
+Acceptance:
+
+```text
+The input area is visually obvious.
+Users can identify model/account/browser without scanning the header.
+Existing composer tests still pass.
+```
+
+### PR 4: Transcript Visual Cleanup
+
+```text
+1. Replace "+-" block grammar with simple labels and indentation.
+2. Rebalance result/source/error/next visual hierarchy.
+3. Keep markdown result rendering clean.
+4. Update deterministic dumps and smoke expectations.
+```
+
+Acceptance:
+
+```text
+The transcript looks like assistant output, not debug output.
+Result content is the visual priority.
+Activity is readable but secondary.
+```
+
+### PR 5: Optional Wide Rail
+
+```text
+1. Add right rail at width >= 120.
+2. Show browser/task metadata only.
+3. Hide the rail on narrow terminals.
+4. Verify wrapping and mobile/narrow terminal behavior.
+```
+
+Acceptance:
+
+```text
+Wide terminals use space well.
+Narrow terminals stay simple.
+The rail never steals room from important result text.
+```
+
+## Test Plan
+
+Extend `scripts/tui-terminal-smoke.py`.
+
+Add assertions:
+
+```text
+no more than 8 consecutive blank visible lines in normal live views
+composer visible near bottom after starting a new session
+composer visible near bottom after selecting history
+composer visible near bottom after failed retry
+failed selected task has exactly one next section
+stopped selected task has exactly one next section
+native replay contains no footer text
+native replay contains no composer placeholder
+native replay contains no action menu unless it was part of the result text
+```
+
+Keep existing checks:
+
+```text
+no duplicate app chrome
+no leaked escape sequences
+bracketed paste markers do not leak
+arrow keys are consumed inside surfaces
+completed non-interactive output is plain text
+deterministic dumps still cover setup, ready, running, result, browser, history, actions, developer
+```
+
+## Decisions Needed
+
+Before implementing, decide:
+
+```text
+1. Use full-height inline viewport, or alternate screen plus explicit transcript export?
+2. Keep "Build" as the mode label, or rename it to "Browse", "Task", or "Agent"?
+3. Should right rail ship in the first visual pass or wait until the composer lands?
+4. Should Developer remain ctrl+e or be hidden behind actions?
+5. Should setup use the composer box style or stay as a plain list?
+```
+
+Recommended answers:
+
+```text
+1. Full-height inline viewport first.
+2. Keep Build for now, revisit after visual pass.
+3. Wait on right rail until composer and transcript split are done.
+4. Keep ctrl+e for now because it is already hidden enough.
+5. Keep setup as a plain list.
+```
+
+## Final Target
+
+The redesigned app should feel like:
+
+```text
+OpenCode-style prompt confidence
+Codex-style compact status
+Claude-style readable terminal rhythm
+Browser Use-specific browser state and live view control
+```
+
+It should not copy those products directly. It should borrow the convention users
+already understand: the prompt box is the center, transcript is plain, controls
+are compact, and status is always visible but quiet.

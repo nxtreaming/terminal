@@ -102,6 +102,22 @@ def assert_count(text: str, needle: str, expected: int, context: str) -> None:
         raise AssertionError(f"{context}: expected {expected} x {needle!r}, saw {count}\n\n{text}")
 
 
+def assert_row_gap_at_most(text: str, before: str, after: str, max_rows: int, context: str) -> None:
+    lines = text.splitlines()
+    before_indexes = [idx for idx, line in enumerate(lines) if before in line]
+    if not before_indexes:
+        raise AssertionError(f"{context}: missing {before!r}\n\n{text}")
+    before_idx = before_indexes[-1]
+    after_idx = next((idx for idx in range(before_idx + 1, len(lines)) if after in lines[idx]), None)
+    if after_idx is None:
+        raise AssertionError(f"{context}: missing {after!r} after {before!r}\n\n{text}")
+    rows_between = after_idx - before_idx - 1
+    if rows_between > max_rows:
+        raise AssertionError(
+            f"{context}: expected at most {max_rows} rows between {before!r} and {after!r}, saw {rows_between}\n\n{text}"
+        )
+
+
 def assert_regex_count(text: str, pattern: str, expected: int, context: str) -> None:
     count = len(re.findall(pattern, text, flags=re.MULTILINE))
     if count != expected:
@@ -138,7 +154,7 @@ def start_session(
         f"--state-dir {state_dir} --seed-demo {seed_demo} {select_arg}--agent none --height 28"
     )
     tmux_send(session, command, "C-m")
-    wait_for(session, "browser-use", f"initial-{seed_demo}")
+    wait_for(session, "Browser Use cloud", f"initial-{seed_demo}")
 
 
 def smoke_interactive_terminal(binary: Path) -> None:
@@ -146,7 +162,7 @@ def smoke_interactive_terminal(binary: Path) -> None:
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-"))
     try:
         start_session(session, binary, state_dir)
-        wait_for(session, "+- working", "initial-running")
+        wait_for(session, "● working", "initial-running")
 
         tmux_send(session, "Tab", "Down", "Down", "Down")
         history = wait_for(session, "browser-use / previous work", "history")
@@ -154,7 +170,7 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(history, "^[[B", "arrow keys should be consumed by the TUI")
 
         tmux_send(session, "Escape")
-        wait_for(session, "+- working", "main-after-history")
+        wait_for(session, "● working", "main-after-history")
 
         tmux_send_literal(session, "alpha")
         tmux_send_shift_enter(session)
@@ -165,7 +181,7 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(multiline, "Follow-up\n    alpha", "shift-enter must not submit")
         assert_not_contains(multiline, "alpha|", "composer should use the terminal cursor, not a fake pipe")
         assert_not_contains(multiline, "beta|", "composer should use the terminal cursor, not a fake pipe")
-        assert_regex_count(multiline, r"^browser-use\b", 1, "multiline edit should not append duplicate app screens")
+        assert_count(multiline, "Browser Use cloud", 1, "multiline edit should not append duplicate app screens")
 
         tmux_send(session, "C-u", "C-u")
         line_removed = capture_after_idle(session, "ctrl-u-removes-empty-composer-line", visible_only=True)
@@ -173,7 +189,7 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(line_removed, "  beta", "second ctrl-u should remove the cleared composer line")
 
         tmux_send(session, "C-c")
-        wait_for(session, "+- working", "main-after-clear")
+        wait_for(session, "● working", "main-after-clear")
 
         bracketed = "\x1b[200~paste one\npaste two\x1b[201~"
         tmux_send_literal(session, bracketed)
@@ -182,18 +198,23 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_contains(pasted, "paste two", "bracketed paste second line")
         assert_not_contains(pasted, "^[[200~", "bracketed paste markers should not leak")
         assert_not_contains(pasted, "paste two|", "paste should use the terminal cursor, not a fake pipe")
-        assert_regex_count(pasted, r"^browser-use\b", 1, "paste should not append duplicate app screens")
+        assert_count(pasted, "Browser Use cloud", 1, "paste should not append duplicate app screens")
 
-        tmux_send(session, "C-c", "/")
-        wait_for(session, "Actions", "actions-open")
-        tmux_send(session, "b", "r", "o")
-        actions = wait_for(session, "filter  bro", "actions-filter")
-        assert_contains(actions, "Open browser", "actions filter should show matching command")
-        assert_not_contains(actions, "filter  b\n", "actions filter should redraw in place")
-        assert_not_contains(actions, "filter  br\n", "actions filter should redraw in place")
+        tmux_send(session, "C-c")
+        after_paste_clear = capture_after_idle(session, "main-after-paste-clear", visible_only=True)
+        assert_contains(after_paste_clear, "● working", "clearing pasted text should not stop the task")
+        assert_not_contains(after_paste_clear, "paste two", "ctrl+c should clear pasted composer text")
+
+        tmux_send(session, "/")
+        wait_for(session, "/task", "slash-palette-open")
+        wait_for(session, "/model", "slash-palette-open-model")
+        tmux_send_literal(session, "bro")
+        actions = wait_for(session, "> /bro", "slash-palette-filtered")
+        assert_contains(actions, "/browser", "slash palette should show matching command")
+        assert_not_contains(actions, "/model", "slash palette should hide non-matching commands")
 
         tmux_send(session, "Escape")
-        wait_for(session, "+- working", "main-after-actions")
+        wait_for(session, "● working", "main-after-slash-palette")
         tmux_send(session, "F2")
         browser = wait_for(session, "Current browser", "browser-panel")
         assert_count(browser, "browser-use / browser", 1, "browser panel should be live, not appended repeatedly")
@@ -201,13 +222,13 @@ def smoke_interactive_terminal(binary: Path) -> None:
         tmux("resize-window", "-t", session, "-x", "100", "-y", "22")
         resized_small = capture_after_idle(session, "resize-100x22", visible_only=True)
         assert_contains(resized_small, "Current browser", "resize should keep the live app visible")
-        assert_regex_count(resized_small, r"^  browser-use / browser\b", 1, "resize shrink should redraw in place")
+        assert_regex_count(resized_small, r"^\s+browser-use / browser\b", 1, "resize shrink should redraw in place")
         assert_not_contains(resized_small, "^[[", "resize shrink should not leak escape sequences")
 
         tmux("resize-window", "-t", session, "-x", "120", "-y", "28")
         resized_large = capture_after_idle(session, "resize-120x28", visible_only=True)
         assert_contains(resized_large, "Current browser", "resize grow should keep the live app visible")
-        assert_regex_count(resized_large, r"^  browser-use / browser\b", 1, "resize grow should redraw in place")
+        assert_regex_count(resized_large, r"^\s+browser-use / browser\b", 1, "resize grow should redraw in place")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -224,21 +245,36 @@ def smoke_history_selection_emits_native_transcript(binary: Path) -> None:
             seed_demo="cancelled",
             select_latest=False,
         )
-        wait_for(session, "What should the browser do?", "history-start-ready")
+        wait_for(session, "Tell the browser what to do...", "history-start-ready")
         tmux_send(session, "Tab")
         wait_for(session, "browser-use / previous work", "history-open-cancelled")
         tmux_send(session, "Enter")
-        selected = wait_for(session, "+- stopped", "history-select-cancelled")
-        assert_regex_count(selected, r"^browser-use\b", 1, "history selection should emit one transcript header")
+        selected = wait_for(session, "stopped", "history-select-cancelled")
         assert_contains(selected, "> Find the top 5 Hacker News posts", "selected task should be in native scrollback")
-        assert_contains(selected, "+- stopped", "cancelled task should render as native transcript")
+        assert_contains(selected, "stopped", "cancelled task should render as native transcript")
+        assert_not_contains(selected, "+- stopped", "native transcript should use simple section labels")
+        assert_not_contains(selected, "+- browser", "native transcript should use simple section labels")
+        assert_row_gap_at_most(
+            selected,
+            "Progress is saved",
+            "Previous work",
+            5,
+            "stopped status and next menu should stay grouped together",
+        )
+        assert_row_gap_at_most(
+            selected,
+            "Previous work",
+            "Ask a follow-up",
+            1,
+            "stopped next menu should stay attached to the composer",
+        )
         assert_not_contains(selected, "\x1b[", "native transcript should not leak escapes")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def smoke_tall_terminal_keeps_live_viewport_compact(binary: Path) -> None:
+def smoke_tall_terminal_keeps_running_controls_attached_to_content(binary: Path) -> None:
     session = f"but-smoke-height-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-height-"))
     try:
@@ -249,17 +285,16 @@ def smoke_tall_terminal_keeps_live_viewport_compact(binary: Path) -> None:
             f"--state-dir {state_dir} --seed-demo running --select-latest --agent none"
         )
         tmux_send(session, command, "C-m")
-        wait_for(session, "+- working", "height-120x40-history")
+        wait_for(session, "● working", "height-120x40-history")
         visible = capture_visible(session, "height-120x40")
-        assert_regex_count(visible, r"^browser-use\b", 1, "tall terminal should have one emitted transcript")
-        footer_rows = [
-            idx for idx, line in enumerate(visible.splitlines()) if "enter steer" in line
-        ]
-        if not footer_rows or max(footer_rows) > 24:
-            raise AssertionError(
-                "tall terminal should keep a compact live viewport and leave native scrollback to the terminal\n\n"
-                + visible
-            )
+        assert_count(visible, "Browser Use cloud", 1, "tall terminal should have one live app status")
+        assert_row_gap_at_most(
+            visible,
+            "connected live browser",
+            "Type to steer",
+            6,
+            "running controls should stay attached to the latest activity on tall terminals",
+        )
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -276,27 +311,66 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
             seed_demo="long",
             select_latest=False,
         )
-        wait_for(session, "What should the browser do?", "long-history-start-ready")
+        wait_for(session, "Tell the browser what to do...", "long-history-start-ready")
         tmux_send(session, "Tab", "Enter")
         selected = wait_for(session, "scroll check line 60", "long-history-selected")
         visible = capture_after_idle(session, "long-history-selected-visible", visible_only=True)
         assert_contains(selected, "scroll check line 1", "native transcript should include first result line")
         assert_contains(selected, "scroll check line 60", "native transcript should include last result line")
-        assert_contains(selected, "+- source", "native transcript should include source section")
+        assert_contains(selected, "source", "native transcript should include source section")
         assert_contains(visible, "Ask a follow-up", "live viewport should redraw the composer after transcript insert")
-        assert_regex_count(selected, r"^browser-use\b", 1, "long selected task should emit one transcript header")
+        assert_contains(visible, "scroll check line 1", "live viewport should show a result preview above the composer")
+        assert_row_gap_at_most(
+            visible,
+            "https://news.ycombinator.com",
+            "Ask a follow-up",
+            1,
+            "result preview should stay attached to the composer",
+        )
+        assert_not_contains(selected, "+- source", "native transcript should use simple section labels")
+        assert_not_contains(selected, "+- result", "native transcript should use simple section labels")
         assert_not_contains(selected, "earlier steps", "native transcript should not compact activity")
         assert_not_contains(selected, "\x1b[", "native transcript should not leak escapes")
 
         tmux_send_literal(session, "continue")
         tmux_send(session, "Enter")
-        running = wait_for(session, "+- working", "long-history-followup-running")
+        running = wait_for(session, "Type to steer the agent", "long-history-followup-running")
         visible_running = capture_after_idle(session, "long-history-followup-visible", visible_only=True)
-        if len(re.findall(r"^browser-use\b", visible_running, flags=re.MULTILINE)) > 1:
+        if visible_running.count("Browser Use cloud") > 1:
             raise AssertionError(
                 "follow-up should not append duplicate app screens\n\n" + visible_running
             )
         assert_not_contains(running, "using browser", "internal browser helper starts should stay hidden")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
+    session = f"but-smoke-short-done-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-short-done-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="done",
+            select_latest=False,
+        )
+        wait_for(session, "Tell the browser what to do...", "short-done-start-ready")
+        tmux_send(session, "Tab", "Enter")
+        selected = wait_for(session, "Top 5 Hacker News posts", "short-done-selected")
+        visible = capture_after_idle(session, "short-done-selected-visible", visible_only=True)
+        assert_contains(selected, "Top 5 Hacker News posts", "selected task should be replayed to native scrollback")
+        assert_contains(visible, "Top 5 Hacker News posts", "live viewport should not be blank for completed history")
+        assert_contains(visible, "https://news.ycombinator.com", "live viewport should show completed source")
+        assert_row_gap_at_most(
+            visible,
+            "https://news.ycombinator.com",
+            "Ask a follow-up",
+            1,
+            "short completed result should stay attached to the composer",
+        )
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -313,7 +387,7 @@ def smoke_main_resize_does_not_duplicate_transcript(binary: Path) -> None:
             seed_demo="long",
             select_latest=False,
         )
-        wait_for(session, "What should the browser do?", "main-resize-start-ready")
+        wait_for(session, "Tell the browser what to do...", "main-resize-start-ready")
         tmux_send(session, "Tab", "Enter")
         wait_for(session, "scroll check line 60", "main-resize-selected")
         tmux("resize-window", "-t", session, "-x", "96", "-y", "24")
@@ -322,7 +396,7 @@ def smoke_main_resize_does_not_duplicate_transcript(binary: Path) -> None:
         large = capture_after_idle(session, "main-resize-140x34")
         for name, text in [("small", small), ("large", large)]:
             assert_not_contains(text, "^[[", f"main resize {name} should not leak escapes")
-            if len(re.findall(r"^browser-use\b", text, flags=re.MULTILINE)) > 1:
+            if text.count("Browser Use cloud") > 1:
                 raise AssertionError(
                     f"main resize {name} should not duplicate transcript headers\n\n{text}"
                 )
@@ -347,7 +421,7 @@ def smoke_session_switch_clears_previous_transcript(binary: Path) -> None:
             seed_demo="long",
             select_latest=False,
         )
-        wait_for(session, "What should the browser do?", "switch-start-ready")
+        wait_for(session, "Tell the browser what to do...", "switch-start-ready")
         tmux_send_literal(session, transient_task)
         tmux_send(session, "Enter")
         wait_for(session, transient_task, "switch-transient-created")
@@ -379,17 +453,19 @@ def smoke_large_composer_input_is_batched(binary: Path) -> None:
             seed_demo="running",
             select_latest=True,
         )
-        wait_for(session, "+- working", "large-input-start")
+        wait_for(session, "● working", "large-input-start")
+        wait_for(session, "Type to steer the agent", "large-input-composer-ready")
         large_text = "x" * 1200
         started = time.time()
-        tmux_send_literal(session, large_text)
+        for offset in range(0, len(large_text), 50):
+            tmux_send_literal(session, large_text[offset : offset + 50])
         typed = wait_for(session, "x" * 80, "large-input-typed", timeout=4.0)
         elapsed = time.time() - started
         if elapsed > 4.0:
             raise AssertionError(f"large input took too long to appear: {elapsed:.2f}s")
         assert_not_contains(typed, "^[[200~", "large input should not leak bracketed paste markers")
         assert_not_contains(typed, "^[[", "large input should not leak escape sequences")
-        if len(re.findall(r"^browser-use\b", typed, flags=re.MULTILINE)) > 1:
+        if typed.count("Browser Use cloud") > 1:
             raise AssertionError("large input should not duplicate app screens\n\n" + typed)
     finally:
         tmux("kill-session", "-t", session, check=False)
@@ -407,13 +483,27 @@ def smoke_failed_retry_switches_to_live_running(binary: Path) -> None:
             seed_demo="failed",
             select_latest=False,
         )
-        wait_for(session, "What should the browser do?", "failed-retry-start-ready")
+        wait_for(session, "Tell the browser what to do...", "failed-retry-start-ready")
         tmux_send(session, "Tab", "Enter")
-        wait_for(session, "+- error", "failed-retry-initial")
+        initial = wait_for(session, "error", "failed-retry-initial")
+        assert_row_gap_at_most(
+            initial,
+            "OpenRouter API key is missing",
+            "New task",
+            6,
+            "failed status and next menu should stay grouped together",
+        )
+        assert_row_gap_at_most(
+            initial,
+            "New task",
+            "Ask a follow-up",
+            1,
+            "failed next menu should stay attached to the composer",
+        )
         tmux_send(session, "Enter")
-        running = wait_for(session, "+- working", "failed-retry-running")
+        running = wait_for(session, "● working", "failed-retry-running")
         visible_running = capture_after_idle(session, "failed-retry-visible", visible_only=True)
-        if len(re.findall(r"^browser-use\b", visible_running, flags=re.MULTILINE)) > 1:
+        if visible_running.count("Browser Use cloud") > 1:
             raise AssertionError(
                 "retry should replace the failure view with one live running viewport\n\n"
                 + visible_running
@@ -442,7 +532,8 @@ def smoke_completed_plain_output(binary: Path) -> None:
         ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
         (ARTIFACT_DIR / "tui-terminal-smoke-completed-output.txt").write_text(result)
         assert_contains(result, "scroll check line 60", "completed result should print full plain transcript")
-        assert_contains(result, "+- source", "completed result should include source section")
+        assert_contains(result, "source", "completed result should include source section")
+        assert_not_contains(result, "+-", "completed result should use simple section labels")
         assert_no_ansi(result, "completed result should be selectable plain text")
     finally:
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -460,8 +551,9 @@ def main() -> int:
     binary = ROOT / "target" / "debug" / "but" if args.skip_build else build_binary()
     smoke_interactive_terminal(binary)
     smoke_history_selection_emits_native_transcript(binary)
-    smoke_tall_terminal_keeps_live_viewport_compact(binary)
+    smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
     smoke_completed_history_uses_native_scrollback(binary)
+    smoke_short_completed_history_has_live_preview(binary)
     smoke_main_resize_does_not_duplicate_transcript(binary)
     smoke_session_switch_clears_previous_transcript(binary)
     smoke_large_composer_input_is_batched(binary)

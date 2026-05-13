@@ -34,7 +34,6 @@ dump_screen running --seed-demo running --select-latest
 dump_screen cancelled --seed-demo cancelled --select-latest
 dump_screen browser --seed-demo done --select-latest --overlay browser
 dump_screen history --seed-demo done --select-latest --overlay history
-dump_screen actions --seed-demo done --select-latest --overlay actions
 dump_screen developer --seed-demo done --select-latest --overlay developer
 
 echo "== real terminal smoke =="
