@@ -61,15 +61,16 @@ pub(crate) fn exec_command(
     session: &SessionMeta,
     call: &ToolCall,
 ) -> Result<CommandToolResult> {
-    let cmd = call
+    let raw_cmd = call
         .arguments
         .get("cmd")
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    if cmd.is_empty() {
+    if raw_cmd.is_empty() {
         bail!("exec_command requires cmd");
     }
+    let cmd = rewrite_virtual_home_in_text(session, raw_cmd);
     let yield_time = yield_time(&call.arguments);
     let max_chars = max_output_chars(&call.arguments);
     let workdir = resolve_workdir(
@@ -118,8 +119,16 @@ pub(crate) fn exec_command(
 
     let process_id = format!("cmd_{}", &call.id.replace('-', "_"));
     let output = Arc::new(Mutex::new(Vec::new()));
-    let (process, readers, tty_allocated) =
-        spawn_process(&shell, login, cmd, &workdir, tty_requested, output.clone())?;
+    let forbid_local_cdp = virtual_home_for_cwd(Path::new(&session.cwd)).is_some();
+    let (process, readers, tty_allocated) = spawn_process(
+        &shell,
+        login,
+        &cmd,
+        &workdir,
+        tty_requested,
+        forbid_local_cdp,
+        output.clone(),
+    )?;
     let mut managed = ManagedCommand {
         session_id: session.id.clone(),
         process,
@@ -311,12 +320,13 @@ fn spawn_process(
     cmd: &str,
     workdir: &Path,
     tty_requested: bool,
+    forbid_local_cdp: bool,
     output: Arc<Mutex<Vec<OutputChunk>>>,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     if tty_requested {
-        return spawn_pty_process(shell, login, cmd, workdir, output);
+        return spawn_pty_process(shell, login, cmd, workdir, forbid_local_cdp, output);
     }
-    spawn_pipe_process(shell, login, cmd, workdir, output)
+    spawn_pipe_process(shell, login, cmd, workdir, forbid_local_cdp, output)
 }
 
 fn spawn_pipe_process(
@@ -324,6 +334,7 @@ fn spawn_pipe_process(
     login: bool,
     cmd: &str,
     workdir: &Path,
+    forbid_local_cdp: bool,
     output: Arc<Mutex<Vec<OutputChunk>>>,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     let mut command = Command::new(shell);
@@ -333,6 +344,9 @@ fn spawn_pipe_process(
         .stdin(Stdio::piped())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    if forbid_local_cdp {
+        apply_no_local_cdp_env(&mut command);
+    }
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn command via shell {} in {}", shell, workdir.display()))?;
@@ -352,6 +366,7 @@ fn spawn_pty_process(
     login: bool,
     cmd: &str,
     workdir: &Path,
+    forbid_local_cdp: bool,
     output: Arc<Mutex<Vec<OutputChunk>>>,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     let pty_system = native_pty_system();
@@ -366,6 +381,9 @@ fn spawn_pty_process(
     let mut command = CommandBuilder::new(shell);
     command.args(shell_args(shell, login, cmd));
     command.cwd(workdir.as_os_str());
+    if forbid_local_cdp {
+        apply_no_local_cdp_pty_env(&mut command);
+    }
     let child = pair.slave.spawn_command(command).with_context(|| {
         format!(
             "spawn pty command via shell {} in {}",
@@ -383,6 +401,25 @@ fn spawn_pty_process(
         readers,
         true,
     ))
+}
+
+fn apply_no_local_cdp_env(command: &mut Command) {
+    command
+        .env("BU_CDP_URL", "")
+        .env(
+            "BU_CDP_WS",
+            "ws://browser-use-cloud-required.invalid/devtools/browser/disabled",
+        )
+        .env("BU_BROWSER_ID", "");
+}
+
+fn apply_no_local_cdp_pty_env(command: &mut CommandBuilder) {
+    command.env("BU_CDP_URL", "");
+    command.env(
+        "BU_CDP_WS",
+        "ws://browser-use-cloud-required.invalid/devtools/browser/disabled",
+    );
+    command.env("BU_BROWSER_ID", "");
 }
 
 impl ManagedProcess {
@@ -607,6 +644,9 @@ fn resolve_workdir(session: &SessionMeta, workdir: Option<&str>) -> Result<PathB
     let Some(workdir) = workdir.filter(|value| !value.trim().is_empty()) else {
         return Ok(cwd.to_path_buf());
     };
+    if let Some(path) = resolve_virtual_home_path(cwd, workdir) {
+        return Ok(path);
+    }
     let path = Path::new(workdir);
     let resolved = if path.is_absolute() {
         path.to_path_buf()
@@ -614,6 +654,37 @@ fn resolve_workdir(session: &SessionMeta, workdir: Option<&str>) -> Result<PathB
         cwd.join(path)
     };
     Ok(resolved)
+}
+
+fn rewrite_virtual_home_in_text(session: &SessionMeta, value: &str) -> String {
+    let cwd = Path::new(&session.cwd);
+    let Some(home) = virtual_home_for_cwd(cwd) else {
+        return value.to_string();
+    };
+    value.replace("/home/user", &home.display().to_string())
+}
+
+fn resolve_virtual_home_path(cwd: &Path, raw: &str) -> Option<PathBuf> {
+    let suffix = raw.strip_prefix("/home/user")?;
+    let home = virtual_home_for_cwd(cwd)?;
+    let suffix = suffix.trim_start_matches('/');
+    if suffix.is_empty() {
+        Some(home)
+    } else {
+        Some(home.join(suffix))
+    }
+}
+
+fn virtual_home_for_cwd(cwd: &Path) -> Option<PathBuf> {
+    if cwd.file_name().and_then(|name| name.to_str()) != Some("cwd") {
+        return None;
+    }
+    let root = cwd.parent()?.to_path_buf();
+    if root.join("outputs").exists() {
+        Some(root)
+    } else {
+        None
+    }
 }
 
 fn default_shell() -> String {
@@ -646,6 +717,16 @@ mod tests {
         (store, session)
     }
 
+    fn virtual_home_session(tmp: &TempDir) -> (Store, SessionMeta, std::path::PathBuf) {
+        let store = Store::open(tmp.path().join("state")).expect("store");
+        let root = tmp.path().join("task-root");
+        let cwd = root.join("cwd");
+        std::fs::create_dir_all(root.join("outputs")).expect("outputs");
+        std::fs::create_dir_all(&cwd).expect("cwd");
+        let session = store.create_session(None, cwd).expect("session");
+        (store, session, root)
+    }
+
     #[test]
     fn exec_command_returns_completed_output() {
         let tmp = TempDir::new().expect("tmp");
@@ -667,6 +748,32 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "command.finished"));
+    }
+
+    #[test]
+    fn exec_command_maps_virtual_home_paths() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session, root) = virtual_home_session(&tmp);
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_virtual_home".to_string(),
+                name: "exec_command".to_string(),
+                arguments: json!({
+                    "cmd": "printf artifact > /home/user/outputs/result.txt",
+                    "workdir": "/home/user",
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("exec");
+
+        assert_eq!(result.content["running"], false);
+        assert_eq!(
+            std::fs::read_to_string(root.join("outputs/result.txt")).expect("result"),
+            "artifact"
+        );
     }
 
     #[test]

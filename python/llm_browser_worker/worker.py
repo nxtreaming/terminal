@@ -86,6 +86,32 @@ def _agent_workspace_path(cwd: Path) -> Path:
     return (cwd / ".browser-use" / "agent-workspace").expanduser()
 
 
+def _virtual_home_path(cwd: Path) -> Path | None:
+    if cwd.name == "cwd" and (cwd.parent / "outputs").exists():
+        return cwd.parent
+    raw = os.environ.get("LLM_BROWSER_VIRTUAL_HOME")
+    if raw:
+        return Path(raw).expanduser()
+    return None
+
+
+def _outputs_dir_path(cwd: Path) -> Path:
+    raw = os.environ.get("LLM_BROWSER_OUTPUTS_DIR")
+    if raw:
+        return Path(raw).expanduser()
+    home = _virtual_home_path(cwd)
+    if home is not None:
+        return home / "outputs"
+    return cwd / "outputs"
+
+
+def _rewrite_virtual_home_text(text: str) -> str:
+    raw = os.environ.get("LLM_BROWSER_VIRTUAL_HOME")
+    if not raw:
+        return text
+    return text.replace("/home/user", raw)
+
+
 def _pick_chromium_path() -> str:
     if path := os.environ.get("CHROME_PATH"):
         return path
@@ -169,6 +195,56 @@ def _free_port() -> int:
         return int(sock.getsockname()[1])
 
 
+def _managed_chrome_is_visible() -> bool:
+    return os.environ.get("LLM_BROWSER_MANAGED_CHROME_VISIBLE") == "1"
+
+
+def _should_start_managed_chrome() -> bool:
+    if os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS") or os.environ.get("BU_BROWSER_ID"):
+        return False
+    return (
+        _browser_mode() in {"headless", "headless-chromium"}
+        or os.environ.get("LLM_BROWSER_AUTO_CHROME") == "1"
+    )
+
+
+def _pick_managed_chrome_path(visible: bool) -> str:
+    if not visible:
+        return _pick_chromium_path()
+    if path := os.environ.get("CHROME_PATH"):
+        return path
+    google_chrome = Path("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome")
+    if google_chrome.exists():
+        return str(google_chrome)
+    return _pick_chromium_path()
+
+
+def _managed_chrome_args(chrome: str, port: int, profile: Path, visible: bool) -> list[str]:
+    args = [
+        chrome,
+        "--remote-debugging-address=127.0.0.1",
+        f"--remote-debugging-port={port}",
+        f"--user-data-dir={profile}",
+        "--no-first-run",
+        "--no-default-browser-check",
+    ]
+    if visible:
+        args.extend(["--new-window", "--window-size=1512,900"])
+    else:
+        args.append("--headless=new")
+    args.append("about:blank")
+    return args
+
+
+def _daemon_has_browser_connection(admin: Any) -> bool:
+    try:
+        name = os.environ.get("BU_NAME", "default")
+        connection = getattr(admin, "_daemon_browser_connection", lambda _name: None)(name)
+        return bool(connection and connection.get("page"))
+    except Exception:
+        return False
+
+
 def _cleanup_managed_chrome() -> None:
     global _managed_chrome, _managed_chrome_profile
     proc = _managed_chrome
@@ -185,31 +261,24 @@ def _cleanup_managed_chrome() -> None:
         _managed_chrome_profile = None
 
 
-def _ensure_managed_chrome() -> None:
+def _ensure_managed_chrome(admin: Any | None = None) -> None:
     global _managed_chrome, _managed_chrome_profile
-    if os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS") or os.environ.get("BU_BROWSER_ID"):
+    if not _should_start_managed_chrome():
         return
-    if _browser_mode() not in {"headless", "headless-chromium"} and os.environ.get("LLM_BROWSER_AUTO_CHROME") != "1":
+    if admin is not None and _daemon_has_browser_connection(admin):
         return
     if _managed_chrome is not None and _managed_chrome.poll() is None:
         return
 
     port = _free_port()
     profile = Path(tempfile.mkdtemp(prefix="but-managed-chrome."))
-    chrome = _pick_chromium_path()
+    visible = _managed_chrome_is_visible()
+    chrome = _pick_managed_chrome_path(visible)
     proc = subprocess.Popen(
-        [
-            chrome,
-            "--headless=new",
-            "--remote-debugging-address=127.0.0.1",
-            f"--remote-debugging-port={port}",
-            f"--user-data-dir={profile}",
-            "--no-first-run",
-            "--no-default-browser-check",
-            "about:blank",
-        ],
+        _managed_chrome_args(chrome, port, profile, visible),
         stdout=subprocess.DEVNULL,
         stderr=subprocess.DEVNULL,
+        start_new_session=visible,
     )
     deadline = time.time() + 20
     last_error: Exception | None = None
@@ -230,25 +299,72 @@ def _ensure_managed_chrome() -> None:
     _managed_chrome = proc
     _managed_chrome_profile = profile
     os.environ["BU_CDP_URL"] = f"http://127.0.0.1:{port}"
-    atexit.register(_cleanup_managed_chrome)
+    if not visible:
+        atexit.register(_cleanup_managed_chrome)
 
 
 def _ensure_cloud_browser(admin: Any) -> None:
     if _browser_mode() != "cloud":
         return
-    if os.environ.get("BU_CDP_URL") or os.environ.get("BU_CDP_WS") or os.environ.get("BU_BROWSER_ID"):
-        return
+    _clear_cloud_cdp_overrides()
     if not os.environ.get("BROWSER_USE_API_KEY"):
         raise RuntimeError("Browser Use cloud selected, but BROWSER_USE_API_KEY is not set")
     name = os.environ.get("BU_NAME", "default")
     if admin.daemon_alive(name):
-        return
+        if (
+            os.environ.get("LLM_BROWSER_OWN_REMOTE_DAEMON") == "1"
+            and os.environ.get("LLM_BROWSER_OWN_REMOTE_DAEMON_NAME") == name
+        ):
+            return
+        if _daemon_log_is_cloud(admin, name):
+            return
+        with contextlib.suppress(Exception):
+            admin.stop_remote_daemon(name)
+        if admin.daemon_alive(name):
+            raise RuntimeError(f"Browser Use cloud selected, but daemon {name!r} is not cloud-backed")
+    if os.environ.get("LLM_BROWSER_OPEN_CLOUD_LIVE_VIEW") != "1":
+        admin._show_live_url = lambda url: None
     browser = admin.start_remote_daemon(name=name)
     os.environ["LLM_BROWSER_OWN_REMOTE_DAEMON"] = "1"
     os.environ["LLM_BROWSER_OWN_REMOTE_DAEMON_NAME"] = name
     live_url = browser.get("liveUrl")
     if live_url:
         os.environ["LLM_BROWSER_LIVE_URL"] = str(live_url)
+
+
+def _clear_cloud_cdp_overrides() -> None:
+    for key in ("BU_CDP_URL", "BU_CDP_WS", "BU_BROWSER_ID"):
+        value = os.environ.get(key)
+        if not value:
+            continue
+        if key == "BU_BROWSER_ID" or _looks_like_local_cdp(value):
+            os.environ.pop(key, None)
+            continue
+        if key in {"BU_CDP_URL", "BU_CDP_WS"} and "browser-use.com" not in value:
+            raise RuntimeError(
+                f"Browser Use cloud selected, but {key} points outside Browser Use cloud: {value}"
+            )
+
+
+def _looks_like_local_cdp(value: str) -> bool:
+    lower = value.lower()
+    return (
+        "127.0.0.1" in lower
+        or "localhost" in lower
+        or lower.startswith("http://[::1]")
+        or lower.startswith("ws://[::1]")
+    )
+
+
+def _daemon_log_is_cloud(admin: Any, name: str) -> bool:
+    try:
+        log_path = admin.ipc.log_path(name)
+        text = Path(str(log_path)).read_text(errors="ignore")
+    except Exception:
+        return False
+    if "remote=local" in text or "ws://127.0.0.1" in text or "ws://localhost" in text:
+        return False
+    return "browser-use.com" in text or ("remote=" in text and "remote=local" not in text)
 
 
 def _shutdown_owned_cloud_browser() -> Dict[str, Any]:
@@ -272,14 +388,20 @@ def _load_browser_harness(ns: Dict[str, Any]) -> None:
     try:
         cwd = Path(str(ns.get("cwd") or ".")).expanduser()
         os.environ.setdefault("BH_AGENT_WORKSPACE", str(_agent_workspace_path(cwd)))
-        _ensure_managed_chrome()
         admin = importlib.import_module("browser_harness.admin")
+        _patch_browser_harness_admin(admin)
+        _ensure_managed_chrome(admin)
         _ensure_cloud_browser(admin)
         helpers = importlib.import_module("browser_harness.helpers")
         _patch_browser_harness_cdp(helpers, admin)
         names = getattr(helpers, "__all__", None) or [name for name in dir(helpers) if not name.startswith("_")]
         ns.update({name: getattr(helpers, name) for name in names})
-        ns["ensure_browser_connection"] = admin.ensure_daemon
+        def ensure_browser_connection() -> Any:
+            if _browser_mode() == "cloud":
+                return _ensure_cloud_browser(admin)
+            return admin.ensure_daemon()
+
+        ns["ensure_browser_connection"] = ensure_browser_connection
         ns["browser_daemon_alive"] = admin.daemon_alive
         ns["__browser_harness_helpers__"] = helpers
         ns["__browser_harness_admin__"] = admin
@@ -296,12 +418,39 @@ def _patch_browser_harness_cdp(helpers: Any, admin: Any) -> None:
     original_cdp = helpers.cdp
 
     def cdp_with_daemon(method: str, session_id: Any = None, **params: Any) -> Any:
-        admin.ensure_daemon()
+        if _browser_mode() == "cloud":
+            _ensure_cloud_browser(admin)
+        else:
+            admin.ensure_daemon()
         return original_cdp(method, session_id=session_id, **params)
 
     helpers.__llm_browser_original_cdp__ = original_cdp
     helpers.__llm_browser_cdp_patched__ = True
     helpers.cdp = cdp_with_daemon
+
+
+def _patch_browser_harness_admin(admin: Any) -> None:
+    if getattr(admin, "__llm_browser_admin_patched__", False):
+        return
+    original_ensure_daemon = admin.ensure_daemon
+
+    def ensure_daemon_cloud_guard(*args: Any, **kwargs: Any) -> Any:
+        env = kwargs.get("env")
+        if env is None and len(args) >= 3:
+            env = args[2]
+        if _browser_mode() == "cloud" and not (isinstance(env, dict) and env.get("BU_CDP_WS")):
+            name = kwargs.get("name") or os.environ.get("BU_NAME", "default")
+            _ensure_cloud_browser(admin)
+            if not _daemon_log_is_cloud(admin, str(name)):
+                raise RuntimeError(
+                    f"Browser Use cloud selected, but daemon {name!r} is not cloud-backed"
+                )
+            return None
+        return original_ensure_daemon(*args, **kwargs)
+
+    admin.__llm_browser_original_ensure_daemon__ = original_ensure_daemon
+    admin.__llm_browser_admin_patched__ = True
+    admin.ensure_daemon = ensure_daemon_cloud_guard
 
 
 def _emit_protocol_event(request_id: str, event: str, payload: Dict[str, Any]) -> None:
@@ -341,6 +490,10 @@ def _namespace(session_id: str, cwd: Path, artifact_dir: Path) -> Dict[str, Any]
         },
     )
     artifact_dir.mkdir(parents=True, exist_ok=True)
+    _outputs_dir_path(cwd).mkdir(parents=True, exist_ok=True)
+    workspace = _agent_workspace_path(cwd)
+    workspace.mkdir(parents=True, exist_ok=True)
+    (workspace / "agent_helpers.py").touch(exist_ok=True)
     ns["cwd"] = cwd
     ns["artifact_dir"] = artifact_dir
     ns["result"] = None
@@ -776,12 +929,26 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
     def artifact_root() -> str:
         return str(artifact_dir)
 
+    def outputs_dir() -> str:
+        path = _outputs_dir_path(Path(str(ns.get("cwd") or ".")))
+        path.mkdir(parents=True, exist_ok=True)
+        return str(path)
+
+    def virtual_home() -> str | None:
+        home = _virtual_home_path(Path(str(ns.get("cwd") or ".")))
+        return str(home) if home is not None else None
+
     def session_metadata() -> Dict[str, Any]:
+        cwd_path = Path(str(ns.get("cwd") or "."))
+        home = _virtual_home_path(cwd_path)
         return {
             "session_id": str(ns.get("session_id")),
             "cwd": str(ns.get("cwd")),
             "artifact_root": str(artifact_dir),
-            "agent_workspace": str(_agent_workspace_path(Path(str(ns.get("cwd") or ".")))),
+            "outputs_dir": str(_outputs_dir_path(cwd_path)),
+            "virtual_home": str(home) if home is not None else None,
+            "virtual_home_alias": "/home/user" if home is not None else None,
+            "agent_workspace": str(_agent_workspace_path(cwd_path)),
         }
 
     def agent_workspace(create: bool = True) -> str:
@@ -812,6 +979,8 @@ def _install_host_helpers(ns: Dict[str, Any], request_id: str, cancel_requested:
             "emit_browser_state": emit_browser_state,
             "check_cancel": check_cancel,
             "artifact_root": artifact_root,
+            "outputs_dir": outputs_dir,
+            "virtual_home": virtual_home,
             "session_metadata": session_metadata,
             "agent_workspace": agent_workspace,
             "load_agent_helpers": load_agent_helpers,
@@ -1027,7 +1196,7 @@ def _run(request: Dict[str, Any]) -> Dict[str, Any]:
     session_id = str(request.get("session_id") or "default")
     cwd = Path(str(request.get("cwd") or ".")).expanduser().resolve()
     artifact_dir = Path(str(request.get("artifact_dir") or cwd / "artifacts")).expanduser().resolve()
-    code = str(request.get("code") or "")
+    code = _rewrite_virtual_home_text(str(request.get("code") or ""))
     cancel_requested = bool(request.get("cancel_requested"))
     timeout_seconds = float(request.get("timeout_seconds") or 0)
     stdout = io.StringIO()

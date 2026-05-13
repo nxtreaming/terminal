@@ -288,9 +288,41 @@ impl App {
                 })
                 .collect::<Result<Vec<_>>>()?
         } else {
-            current_id
-                .map(|id| vec![(id.to_string(), current_events.clone())])
-                .unwrap_or_default()
+            let Some(id) = current_id else {
+                return Ok(project_workbench(
+                    &sessions,
+                    &current_events,
+                    &[],
+                    current_id,
+                    self.browser.clone(),
+                ));
+            };
+            let mut session_ids = vec![id.to_string()];
+            let mut index = 0;
+            while index < session_ids.len() {
+                let parent_id = session_ids[index].clone();
+                for session in sessions
+                    .iter()
+                    .filter(|session| session.parent_id.as_deref() == Some(parent_id.as_str()))
+                {
+                    if !session_ids.iter().any(|id| id == &session.id) {
+                        session_ids.push(session.id.clone());
+                    }
+                }
+                index += 1;
+            }
+            session_ids
+                .into_iter()
+                .map(|session_id| {
+                    if session_id == id {
+                        Ok((session_id, current_events.clone()))
+                    } else {
+                        self.store
+                            .events_for_session(&session_id)
+                            .map(|events| (session_id, events))
+                    }
+                })
+                .collect::<Result<Vec<_>>>()?
         };
         Ok(project_workbench(
             &sessions,
@@ -371,15 +403,6 @@ impl App {
                     &session.id,
                     "session.input",
                     serde_json::json!({ "text": text }),
-                )?;
-                self.store.append_event(
-                    &session.id,
-                    "browser.page",
-                    serde_json::json!({
-                        "url": "about:blank",
-                        "title": "Browser ready",
-                        "status": "connected",
-                    }),
                 )?;
                 self.selected_session_id = Some(session.id.clone());
                 self.native_history.reset_with_clear();
@@ -1535,6 +1558,10 @@ fn maybe_emit_native_transcript(
     };
 
     if !app.native_history.is_active_for(Some(&session.id)) {
+        if session.status.is_active() {
+            app.native_history.reset();
+            return Ok(());
+        }
         let events = app.store.events_for_session(&session.id)?;
         let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
         let lines = native_scrollback_lines(app, size.width)?;
@@ -1643,7 +1670,18 @@ fn seed_demo_if_requested(store: &Store, mode: Option<&str>) -> Result<()> {
         "browser.live_url",
         serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
     )?;
-    if mode == "done" || mode == "followup" {
+    if mode == "running" {
+        store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Reading the page and preparing the next browser action..."}),
+        )?;
+    } else if mode == "done" || mode == "followup" {
         store.append_event(
             &session.id,
             "session.done",
@@ -1885,10 +1923,17 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(running_session.id);
         let running_screen = render_dump(&mut app)?;
-        assert!(row_containing(&running_screen, "working") <= 2);
+        let header_row = running_screen
+            .lines()
+            .find(|line| line.contains("> run near the top"))
+            .unwrap_or_else(|| panic!("screen did not contain running header\n{running_screen}"));
+        assert!(!header_row.contains("working"));
+        let running_status_row = row_containing(&running_screen, "Working (");
+        assert!(running_screen.contains("esc to interrupt"));
         let running_composer_row = row_containing(&running_screen, "Type to steer the agent...");
+        assert_eq!(running_composer_row, running_status_row + 1);
         let running_activity_row = row_containing(&running_screen, "opened example.com");
-        assert!(running_composer_row.saturating_sub(running_activity_row) <= 5);
+        assert!(running_composer_row.saturating_sub(running_activity_row) <= 6);
 
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
@@ -1966,6 +2011,8 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         assert!(app.is_slash_palette_active());
         let screen = render_dump(&mut app)?;
+        let input_row = row_containing(&screen, "> /");
+        assert!(row_containing(&screen, "/task") > input_row);
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
@@ -1974,12 +2021,15 @@ mod redesign_tests {
         assert!(screen.contains("/laminar"));
         assert!(screen.contains("start a new task"));
         assert!(screen.contains("change browser backend"));
+        assert!(!screen.contains("tab history"));
         assert!(!screen.contains("Open browser"));
         assert!(!screen.contains("Reconnect browser"));
         for ch in "mo".chars() {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
         }
         let screen = render_dump(&mut app)?;
+        let input_row = row_containing(&screen, "> /mo");
+        assert!(row_containing(&screen, "/model") > input_row);
         assert!(screen.contains("/model"));
         assert!(!screen.contains("/browser"));
         Ok(())
@@ -2388,6 +2438,175 @@ mod redesign_tests {
         assert!(!text.contains("writing result"));
         assert!(!text.contains("using browser"));
         assert_eq!(text.matches("opened example.com/page-").count(), 14);
+        Ok(())
+    }
+
+    #[test]
+    fn model_waits_are_visible_as_thinking_activity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "wait on the model"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("thinking"));
+        assert!(screen.contains("waiting for GPT-5.5"));
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_model_text_is_visible_while_task_runs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "write as it streams"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Streaming draft answer"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("streaming"));
+        assert!(screen.contains("Streaming draft answer"));
+        Ok(())
+    }
+
+    #[test]
+    fn child_agent_progress_is_visible_in_parent_live_view() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "explain this repo"}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo-explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "agent.context",
+            serde_json::json!({"nickname": "repo-explorer", "role": "explorer"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer", "role": "explorer"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "file.read",
+            serde_json::json!({"path": "/repo/README.md"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Mapping the main crates."}),
+        )?;
+        app.selected_session_id = Some(parent.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("helpers"));
+        assert!(screen.contains("repo-explorer working"));
+        assert!(screen.contains("repo-explorer: read README.md"));
+        assert!(screen.contains("Mapping the main crates"));
+        Ok(())
+    }
+
+    #[test]
+    fn long_browser_urls_do_not_overrun_the_timeline_column() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "what do you see"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.state",
+            serde_json::json!({
+                "title": "Amazon Web Services Sign-In",
+                "tabs": 2,
+                "url": "https://signin.aws.amazon.com/signin?redirect_uri=https%3A%2F%2Faws.amazon.com%2Fmarketplace%2Fmanagement%2Fseller-settings%2Faccount%2Fcustom-notification-submitted%3F%26isauthcode%3Dtrue&client_id=arn%3Aaws%3Aiam%3A%3A015428540659%3Auser%2Fawsmp-contessa&forceMobileApp=0",
+            }),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("signin.aws.amazon.com/signin?..."));
+        assert!(!screen.contains("redirect_uri=https"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_scrollback_live_view_shows_tail_above_bottom_composer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 44;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "go say hi to aitor"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Hi Aitor - this is the short summary."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(session.id, last_seq);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("go say hi to aitor"));
+        assert!(screen.contains("Hi Aitor"));
+        assert!(screen.contains("Ask a follow-up"));
+        assert!(row_containing(&screen, "Ask a follow-up") >= 38);
+        assert!(
+            row_containing(&screen, "Ask a follow-up")
+                .saturating_sub(row_containing(&screen, "Hi Aitor"))
+                <= 8
+        );
         Ok(())
     }
 

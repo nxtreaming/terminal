@@ -80,6 +80,7 @@ pub struct AgentRunOptions {
     pub max_context_chars: usize,
     pub browser_mode: Option<String>,
     pub python_tool_timeout_seconds: u64,
+    pub python_env: Vec<(String, String)>,
 }
 
 impl Default for AgentRunOptions {
@@ -89,6 +90,7 @@ impl Default for AgentRunOptions {
             max_context_chars: 240_000,
             browser_mode: None,
             python_tool_timeout_seconds: 120,
+            python_env: Vec::new(),
         }
     }
 }
@@ -101,6 +103,11 @@ impl AgentRunOptions {
 
     pub fn with_python_tool_timeout_seconds(mut self, timeout_seconds: u64) -> Self {
         self.python_tool_timeout_seconds = timeout_seconds;
+        self
+    }
+
+    pub fn with_python_env(mut self, env: Vec<(String, String)>) -> Self {
+        self.python_env = env;
         self
     }
 }
@@ -453,7 +460,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         )?;
     }
     let result = (|| -> Result<String> {
-        let mut worker = PythonWorker::start_with_browser_mode(options.browser_mode.as_deref())?;
+        let mut worker = PythonWorker::start_with_browser_mode_and_env(
+            options.browser_mode.as_deref(),
+            options
+                .python_env
+                .iter()
+                .map(|(key, value)| (key.as_str(), value.as_str())),
+        )?;
         let run_result = (|| -> Result<String> {
             store.append_event(
                 &session.id,
@@ -716,8 +729,26 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
     let max_retries = provider_retry_budget(provider.provider_name());
     let mut attempt = 0_usize;
     loop {
-        match provider.start_turn(turn.clone()) {
-            Ok(events) => {
+        let mut events = Vec::new();
+        let mut streamed_text = String::new();
+        match provider.stream_turn(turn.clone(), &mut |event| {
+            if let ModelEvent::TextDelta { text } = &event {
+                if let Some(delta) = assistant_delta_to_append(&streamed_text, text) {
+                    record_model_stream_delta(
+                        store,
+                        session_id,
+                        provider,
+                        turn_idx,
+                        attempt + 1,
+                        &delta,
+                    )?;
+                    streamed_text.push_str(&delta);
+                }
+            }
+            events.push(event);
+            Ok(())
+        }) {
+            Ok(()) => {
                 record_model_turn_response(store, session_id, turn_idx, attempt + 1, &events)?;
                 return Ok(events);
             }
@@ -758,6 +789,31 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
             }
         }
     }
+}
+
+fn record_model_stream_delta<P: ModelProvider>(
+    store: &Store,
+    session_id: &str,
+    provider: &P,
+    turn_idx: usize,
+    attempt: usize,
+    text: &str,
+) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    store.append_event(
+        session_id,
+        "model.stream_delta",
+        serde_json::json!({
+            "turn_idx": turn_idx,
+            "attempt": attempt,
+            "provider": provider.provider_name(),
+            "model": provider.model_name(),
+            "text": text,
+        }),
+    )?;
+    Ok(())
 }
 
 fn provider_retry_budget(provider_name: &str) -> usize {
@@ -2169,7 +2225,20 @@ fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Va
         .and_then(|summary| summary.get("count"))
         .and_then(Value::as_u64)
         .unwrap_or(0);
-    count > 0 && looks_like_empty_structured_result(requested_result)
+    count > 0
+        && (looks_like_empty_structured_result(requested_result)
+            || looks_like_placeholder_done_result(requested_result))
+}
+
+fn looks_like_placeholder_done_result(result: &str) -> bool {
+    let trimmed = result.trim();
+    let normalized = trimmed
+        .trim_matches(|ch: char| ch == '.' || ch == '!' || ch.is_whitespace())
+        .to_ascii_lowercase();
+    matches!(
+        normalized.as_str(),
+        "done" | "complete" | "completed" | "finished"
+    )
 }
 
 fn looks_like_empty_structured_result(result: &str) -> bool {
@@ -3641,6 +3710,37 @@ mod tests {
     }
 
     #[test]
+    fn provider_loop_records_live_stream_deltas() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::TextDelta {
+                text: "live ".to_string(),
+            },
+            ModelEvent::TextDelta {
+                text: "live answer".to_string(),
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish with streaming text",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        let stream_text = events
+            .iter()
+            .filter(|event| event.event_type == "model.stream_delta")
+            .filter_map(|event| event.payload.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert_eq!(stream_text, "live answer");
+        Ok(())
+    }
+
+    #[test]
     fn provider_loop_respects_external_cancel_before_finalizing() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -4072,6 +4172,7 @@ mod tests {
                 max_context_chars: 500,
                 browser_mode: None,
                 python_tool_timeout_seconds: 120,
+                python_env: Vec::new(),
             },
         )?;
         let events = store.events_for_session(&session_id)?;
@@ -4407,6 +4508,7 @@ mod tests {
                 max_context_chars: 80_000,
                 browser_mode: None,
                 python_tool_timeout_seconds: 120,
+                python_env: Vec::new(),
             },
         )?;
         let events = store.events_for_session(&session_id)?;

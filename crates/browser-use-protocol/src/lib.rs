@@ -182,6 +182,7 @@ pub struct TranscriptTurn {
     pub prompt: String,
     pub is_followup: bool,
     pub activity: Vec<String>,
+    pub streaming_text: Option<String>,
     pub result: Option<String>,
     pub failure: Option<String>,
 }
@@ -237,6 +238,7 @@ pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
                 prompt: prompt.clone(),
                 is_followup: *is_followup,
                 activity: activity_from_events(segment),
+                streaming_text: turn_streaming_text_from_events(segment),
                 result: turn_result_from_events(segment),
                 failure: turn_failure_from_events(segment),
             }
@@ -318,6 +320,45 @@ pub fn turn_failure_from_events(events: &[EventRecord]) -> Option<String> {
 
 pub fn turn_result_from_events(events: &[EventRecord]) -> Option<String> {
     result_from_events(events)
+}
+
+pub fn turn_streaming_text_from_events(events: &[EventRecord]) -> Option<String> {
+    let mut text = String::new();
+    for event in events {
+        match event.event_type.as_str() {
+            "model.turn.request" | "model.turn.retry" | "model.turn.error" => {
+                text.clear();
+            }
+            "model.stream_delta" => {
+                if let Some(incoming) = event.payload.get("text").and_then(Value::as_str) {
+                    append_streaming_text_delta(&mut text, incoming);
+                }
+            }
+            _ => {}
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn append_streaming_text_delta(current: &mut String, incoming: &str) {
+    if incoming.is_empty() {
+        return;
+    }
+    if current.is_empty() {
+        current.push_str(incoming);
+        return;
+    }
+    if incoming == current || incoming.trim() == current.trim() {
+        return;
+    }
+    if let Some(suffix) = incoming.strip_prefix(current.as_str()) {
+        current.push_str(suffix);
+        return;
+    }
+    if incoming.chars().count() >= 24 && current.ends_with(incoming) {
+        return;
+    }
+    current.push_str(incoming);
 }
 
 pub fn failure_from_events(events: &[EventRecord]) -> Option<String> {
@@ -467,6 +508,15 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
                     push_activity(&mut activity, format!("browsing {}", compact_url(url)));
                 }
             }
+            "model.turn.request" => {
+                push_activity(&mut activity, model_turn_request_activity(&event.payload));
+            }
+            "model.turn.retry" => {
+                push_activity(&mut activity, model_turn_retry_activity(&event.payload));
+            }
+            "model.turn.error" => {
+                push_activity(&mut activity, model_turn_error_activity(&event.payload));
+            }
             "plan.updated" => push_activity(&mut activity, "updated plan"),
             "command.started" => {
                 if let Some(cmd) = event.payload.get("cmd").and_then(Value::as_str) {
@@ -545,6 +595,38 @@ fn push_activity(activity: &mut Vec<String>, item: impl Into<String>) {
     activity.push(item);
 }
 
+fn model_turn_request_activity(payload: &Value) -> String {
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or("model");
+    format!("thinking waiting for {model}")
+}
+
+fn model_turn_retry_activity(payload: &Value) -> String {
+    let attempt = payload.get("attempt").and_then(Value::as_u64);
+    let max_retries = payload.get("max_retries").and_then(Value::as_u64);
+    match (attempt, max_retries) {
+        (Some(attempt), Some(max_retries)) => {
+            format!("thinking retrying model request {attempt}/{max_retries}")
+        }
+        _ => "thinking retrying model request".to_string(),
+    }
+}
+
+fn model_turn_error_activity(payload: &Value) -> String {
+    let transient = payload
+        .get("transient")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if transient {
+        "thinking model request hit a transient error".to_string()
+    } else {
+        "thinking model request failed".to_string()
+    }
+}
+
 fn compact_path(path: &str) -> String {
     let trimmed = path.trim();
     trimmed
@@ -605,6 +687,116 @@ fn agent_started_text(payload: &Value) -> String {
     format!("started {label} helper")
 }
 
+fn activity_with_child_agents(
+    sessions: &[SessionMeta],
+    events_for_current: &[EventRecord],
+    all_events: &[(String, Vec<EventRecord>)],
+    selected_session_id: Option<&str>,
+) -> Vec<String> {
+    let mut activity = activity_from_events(events_for_current);
+    let Some(parent_id) = selected_session_id else {
+        return activity;
+    };
+    let mut child_activity = Vec::new();
+    for child in sessions
+        .iter()
+        .filter(|session| is_descendant_session(sessions, &session.id, parent_id))
+    {
+        let child_events = all_events
+            .iter()
+            .find(|(id, _)| id == &child.id)
+            .map(|(_, events)| events.as_slice())
+            .unwrap_or_default();
+        child_activity.extend(child_agent_activity(child, child_events));
+    }
+    if !child_activity.is_empty() {
+        activity.retain(|item| {
+            !matches!(
+                item.as_str(),
+                "helper finished" | "helper failed" | "helper stopped"
+            )
+        });
+    }
+    activity.extend(child_activity);
+    activity
+}
+
+fn is_descendant_session(sessions: &[SessionMeta], session_id: &str, parent_id: &str) -> bool {
+    let mut cursor = sessions
+        .iter()
+        .find(|session| session.id == session_id)
+        .and_then(|session| session.parent_id.as_deref());
+    while let Some(current_parent_id) = cursor {
+        if current_parent_id == parent_id {
+            return true;
+        }
+        cursor = sessions
+            .iter()
+            .find(|session| session.id == current_parent_id)
+            .and_then(|session| session.parent_id.as_deref());
+    }
+    false
+}
+
+fn child_agent_activity(child: &SessionMeta, child_events: &[EventRecord]) -> Vec<String> {
+    let label = child_agent_label(child, child_events);
+    let mut activity = Vec::new();
+    match child.status {
+        SessionStatus::Created | SessionStatus::Running => {
+            push_activity(&mut activity, format!("helper {label} working"));
+        }
+        SessionStatus::Done => push_activity(&mut activity, format!("helper {label} finished")),
+        SessionStatus::Failed => push_activity(&mut activity, format!("helper {label} failed")),
+        SessionStatus::Cancelled => push_activity(&mut activity, format!("helper {label} stopped")),
+    }
+
+    let mut recent = activity_from_events(child_events)
+        .into_iter()
+        .filter(|item| !item.starts_with("started "))
+        .collect::<Vec<_>>();
+    if recent.len() > 6 {
+        recent = recent.split_off(recent.len() - 6);
+    }
+    for item in recent {
+        push_activity(
+            &mut activity,
+            format!("helper {label}: {}", child_agent_activity_text(&item)),
+        );
+    }
+    if let Some(streaming_text) = turn_streaming_text_from_events(child_events) {
+        push_activity(
+            &mut activity,
+            format!(
+                "helper {label}: streaming {}",
+                truncate_activity(streaming_text.trim(), 96)
+            ),
+        );
+    }
+    activity
+}
+
+fn child_agent_label(child: &SessionMeta, child_events: &[EventRecord]) -> String {
+    child_events
+        .iter()
+        .find(|event| event.event_type == "agent.context")
+        .and_then(|event| {
+            event
+                .payload
+                .get("nickname")
+                .and_then(Value::as_str)
+                .or_else(|| event.payload.get("role").and_then(Value::as_str))
+                .or_else(|| event.payload.get("agent_path").and_then(Value::as_str))
+        })
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(|| compact_path(&child.id))
+}
+
+fn child_agent_activity_text(item: &str) -> String {
+    item.strip_prefix("thinking ").unwrap_or(item).to_string()
+}
+
 pub fn project_workbench(
     sessions: &[SessionMeta],
     events_for_current: &[EventRecord],
@@ -657,7 +849,12 @@ pub fn project_workbench(
         task: task_from_events(events_for_current),
         result,
         failure,
-        activity: activity_from_events(events_for_current),
+        activity: activity_with_child_agents(
+            sessions,
+            events_for_current,
+            all_events,
+            selected_session_id,
+        ),
         transcript: transcript_from_events(events_for_current),
         browser: browser_summary_from_events(events_for_current, browser_backend),
         telemetry: telemetry_summary_from_events(events_for_current),
@@ -734,6 +931,97 @@ mod tests {
                 "modified main.rs",
             ]
         );
+    }
+
+    #[test]
+    fn projects_child_agent_activity_into_parent_workbench() {
+        let sessions = vec![
+            SessionMeta {
+                id: "parent".to_string(),
+                parent_id: None,
+                cwd: "/repo".to_string(),
+                artifact_root: "/tmp/parent".to_string(),
+                status: SessionStatus::Running,
+                created_ms: 1,
+                updated_ms: 4,
+            },
+            SessionMeta {
+                id: "child".to_string(),
+                parent_id: Some("parent".to_string()),
+                cwd: "/repo".to_string(),
+                artifact_root: "/tmp/child".to_string(),
+                status: SessionStatus::Running,
+                created_ms: 2,
+                updated_ms: 4,
+            },
+        ];
+        let parent_events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "parent".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: json!({"text": "explain the repo"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "parent".to_string(),
+                ts_ms: 2,
+                event_type: "agent.spawned".to_string(),
+                payload: json!({"child_session_id": "child", "nickname": "repo-explorer", "role": "explorer"}),
+            },
+        ];
+        let child_events = vec![
+            EventRecord {
+                seq: 3,
+                id: "e3".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 3,
+                event_type: "agent.context".to_string(),
+                payload: json!({"nickname": "repo-explorer", "role": "explorer"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "e4".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 4,
+                event_type: "file.read".to_string(),
+                payload: json!({"path": "/repo/README.md"}),
+            },
+            EventRecord {
+                seq: 5,
+                id: "e5".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 5,
+                event_type: "model.stream_delta".to_string(),
+                payload: json!({"text": "I am mapping the crates now."}),
+            },
+        ];
+        let state = project_workbench(
+            &sessions,
+            &parent_events,
+            &[
+                ("parent".to_string(), parent_events.clone()),
+                ("child".to_string(), child_events),
+            ],
+            Some("parent"),
+            "local chrome",
+        );
+        assert!(state
+            .activity
+            .contains(&"started repo-explorer helper".to_string()));
+        assert!(state
+            .activity
+            .contains(&"helper repo-explorer working".to_string()));
+        assert!(state
+            .activity
+            .contains(&"helper repo-explorer: read README.md".to_string()));
+        assert!(state
+            .activity
+            .iter()
+            .any(|item| item.contains("mapping the crates")));
     }
 
     #[test]
@@ -822,6 +1110,114 @@ mod tests {
             payload: json!({"name": "python", "call_id": "call-1"}),
         }];
         assert!(activity_from_events(&events).is_empty());
+    }
+
+    #[test]
+    fn projects_model_waits_and_retries_as_activity() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 1,
+                event_type: "model.turn.request".to_string(),
+                payload: json!({"model": "GPT-5.5", "provider": "codex"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 2,
+                event_type: "model.turn.error".to_string(),
+                payload: json!({"transient": true, "error": "stream disconnected"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "e3".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 3,
+                event_type: "model.turn.retry".to_string(),
+                payload: json!({"attempt": 1, "max_retries": 5}),
+            },
+        ];
+
+        assert_eq!(
+            activity_from_events(&events),
+            vec![
+                "thinking waiting for GPT-5.5",
+                "thinking model request hit a transient error",
+                "thinking retrying model request 1/5",
+            ]
+        );
+    }
+
+    #[test]
+    fn projects_streaming_text_for_running_turn_and_resets_failed_attempts() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: json!({"text": "stream please"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 2,
+                event_type: "model.turn.request".to_string(),
+                payload: json!({"model": "GPT-5.5"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "e3".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 3,
+                event_type: "model.stream_delta".to_string(),
+                payload: json!({"text": "stale"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "e4".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 4,
+                event_type: "model.turn.error".to_string(),
+                payload: json!({"transient": true}),
+            },
+            EventRecord {
+                seq: 5,
+                id: "e5".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 5,
+                event_type: "model.turn.retry".to_string(),
+                payload: json!({"attempt": 1, "max_retries": 5}),
+            },
+            EventRecord {
+                seq: 6,
+                id: "e6".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 6,
+                event_type: "model.stream_delta".to_string(),
+                payload: json!({"text": "fresh "}),
+            },
+            EventRecord {
+                seq: 7,
+                id: "e7".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 7,
+                event_type: "model.stream_delta".to_string(),
+                payload: json!({"text": "fresh answer"}),
+            },
+        ];
+
+        let transcript = transcript_from_events(&events);
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(
+            transcript[0].streaming_text.as_deref(),
+            Some("fresh answer")
+        );
     }
 
     #[test]

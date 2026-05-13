@@ -764,11 +764,37 @@ fn optional_path(session: &SessionMeta, arguments: &Value, key: &str) -> Result<
 }
 
 fn resolve_path(cwd: &Path, raw: &str) -> PathBuf {
+    if let Some(path) = resolve_virtual_home_path(cwd, raw) {
+        return path;
+    }
     let path = Path::new(raw);
     if path.is_absolute() {
         path.to_path_buf()
     } else {
         cwd.join(path)
+    }
+}
+
+fn resolve_virtual_home_path(cwd: &Path, raw: &str) -> Option<PathBuf> {
+    let suffix = raw.strip_prefix("/home/user")?;
+    let home = virtual_home_for_cwd(cwd)?;
+    let suffix = suffix.trim_start_matches('/');
+    if suffix.is_empty() {
+        Some(home)
+    } else {
+        Some(home.join(suffix))
+    }
+}
+
+fn virtual_home_for_cwd(cwd: &Path) -> Option<PathBuf> {
+    if cwd.file_name().and_then(|name| name.to_str()) != Some("cwd") {
+        return None;
+    }
+    let root = cwd.parent()?.to_path_buf();
+    if root.join("outputs").exists() {
+        Some(root)
+    } else {
+        None
     }
 }
 
@@ -883,6 +909,16 @@ mod tests {
         (store, session)
     }
 
+    fn virtual_home_session(tmp: &TempDir) -> (Store, SessionMeta, PathBuf) {
+        let store = Store::open(tmp.path().join("state")).expect("store");
+        let root = tmp.path().join("task-root");
+        let cwd = root.join("cwd");
+        fs::create_dir_all(root.join("outputs")).expect("outputs");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let session = store.create_session(None, cwd).expect("session");
+        (store, session, root)
+    }
+
     #[test]
     fn read_file_returns_numbered_range() {
         let tmp = TempDir::new().expect("tmp");
@@ -942,6 +978,30 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "patch.file_changed"));
+    }
+
+    #[test]
+    fn apply_patch_maps_virtual_home_paths() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session, root) = virtual_home_session(&tmp);
+        let patch = r#"*** Begin Patch
+*** Add File: /home/user/outputs/result.txt
++artifact
+*** End Patch"#;
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_virtual_home".to_string(),
+                name: "apply_patch".to_string(),
+                arguments: json!({"patch": patch}),
+            },
+        )
+        .expect("patch");
+        assert_eq!(
+            fs::read_to_string(root.join("outputs/result.txt")).expect("result"),
+            "artifact\n"
+        );
     }
 
     #[test]

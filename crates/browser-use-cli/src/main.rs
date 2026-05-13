@@ -1,8 +1,9 @@
-use std::collections::{HashMap, HashSet};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc;
+use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -202,6 +203,10 @@ enum Command {
         stop_on_failure: bool,
         #[arg(long, default_value_t = 1)]
         max_attempts: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long)]
+        browser_mode: Option<String>,
     },
     DatasetRunOpenai {
         dataset: String,
@@ -227,6 +232,10 @@ enum Command {
         stop_on_failure: bool,
         #[arg(long, default_value_t = 2)]
         max_attempts: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long)]
+        browser_mode: Option<String>,
     },
     DatasetRunCodex {
         dataset: String,
@@ -252,6 +261,10 @@ enum Command {
         stop_on_failure: bool,
         #[arg(long, default_value_t = 2)]
         max_attempts: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long)]
+        browser_mode: Option<String>,
     },
     DatasetRunAnthropic {
         dataset: String,
@@ -277,6 +290,10 @@ enum Command {
         stop_on_failure: bool,
         #[arg(long, default_value_t = 2)]
         max_attempts: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long)]
+        browser_mode: Option<String>,
     },
     DatasetRunOpenrouter {
         dataset: String,
@@ -302,6 +319,10 @@ enum Command {
         stop_on_failure: bool,
         #[arg(long, default_value_t = 2)]
         max_attempts: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long)]
+        browser_mode: Option<String>,
     },
 }
 
@@ -392,14 +413,29 @@ struct DatasetRunOptions {
     skip_failed: bool,
     stop_on_failure: bool,
     max_attempts: usize,
+    concurrency: usize,
+    browser_mode: Option<String>,
 }
 
-#[derive(Clone, Copy, Debug)]
-struct DatasetProviderConfig<'a> {
-    provider: &'a str,
-    model: &'a str,
+#[derive(Clone, Debug)]
+struct DatasetProviderConfig {
+    provider: String,
+    model: String,
+    browser_mode: String,
     max_turns: usize,
     python_timeout_seconds: u64,
+}
+
+#[derive(Clone, Debug, Serialize)]
+struct DatasetTaskPaths {
+    root: PathBuf,
+    cwd: PathBuf,
+    outputs: PathBuf,
+    artifacts: PathBuf,
+    agent_workspace: PathBuf,
+    logs: PathBuf,
+    runtime: PathBuf,
+    tmp: PathBuf,
 }
 
 fn main() -> Result<()> {
@@ -473,6 +509,8 @@ fn main() -> Result<()> {
             skip_failed,
             stop_on_failure,
             max_attempts,
+            concurrency,
+            browser_mode,
         } => dataset_run_fake(
             &store,
             &dataset,
@@ -485,6 +523,8 @@ fn main() -> Result<()> {
                 skip_failed,
                 stop_on_failure,
                 max_attempts,
+                concurrency,
+                browser_mode,
             },
         ),
         Command::DatasetRunOpenai {
@@ -500,6 +540,8 @@ fn main() -> Result<()> {
             skip_failed,
             stop_on_failure,
             max_attempts,
+            concurrency,
+            browser_mode,
         } => dataset_run_openai(
             &store,
             &dataset,
@@ -512,6 +554,8 @@ fn main() -> Result<()> {
                 skip_failed,
                 stop_on_failure,
                 max_attempts,
+                concurrency,
+                browser_mode,
             },
             model,
             max_turns,
@@ -530,6 +574,8 @@ fn main() -> Result<()> {
             skip_failed,
             stop_on_failure,
             max_attempts,
+            concurrency,
+            browser_mode,
         } => dataset_run_codex(
             &store,
             &dataset,
@@ -542,6 +588,8 @@ fn main() -> Result<()> {
                 skip_failed,
                 stop_on_failure,
                 max_attempts,
+                concurrency,
+                browser_mode,
             },
             model,
             max_turns,
@@ -560,6 +608,8 @@ fn main() -> Result<()> {
             skip_failed,
             stop_on_failure,
             max_attempts,
+            concurrency,
+            browser_mode,
         } => dataset_run_anthropic(
             &store,
             &dataset,
@@ -572,6 +622,8 @@ fn main() -> Result<()> {
                 skip_failed,
                 stop_on_failure,
                 max_attempts,
+                concurrency,
+                browser_mode,
             },
             model,
             max_turns,
@@ -590,6 +642,8 @@ fn main() -> Result<()> {
             skip_failed,
             stop_on_failure,
             max_attempts,
+            concurrency,
+            browser_mode,
         } => dataset_run_openrouter(
             &store,
             &dataset,
@@ -602,6 +656,8 @@ fn main() -> Result<()> {
                 skip_failed,
                 stop_on_failure,
                 max_attempts,
+                concurrency,
+                browser_mode,
             },
             model,
             max_turns,
@@ -698,11 +754,15 @@ fn cli_browser_mode() -> String {
         .unwrap_or_else(|| "headless".to_string())
 }
 
-fn cli_agent_options_with(max_turns: usize, python_timeout_seconds: u64) -> AgentRunOptions {
-    let mut options = cli_agent_options();
-    options.max_turns = max_turns;
-    options.python_tool_timeout_seconds = python_timeout_seconds;
+fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
     options
+        .browser_mode
+        .as_deref()
+        .filter(|mode| !mode.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .unwrap_or_else(cli_browser_mode)
+        .to_ascii_lowercase()
+        .replace(['_', ' '], "-")
 }
 
 fn run_openai(store: &Store, text: String, model: String) -> Result<()> {
@@ -1873,6 +1933,8 @@ fn dataset_sample(dataset: &str, count: usize, task_ids: Vec<String>, all: bool)
             skip_failed: false,
             stop_on_failure: false,
             max_attempts: 1,
+            concurrency: 1,
+            browser_mode: None,
         },
     )?;
     let sample = selected
@@ -1894,14 +1956,16 @@ fn dataset_report(store: &Store, run_id_or_path: &str) -> Result<()> {
 
 fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) -> Result<()> {
     let provider = FakeProvider::with_text("Fake dataset case completed.");
+    let browser_mode = dataset_browser_mode(&options);
     dataset_run_provider(
         store,
         dataset,
         options,
         &provider,
         DatasetProviderConfig {
-            provider: "fake",
-            model: "fake",
+            provider: "fake".to_string(),
+            model: "fake".to_string(),
+            browser_mode,
             max_turns: 80,
             python_timeout_seconds: 120,
         },
@@ -1913,11 +1977,10 @@ fn create_dataset_session(
     run_id: &str,
     case: &DatasetCase,
     attempt: usize,
-) -> Result<String> {
-    let workspace = dataset_workspace_path(store, run_id, case, attempt);
-    std::fs::create_dir_all(&workspace)
-        .with_context(|| format!("create {}", workspace.display()))?;
-    let session = store.create_session(None, &workspace)?;
+) -> Result<(String, DatasetTaskPaths)> {
+    let paths = dataset_task_paths(store, run_id, case, attempt);
+    create_dataset_task_dirs(&paths)?;
+    let session = store.create_session_with_artifact_root(None, &paths.cwd, &paths.artifacts)?;
     let prompt = build_dataset_prompt(case);
     store.append_event(
         &session.id,
@@ -1932,10 +1995,14 @@ fn create_dataset_session(
             "path": case.path,
             "task_id": case.task_id,
             "attempt": attempt,
-            "workspace": workspace.display().to_string(),
+            "workspace": paths.cwd.display().to_string(),
+            "task_root": paths.root.display().to_string(),
+            "outputs": paths.outputs.display().to_string(),
+            "agent_workspace": paths.agent_workspace.display().to_string(),
+            "runtime": paths.runtime.display().to_string(),
         }),
     )?;
-    Ok(session.id)
+    Ok((session.id, paths))
 }
 
 fn dataset_run_openai(
@@ -1947,14 +2014,16 @@ fn dataset_run_openai(
     python_timeout_seconds: u64,
 ) -> Result<()> {
     let provider = openai_provider(store, model.clone())?;
+    let browser_mode = dataset_browser_mode(&options);
     dataset_run_provider(
         store,
         dataset,
         options,
         &provider,
         DatasetProviderConfig {
-            provider: "openai",
-            model: &model,
+            provider: "openai".to_string(),
+            model: model.clone(),
+            browser_mode,
             max_turns,
             python_timeout_seconds,
         },
@@ -1970,14 +2039,16 @@ fn dataset_run_codex(
     python_timeout_seconds: u64,
 ) -> Result<()> {
     let provider = codex_provider(store, model.clone())?;
+    let browser_mode = dataset_browser_mode(&options);
     dataset_run_provider(
         store,
         dataset,
         options,
         &provider,
         DatasetProviderConfig {
-            provider: "codex",
-            model: &model,
+            provider: "codex".to_string(),
+            model: model.clone(),
+            browser_mode,
             max_turns,
             python_timeout_seconds,
         },
@@ -1993,14 +2064,16 @@ fn dataset_run_anthropic(
     python_timeout_seconds: u64,
 ) -> Result<()> {
     let provider = anthropic_provider(store, model.clone())?;
+    let browser_mode = dataset_browser_mode(&options);
     dataset_run_provider(
         store,
         dataset,
         options,
         &provider,
         DatasetProviderConfig {
-            provider: "anthropic",
-            model: &model,
+            provider: "anthropic".to_string(),
+            model: model.clone(),
+            browser_mode,
             max_turns,
             python_timeout_seconds,
         },
@@ -2016,27 +2089,32 @@ fn dataset_run_openrouter(
     python_timeout_seconds: u64,
 ) -> Result<()> {
     let provider = openrouter_provider(store, model.clone())?;
+    let browser_mode = dataset_browser_mode(&options);
     dataset_run_provider(
         store,
         dataset,
         options,
         &provider,
         DatasetProviderConfig {
-            provider: "openrouter",
-            model: &model,
+            provider: "openrouter".to_string(),
+            model: model.clone(),
+            browser_mode,
             max_turns,
             python_timeout_seconds,
         },
     )
 }
 
-fn dataset_run_provider<P: ModelProvider>(
+fn dataset_run_provider<P>(
     store: &Store,
     dataset: &str,
     options: DatasetRunOptions,
     provider: &P,
-    config: DatasetProviderConfig<'_>,
-) -> Result<()> {
+    config: DatasetProviderConfig,
+) -> Result<()>
+where
+    P: ModelProvider + Clone + Send + Sync + 'static,
+{
     let all_cases = load_dataset_cases(dataset)?;
     let run_id = options
         .run_id
@@ -2057,7 +2135,7 @@ fn dataset_run_provider<P: ModelProvider>(
     let mut manifest = if resume_manifest {
         load_dataset_manifest(store, &run_id)?
     } else {
-        new_dataset_manifest(&run_id, dataset, &selected, config)
+        new_dataset_manifest(&run_id, dataset, &selected, &options, &config)
     };
     let skip_ids = if options.resume {
         resume_skip_ids(&manifest, options.skip_failed)
@@ -2066,27 +2144,88 @@ fn dataset_run_provider<P: ModelProvider>(
     };
     write_dataset_manifest(store, &run_id, &manifest)?;
 
-    for case in selected {
-        if skip_ids.contains(&case.task_id) {
-            println!("{}  skipped", case.task_id);
-            continue;
+    let selected = selected
+        .into_iter()
+        .filter(|case| {
+            if skip_ids.contains(&case.task_id) {
+                println!("{}  skipped", case.task_id);
+                false
+            } else {
+                true
+            }
+        })
+        .collect::<Vec<_>>();
+
+    let mut pending = VecDeque::from(selected);
+    let mut active = 0_usize;
+    let mut stop_launching = false;
+    let concurrency = options.concurrency.max(1);
+    let max_attempts = options.max_attempts.max(1);
+    let state_dir = store.state_dir().to_path_buf();
+    let (tx, rx) = mpsc::channel::<(String, Result<Value>)>();
+
+    while active > 0 || (!pending.is_empty() && !stop_launching) {
+        while active < concurrency && !pending.is_empty() && !stop_launching {
+            let case = pending.pop_front().expect("pending checked");
+            let task_id = case.task_id.clone();
+            let run_id = run_id.clone();
+            let config = config.clone();
+            let provider = provider.clone();
+            let state_dir = state_dir.clone();
+            let tx = tx.clone();
+            thread::spawn(move || {
+                let result =
+                    std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> Result<Value> {
+                        let store = Store::open(&state_dir)?;
+                        run_dataset_case_with_attempts(
+                            &store,
+                            &provider,
+                            &run_id,
+                            &case,
+                            config,
+                            max_attempts,
+                        )
+                    }))
+                    .unwrap_or_else(|panic| {
+                        Err(anyhow::anyhow!(
+                            "dataset worker panicked: {}",
+                            panic_payload_message(panic)
+                        ))
+                    });
+                let _ = tx.send((task_id, result));
+            });
+            active += 1;
         }
-        let result = run_dataset_case_with_attempts(
-            store,
-            provider,
-            &run_id,
-            &case,
-            config,
-            options.max_attempts.max(1),
-        )?;
+        if active == 0 {
+            break;
+        }
+        let (task_id, result) = rx.recv().context("dataset worker channel closed")?;
+        active -= 1;
+        let result = match result {
+            Ok(result) => result,
+            Err(error) => serde_json::json!({
+                "task_id": task_id,
+                "ok": false,
+                "error_type": "runner",
+                "error": format!("{error:#}"),
+            }),
+        };
         let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
         manifest_sessions_mut(&mut manifest)?.push(result);
         manifest["summary"] = summarize_dataset_manifest(&manifest);
         write_dataset_manifest(store, &run_id, &manifest)?;
         if options.stop_on_failure && !ok {
-            println!("{}", serde_json::to_string_pretty(&manifest)?);
-            bail!("dataset task {} failed", case.task_id);
+            stop_launching = true;
+            pending.clear();
         }
+    }
+
+    for case in pending {
+        if skip_ids.contains(&case.task_id) {
+            println!("{}  skipped", case.task_id);
+            continue;
+        }
+        println!("{}  pending", case.task_id);
     }
 
     manifest["summary"] = summarize_dataset_manifest(&manifest);
@@ -2103,13 +2242,13 @@ fn run_dataset_case_with_attempts<P: ModelProvider>(
     provider: &P,
     run_id: &str,
     case: &DatasetCase,
-    config: DatasetProviderConfig<'_>,
+    config: DatasetProviderConfig,
     max_attempts: usize,
 ) -> Result<Value> {
     let mut retry_history = Vec::new();
     for attempt in 1..=max_attempts {
         let mut result =
-            run_dataset_case_with_provider(store, provider, run_id, case, config, attempt)?;
+            run_dataset_case_with_provider(store, provider, run_id, case, config.clone(), attempt)?;
         let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
         if ok {
             if !retry_history.is_empty() {
@@ -2139,20 +2278,22 @@ fn run_dataset_case_with_provider<P: ModelProvider>(
     provider: &P,
     run_id: &str,
     case: &DatasetCase,
-    config: DatasetProviderConfig<'_>,
+    config: DatasetProviderConfig,
     attempt: usize,
 ) -> Result<Value> {
-    let session_id = create_dataset_session(store, run_id, case, attempt)?;
+    let (session_id, paths) = create_dataset_session(store, run_id, case, attempt)?;
     println!("{}  {}", case.task_id, session_id);
     io::stdout().flush()?;
-    let run_error = run_existing_session_with_provider(
-        store,
-        provider,
-        &session_id,
-        cli_agent_options_with(config.max_turns, config.python_timeout_seconds),
-    )
-    .err()
-    .map(|error| format!("{error:#}"));
+    let agent_options = AgentRunOptions {
+        max_turns: config.max_turns,
+        max_context_chars: AgentRunOptions::default().max_context_chars,
+        browser_mode: Some(config.browser_mode.clone()),
+        python_tool_timeout_seconds: config.python_timeout_seconds,
+        python_env: dataset_python_env(run_id, case, attempt, &paths, &config),
+    };
+    let run_error = run_existing_session_with_provider(store, provider, &session_id, agent_options)
+        .err()
+        .map(|error| format!("{error:#}"));
     dataset_attempt_result(store, case, &session_id, config, attempt, run_error)
 }
 
@@ -2160,7 +2301,7 @@ fn dataset_attempt_result(
     store: &Store,
     case: &DatasetCase,
     session_id: &str,
-    config: DatasetProviderConfig<'_>,
+    config: DatasetProviderConfig,
     attempt: usize,
     run_error: Option<String>,
 ) -> Result<Value> {
@@ -2364,7 +2505,8 @@ fn new_dataset_manifest(
     run_id: &str,
     dataset: &str,
     cases: &[DatasetCase],
-    config: DatasetProviderConfig<'_>,
+    options: &DatasetRunOptions,
+    config: &DatasetProviderConfig,
 ) -> Value {
     let mut datasets = HashMap::<String, usize>::new();
     for case in cases {
@@ -2376,8 +2518,12 @@ fn new_dataset_manifest(
         "created_ms": now_ms(),
         "provider": config.provider,
         "model": config.model,
-        "headless": cli_browser_mode() != "cloud",
-        "browser": cli_browser_mode(),
+        "concurrency": options.concurrency.max(1),
+        "max_attempts": options.max_attempts.max(1),
+        "max_turns": config.max_turns,
+        "python_timeout_seconds": config.python_timeout_seconds,
+        "headless": config.browser_mode != "cloud",
+        "browser": config.browser_mode,
         "selection": cases.iter().map(dataset_case_manifest).collect::<Vec<_>>(),
         "summary": {
             "count": cases.len(),
@@ -2415,21 +2561,112 @@ fn dataset_manifest_path(store: &Store, run_id: &str) -> PathBuf {
         .join(format!("{run_id}.json"))
 }
 
-fn dataset_workspace_path(
+fn dataset_run_files_path(store: &Store, run_id: &str) -> PathBuf {
+    store
+        .state_dir()
+        .join("dataset-run-files")
+        .join(safe_path_segment(run_id))
+}
+
+fn dataset_task_paths(
     store: &Store,
     run_id: &str,
     case: &DatasetCase,
     attempt: usize,
-) -> PathBuf {
-    store
-        .state_dir()
-        .join("dataset-workspaces")
-        .join(safe_path_segment(run_id))
+) -> DatasetTaskPaths {
+    let root = dataset_run_files_path(store, run_id).join(format!(
+        "task-{}-attempt-{}",
+        safe_path_segment(&case.task_id),
+        attempt
+    ));
+    let runtime_base = PathBuf::from("/tmp")
+        .join("lbe")
+        .join(stable_short_hash(run_id, 12))
         .join(format!(
-            "{}-attempt-{}",
-            safe_path_segment(&case.task_id),
+            "t{}a{}",
+            stable_short_hash(&case.task_id, 10),
             attempt
-        ))
+        ));
+    DatasetTaskPaths {
+        cwd: root.join("cwd"),
+        outputs: root.join("outputs"),
+        artifacts: root.join("artifacts"),
+        agent_workspace: root.join("agent-workspace"),
+        logs: root.join("logs"),
+        runtime: runtime_base.join("r"),
+        tmp: root.join("tmp"),
+        root,
+    }
+}
+
+fn create_dataset_task_dirs(paths: &DatasetTaskPaths) -> Result<()> {
+    for path in [
+        &paths.root,
+        &paths.cwd,
+        &paths.outputs,
+        &paths.artifacts,
+        &paths.agent_workspace,
+        &paths.logs,
+        &paths.runtime,
+        &paths.tmp,
+    ] {
+        std::fs::create_dir_all(path).with_context(|| format!("create {}", path.display()))?;
+    }
+    let helper = paths.agent_workspace.join("agent_helpers.py");
+    if !helper.exists() {
+        std::fs::write(&helper, "").with_context(|| format!("write {}", helper.display()))?;
+    }
+    Ok(())
+}
+
+fn dataset_python_env(
+    run_id: &str,
+    case: &DatasetCase,
+    attempt: usize,
+    paths: &DatasetTaskPaths,
+    config: &DatasetProviderConfig,
+) -> Vec<(String, String)> {
+    let task_name = format!(
+        "bu{}{}a{}",
+        stable_short_hash(run_id, 8),
+        stable_short_hash(&case.task_id, 8),
+        attempt
+    );
+    let mut env = vec![
+        ("BU_NAME".to_string(), task_name),
+        (
+            "BH_RUNTIME_DIR".to_string(),
+            paths.runtime.display().to_string(),
+        ),
+        ("BH_TMP_DIR".to_string(), paths.tmp.display().to_string()),
+        (
+            "BH_AGENT_WORKSPACE".to_string(),
+            paths.agent_workspace.display().to_string(),
+        ),
+        (
+            "LLM_BROWSER_VIRTUAL_HOME".to_string(),
+            paths.root.display().to_string(),
+        ),
+        (
+            "LLM_BROWSER_OUTPUTS_DIR".to_string(),
+            paths.outputs.display().to_string(),
+        ),
+        (
+            "LLM_BROWSER_BROWSER_MODE".to_string(),
+            config.browser_mode.clone(),
+        ),
+        (
+            "LLM_BROWSER_OPEN_CLOUD_LIVE_VIEW".to_string(),
+            "0".to_string(),
+        ),
+    ];
+    if config.browser_mode == "cloud" {
+        env.push(("LLM_BROWSER_AUTO_CHROME".to_string(), "0".to_string()));
+        env.push(("BU_CDP_URL".to_string(), "".to_string()));
+        env.push(("BU_CDP_WS".to_string(), "".to_string()));
+        env.push(("BU_BROWSER_ID".to_string(), "".to_string()));
+    }
+    env
 }
 
 fn safe_path_segment(value: &str) -> String {
@@ -2449,6 +2686,26 @@ fn safe_path_segment(value: &str) -> String {
         safe.push_str("case");
     }
     safe
+}
+
+fn stable_short_hash(value: &str, len: usize) -> String {
+    let mut hash = 0xcbf29ce484222325_u64;
+    for byte in value.as_bytes() {
+        hash ^= u64::from(*byte);
+        hash = hash.wrapping_mul(0x100000001b3);
+    }
+    let hex = format!("{hash:016x}");
+    hex.chars().take(len.min(hex.len())).collect()
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_string()
 }
 
 fn load_dataset_manifest(store: &Store, run_id_or_path: &str) -> Result<Value> {

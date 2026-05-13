@@ -351,12 +351,12 @@ fn render_main(
     state: &WorkbenchState,
     product_state: ProductState,
 ) {
-    let bottom_h = main_bottom_height_for(app, state, app.surface, area);
+    let bottom_h = main_bottom_height_for(app, state, app.surface, area, product_state);
     let body_width = area.width;
     let body = if app.surface.is_bottom_pane() {
         Vec::new()
     } else if app.native_scrollback_is_active() {
-        native_replay_live_lines(app, state, product_state, body_width)
+        Vec::new()
     } else {
         match product_state {
             ProductState::SetupNeeded => setup_lines(app),
@@ -367,7 +367,16 @@ fn render_main(
             | ProductState::Cancelled => work_lines(state, app, body_width, product_state),
         }
     };
-    let (body_area, bottom_area, footer_area) = main_layout_areas(area, bottom_h, body.len());
+    let show_footer = !(app.is_slash_palette_active() && !app.surface.is_bottom_pane());
+    let pin_bottom =
+        app.native_scrollback_is_active() && matches!(product_state, ProductState::Result);
+    let (body_area, bottom_area, footer_area) =
+        main_layout_areas(area, bottom_h, body.len(), show_footer, pin_bottom);
+    let body = if app.native_scrollback_is_active() && !app.surface.is_bottom_pane() {
+        native_replay_live_lines(app, state, product_state, body_width, body_area.height)
+    } else {
+        body
+    };
     frame.render_widget(
         Paragraph::new(body)
             .style(Style::default().fg(text()))
@@ -379,17 +388,27 @@ fn render_main(
     } else {
         render_composer(frame, bottom_area, app, state, product_state);
     }
-    render_footer(frame, footer_area, app, state, product_state);
+    if show_footer {
+        render_footer(frame, footer_area, app, state, product_state);
+    }
 }
 
-fn main_layout_areas(area: Rect, bottom_h: u16, body_len: usize) -> (Rect, Rect, Rect) {
-    let footer_h = u16::from(area.height > bottom_h);
+fn main_layout_areas(
+    area: Rect,
+    bottom_h: u16,
+    body_len: usize,
+    show_footer: bool,
+    pin_bottom: bool,
+) -> (Rect, Rect, Rect) {
+    let footer_h = u16::from(show_footer && area.height > bottom_h);
     let max_body_h = area
         .height
         .saturating_sub(bottom_h)
         .saturating_sub(footer_h);
     let body_h = if max_body_h == 0 {
         0
+    } else if pin_bottom {
+        max_body_h
     } else {
         (body_len as u16).clamp(1, max_body_h)
     };
@@ -405,9 +424,15 @@ fn main_layout_areas(area: Rect, bottom_h: u16, body_len: usize) -> (Rect, Rect,
     (chunks[0], chunks[1], chunks[2])
 }
 
-fn main_bottom_height_for(app: &App, state: &WorkbenchState, surface: Surface, area: Rect) -> u16 {
+fn main_bottom_height_for(
+    app: &App,
+    state: &WorkbenchState,
+    surface: Surface,
+    area: Rect,
+    product_state: ProductState,
+) -> u16 {
     if !surface.is_bottom_pane() {
-        return composer_pane_height(app, area.width);
+        return composer_pane_height(app, product_state, area.width);
     }
     let line_count = surface_lines(surface, app, state).len() as u16;
     let max_height = match surface {
@@ -420,7 +445,22 @@ fn main_bottom_height_for(app: &App, state: &WorkbenchState, surface: Surface, a
     desired.min(available)
 }
 
-fn composer_pane_height(app: &App, width: u16) -> u16 {
+fn composer_pane_height(app: &App, product_state: ProductState, width: u16) -> u16 {
+    let visual_input_lines = composer_visual_input_lines(app, width);
+    let palette_h = slash_palette_pane_height(app);
+    let live_status_h = u16::from(composer_live_status_visible(product_state));
+    if palette_h > 0 {
+        visual_input_lines + palette_h + live_status_h + 1
+    } else {
+        visual_input_lines + live_status_h + 3
+    }
+}
+
+fn composer_live_status_visible(product_state: ProductState) -> bool {
+    matches!(product_state, ProductState::Running)
+}
+
+fn composer_visual_input_lines(app: &App, width: u16) -> u16 {
     let input_width = width.saturating_sub(4).max(1) as usize;
     let visual_input_lines = if app.composer.input().is_empty() {
         1
@@ -435,8 +475,7 @@ fn composer_pane_height(app: &App, width: u16) -> u16 {
             .map(|lines| lines.max(1))
             .sum::<usize>()
     };
-    let palette_h = slash_palette_pane_height(app);
-    visual_input_lines.clamp(1, 10) as u16 + 3 + palette_h
+    visual_input_lines.clamp(1, 10) as u16
 }
 
 fn slash_palette_pane_height(app: &App) -> u16 {
@@ -497,8 +536,9 @@ fn native_replay_live_lines(
     state: &WorkbenchState,
     product_state: ProductState,
     width: u16,
+    height: u16,
 ) -> Vec<Line<'static>> {
-    match product_state {
+    let lines = match product_state {
         ProductState::Running => {
             let mut lines = Vec::new();
             append_ascii_text_block(
@@ -507,6 +547,10 @@ fn native_replay_live_lines(
                 &[format!("{} running browser task", spinner_frame())],
                 Some("live"),
             );
+            if let Some(streaming_text) = current_streaming_text(state) {
+                lines.push(Line::from(""));
+                append_streaming_block(&mut lines, streaming_text, width);
+            }
             lines
         }
         ProductState::Failed => {
@@ -555,10 +599,29 @@ fn native_replay_live_lines(
             );
             lines
         }
-        ProductState::Result => result_preview_lines(state, width),
+        ProductState::Result => native_plain_transcript_lines(state, width, product_state),
         ProductState::Ready => Vec::new(),
         ProductState::SetupNeeded => setup_lines(app),
+    };
+    if matches!(product_state, ProductState::Result) {
+        bottom_aligned_tail_lines(lines, height)
+    } else {
+        lines
     }
+}
+
+fn bottom_aligned_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
+    let height = height as usize;
+    if height == 0 {
+        return Vec::new();
+    }
+    if lines.len() > height {
+        lines = lines.split_off(lines.len() - height);
+    }
+    let mut out = Vec::with_capacity(height);
+    out.extend(std::iter::repeat_with(|| Line::from("")).take(height.saturating_sub(lines.len())));
+    out.extend(lines);
+    out
 }
 
 fn render_surface(
@@ -694,11 +757,52 @@ fn render_composer(
         return;
     }
     let palette_h = slash_palette_pane_height(app);
+    let live_status_h = u16::from(composer_live_status_visible(product_state));
+    if palette_h > 0 {
+        let input_h = composer_visual_input_lines(app, area.width);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(1),
+                Constraint::Length(live_status_h),
+                Constraint::Length(input_h),
+                Constraint::Length(palette_h),
+            ])
+            .split(area);
+        frame.render_widget(
+            Paragraph::new(composer_rule(chunks[0].width)).style(dim()),
+            chunks[0],
+        );
+        if live_status_h > 0 {
+            let live_status_area = chunks[1].inner(Margin {
+                vertical: 0,
+                horizontal: 2,
+            });
+            frame.render_widget(
+                Paragraph::new(composer_live_status_line(state, product_state)),
+                live_status_area,
+            );
+        }
+        let input_area = chunks[2].inner(Margin {
+            vertical: 0,
+            horizontal: 2,
+        });
+        render_composer_input(frame, input_area, app, state.current_session.as_ref());
+        let palette_area = chunks[3].inner(Margin {
+            vertical: 0,
+            horizontal: 2,
+        });
+        frame.render_widget(
+            Paragraph::new(slash_palette_lines(app, palette_area.width as usize)),
+            palette_area,
+        );
+        return;
+    }
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(palette_h),
+            Constraint::Length(live_status_h),
             Constraint::Min(1),
             Constraint::Length(1),
             Constraint::Length(1),
@@ -708,14 +812,14 @@ fn render_composer(
         Paragraph::new(composer_rule(chunks[0].width)).style(dim()),
         chunks[0],
     );
-    if palette_h > 0 {
-        let palette_area = chunks[1].inner(Margin {
+    if live_status_h > 0 {
+        let live_status_area = chunks[1].inner(Margin {
             vertical: 0,
             horizontal: 2,
         });
         frame.render_widget(
-            Paragraph::new(slash_palette_lines(app, palette_area.width as usize)),
-            palette_area,
+            Paragraph::new(composer_live_status_line(state, product_state)),
+            live_status_area,
         );
     }
     let input_area = chunks[2].inner(Margin {
@@ -847,6 +951,16 @@ fn render_footer(
     );
 }
 
+fn composer_live_status_line(state: &WorkbenchState, product_state: ProductState) -> Line<'static> {
+    let elapsed = elapsed_label(state, product_state).unwrap_or_else(|| "0s".to_string());
+    Line::from(vec![
+        Span::styled("•", running()),
+        Span::raw(" "),
+        Span::styled("Working", bold()),
+        Span::styled(format!(" ({elapsed} · esc to interrupt)"), muted()),
+    ])
+}
+
 fn composer_status_line(
     app: &App,
     state: &WorkbenchState,
@@ -856,12 +970,16 @@ fn composer_status_line(
     let mode = match product_state {
         ProductState::SetupNeeded => "Setup",
         ProductState::Ready => "Build",
-        ProductState::Running => "Working",
+        ProductState::Running => "",
         ProductState::Result => "Done",
         ProductState::Failed => "Failed",
         ProductState::Cancelled => "Stopped",
     };
-    let left = format!("{mode}  {}  {}", app.model, app.account);
+    let left = if mode.is_empty() {
+        format!("{}  {}", app.model, app.account)
+    } else {
+        format!("{mode}  {}  {}", app.model, app.account)
+    };
     let mut right = browser_ready_label(app, state);
     let width = width as usize;
     let left_len = left.chars().count();
@@ -1274,7 +1392,9 @@ fn work_lines(
     let tile = browser_tile_lines(&state.browser, tile_w);
     out.extend(zip_columns(timeline, tile, left_w, gap));
     if let Some(block) = outcome_lines(state, product_state, width as usize) {
-        out.push(Line::from(""));
+        if !running_streaming_preview_is_outcome(state, product_state) {
+            out.push(Line::from(""));
+        }
         out.extend(block);
     }
     if let Some(next) = next_action_lines(state, app, product_state) {
@@ -1321,15 +1441,17 @@ fn work_header_lines(
         .or(state.task.as_deref())
         .unwrap_or("browser task")
         .to_string();
-    let (glyph, glyph_style, label) = state_pill(product_state);
-    let elapsed = elapsed_label(state, product_state);
-    let mut right_parts: Vec<(String, Style)> = vec![
-        (glyph.to_string(), glyph_style),
-        (" ".to_string(), muted()),
-        (label.to_string(), glyph_style),
-    ];
-    if let Some(elapsed) = elapsed {
-        right_parts.push((format!(" · {elapsed}"), muted()));
+    let mut right_parts: Vec<(String, Style)> = Vec::new();
+    if !matches!(product_state, ProductState::Running) {
+        let (glyph, glyph_style, label) = state_pill(product_state);
+        right_parts.extend([
+            (glyph.to_string(), glyph_style),
+            (" ".to_string(), muted()),
+            (label.to_string(), glyph_style),
+        ]);
+        if let Some(elapsed) = elapsed_label(state, product_state) {
+            right_parts.push((format!(" · {elapsed}"), muted()));
+        }
     }
     let right_len: usize = right_parts.iter().map(|(s, _)| s.chars().count()).sum();
     let max_task = width.saturating_sub(right_len + 4).max(10);
@@ -1404,9 +1526,14 @@ fn zip_columns(
 fn timeline_lines(
     state: &WorkbenchState,
     product_state: ProductState,
-    _w: usize,
+    w: usize,
 ) -> Vec<Line<'static>> {
-    let groups = group_activity_for_timeline(&state.activity);
+    let activity = visible_activity(
+        &state.activity,
+        product_state == ProductState::Running,
+        true,
+    );
+    let groups = group_activity_for_timeline(&activity);
     let mut out = Vec::new();
     let mut n: usize = 0;
     for (label, items) in groups {
@@ -1418,9 +1545,10 @@ fn timeline_lines(
             Span::raw(" "),
             Span::styled(format!("{n:02}"), muted()),
             Span::raw("  "),
-            Span::styled(label.to_string(), bold()),
+            Span::styled(truncate(label, w.saturating_sub(5)), bold()),
         ]));
         for item in items {
+            let item = truncate(&item, w.saturating_sub(5).max(8));
             out.push(Line::from(vec![
                 Span::raw("     "),
                 Span::styled(item, text_style()),
@@ -1440,7 +1568,7 @@ fn timeline_lines(
             Span::raw(" "),
             Span::styled("··", muted()),
             Span::raw("  "),
-            Span::styled(text, style),
+            Span::styled(truncate(&text, w.saturating_sub(5).max(8)), style),
         ]));
     } else if out
         .last()
@@ -1453,6 +1581,8 @@ fn timeline_lines(
 
 fn group_activity_for_timeline(activity: &[String]) -> Vec<(&'static str, Vec<String>)> {
     let mut browser = Vec::new();
+    let mut thinking = Vec::new();
+    let mut helpers = Vec::new();
     let mut explored = Vec::new();
     let mut ran = Vec::new();
     let mut changed = Vec::new();
@@ -1461,6 +1591,10 @@ fn group_activity_for_timeline(activity: &[String]) -> Vec<(&'static str, Vec<St
         let formatted = format_activity_item(item);
         if is_browser_activity(item) {
             browser.push(formatted);
+        } else if is_thinking_activity(item) {
+            thinking.push(formatted);
+        } else if is_helper_activity(item) {
+            helpers.push(formatted);
         } else if is_command_activity(item) {
             ran.push(formatted);
         } else if is_change_activity(item) {
@@ -1473,6 +1607,8 @@ fn group_activity_for_timeline(activity: &[String]) -> Vec<(&'static str, Vec<St
     }
     vec![
         ("browser", browser),
+        ("thinking", thinking),
+        ("helpers", helpers),
         ("explored", explored),
         ("ran", ran),
         ("changed", changed),
@@ -1568,27 +1704,72 @@ fn outcome_lines(
             ]),
         ]);
     }
-    let result = state
+    if let Some(result) = state
         .transcript
         .last()
         .and_then(|turn| turn.result.as_deref())
-        .or(state.result.as_deref())?;
-    let mut out = result_collapsed_lines(result, width);
-    if let Some(source) = state
-        .browser
-        .url
-        .as_ref()
-        .or(state.browser.live_url.as_ref())
-        .filter(|u| !u.is_empty())
+        .or(state.result.as_deref())
     {
-        out.push(Line::from(""));
-        out.push(Line::from(Span::styled("source", muted())));
-        out.push(Line::from(vec![
-            Span::raw("  "),
-            Span::styled(source.clone(), link()),
-        ]));
+        let mut out = result_collapsed_lines(result, width);
+        if let Some(source) = state
+            .browser
+            .url
+            .as_ref()
+            .or(state.browser.live_url.as_ref())
+            .filter(|source| is_useful_source(source))
+        {
+            let source = truncate(
+                &compact_source_url_for_render(source),
+                width.saturating_sub(2).max(8),
+            );
+            out.push(Line::from(""));
+            out.push(Line::from(vec![
+                Span::styled("source", muted()),
+                Span::raw("  "),
+                Span::styled(source, link()),
+            ]));
+        }
+        return Some(out);
     }
-    Some(out)
+    if matches!(product_state, ProductState::Running) {
+        return current_streaming_text(state).map(|text| streaming_collapsed_lines(text, width));
+    }
+    None
+}
+
+fn running_streaming_preview_is_outcome(
+    state: &WorkbenchState,
+    product_state: ProductState,
+) -> bool {
+    matches!(product_state, ProductState::Running)
+        && state
+            .transcript
+            .last()
+            .and_then(|turn| turn.result.as_deref())
+            .or(state.result.as_deref())
+            .is_none()
+        && current_streaming_text(state).is_some()
+}
+
+fn current_streaming_text(state: &WorkbenchState) -> Option<&str> {
+    state
+        .transcript
+        .last()
+        .and_then(|turn| turn.streaming_text.as_deref())
+        .map(str::trim_end)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn streaming_collapsed_lines(text: &str, width: usize) -> Vec<Line<'static>> {
+    let body_width = width.saturating_sub(4).max(24) as u16;
+    let body = markdown_result_lines(text, body_width)
+        .into_iter()
+        .map(trim_default_markdown_indent);
+    let mut out = vec![Line::from(Span::styled("streaming", muted()))];
+    for line in body {
+        out.push(prefix_block_line("  ", line));
+    }
+    out
 }
 
 fn result_collapsed_lines(result: &str, width: usize) -> Vec<Line<'static>> {
@@ -1634,38 +1815,6 @@ fn next_action_lines(
         ));
     }
     Some(out)
-}
-
-fn result_preview_lines(state: &WorkbenchState, width: u16) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
-    if let Some(turn) = state.transcript.last() {
-        append_prompt_section(&mut lines, &turn.prompt);
-        append_turn_activity(&mut lines, turn);
-        if let Some(result) = turn.result.as_ref() {
-            lines.push(Line::from(""));
-            append_result_preview_block(&mut lines, result, state, width);
-        } else if let Some(failure) = turn.failure.as_ref() {
-            lines.push(Line::from(""));
-            append_ascii_text_block(
-                &mut lines,
-                "error",
-                &[friendly_error_message(failure)],
-                None,
-            );
-        }
-        return lines;
-    }
-
-    append_task_section(&mut lines, state);
-    if !state.activity.is_empty() {
-        lines.push(Line::from(""));
-        append_activity_blocks(&mut lines, &state.activity);
-    }
-    if let Some(result) = state.result.as_ref() {
-        lines.push(Line::from(""));
-        append_result_preview_block(&mut lines, result, state, width);
-    }
-    lines
 }
 
 fn transcript_lines(
@@ -1742,8 +1891,12 @@ fn native_plain_transcript_lines(
                 lines.push(Line::from(""));
             }
             let is_current_turn = idx + 1 == state.transcript.len();
+            let is_current_running = is_current_turn
+                && product_state == ProductState::Running
+                && turn.result.is_none()
+                && turn.failure.is_none();
             append_prompt_section(&mut lines, &turn.prompt);
-            append_turn_activity(&mut lines, turn);
+            append_turn_activity(&mut lines, turn, is_current_running, is_current_running);
             if let Some(result) = turn.result.as_ref() {
                 lines.push(Line::from(""));
                 if is_current_turn {
@@ -1763,6 +1916,11 @@ fn native_plain_transcript_lines(
                         ))],
                         Some("saved"),
                     );
+                }
+            } else if is_current_turn && product_state == ProductState::Running {
+                if let Some(streaming_text) = turn.streaming_text.as_deref() {
+                    lines.push(Line::from(""));
+                    append_streaming_block(&mut lines, streaming_text, width);
                 }
             }
         }
@@ -1907,8 +2065,17 @@ fn append_transcript_turns(
             && turn.result.is_none()
             && turn.failure.is_none();
         append_prompt_section(lines, &turn.prompt);
-        append_turn_activity(lines, turn);
+        append_turn_activity(
+            lines,
+            turn,
+            is_pending_running,
+            is_pending_running || turn.result.is_none(),
+        );
         if is_pending_running {
+            if let Some(streaming_text) = turn.streaming_text.as_deref() {
+                lines.push(Line::from(""));
+                append_streaming_block(lines, streaming_text, width);
+            }
             continue;
         }
         if let Some(failure) = turn.failure.as_ref() {
@@ -1941,16 +2108,27 @@ fn append_prompt_section(lines: &mut Vec<Line<'static>>, prompt: &str) {
     ]));
 }
 
-fn append_turn_activity(lines: &mut Vec<Line<'static>>, turn: &TranscriptTurn) {
-    if turn.activity.is_empty() {
+fn append_turn_activity(
+    lines: &mut Vec<Line<'static>>,
+    turn: &TranscriptTurn,
+    include_thinking: bool,
+    include_completed_helper_markers: bool,
+) {
+    let activity = visible_activity(
+        &turn.activity,
+        include_thinking,
+        include_completed_helper_markers,
+    );
+    if activity.is_empty() {
         return;
     }
     lines.push(Line::from(""));
-    append_activity_blocks(lines, &turn.activity);
+    append_activity_blocks(lines, &activity);
 }
 
 fn append_activity_section(lines: &mut Vec<Line<'static>>, state: &WorkbenchState, running: bool) {
-    if state.activity.is_empty() {
+    let activity = visible_activity(&state.activity, running, running);
+    if activity.is_empty() {
         let fallback = if running {
             "starting browser task"
         } else {
@@ -1959,11 +2137,32 @@ fn append_activity_section(lines: &mut Vec<Line<'static>>, state: &WorkbenchStat
         append_ascii_text_block(lines, "activity", &[fallback.to_string()], Some("pending"));
         return;
     }
-    append_activity_blocks(lines, &state.activity);
+    append_activity_blocks(lines, &activity);
+}
+
+fn visible_activity(
+    activity: &[String],
+    include_thinking: bool,
+    include_completed_helper_markers: bool,
+) -> Vec<String> {
+    activity
+        .iter()
+        .filter(|item| include_thinking || !is_thinking_activity(item))
+        .filter(|item| {
+            include_completed_helper_markers
+                || !matches!(
+                    item.as_str(),
+                    "helper finished" | "helper failed" | "helper stopped"
+                )
+        })
+        .cloned()
+        .collect()
 }
 
 fn append_activity_blocks(lines: &mut Vec<Line<'static>>, activity: &[String]) {
     let mut browser = Vec::new();
+    let mut thinking = Vec::new();
+    let mut helpers = Vec::new();
     let mut explored = Vec::new();
     let mut ran = Vec::new();
     let mut changed = Vec::new();
@@ -1973,6 +2172,10 @@ fn append_activity_blocks(lines: &mut Vec<Line<'static>>, activity: &[String]) {
         let formatted = format_activity_item(item);
         if is_browser_activity(item) {
             browser.push(formatted);
+        } else if is_thinking_activity(item) {
+            thinking.push(formatted);
+        } else if is_helper_activity(item) {
+            helpers.push(formatted);
         } else if is_command_activity(item) {
             ran.push(formatted);
         } else if is_change_activity(item) {
@@ -1987,6 +2190,8 @@ fn append_activity_blocks(lines: &mut Vec<Line<'static>>, activity: &[String]) {
     let mut wrote = false;
     for (title, items) in [
         ("browser", browser),
+        ("thinking", thinking),
+        ("helpers", helpers),
         ("explored", explored),
         ("ran", ran),
         ("changed", changed),
@@ -2015,6 +2220,7 @@ fn append_result_block(
         .url
         .as_ref()
         .or(state.browser.live_url.as_ref())
+        .filter(|source| is_useful_source(source))
     {
         append_ascii_tail(
             lines,
@@ -2026,35 +2232,13 @@ fn append_result_block(
     }
 }
 
-fn append_result_preview_block(
-    lines: &mut Vec<Line<'static>>,
-    result: &str,
-    state: &WorkbenchState,
-    width: u16,
-) {
-    let body_width = width.saturating_sub(8).max(24);
-    let mut body = markdown_result_lines(result, body_width)
-        .into_iter()
-        .map(trim_default_markdown_indent)
-        .collect::<Vec<_>>();
-    const MAX_PREVIEW_LINES: usize = 8;
-    if body.len() > MAX_PREVIEW_LINES {
-        body.truncate(MAX_PREVIEW_LINES);
-        body.push(Line::from(Span::styled("...", muted())));
-    }
-    append_ascii_lines_block(lines, "result", body, None);
-    if let Some(source) = state
-        .browser
-        .url
-        .as_ref()
-        .or(state.browser.live_url.as_ref())
-    {
-        append_ascii_tail(
-            lines,
-            "source",
-            vec![Line::from(Span::styled(source.clone(), link()))],
-        );
-    }
+fn append_streaming_block(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
+    append_markdown_block(lines, "streaming", text.trim_end(), width, None);
+}
+
+fn is_useful_source(source: &str) -> bool {
+    let source = source.trim();
+    !source.is_empty() && source != "about:blank"
 }
 
 fn append_markdown_block(
@@ -2152,7 +2336,15 @@ fn trim_default_markdown_indent(mut line: Line<'static>) -> Line<'static> {
 
 fn format_activity_item(item: &str) -> String {
     item.strip_prefix("browsing ")
-        .map(|url| format!("opened {url}"))
+        .map(|url| format!("opened {}", compact_activity_url_for_render(url)))
+        .or_else(|| {
+            if matches!(item, "helper finished" | "helper failed" | "helper stopped") {
+                Some(item.to_string())
+            } else {
+                item.strip_prefix("helper ").map(|text| text.to_string())
+            }
+        })
+        .or_else(|| item.strip_prefix("thinking ").map(|text| text.to_string()))
         .or_else(|| item.strip_prefix("ran ").map(|cmd| cmd.to_string()))
         .or_else(|| {
             item.strip_prefix("read ")
@@ -2186,6 +2378,24 @@ fn compact_url_for_render(url: &str) -> String {
         .to_string()
 }
 
+fn compact_activity_url_for_render(url: &str) -> String {
+    let compact = compact_url_for_render(url);
+    if let Some((prefix, _)) = compact.split_once('?') {
+        format!("{prefix}?...")
+    } else {
+        compact
+    }
+}
+
+fn compact_source_url_for_render(url: &str) -> String {
+    let trimmed = url.trim().trim_end_matches('/');
+    if let Some((prefix, _)) = trimmed.split_once('?') {
+        format!("{prefix}?...")
+    } else {
+        trimmed.to_string()
+    }
+}
+
 fn compact_path_for_render(path: &str) -> String {
     let trimmed = path.trim();
     trimmed
@@ -2211,6 +2421,14 @@ fn is_browser_activity(item: &str) -> bool {
         || item == "connected live browser"
 }
 
+fn is_thinking_activity(item: &str) -> bool {
+    item.starts_with("thinking ")
+}
+
+fn is_helper_activity(item: &str) -> bool {
+    item.starts_with("helper ")
+}
+
 fn is_command_activity(item: &str) -> bool {
     item.starts_with("ran ") || item.starts_with("command failed")
 }
@@ -2224,7 +2442,6 @@ fn is_explore_activity(item: &str) -> bool {
         || item.starts_with("searched ")
         || item == "listed files"
         || item.starts_with("started ")
-        || item.starts_with("helper ")
 }
 
 fn spinner_frame() -> &'static str {

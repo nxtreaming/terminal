@@ -72,6 +72,13 @@ impl Store {
         })?;
         let conn = Connection::open(state_dir.join("state.db"))
             .with_context(|| format!("open {}", state_dir.join("state.db").display()))?;
+        conn.busy_timeout(Duration::from_secs(30))?;
+        conn.execute_batch(
+            r#"
+            PRAGMA journal_mode = WAL;
+            PRAGMA busy_timeout = 30000;
+            "#,
+        )?;
         let store = Self { state_dir, conn };
         store.migrate()?;
         Ok(store)
@@ -121,8 +128,29 @@ impl Store {
         cwd: impl AsRef<Path>,
     ) -> Result<SessionMeta> {
         let id = Uuid::new_v4().simple().to_string()[..12].to_string();
-        let now = now_ms();
         let artifact_root = self.state_dir.join("artifacts").join(&id);
+        self.create_session_with_id_and_artifact_root(parent_id, cwd, artifact_root, id)
+    }
+
+    pub fn create_session_with_artifact_root(
+        &self,
+        parent_id: Option<&str>,
+        cwd: impl AsRef<Path>,
+        artifact_root: impl AsRef<Path>,
+    ) -> Result<SessionMeta> {
+        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        self.create_session_with_id_and_artifact_root(parent_id, cwd, artifact_root, id)
+    }
+
+    fn create_session_with_id_and_artifact_root(
+        &self,
+        parent_id: Option<&str>,
+        cwd: impl AsRef<Path>,
+        artifact_root: impl AsRef<Path>,
+        id: String,
+    ) -> Result<SessionMeta> {
+        let now = now_ms();
+        let artifact_root = artifact_root.as_ref().to_path_buf();
         std::fs::create_dir_all(&artifact_root)
             .with_context(|| format!("create artifact root {}", artifact_root.display()))?;
         let session = SessionMeta {

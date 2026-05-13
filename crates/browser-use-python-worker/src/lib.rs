@@ -63,6 +63,18 @@ impl PythonWorker {
     }
 
     pub fn start_with_browser_mode(browser_mode: Option<&str>) -> Result<Self> {
+        Self::start_with_browser_mode_and_env(browser_mode, std::iter::empty::<(&str, &str)>())
+    }
+
+    pub fn start_with_browser_mode_and_env<I, K, V>(
+        browser_mode: Option<&str>,
+        extra_env: I,
+    ) -> Result<Self>
+    where
+        I: IntoIterator<Item = (K, V)>,
+        K: AsRef<OsStr>,
+        V: AsRef<OsStr>,
+    {
         let cwd = std::env::current_dir()?;
         let mut paths = Vec::new();
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -92,12 +104,17 @@ impl PythonWorker {
             paths.extend(std::env::split_paths(&path));
         }
         let pythonpath = std::env::join_paths(paths)?;
-        Self::start_with_default_runtime(pythonpath, browser_mode)
+        let extra_env = extra_env
+            .into_iter()
+            .map(|(key, value)| (key.as_ref().to_os_string(), value.as_ref().to_os_string()))
+            .collect::<Vec<_>>();
+        Self::start_with_default_runtime(pythonpath, browser_mode, &extra_env)
     }
 
     fn start_with_default_runtime(
         pythonpath: impl AsRef<OsStr>,
         browser_mode: Option<&str>,
+        extra_env: &[(std::ffi::OsString, std::ffi::OsString)],
     ) -> Result<Self> {
         if std::env::var_os("LLM_BROWSER_PYTHON_WORKER_DIRECT").is_none() {
             let uv = PathBuf::from("uv");
@@ -114,20 +131,30 @@ impl PythonWorker {
                 "websockets==15.0.1",
                 "python",
             ];
-            if let Ok(worker) =
-                Self::start_with_program_args(&uv, &args, pythonpath.as_ref(), browser_mode)
-            {
+            if let Ok(worker) = Self::start_with_program_args(
+                &uv,
+                &args,
+                pythonpath.as_ref(),
+                browser_mode,
+                extra_env,
+            ) {
                 return Ok(worker);
             }
         }
-        Self::start_with_program_args(Path::new("python3"), &[], pythonpath.as_ref(), browser_mode)
+        Self::start_with_program_args(
+            Path::new("python3"),
+            &[],
+            pythonpath.as_ref(),
+            browser_mode,
+            extra_env,
+        )
     }
 
     pub fn start_with_pythonpath(
         python: impl AsRef<Path>,
         pythonpath: impl AsRef<OsStr>,
     ) -> Result<Self> {
-        Self::start_with_program_args(python.as_ref(), &[], pythonpath.as_ref(), None)
+        Self::start_with_program_args(python.as_ref(), &[], pythonpath.as_ref(), None, &[])
     }
 
     fn start_with_program_args(
@@ -135,6 +162,7 @@ impl PythonWorker {
         args: &[&str],
         pythonpath: &OsStr,
         browser_mode: Option<&str>,
+        extra_env: &[(std::ffi::OsString, std::ffi::OsString)],
     ) -> Result<Self> {
         let mut command = Command::new(program);
         command
@@ -143,6 +171,7 @@ impl PythonWorker {
             .arg("llm_browser_worker.worker")
             .env("PYTHONUNBUFFERED", "1")
             .env("PYTHONPATH", pythonpath);
+        command.envs(extra_env.iter().cloned());
         if let Some(browser_mode) = browser_mode.filter(|mode| !mode.trim().is_empty()) {
             command.env("LLM_BROWSER_BROWSER_MODE", browser_mode);
         }

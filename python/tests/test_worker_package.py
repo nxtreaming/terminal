@@ -398,3 +398,35 @@ def test_managed_browser_does_not_use_system_chromium_without_opt_in(
 
     monkeypatch.setenv("LLM_BROWSER_ALLOW_SYSTEM_CHROMIUM", "1")
     assert worker._pick_chromium_path()
+
+
+def test_visible_managed_browser_prefers_google_chrome(monkeypatch) -> None:
+    monkeypatch.delenv("CHROME_PATH", raising=False)
+
+    class FakePath:
+        def __init__(self, value: str) -> None:
+            self.value = value
+
+        def exists(self) -> bool:
+            return self.value == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+
+        def __str__(self) -> str:
+            return self.value
+
+    monkeypatch.setattr(worker, "Path", FakePath)
+
+    assert (
+        worker._pick_managed_chrome_path(visible=True)
+        == "/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"
+    )
+
+
+def test_managed_chrome_args_visible_vs_headless(tmp_path: Path) -> None:
+    visible = worker._managed_chrome_args("/chrome", 9333, tmp_path / "profile", True)
+    headless = worker._managed_chrome_args("/chrome", 9334, tmp_path / "profile", False)
+
+    assert "--new-window" in visible
+    assert "--window-size=1512,900" in visible
+    assert "--headless=new" not in visible
+    assert "--headless=new" in headless
+    assert "--new-window" not in headless

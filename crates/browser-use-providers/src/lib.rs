@@ -31,6 +31,17 @@ pub trait ModelProvider {
     }
 
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>>;
+
+    fn stream_turn(
+        &self,
+        turn: ProviderTurn,
+        on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+    ) -> Result<()> {
+        for event in self.start_turn(turn)? {
+            on_event(event)?;
+        }
+        Ok(())
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -719,6 +730,20 @@ impl ModelProvider for CodexResponsesProvider {
     }
 
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+        parse_codex_sse(self.send_turn_request(turn)?, &self.model)
+    }
+
+    fn stream_turn(
+        &self,
+        turn: ProviderTurn,
+        on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+    ) -> Result<()> {
+        parse_codex_sse_stream(self.send_turn_request(turn)?, &self.model, on_event)
+    }
+}
+
+impl CodexResponsesProvider {
+    fn send_turn_request(&self, turn: ProviderTurn) -> Result<reqwest::blocking::Response> {
         let input = messages_to_responses_input(&turn.messages)?;
         let tools = tool_specs_to_responses_tools(&turn.tools);
         let mut body = json!({
@@ -754,7 +779,7 @@ impl ModelProvider for CodexResponsesProvider {
                 body.chars().take(1000).collect::<String>()
             );
         }
-        parse_codex_sse(response, &self.model)
+        Ok(response)
     }
 }
 
@@ -853,28 +878,54 @@ fn account_id_from_id_token(id_token: &str) -> Option<String> {
 
 fn parse_codex_sse(response: reqwest::blocking::Response, model: &str) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
+    parse_codex_sse_stream(response, model, &mut |event| {
+        events.push(event);
+        Ok(())
+    })?;
+    Ok(events)
+}
+
+fn parse_codex_sse_stream(
+    response: reqwest::blocking::Response,
+    model: &str,
+    on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+) -> Result<()> {
     let mut data_lines = Vec::new();
     let mut seen_tool_calls = std::collections::HashSet::new();
+    let mut emitted_done = false;
     for line in BufReader::new(response).lines() {
         let line = line.context("read Codex SSE line")?;
         if line.is_empty() {
-            flush_sse_event(&mut data_lines, &mut seen_tool_calls, &mut events, model)?;
+            flush_sse_event(
+                &mut data_lines,
+                &mut seen_tool_calls,
+                model,
+                on_event,
+                &mut emitted_done,
+            )?;
         } else if let Some(data) = line.strip_prefix("data:") {
             data_lines.push(data.trim().to_string());
         }
     }
-    flush_sse_event(&mut data_lines, &mut seen_tool_calls, &mut events, model)?;
-    if !events.iter().any(|event| matches!(event, ModelEvent::Done)) {
-        events.push(ModelEvent::Done);
+    flush_sse_event(
+        &mut data_lines,
+        &mut seen_tool_calls,
+        model,
+        on_event,
+        &mut emitted_done,
+    )?;
+    if !emitted_done {
+        emit_codex_model_event(ModelEvent::Done, on_event, &mut emitted_done)?;
     }
-    Ok(events)
+    Ok(())
 }
 
 fn flush_sse_event(
     data_lines: &mut Vec<String>,
     seen_tool_calls: &mut std::collections::HashSet<String>,
-    events: &mut Vec<ModelEvent>,
     model: &str,
+    on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+    emitted_done: &mut bool,
 ) -> Result<()> {
     if data_lines.is_empty() {
         return Ok(());
@@ -888,33 +939,56 @@ fn flush_sse_event(
     match event.get("type").and_then(Value::as_str) {
         Some("response.output_text.delta") => {
             if let Some(delta) = event.get("delta").and_then(Value::as_str) {
-                events.push(ModelEvent::TextDelta {
-                    text: delta.to_string(),
-                });
+                emit_codex_model_event(
+                    ModelEvent::TextDelta {
+                        text: delta.to_string(),
+                    },
+                    on_event,
+                    emitted_done,
+                )?;
             }
         }
         Some("response.output_item.done") => {
             if let Some(item) = event.get("item") {
-                maybe_push_codex_output_item(item, seen_tool_calls, events)?;
+                let mut item_events = Vec::new();
+                maybe_push_codex_output_item(item, seen_tool_calls, &mut item_events)?;
+                for item_event in item_events {
+                    emit_codex_model_event(item_event, on_event, emitted_done)?;
+                }
             }
         }
         Some("response.completed") | Some("response.done") | Some("response.incomplete") => {
             if let Some(response) = event.get("response") {
                 if let Some(items) = response.get("output").and_then(Value::as_array) {
                     for item in items {
-                        maybe_push_codex_output_item(item, seen_tool_calls, events)?;
+                        let mut item_events = Vec::new();
+                        maybe_push_codex_output_item(item, seen_tool_calls, &mut item_events)?;
+                        for item_event in item_events {
+                            emit_codex_model_event(item_event, on_event, emitted_done)?;
+                        }
                     }
                 }
                 if let Some(usage) = parse_usage(response.get("usage"), model) {
-                    events.push(ModelEvent::Usage { usage });
+                    emit_codex_model_event(ModelEvent::Usage { usage }, on_event, emitted_done)?;
                 }
             }
-            events.push(ModelEvent::Done);
+            emit_codex_model_event(ModelEvent::Done, on_event, emitted_done)?;
         }
         Some("error") => bail!("Codex stream error: {event}"),
         _ => {}
     }
     Ok(())
+}
+
+fn emit_codex_model_event(
+    event: ModelEvent,
+    on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+    emitted_done: &mut bool,
+) -> Result<()> {
+    if matches!(event, ModelEvent::Done) {
+        *emitted_done = true;
+    }
+    on_event(event)
 }
 
 fn maybe_push_codex_output_item(
