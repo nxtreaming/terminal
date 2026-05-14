@@ -186,7 +186,10 @@ impl Composer {
                 self.move_to_line_end();
                 true
             }
-            (KeyCode::Char(ch), modifiers) if !has_ctrl_or_alt(modifiers) => {
+            (KeyCode::Char(_), modifiers) if !has_ctrl_or_alt(modifiers) => {
+                let Some(ch) = text_char_for_key(key) else {
+                    return false;
+                };
                 self.insert_char(ch);
                 true
             }
@@ -570,6 +573,23 @@ fn has_ctrl_or_alt(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META)
 }
 
+fn text_char_for_key(event: KeyEvent) -> Option<char> {
+    let modifiers = normalized_modifiers(event.modifiers);
+    if has_ctrl_or_alt(modifiers) {
+        return None;
+    }
+    let KeyCode::Char(ch) = event.code else {
+        return None;
+    };
+    if ch.is_control() {
+        return None;
+    }
+    if modifiers.contains(KeyModifiers::SHIFT) && ch.is_ascii_lowercase() {
+        return Some(ch.to_ascii_uppercase());
+    }
+    Some(ch)
+}
+
 fn c0_control_char_to_ctrl_char(ch: char) -> Option<char> {
     let code = u32::from(ch);
     match code {
@@ -577,5 +597,26 @@ fn c0_control_char_to_ctrl_char(ch: char) -> Option<char> {
         0x01..=0x1a => char::from_u32(code - 0x01 + u32::from('a')),
         0x1c..=0x1f => char::from_u32(code - 0x1c + u32::from('4')),
         _ => None,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn shifted_letters_insert_as_uppercase() {
+        let mut composer = Composer::default();
+
+        for (code, modifiers) in [
+            (KeyCode::Char('A'), KeyModifiers::SHIFT),
+            (KeyCode::Char('b'), KeyModifiers::SHIFT),
+            (KeyCode::Char('!'), KeyModifiers::SHIFT),
+            (KeyCode::Char('c'), KeyModifiers::NONE),
+        ] {
+            assert!(composer.handle_key(KeyEvent::new(code, modifiers)));
+        }
+
+        assert_eq!(composer.input(), "AB!c");
     }
 }

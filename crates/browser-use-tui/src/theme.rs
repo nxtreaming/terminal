@@ -1,35 +1,35 @@
 use ratatui::style::{Color, Modifier, Style};
 
 pub(crate) fn text() -> Color {
-    Color::Rgb(230, 230, 235)
+    Color::Rgb(236, 238, 232)
 }
 
 fn muted_color() -> Color {
-    Color::Rgb(156, 158, 168)
+    Color::Rgb(138, 144, 136)
 }
 
 fn dim_color() -> Color {
-    Color::Rgb(102, 105, 116)
+    Color::Rgb(84, 91, 84)
 }
 
 fn accent_color() -> Color {
-    Color::Rgb(92, 156, 245)
+    Color::Rgb(108, 168, 118)
 }
 
 fn border_color() -> Color {
-    Color::Rgb(74, 78, 92)
+    Color::Rgb(53, 61, 52)
 }
 
 fn done_color() -> Color {
-    Color::Rgb(126, 192, 143)
+    accent_color()
 }
 
 fn running_color() -> Color {
-    Color::Rgb(215, 168, 79)
+    Color::Rgb(255, 106, 26)
 }
 
 fn failed_color() -> Color {
-    Color::Rgb(230, 126, 126)
+    running_color()
 }
 
 pub(crate) fn text_style() -> Style {
@@ -59,7 +59,7 @@ pub(crate) fn border() -> Style {
 }
 
 pub(crate) fn link() -> Style {
-    Style::default().fg(Color::Rgb(125, 180, 255))
+    text_style().add_modifier(Modifier::UNDERLINED)
 }
 
 pub(crate) fn done() -> Style {

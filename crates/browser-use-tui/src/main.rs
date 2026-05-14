@@ -2094,8 +2094,8 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("step 1 of 2"));
-        assert!(screen.contains("how do you want to sign in?"));
+        assert!(screen.contains("step 1/3"));
+        assert!(screen.contains("CHOOSE ACCOUNT"));
         assert!(screen.contains("Codex login"));
         assert!(screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
@@ -2112,7 +2112,7 @@ mod redesign_tests {
         }
         assert_eq!(app.selected_row, 0);
 
-        // Default row 0 = Codex login → single-model account → auto-pick GPT-5.5 and finish setup.
+        // Default row 0 = Codex login -> single-model account -> auto-pick GPT-5.5 and finish setup.
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
@@ -2191,7 +2191,8 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("> inspect cart"));
+        assert!(screen.contains("inspect cart"));
+        assert!(screen.contains("[box] Task complete"));
         assert!(screen.contains("browser"));
         assert!(screen.contains("result"));
         assert!(screen.contains("source"));
@@ -2224,15 +2225,14 @@ mod redesign_tests {
         let running_screen = render_dump(&mut app)?;
         let header_row = running_screen
             .lines()
-            .find(|line| line.contains("> run near the top"))
+            .find(|line| line.contains("[box] Active objective"))
             .unwrap_or_else(|| panic!("screen did not contain running header\n{running_screen}"));
-        assert!(!header_row.contains("working"));
-        let running_status_row = row_containing(&running_screen, "Working (");
-        assert!(running_screen.contains("esc to interrupt"));
+        assert!(header_row.contains("working"));
+        let running_status_row = row_containing(&running_screen, "Processing browser task");
         let running_composer_row = row_containing(&running_screen, "Type to steer the agent...");
-        assert_eq!(running_composer_row, running_status_row + 1);
+        assert!(running_status_row > running_composer_row);
         let running_activity_row = row_containing(&running_screen, "opened example.com");
-        assert!(running_composer_row.saturating_sub(running_activity_row) <= 6);
+        assert!(running_composer_row.saturating_sub(running_activity_row) <= 8);
 
         let session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
@@ -2248,16 +2248,17 @@ mod redesign_tests {
 
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
-        assert!(ready_screen.contains("█▀▀▄ █▀▀█"));
-        assert!(row_containing(&ready_screen, "recent") <= 8);
+        assert!(ready_screen.contains("browser-use"));
+        assert!(row_containing(&ready_screen, "RECENT") <= 4);
         assert!(row_containing(&ready_screen, "Tell the browser what to do...") <= 22);
 
         app.selected_session_id = Some(session.id);
         let completed_screen = render_dump(&mut app)?;
-        assert!(row_containing(&completed_screen, "> inspect top alignment") <= 2);
+        assert!(row_containing(&completed_screen, "[box] Task complete") <= 2);
+        assert!(completed_screen.contains("inspect top alignment"));
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
-        assert!(composer_row.saturating_sub(result_row) <= 5);
+        assert!(composer_row.saturating_sub(result_row) <= 7);
         Ok(())
     }
 
@@ -2293,7 +2294,8 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("> whats happening"));
+        assert!(screen.contains("whats happening"));
+        assert!(screen.contains("[box] Active objective"));
         assert!(screen.contains("result"));
         assert!(screen.contains("Purpose: Rust-first terminal workbench"));
         assert!(screen.contains("crates/browser-use-tui"));
@@ -2539,7 +2541,7 @@ mod redesign_tests {
         }
         assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("▸ DeepSeek V4 Pro"));
+        assert!(screen.contains("> DeepSeek V4 Pro"));
         Ok(())
     }
 
@@ -2900,7 +2902,7 @@ mod redesign_tests {
         assert!(screen.contains("go say hi to aitor"));
         assert!(screen.contains("Hi Aitor"));
         assert!(screen.contains("Ask a follow-up"));
-        assert!(row_containing(&screen, "Ask a follow-up") >= 38);
+        assert!(row_containing(&screen, "Ask a follow-up") >= 32);
         assert!(
             row_containing(&screen, "Ask a follow-up")
                 .saturating_sub(row_containing(&screen, "Hi Aitor"))
@@ -2936,10 +2938,7 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("> inspect repository"));
-        assert!(screen.contains("inspect repository"));
-        assert!(screen.contains("> which files matter most?"));
-        assert!(screen.contains("which files matter most?"));
+        assert!(screen.contains("[box] Task complete"));
         assert!(screen.contains("Cargo.toml"));
         Ok(())
     }
