@@ -438,19 +438,14 @@ fn main_bottom_height_for(
     desired.min(available)
 }
 
-fn composer_pane_height(app: &App, product_state: ProductState, width: u16) -> u16 {
+fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> u16 {
     let visual_input_lines = composer_visual_input_lines(app, width);
     let palette_h = slash_palette_pane_height(app);
-    let live_status_h = u16::from(composer_live_status_visible(product_state));
     if palette_h > 0 {
-        visual_input_lines + palette_h + live_status_h + 1
+        visual_input_lines + palette_h + 7
     } else {
-        visual_input_lines + live_status_h + 3
+        visual_input_lines + 8
     }
-}
-
-fn composer_live_status_visible(product_state: ProductState) -> bool {
-    matches!(product_state, ProductState::Running)
 }
 
 fn composer_visual_input_lines(app: &App, width: u16) -> u16 {
@@ -479,7 +474,7 @@ fn slash_palette_pane_height(app: &App) -> u16 {
     if items.is_empty() {
         return 0;
     }
-    (items.len() as u16).min(8)
+    (items.len() as u16).min(8).saturating_add(5)
 }
 
 fn render_bottom_pane(
@@ -750,89 +745,77 @@ fn render_composer(
         return;
     }
     let palette_h = slash_palette_pane_height(app);
-    let live_status_h = u16::from(composer_live_status_visible(product_state));
-    if palette_h > 0 {
-        let input_h = composer_visual_input_lines(app, area.width);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Length(1),
-                Constraint::Length(live_status_h),
-                Constraint::Length(input_h),
-                Constraint::Length(palette_h),
-            ])
-            .split(area);
-        frame.render_widget(
-            Paragraph::new(composer_rule(chunks[0].width)).style(dim()),
-            chunks[0],
-        );
-        if live_status_h > 0 {
-            let live_status_area = chunks[1].inner(Margin {
-                vertical: 0,
-                horizontal: 2,
-            });
-            frame.render_widget(
-                Paragraph::new(composer_live_status_line(state, product_state)),
-                live_status_area,
-            );
-        }
-        let input_area = chunks[2].inner(Margin {
-            vertical: 0,
-            horizontal: 2,
-        });
-        render_composer_input(frame, input_area, app, state.current_session.as_ref());
-        let palette_area = chunks[3].inner(Margin {
-            vertical: 0,
-            horizontal: 2,
-        });
-        frame.render_widget(
-            Paragraph::new(slash_palette_lines(app, palette_area.width as usize)),
-            palette_area,
-        );
-        return;
-    }
+    let input_h = composer_visual_input_lines(app, area.width.saturating_sub(4));
+    let action_h = if palette_h > 0 { palette_h } else { 1 };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(live_status_h),
-            Constraint::Min(1),
+            Constraint::Length(1),
+            Constraint::Length(input_h),
+            Constraint::Length(1),
+            Constraint::Length(action_h),
+            Constraint::Length(1),
+            Constraint::Length(1),
             Constraint::Length(1),
             Constraint::Length(1),
         ])
         .split(area);
     frame.render_widget(
-        Paragraph::new(composer_rule(chunks[0].width)).style(dim()),
+        Paragraph::new(composer_label(product_state)).style(muted()),
         chunks[0],
     );
-    if live_status_h > 0 {
-        let live_status_area = chunks[1].inner(Margin {
-            vertical: 0,
-            horizontal: 2,
-        });
-        frame.render_widget(
-            Paragraph::new(composer_live_status_line(state, product_state)),
-            live_status_area,
-        );
-    }
+    frame.render_widget(
+        Paragraph::new(input_box_rule(chunks[1].width)).style(border()),
+        chunks[1],
+    );
     let input_area = chunks[2].inner(Margin {
         vertical: 0,
         horizontal: 2,
     });
     render_composer_input(frame, input_area, app, state.current_session.as_ref());
-    let status_area = chunks[4].inner(Margin {
+    frame.render_widget(
+        Paragraph::new(input_box_rule(chunks[3].width)).style(border()),
+        chunks[3],
+    );
+    let action_area = chunks[4].inner(Margin {
         vertical: 0,
         horizontal: 2,
     });
+    if palette_h > 0 {
+        frame.render_widget(
+            Paragraph::new(slash_palette_lines(app, action_area.width as usize)),
+            action_area,
+        );
+    } else {
+        frame.render_widget(
+            Paragraph::new(chip_row(product_state, action_area.width as usize)),
+            action_area,
+        );
+    }
+
+    let labels_area = chunks[6].inner(Margin {
+        vertical: 0,
+        horizontal: 2,
+    });
+    let values_area = chunks[7].inner(Margin {
+        vertical: 0,
+        horizontal: 2,
+    });
+    let progress_area = chunks[8].inner(Margin {
+        vertical: 0,
+        horizontal: 2,
+    });
+    let (labels, values) = metric_band_lines(app, state, product_state, labels_area.width);
+    frame.render_widget(Paragraph::new(labels), labels_area);
+    frame.render_widget(Paragraph::new(values), values_area);
     frame.render_widget(
-        Paragraph::new(composer_status_line(
-            app,
+        Paragraph::new(progress_rail_line(
             state,
             product_state,
-            status_area.width,
-        ))
-        .style(muted()),
-        status_area,
+            progress_area.width as usize,
+        )),
+        progress_area,
     );
 }
 
@@ -844,23 +827,224 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0)
         .max(8);
-    items
-        .iter()
-        .enumerate()
-        .map(|(idx, item)| {
-            let is_selected = idx == app.selected_row;
-            let cmd_style = if is_selected { done() } else { dim() };
-            let desc_style = if is_selected { text_style() } else { muted() };
-            let desc_max = width.saturating_sub(cmd_col + 4).max(8);
-            let description = truncate(item.description, desc_max);
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(format!("{:<cmd_col$}", item.command), cmd_style),
-                Span::raw("  "),
-                Span::styled(description, desc_style),
-            ])
-        })
-        .collect()
+    let rule_w = width.saturating_sub(28);
+    let mut lines = vec![
+        Line::from(vec![
+            Span::styled("actions ", bold()),
+            Span::styled("-".repeat(rule_w), dim()),
+            Span::styled(" esc close", muted()),
+        ]),
+        Line::from(vec![
+            Span::styled("> ", accent()),
+            Span::styled("filter actions...", dim()),
+        ]),
+        Line::from(""),
+    ];
+    for (idx, item) in items.iter().enumerate() {
+        let is_selected = idx == app.selected_row;
+        let cmd_style = if is_selected { accent() } else { text_style() };
+        let desc_style = if is_selected { text_style() } else { muted() };
+        let desc_max = width.saturating_sub(cmd_col + 4).max(8);
+        let description = truncate(item.description, desc_max);
+        lines.push(Line::from(vec![
+            Span::styled(
+                if is_selected { "> " } else { "  " },
+                if is_selected { accent() } else { dim() },
+            ),
+            Span::styled(format!("{:<cmd_col$}", item.command), cmd_style),
+            Span::raw("  "),
+            Span::styled(description, desc_style),
+        ]));
+    }
+    lines.push(Line::from(Span::styled("-".repeat(rule_w), dim())));
+    lines.push(Line::from(Span::styled(
+        "up/down navigate . enter select",
+        muted(),
+    )));
+    lines
+}
+
+fn composer_label(product_state: ProductState) -> Line<'static> {
+    let label = match product_state {
+        ProductState::Result | ProductState::Failed | ProductState::Cancelled => "ASK FOLLOW-UP",
+        _ => "ASK",
+    };
+    Line::from(Span::styled(label, muted()))
+}
+
+fn input_box_rule(width: u16) -> String {
+    let width = width as usize;
+    if width < 2 {
+        return "+".repeat(width);
+    }
+    format!("+{}+", "-".repeat(width.saturating_sub(2)))
+}
+
+fn chip_row(product_state: ProductState, width: usize) -> Line<'static> {
+    let chips: &[&str] = match product_state {
+        ProductState::Running => &["pause", "open browser", "rerun", "new task"],
+        ProductState::Result => &["new task", "open browser", "history", "rerun"],
+        ProductState::Failed | ProductState::Cancelled => {
+            &["retry", "follow up", "open browser", "new task"]
+        }
+        _ => &["new task", "history", "change browser", "choose model"],
+    };
+    let mut spans = Vec::new();
+    for (idx, chip) in chips.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let text = format!("[ {chip} ]");
+        let used: usize = spans
+            .iter()
+            .map(|span: &Span<'_>| span.content.chars().count())
+            .sum();
+        if used + text.chars().count() > width {
+            break;
+        }
+        spans.push(Span::styled(
+            text,
+            if idx == 0 { text_style() } else { muted() },
+        ));
+    }
+    Line::from(spans)
+}
+
+fn metric_band_lines(
+    app: &App,
+    state: &WorkbenchState,
+    product_state: ProductState,
+    width: u16,
+) -> (Line<'static>, Line<'static>) {
+    let width = width as usize;
+    let columns = if width < 82 { 3 } else { 4 };
+    let col_w = (width.saturating_sub((columns - 1) * 2) / columns).max(14);
+    let elapsed = elapsed_label(state, product_state).unwrap_or_else(|| "idle".to_string());
+    let (session, session_style) = match product_state {
+        ProductState::Running => (format!("{elapsed} . running"), running()),
+        ProductState::Result => (format!("{elapsed} . done"), done()),
+        ProductState::Failed => (format!("{elapsed} . failed"), failed()),
+        ProductState::Cancelled => (format!("{elapsed} . stopped"), failed()),
+        _ => ("idle".to_string(), muted()),
+    };
+    let mut labels = vec!["AI ENGINE", "SESSION", "BROWSER"];
+    let browser_label = browser_ready_label(app, state)
+        .replace(" ready", " . ready")
+        .replace(" connected", " . connected");
+    let mut values: Vec<(String, Style)> = vec![
+        (
+            format!("{} . {}", app.model, compact_account_label(&app.account)),
+            text_style(),
+        ),
+        (session, session_style),
+        (browser_label, browser_status_style(state)),
+    ];
+    if columns > 3 {
+        labels.push("MODE");
+        values.push((mode_label(product_state).to_string(), text_style()));
+    }
+    let mut label_spans = Vec::new();
+    let mut value_spans = Vec::new();
+    for (idx, label) in labels.iter().enumerate() {
+        if idx > 0 {
+            label_spans.push(Span::raw("  "));
+            value_spans.push(Span::raw("  "));
+        }
+        label_spans.push(Span::styled(fit_cell(label, col_w), muted()));
+        let (value, style) = values
+            .get(idx)
+            .cloned()
+            .unwrap_or_else(|| ("".to_string(), text_style()));
+        value_spans.push(Span::styled(fit_cell(&value, col_w), style));
+    }
+    (Line::from(label_spans), Line::from(value_spans))
+}
+
+fn progress_rail_line(
+    _state: &WorkbenchState,
+    product_state: ProductState,
+    width: usize,
+) -> Line<'static> {
+    let width = width.max(8);
+    let label = match product_state {
+        ProductState::Running => "Processing browser task",
+        ProductState::Result => "Task complete",
+        ProductState::Failed => "Task interrupted",
+        ProductState::Cancelled => "Task stopped",
+        ProductState::SetupNeeded => "Setting up browser-use",
+        ProductState::Ready => "Ready",
+    };
+    let label_len = label.chars().count();
+    let bar_w = width.saturating_sub(label_len + 2).max(8);
+    let filled = match product_state {
+        ProductState::Running => bar_w.saturating_mul(34) / 100,
+        ProductState::Result => bar_w,
+        ProductState::Failed | ProductState::Cancelled => bar_w.saturating_mul(28) / 100,
+        _ => 0,
+    };
+    let mut spans = vec![
+        Span::styled(label.to_string(), text_style()),
+        Span::raw("  "),
+    ];
+    match product_state {
+        ProductState::Result => spans.push(Span::styled("|".repeat(bar_w), done())),
+        ProductState::Failed | ProductState::Cancelled => {
+            let prefix = "|".repeat(filled.max(1));
+            let gap = ".".repeat(2.min(bar_w.saturating_sub(prefix.len())));
+            let after = bar_w.saturating_sub(prefix.len() + gap.len());
+            let secondary = after.min(3);
+            spans.push(Span::styled(prefix, failed()));
+            spans.push(Span::styled(gap, dim()));
+            spans.push(Span::styled("|".repeat(secondary), failed()));
+            spans.push(Span::styled(
+                ".".repeat(after.saturating_sub(secondary)),
+                dim(),
+            ));
+        }
+        ProductState::Running => {
+            let filled = filled.max(1);
+            spans.push(Span::styled("|".repeat(filled), running()));
+            spans.push(Span::styled(
+                ".".repeat(bar_w.saturating_sub(filled)),
+                dim(),
+            ));
+        }
+        _ => spans.push(Span::styled("|".repeat(bar_w), dim())),
+    }
+    Line::from(spans)
+}
+
+fn compact_account_label(account: &str) -> String {
+    if account == ACCOUNT_CODEX {
+        "Codex".to_string()
+    } else if is_claude_code_account(account) {
+        "Claude Code".to_string()
+    } else {
+        account.replace(" API key", "")
+    }
+}
+
+fn browser_status_style(state: &WorkbenchState) -> Style {
+    if state.browser.status == "not connected" {
+        muted()
+    } else {
+        done()
+    }
+}
+
+fn mode_label(product_state: ProductState) -> &'static str {
+    match product_state {
+        ProductState::SetupNeeded => "setup",
+        ProductState::Ready => "build",
+        ProductState::Running => "working",
+        ProductState::Result => "done",
+        ProductState::Failed => "failed",
+        ProductState::Cancelled => "stopped",
+    }
+}
+
+fn fit_cell(value: &str, width: usize) -> String {
+    format!("{:<width$}", truncate(value, width))
 }
 
 fn render_composer_input(
@@ -919,22 +1103,8 @@ fn render_footer(
     } else if app.surface.is_bottom_pane() {
         surface_footer(app.surface)
     } else {
-        match product_state {
-            ProductState::Running => {
-                "enter send   shift+enter newline   ctrl+c stop   esc esc stop   f2 browser   / actions"
-            }
-            ProductState::Ready | ProductState::SetupNeeded => {
-                "enter run   tab history   / actions"
-            }
-            ProductState::Failed | ProductState::Cancelled => "enter select   / actions",
-            ProductState::Result => {
-                if state.current_session.is_some() {
-                    "enter send   shift+enter newline   f2 browser   tab history   / actions"
-                } else {
-                    "enter run   tab history   / actions"
-                }
-            }
-        }
+        let _ = (state, product_state);
+        "/"
     };
     frame.render_widget(
         Paragraph::new(label)
@@ -944,77 +1114,20 @@ fn render_footer(
     );
 }
 
-fn composer_live_status_line(state: &WorkbenchState, product_state: ProductState) -> Line<'static> {
-    let elapsed = elapsed_label(state, product_state).unwrap_or_else(|| "0s".to_string());
-    Line::from(vec![
-        Span::styled("•", running()),
-        Span::raw(" "),
-        Span::styled("Working", bold()),
-        Span::styled(format!(" ({elapsed} · esc to interrupt)"), muted()),
-    ])
-}
-
-fn composer_status_line(
-    app: &App,
-    state: &WorkbenchState,
-    product_state: ProductState,
-    width: u16,
-) -> Line<'static> {
-    let mode = match product_state {
-        ProductState::SetupNeeded => "Setup",
-        ProductState::Ready => "Build",
-        ProductState::Running => "",
-        ProductState::Result => "Done",
-        ProductState::Failed => "Failed",
-        ProductState::Cancelled => "Stopped",
-    };
-    let left = if mode.is_empty() {
-        format!("{}  {}", app.model, app.account)
-    } else {
-        format!("{mode}  {}  {}", app.model, app.account)
-    };
-    let mut right = browser_ready_label(app, state);
-    let width = width as usize;
-    let left_len = left.chars().count();
-    right = truncate(&right, width.saturating_sub(left_len + 1));
-    let right_len = right.chars().count();
-    let gap = width.saturating_sub(left_len + right_len).max(1);
-    Line::from(vec![
-        Span::styled(left, status_style(product_state_label(product_state))),
-        Span::raw(" ".repeat(gap)),
-        Span::styled(right, muted()),
-    ])
-}
-
-fn product_state_label(product_state: ProductState) -> &'static str {
-    match product_state {
-        ProductState::Running => "running",
-        ProductState::Result => "done",
-        ProductState::Failed => "failed",
-        ProductState::Cancelled => "failed",
-        _ => "ready",
-    }
-}
-
 fn setup_lines(app: &App) -> Vec<Line<'static>> {
-    let width = app.args.width;
     let mut lines = Vec::new();
-    lines.extend(wordmark_lines(width));
-    lines.push(Line::from(""));
-    lines.push(centered_line(
-        "a browser agent that lives in your terminal",
-        width,
-        muted(),
-    ));
-    lines.push(Line::from(""));
-    lines.push(Line::from(""));
     lines.push(Line::from(vec![
-        Span::raw("  "),
-        Span::styled("step 1 of ", muted()),
-        Span::styled("2", bold()),
-        Span::styled("  ·  how do you want to sign in?", muted()),
+        Span::styled("browser-use setup", muted()),
+        Span::styled(" / ", dim()),
+        Span::styled("authenticate", bold()),
+        Span::styled(
+            " -------------------------------------------------------------- ",
+            dim(),
+        ),
+        Span::styled("step 1/3", muted()),
     ]));
     lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("  CHOOSE ACCOUNT", muted())));
     if let Some(notice) = app.status_notice.as_ref() {
         lines.push(Line::from(vec![
             Span::raw("  "),
@@ -1032,12 +1145,20 @@ fn setup_lines(app: &App) -> Vec<Line<'static>> {
     for (idx, (label, hint)) in options.iter().enumerate() {
         lines.push(setup_account_row(*label, *hint, idx, app.selected_row));
     }
+    lines.extend([
+        Line::from(""),
+        Line::from(Span::styled(
+            "--------------------------------------------------------------------------------",
+            dim(),
+        )),
+        Line::from(Span::styled("enter select     esc quit", muted())),
+    ]);
     lines
 }
 
 fn setup_account_row(label: &str, hint: &str, idx: usize, selected_row: usize) -> Line<'static> {
     let is_selected = idx == selected_row;
-    let chev = if is_selected { "▸" } else { " " };
+    let chev = if is_selected { ">" } else { " " };
     let chev_style = if is_selected { accent() } else { dim() };
     let label_style = if is_selected { bold() } else { text_style() };
     Line::from(vec![
@@ -1177,7 +1298,7 @@ fn model_row(idx: usize, app: &App) -> Line<'static> {
     let selected = idx == app.selected_row;
     let current =
         app.model_configured && app.model == choice.display && app.account == choice.account;
-    let chev = if selected { "▸" } else { " " };
+    let chev = if selected { ">" } else { " " };
     let chev_style = if selected { accent() } else { dim() };
     let name_style = if selected { bold() } else { text_style() };
     let access = access_label(choice.account);
@@ -1194,7 +1315,7 @@ fn model_row(idx: usize, app: &App) -> Line<'static> {
         Span::styled(format!("{:<20}", choice.display), name_style),
         Span::styled(format!("{:<22}", access), muted()),
         Span::styled(format!("{:<22}", descriptor), descriptor_style),
-        Span::styled(if current { "★" } else { "" }.to_string(), done()),
+        Span::styled(if current { "*" } else { "" }.to_string(), done()),
     ])
 }
 
@@ -1220,7 +1341,7 @@ fn descriptor_for(idx: usize) -> &'static str {
 
 fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
     let mut lines = vec![
-        Line::from(Span::styled("Choose browser", bold())),
+        Line::from(Span::styled("CHOOSE BROWSER", muted())),
         Line::from(""),
     ];
     let descriptions = [
@@ -1237,8 +1358,12 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
     }
     lines.extend([
         Line::from(""),
-        Line::from(Span::styled("Current", muted())),
-        Line::from(format!("  {}", app.browser)),
+        Line::from(Span::styled("CURRENT", muted())),
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled(app.browser.clone(), text_style()),
+            Span::styled(" . ready", done()),
+        ]),
     ]);
     lines
 }
@@ -1249,119 +1374,64 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16) -> Vec<Line<'stati
         lines.push(Line::from(Span::styled(notice.clone(), failed())));
         lines.push(Line::from(""));
     }
-    lines.extend(wordmark_lines(width));
+    lines.push(header_status_line(
+        "browser-use",
+        &browser_ready_label(app, state).replace(" ready", " . idle"),
+        width as usize,
+    ));
     lines.push(Line::from(""));
 
     if !state.history.is_empty() {
         let total = state.history.len();
         let header_text = if total > 4 {
-            format!("recent  ·  {total} total")
+            format!("RECENT  .  {total} total")
         } else {
-            "recent".to_string()
+            "RECENT".to_string()
         };
         lines.push(Line::from(Span::styled(header_text, muted())));
         let rows: Vec<&HistoryRow> = state.history.iter().take(4).collect();
-        for chunk in rows.chunks(2) {
-            lines.extend(history_card_row(chunk, width as usize));
+        for row in rows {
+            lines.push(history_plain_row(row, width as usize));
         }
     }
     lines
 }
 
-fn history_card_row(rows: &[&HistoryRow], total_width: usize) -> Vec<Line<'static>> {
-    const GAP: usize = 2;
-    const MIN_CARD: usize = 36;
-    let card_w = if rows.len() == 2 {
-        ((total_width.saturating_sub(GAP)) / 2).max(MIN_CARD)
-    } else {
-        total_width.max(MIN_CARD)
-    };
-    let card_a = history_card(rows[0], card_w);
-    let card_b = if rows.len() > 1 {
-        Some(history_card(rows[1], card_w))
-    } else {
-        None
-    };
-    let mut out = Vec::with_capacity(card_a.len());
-    for i in 0..card_a.len() {
-        let mut spans = card_a[i].spans.clone();
-        if let Some(b) = card_b.as_ref() {
-            spans.push(Span::raw(" ".repeat(GAP)));
-            spans.extend(b[i].spans.clone());
-        }
-        out.push(Line::from(spans));
-    }
-    out
+fn header_status_line(left: &str, right: &str, width: usize) -> Line<'static> {
+    let right = truncate(right, width.saturating_sub(left.chars().count() + 3).max(8));
+    let rule_len = width.saturating_sub(left.chars().count() + right.chars().count() + 2);
+    Line::from(vec![
+        Span::styled(left.to_string(), bold()),
+        Span::raw(" "),
+        Span::styled("-".repeat(rule_len), dim()),
+        Span::raw(" "),
+        Span::styled(right, done()),
+    ])
 }
 
-fn history_card(row: &HistoryRow, card_w: usize) -> Vec<Line<'static>> {
-    let inner = card_w.saturating_sub(2);
-    let glyph = status_glyph(row.status.as_str());
-    let glyph_style = status_style(row.status.as_str());
+fn history_plain_row(row: &HistoryRow, width: usize) -> Line<'static> {
     let time = relative_time(row.updated_ms);
-    let status_label = row.status.as_str();
-    let task_max = inner.saturating_sub(6);
-    let task = truncate(&row.task, task_max);
-    let line1_used = 1 + glyph.chars().count() + 2 + task.chars().count();
-    let line1_pad = inner.saturating_sub(line1_used);
-    let meta = format!("{status_label} · {time}");
-    let line2_used = 4 + meta.chars().count();
-    let line2_pad = inner.saturating_sub(line2_used);
-    let top = format!("╭{}╮", "─".repeat(inner));
-    let bot = format!("╰{}╯", "─".repeat(inner));
-    vec![
-        Line::from(Span::styled(top, border())),
-        Line::from(vec![
-            Span::styled("│", border()),
-            Span::raw(" "),
-            Span::styled(glyph.to_string(), glyph_style),
-            Span::raw("  "),
-            Span::styled(task, text_style()),
-            Span::raw(" ".repeat(line1_pad)),
-            Span::styled("│", border()),
-        ]),
-        Line::from(vec![
-            Span::styled("│", border()),
-            Span::raw("    "),
-            Span::styled(meta, muted()),
-            Span::raw(" ".repeat(line2_pad)),
-            Span::styled("│", border()),
-        ]),
-        Line::from(Span::styled(bot, border())),
-    ]
+    let glyph = status_glyph(row.status.as_str());
+    let prefix_len = glyph.chars().count() + 4;
+    let time_len = time.chars().count();
+    let task_w = width.saturating_sub(prefix_len + time_len + 2).max(12);
+    Line::from(vec![
+        Span::styled(glyph.to_string(), status_style(row.status.as_str())),
+        Span::raw("  "),
+        Span::styled(fit_cell(&row.task, task_w), text_style()),
+        Span::raw("  "),
+        Span::styled(time, muted()),
+    ])
 }
 
 fn status_glyph(status: &str) -> &'static str {
     match status {
-        "done" => "✓",
-        "running" | "created" => "●",
-        "cancelled" => "⊘",
-        "failed" => "✗",
-        _ => "·",
+        "done" => "[x]",
+        "running" | "created" => "[>]",
+        "cancelled" => "[!]",
+        "failed" => "[!]",
+        _ => "[ ]",
     }
-}
-
-fn wordmark_lines(width: u16) -> Vec<Line<'static>> {
-    const WORDMARK: [&str; 4] = [
-        "▄",
-        "█▀▀▄ █▀▀█ █▀▀█ █   █ █▀▀ █▀▀ █▀▀█   █  █ █▀▀ █▀▀",
-        "█▀▀▄ █▄▄▀ █  █ █▄█▄█ ▀▀█ █▀▀ █▄▄▀   █  █ ▀▀█ █▀▀",
-        "▀▀▀  ▀ ▀▀ ▀▀▀▀  ▀ ▀  ▀▀▀ ▀▀▀ ▀ ▀▀   ▀▀▀▀ ▀▀▀ ▀▀▀",
-    ];
-    WORDMARK
-        .iter()
-        .map(|line| centered_line(line, width, bold()))
-        .collect()
-}
-
-fn centered_line(text: &str, width: u16, style: Style) -> Line<'static> {
-    let width = width as usize;
-    let len = text.chars().count();
-    let pad = width.saturating_sub(len) / 2;
-    Line::from(vec![
-        Span::raw(" ".repeat(pad)),
-        Span::styled(text.to_string(), style),
-    ])
 }
 
 fn work_lines(
@@ -1371,20 +1441,18 @@ fn work_lines(
     product_state: ProductState,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
-    let prior_count = state.transcript.len().saturating_sub(1);
-    for turn in state.transcript.iter().take(prior_count) {
-        out.extend(prior_turn_lines(turn, width as usize));
-        out.push(Line::from(""));
-    }
-    out.extend(work_header_lines(state, product_state, width as usize));
+    out.extend(objective_tree_lines(state, product_state, width as usize));
     out.push(Line::from(""));
-    let tile_w: usize = 30;
-    let gap: usize = 2;
-    let left_w = (width as usize).saturating_sub(tile_w + gap).max(40);
-    let timeline = timeline_lines(state, product_state, left_w);
-    let tile = browser_tile_lines(&state.browser, tile_w);
-    out.extend(zip_columns(timeline, tile, left_w, gap));
-    if let Some(block) = outcome_lines(state, product_state, width as usize) {
+    out.extend(runtime_tabs_lines(product_state, width as usize));
+    out.extend(runtime_context_band_lines(app, state, width as usize));
+    out.push(Line::from(""));
+    let outcome = outcome_lines(state, product_state, width as usize);
+    if outcome.is_some() {
+        out.extend(compact_timeline_lines(state, product_state, width as usize));
+    } else {
+        out.extend(timeline_lines(state, product_state, width as usize));
+    }
+    if let Some(block) = outcome {
         if !running_streaming_preview_is_outcome(state, product_state) {
             out.push(Line::from(""));
         }
@@ -1397,80 +1465,224 @@ fn work_lines(
     out
 }
 
-fn prior_turn_lines(turn: &TranscriptTurn, width: usize) -> Vec<Line<'static>> {
-    let mut out = vec![Line::from(vec![
-        Span::styled("> ", accent()),
-        Span::styled(turn.prompt.clone(), text_style()),
-    ])];
-    if let Some(result) = turn.result.as_ref() {
-        out.push(Line::from(Span::styled("  result", muted())));
-        let body_width = (width.saturating_sub(4).max(24)) as u16;
-        let body = markdown_result_lines(result, body_width)
-            .into_iter()
-            .map(trim_default_markdown_indent)
-            .collect::<Vec<_>>();
-        for line in body.into_iter().take(3) {
-            out.push(prefix_block_line("    ", line));
-        }
-    } else if let Some(failure) = turn.failure.as_ref() {
-        out.push(Line::from(Span::styled("  error", muted())));
-        out.push(Line::from(vec![
-            Span::raw("    "),
-            Span::styled(friendly_error_message(failure), failed()),
-        ]));
-    }
-    out
-}
-
-fn work_header_lines(
+fn compact_timeline_lines(
     state: &WorkbenchState,
     product_state: ProductState,
     width: usize,
 ) -> Vec<Line<'static>> {
-    let task = state
-        .transcript
-        .last()
-        .map(|turn| turn.prompt.as_str())
-        .or(state.task.as_deref())
-        .unwrap_or("browser task")
-        .to_string();
-    let mut right_parts: Vec<(String, Style)> = Vec::new();
-    if !matches!(product_state, ProductState::Running) {
-        let (glyph, glyph_style, label) = state_pill(product_state);
-        right_parts.extend([
-            (glyph.to_string(), glyph_style),
-            (" ".to_string(), muted()),
-            (label.to_string(), glyph_style),
-        ]);
-        if let Some(elapsed) = elapsed_label(state, product_state) {
-            right_parts.push((format!(" · {elapsed}"), muted()));
+    let activity = visible_activity(
+        &state.activity,
+        product_state == ProductState::Running,
+        true,
+    );
+    let groups = group_activity_for_timeline(&activity);
+    let mut out = Vec::new();
+    for (label, items) in groups.into_iter().filter(|(_, items)| !items.is_empty()) {
+        if product_state == ProductState::Result && label != "helpers" {
+            continue;
+        }
+        let item = items
+            .iter()
+            .take(2)
+            .cloned()
+            .collect::<Vec<_>>()
+            .join(" / ");
+        let text = if item.is_empty() {
+            label.to_string()
+        } else {
+            format!("{label}  {item}")
+        };
+        out.push(Line::from(vec![
+            Span::styled(format!(" {:02}  ", out.len() + 1), muted()),
+            Span::styled(truncate(&text, width.saturating_sub(5)), text_style()),
+        ]));
+        if out.len() >= 2 {
+            break;
         }
     }
-    let right_len: usize = right_parts.iter().map(|(s, _)| s.chars().count()).sum();
-    let max_task = width.saturating_sub(right_len + 4).max(10);
-    let task = truncate(&task, max_task);
-    let task_len = task.chars().count();
-    let pad = width.saturating_sub(2 + task_len + right_len);
-    let mut spans: Vec<Span<'static>> = vec![
-        Span::styled("> ", accent()),
-        Span::styled(task, bold()),
-        Span::raw(" ".repeat(pad)),
-    ];
-    for (text, style) in right_parts {
-        spans.push(Span::styled(text, style));
-    }
-    let rule = Line::from(Span::styled("─".repeat(width), border()));
-    vec![Line::from(spans), rule]
+    out
 }
 
-fn state_pill(product_state: ProductState) -> (&'static str, Style, &'static str) {
+fn objective_tree_lines(
+    state: &WorkbenchState,
+    product_state: ProductState,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let (title, status, status_style) = match product_state {
+        ProductState::Running => (
+            "Active objective",
+            elapsed_label(state, product_state)
+                .map(|elapsed| format!("working . {elapsed}"))
+                .unwrap_or_else(|| "working".to_string()),
+            running(),
+        ),
+        ProductState::Result => (
+            "Task complete",
+            elapsed_label(state, product_state)
+                .map(|elapsed| format!("done . {elapsed}"))
+                .unwrap_or_else(|| "done".to_string()),
+            done(),
+        ),
+        ProductState::Failed => ("Task stopped", "failed".to_string(), failed()),
+        ProductState::Cancelled => ("Task stopped", "stopped".to_string(), failed()),
+        _ => ("No objective", "idle".to_string(), muted()),
+    };
+    let left = format!("[box] {title}");
+    let right = status;
+    let rule_w = width.saturating_sub(left.chars().count() + right.chars().count() + 2);
+    let mut out = vec![Line::from(vec![
+        Span::styled(left, bold()),
+        Span::raw(" "),
+        Span::styled("-".repeat(rule_w), dim()),
+        Span::raw(" "),
+        Span::styled(right, status_style),
+    ])];
+
+    let url = state
+        .browser
+        .url
+        .as_deref()
+        .or(state.browser.live_url.as_deref())
+        .filter(|url| is_useful_source(url))
+        .map(compact_activity_url_for_render);
+    let first = url
+        .map(|url| format!("Opened {url}"))
+        .unwrap_or_else(|| "Received task".to_string());
+    out.push(tree_step("|", "[x]", &first, done()));
     match product_state {
-        ProductState::Running => ("●", running(), "working"),
-        ProductState::Result => ("✓", done(), "done"),
-        ProductState::Failed => ("✗", failed(), "failed"),
-        ProductState::Cancelled => ("⊘", muted(), "stopped"),
-        _ => ("·", muted(), "ready"),
+        ProductState::Running => {
+            let active = current_streaming_text(state)
+                .map(first_line)
+                .unwrap_or_else(|| "Working through browser task".to_string());
+            out.push(tree_step("|", "[>]", &active, running()));
+            out.push(tree_step("'", "[ ]", "Awaiting result", dim()));
+        }
+        ProductState::Result => {
+            out.push(tree_step("'", "[x]", "Prepared result", done()));
+        }
+        ProductState::Failed => {
+            let error = state.failure.as_deref().unwrap_or("The task failed.");
+            out.push(tree_step(
+                "|",
+                "[!]",
+                &friendly_error_message(error),
+                failed(),
+            ));
+            out.push(tree_step("'", "[ ]", "Recover or start a new task", dim()));
+        }
+        ProductState::Cancelled => {
+            out.push(tree_step("|", "[!]", "Stopped before completion", failed()));
+            out.push(tree_step("'", "[ ]", "Progress saved in history", dim()));
+        }
+        _ => out.push(tree_step("'", "[ ]", "idle", dim())),
     }
+    out
+}
+
+fn tree_step(branch: &'static str, glyph: &'static str, text: &str, style: Style) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!(" {branch} "), dim()),
+        Span::styled(glyph.to_string(), style),
+        Span::raw(" "),
+        Span::styled(
+            text.to_string(),
+            if glyph == "[ ]" { dim() } else { text_style() },
+        ),
+    ])
+}
+
+fn runtime_tabs_lines(product_state: ProductState, width: usize) -> Vec<Line<'static>> {
+    let compact = width < 92;
+    let runtime_label = if product_state == ProductState::Running {
+        if compact {
+            "RUN *"
+        } else {
+            "RUNTIME *"
+        }
+    } else if compact {
+        "RUN"
+    } else {
+        "RUNTIME"
+    };
+    let labels = if compact {
+        ["TERM", runtime_label, "BROWSER", "HIST", "DEV"]
+    } else {
+        ["TERMINAL", runtime_label, "BROWSER", "HISTORY", "DEV"]
+    };
+    let mut spans = Vec::new();
+    for (idx, label) in labels.iter().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("   "));
+        }
+        let style = if idx == 1 {
+            accent()
+        } else if idx == 4 {
+            dim()
+        } else {
+            text_style()
+        };
+        spans.push(Span::styled(label.to_string(), style));
+    }
+    vec![
+        Line::from(spans),
+        Line::from(Span::styled("-".repeat(width), dim())),
+    ]
+}
+
+fn runtime_context_band_lines(
+    app: &App,
+    state: &WorkbenchState,
+    width: usize,
+) -> Vec<Line<'static>> {
+    let columns = if width < 90 { 3 } else { 4 };
+    let col_w = (width.saturating_sub((columns - 1) * 2) / columns).max(14);
+    let task = current_task_label(state);
+    let labels = if columns == 3 {
+        vec!["AGENT", "MODEL", "BROWSER"]
+    } else {
+        vec!["AGENT", "MODEL", "BROWSER", "TASK"]
+    };
+    let values = if columns == 3 {
+        vec![
+            ("runtime".to_string(), text_style()),
+            (
+                format!("{} . {}", app.model, compact_account_label(&app.account)),
+                text_style(),
+            ),
+            (browser_ready_label(app, state), browser_status_style(state)),
+        ]
+    } else {
+        vec![
+            ("runtime".to_string(), text_style()),
+            (
+                format!("{} . {}", app.model, compact_account_label(&app.account)),
+                text_style(),
+            ),
+            (browser_ready_label(app, state), browser_status_style(state)),
+            (task, text_style()),
+        ]
+    };
+    let mut label_spans = Vec::new();
+    let mut value_spans = Vec::new();
+    for (idx, label) in labels.iter().enumerate() {
+        if idx > 0 {
+            label_spans.push(Span::raw("  "));
+            value_spans.push(Span::raw("  "));
+        }
+        label_spans.push(Span::styled(fit_cell(label, col_w), muted()));
+        let (value, style) = values[idx].clone();
+        value_spans.push(Span::styled(fit_cell(&value, col_w), style));
+    }
+    vec![Line::from(label_spans), Line::from(value_spans)]
+}
+
+fn current_task_label(state: &WorkbenchState) -> String {
+    state
+        .transcript
+        .last()
+        .map(|turn| turn.prompt.clone())
+        .or_else(|| state.task.clone())
+        .unwrap_or_else(|| "browser task".to_string())
 }
 
 fn elapsed_label(state: &WorkbenchState, product_state: ProductState) -> Option<String> {
@@ -1492,28 +1704,6 @@ fn elapsed_label(state: &WorkbenchState, product_state: ProductState) -> Option<
     } else {
         Some(format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60))
     }
-}
-
-fn zip_columns(
-    left: Vec<Line<'static>>,
-    right: Vec<Line<'static>>,
-    left_w: usize,
-    gap: usize,
-) -> Vec<Line<'static>> {
-    let n = left.len().max(right.len());
-    let mut out = Vec::with_capacity(n);
-    for i in 0..n {
-        let l = left.get(i).cloned().unwrap_or_else(|| Line::from(""));
-        let l_chars: usize = l.spans.iter().map(|s| s.content.chars().count()).sum();
-        let mut spans = l.spans;
-        if let Some(r) = right.get(i) {
-            let pad = left_w.saturating_sub(l_chars).saturating_add(gap);
-            spans.push(Span::raw(" ".repeat(pad)));
-            spans.extend(r.spans.clone());
-        }
-        out.push(Line::from(spans));
-    }
-    out
 }
 
 fn timeline_lines(
@@ -1547,7 +1737,6 @@ fn timeline_lines(
                 Span::styled(item, text_style()),
             ]));
         }
-        out.push(Line::from(""));
     }
     if out.is_empty() {
         let (text, style) = match product_state {
@@ -1559,15 +1748,10 @@ fn timeline_lines(
         };
         out.push(Line::from(vec![
             Span::raw(" "),
-            Span::styled("··", muted()),
+            Span::styled("..", muted()),
             Span::raw("  "),
             Span::styled(truncate(&text, w.saturating_sub(5).max(8)), style),
         ]));
-    } else if out
-        .last()
-        .is_some_and(|line| line.spans.iter().all(|s| s.content.trim().is_empty()))
-    {
-        out.pop();
     }
     out
 }
@@ -1607,70 +1791,6 @@ fn group_activity_for_timeline(activity: &[String]) -> Vec<(&'static str, Vec<St
         ("changed", changed),
         ("activity", other),
     ]
-}
-
-fn browser_tile_lines(
-    browser: &browser_use_protocol::BrowserSummary,
-    w: usize,
-) -> Vec<Line<'static>> {
-    let inner = w.saturating_sub(2);
-    let url = browser
-        .url
-        .as_deref()
-        .or(browser.live_url.as_deref())
-        .filter(|u| !u.is_empty())
-        .map(compact_url_for_render)
-        .unwrap_or_else(|| "idle".to_string());
-    let tabs = browser
-        .tabs
-        .map(|t| format!("{t} tab{}", if t == 1 { "" } else { "s" }))
-        .unwrap_or_else(|| "—".to_string());
-    let status = if browser.status.is_empty() || browser.status == "not connected" {
-        "idle".to_string()
-    } else {
-        browser.status.clone()
-    };
-    let mut lines = Vec::new();
-    let title = " BROWSER ";
-    let dashes = inner.saturating_sub(2 + title.chars().count());
-    lines.push(Line::from(vec![
-        Span::styled("╭".to_string(), border()),
-        Span::styled("──".to_string(), border()),
-        Span::styled(title.to_string(), bold()),
-        Span::styled("─".repeat(dashes), border()),
-        Span::styled("╮".to_string(), border()),
-    ]));
-    lines.push(tile_content(&url, link(), inner));
-    lines.push(tile_content(
-        &format!("{tabs} · {status}"),
-        text_style(),
-        inner,
-    ));
-    let hint = if browser.live_url.is_some() {
-        "f2 · live view"
-    } else {
-        "f2 to open"
-    };
-    lines.push(tile_content(hint, muted(), inner));
-    lines.push(Line::from(Span::styled(
-        format!("╰{}╯", "─".repeat(inner)),
-        border(),
-    )));
-    lines
-}
-
-fn tile_content(text: &str, style: Style, inner: usize) -> Line<'static> {
-    let text = truncate(text, inner.saturating_sub(4));
-    let used = 3 + text.chars().count();
-    let pad = inner.saturating_sub(used);
-    Line::from(vec![
-        Span::styled("│".to_string(), border()),
-        Span::raw("  "),
-        Span::styled(text, style),
-        Span::raw(" ".repeat(pad)),
-        Span::raw(" "),
-        Span::styled("│".to_string(), border()),
-    ])
 }
 
 fn outcome_lines(
