@@ -1947,10 +1947,9 @@ fn dataset_sample(dataset: &str, count: usize, task_ids: Vec<String>, all: bool)
 
 fn dataset_report(store: &Store, run_id_or_path: &str) -> Result<()> {
     let manifest = load_dataset_manifest(store, run_id_or_path)?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&summarize_dataset_manifest(&manifest))?
-    );
+    let mut summary = summarize_dataset_manifest(&manifest);
+    summary["artifact_salvage"] = dataset_artifact_salvage_report(store, &manifest)?;
+    println!("{}", serde_json::to_string_pretty(&summary)?);
     Ok(())
 }
 
@@ -2311,6 +2310,8 @@ fn dataset_attempt_result(
     let final_result_chars = final_result.as_deref().map(str::len).unwrap_or(0);
     let usage = usage_summary_from_events(&events);
     let session_failure = failure_from_events(&events);
+    let artifacts =
+        dataset_artifacts_for_paths(Path::new(&session.cwd), Path::new(&session.artifact_root))?;
     let error = run_error.clone().or(session_failure.clone());
     let error_type = if run_error.is_some() {
         Value::String("provider".to_string())
@@ -2334,6 +2335,7 @@ fn dataset_attempt_result(
         "usage": usage,
         "final_result": final_result,
         "final_result_chars": final_result_chars,
+        "artifacts": artifacts,
         "error_type": error_type,
         "error": error,
         "session": {
@@ -2801,6 +2803,220 @@ fn summarize_dataset_manifest(manifest: &Value) -> Value {
         "attempts_by_task": attempts,
         "usage": usage_summary_from_manifest(manifest),
     })
+}
+
+fn dataset_artifact_salvage_report(store: &Store, manifest: &Value) -> Result<Value> {
+    let summary = summarize_dataset_manifest(manifest);
+    let sessions = manifest
+        .get("sessions")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>();
+    let sessions_with_artifacts = sessions
+        .iter()
+        .filter(|session| {
+            session
+                .get("artifacts")
+                .and_then(|artifacts| artifacts.get("found"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .count();
+    let failed_with_artifacts = sessions
+        .iter()
+        .filter(|session| !session.get("ok").and_then(Value::as_bool).unwrap_or(false))
+        .filter(|session| {
+            session
+                .get("artifacts")
+                .and_then(|artifacts| artifacts.get("found"))
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        })
+        .filter_map(|session| session.get("task_id").and_then(Value::as_str))
+        .map(str::to_string)
+        .collect::<Vec<_>>();
+
+    let run_id = manifest.get("run_id").and_then(Value::as_str);
+    let mut pending_with_artifacts = Vec::new();
+    if let Some(run_id) = run_id {
+        for task_id in summary
+            .get("pending_ids")
+            .and_then(Value::as_array)
+            .into_iter()
+            .flatten()
+            .filter_map(Value::as_str)
+        {
+            let attempts = pending_artifact_attempts(store, run_id, task_id)?;
+            if !attempts.is_empty() {
+                pending_with_artifacts.push(serde_json::json!({
+                    "task_id": task_id,
+                    "attempts": attempts,
+                }));
+            }
+        }
+    }
+
+    Ok(serde_json::json!({
+        "note": "Artifact presence is reported for manual review only; it does not mark a task successful.",
+        "sessions_with_artifacts": sessions_with_artifacts,
+        "failed_with_artifacts": failed_with_artifacts,
+        "pending_with_artifacts": pending_with_artifacts,
+    }))
+}
+
+fn pending_artifact_attempts(store: &Store, run_id: &str, task_id: &str) -> Result<Vec<Value>> {
+    let base = dataset_run_files_path(store, run_id);
+    if !base.exists() {
+        return Ok(Vec::new());
+    }
+    let prefix = format!("task-{}-attempt-", safe_path_segment(task_id));
+    let mut attempts = Vec::new();
+    for entry in std::fs::read_dir(&base).with_context(|| format!("read {}", base.display()))? {
+        let entry = entry?;
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+            continue;
+        };
+        let Some(attempt) = name.strip_prefix(&prefix) else {
+            continue;
+        };
+        let artifacts = dataset_artifacts_for_paths(&path.join("cwd"), &path.join("artifacts"))?;
+        if artifacts
+            .get("found")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
+        {
+            attempts.push(serde_json::json!({
+                "attempt": attempt,
+                "task_root": path.display().to_string(),
+                "artifacts": artifacts,
+            }));
+        }
+    }
+    attempts.sort_by(|left, right| {
+        left.get("attempt")
+            .and_then(Value::as_str)
+            .cmp(&right.get("attempt").and_then(Value::as_str))
+    });
+    Ok(attempts)
+}
+
+fn dataset_artifacts_for_paths(cwd: &Path, artifact_root: &Path) -> Result<Value> {
+    let task_root = cwd.parent().unwrap_or(cwd);
+    let outputs = task_root.join("outputs");
+    let final_answer = artifact_root.join(".final_answer.json");
+
+    let final_answer_summary = if final_answer.exists() {
+        summarize_artifact_file(&final_answer)
+    } else {
+        Value::Null
+    };
+    let output_summaries = summarize_output_dir(&outputs)?;
+    let found = !final_answer_summary.is_null() || !output_summaries.is_empty();
+
+    Ok(serde_json::json!({
+        "found": found,
+        "final_answer": final_answer_summary,
+        "outputs": output_summaries,
+    }))
+}
+
+fn summarize_output_dir(outputs: &Path) -> Result<Vec<Value>> {
+    if !outputs.exists() {
+        return Ok(Vec::new());
+    }
+    let mut files = Vec::new();
+    for entry in
+        std::fs::read_dir(outputs).with_context(|| format!("read {}", outputs.display()))?
+    {
+        let entry = entry?;
+        let path = entry.path();
+        if path.is_file() {
+            files.push(path);
+        }
+    }
+    files.sort();
+    Ok(files
+        .into_iter()
+        .take(20)
+        .map(|path| summarize_artifact_file(&path))
+        .collect())
+}
+
+fn summarize_artifact_file(path: &Path) -> Value {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) => {
+            return serde_json::json!({
+                "path": path.display().to_string(),
+                "error": format!("{error:#}"),
+            });
+        }
+    };
+    let mut summary = serde_json::json!({
+        "path": path.display().to_string(),
+        "bytes": metadata.len(),
+    });
+    let extension = path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_ascii_lowercase();
+    if extension == "json" && metadata.len() <= 10_000_000 {
+        match std::fs::read_to_string(path)
+            .map_err(anyhow::Error::from)
+            .and_then(|content| {
+                serde_json::from_str::<Value>(&content).map_err(anyhow::Error::from)
+            }) {
+            Ok(value) => {
+                summary["json"] = summarize_json_artifact(&value);
+            }
+            Err(error) => {
+                summary["json_error"] = Value::String(format!("{error:#}"));
+            }
+        }
+    } else if extension == "csv" {
+        summary["kind"] = Value::String("csv".to_string());
+    } else {
+        summary["kind"] = Value::String(if extension.is_empty() {
+            "file".to_string()
+        } else {
+            extension
+        });
+    }
+    summary
+}
+
+fn summarize_json_artifact(value: &Value) -> Value {
+    match value {
+        Value::Array(items) => serde_json::json!({
+            "kind": "array",
+            "length": items.len(),
+        }),
+        Value::Object(object) => {
+            let keys = object.keys().take(20).cloned().collect::<Vec<_>>();
+            let array_lengths = object
+                .iter()
+                .filter_map(|(key, value)| {
+                    value
+                        .as_array()
+                        .map(|items| (key.clone(), Value::from(items.len())))
+                })
+                .collect::<serde_json::Map<_, _>>();
+            serde_json::json!({
+                "kind": "object",
+                "keys": keys,
+                "array_lengths": array_lengths,
+            })
+        }
+        _ => serde_json::json!({
+            "kind": "scalar",
+        }),
+    }
 }
 
 fn usage_summary_from_events(events: &[browser_use_protocol::EventRecord]) -> Value {

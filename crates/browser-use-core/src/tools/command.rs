@@ -163,6 +163,7 @@ pub(crate) fn exec_command(
             duration: managed.started_at.elapsed(),
             tty_requested,
             tty_allocated,
+            write_error: None,
         });
         store.append_event(
             &session.id,
@@ -196,6 +197,7 @@ pub(crate) fn exec_command(
         duration: managed.started_at.elapsed(),
         tty_requested,
         tty_allocated,
+        write_error: None,
     });
     commands()
         .lock()
@@ -257,9 +259,26 @@ pub(crate) fn write_stdin(
             .insert(process_id.to_string(), command);
         bail!("command session belongs to another task: {process_id}");
     }
-    if !chars.is_empty() {
-        command.process.write_all(chars.as_bytes())?;
-    }
+    let write_error = if !chars.is_empty() {
+        match command.process.write_all(chars.as_bytes()) {
+            Ok(()) => None,
+            Err(error) => {
+                let message = format!("{error:#}");
+                store.append_event(
+                    &session.id,
+                    "command.write_error",
+                    json!({
+                        "tool_call_id": call.id,
+                        "session_id": process_id,
+                        "error": message,
+                    }),
+                )?;
+                Some(message)
+            }
+        }
+    } else {
+        None
+    };
     wait_for_output(yield_time, || command.process.try_wait())?;
     let status = command.process.try_wait()?;
     if status.is_some() {
@@ -279,6 +298,7 @@ pub(crate) fn write_stdin(
         duration: command.started_at.elapsed(),
         tty_requested: tty_allocated,
         tty_allocated,
+        write_error: write_error.as_deref(),
     });
     if let Some(status) = status {
         store.append_event(
@@ -577,6 +597,7 @@ struct CommandOutputPayload<'a> {
     duration: Duration,
     tty_requested: bool,
     tty_allocated: bool,
+    write_error: Option<&'a str>,
 }
 
 fn command_output(payload: CommandOutputPayload<'_>) -> Value {
@@ -591,6 +612,7 @@ fn command_output(payload: CommandOutputPayload<'_>) -> Value {
             "truncated": truncated,
             "tty_requested": payload.tty_requested,
             "tty_allocated": payload.tty_allocated,
+            "write_error": payload.write_error,
         }
     })
 }
@@ -883,6 +905,57 @@ mod tests {
         assert!(error.to_string().contains("another task"));
         assert_eq!(session.status, SessionStatus::Created);
         stop_for_test(process_id);
+    }
+
+    #[test]
+    fn write_stdin_reports_broken_pipe_without_failing_tool() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let started = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_closed_stdin".to_string(),
+                name: "exec_command".to_string(),
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import os, time; os.close(0); print('ready', flush=True); time.sleep(1)\"",
+                    "yield_time_ms": 100,
+                }),
+            },
+        )
+        .expect("exec");
+        let process_id = started.content["session_id"]
+            .as_str()
+            .expect("session id")
+            .to_string();
+
+        let written = write_stdin(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_write_closed_stdin".to_string(),
+                name: "write_stdin".to_string(),
+                arguments: json!({
+                    "session_id": process_id,
+                    "chars": "stop\n",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )
+        .expect("broken pipe should be a tool result, not a fatal error");
+
+        assert!(written.content["metadata"]["write_error"]
+            .as_str()
+            .is_some_and(|error| !error.is_empty()));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "command.write_error"));
+        stop_for_test(
+            written.content["session_id"]
+                .as_str()
+                .unwrap_or("cmd_call_exec_closed_stdin"),
+        );
     }
 
     fn stop_for_test(process_id: &str) {

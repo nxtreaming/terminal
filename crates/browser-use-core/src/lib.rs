@@ -493,13 +493,18 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     options.max_context_chars,
                 )?;
                 normalize_provider_messages(&mut messages);
-                maybe_emit_deadline_warning(
+                if maybe_emit_deadline_warning(
                     store,
                     &session.id,
                     turn_idx,
                     options.max_turns,
                     &mut deadline_warning_emitted,
-                )?;
+                )? {
+                    messages.push(serde_json::json!({
+                        "role": "user",
+                        "content": "The turn budget is nearly exhausted. Stop starting new lines of investigation. Produce the best available final answer now, write or reference any artifacts you have, and explicitly mark unknown or ambiguous fields instead of timing out with no deliverable.",
+                    }));
+                }
                 let mut assistant_text = String::new();
                 let mut tool_calls = Vec::new();
                 let step_span = telemetry.start_step_span(
@@ -1013,9 +1018,9 @@ fn maybe_emit_deadline_warning(
     turn_idx: usize,
     max_turns: usize,
     emitted: &mut bool,
-) -> Result<()> {
+) -> Result<bool> {
     if *emitted || max_turns < 2 || turn_idx + 1 < max_turns {
-        return Ok(());
+        return Ok(false);
     }
     *emitted = true;
     store.append_event(
@@ -1027,7 +1032,7 @@ fn maybe_emit_deadline_warning(
             "remaining_turns": max_turns.saturating_sub(turn_idx),
         }),
     )?;
-    Ok(())
+    Ok(true)
 }
 
 fn maybe_compact_messages(
