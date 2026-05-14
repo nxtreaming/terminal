@@ -2,6 +2,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -26,7 +27,18 @@ const MIGRATIONS: &[(i64, &str)] = &[
 pub struct Store {
     state_dir: PathBuf,
     conn: Connection,
+    notifier: Option<StoreNotifier>,
 }
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum StoreNotification {
+    SessionsChanged,
+    SessionChanged { session_id: String },
+    EventsChanged { session_id: String, seq: i64 },
+    SettingsChanged,
+}
+
+pub type StoreNotifier = mpsc::Sender<StoreNotification>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSummary {
@@ -61,6 +73,20 @@ pub struct RunSummary {
 
 impl Store {
     pub fn open(state_dir: impl AsRef<Path>) -> Result<Self> {
+        Self::open_with_optional_notifier(state_dir, None)
+    }
+
+    pub fn open_with_notifier(
+        state_dir: impl AsRef<Path>,
+        notifier: StoreNotifier,
+    ) -> Result<Self> {
+        Self::open_with_optional_notifier(state_dir, Some(notifier))
+    }
+
+    pub fn open_with_optional_notifier(
+        state_dir: impl AsRef<Path>,
+        notifier: Option<StoreNotifier>,
+    ) -> Result<Self> {
         let state_dir = state_dir.as_ref().to_path_buf();
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
@@ -79,13 +105,27 @@ impl Store {
             PRAGMA busy_timeout = 30000;
             "#,
         )?;
-        let store = Self { state_dir, conn };
+        let store = Self {
+            state_dir,
+            conn,
+            notifier,
+        };
         store.migrate()?;
         Ok(store)
     }
 
     pub fn state_dir(&self) -> &Path {
         &self.state_dir
+    }
+
+    pub fn notifier(&self) -> Option<StoreNotifier> {
+        self.notifier.clone()
+    }
+
+    fn notify(&self, notification: StoreNotification) {
+        if let Some(notifier) = self.notifier.as_ref() {
+            let _ = notifier.send(notification);
+        }
     }
 
     fn migrate(&self) -> Result<()> {
@@ -163,6 +203,7 @@ impl Store {
             updated_ms: now,
         };
         self.insert_session(&session)?;
+        self.notify(StoreNotification::SessionsChanged);
         self.append_event(&id, "session.created", serde_json::json!({}))?;
         self.load_session(&id)?
             .context("created session was not readable")
@@ -213,6 +254,7 @@ impl Store {
             params![parent_id, id, now],
         )?;
         tx.commit()?;
+        self.notify(StoreNotification::SessionsChanged);
         self.append_event(&id, "session.created", serde_json::json!({}))?;
         self.load_session(&id)?
             .context("created child session was not readable")
@@ -224,6 +266,9 @@ impl Store {
             "UPDATE sessions SET status = ?1, updated_ms = ?2 WHERE id = ?3",
             params![status.as_str(), now, session_id],
         )?;
+        self.notify(StoreNotification::SessionChanged {
+            session_id: session_id.to_string(),
+        });
         Ok(())
     }
 
@@ -285,6 +330,13 @@ impl Store {
             )?;
         }
         tx.commit()?;
+        self.notify(StoreNotification::EventsChanged {
+            session_id: session_id.to_string(),
+            seq,
+        });
+        self.notify(StoreNotification::SessionChanged {
+            session_id: session_id.to_string(),
+        });
         Ok(EventRecord {
             seq,
             id: event_id,
@@ -480,6 +532,9 @@ impl Store {
                 "UPDATE agent_edges SET status = 'closed', updated_ms = ?1 WHERE child_session_id = ?2",
                 params![now, id],
             )?;
+            self.notify(StoreNotification::SessionChanged {
+                session_id: id.clone(),
+            });
             self.request_cancel(&id, reason)?;
         }
         Ok(())
@@ -510,6 +565,9 @@ impl Store {
             "UPDATE agent_edges SET status = ?1, updated_ms = ?2 WHERE child_session_id = ?3",
             params![status, now, child_session_id],
         )?;
+        self.notify(StoreNotification::SessionChanged {
+            session_id: child_session_id.to_string(),
+        });
         Ok(())
     }
 
@@ -543,6 +601,12 @@ impl Store {
                 message.created_ms,
             ],
         )?;
+        self.notify(StoreNotification::SessionChanged {
+            session_id: author_session_id.to_string(),
+        });
+        self.notify(StoreNotification::SessionChanged {
+            session_id: target_session_id.to_string(),
+        });
         Ok(message)
     }
 
@@ -578,12 +642,14 @@ impl Store {
             "#,
             params![key, value, now_ms()],
         )?;
+        self.notify(StoreNotification::SettingsChanged);
         Ok(())
     }
 
     pub fn delete_setting(&self, key: &str) -> Result<()> {
         self.conn
             .execute("DELETE FROM app_settings WHERE key = ?1", params![key])?;
+        self.notify(StoreNotification::SettingsChanged);
         Ok(())
     }
 
@@ -726,6 +792,7 @@ impl Store {
                 .unwrap_or(now),
         };
         self.insert_session(&session)?;
+        self.notify(StoreNotification::SessionsChanged);
         for event in events {
             self.append_event_with_identity(
                 &session_id,
@@ -987,6 +1054,44 @@ mod tests {
         let waited =
             store.wait_for_events_after_seq(&session.id, first.seq, Duration::from_millis(1))?;
         assert_eq!(waited, vec![second]);
+        Ok(())
+    }
+
+    #[test]
+    fn store_notifier_reports_sessions_events_and_settings() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let (tx, rx) = mpsc::channel();
+        let store = Store::open_with_notifier(temp.path(), tx)?;
+
+        let session = store.create_session(None, "/tmp")?;
+        let startup_notifications: Vec<_> = rx.try_iter().collect();
+        assert!(startup_notifications.contains(&StoreNotification::SessionsChanged));
+        assert!(startup_notifications.iter().any(|notification| matches!(
+            notification,
+            StoreNotification::EventsChanged { session_id, .. } if session_id == &session.id
+        )));
+
+        let event = store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "start"}),
+        )?;
+        let event_notifications: Vec<_> = rx.try_iter().collect();
+        assert!(
+            event_notifications.contains(&StoreNotification::EventsChanged {
+                session_id: session.id.clone(),
+                seq: event.seq,
+            })
+        );
+        assert!(
+            event_notifications.contains(&StoreNotification::SessionChanged {
+                session_id: session.id.clone(),
+            })
+        );
+
+        store.set_setting("setup.complete", "1")?;
+        assert_eq!(rx.recv()?, StoreNotification::SettingsChanged);
+
         Ok(())
     }
 

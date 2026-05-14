@@ -21,6 +21,7 @@ use crate::theme::*;
 use super::{App, ProductState, Surface};
 
 pub(crate) fn render_dump(app: &mut App) -> Result<String> {
+    app.drain_store_notifications()?;
     let backend = TestBackend::new(app.args.width, app.args.height);
     let mut terminal = Terminal::new(backend)?;
     terminal.draw(|frame| render(frame, app))?;
@@ -42,6 +43,7 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
 }
 
 pub(crate) fn native_scrollback_lines(app: &mut App, width: u16) -> Result<Vec<Line<'static>>> {
+    app.drain_store_notifications()?;
     let state = app.workbench_state()?;
     let product_state = app.product_state(&state);
     let body_width = width.saturating_sub(4).max(1);
@@ -312,18 +314,9 @@ pub(crate) fn native_scrollback_event_lines(
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let area = app_surface(frame.area());
-    let state = app.workbench_state().unwrap_or_else(|_| WorkbenchState {
-        setup_complete: false,
-        current_session: None,
-        task: None,
-        result: None,
-        failure: Some("Could not load state.".to_string()),
-        activity: Vec::new(),
-        transcript: Vec::new(),
-        browser: Default::default(),
-        telemetry: Default::default(),
-        history: Vec::new(),
-    });
+    let state = app
+        .workbench_state()
+        .unwrap_or_else(|_| app.empty_workbench_state_with_failure());
     let product_state = app.product_state(&state);
 
     if app.is_first_run_setup_visible().unwrap_or(false) && app.surface == Surface::Main {
@@ -2018,21 +2011,22 @@ fn developer_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("Events", bold())));
     lines.push(Line::from(""));
-    match app.store.events_for_session(&session.id) {
-        Ok(events) => {
-            for event in events.iter().rev().take(12).rev() {
-                let payload = truncate(&event.payload.to_string(), 44);
-                lines.push(Line::from(vec![
-                    Span::styled(format!("{:>4}  ", event.seq), muted()),
-                    Span::styled(
-                        format!("{:<24}", truncate(&event.event_type, 24)),
-                        text_style(),
-                    ),
-                    Span::styled(payload, dim()),
-                ]));
-            }
-        }
-        Err(err) => lines.push(Line::from(Span::styled(err.to_string(), dim()))),
+    for event in app
+        .cached_events_for_session(&session.id)
+        .iter()
+        .rev()
+        .take(12)
+        .rev()
+    {
+        let payload = truncate(&event.payload.to_string(), 44);
+        lines.push(Line::from(vec![
+            Span::styled(format!("{:>4}  ", event.seq), muted()),
+            Span::styled(
+                format!("{:<24}", truncate(&event.event_type, 24)),
+                text_style(),
+            ),
+            Span::styled(payload, dim()),
+        ]));
     }
     lines
 }

@@ -1094,7 +1094,7 @@ mod tests {
                 id: "call_exec_closed_stdin".to_string(),
                 name: "exec_command".to_string(),
                 arguments: json!({
-                    "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(0.2)\"",
+                    "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(0.6)\"",
                     "yield_time_ms": 50,
                 }),
             },
@@ -1104,7 +1104,7 @@ mod tests {
             .as_str()
             .expect("session id")
             .to_string();
-        std::thread::sleep(std::time::Duration::from_millis(400));
+        std::thread::sleep(std::time::Duration::from_millis(900));
 
         let written = write_stdin(
             &store,

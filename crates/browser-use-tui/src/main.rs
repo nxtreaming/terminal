@@ -1,12 +1,16 @@
+use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
 use std::path::{Path, PathBuf};
+use std::sync::mpsc;
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use browser_use_protocol::{project_workbench, SessionStatus, WorkbenchState};
-use browser_use_store::Store;
+use browser_use_protocol::{
+    project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
+};
+use browser_use_store::{Store, StoreNotification};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
@@ -41,6 +45,8 @@ use settings::{
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
+const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -154,6 +160,8 @@ enum AppCommand {
 
 struct App {
     store: Store,
+    store_rx: mpsc::Receiver<StoreNotification>,
+    state_cache: AppStateCache,
     args: Args,
     selected_session_id: Option<String>,
     composer: Composer,
@@ -173,6 +181,283 @@ struct App {
     quit_hint_until: Option<Instant>,
     escape_stop_until: Option<Instant>,
     native_history: NativeHistoryState,
+}
+
+#[derive(Debug)]
+struct AppStateCache {
+    sessions: Vec<SessionMeta>,
+    events_by_session: HashMap<String, Vec<EventRecord>>,
+    last_seq_by_session: HashMap<String, i64>,
+    projected: WorkbenchState,
+    projection_key: Option<ProjectionKey>,
+    dirty_projection: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ProjectionKey {
+    selected_session_id: Option<String>,
+    browser: String,
+    history_tasks_visible: bool,
+}
+
+impl AppStateCache {
+    fn hydrate(store: &Store, browser: &str) -> Result<Self> {
+        let sessions = store.list_sessions()?;
+        let mut events_by_session = HashMap::new();
+        let mut last_seq_by_session = HashMap::new();
+        for session in &sessions {
+            let events = store.events_for_session(&session.id)?;
+            let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+            last_seq_by_session.insert(session.id.clone(), last_seq);
+            events_by_session.insert(session.id.clone(), events);
+        }
+        Ok(Self {
+            sessions,
+            events_by_session,
+            last_seq_by_session,
+            projected: empty_workbench_state(browser),
+            projection_key: None,
+            dirty_projection: true,
+        })
+    }
+
+    fn apply_notification(
+        &mut self,
+        store: &Store,
+        notification: StoreNotification,
+    ) -> Result<bool> {
+        match notification {
+            StoreNotification::SessionsChanged => self.refresh_sessions(store),
+            StoreNotification::SessionChanged { session_id } => {
+                self.refresh_session(store, &session_id)
+            }
+            StoreNotification::EventsChanged { session_id, seq: _ } => {
+                self.refresh_events_after_seq(store, &session_id)
+            }
+            StoreNotification::SettingsChanged => Ok(false),
+        }
+    }
+
+    fn refresh_all(&mut self, store: &Store) -> Result<bool> {
+        let mut changed = self.refresh_sessions(store)?;
+        let session_ids = self
+            .sessions
+            .iter()
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        for session_id in session_ids {
+            changed |= self.refresh_events_after_seq(store, &session_id)?;
+        }
+        Ok(changed)
+    }
+
+    fn refresh_sessions(&mut self, store: &Store) -> Result<bool> {
+        let sessions = store.list_sessions()?;
+        let sessions_changed = self.sessions != sessions;
+        self.sessions = sessions;
+        let live_ids = self
+            .sessions
+            .iter()
+            .map(|session| session.id.as_str())
+            .collect::<std::collections::HashSet<_>>();
+        let old_event_count = self.events_by_session.len();
+        self.events_by_session
+            .retain(|session_id, _| live_ids.contains(session_id.as_str()));
+        self.last_seq_by_session
+            .retain(|session_id, _| live_ids.contains(session_id.as_str()));
+        let removed_events = self.events_by_session.len() != old_event_count;
+        let unknown_ids = self
+            .sessions
+            .iter()
+            .filter(|session| !self.events_by_session.contains_key(&session.id))
+            .map(|session| session.id.clone())
+            .collect::<Vec<_>>();
+        let loaded_events = !unknown_ids.is_empty();
+        for session_id in unknown_ids {
+            let events = store.events_for_session(&session_id)?;
+            let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+            self.last_seq_by_session
+                .insert(session_id.clone(), last_seq);
+            self.events_by_session.insert(session_id, events);
+        }
+        let changed = sessions_changed || removed_events || loaded_events;
+        if changed {
+            self.dirty_projection = true;
+        }
+        Ok(changed)
+    }
+
+    fn refresh_session(&mut self, store: &Store, session_id: &str) -> Result<bool> {
+        let changed = match store.load_session(session_id)? {
+            Some(session) => self.upsert_session(session),
+            None => {
+                let old_len = self.sessions.len();
+                self.sessions.retain(|session| session.id != session_id);
+                let removed_events = self.events_by_session.remove(session_id).is_some();
+                let removed_seq = self.last_seq_by_session.remove(session_id).is_some();
+                old_len != self.sessions.len() || removed_events || removed_seq
+            }
+        };
+        if changed {
+            self.dirty_projection = true;
+        }
+        Ok(changed)
+    }
+
+    fn refresh_events_after_seq(&mut self, store: &Store, session_id: &str) -> Result<bool> {
+        let after_seq = self
+            .last_seq_by_session
+            .get(session_id)
+            .copied()
+            .unwrap_or_default();
+        let events = store.events_after_seq(session_id, after_seq)?;
+        if events.is_empty() {
+            return Ok(false);
+        }
+        let last_seq = events.last().map(|event| event.seq).unwrap_or(after_seq);
+        self.events_by_session
+            .entry(session_id.to_string())
+            .or_default()
+            .extend(events);
+        self.last_seq_by_session
+            .insert(session_id.to_string(), last_seq);
+        self.dirty_projection = true;
+        Ok(true)
+    }
+
+    fn upsert_session(&mut self, session: SessionMeta) -> bool {
+        if let Some(existing) = self
+            .sessions
+            .iter_mut()
+            .find(|candidate| candidate.id == session.id)
+        {
+            if *existing == session {
+                return false;
+            }
+            *existing = session;
+        } else {
+            self.sessions.push(session);
+        }
+        self.sessions
+            .sort_by(|left, right| right.updated_ms.cmp(&left.updated_ms));
+        true
+    }
+
+    fn project_if_needed(
+        &mut self,
+        selected_session_id: Option<&str>,
+        browser: &str,
+        history_tasks_visible: bool,
+    ) -> &WorkbenchState {
+        let key = ProjectionKey {
+            selected_session_id: selected_session_id.map(ToOwned::to_owned),
+            browser: browser.to_string(),
+            history_tasks_visible,
+        };
+        if !self.dirty_projection && self.projection_key.as_ref() == Some(&key) {
+            return &self.projected;
+        }
+
+        let current_events = selected_session_id
+            .and_then(|id| self.events_by_session.get(id))
+            .map(Vec::as_slice)
+            .unwrap_or_default();
+        let all_events = if history_tasks_visible {
+            self.sessions
+                .iter()
+                .map(|session| {
+                    (
+                        session.id.clone(),
+                        self.events_by_session
+                            .get(&session.id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else if let Some(id) = selected_session_id {
+            let mut session_ids = vec![id.to_string()];
+            let mut index = 0;
+            while index < session_ids.len() {
+                let parent_id = session_ids[index].clone();
+                for session in self
+                    .sessions
+                    .iter()
+                    .filter(|session| session.parent_id.as_deref() == Some(parent_id.as_str()))
+                {
+                    if !session_ids.iter().any(|id| id == &session.id) {
+                        session_ids.push(session.id.clone());
+                    }
+                }
+                index += 1;
+            }
+            session_ids
+                .into_iter()
+                .map(|session_id| {
+                    (
+                        session_id.clone(),
+                        self.events_by_session
+                            .get(&session_id)
+                            .cloned()
+                            .unwrap_or_default(),
+                    )
+                })
+                .collect::<Vec<_>>()
+        } else {
+            Vec::new()
+        };
+        self.projected = project_workbench(
+            &self.sessions,
+            current_events,
+            &all_events,
+            selected_session_id,
+            browser.to_string(),
+        );
+        self.projection_key = Some(key);
+        self.dirty_projection = false;
+        &self.projected
+    }
+
+    fn events_for_session(&self, session_id: &str) -> &[EventRecord] {
+        self.events_by_session
+            .get(session_id)
+            .map(Vec::as_slice)
+            .unwrap_or_default()
+    }
+
+    fn events_after_seq(&self, session_id: &str, after_seq: i64) -> Vec<EventRecord> {
+        self.events_for_session(session_id)
+            .iter()
+            .filter(|event| event.seq > after_seq)
+            .cloned()
+            .collect()
+    }
+
+    fn last_seq_for_session(&self, session_id: &str) -> i64 {
+        self.last_seq_by_session
+            .get(session_id)
+            .copied()
+            .unwrap_or_default()
+    }
+}
+
+fn empty_workbench_state(browser: &str) -> WorkbenchState {
+    WorkbenchState {
+        setup_complete: false,
+        current_session: None,
+        task: None,
+        result: None,
+        failure: None,
+        activity: Vec::new(),
+        transcript: Vec::new(),
+        browser: browser_use_protocol::BrowserSummary {
+            backend: browser.to_string(),
+            status: "not connected".to_string(),
+            ..Default::default()
+        },
+        telemetry: Default::default(),
+        history: Vec::new(),
+    }
 }
 
 #[derive(Debug, Default)]
@@ -216,11 +501,13 @@ impl NativeHistoryState {
 
 impl App {
     fn new(args: Args) -> Result<Self> {
-        let store = Store::open(&args.state_dir)?;
+        let (store_tx, store_rx) = mpsc::channel();
+        let store = Store::open_with_notifier(&args.state_dir, store_tx)?;
         seed_demo_if_requested(&store, args.seed_demo.as_deref())?;
+        let state_cache = AppStateCache::hydrate(&store, &args.browser)?;
         let selected_session_id = if args.select_latest {
-            store
-                .list_sessions()?
+            state_cache
+                .sessions
                 .first()
                 .map(|session| session.id.clone())
         } else {
@@ -247,8 +534,10 @@ impl App {
             .unwrap_or(args.agent);
         let selected_row = 0;
         let _ = had_stored_model;
-        Ok(Self {
+        let mut app = Self {
             store,
+            store_rx,
+            state_cache,
             args,
             selected_session_id,
             composer: Composer::default(),
@@ -268,69 +557,63 @@ impl App {
             quit_hint_until: None,
             escape_stop_until: None,
             native_history: NativeHistoryState::default(),
-        })
+        };
+        app.refresh_cached_projection();
+        Ok(app)
     }
 
-    fn workbench_state(&self) -> Result<WorkbenchState> {
-        let sessions = self.store.list_sessions()?;
-        let current_id = self.selected_session_id.as_deref();
-        let current_events = current_id
-            .map(|id| self.store.events_for_session(id))
-            .transpose()?
-            .unwrap_or_default();
-        let all_events = if self.history_tasks_are_visible() {
-            sessions
-                .iter()
-                .map(|session| {
-                    self.store
-                        .events_for_session(&session.id)
-                        .map(|events| (session.id.clone(), events))
-                })
-                .collect::<Result<Vec<_>>>()?
-        } else {
-            let Some(id) = current_id else {
-                return Ok(project_workbench(
-                    &sessions,
-                    &current_events,
-                    &[],
-                    current_id,
-                    self.browser.clone(),
-                ));
-            };
-            let mut session_ids = vec![id.to_string()];
-            let mut index = 0;
-            while index < session_ids.len() {
-                let parent_id = session_ids[index].clone();
-                for session in sessions
-                    .iter()
-                    .filter(|session| session.parent_id.as_deref() == Some(parent_id.as_str()))
-                {
-                    if !session_ids.iter().any(|id| id == &session.id) {
-                        session_ids.push(session.id.clone());
-                    }
-                }
-                index += 1;
-            }
-            session_ids
-                .into_iter()
-                .map(|session_id| {
-                    if session_id == id {
-                        Ok((session_id, current_events.clone()))
-                    } else {
-                        self.store
-                            .events_for_session(&session_id)
-                            .map(|events| (session_id, events))
-                    }
-                })
-                .collect::<Result<Vec<_>>>()?
-        };
-        Ok(project_workbench(
-            &sessions,
-            &current_events,
-            &all_events,
-            current_id,
-            self.browser.clone(),
-        ))
+    fn workbench_state(&mut self) -> Result<WorkbenchState> {
+        Ok(self.refresh_cached_projection().clone())
+    }
+
+    fn refresh_cached_projection(&mut self) -> &WorkbenchState {
+        let selected_session_id = self.selected_session_id.clone();
+        let browser = self.browser.clone();
+        let history_tasks_visible = self.history_tasks_are_visible();
+        self.state_cache.project_if_needed(
+            selected_session_id.as_deref(),
+            &browser,
+            history_tasks_visible,
+        )
+    }
+
+    fn drain_store_notifications(&mut self) -> Result<bool> {
+        let mut changed = false;
+        while let Ok(notification) = self.store_rx.try_recv() {
+            changed |= self
+                .state_cache
+                .apply_notification(&self.store, notification)?;
+        }
+        if changed {
+            self.refresh_cached_projection();
+        }
+        Ok(changed)
+    }
+
+    fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
+        let changed = self.state_cache.refresh_all(&self.store)?;
+        if changed {
+            self.refresh_cached_projection();
+        }
+        Ok(changed)
+    }
+
+    fn cached_events_for_session(&self, session_id: &str) -> &[EventRecord] {
+        self.state_cache.events_for_session(session_id)
+    }
+
+    fn cached_events_after_seq(&self, session_id: &str, after_seq: i64) -> Vec<EventRecord> {
+        self.state_cache.events_after_seq(session_id, after_seq)
+    }
+
+    fn cached_last_seq_for_session(&self, session_id: &str) -> i64 {
+        self.state_cache.last_seq_for_session(session_id)
+    }
+
+    fn empty_workbench_state_with_failure(&self) -> WorkbenchState {
+        let mut state = empty_workbench_state(&self.browser);
+        state.failure = Some("Could not load state.".to_string());
+        state
     }
 
     fn history_tasks_are_visible(&self) -> bool {
@@ -357,7 +640,13 @@ impl App {
             if let Some(session) = self
                 .selected_session_id
                 .as_deref()
-                .and_then(|id| self.store.load_session(id).ok().flatten())
+                .and_then(|id| {
+                    self.state_cache
+                        .sessions
+                        .iter()
+                        .find(|session| session.id == id)
+                })
+                .cloned()
             {
                 if session.status == SessionStatus::Failed {
                     self.execute_failed_selection(session.id)?;
@@ -370,7 +659,13 @@ impl App {
         if let Some(session) = self
             .selected_session_id
             .as_deref()
-            .and_then(|id| self.store.load_session(id).ok().flatten())
+            .and_then(|id| {
+                self.state_cache
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+            })
+            .cloned()
         {
             self.dispatch(AppCommand::SendFollowup {
                 session_id: session.id,
@@ -459,6 +754,7 @@ impl App {
             AppCommand::SaveAuth(secret) => self.save_auth(secret)?,
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
         }
+        self.drain_store_notifications()?;
         Ok(())
     }
 
@@ -470,10 +766,12 @@ impl App {
         let backend = self.agent_backend;
         let model = self.provider_model.clone();
         let browser = self.browser.clone();
+        let notifier = self.store.notifier();
         thread::Builder::new()
             .name(format!("browser-use-agent-{session_id}"))
             .spawn(move || {
-                if let Err(error) = run_agent_thread(state_dir, session_id, backend, model, browser)
+                if let Err(error) =
+                    run_agent_thread(state_dir, session_id, backend, model, browser, notifier)
                 {
                     eprintln!("agent thread failed: {error:#}");
                 }
@@ -510,8 +808,10 @@ impl App {
             return Ok(false);
         };
         Ok(self
-            .store
-            .load_session(id)?
+            .state_cache
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
             .is_some_and(|session| session.status.is_active()))
     }
 
@@ -541,6 +841,7 @@ impl App {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return Ok(false);
         }
+        self.drain_store_notifications()?;
         if key.code != KeyCode::Esc || !key.modifiers.is_empty() {
             self.escape_stop_until = None;
         }
@@ -700,6 +1001,7 @@ impl App {
             } => self.complete_demo_result()?,
             _ => {}
         }
+        self.drain_store_notifications()?;
         Ok(false)
     }
 
@@ -724,13 +1026,13 @@ impl App {
             && self.surface == Surface::Main
             && self.selected_session_id.is_none()
             && self.composer.is_empty()
-            && self.store.list_sessions()?.is_empty())
+            && self.state_cache.sessions.is_empty())
     }
 
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
             Surface::History => {
-                let sessions = self.store.list_sessions()?;
+                let sessions = &self.state_cache.sessions;
                 if let Some(session) =
                     sessions.get(self.selected_row.min(sessions.len().saturating_sub(1)))
                 {
@@ -793,7 +1095,7 @@ impl App {
     }
 
     fn resume_selected_history(&mut self) -> Result<()> {
-        let sessions = self.store.list_sessions()?;
+        let sessions = &self.state_cache.sessions;
         if let Some(session) = sessions.get(self.selected_row.min(sessions.len().saturating_sub(1)))
         {
             self.dispatch(AppCommand::SelectHistory(session.id.clone()))?;
@@ -1034,7 +1336,7 @@ impl App {
         Ok(())
     }
 
-    fn selectable_row_count(&self) -> Result<usize> {
+    fn selectable_row_count(&mut self) -> Result<usize> {
         Ok(match self.surface {
             Surface::Main => {
                 if self.is_first_run_setup_visible()? {
@@ -1049,7 +1351,7 @@ impl App {
             Surface::Model => MODEL_CHOICES.len(),
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
-            Surface::History => self.store.list_sessions()?.len(),
+            Surface::History => self.state_cache.sessions.len(),
             Surface::Developer => 1,
         })
     }
@@ -1091,7 +1393,7 @@ impl App {
         Ok(())
     }
 
-    fn main_selection_count(&self) -> Result<usize> {
+    fn main_selection_count(&mut self) -> Result<usize> {
         let state = self.workbench_state()?;
         Ok(match self.product_state(&state) {
             ProductState::Failed => 4,
@@ -1155,7 +1457,7 @@ impl App {
         }
     }
 
-    fn should_print_and_exit(&self) -> Result<bool> {
+    fn should_print_and_exit(&mut self) -> Result<bool> {
         if self.surface != Surface::Main || self.is_first_run_setup_visible()? {
             return Ok(false);
         }
@@ -1417,8 +1719,6 @@ fn print_native_transcript(app: &mut App) -> Result<()> {
 }
 
 fn run_terminal(mut app: App) -> Result<()> {
-    const MAX_INPUT_EVENTS_PER_FRAME: usize = 16;
-
     let live_height = crossterm::terminal::size()
         .map(|(_, height)| height.saturating_sub(1).max(12))
         .unwrap_or_else(|_| app.live_viewport_height());
@@ -1441,24 +1741,26 @@ fn run_terminal(mut app: App) -> Result<()> {
         },
     )?;
     let result = (|| -> Result<()> {
+        let mut draw_needed = true;
+        let mut last_fallback_refresh = Instant::now();
         loop {
-            draw_terminal_frame(&mut terminal, &mut app)?;
-            if event::poll(Duration::from_millis(100))? {
-                let mut should_quit = false;
-                for _ in 0..MAX_INPUT_EVENTS_PER_FRAME {
-                    let event = event::read()?;
-                    if handle_terminal_event(event, &mut app, &mut terminal)? {
-                        should_quit = true;
-                        break;
-                    }
-                    if !event::poll(Duration::ZERO)? {
-                        break;
-                    }
-                }
-                if should_quit {
-                    break Ok(());
-                }
+            draw_needed |= app.drain_store_notifications()?;
+            if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
+                draw_needed |= app.refresh_state_cache_from_store()?;
+                last_fallback_refresh = Instant::now();
             }
+            if draw_needed {
+                draw_terminal_frame(&mut terminal, &mut app)?;
+                draw_needed = false;
+            }
+            if !event::poll(INPUT_POLL_INTERVAL)? {
+                continue;
+            }
+            let event = event::read()?;
+            if handle_terminal_event(event, &mut app, &mut terminal)? {
+                break Ok(());
+            }
+            draw_needed = true;
         }
     })();
     let restore_result = restore_terminal(terminal.backend_mut());
@@ -1562,8 +1864,7 @@ fn maybe_emit_native_transcript(
             app.native_history.reset();
             return Ok(());
         }
-        let events = app.store.events_for_session(&session.id)?;
-        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        let last_seq = app.cached_last_seq_for_session(&session.id);
         let lines = native_scrollback_lines(app, size.width)?;
         if !should_use_native_scrollback(size.height, lines.len()) {
             app.native_history.reset();
@@ -1575,9 +1876,7 @@ fn maybe_emit_native_transcript(
         return Ok(());
     }
 
-    let events = app
-        .store
-        .events_after_seq(&session.id, app.native_history.last_seq)?;
+    let events = app.cached_events_after_seq(&session.id, app.native_history.last_seq);
     if events.is_empty() {
         return Ok(());
     }

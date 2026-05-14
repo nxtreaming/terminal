@@ -2041,14 +2041,16 @@ fn dispatch_parallel_tool_batch(
         .map(|call| telemetry.start_tool_span(step_span, &session.id, turn_idx, call))
         .collect::<Vec<_>>();
     let state_dir = store.state_dir().to_path_buf();
+    let notifier = store.notifier();
     let handles = batch
         .iter()
         .cloned()
         .map(|call| {
             let state_dir = state_dir.clone();
             let session = session.clone();
+            let notifier = notifier.clone();
             thread::spawn(move || {
-                let store = Store::open(state_dir)?;
+                let store = Store::open_with_optional_notifier(state_dir, notifier)?;
                 dispatch_parallel_tool_call_recoverably(&store, &session, &call)
             })
         })
