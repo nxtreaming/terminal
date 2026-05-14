@@ -2,7 +2,7 @@ use std::path::PathBuf;
 
 use anyhow::Result;
 use browser_use_core::{run_existing_session_from_config, AgentRunOptions, ProviderRunConfig};
-use browser_use_store::Store;
+use browser_use_store::{Store, StoreNotifier};
 
 use crate::settings::AgentBackend;
 
@@ -12,8 +12,9 @@ pub(crate) fn run_agent_thread(
     backend: AgentBackend,
     model: String,
     browser: String,
+    notifier: Option<StoreNotifier>,
 ) -> Result<()> {
-    let store = Store::open(&state_dir)?;
+    let store = Store::open_with_optional_notifier(&state_dir, notifier)?;
     let config = ProviderRunConfig::new(backend.into(), model)
         .with_options(tui_agent_options(&browser, &session_id))
         .with_fake_result("Fake result from the Rust TUI agent loop.");

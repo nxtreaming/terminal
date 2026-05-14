@@ -479,7 +479,7 @@ def smoke_session_switch_clears_previous_transcript(binary: Path) -> None:
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def smoke_large_composer_input_is_batched(binary: Path) -> None:
+def smoke_large_composer_input_is_responsive(binary: Path) -> None:
     session = f"but-smoke-large-input-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-large-input-"))
     try:
@@ -496,9 +496,9 @@ def smoke_large_composer_input_is_batched(binary: Path) -> None:
         started = time.time()
         for offset in range(0, len(large_text), 50):
             tmux_send_literal(session, large_text[offset : offset + 50])
-        typed = wait_for(session, "x" * 80, "large-input-typed", timeout=4.0)
+        typed = wait_for(session, "x" * 80, "large-input-typed", timeout=1.5)
         elapsed = time.time() - started
-        if elapsed > 4.0:
+        if elapsed > 1.5:
             raise AssertionError(f"large input took too long to appear: {elapsed:.2f}s")
         assert_not_contains(typed, "^[[200~", "large input should not leak bracketed paste markers")
         assert_not_contains(typed, "^[[", "large input should not leak escape sequences")
@@ -595,7 +595,7 @@ def main() -> int:
     smoke_short_completed_history_has_live_preview(binary)
     smoke_main_resize_does_not_duplicate_transcript(binary)
     smoke_session_switch_clears_previous_transcript(binary)
-    smoke_large_composer_input_is_batched(binary)
+    smoke_large_composer_input_is_responsive(binary)
     smoke_failed_retry_switches_to_live_running(binary)
     smoke_completed_plain_output(binary)
     print("tui terminal smoke passed")
