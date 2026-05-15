@@ -2304,6 +2304,7 @@ Rules:
 
 - child internal prompts do not render as parent user prompts;
 - child final answers do not render as parent assistant final answers;
+- child sessions do not appear as top-level history rows;
 - parent gets a `SubagentResultCell`;
 - full transcript overlay can expand child details;
 - developer/debug overlay can show raw child event stream.
@@ -2345,6 +2346,7 @@ subagent task:
 history overlay:
   assert opening overlay hides normal dock body
   assert closing overlay restores dock
+  assert Enter and resume select projected root rows, not raw child sessions
 
 resize:
   assert scrollback rebuilt from cells

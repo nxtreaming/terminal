@@ -1021,11 +1021,12 @@ impl App {
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
             Surface::History => {
-                let sessions = &self.state_cache.sessions;
-                if let Some(session) =
-                    sessions.get(self.selected_row.min(sessions.len().saturating_sub(1)))
+                let state = self.workbench_state()?.clone();
+                if let Some(row) = state
+                    .history
+                    .get(self.selected_row.min(state.history.len().saturating_sub(1)))
                 {
-                    self.dispatch(AppCommand::SelectHistory(session.id.clone()))?;
+                    self.dispatch(AppCommand::SelectHistory(row.session_id.clone()))?;
                 }
             }
             Surface::Setup => self.execute_first_run_setup_selection()?,
@@ -1084,10 +1085,12 @@ impl App {
     }
 
     fn resume_selected_history(&mut self) -> Result<()> {
-        let sessions = &self.state_cache.sessions;
-        if let Some(session) = sessions.get(self.selected_row.min(sessions.len().saturating_sub(1)))
+        let state = self.workbench_state()?.clone();
+        if let Some(row) = state
+            .history
+            .get(self.selected_row.min(state.history.len().saturating_sub(1)))
         {
-            self.dispatch(AppCommand::SelectHistory(session.id.clone()))?;
+            self.dispatch(AppCommand::SelectHistory(row.session_id.clone()))?;
         }
         Ok(())
     }
@@ -1340,7 +1343,7 @@ impl App {
             Surface::Model => MODEL_CHOICES.len(),
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
-            Surface::History => self.state_cache.sessions.len(),
+            Surface::History => self.workbench_state()?.history.len(),
             Surface::Developer => 1,
         })
     }
@@ -1794,14 +1797,23 @@ fn desired_terminal_viewport_height(app: &App) -> Result<u16> {
     let terminal_height = crossterm::terminal::size()
         .map(|(_, height)| height)
         .unwrap_or(app.args.height);
+    let full_height = terminal_height
+        .saturating_sub(1)
+        .max(app.live_viewport_height());
+    let selected_status = app.selected_session_id.as_deref().and_then(|id| {
+        app.state_cache
+            .sessions
+            .iter()
+            .find(|session| session.id == id)
+            .map(|session| &session.status)
+    });
     if app.surface != Surface::Main
         || app.is_slash_palette_active()
         || app.is_first_run_setup_visible()?
         || app.selected_session_id.is_none()
+        || selected_status.is_some_and(SessionStatus::is_active)
     {
-        return Ok(terminal_height
-            .saturating_sub(1)
-            .max(app.live_viewport_height()));
+        return Ok(full_height);
     }
     Ok(app.live_viewport_height())
 }
@@ -1924,7 +1936,7 @@ fn maybe_emit_native_transcript(
             width,
             &mut last_group,
         );
-        insert_native_lines(terminal, lines)?;
+        insert_initial_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session_with_group(session_id, last_seq, last_group);
         return Ok(());
@@ -1998,6 +2010,25 @@ fn insert_native_lines(
         Paragraph::new(lines).render(buf.area, buf);
     })?;
     Ok(())
+}
+
+fn insert_initial_native_lines(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    mut lines: Vec<ratatui::text::Line<'static>>,
+) -> Result<()> {
+    if lines.is_empty() {
+        return Ok(());
+    }
+    let viewport_height = terminal.size()?.height;
+    let terminal_height = crossterm::terminal::size()
+        .map(|(_, height)| height)
+        .unwrap_or(viewport_height);
+    let line_count = u16::try_from(lines.len()).unwrap_or(u16::MAX);
+    let filler = terminal_height
+        .saturating_sub(viewport_height)
+        .saturating_sub(line_count);
+    lines.extend((0..filler).map(|_| ratatui::text::Line::from("")));
+    insert_native_lines(terminal, lines)
 }
 
 fn restore_terminal(mut target: impl io::Write) -> Result<()> {
@@ -2416,6 +2447,50 @@ mod redesign_tests {
             .enumerate()
             .any(|(idx, line)| idx >= input_row && line.contains("/model")));
         assert!(screen.contains("/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn history_selection_uses_projected_root_task_rows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "parent task"}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo-explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "session.input",
+            serde_json::json!({"text": "child helper task"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "session.cancelled",
+            serde_json::json!({"reason": "test"}),
+        )?;
+        app.drain_store_notifications()?;
+        app.open_surface(Surface::History);
+
+        let state = app.workbench_state()?.clone();
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].session_id, parent.id);
+
+        app.resume_selected_history()?;
+        assert_eq!(app.selected_session_id.as_deref(), Some(parent.id.as_str()));
+
+        app.selected_session_id = None;
+        app.open_surface(Surface::History);
+        app.execute_surface_selection()?;
+        assert_eq!(app.selected_session_id.as_deref(), Some(parent.id.as_str()));
         Ok(())
     }
 
@@ -2974,7 +3049,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn child_agent_progress_is_visible_in_parent_live_view() -> Result<()> {
+    fn child_agent_progress_is_summarized_in_parent_live_view() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -3013,9 +3088,11 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": read"));
         assert!(screen.contains(": subagent"));
         assert!(screen.contains("repo-explorer"));
+        assert!(!screen.contains(": read"));
+        assert!(!screen.contains("README.md"));
+        assert!(!screen.contains("Mapping the main crates."));
         Ok(())
     }
 
@@ -3083,7 +3160,7 @@ mod redesign_tests {
         assert!(text.contains("repo-explorer started"));
         assert!(text.contains("subagent finished"));
         assert!(text.contains("Short helper summary"));
-        assert!(text.contains("README.md"));
+        assert!(!text.contains("README.md"));
         assert!(!text.contains("read every repo file"));
         assert!(!text.contains("CHILD FULL DETAILS SHOULD NOT BE TOP LEVEL"));
         Ok(())

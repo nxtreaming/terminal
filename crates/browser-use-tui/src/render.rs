@@ -151,10 +151,20 @@ fn render_main(
     let body_width = area.width;
     let native_scrollback_active =
         app.native_scrollback_is_active() && !app.surface.is_bottom_pane();
+    let show_footer = app.surface.is_bottom_pane()
+        || app
+            .quit_hint_until
+            .is_some_and(|until| std::time::Instant::now() <= until)
+        || app.escape_stop_is_pending();
+    let footer_h = u16::from(show_footer && area.height > bottom_h);
+    let max_body_h = area
+        .height
+        .saturating_sub(bottom_h)
+        .saturating_sub(footer_h);
     let body = if app.surface.is_bottom_pane() {
         Vec::new()
     } else if native_scrollback_active {
-        native_replay_live_lines(app, state, product_state, body_width, u16::MAX)
+        native_replay_live_lines(app, state, product_state, body_width, max_body_h)
     } else {
         match product_state {
             ProductState::SetupNeeded => setup_lines(app),
@@ -165,23 +175,36 @@ fn render_main(
             | ProductState::Cancelled => work_lines(state, app, body_width, product_state),
         }
     };
-    let show_footer = app.surface.is_bottom_pane()
-        || app
-            .quit_hint_until
-            .is_some_and(|until| std::time::Instant::now() <= until)
-        || app.escape_stop_is_pending();
-    let pin_bottom = should_pin_main_bottom(product_state);
+    let pin_bottom = should_pin_main_bottom(product_state, native_scrollback_active);
     let (body_area, bottom_area, footer_area) =
         main_layout_areas(area, bottom_h, body.len(), show_footer, pin_bottom);
     let mut body = body;
     if body.len() > body_area.height as usize {
         body = visible_main_body_lines(body, body_area.height, product_state);
     }
+    let body_render_area = if pin_bottom
+        && !body.is_empty()
+        && body.len() < body_area.height as usize
+    {
+        let empty_rows = body_area.height.saturating_sub(body.len() as u16);
+        let top_gap = match product_state {
+            ProductState::Result => empty_rows.saturating_sub(4).min(8),
+            ProductState::Running | ProductState::Failed | ProductState::Cancelled => empty_rows,
+            ProductState::Ready | ProductState::SetupNeeded => 0,
+        };
+        Rect {
+            y: body_area.y.saturating_add(top_gap),
+            height: body_area.height.saturating_sub(top_gap),
+            ..body_area
+        }
+    } else {
+        body_area
+    };
     frame.render_widget(
         Paragraph::new(body)
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
-        body_area,
+        body_render_area,
     );
     if app.surface.is_bottom_pane() {
         render_bottom_pane(frame, bottom_area, app, state, app.surface);
@@ -222,8 +245,15 @@ fn main_layout_areas(
     (chunks[0], chunks[1], chunks[2])
 }
 
-fn should_pin_main_bottom(_product_state: ProductState) -> bool {
-    false
+fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active: bool) -> bool {
+    native_scrollback_active
+        || matches!(
+            product_state,
+            ProductState::Running
+                | ProductState::Result
+                | ProductState::Failed
+                | ProductState::Cancelled
+        )
 }
 
 fn main_bottom_height_for(
@@ -337,25 +367,27 @@ fn native_replay_live_lines(
 ) -> Vec<Line<'static>> {
     let lines = match product_state {
         ProductState::Running => {
-            let mut lines = Vec::new();
-            append_ascii_text_block(
-                &mut lines,
-                "status",
-                &["running browser task".to_string()],
-                Some("live"),
-            );
             if let Some(streaming_text) = current_streaming_text(state) {
-                lines.push(Line::from(""));
+                let mut lines = Vec::new();
                 append_streaming_block(&mut lines, streaming_text, width);
+                lines
+            } else {
+                let mut lines = Vec::new();
+                append_ascii_text_block(
+                    &mut lines,
+                    "status",
+                    &["running browser task".to_string()],
+                    Some("live"),
+                );
+                lines
             }
-            lines
         }
         ProductState::Failed => {
             let error = state.failure.as_deref().unwrap_or("The task failed.");
             let (primary, secondary) = failure_actions(error);
-            let mut lines = Vec::new();
+            let mut next_lines = Vec::new();
             append_ascii_lines_block(
-                &mut lines,
+                &mut next_lines,
                 "next",
                 vec![
                     selected(primary, 0, app.selected_row),
@@ -365,12 +397,12 @@ fn native_replay_live_lines(
                 ],
                 None,
             );
-            lines
+            next_lines
         }
         ProductState::Cancelled => {
-            let mut lines = Vec::new();
+            let mut next_lines = Vec::new();
             append_ascii_lines_block(
-                &mut lines,
+                &mut next_lines,
                 "next",
                 vec![
                     selected("Continue with a follow-up", 0, app.selected_row),
@@ -379,7 +411,7 @@ fn native_replay_live_lines(
                 ],
                 None,
             );
-            lines
+            next_lines
         }
         ProductState::Result => Vec::new(),
         ProductState::Ready => Vec::new(),
@@ -1236,7 +1268,10 @@ fn tool_aware_chronological_lines(
     let mut wrote_event = false;
     let mut pending_delta = PendingDeltaBlock::default();
     for event in events {
-        if event.session_id == session.id && event.event_type == "session.input" {
+        if event.session_id != session.id {
+            continue;
+        }
+        if event.event_type == "session.input" {
             continue;
         }
         if event.event_type == "model.thinking_delta" {
@@ -1656,11 +1691,11 @@ fn append_native_timeline_event(
     event: &EventRecord,
     width: u16,
 ) {
+    if !is_root_session_event(state, event) {
+        return;
+    }
     match event.event_type.as_str() {
         "session.input" | "session.followup" => {
-            if !is_root_session_event(state, event) {
-                return;
-            }
             if let Some(prompt) = event
                 .payload
                 .get("text")
@@ -1674,9 +1709,6 @@ fn append_native_timeline_event(
             }
         }
         "session.done" => {
-            if !is_root_session_event(state, event) {
-                return;
-            }
             if let Some(result) = event
                 .payload
                 .get("result")
@@ -1689,9 +1721,6 @@ fn append_native_timeline_event(
             }
         }
         "session.failed" => {
-            if !is_root_session_event(state, event) {
-                return;
-            }
             let error = event
                 .payload
                 .get("error")
@@ -1702,9 +1731,6 @@ fn append_native_timeline_event(
             append_ascii_text_block(lines, "error", &[friendly_error_message(error)], None);
         }
         "session.cancelled" => {
-            if !is_root_session_event(state, event) {
-                return;
-            }
             last_group.take();
             push_gap_if_needed(lines);
             append_ascii_text_block(

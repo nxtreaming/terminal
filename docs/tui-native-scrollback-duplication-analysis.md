@@ -20,6 +20,7 @@ There should be clear ownership:
 - Full completed transcript: native terminal scrollback.
 - Current composer and controls: small Ratatui inline viewport.
 - History picker: full-screen Ratatui surface.
+- Top-level history rows: root task sessions only.
 - Child/subagent summaries: parent `agent.completed` preview, not child `session.done` as another top-level answer.
 
 Instead, the current implementation mixes these modes. After replaying the transcript into terminal scrollback, it still lets the main Ratatui render path build a full transcript view. That makes the UI appear duplicated even when the persisted state contains only one parent final answer.
@@ -131,25 +132,33 @@ Parent-level `agent.spawned`, `agent.completed`, `agent.failed`, and `agent.canc
 
 This prevents child final answers from appearing once as standalone answers and again as `agent.completed` previews.
 
-### 3. Make History A Full-Screen Surface
+### 3. Project History From Root Tasks Only
+
+History rows should come from the same projected workbench model the user sees on screen.
+Do not select history rows from the raw session vector, because that vector also contains child/subagent sessions.
+
+Every history selection path, including `Enter` and resume, should resolve through `WorkbenchState.history`.
+
+### 4. Make History A Full-Screen Surface
 
 Remove `Surface::History` from the bottom-pane set.
 
 Opening history should temporarily suspend native transcript rendering and show a clean full-screen list. Selecting a task should close history, clear the current app frame if needed, then replay the selected transcript once.
 
-### 4. Separate Terminal Viewport Height By Mode
+### 5. Separate Terminal Viewport Height By Mode
 
 Use a tall inline viewport only when Ratatui owns the full screen.
 
 When native transcript mode is active, keep the inline viewport small enough for composer/controls. The transcript content should live above it in terminal scrollback.
 
-### 5. Add Regression Coverage For The Real Failure
+### 6. Add Regression Coverage For The Real Failure
 
 The smoke test should assert these cases in a real tmux terminal:
 
 - selecting a completed task prints the first and last transcript lines exactly once in scrollback;
 - the visible viewport shows the composer and does not duplicate the full transcript;
 - selecting a task with a subagent does not show the child `session.done` result as a standalone answer;
+- selecting from history opens the projected root task, not a child session at the same raw index;
 - opening history after a selected transcript shows one clean history list, not transcript text plus list text;
 - no duplicate app chrome appears after switching sessions, resizing, pressing `Tab`, and returning with `Esc`.
 

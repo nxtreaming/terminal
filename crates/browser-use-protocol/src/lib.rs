@@ -955,6 +955,7 @@ pub fn project_workbench(
 
     let mut history = sessions
         .iter()
+        .filter(|session| session.parent_id.is_none())
         .map(|session| {
             let events = all_events
                 .iter()
@@ -1479,6 +1480,33 @@ mod tests {
         let state = project_workbench(&sessions, &[], &[], None, "local chrome");
         assert!(state.current_session.is_none());
         assert_eq!(state.history.len(), 1);
+    }
+
+    #[test]
+    fn history_contains_only_root_tasks() {
+        let sessions = vec![
+            SessionMeta {
+                id: "parent".to_string(),
+                parent_id: None,
+                cwd: "/tmp".to_string(),
+                artifact_root: "/tmp/artifacts/parent".to_string(),
+                status: SessionStatus::Done,
+                created_ms: 1,
+                updated_ms: 2,
+            },
+            SessionMeta {
+                id: "child".to_string(),
+                parent_id: Some("parent".to_string()),
+                cwd: "/tmp".to_string(),
+                artifact_root: "/tmp/artifacts/child".to_string(),
+                status: SessionStatus::Done,
+                created_ms: 3,
+                updated_ms: 4,
+            },
+        ];
+        let state = project_workbench(&sessions, &[], &[], None, "local chrome");
+        assert_eq!(state.history.len(), 1);
+        assert_eq!(state.history[0].session_id, "parent");
     }
 
     #[test]

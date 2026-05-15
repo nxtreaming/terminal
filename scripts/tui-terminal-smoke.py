@@ -159,6 +159,21 @@ def assert_first_content_near_top(text: str, max_row: int, context: str) -> None
     raise AssertionError(f"{context}: capture had no visible content\n\n{text}")
 
 
+def assert_max_consecutive_blank_lines(text: str, max_blank_lines: int, context: str) -> None:
+    longest = 0
+    current = 0
+    for line in text.splitlines():
+        if line.strip():
+            current = 0
+        else:
+            current += 1
+            longest = max(longest, current)
+    if longest > max_blank_lines:
+        raise AssertionError(
+            f"{context}: expected at most {max_blank_lines} consecutive blank visible lines, saw {longest}\n\n{text}"
+        )
+
+
 def assert_no_ansi(text: str, context: str) -> None:
     if re.search(r"\x1b\[[0-?]*[ -/]*[@-~]", text):
         raise AssertionError(f"{context}: output contained ANSI escapes\n\n{text!r}")
@@ -478,6 +493,11 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
         assert_contains(visible, "Ask a follow-up", "live viewport should redraw the composer after transcript insert")
         assert_contains(visible, "scroll check line 60", "live viewport should show the native transcript tail")
         assert_contains(visible, "https://news.ycombinator.com", "live viewport should show source above composer")
+        assert_max_consecutive_blank_lines(
+            visible,
+            8,
+            "long completed history should not leave a large blank gap in the visible terminal",
+        )
         assert_row_near_bottom(
             visible,
             "Ask a follow-up",
@@ -529,12 +549,23 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
         assert_contains(selected, "Top 5 Hacker News posts", "selected task should be replayed to native scrollback")
         assert_contains(visible, "Top 5 Hacker News posts", "live viewport should not be blank for completed history")
         assert_contains(visible, "https://news.ycombinator.com", "live viewport should show completed source")
+        assert_max_consecutive_blank_lines(
+            visible,
+            8,
+            "short completed history should not leave a large blank gap in the visible terminal",
+        )
         assert_row_gap_at_most(
             visible,
             "https://news.ycombinator.com",
             "Ask a follow-up",
-            5,
+            8,
             "short completed composer should stay attached to the result",
+        )
+        assert_row_near_bottom(
+            visible,
+            "Ask a follow-up",
+            8,
+            "short completed composer should stay pinned to the terminal bottom",
         )
     finally:
         tmux("kill-session", "-t", session, check=False)
@@ -610,6 +641,11 @@ def smoke_session_switch_clears_previous_transcript(binary: Path) -> None:
         assert_contains(visible, "Ask a follow-up", "session switch should redraw the composer after replay")
         assert_not_contains(visible, "^[[", "session switch clear should not leak escape sequences")
         assert_first_content_near_top(visible, 2, "selected long transcript should not drift down after switch")
+        assert_max_consecutive_blank_lines(
+            visible,
+            8,
+            "selected long transcript should not leave a large blank gap after switch",
+        )
 
         tmux_send(session, "Tab")
         wait_for(session, "browser-use / previous work", "switch-history-reopen-transient")
