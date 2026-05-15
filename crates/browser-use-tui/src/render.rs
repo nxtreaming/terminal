@@ -12,6 +12,7 @@ use ratatui::{Frame, Terminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::composer::composer_rule;
+use crate::palette;
 use crate::settings::{
     is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CLAUDE_CODE, ACCOUNT_CODEX,
     ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, MODEL_CHOICES,
@@ -254,7 +255,11 @@ fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active:
 }
 
 pub(crate) fn main_viewport_height(app: &App, width: u16) -> u16 {
-    composer_pane_height(app, ProductState::Ready, width)
+    let current = composer_pane_height(app, ProductState::Ready, width);
+    let input_h = composer_visual_input_lines(app, width);
+    let palette_h = (palette::max_item_count() as u16).min(8).saturating_add(3);
+    let max_palette = input_h.saturating_add(palette_h).saturating_add(2);
+    current.max(max_palette)
 }
 
 fn main_bottom_height_for(
@@ -314,7 +319,7 @@ fn slash_palette_pane_height(app: &App) -> u16 {
     if items.is_empty() {
         return 0;
     }
-    (items.len() as u16).min(8).saturating_add(4)
+    (items.len() as u16).min(8).saturating_add(3)
 }
 
 fn render_bottom_pane(
@@ -644,14 +649,11 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .unwrap_or(0)
         .max(8);
     let rule_w = width.saturating_sub(28);
-    let mut lines = vec![
-        Line::from(vec![
-            Span::styled("actions ", bold()),
-            Span::styled("-".repeat(rule_w), dim()),
-            Span::styled(" esc close", muted()),
-        ]),
-        Line::from(""),
-    ];
+    let mut lines = vec![Line::from(vec![
+        Span::styled("actions ", bold()),
+        Span::styled("-".repeat(rule_w), dim()),
+        Span::styled(" esc close", muted()),
+    ])];
     for (idx, item) in items.iter().enumerate() {
         let is_selected = idx == app.selected_row;
         let cmd_style = if is_selected { accent() } else { text_style() };

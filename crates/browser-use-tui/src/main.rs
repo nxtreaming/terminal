@@ -3237,6 +3237,34 @@ mod redesign_tests {
     }
 
     #[test]
+    fn slash_palette_does_not_resize_completed_history_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(session.id, last_seq);
+
+        let before = desired_terminal_viewport_height(&mut app)?;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        assert!(app.is_slash_palette_active());
+        let after = desired_terminal_viewport_height(&mut app)?;
+        assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
     fn followups_render_as_transcript_turns() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;

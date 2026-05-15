@@ -48,6 +48,10 @@ const ITEMS: [PaletteItem; 6] = [
     },
 ];
 
+pub(crate) const fn max_item_count() -> usize {
+    ITEMS.len()
+}
+
 pub(crate) fn items_filtered(filter: &str) -> Vec<PaletteItem> {
     let trimmed = filter.trim_start_matches('/').to_ascii_lowercase();
     if trimmed.is_empty() {

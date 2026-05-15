@@ -564,6 +564,13 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
             3,
             "slash palette should not push the completed transcript down",
         )
+        assert_row_gap_at_most(
+            slash,
+            "actions",
+            "/task",
+            3,
+            "slash palette should render in-place without a large redraw gap",
+        )
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
