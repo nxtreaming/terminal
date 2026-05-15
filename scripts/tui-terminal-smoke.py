@@ -296,6 +296,7 @@ def smoke_interactive_terminal(binary: Path) -> None:
         palette = wait_for(session, "/task", "slash-palette-open")
         assert_contains(palette, "/auth", "slash palette should fit every product action")
         assert_contains(palette, "up/down navigate", "slash palette footer should be visible")
+        assert_not_contains(palette, "filter actions", "slash palette should not show a redundant filter prompt")
         assert_first_content_near_top(palette, 2, "slash palette should not be pushed down by previous viewport state")
         wait_for(session, "/model", "slash-palette-open-model")
         tmux_send_literal(session, "bro")
