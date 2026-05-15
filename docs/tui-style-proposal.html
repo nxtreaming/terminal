@@ -1,0 +1,869 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Browser Use TUI Style Proposal</title>
+    <style>
+      :root {
+        color-scheme: dark;
+        --page: #080a08;
+        --surface: #0f120e;
+        --panel: #151a14;
+        --line: #252c24;
+        --line-strong: #353d34;
+        --text: #ECEEE8;
+        --muted: #8A9088;
+        --dim: #606860;
+        --faint: #3f463f;
+        --green: #6CA876;
+        --orange: #FF6A1A;
+        --font: "SF Mono", "Cascadia Code", "JetBrains Mono", "Menlo", monospace;
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background: var(--page);
+        color: var(--text);
+        font-family: var(--font);
+        font-variant-numeric: tabular-nums;
+        font-feature-settings: "calt" 0, "liga" 0;
+        -webkit-font-smoothing: antialiased;
+      }
+
+      .page {
+        width: min(1480px, calc(100vw - 36px));
+        margin: 0 auto;
+        padding: 42px 0 80px;
+      }
+
+      .hero {
+        display: grid;
+        grid-template-columns: minmax(0, 1.1fr) minmax(330px, 0.9fr);
+        gap: 26px;
+        align-items: end;
+        margin-bottom: 28px;
+      }
+
+      h1,
+      h2,
+      h3,
+      p {
+        margin: 0;
+      }
+
+      h1 {
+        font-size: 38px;
+        line-height: 1.05;
+        letter-spacing: 0;
+        text-transform: uppercase;
+      }
+
+      h2 {
+        margin-top: 52px;
+        margin-bottom: 16px;
+        font-size: 16px;
+        letter-spacing: 0.04em;
+        text-transform: uppercase;
+      }
+
+      h3 {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 16px;
+        margin-bottom: 10px;
+        color: var(--text);
+        font-size: 12px;
+        font-weight: 700;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .lede {
+        max-width: 78ch;
+        margin-top: 18px;
+        color: var(--muted);
+        font-size: 14px;
+        line-height: 1.7;
+      }
+
+      .note {
+        border: 1px solid var(--line);
+        background: var(--surface);
+        padding: 22px;
+      }
+
+      .note p {
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.65;
+      }
+
+      .kicker {
+        margin-bottom: 14px;
+        color: var(--green);
+        font-size: 11px;
+        font-weight: 700;
+        letter-spacing: 0.14em;
+        text-transform: uppercase;
+      }
+
+      .palette {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(150px, 1fr));
+        gap: 10px;
+      }
+
+      .swatch {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        padding: 12px;
+      }
+
+      .chip-color {
+        width: 100%;
+        height: 34px;
+        margin-bottom: 10px;
+        border: 1px solid rgba(236, 238, 232, 0.12);
+      }
+
+      .swatch b,
+      .swatch code {
+        display: block;
+        font-size: 11px;
+      }
+
+      .swatch code {
+        margin-top: 5px;
+        color: var(--muted);
+      }
+
+      .swatch p {
+        margin-top: 8px;
+        font-size: 10px;
+        color: var(--dim);
+        line-height: 1.5;
+      }
+
+      .palette-note {
+        margin-top: 12px;
+        color: var(--dim);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .grammar {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .component {
+        border: 1px solid var(--line);
+        background: var(--panel);
+        padding: 16px;
+      }
+
+      .component pre {
+        margin: 0;
+        color: var(--muted);
+        font: 12px/1.55 var(--font);
+        white-space: pre-wrap;
+      }
+
+      .states {
+        display: grid;
+        grid-template-columns: repeat(4, minmax(0, 1fr));
+        gap: 12px;
+        margin-top: 14px;
+        padding-top: 14px;
+        border-top: 1px solid var(--line);
+      }
+
+      .state pre {
+        margin: 0;
+        font: 11px/1.5 var(--font);
+        white-space: pre;
+      }
+
+      .state-label {
+        display: block;
+        margin-bottom: 6px;
+        color: var(--dim);
+        font-size: 10px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .screens {
+        display: grid;
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+        gap: 18px;
+      }
+
+      .screen {
+        border: 1px solid var(--line);
+        background: var(--surface);
+        padding: 16px;
+      }
+
+      .screen.wide {
+        grid-column: 1 / -1;
+      }
+
+      .screen h3 span:last-child {
+        color: var(--dim);
+        font-weight: 500;
+        letter-spacing: 0;
+        text-transform: none;
+      }
+
+      .terminal {
+        overflow: hidden;
+        border: 1px solid var(--line);
+        background: #0f120e;
+        padding: 18px;
+      }
+
+      pre {
+        margin: 0;
+        color: var(--muted);
+        font: 13px/1.5 var(--font);
+        tab-size: 2;
+        white-space: pre;
+      }
+
+      .t {
+        color: var(--text);
+      }
+
+      .m {
+        color: var(--muted);
+      }
+
+      .d {
+        color: var(--dim);
+      }
+
+      .g {
+        color: var(--green);
+      }
+
+      .o {
+        color: var(--orange);
+      }
+
+      .u {
+        text-decoration: underline;
+        color: var(--text);
+      }
+
+      .section {
+        margin-top: 52px;
+      }
+
+      .rules {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 14px;
+      }
+
+      .rule {
+        border: 1px solid var(--line);
+        background: var(--surface);
+        padding: 16px;
+      }
+
+      .rule b {
+        display: block;
+        margin-bottom: 8px;
+        color: var(--text);
+        font-size: 12px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .rule p {
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.6;
+      }
+
+      .small {
+        color: var(--dim);
+        font-size: 12px;
+      }
+
+      .widths {
+        display: grid;
+        grid-template-columns: minmax(0, 0.8fr) minmax(0, 1.4fr);
+        gap: 18px;
+      }
+
+      .width-label {
+        margin-bottom: 8px;
+        color: var(--dim);
+        font-size: 11px;
+        letter-spacing: 0.08em;
+        text-transform: uppercase;
+      }
+
+      .terminal.narrow pre {
+        font-size: 11px;
+        line-height: 1.5;
+      }
+
+      .annotation {
+        margin-top: 10px;
+        color: var(--dim);
+        font-size: 11px;
+        line-height: 1.55;
+      }
+
+      @media (max-width: 1100px) {
+        .hero,
+        .screens,
+        .grammar,
+        .rules,
+        .widths {
+          grid-template-columns: 1fr;
+        }
+
+        .palette {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+
+        .states {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main class="page">
+      <section class="hero">
+        <div>
+          <div class="kicker">Browser Use TUI style target — v2</div>
+          <h1>runtime cockpit, not chat log</h1>
+          <p class="lede">
+            Flat surfaces, four colors, four primitives, six screens. Everything in this
+            document maps 1:1 to something Ratatui can render — no shadows, no gradients,
+            no rounded corners, no invented depth.
+          </p>
+        </div>
+        <div class="note">
+          <p>
+            Changes from v1: depth tricks stripped, palette cut from 8 to 4, screens
+            cut from 13 to 6, every primitive shown in 4 states, narrow/wide comparison
+            for the cockpit screen, footers collapsed to <code>/</code>.
+          </p>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Color Tokens — 4 only</h2>
+        <div class="palette">
+          <div class="swatch">
+            <div class="chip-color" style="background:#ECEEE8"></div>
+            <b>text</b><code>#ECEEE8</code>
+            <p>default body text, active values, headings</p>
+          </div>
+          <div class="swatch">
+            <div class="chip-color" style="background:#8A9088"></div>
+            <b>muted</b><code>#8A9088</code>
+            <p>labels, hints, footer text, separators</p>
+          </div>
+          <div class="swatch">
+            <div class="chip-color" style="background:#6CA876"></div>
+            <b>green</b><code>#6CA876</code>
+            <p>ok, done, connected — desaturated on purpose, never focal</p>
+          </div>
+          <div class="swatch">
+            <div class="chip-color" style="background:#FF6A1A"></div>
+            <b>orange</b><code>#FF6A1A</code>
+            <p>the only loud color — active work, progress, errors with <code>[!]</code></p>
+          </div>
+        </div>
+        <p class="palette-note">
+          No blue. No red. No yellow. Links get an underline, not a color. Errors are
+          orange + <code>[!]</code>. Chrome colors (page, surface, panel, line, dim) exist
+          but are structure, not vocabulary — agents and humans should never have to learn them.
+        </p>
+      </section>
+
+      <section class="section">
+        <h2>Component Grammar — 4 primitives, every state</h2>
+        <div class="grammar">
+          <div class="component">
+            <h3><span>Objective Tree</span><span>top region · always visible</span></h3>
+<pre><span class="t">[box] Active objective</span>
+<span class="d"> |</span> <span class="g">[x]</span> Opened target
+<span class="d"> |</span> <span class="o">[&gt;]</span> Reading page
+<span class="d"> |</span> <span class="d">[ ]</span> Planning action
+<span class="d"> '</span> <span class="d">[ ]</span> Preparing answer</pre>
+            <div class="states">
+              <div class="state">
+                <span class="state-label">empty</span>
+<pre><span class="d">[box] No objective</span>
+<span class="d"> '</span> <span class="d">[ ]</span> idle</pre>
+              </div>
+              <div class="state">
+                <span class="state-label">working</span>
+<pre><span class="t">[box] Active</span>
+<span class="d"> |</span> <span class="g">[x]</span> opened
+<span class="d"> |</span> <span class="o">[&gt;]</span> reading
+<span class="d"> '</span> <span class="d">[ ]</span> answer</pre>
+              </div>
+              <div class="state">
+                <span class="state-label">done</span>
+<pre><span class="t">[box] Complete</span>
+<span class="d"> |</span> <span class="g">[x]</span> opened
+<span class="d"> |</span> <span class="g">[x]</span> read
+<span class="d"> '</span> <span class="g">[x]</span> answered</pre>
+              </div>
+              <div class="state">
+                <span class="state-label">failed</span>
+<pre><span class="t">[box] Stopped</span>
+<span class="d"> |</span> <span class="g">[x]</span> opened
+<span class="d"> |</span> <span class="o">[!]</span> click failed
+<span class="d"> '</span> <span class="d">[ ]</span> recover</pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="component">
+            <h3><span>Runtime Tabs</span><span>mid region · workspace switcher</span></h3>
+<pre><span class="d">TERMINAL</span>  <span class="g">RUNTIME *</span>  <span class="t">BROWSER</span>  <span class="t">HISTORY</span>  <span class="t">DEV</span>
+<span class="d">---------------------------------------------------------</span>
+
+active uses green underline · star marks unread
+inactive stays text · disabled goes dim</pre>
+            <div class="states">
+              <div class="state">
+                <span class="state-label">inactive</span>
+<pre><span class="t">TERMINAL</span>
+<span class="d">--------</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">active</span>
+<pre><span class="g">RUNTIME</span>
+<span class="g">-------</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">unread</span>
+<pre><span class="g">RUNTIME *</span>
+<span class="g">---------</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">disabled</span>
+<pre><span class="d">DEV</span>
+<span class="d">---</span></pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="component">
+            <h3><span>Metric Band</span><span>bottom region · stable columns</span></h3>
+<pre><span class="d">AI ENGINE</span>          <span class="d">SESSION</span>             <span class="d">BROWSER</span>
+<span class="t">GPT-5.5 · Codex</span>    <span class="o">1m 14s · running</span>    <span class="g">Local Chrome · idle</span>
+
+short labels, no colons, tabular numerals,
+columns align with the tab strip above.</pre>
+            <div class="states">
+              <div class="state">
+                <span class="state-label">idle</span>
+<pre><span class="d">SESSION</span>
+<span class="m">idle</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">running</span>
+<pre><span class="d">SESSION</span>
+<span class="o">1m 14s · running</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">done</span>
+<pre><span class="d">SESSION</span>
+<span class="g">14s · done</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">failed</span>
+<pre><span class="d">SESSION</span>
+<span class="o">2m · failed</span></pre>
+              </div>
+            </div>
+          </div>
+
+          <div class="component">
+            <h3><span>Progress Rail</span><span>bottom region · the heartbeat</span></h3>
+<pre><span class="t">Setting up browser context</span>
+<span class="o">|||||||||||||||||||||</span><span class="d">.....................</span>
+
+always present — idle full muted,
+working partial orange, done full green.</pre>
+            <div class="states">
+              <div class="state">
+                <span class="state-label">idle</span>
+<pre><span class="m">||||||||||||||||||||||||||||||||</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">working</span>
+<pre><span class="o">|||||||||||||||||</span><span class="d">...............</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">done</span>
+<pre><span class="g">||||||||||||||||||||||||||||||||</span></pre>
+              </div>
+              <div class="state">
+                <span class="state-label">failed</span>
+<pre><span class="o">|||||||||</span><span class="d">..</span><span class="o">|||</span><span class="d">..</span><span class="o">|</span><span class="d">..............</span></pre>
+              </div>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Screen Set — 6 screens</h2>
+        <p class="lede" style="margin-top:-4px;margin-bottom:20px">
+          Setup is one template that renders for account / model / browser / key.
+          Running, Result, and Failed are the same layout in three states.
+        </p>
+        <div class="screens">
+
+          <article class="screen wide">
+            <h3><span>01 Setup</span><span>one template · 4 fills</span></h3>
+            <div class="terminal">
+<pre><span class="d">browser-use setup</span> <span class="d">/</span> <span class="t">browser</span> <span class="d">--------------------------------------------------------------</span> <span class="d">step 3/3</span>
+
+  <span class="d">CHOOSE BROWSER</span>
+  <span class="g">&gt;</span> <span class="t">Browser Use cloud</span>         remote browser with live view
+    Local Chrome              visible on this machine
+    Headless Chromium         background runner
+
+  <span class="d">CURRENT</span>
+    <span class="t">Local Chrome</span> <span class="d">·</span> <span class="g">ready</span>
+
+<span class="d">----------------------------------------------------------------------------------------------</span>
+<span class="d">enter select</span>     <span class="d">esc back</span>                                                                  <span class="d">/</span></pre>
+            </div>
+            <p class="annotation">
+              uses: label-above-stack · selection cursor · footer.
+              The same template renders for: <span class="m">account</span> (Codex / Claude Code /
+              OpenAI / Anthropic / OpenRouter), <span class="m">model</span> (recommended / BYOK /
+              OpenRouter), <span class="m">browser</span> (above), <span class="m">api key</span> (label +
+              input box + validation line). One layout, four fills.
+            </p>
+          </article>
+
+          <article class="screen wide">
+            <h3><span>02 Home</span><span>empty state · no wordmark</span></h3>
+            <div class="terminal">
+<pre><span class="d">browser-use</span> <span class="d">------------------------------------------------------------------------</span> <span class="g">Local Chrome · idle</span>
+
+<span class="d">RECENT</span>  <span class="d">·</span>  <span class="d">26 total</span>
+<span class="g">[x]</span>  whats this repo about? explain super high level pls                          <span class="d">2h ago</span>
+<span class="g">[x]</span>  Read-only repository exploration: identify main crates                       <span class="d">2h ago</span>
+<span class="g">[x]</span>  what is this repo about?                                                     <span class="d">2h ago</span>
+<span class="g">[x]</span>  Read-only inspect this repository and summarise                              <span class="d">2h ago</span>
+
+<span class="d">ASK</span>
++--------------------------------------------------------------------------------------------+
+| <span class="d">Tell the browser what to do...</span>                                                             |
++--------------------------------------------------------------------------------------------+
+
+  <span class="t">[ new task ]</span>   [ history ]   [ change browser ]   [ choose model ]                       <span class="d">/</span>
+
+<span class="d">AI ENGINE</span>             <span class="d">ACCOUNT</span>               <span class="d">BROWSER</span>                  <span class="d">MODE</span>
+<span class="t">GPT-5.5</span>               <span class="t">Codex login</span>           <span class="g">Local Chrome</span>             <span class="t">Build</span>
+
+<span class="m">||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||</span></pre>
+            </div>
+            <p class="annotation">
+              wordmark gone. The header line itself is the brand because it's specific
+              (your browser, your status). Recents are plain rows — single <code>[x]</code> glyph,
+              prompt, right-aligned relative time. Same metric-band + progress as every other screen.
+            </p>
+          </article>
+
+          <article class="screen wide">
+            <h3><span>03 Running</span><span>cockpit · objective fixed on top</span></h3>
+            <div class="terminal">
+<pre><span class="t">[box] Active objective</span> <span class="d">--------------------------------------------------------------</span> <span class="o">working · 1m 14s</span>
+<span class="d"> |</span> <span class="g">[x]</span> Opened repository
+<span class="d"> |</span> <span class="g">[x]</span> Inspected main crates
+<span class="d"> |</span> <span class="o">[&gt;]</span> Summarising findings
+<span class="d"> '</span> <span class="d">[ ]</span> Awaiting follow-up
+
+<span class="d">TERMINAL</span>   <span class="g">RUNTIME *</span>   <span class="t">BROWSER</span>   <span class="t">HISTORY</span>   <span class="d">DEV</span>                                              <span class="d">/</span>
+<span class="d">----------------------------------------------------------------------------------------------</span>
+<span class="d">AGENT</span>              <span class="d">MODEL</span>                <span class="d">BROWSER</span>                  <span class="d">TASK</span>
+<span class="t">repo-explorer</span>      <span class="t">GPT-5.5 · Codex</span>      <span class="g">Local Chrome · idle</span>      <span class="t">whats this repo about?</span>
+
+<span class="m">// reading worker.py</span>
+<span class="m">// reading lib.rs</span>
+<span class="m">// ran  for f in crates/*/Cargo.toml; do echo '---' $f; ...</span>
+
+<span class="o">&lt;..&gt;</span> streaming response from GPT-5.5
+
+<span class="d">ASK</span>
++--------------------------------------------------------------------------------------------+
+| <span class="d">Type to steer the agent...</span>                                                                 |
++--------------------------------------------------------------------------------------------+
+
+  [ pause ]   [ open browser ]   [ rerun ]   [ new task ]                                    <span class="d">/</span>
+
+<span class="d">AI ENGINE</span>             <span class="d">SESSION</span>               <span class="d">BROWSER</span>                  <span class="d">EVENTS</span>
+<span class="t">GPT-5.5 · Codex</span>       <span class="o">1m 14s · running</span>      <span class="g">Local Chrome · idle</span>      <span class="t">6</span>
+
+<span class="o">|||||||||||||||||||||||||||||||||||||||||||||||</span><span class="d">.................................................</span></pre>
+            </div>
+            <p class="annotation">
+              objective stack stays fixed; runtime body scrolls underneath. Tab strip
+              has a hairline rule under it (no floating). The agent context band
+              (AGENT / MODEL / BROWSER / TASK) lives just under the tab strip — it tells
+              you what the agent <em>is</em>. The bottom band tells you what the runtime
+              <em>looks like</em>. Same primitive, different intent.
+            </p>
+          </article>
+
+          <article class="screen wide">
+            <h3><span>04 Result</span><span>same layout · result section open</span></h3>
+            <div class="terminal">
+<pre><span class="t">[box] Task complete</span> <span class="d">-----------------------------------------------------------------</span> <span class="g">done · 14s</span>
+<span class="d"> |</span> <span class="g">[x]</span> Opened Hacker News
+<span class="d"> |</span> <span class="g">[x]</span> Read visible ranking
+<span class="d"> '</span> <span class="g">[x]</span> Wrote summary
+
+<span class="d">TERMINAL</span>   <span class="t">RUNTIME</span>   <span class="t">BROWSER</span>   <span class="t">HISTORY</span>   <span class="d">DEV</span>                                                <span class="d">/</span>
+<span class="d">----------------------------------------------------------------------------------------------</span>
+<span class="d">RESULT</span>
+  Top 5 Hacker News posts
+  1. Example story
+  2. Another story
+  3. Browser agents in practice
+  4. A fourth story
+  5. A fifth story
+
+<span class="d">SOURCE</span>
+  <span class="u">https://news.ycombinator.com</span>
+
+<span class="d">ASK FOLLOW-UP</span>
++--------------------------------------------------------------------------------------------+
+| <span class="d">Ask a follow-up...</span>                                                                         |
++--------------------------------------------------------------------------------------------+
+
+  [ summarise ]   [ open in browser ]   [ rerun ]   [ new task ]                             <span class="d">/</span>
+
+<span class="d">AI ENGINE</span>             <span class="d">SESSION</span>               <span class="d">BROWSER</span>                  <span class="d">STATUS</span>
+<span class="t">GPT-5.5 · Codex</span>       <span class="t">14s</span>                   <span class="g">Local Chrome · idle</span>      <span class="g">done</span>
+
+<span class="g">||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||||</span></pre>
+            </div>
+            <p class="annotation">
+              floating browser sticker deleted — that information moved into the bottom
+              metric band (BROWSER column). Link is underlined, not coloured blue. Progress
+              bar holds at full green for ~2s then fades to muted.
+            </p>
+          </article>
+
+          <article class="screen wide">
+            <h3><span>05 Failed</span><span>same layout · recovery state</span></h3>
+            <div class="terminal">
+<pre><span class="t">[box] Task stopped</span> <span class="d">------------------------------------------------------------------</span> <span class="o">failed · 2m</span>
+<span class="d"> |</span> <span class="g">[x]</span> Opened checkout page
+<span class="d"> |</span> <span class="o">[!]</span> Browser action failed
+<span class="d"> '</span> <span class="d">[ ]</span> Saved progress to history
+
+<span class="d">TERMINAL</span>   <span class="t">RUNTIME</span>   <span class="t">BROWSER</span>   <span class="t">HISTORY</span>   <span class="d">DEV</span>                                                <span class="d">/</span>
+<span class="d">----------------------------------------------------------------------------------------------</span>
+<span class="d">ERROR</span>
+  The browser could not click the payment button because the page changed.
+
+<span class="d">WHAT TO DO NEXT</span>
+  <span class="g">&gt;</span> <span class="t">Retry from current page</span>
+    Continue with a follow-up
+    Open browser
+    Start a new task
+
+<span class="d">ASK FOLLOW-UP</span>
++--------------------------------------------------------------------------------------------+
+| <span class="d">Tell the agent how to recover...</span>                                                           |
++--------------------------------------------------------------------------------------------+
+
+  <span class="t">[ retry ]</span>   [ open browser ]   [ new task ]                                              <span class="d">/</span>
+
+<span class="d">AI ENGINE</span>             <span class="d">SESSION</span>               <span class="d">BROWSER</span>                  <span class="d">STATUS</span>
+<span class="t">GPT-5.5 · Codex</span>       <span class="o">2m · failed</span>           <span class="t">Local Chrome</span>             <span class="o">failed</span>
+
+<span class="o">|||||||||</span><span class="d">..</span><span class="o">|||</span><span class="d">..</span><span class="o">|</span><span class="d">.....................................................................</span></pre>
+            </div>
+            <p class="annotation">
+              same screen as Running and Result. Failure is one glyph swap
+              (<code>[&gt;]</code> → <code>[!]</code>) and orange status in the band. Progress
+              bar uses a broken pattern so failure has its own visual rhythm without
+              needing a second colour.
+            </p>
+          </article>
+
+          <article class="screen wide">
+            <h3><span>06 Palette</span><span>modal overlay · hairline frame</span></h3>
+            <div class="terminal">
+<pre><span class="t">&gt; Find the top 5 Hacker News posts</span>                                              <span class="o">working · 1s</span>
+<span class="d">----------------------------------------------------------------------------------------------</span>
+
+                  <span class="d">--</span> <span class="t">actions</span> <span class="d">--------------------------------------------- esc close --</span>
+
+                  <span class="g">&gt;</span> <span class="d">filter actions...</span>
+
+                  <span class="d">TASK</span>                                                       <span class="d">1 previous</span>
+                  <span class="g">&gt;</span> <span class="t">New task</span>
+                    Previous work
+
+                  <span class="d">BROWSER</span>                                  <span class="g">Browser Use cloud · connected</span>
+                    Change browser
+
+                  <span class="d">SETTINGS</span>                                          <span class="t">GPT-5.5 · Codex login</span>
+                    Choose model
+                    Authenticate
+
+                  <span class="d">DEBUG</span>
+                    Configure Laminar
+
+                  <span class="d">------------------------------------------- up/down navigate · enter select --</span></pre>
+            </div>
+            <p class="annotation">
+              no outer <code>+----+</code> box — palette is framed with hairlines top and bottom only.
+              Background screen stays visible (dimmed by the renderer, not redrawn). One <code>esc</code> closes.
+            </p>
+          </article>
+
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Width Reflow — 80 vs 140 cols</h2>
+        <p class="lede" style="margin-top:-4px;margin-bottom:20px">
+          Every screen must survive a Ghostty split. The cockpit at 80 columns shortens
+          the agent-context band, abbreviates tab labels, and lets the progress bar shrink.
+          Nothing collapses or disappears — the four regions stay in the same order.
+        </p>
+        <div class="widths">
+          <div>
+            <div class="width-label">narrow · 80 cols</div>
+            <div class="terminal narrow">
+<pre><span class="t">[box] Active</span> <span class="d">--------------------------------</span> <span class="o">working · 1m 14s</span>
+<span class="d"> |</span> <span class="g">[x]</span> Opened repository
+<span class="d"> |</span> <span class="g">[x]</span> Inspected main crates
+<span class="d"> |</span> <span class="o">[&gt;]</span> Summarising findings
+<span class="d"> '</span> <span class="d">[ ]</span> Awaiting follow-up
+
+<span class="d">TERM</span>  <span class="g">RUN *</span>  <span class="t">BROW</span>  <span class="t">HIST</span>  <span class="d">DEV</span>                            <span class="d">/</span>
+<span class="d">--------------------------------------------------------------------------------</span>
+<span class="d">AGENT</span>          <span class="d">MODEL</span>          <span class="d">BROWSER</span>        <span class="d">TASK</span>
+<span class="t">repo-explorer</span>  <span class="t">GPT-5.5</span>        <span class="g">Local · idle</span>   <span class="t">whats this re...</span>
+
+<span class="m">// reading worker.py</span>
+<span class="m">// reading lib.rs</span>
+<span class="m">// ran  for f in crates/*/Cargo.toml...</span>
+
+<span class="o">&lt;..&gt;</span> streaming...
+
+<span class="d">ASK</span>
++----------------------------------------------------------+
+| <span class="d">Type to steer the agent...</span>                              |
++----------------------------------------------------------+
+
+  <span class="t">[ pause ]</span>  [ browser ]  [ rerun ]  [ new ]              <span class="d">/</span>
+
+<span class="d">AI ENGINE</span>      <span class="d">SESSION</span>          <span class="d">BROWSER</span>       <span class="d">EVENTS</span>
+<span class="t">GPT-5.5</span>        <span class="o">1m 14s · run</span>    <span class="g">Local · idle</span>  <span class="t">6</span>
+
+<span class="o">||||||||||||||||||||||||||||||</span><span class="d">..................................</span></pre>
+            </div>
+          </div>
+          <div>
+            <div class="width-label">wide · 140 cols (target)</div>
+            <div class="terminal">
+<pre><span class="t">[box] Active objective</span> <span class="d">----------------------------------------------------------------------------------</span> <span class="o">working · 1m 14s</span>
+<span class="d"> |</span> <span class="g">[x]</span> Opened repository
+<span class="d"> |</span> <span class="g">[x]</span> Inspected main crates
+<span class="d"> |</span> <span class="o">[&gt;]</span> Summarising findings
+<span class="d"> '</span> <span class="d">[ ]</span> Awaiting follow-up
+
+<span class="d">TERMINAL</span>   <span class="g">RUNTIME *</span>   <span class="t">BROWSER</span>   <span class="t">HISTORY</span>   <span class="d">DEV</span>                                                              <span class="d">/</span>
+<span class="d">--------------------------------------------------------------------------------------------------------------------</span>
+<span class="d">AGENT</span>              <span class="d">MODEL</span>                <span class="d">BROWSER</span>                       <span class="d">TASK</span>
+<span class="t">repo-explorer</span>      <span class="t">GPT-5.5 · Codex</span>      <span class="g">Local Chrome · idle</span>           <span class="t">whats this repo about?</span>
+
+<span class="m">// reading worker.py</span>
+<span class="m">// reading lib.rs</span>
+<span class="m">// ran  for f in crates/*/Cargo.toml; do echo '---' $f; ...</span>
+
+<span class="o">&lt;..&gt;</span> streaming response from GPT-5.5
+
+<span class="d">ASK</span>
++----------------------------------------------------------------------------------------------------------------+
+| <span class="d">Type to steer the agent...</span>                                                                                     |
++----------------------------------------------------------------------------------------------------------------+
+
+  <span class="t">[ pause ]</span>   [ open browser ]   [ rerun ]   [ new task ]                                                    <span class="d">/</span>
+
+<span class="d">AI ENGINE</span>             <span class="d">SESSION</span>               <span class="d">BROWSER</span>                       <span class="d">EVENTS</span>
+<span class="t">GPT-5.5 · Codex</span>       <span class="o">1m 14s · running</span>      <span class="g">Local Chrome · idle</span>           <span class="t">6</span>
+
+<span class="o">|||||||||||||||||||||||||||||||||||||||||||||||||||||||||||</span><span class="d">.....................................................</span></pre>
+            </div>
+          </div>
+        </div>
+      </section>
+
+      <section class="section">
+        <h2>Design Rules To Port</h2>
+        <div class="rules">
+          <div class="rule">
+            <b>One loud color</b>
+            <p>Orange is the only saturated colour. Green and text are de-emphasised so orange always wins the eye. Don't argue with this.</p>
+          </div>
+          <div class="rule">
+            <b>Top owns state</b>
+            <p>Objective tree is fixed at the top and never scrolls. The first thing visible always answers "what is happening now."</p>
+          </div>
+          <div class="rule">
+            <b>Bottom owns control</b>
+            <p>Composer, chip row, metric band, progress bar are one grouped region. The eye knows where to act.</p>
+          </div>
+          <div class="rule">
+            <b>Same context, same place</b>
+            <p>Browser / model / session info appears in the metric band, once. Never repeat the same fact in a sticker, footer, and header.</p>
+          </div>
+          <div class="rule">
+            <b>Hairlines, not boxes</b>
+            <p>Grouping is a single dim grey line. <code>+----+</code> is reserved for inputs only. Panels die.</p>
+          </div>
+          <div class="rule">
+            <b>Footer is just <code>/</code></b>
+            <p>Setup keeps <code>enter</code>/<code>esc</code> because they're contextual. Every other screen uses <code>/</code> in the corner; the long key list lives inside the palette.</p>
+          </div>
+          <div class="rule">
+            <b>Progress is the heartbeat</b>
+            <p>The bar is always there. Idle = muted full, working = orange partial, done = green full, failed = broken orange pattern.</p>
+          </div>
+          <div class="rule">
+            <b>Tabular numerals, no ligatures</b>
+            <p><code>font-variant-numeric: tabular-nums</code> and <code>"calt" 0, "liga" 0</code>. Numbers in the metric band must align across rows and screens.</p>
+          </div>
+          <div class="rule">
+            <b>Six screens, three states</b>
+            <p>Setup, Home, Running, Result, Failed, Palette. Running/Result/Failed are the same layout — failure isn't a new screen, it's a state.</p>
+          </div>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
