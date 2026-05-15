@@ -148,6 +148,17 @@ def assert_regex_count(text: str, pattern: str, expected: int, context: str) -> 
         raise AssertionError(f"{context}: expected {expected} x /{pattern}/, saw {count}\n\n{text}")
 
 
+def assert_first_content_near_top(text: str, max_row: int, context: str) -> None:
+    for idx, line in enumerate(text.splitlines()):
+        if line.strip():
+            if idx > max_row:
+                raise AssertionError(
+                    f"{context}: first visible content should be within {max_row} rows of top, saw row {idx}\n\n{text}"
+                )
+            return
+    raise AssertionError(f"{context}: capture had no visible content\n\n{text}")
+
+
 def assert_no_ansi(text: str, context: str) -> None:
     if re.search(r"\x1b\[[0-?]*[ -/]*[@-~]", text):
         raise AssertionError(f"{context}: output contained ANSI escapes\n\n{text!r}")
@@ -267,7 +278,10 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(after_paste_clear, "paste two", "ctrl+c should clear pasted composer text")
 
         tmux_send(session, "/")
-        wait_for(session, "/task", "slash-palette-open")
+        palette = wait_for(session, "/task", "slash-palette-open")
+        assert_contains(palette, "/auth", "slash palette should fit every product action")
+        assert_contains(palette, "up/down navigate", "slash palette footer should be visible")
+        assert_first_content_near_top(palette, 2, "slash palette should not be pushed down by previous viewport state")
         wait_for(session, "/model", "slash-palette-open-model")
         tmux_send_literal(session, "bro")
         actions = wait_for(session, "> /bro", "slash-palette-filtered")
@@ -276,6 +290,15 @@ def smoke_interactive_terminal(binary: Path) -> None:
 
         tmux_send(session, "Escape")
         wait_for(session, "Type to steer the agent", "main-after-slash-palette")
+        tmux_send_literal(session, "/model")
+        tmux_send(session, "Enter")
+        model = wait_for(session, "browser-use setup / model", "model-panel")
+        assert_contains(model, "bring your own key", "model surface should show lower sections")
+        assert_contains(model, "DeepSeek V4 Pro", "model surface should fit all model rows")
+        assert_contains(model, "Enter:select", "model surface footer should be visible")
+        assert_first_content_near_top(model, 2, "model surface should not be rendered in the compact dock")
+        tmux_send(session, "Escape")
+        wait_for(session, "Type to steer the agent", "main-after-model-surface")
         tmux_send(session, "F2")
         browser = wait_for(session, "Current browser", "browser-panel")
         assert_count(browser, "browser-use / browser", 1, "browser panel should be live, not appended repeatedly")
@@ -586,6 +609,27 @@ def smoke_session_switch_clears_previous_transcript(binary: Path) -> None:
         assert_not_contains(visible, transient_task, "session switch should clear the previous visible transcript")
         assert_contains(visible, "Ask a follow-up", "session switch should redraw the composer after replay")
         assert_not_contains(visible, "^[[", "session switch clear should not leak escape sequences")
+        assert_first_content_near_top(visible, 2, "selected long transcript should not drift down after switch")
+
+        tmux_send(session, "Tab")
+        wait_for(session, "browser-use / previous work", "switch-history-reopen-transient")
+        tmux_send(session, "Enter")
+        transient_visible = wait_for(session, transient_task, "switch-transient-selected-visible")
+        assert_first_content_near_top(
+            transient_visible,
+            2,
+            "switching back to another session should reset the inline viewport origin",
+        )
+
+        tmux_send(session, "Tab")
+        wait_for(session, "browser-use / previous work", "switch-history-reopen-long")
+        tmux_send(session, "Down", "Enter")
+        long_again = wait_for(session, "scroll check line 60", "switch-long-selected-again-visible")
+        assert_first_content_near_top(
+            long_again,
+            2,
+            "switching repeatedly should not accumulate blank rows above transcript",
+        )
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)

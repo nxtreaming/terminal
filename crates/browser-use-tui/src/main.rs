@@ -22,6 +22,7 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::Command;
 use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Position, Rect};
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
@@ -95,14 +96,11 @@ enum Surface {
 
 impl Surface {
     fn is_bottom_pane(self) -> bool {
-        matches!(
-            self,
-            Self::Browser | Self::BrowserSelect | Self::Developer | Self::Model
-        )
+        false
     }
 
     fn uses_main_view(self) -> bool {
-        self == Self::Main || self.is_bottom_pane()
+        self == Self::Main
     }
 }
 
@@ -1710,7 +1708,7 @@ fn print_native_transcript(app: &mut App) -> Result<()> {
 }
 
 fn run_terminal(mut app: App) -> Result<()> {
-    let live_height = app.live_viewport_height();
+    let mut viewport_height = desired_terminal_viewport_height(&app)?;
     enable_raw_mode()?;
     let mut stdout = io::stdout();
     execute!(
@@ -1724,13 +1722,7 @@ fn run_terminal(mut app: App) -> Result<()> {
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     )?;
-    let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::with_options(
-        backend,
-        TerminalOptions {
-            viewport: Viewport::Inline(live_height),
-        },
-    )?;
+    let mut terminal = new_inline_terminal(viewport_height)?;
     let result = (|| -> Result<()> {
         let mut draw_needed = true;
         let mut last_fallback_refresh = Instant::now();
@@ -1749,6 +1741,13 @@ fn run_terminal(mut app: App) -> Result<()> {
                 }
             }
             if pending_resize_at.is_none() && draw_needed {
+                let desired_height = desired_terminal_viewport_height(&app)?;
+                if desired_height != viewport_height {
+                    reset_terminal_screen(terminal.backend_mut(), ClearType::Purge)?;
+                    terminal = new_inline_terminal(desired_height)?;
+                    viewport_height = desired_height;
+                    app.native_history.reset();
+                }
                 draw_terminal_frame(&mut terminal, &mut app)?;
                 draw_needed = false;
             }
@@ -1779,6 +1778,32 @@ fn run_terminal(mut app: App) -> Result<()> {
     cursor_result?;
     result?;
     Ok(())
+}
+
+fn new_inline_terminal(height: u16) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
+    let backend = CrosstermBackend::new(io::stdout());
+    Ok(Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(height),
+        },
+    )?)
+}
+
+fn desired_terminal_viewport_height(app: &App) -> Result<u16> {
+    let terminal_height = crossterm::terminal::size()
+        .map(|(_, height)| height)
+        .unwrap_or(app.args.height);
+    if app.surface != Surface::Main
+        || app.is_slash_palette_active()
+        || app.is_first_run_setup_visible()?
+        || app.selected_session_id.is_none()
+    {
+        return Ok(terminal_height
+            .saturating_sub(1)
+            .max(app.live_viewport_height()));
+    }
+    Ok(app.live_viewport_height())
 }
 
 fn handle_terminal_event(
@@ -1812,12 +1837,8 @@ fn settle_terminal_resize(
 fn reset_inline_terminal_after_resize(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
-    execute!(
-        terminal.backend_mut(),
-        Clear(ClearType::All),
-        Clear(ClearType::Purge),
-        MoveTo(0, 0)
-    )?;
+    reset_terminal_screen(terminal.backend_mut(), ClearType::Purge)?;
+    reset_inline_viewport_origin(terminal)?;
     terminal.autoresize()?;
     terminal.clear()?;
     Ok(())
@@ -1876,7 +1897,10 @@ fn maybe_emit_native_transcript(
 ) -> Result<()> {
     let size = terminal.size()?;
     let state = app.workbench_state()?;
-    if !app.surface.uses_main_view() || app.is_first_run_setup_visible()? {
+    if !app.surface.uses_main_view()
+        || app.is_slash_palette_active()
+        || app.is_first_run_setup_visible()?
+    {
         return Ok(());
     }
     let should_clear = app.native_history.take_clear_before_replay();
@@ -1933,13 +1957,32 @@ fn native_scrollback_width(terminal_width: u16) -> u16 {
 fn clear_native_transcript_screen(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
 ) -> Result<()> {
+    reset_terminal_screen(terminal.backend_mut(), ClearType::Purge)?;
+    reset_inline_viewport_origin(terminal)?;
+    terminal.clear()?;
+    Ok(())
+}
+
+fn reset_terminal_screen(
+    target: &mut CrosstermBackend<io::Stdout>,
+    clear_type: ClearType,
+) -> Result<()> {
     execute!(
-        terminal.backend_mut(),
+        target,
         Clear(ClearType::All),
-        Clear(ClearType::Purge),
+        Clear(clear_type),
         MoveTo(0, 0)
     )?;
-    terminal.clear()?;
+    Ok(())
+}
+
+fn reset_inline_viewport_origin(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
+    terminal.set_cursor_position(Position::ORIGIN)?;
+    let size = terminal.size()?;
+    let area = Rect::new(0, 0, size.width, size.height);
+    terminal.resize(area)?;
     Ok(())
 }
 
