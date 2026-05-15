@@ -386,6 +386,7 @@ fn spawn_agent_tool_spec() -> ToolSpec {
         name: "spawn_agent".to_string(),
         description: concat!(
             "Create a separate helper session for bounded background exploration. ",
+            "The task_name is an agent routing name, not a filesystem path. ",
             "For repository, codebase, or directory analysis, spawn a read-only helper with role \"explorer\" before answering unless you are already inside an explorer/helper session or the user asks not to. ",
             "Explorer helpers should inspect directly with local tools and must not spawn nested explorers for the same analysis."
         )
@@ -397,15 +398,15 @@ fn spawn_agent_tool_spec() -> ToolSpec {
                     "type": "string",
                     "description": "The bounded task for the helper session."
                 },
-                "path": {
+                "task_name": {
                     "type": "string",
-                    "description": "Optional stable task path, such as flight-search. Relative paths are stored under /root/."
+                    "description": "Stable task name for the new agent, such as flight_search. Use lowercase letters, digits, and underscores."
                 },
                 "nickname": {
                     "type": "string",
                     "description": "Optional short display name."
                 },
-                "role": {
+                "agent_type": {
                     "type": "string",
                     "description": "Optional helper role label. Use \"explorer\" for read-only repository/codebase questions and \"worker\" for implementation or editing tasks."
                 },
@@ -420,7 +421,7 @@ fn spawn_agent_tool_spec() -> ToolSpec {
                     "description": "Number of recent user/follow-up turns to include when fork_mode is last_n."
                 }
             },
-            "required": ["message"],
+            "required": ["task_name", "message"],
             "additionalProperties": false
         }),
     }
@@ -435,9 +436,9 @@ fn wait_agent_tool_spec() -> ToolSpec {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "child_session_id": {
+                "target": {
                     "type": "string",
-                    "description": "The helper session id or canonical helper path returned by spawn_agent."
+                    "description": "The relative or canonical task name returned by spawn_agent."
                 },
                 "timeout_ms": {
                     "type": "integer",
@@ -445,7 +446,7 @@ fn wait_agent_tool_spec() -> ToolSpec {
                     "description": "Optional maximum time to wait for an active helper to finish before returning its current status."
                 }
             },
-            "required": ["child_session_id"],
+            "required": ["target"],
             "additionalProperties": false
         }),
     }
@@ -458,23 +459,16 @@ fn send_input_tool_spec() -> ToolSpec {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "child_session_id": {
-                    "type": "string",
-                    "description": "The helper session id or canonical helper path returned by spawn_agent."
-                },
                 "target": {
                     "type": "string",
-                    "description": "Alias for child_session_id, matching Codex-style target naming."
+                    "description": "The relative or canonical task name returned by spawn_agent."
                 },
                 "message": {
                     "type": "string",
                     "description": "The instruction for the helper."
-                },
-                "input": {
-                    "type": "string",
-                    "description": "Alias for message."
                 }
             },
+            "required": ["target", "message"],
             "additionalProperties": false
         }),
     }
@@ -487,16 +481,16 @@ fn send_message_tool_spec() -> ToolSpec {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "child_session_id": {
+                "target": {
                     "type": "string",
-                    "description": "The helper session id or canonical helper path returned by spawn_agent."
+                    "description": "The relative or canonical task name to message."
                 },
                 "message": {
                     "type": "string",
                     "description": "The message to queue for the helper."
                 }
             },
-            "required": ["child_session_id", "message"],
+            "required": ["target", "message"],
             "additionalProperties": false
         }),
     }
@@ -510,16 +504,16 @@ fn followup_task_tool_spec() -> ToolSpec {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "child_session_id": {
+                "target": {
                     "type": "string",
-                    "description": "The helper session id or canonical helper path returned by spawn_agent."
+                    "description": "The relative or canonical task name to message."
                 },
                 "message": {
                     "type": "string",
                     "description": "The follow-up instruction for the helper."
                 }
             },
-            "required": ["child_session_id", "message"],
+            "required": ["target", "message"],
             "additionalProperties": false
         }),
     }
@@ -534,7 +528,7 @@ fn list_agents_tool_spec() -> ToolSpec {
             "properties": {
                 "path_prefix": {
                     "type": "string",
-                    "description": "Optional canonical path prefix, such as /root/research."
+                    "description": "Optional canonical task-name prefix, such as /root/research."
                 }
             },
             "additionalProperties": false
@@ -549,16 +543,16 @@ fn close_agent_tool_spec() -> ToolSpec {
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
-                "child_session_id": {
+                "target": {
                     "type": "string",
-                    "description": "The helper session id or canonical helper path returned by spawn_agent."
+                    "description": "The relative or canonical task name returned by spawn_agent."
                 },
                 "reason": {
                     "type": "string",
                     "description": "Short reason for closing the helper."
                 }
             },
-            "required": ["child_session_id"],
+            "required": ["target"],
             "additionalProperties": false
         }),
     }

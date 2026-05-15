@@ -1637,14 +1637,18 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                 );
                 let mut sections = Vec::new();
                 if let Some(role) = event.payload.get("role").and_then(Value::as_str) {
-                    let canonical_path_sentence = event
+                    let canonical_task_sentence = event
                         .payload
                         .get("agent_path")
                         .and_then(Value::as_str)
-                        .map(|path| format!(" Canonical path: {path}."))
+                        .map(|path| {
+                            format!(
+                                " Canonical task name: {path}. This is an agent routing name, not a filesystem path."
+                            )
+                        })
                         .unwrap_or_default();
                     let explorer_instruction = if role.to_ascii_lowercase().contains("explor") {
-                        "As the explorer, inspect the repository/codebase directly with local tools. Do not spawn another explorer for this same repository-analysis task unless explicitly instructed."
+                        "As the explorer, inspect the repository/codebase directly with local tools from the task cwd. Use `.` for the repository root; do not use your canonical task name as a directory. Do not spawn another explorer for this same repository-analysis task unless explicitly instructed."
                     } else {
                         ""
                     };
@@ -1652,7 +1656,7 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                         include_str!("../../../prompts/helper-session-identity.md"),
                         &[
                             ("{{role}}", role),
-                            ("{{canonical_path_sentence}}", &canonical_path_sentence),
+                            ("{{canonical_task_sentence}}", &canonical_task_sentence),
                             ("{{explorer_instruction}}", explorer_instruction),
                         ],
                     ));
@@ -3145,13 +3149,22 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
         .and_then(Value::as_u64)
         .unwrap_or(0) as usize;
     let inherited_context = inherited_context_for_spawn(&parent_events, fork_mode, fork_turns);
-    let agent_path = normalize_agent_path(call.arguments.get("path").and_then(Value::as_str));
+    let parent_agent_path = display_agent_path_for_session(store, &session.id)?;
+    let agent_path = match spawn_agent_task_name(&call.arguments, &parent_agent_path) {
+        Ok(agent_path) => agent_path,
+        Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+    };
+    let agent_role = call
+        .arguments
+        .get("agent_type")
+        .or_else(|| call.arguments.get("role"))
+        .and_then(Value::as_str);
     let child = store.create_child_session(
         &session.id,
         &session.cwd,
-        agent_path.as_deref(),
+        Some(agent_path.as_str()),
         call.arguments.get("nickname").and_then(Value::as_str),
-        call.arguments.get("role").and_then(Value::as_str),
+        agent_role,
     )?;
     store.append_event(
         &child.id,
@@ -3162,7 +3175,7 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "fork_turns": fork_turns,
             "agent_path": agent_path.clone(),
             "nickname": call.arguments.get("nickname").and_then(Value::as_str),
-            "role": call.arguments.get("role").and_then(Value::as_str),
+            "role": agent_role,
             "context": inherited_context,
         }),
     )?;
@@ -3178,7 +3191,7 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "child_session_id": child.id,
             "agent_path": agent_path.clone(),
             "nickname": call.arguments.get("nickname").and_then(Value::as_str),
-            "role": call.arguments.get("role").and_then(Value::as_str),
+            "role": agent_role,
             "fork_mode": fork_mode,
         }),
     )?;
@@ -3203,7 +3216,7 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "spawn_agent",
             serde_json::json!({
                 "child_session_id": child.id,
-                "agent_path": agent_path,
+                "task_name": agent_path,
                 "status": child_result.get("status").cloned().unwrap_or(Value::Null),
                 "result": child_result.get("result").cloned().unwrap_or(Value::Null),
                 "failure": child_result.get("failure").cloned().unwrap_or(Value::Null),
@@ -3304,8 +3317,53 @@ fn inherited_context_for_spawn(
     }
 }
 
-fn normalize_agent_path(path: Option<&str>) -> Option<String> {
-    path.and_then(|path| (!path.trim().is_empty()).then(|| canonical_agent_path(path)))
+fn spawn_agent_task_name(arguments: &Value, parent_agent_path: &str) -> Result<String, String> {
+    if let Some(task_name) = arguments.get("task_name").and_then(Value::as_str) {
+        return canonical_agent_path_from_task_name(task_name, parent_agent_path);
+    }
+    if let Some(path) = arguments.get("path").and_then(Value::as_str) {
+        let trimmed = path.trim();
+        if trimmed.is_empty() {
+            return Err("spawn_agent requires task_name".to_string());
+        }
+        return Ok(canonical_agent_path(trimmed));
+    }
+    Err("spawn_agent requires task_name".to_string())
+}
+
+fn canonical_agent_path_from_task_name(
+    task_name: &str,
+    parent_agent_path: &str,
+) -> Result<String, String> {
+    let task_name = task_name.trim();
+    validate_agent_task_name(task_name)?;
+    let parent_agent_path = canonical_agent_path(parent_agent_path);
+    if parent_agent_path == "/root" {
+        Ok(format!("/root/{task_name}"))
+    } else {
+        Ok(format!("{parent_agent_path}/{task_name}"))
+    }
+}
+
+fn validate_agent_task_name(task_name: &str) -> Result<(), String> {
+    if task_name.is_empty() {
+        return Err("task_name must not be empty".to_string());
+    }
+    if matches!(task_name, "root" | "." | "..") {
+        return Err(format!("task_name `{task_name}` is reserved"));
+    }
+    if task_name.contains('/') {
+        return Err("task_name must not contain `/`".to_string());
+    }
+    if !task_name
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(
+            "task_name must use only lowercase letters, digits, and underscores".to_string(),
+        );
+    }
+    Ok(())
 }
 
 fn canonical_agent_path(path: &str) -> String {
@@ -3342,6 +3400,21 @@ fn canonical_agent_path(path: &str) -> String {
     }
 }
 
+fn canonical_agent_reference(reference: &str, current_agent_path: &str) -> String {
+    let trimmed = reference.trim();
+    if trimmed.starts_with('/') || trimmed == "root" || trimmed.starts_with("root/") {
+        return canonical_agent_path(trimmed);
+    }
+    let current_agent_path = canonical_agent_path(current_agent_path);
+    if current_agent_path == "/root" {
+        canonical_agent_path(trimmed)
+    } else {
+        let relative = canonical_agent_path(trimmed);
+        let relative = relative.strip_prefix("/root/").unwrap_or(relative.as_str());
+        format!("{current_agent_path}/{relative}")
+    }
+}
+
 fn resolve_child_agent(
     store: &Store,
     parent_session_id: &str,
@@ -3355,7 +3428,8 @@ fn resolve_child_agent(
     {
         return Ok(Some(agent));
     }
-    let canonical = canonical_agent_path(reference);
+    let parent_agent_path = display_agent_path_for_session(store, parent_session_id)?;
+    let canonical = canonical_agent_reference(reference, &parent_agent_path);
     Ok(agents.into_iter().find(|agent| {
         agent.agent_path.as_deref() == Some(reference)
             || agent.agent_path.as_deref() == Some(canonical.as_str())
@@ -3385,15 +3459,11 @@ fn dispatch_wait_agent_tool(
 ) -> Result<ToolDispatchOutcome> {
     let Some(child_ref) = call
         .arguments
-        .get("child_session_id")
+        .get("target")
+        .or_else(|| call.arguments.get("child_session_id"))
         .and_then(Value::as_str)
     else {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            "wait_agent requires child_session_id",
-        );
+        return dispatch_tool_validation_error(store, session, call, "wait_agent requires target");
     };
     let Some(child_summary) = resolve_child_agent(store, &session.id, child_ref)? else {
         return dispatch_tool_validation_error(
@@ -3465,7 +3535,7 @@ fn dispatch_wait_agent_tool(
             "wait_agent",
             serde_json::json!({
                 "child_session_id": child_session_id,
-                "agent_path": agent_path,
+                "task_name": agent_path,
                 "status": child.status.as_str(),
                 "result": result_from_events(&child_events),
                 "failure": failure_from_events(&child_events),
@@ -3487,15 +3557,15 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
 ) -> Result<ToolDispatchOutcome> {
     let Some(child_ref) = call
         .arguments
-        .get("child_session_id")
-        .or_else(|| call.arguments.get("target"))
+        .get("target")
+        .or_else(|| call.arguments.get("child_session_id"))
         .and_then(Value::as_str)
     else {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            &format!("{tool_name} requires child_session_id"),
+            &format!("{tool_name} requires target"),
         );
     };
     let Some(child_summary) = resolve_child_agent(store, &session.id, child_ref)? else {
@@ -3595,7 +3665,7 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
             serde_json::json!({
                 "message_id": mail.id,
                 "child_session_id": child_session_id,
-                "agent_path": agent_path,
+                "task_name": agent_path,
                 "author_path": author_path,
                 "recipient_path": recipient_path,
                 "trigger_turn": trigger_turn,
@@ -3637,7 +3707,11 @@ fn dispatch_list_agents_tool(
         .arguments
         .get("path_prefix")
         .and_then(Value::as_str)
-        .map(canonical_agent_path);
+        .map(|prefix| {
+            display_agent_path_for_session(store, &session.id)
+                .map(|current| canonical_agent_reference(prefix, &current))
+        })
+        .transpose()?;
     let agents = store
         .list_child_agents(&session.id)?
         .into_iter()
@@ -3652,7 +3726,7 @@ fn dispatch_list_agents_tool(
             serde_json::json!({
                 "child_session_id": agent.child_session_id,
                 "status": agent.status,
-                "path": agent.agent_path,
+                "task_name": agent.agent_path,
                 "nickname": agent.agent_nickname,
                 "role": agent.agent_role,
                 "updated_ms": agent.updated_ms,
@@ -3686,15 +3760,11 @@ fn dispatch_close_agent_tool(
 ) -> Result<ToolDispatchOutcome> {
     let Some(child_ref) = call
         .arguments
-        .get("child_session_id")
+        .get("target")
+        .or_else(|| call.arguments.get("child_session_id"))
         .and_then(Value::as_str)
     else {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            "close_agent requires child_session_id",
-        );
+        return dispatch_tool_validation_error(store, session, call, "close_agent requires target");
     };
     let Some(child_summary) = resolve_child_agent(store, &session.id, child_ref)? else {
         return dispatch_tool_validation_error(
@@ -3751,7 +3821,7 @@ fn dispatch_close_agent_tool(
             "close_agent",
             serde_json::json!({
                 "child_session_id": child_session_id,
-                "agent_path": agent_path,
+                "task_name": agent_path,
                 "status": "cancelled",
             }),
         )?],
@@ -5779,7 +5849,7 @@ mod tests {
         assert_eq!(children[0].status, "closed");
         assert_eq!(
             children[0].agent_path.as_deref(),
-            Some("/root/flight-search")
+            Some("/root/flight_search")
         );
 
         let parent_events = store.events_for_session(&session_id)?;
@@ -5802,7 +5872,7 @@ mod tests {
             .any(|event| event.event_type == "agent.message"
                 && event.payload["trigger_turn"] == true
                 && event.payload["author_path"] == "/root"
-                && event.payload["recipient_path"] == "/root/flight-search"));
+                && event.payload["recipient_path"] == "/root/flight_search"));
         assert!(parent_events
             .iter()
             .any(|event| event.event_type == "model.tool_call"
@@ -5889,7 +5959,7 @@ mod tests {
                 id: "wait_active".to_string(),
                 name: "wait_agent".to_string(),
                 arguments: serde_json::json!({
-                    "child_session_id": "/root/helper",
+                    "target": "/root/helper",
                     "timeout_ms": 1,
                 }),
             },
@@ -5907,6 +5977,28 @@ mod tests {
             .any(|event| event.event_type == "tool.finished"
                 && event.payload["name"] == "wait_agent"));
         Ok(())
+    }
+
+    #[test]
+    fn agent_task_names_resolve_relative_to_current_agent() {
+        assert_eq!(
+            canonical_agent_path_from_task_name("worker", "/root/researcher")
+                .expect("valid task name"),
+            "/root/researcher/worker"
+        );
+        assert_eq!(
+            canonical_agent_reference("worker", "/root/researcher"),
+            "/root/researcher/worker"
+        );
+        assert_eq!(
+            canonical_agent_reference("/root/other", "/root/researcher"),
+            "/root/other"
+        );
+        assert_eq!(
+            canonical_agent_path_from_task_name("BadName", "/root")
+                .expect_err("uppercase task names should be rejected"),
+            "task_name must use only lowercase letters, digits, and underscores"
+        );
     }
 
     #[test]
@@ -6314,23 +6406,23 @@ mod tests {
                         name: "spawn_agent".to_string(),
                         arguments: serde_json::json!({
                             "message": "inspect flight search constraints",
-                            "path": "flight-search",
+                            "task_name": "flight_search",
                             "nickname": "Flight helper",
-                            "role": "researcher",
+                            "agent_type": "researcher",
                         }),
                     },
                 },
                 1 => {
                     assert_eq!(
-                        agent_path_from_tool_messages(&turn).as_deref(),
-                        Some("/root/flight-search")
+                        task_name_from_tool_messages(&turn).as_deref(),
+                        Some("/root/flight_search")
                     );
                     ModelEvent::ToolCall {
                         call: ToolCall {
                             id: "send_1".to_string(),
                             name: "send_message".to_string(),
                             arguments: serde_json::json!({
-                                "child_session_id": "/root/flight-search",
+                                "target": "/root/flight_search",
                                 "message": "keep this in your notes",
                             }),
                         },
@@ -6341,8 +6433,8 @@ mod tests {
                         id: "send_input_1".to_string(),
                         name: "send_input".to_string(),
                         arguments: serde_json::json!({
-                            "target": "flight-search",
-                            "input": "run the codex-style input",
+                            "target": "flight_search",
+                            "message": "run the codex-style input",
                         }),
                     },
                 },
@@ -6351,7 +6443,7 @@ mod tests {
                         id: "followup_1".to_string(),
                         name: "followup_task".to_string(),
                         arguments: serde_json::json!({
-                            "child_session_id": "flight-search",
+                            "target": "flight_search",
                             "message": "run the focused follow-up",
                         }),
                     },
@@ -6361,7 +6453,7 @@ mod tests {
                         id: "wait_1".to_string(),
                         name: "wait_agent".to_string(),
                         arguments: serde_json::json!({
-                            "child_session_id": "/root/flight-search",
+                            "target": "/root/flight_search",
                         }),
                     },
                 },
@@ -6377,7 +6469,7 @@ mod tests {
                         id: "close_1".to_string(),
                         name: "close_agent".to_string(),
                         arguments: serde_json::json!({
-                            "child_session_id": "flight-search",
+                            "target": "flight_search",
                             "reason": "parent has enough context",
                         }),
                     },
@@ -6397,7 +6489,7 @@ mod tests {
         }
     }
 
-    fn agent_path_from_tool_messages(turn: &ProviderTurn) -> Option<String> {
+    fn task_name_from_tool_messages(turn: &ProviderTurn) -> Option<String> {
         turn.messages.iter().rev().find_map(|message| {
             if message.get("name").and_then(Value::as_str) != Some("spawn_agent") {
                 return None;
@@ -6405,7 +6497,7 @@ mod tests {
             let content = message.get("content").and_then(Value::as_str)?;
             serde_json::from_str::<Value>(content)
                 .ok()?
-                .get("agent_path")
+                .get("task_name")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
         })

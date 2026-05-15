@@ -27,6 +27,7 @@ use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
 
 mod composer;
+mod markdown;
 mod palette;
 mod render;
 mod runtime;
@@ -3101,8 +3102,8 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains(": subagent"));
         assert!(screen.contains("repo-explorer"));
-        assert!(!screen.contains(": read"));
-        assert!(!screen.contains("README.md"));
+        assert!(screen.contains(": subagent repo-explorer"));
+        assert!(screen.contains("read /repo/README.md"));
         assert!(!screen.contains("Mapping the main crates."));
         Ok(())
     }
@@ -3169,9 +3170,10 @@ mod redesign_tests {
 
         assert!(text.contains("explain this repo"));
         assert!(text.contains("repo-explorer started"));
+        assert!(text.contains("subagent repo-explorer"));
+        assert!(text.contains("read /repo/README.md"));
         assert!(text.contains("subagent finished"));
         assert!(text.contains("Short helper summary"));
-        assert!(!text.contains("README.md"));
         assert!(!text.contains("read every repo file"));
         assert!(!text.contains("CHILD FULL DETAILS SHOULD NOT BE TOP LEVEL"));
         Ok(())

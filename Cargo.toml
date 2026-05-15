@@ -38,3 +38,4 @@ opentelemetry_sdk = { version = "0.32", features = ["trace"] }
 open = "5.3"
 portable-pty = "0.9"
 pulldown-cmark = "0.10"
+unicode-width = "0.2"

@@ -264,6 +264,7 @@ dependencies = [
  "ratatui",
  "serde_json",
  "tempfile",
+ "unicode-width",
 ]
 
 [[package]]

@@ -2,7 +2,6 @@ use anyhow::Result;
 use browser_use_protocol::{
     EventRecord, HistoryRow, SessionMeta, TelemetrySummary, TranscriptTurn, WorkbenchState,
 };
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::backend::TestBackend;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::Style;
@@ -12,6 +11,7 @@ use ratatui::{Frame, Terminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::composer::composer_rule;
+use crate::markdown::render_markdown_lines;
 use crate::palette;
 use crate::settings::{
     is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CLAUDE_CODE, ACCOUNT_CODEX,
@@ -21,7 +21,7 @@ use crate::theme::*;
 
 use super::{App, ProductState, Surface};
 
-pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 4;
+pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
 const CONTENT_HORIZONTAL_MARGIN: u16 = 2;
 pub(crate) const NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN: u16 =
     APP_HORIZONTAL_MARGIN + CONTENT_HORIZONTAL_MARGIN;
@@ -92,7 +92,7 @@ pub(crate) fn native_scrollback_event_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for event in events {
-        append_native_timeline_event(&mut lines, last_group, state, event, width);
+        append_native_timeline_event(&mut lines, last_group, None, state, event, width);
     }
     lines
 }
@@ -116,7 +116,7 @@ pub(crate) fn native_scrollback_chronological_event_lines(
         .unwrap_or(after_seq);
     let mut lines = Vec::new();
     for event in events {
-        append_native_timeline_event(&mut lines, last_group, state, event, width);
+        append_native_timeline_event(&mut lines, last_group, Some(app), state, event, width);
     }
     (lines, last_seq)
 }
@@ -1285,10 +1285,14 @@ fn tool_aware_chronological_lines(
     let mut wrote_event = false;
     let mut pending_delta = PendingDeltaBlock::default();
     for event in events {
-        if event.session_id != session.id {
+        if event.event_type == "session.input" {
             continue;
         }
-        if event.event_type == "session.input" {
+        if event.session_id != session.id {
+            pending_delta.flush(&mut lines, &mut last_group, width);
+            let before = lines.len();
+            append_child_timeline_event(&mut lines, &mut last_group, app, state, event, width);
+            wrote_event |= lines.len() != before;
             continue;
         }
         if event.event_type == "model.thinking_delta" {
@@ -1704,11 +1708,15 @@ fn append_tool_aware_event(
 fn append_native_timeline_event(
     lines: &mut Vec<Line<'static>>,
     last_group: &mut Option<String>,
+    app: Option<&App>,
     state: &WorkbenchState,
     event: &EventRecord,
     width: u16,
 ) {
     if !is_root_session_event(state, event) {
+        if let Some(app) = app {
+            append_child_timeline_event(lines, last_group, app, state, event, width);
+        }
         return;
     }
     match event.event_type.as_str() {
@@ -2019,6 +2027,293 @@ fn append_native_timeline_event(
     }
 }
 
+fn append_child_timeline_event(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    app: &App,
+    state: &WorkbenchState,
+    event: &EventRecord,
+    width: u16,
+) {
+    let label = helper_label_for_session(app, &event.session_id);
+    let group = format!("subagent {label}");
+    match event.event_type.as_str() {
+        "session.created"
+        | "session.input"
+        | "session.status"
+        | "session.done"
+        | "agent.context"
+        | "model.config"
+        | "model.delta"
+        | "model.stream_delta"
+        | "model.thinking_delta"
+        | "model.turn.response"
+        | "model.usage"
+        | "model.tool_call"
+        | "tool.started"
+        | "tool.finished"
+        | "tool.batch_started"
+        | "tool.batch_result"
+        | "tool.batch_finished" => {}
+        "model.turn.request" => {
+            let model = event
+                .payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or("model");
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                &format!("waiting for {model}"),
+                width,
+                muted(),
+            );
+        }
+        "model.turn.retry" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                "retrying model request",
+                width,
+                muted(),
+            );
+        }
+        "model.turn.error" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                "model request hit an error",
+                width,
+                failed(),
+            );
+        }
+        "session.failed" => {
+            let error = event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("subagent failed");
+            append_timeline_item(lines, last_group, &group, error, width, failed());
+        }
+        "session.cancelled" => {
+            append_timeline_item(lines, last_group, &group, "stopped", width, muted());
+        }
+        "file.list" => {
+            let path = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| ".".to_string());
+            let item = event
+                .payload
+                .get("count")
+                .and_then(serde_json::Value::as_u64)
+                .map(|count| format!("list {path} ({count} items)"))
+                .unwrap_or_else(|| format!("list {path}"));
+            append_timeline_item(lines, last_group, &group, &item, width, text_style());
+        }
+        "file.read" => {
+            if let Some(path) = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+            {
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    &group,
+                    &format!("read {}", display_path(path, state)),
+                    width,
+                    text_style(),
+                );
+            }
+        }
+        "file.search" => {
+            let query = event
+                .payload
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("files");
+            let matches = event
+                .payload
+                .get("matches")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                &format!("search {query:?} ({matches} matches)"),
+                width,
+                text_style(),
+            );
+        }
+        "command.started" => {
+            let cmd = event
+                .payload
+                .get("cmd")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("command");
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                &format!("run {cmd}"),
+                width,
+                text_style(),
+            );
+        }
+        "command.output" => {
+            if let Some(text) = event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+            {
+                append_preview_text(lines, last_group, &group, text, width, 4);
+            }
+        }
+        "command.finished" => {
+            if event
+                .payload
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .is_some_and(|success| !success)
+            {
+                let code = event
+                    .payload
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    &group,
+                    &format!("failed with exit {code}"),
+                    width,
+                    failed(),
+                );
+            }
+        }
+        "tool.failed" => {
+            let name = event
+                .payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let error = event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool failed");
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                &format!("{name} failed: {error}"),
+                width,
+                failed(),
+            );
+        }
+        "tool.output_spilled" => {
+            let path = event
+                .payload
+                .get("artifact")
+                .and_then(|artifact| artifact.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| "artifact".to_string());
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                &format!("full output saved to {path}"),
+                width,
+                muted(),
+            );
+        }
+        "patch.file_changed" => {
+            let kind = event
+                .payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("changed");
+            let path = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| "file".to_string());
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                &format!("{kind} {path}"),
+                width,
+                text_style(),
+            );
+        }
+        "browser.connected" | "browser.reconnected" | "browser.target_changed" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                "browser connected",
+                width,
+                text_style(),
+            );
+        }
+        "browser.disconnected" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                "browser disconnected",
+                width,
+                muted(),
+            );
+        }
+        "browser.live_url" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                "live view available",
+                width,
+                text_style(),
+            );
+        }
+        "browser.page" | "browser.state" => {
+            if let Some(url) = event.payload.get("url").and_then(serde_json::Value::as_str) {
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    &group,
+                    &format!("opened {}", compact_activity_url_for_render(url)),
+                    width,
+                    text_style(),
+                );
+            }
+        }
+        "plan.updated" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                &group,
+                "updated plan",
+                width,
+                text_style(),
+            );
+        }
+        _ => {}
+    }
+}
+
 fn is_root_session_event(state: &WorkbenchState, event: &EventRecord) -> bool {
     state
         .current_session
@@ -2234,7 +2529,7 @@ fn append_preview_markdown(
     width: u16,
     max_lines: usize,
 ) {
-    let preview_lines = markdown_result_lines(text, width.saturating_sub(4).max(24))
+    let preview_lines = render_markdown_lines(text, width.saturating_sub(4).max(24))
         .into_iter()
         .map(trim_default_markdown_indent)
         .filter(|line| {
@@ -2884,7 +3179,7 @@ fn append_live_delta_text(current: &mut String, incoming: &str) {
 
 fn append_answer_plain_block(lines: &mut Vec<Line<'static>>, markdown: &str, width: u16) {
     let body_width = width.saturating_sub(2).max(24);
-    for line in markdown_result_lines(markdown, body_width)
+    for line in render_markdown_lines(markdown, body_width)
         .into_iter()
         .map(trim_default_markdown_indent)
     {
@@ -2994,6 +3289,36 @@ fn trim_default_markdown_indent(mut line: Line<'static>) -> Line<'static> {
         }
     }
     line
+}
+
+fn wrap_plain(text: &str, width: usize, continuation_indent: &str) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in text.split_whitespace() {
+        let limit = if lines.is_empty() {
+            width
+        } else {
+            width.saturating_sub(continuation_indent.chars().count())
+        };
+        let current_len = current.chars().count();
+        let word_len = word.chars().count();
+        if current_len > 0 && current_len + 1 + word_len > limit {
+            lines.push(current);
+            current = continuation_indent.to_string();
+            current.push_str(word);
+        } else {
+            if !current.is_empty() {
+                current.push(' ');
+            } else if !lines.is_empty() {
+                current.push_str(continuation_indent);
+            }
+            current.push_str(word);
+        }
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    lines
 }
 
 fn format_activity_item(item: &str) -> String {
@@ -3152,312 +3477,6 @@ fn selected(text: &str, idx: usize, selected: usize) -> Line<'static> {
             },
         ),
     ])
-}
-
-fn markdown_result_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
-    let mut options = Options::empty();
-    options.insert(Options::ENABLE_STRIKETHROUGH);
-    let parser = Parser::new_ext(markdown, options);
-    let mut writer = MarkdownWriter::default();
-    for event in parser {
-        writer.handle_event(event);
-    }
-    wrap_markdown_lines(writer.finish(), width as usize)
-}
-
-#[derive(Clone, Debug)]
-struct ListState {
-    next: Option<u64>,
-}
-
-#[derive(Default)]
-struct MarkdownWriter {
-    lines: Vec<Line<'static>>,
-    current: Vec<Span<'static>>,
-    style_stack: Vec<Style>,
-    list_stack: Vec<ListState>,
-    link_stack: Vec<String>,
-    pending_prefix: Option<String>,
-    in_code_block: bool,
-}
-
-impl MarkdownWriter {
-    fn handle_event(&mut self, event: Event<'_>) {
-        match event {
-            Event::Start(tag) => self.start_tag(tag),
-            Event::End(tag) => self.end_tag(tag),
-            Event::Text(text) => self.push_text(&text),
-            Event::Code(code) => {
-                self.ensure_prefix();
-                self.current.push(Span::styled(code.to_string(), muted()));
-            }
-            Event::SoftBreak | Event::HardBreak => self.flush_current(),
-            Event::Rule => {
-                self.flush_current();
-                self.push_non_duplicate_blank();
-                self.lines.push(Line::from(Span::styled("---", muted())));
-                self.push_non_duplicate_blank();
-            }
-            Event::Html(html) | Event::InlineHtml(html) => self.push_text(&html),
-            Event::FootnoteReference(text) => self.push_text(&format!("[{text}]")),
-            Event::TaskListMarker(checked) => {
-                self.ensure_prefix();
-                self.current
-                    .push(Span::styled(if checked { "[x] " } else { "[ ] " }, muted()));
-            }
-        }
-    }
-
-    fn start_tag(&mut self, tag: Tag<'_>) {
-        match tag {
-            Tag::Paragraph => {}
-            Tag::Heading { level, .. } => {
-                self.flush_current();
-                self.style_stack.push(heading_style(level));
-            }
-            Tag::BlockQuote => {
-                self.flush_current();
-                self.pending_prefix = Some("> ".to_string());
-            }
-            Tag::CodeBlock(kind) => {
-                self.flush_current();
-                let label = match kind {
-                    CodeBlockKind::Fenced(language) if !language.is_empty() => {
-                        format!("code {language}")
-                    }
-                    _ => "code".to_string(),
-                };
-                self.lines.push(Line::from(Span::styled(label, muted())));
-                self.in_code_block = true;
-            }
-            Tag::List(start) => {
-                self.flush_current();
-                self.list_stack.push(ListState { next: start });
-            }
-            Tag::Item => {
-                self.flush_current();
-                self.pending_prefix = Some(self.next_list_marker());
-            }
-            Tag::Emphasis => self.style_stack.push(muted()),
-            Tag::Strong => self.style_stack.push(bold()),
-            Tag::Strikethrough => self.style_stack.push(muted()),
-            Tag::Link { dest_url, .. } => {
-                self.link_stack.push(dest_url.to_string());
-                self.style_stack.push(link());
-            }
-            Tag::Image {
-                title, dest_url, ..
-            } => {
-                self.ensure_prefix();
-                let label = if title.is_empty() {
-                    dest_url.to_string()
-                } else {
-                    title.to_string()
-                };
-                self.current
-                    .push(Span::styled(format!("[image: {label}]"), muted()));
-            }
-            Tag::FootnoteDefinition(_)
-            | Tag::HtmlBlock
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
-            | Tag::MetadataBlock(_) => {}
-        }
-    }
-
-    fn end_tag(&mut self, tag: TagEnd) {
-        match tag {
-            TagEnd::Paragraph | TagEnd::Heading(_) | TagEnd::BlockQuote => self.flush_current(),
-            TagEnd::CodeBlock => {
-                self.flush_current();
-                self.in_code_block = false;
-            }
-            TagEnd::List(_) => {
-                self.flush_current();
-                self.list_stack.pop();
-            }
-            TagEnd::Item => self.flush_current(),
-            TagEnd::Emphasis | TagEnd::Strong | TagEnd::Strikethrough => {
-                self.style_stack.pop();
-            }
-            TagEnd::Link => {
-                self.style_stack.pop();
-                if let Some(dest) = self.link_stack.pop() {
-                    self.current.push(Span::raw(" ("));
-                    self.current.push(Span::styled(dest, link()));
-                    self.current.push(Span::raw(")"));
-                }
-            }
-            TagEnd::Image
-            | TagEnd::FootnoteDefinition
-            | TagEnd::HtmlBlock
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
-            | TagEnd::MetadataBlock(_) => {}
-        }
-    }
-
-    fn push_text(&mut self, text: &str) {
-        for (idx, line) in text.lines().enumerate() {
-            if idx > 0 {
-                self.flush_current();
-            }
-            self.ensure_prefix();
-            let style = if self.in_code_block {
-                muted()
-            } else {
-                self.style_stack.last().copied().unwrap_or_else(text_style)
-            };
-            if looks_like_bare_link(line) || looks_like_path(line) {
-                self.current.push(Span::styled(line.to_string(), link()));
-            } else {
-                self.current.push(Span::styled(line.to_string(), style));
-            }
-        }
-    }
-
-    fn ensure_prefix(&mut self) {
-        if self.current.is_empty() {
-            if let Some(prefix) = self.pending_prefix.take() {
-                self.current.push(Span::styled(prefix, accent()));
-            } else {
-                self.current.push(Span::raw("  "));
-            }
-        }
-    }
-
-    fn flush_current(&mut self) {
-        if self.current.is_empty() {
-            return;
-        }
-        self.lines
-            .push(Line::from(std::mem::take(&mut self.current)));
-        self.pending_prefix = None;
-    }
-
-    fn push_non_duplicate_blank(&mut self) {
-        if self.lines.last().is_some_and(|line| !line.spans.is_empty()) {
-            self.lines.push(Line::from(""));
-        }
-    }
-
-    fn next_list_marker(&mut self) -> String {
-        let depth = self.list_stack.len().saturating_sub(1);
-        let indent = format!("  {}", "  ".repeat(depth));
-        let Some(list) = self.list_stack.last_mut() else {
-            return format!("{indent}* ");
-        };
-        match &mut list.next {
-            Some(next) => {
-                let marker = format!("{indent}{next}. ");
-                *next += 1;
-                marker
-            }
-            None => format!("{indent}* "),
-        }
-    }
-
-    fn finish(mut self) -> Vec<Line<'static>> {
-        self.flush_current();
-        if self.lines.is_empty() {
-            self.lines.push(Line::from(""));
-        }
-        self.lines
-    }
-}
-
-fn wrap_markdown_lines(lines: Vec<Line<'static>>, width: usize) -> Vec<Line<'static>> {
-    let width = width.max(24);
-    let mut out = Vec::new();
-    for line in lines {
-        let text = line
-            .spans
-            .iter()
-            .map(|span| span.content.as_ref())
-            .collect::<String>();
-        if text.chars().count() <= width || text.trim().is_empty() {
-            out.push(line);
-            continue;
-        }
-        let continuation_indent = continuation_indent(&text);
-        for (idx, part) in wrap_plain(&text, width, &continuation_indent)
-            .into_iter()
-            .enumerate()
-        {
-            let style = if idx == 0 {
-                line.spans
-                    .last()
-                    .map(|span| span.style)
-                    .unwrap_or_else(text_style)
-            } else {
-                text_style()
-            };
-            out.push(Line::from(Span::styled(part, style)));
-        }
-    }
-    out
-}
-
-fn continuation_indent(text: &str) -> String {
-    let leading = text.chars().take_while(|ch| ch.is_whitespace()).count();
-    let trimmed = text.trim_start();
-    if let Some(rest) = trimmed.strip_prefix("* ") {
-        return format!("{}  ", " ".repeat(leading + trimmed.len() - rest.len() - 2));
-    }
-    let marker_len = trimmed.chars().take_while(|ch| ch.is_ascii_digit()).count();
-    if marker_len > 0 && trimmed.chars().nth(marker_len) == Some('.') {
-        return " ".repeat(leading + marker_len + 2);
-    }
-    " ".repeat(leading)
-}
-
-fn wrap_plain(text: &str, width: usize, continuation_indent: &str) -> Vec<String> {
-    let mut lines = Vec::new();
-    let mut current = String::new();
-    for word in text.split_whitespace() {
-        let limit = if lines.is_empty() {
-            width
-        } else {
-            width.saturating_sub(continuation_indent.chars().count())
-        };
-        let current_len = current.chars().count();
-        let word_len = word.chars().count();
-        if current_len > 0 && current_len + 1 + word_len > limit {
-            lines.push(current);
-            current = continuation_indent.to_string();
-            current.push_str(word);
-        } else {
-            if !current.is_empty() {
-                current.push(' ');
-            } else if !lines.is_empty() {
-                current.push_str(continuation_indent);
-            }
-            current.push_str(word);
-        }
-    }
-    if !current.is_empty() {
-        lines.push(current);
-    }
-    lines
-}
-
-fn heading_style(level: HeadingLevel) -> Style {
-    match level {
-        HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => bold(),
-        HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => text_style(),
-    }
-}
-
-fn looks_like_bare_link(value: &str) -> bool {
-    value.starts_with("http://") || value.starts_with("https://")
-}
-
-fn looks_like_path(value: &str) -> bool {
-    value.starts_with('/') || value.starts_with("~/")
 }
 
 fn append_telemetry_detail_lines(lines: &mut Vec<Line<'static>>, telemetry: &TelemetrySummary) {
