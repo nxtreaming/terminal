@@ -178,6 +178,7 @@ impl ModelProvider for OpenAIResponsesProvider {
             "store": false,
             "parallel_tool_calls": true,
         });
+        apply_reasoning_summary_request(&mut body);
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
@@ -756,6 +757,7 @@ impl CodexResponsesProvider {
             "tool_choice": "auto",
             "parallel_tool_calls": true,
         });
+        apply_reasoning_summary_request(&mut body);
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
@@ -791,6 +793,32 @@ fn codex_responses_url(base_url: &str) -> String {
         format!("{normalized}/responses")
     } else {
         format!("{normalized}/codex/responses")
+    }
+}
+
+fn apply_reasoning_summary_request(body: &mut Value) {
+    let Some(summary) = reasoning_summary_setting() else {
+        return;
+    };
+    body["reasoning"] = json!({ "summary": summary });
+}
+
+fn reasoning_summary_setting() -> Option<String> {
+    match std::env::var("LLM_BROWSER_REASONING_SUMMARY") {
+        Ok(raw) => {
+            let value = raw.trim();
+            if value.is_empty()
+                || matches!(
+                    value.to_ascii_lowercase().as_str(),
+                    "0" | "false" | "off" | "none" | "no"
+                )
+            {
+                None
+            } else {
+                Some(value.to_string())
+            }
+        }
+        Err(_) => Some("auto".to_string()),
     }
 }
 
@@ -942,6 +970,18 @@ fn flush_sse_event(
                 emit_codex_model_event(
                     ModelEvent::TextDelta {
                         text: delta.to_string(),
+                    },
+                    on_event,
+                    emitted_done,
+                )?;
+            }
+        }
+        Some("response.reasoning_summary_text.delta") => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                emit_codex_model_event(
+                    ModelEvent::ThinkingDelta {
+                        text: delta.to_string(),
+                        label: Some("reasoning summary".to_string()),
                     },
                     on_event,
                     emitted_done,
@@ -1821,6 +1861,19 @@ fn parse_anthropic_messages_output(
                     });
                 }
             }
+            Some("thinking") => {
+                if let Some(text) = block
+                    .get("thinking")
+                    .or_else(|| block.get("text"))
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    events.push(ModelEvent::ThinkingDelta {
+                        text: text.to_string(),
+                        label: Some("thinking".to_string()),
+                    });
+                }
+            }
             Some("tool_use") => {
                 let name = block
                     .get("name")
@@ -1863,6 +1916,25 @@ fn parse_response_output_item(item: &Value, events: &mut Vec<ModelEvent>) -> Res
                             });
                         }
                     }
+                }
+            }
+        }
+        Some("reasoning") => {
+            for summary in item
+                .get("summary")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(text) = summary
+                    .get("text")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                {
+                    events.push(ModelEvent::ThinkingDelta {
+                        text: text.to_string(),
+                        label: Some("reasoning summary".to_string()),
+                    });
                 }
             }
         }
@@ -2379,6 +2451,7 @@ mod tests {
     #[test]
     fn codex_responses_provider_parses_sse_text_tool_call_and_usage() -> Result<()> {
         let sse = concat!(
+            "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking context.\"}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Working\\n\"}\n\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_123\",\"name\":\"done\",\"arguments\":\"{\\\"result\\\":\\\"ok\\\"}\"}}\n\n",
             "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n",
@@ -2406,6 +2479,10 @@ mod tests {
             }],
         })?;
         handle.join().expect("mock server thread");
+        assert!(events.contains(&ModelEvent::ThinkingDelta {
+            text: "Checking context.".to_string(),
+            label: Some("reasoning summary".to_string()),
+        }));
         assert!(events.contains(&ModelEvent::TextDelta {
             text: "Working\n".to_string(),
         }));
@@ -2436,6 +2513,15 @@ mod tests {
                 "id": "resp_123",
                 "object": "response",
                 "output": [
+                    {
+                        "type": "reasoning",
+                        "summary": [
+                            {
+                                "type": "summary_text",
+                                "text": "Checking whether a tool is needed."
+                            }
+                        ]
+                    },
                     {
                         "type": "message",
                         "role": "assistant",
@@ -2483,6 +2569,10 @@ mod tests {
             }],
         })?;
         handle.join().expect("mock server thread");
+        assert!(events.contains(&ModelEvent::ThinkingDelta {
+            text: "Checking whether a tool is needed.".to_string(),
+            label: Some("reasoning summary".to_string()),
+        }));
         assert!(events.contains(&ModelEvent::TextDelta {
             text: "Need the browser.\n".to_string()
         }));

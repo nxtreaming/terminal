@@ -313,6 +313,7 @@ impl AgentTelemetry {
         for event in events {
             match event {
                 ModelEvent::TextDelta { text } => output_text.push_str(text),
+                ModelEvent::ThinkingDelta { .. } => {}
                 ModelEvent::ToolCall { call } => tool_calls.push(call),
                 ModelEvent::Usage { usage: event_usage } => usage = Some(event_usage),
                 ModelEvent::Done => {}

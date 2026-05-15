@@ -130,9 +130,20 @@ pub struct ModelUsage {
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum ModelEvent {
-    TextDelta { text: String },
-    ToolCall { call: ToolCall },
-    Usage { usage: ModelUsage },
+    TextDelta {
+        text: String,
+    },
+    ThinkingDelta {
+        text: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        label: Option<String>,
+    },
+    ToolCall {
+        call: ToolCall,
+    },
+    Usage {
+        usage: ModelUsage,
+    },
     Done,
 }
 
@@ -182,6 +193,7 @@ pub struct TranscriptTurn {
     pub prompt: String,
     pub is_followup: bool,
     pub activity: Vec<String>,
+    pub thinking_text: Option<String>,
     pub streaming_text: Option<String>,
     pub result: Option<String>,
     pub failure: Option<String>,
@@ -238,6 +250,7 @@ pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
                 prompt: prompt.clone(),
                 is_followup: *is_followup,
                 activity: activity_from_events(segment),
+                thinking_text: turn_thinking_text_from_events(segment),
                 streaming_text: turn_streaming_text_from_events(segment),
                 result: turn_result_from_events(segment),
                 failure: turn_failure_from_events(segment),
@@ -330,6 +343,24 @@ pub fn turn_streaming_text_from_events(events: &[EventRecord]) -> Option<String>
                 text.clear();
             }
             "model.stream_delta" => {
+                if let Some(incoming) = event.payload.get("text").and_then(Value::as_str) {
+                    append_streaming_text_delta(&mut text, incoming);
+                }
+            }
+            _ => {}
+        }
+    }
+    (!text.trim().is_empty()).then_some(text)
+}
+
+pub fn turn_thinking_text_from_events(events: &[EventRecord]) -> Option<String> {
+    let mut text = String::new();
+    for event in events {
+        match event.event_type.as_str() {
+            "model.turn.request" | "model.turn.retry" | "model.turn.error" => {
+                text.clear();
+            }
+            "model.thinking_delta" => {
                 if let Some(incoming) = event.payload.get("text").and_then(Value::as_str) {
                     append_streaming_text_delta(&mut text, incoming);
                 }
@@ -578,9 +609,9 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
             }
             "file.list" => push_activity(&mut activity, "listed files"),
             "agent.spawned" => push_activity(&mut activity, agent_started_text(&event.payload)),
-            "agent.completed" => push_activity(&mut activity, "helper finished"),
-            "agent.failed" => push_activity(&mut activity, "helper failed"),
-            "agent.cancelled" => push_activity(&mut activity, "helper stopped"),
+            "agent.completed" => push_activity(&mut activity, "subagent finished"),
+            "agent.failed" => push_activity(&mut activity, "subagent failed"),
+            "agent.cancelled" => push_activity(&mut activity, "subagent stopped"),
             _ => {}
         }
     }
@@ -795,8 +826,8 @@ fn agent_started_text(payload: &Value) -> String {
         .get("nickname")
         .and_then(Value::as_str)
         .or_else(|| payload.get("role").and_then(Value::as_str))
-        .unwrap_or("helper");
-    format!("started {label} helper")
+        .unwrap_or("subagent");
+    format!("subagent {label} started")
 }
 
 fn activity_with_child_agents(
@@ -825,7 +856,7 @@ fn activity_with_child_agents(
         activity.retain(|item| {
             !matches!(
                 item.as_str(),
-                "helper finished" | "helper failed" | "helper stopped"
+                "subagent finished" | "subagent failed" | "subagent stopped"
             )
         });
     }
@@ -855,11 +886,13 @@ fn child_agent_activity(child: &SessionMeta, child_events: &[EventRecord]) -> Ve
     let mut activity = Vec::new();
     match child.status {
         SessionStatus::Created | SessionStatus::Running => {
-            push_activity(&mut activity, format!("helper {label} working"));
+            push_activity(&mut activity, format!("subagent {label} working"));
         }
-        SessionStatus::Done => push_activity(&mut activity, format!("helper {label} finished")),
-        SessionStatus::Failed => push_activity(&mut activity, format!("helper {label} failed")),
-        SessionStatus::Cancelled => push_activity(&mut activity, format!("helper {label} stopped")),
+        SessionStatus::Done => push_activity(&mut activity, format!("subagent {label} finished")),
+        SessionStatus::Failed => push_activity(&mut activity, format!("subagent {label} failed")),
+        SessionStatus::Cancelled => {
+            push_activity(&mut activity, format!("subagent {label} stopped"))
+        }
     }
 
     let mut recent = activity_from_events(child_events)
@@ -872,14 +905,14 @@ fn child_agent_activity(child: &SessionMeta, child_events: &[EventRecord]) -> Ve
     for item in recent {
         push_activity(
             &mut activity,
-            format!("helper {label}: {}", child_agent_activity_text(&item)),
+            format!("subagent {label}: {}", child_agent_activity_text(&item)),
         );
     }
     if let Some(streaming_text) = turn_streaming_text_from_events(child_events) {
         push_activity(
             &mut activity,
             format!(
-                "helper {label}: streaming {}",
+                "subagent {label}: streaming {}",
                 truncate_activity(streaming_text.trim(), 96)
             ),
         );
@@ -1123,13 +1156,13 @@ mod tests {
         );
         assert!(state
             .activity
-            .contains(&"started repo-explorer helper".to_string()));
+            .contains(&"subagent repo-explorer started".to_string()));
         assert!(state
             .activity
-            .contains(&"helper repo-explorer working".to_string()));
+            .contains(&"subagent repo-explorer working".to_string()));
         assert!(state
             .activity
-            .contains(&"helper repo-explorer: read README.md".to_string()));
+            .contains(&"subagent repo-explorer: read README.md".to_string()));
         assert!(state
             .activity
             .iter()
@@ -1311,14 +1344,30 @@ mod tests {
                 id: "e6".to_string(),
                 session_id: "s1".to_string(),
                 ts_ms: 6,
-                event_type: "model.stream_delta".to_string(),
-                payload: json!({"text": "fresh "}),
+                event_type: "model.thinking_delta".to_string(),
+                payload: json!({"text": "checking "}),
             },
             EventRecord {
                 seq: 7,
                 id: "e7".to_string(),
                 session_id: "s1".to_string(),
                 ts_ms: 7,
+                event_type: "model.thinking_delta".to_string(),
+                payload: json!({"text": "checking context"}),
+            },
+            EventRecord {
+                seq: 8,
+                id: "e8".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 8,
+                event_type: "model.stream_delta".to_string(),
+                payload: json!({"text": "fresh "}),
+            },
+            EventRecord {
+                seq: 9,
+                id: "e9".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 9,
                 event_type: "model.stream_delta".to_string(),
                 payload: json!({"text": "fresh answer"}),
             },
@@ -1326,6 +1375,10 @@ mod tests {
 
         let transcript = transcript_from_events(&events);
         assert_eq!(transcript.len(), 1);
+        assert_eq!(
+            transcript[0].thinking_text.as_deref(),
+            Some("checking context")
+        );
         assert_eq!(
             transcript[0].streaming_text.as_deref(),
             Some("fresh answer")
@@ -1454,7 +1507,7 @@ mod tests {
         ];
         assert_eq!(
             activity_from_events(&events),
-            vec!["started checkout helper", "helper finished"]
+            vec!["subagent checkout started", "subagent finished"]
         );
         assert_eq!(
             result_from_events(&events).as_deref(),

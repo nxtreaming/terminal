@@ -613,6 +613,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 assistant_text.push_str(&delta);
                             }
                         }
+                        ModelEvent::ThinkingDelta { .. } => {}
                         ModelEvent::Usage { usage } => {
                             store.append_event(
                                 &session.id,
@@ -649,10 +650,82 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
 
                 if tool_calls.is_empty() {
                     if !assistant_text.trim().is_empty() {
+                        let requested_result = assistant_text.trim_end();
+                        if looks_like_placeholder_done_result(requested_result) {
+                            if let Some(final_answer) = persisted_final_answer(&session)? {
+                                if let Some(error) =
+                                    persisted_final_answer_not_ready_message(&final_answer)
+                                {
+                                    store.append_event(
+                                        &session.id,
+                                        "tool.failed",
+                                        serde_json::json!({
+                                            "name": "done",
+                                            "source": "assistant_text_placeholder",
+                                            "error": error,
+                                        }),
+                                    )?;
+                                    messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": error,
+                                    }));
+                                    maybe_compact_messages(
+                                        store,
+                                        &session.id,
+                                        &mut messages,
+                                        options.max_context_chars,
+                                    )?;
+                                    step_span.set_ok();
+                                    continue;
+                                }
+                                if append_done_from_persisted_final_answer(
+                                    store,
+                                    &session.id,
+                                    &final_answer,
+                                    "assistant_text_placeholder",
+                                    None,
+                                )? {
+                                    step_span.set_ok();
+                                    return Ok(session.id.clone());
+                                }
+                            }
+                        }
+                        if let Some(final_answer) = persisted_final_answer(&session)? {
+                            if let Some(error) =
+                                persisted_final_answer_not_ready_message(&final_answer)
+                            {
+                                if !explicit_result_states_persisted_gaps(requested_result) {
+                                    let error = format!(
+                                        "{error} Your explicit final result does not clearly state that the persisted artifact is partial/incomplete or name the remaining gaps. Either fix the artifact/audit and call set_final_answer(..., audit=audit) again, or finalize with an explicit partial answer that leads with the unresolved gaps."
+                                    );
+                                    store.append_event(
+                                        &session.id,
+                                        "tool.failed",
+                                        serde_json::json!({
+                                            "name": "done",
+                                            "source": "assistant_text_final_answer_not_ready",
+                                            "error": error,
+                                        }),
+                                    )?;
+                                    messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": error,
+                                    }));
+                                    maybe_compact_messages(
+                                        store,
+                                        &session.id,
+                                        &mut messages,
+                                        options.max_context_chars,
+                                    )?;
+                                    step_span.set_ok();
+                                    continue;
+                                }
+                            }
+                        }
                         store.append_event(
                             &session.id,
                             "session.done",
-                            serde_json::json!({ "result": assistant_text.trim_end() }),
+                            serde_json::json!({ "result": requested_result }),
                         )?;
                         step_span.set_ok();
                         return Ok(session.id.clone());
@@ -687,6 +760,23 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 step_span.set_ok();
             }
 
+            if let Some(final_answer) = persisted_final_answer(&session)? {
+                if let Some(error) = persisted_final_answer_not_ready_message(&final_answer) {
+                    store.append_event(
+                        &session.id,
+                        "session.final_answer_not_ready_at_max_turns",
+                        serde_json::json!({ "error": error }),
+                    )?;
+                } else if append_done_from_persisted_final_answer(
+                    store,
+                    &session.id,
+                    &final_answer,
+                    "max_turns_exhausted",
+                    None,
+                )? {
+                    return Ok(session.id.clone());
+                }
+            }
             store.append_event(
                 &session.id,
                 "session.failed",
@@ -768,19 +858,37 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
     loop {
         let mut events = Vec::new();
         let mut streamed_text = String::new();
+        let mut streamed_thinking_text = String::new();
         match provider.stream_turn(turn.clone(), &mut |event| {
-            if let ModelEvent::TextDelta { text } = &event {
-                if let Some(delta) = assistant_delta_to_append(&streamed_text, text) {
-                    record_model_stream_delta(
-                        store,
-                        session_id,
-                        provider,
-                        turn_idx,
-                        attempt + 1,
-                        &delta,
-                    )?;
-                    streamed_text.push_str(&delta);
+            match &event {
+                ModelEvent::TextDelta { text } => {
+                    if let Some(delta) = assistant_delta_to_append(&streamed_text, text) {
+                        record_model_stream_delta(
+                            store,
+                            session_id,
+                            provider,
+                            turn_idx,
+                            attempt + 1,
+                            &delta,
+                        )?;
+                        streamed_text.push_str(&delta);
+                    }
                 }
+                ModelEvent::ThinkingDelta { text, label } => {
+                    if let Some(delta) = assistant_delta_to_append(&streamed_thinking_text, text) {
+                        record_model_thinking_delta(
+                            store,
+                            session_id,
+                            provider,
+                            turn_idx,
+                            attempt + 1,
+                            &delta,
+                            label.as_deref(),
+                        )?;
+                        streamed_thinking_text.push_str(&delta);
+                    }
+                }
+                ModelEvent::ToolCall { .. } | ModelEvent::Usage { .. } | ModelEvent::Done => {}
             }
             events.push(event);
             Ok(())
@@ -850,6 +958,32 @@ fn record_model_stream_delta<P: ModelProvider>(
             "text": text,
         }),
     )?;
+    Ok(())
+}
+
+fn record_model_thinking_delta<P: ModelProvider>(
+    store: &Store,
+    session_id: &str,
+    provider: &P,
+    turn_idx: usize,
+    attempt: usize,
+    text: &str,
+    label: Option<&str>,
+) -> Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    let mut payload = serde_json::json!({
+        "turn_idx": turn_idx,
+        "attempt": attempt,
+        "provider": provider.provider_name(),
+        "model": provider.model_name(),
+        "text": text,
+    });
+    if let Some(label) = label.filter(|label| !label.trim().is_empty()) {
+        payload["label"] = serde_json::json!(label);
+    }
+    store.append_event(session_id, "model.thinking_delta", payload)?;
     Ok(())
 }
 
@@ -971,6 +1105,10 @@ fn record_model_turn_response(
         "event_count": events.len(),
         "text_delta_chars": events.iter().map(|event| match event {
             ModelEvent::TextDelta { text } => text.chars().count(),
+            _ => 0,
+        }).sum::<usize>(),
+        "thinking_delta_chars": events.iter().map(|event| match event {
+            ModelEvent::ThinkingDelta { text, .. } => text.chars().count(),
             _ => 0,
         }).sum::<usize>(),
         "tool_call_count": events.iter().filter(|event| matches!(event, ModelEvent::ToolCall { .. })).count(),
@@ -2600,6 +2738,19 @@ fn dispatch_done_tool(
         .as_ref()
         .and_then(|answer| answer.get("summary"))
         .cloned();
+    if let Some(answer) = final_answer.as_ref() {
+        if let Some(error) = persisted_final_answer_not_ready_message(answer) {
+            if use_final_answer {
+                return dispatch_tool_validation_error(store, session, call, &error);
+            }
+            if !explicit_result_states_persisted_gaps(&requested_result) {
+                let error = format!(
+                    "{error} Your explicit final result does not clearly state that the persisted artifact is partial/incomplete or name the remaining gaps. Either fix the artifact/audit and call set_final_answer(..., audit=audit) again, or finalize with an explicit partial answer that leads with the unresolved gaps."
+                );
+                return dispatch_tool_validation_error(store, session, call, &error);
+            }
+        }
+    }
     let result = if use_final_answer {
         let Some(answer) = final_answer.as_ref() else {
             return dispatch_tool_validation_error(
@@ -2609,12 +2760,7 @@ fn dispatch_done_tool(
                 "done could not load the persisted final answer",
             );
         };
-        let Some(result) = answer
-            .get("result")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|result| !result.is_empty())
-        else {
+        let Some(result) = persisted_final_answer_result(answer) else {
             return dispatch_tool_validation_error(
                 store,
                 session,
@@ -2636,12 +2782,18 @@ fn dispatch_done_tool(
         }),
     )?;
     if use_final_answer {
+        let trigger = if should_auto_use_final_answer && !explicit_use_final_answer {
+            "assistant_done_result_replaced"
+        } else {
+            "done_use_final_answer"
+        };
         store.append_event(
             &session.id,
             "session.final_answer_used",
             serde_json::json!({
                 "source": "python.set_final_answer",
                 "tool_call_id": call.id,
+                "trigger": trigger,
             }),
         )?;
     }
@@ -2679,6 +2831,73 @@ fn persisted_final_answer(session: &browser_use_protocol::SessionMeta) -> Result
     Ok(Some(value))
 }
 
+fn persisted_final_answer_result(final_answer: &Value) -> Option<String> {
+    final_answer
+        .get("result")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|result| !result.is_empty())
+        .map(str::to_string)
+}
+
+fn append_done_from_persisted_final_answer(
+    store: &Store,
+    session_id: &str,
+    final_answer: &Value,
+    trigger: &str,
+    tool_call_id: Option<&str>,
+) -> Result<bool> {
+    let Some(result) = persisted_final_answer_result(final_answer) else {
+        return Ok(false);
+    };
+    let mut used_payload = serde_json::json!({
+        "source": "python.set_final_answer",
+        "trigger": trigger,
+    });
+    if let Some(tool_call_id) = tool_call_id {
+        used_payload["tool_call_id"] = Value::String(tool_call_id.to_string());
+    }
+    store.append_event(session_id, "session.final_answer_used", used_payload)?;
+    let mut done_payload = serde_json::json!({
+        "result": result,
+        "source": "python.set_final_answer",
+    });
+    if let Some(summary) = final_answer.get("summary").cloned() {
+        done_payload["final_answer_summary"] = summary;
+    }
+    store.append_event(session_id, "session.done", done_payload)?;
+    Ok(true)
+}
+
+fn persisted_final_answer_not_ready_message(final_answer: &Value) -> Option<String> {
+    let summary = final_answer.get("summary")?;
+    if summary
+        .get("ready_for_done")
+        .and_then(Value::as_bool)
+        .unwrap_or(true)
+    {
+        return None;
+    }
+    if let Some(note) = summary.get("audit_note").and_then(Value::as_str) {
+        return Some(format!(
+            "The persisted final answer is not ready for done. {note} Fix the artifact/audit and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
+        ));
+    }
+    if let Some(audit_path) = summary
+        .get("audit")
+        .and_then(|audit| audit.get("audit_path"))
+        .and_then(Value::as_str)
+    {
+        return Some(format!(
+            "The persisted final answer is not ready for done because the attached artifact audit did not pass ({audit_path}). Review the audit checks, fix the artifact, and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
+        ));
+    }
+    Some(
+        "The persisted final answer is not ready for done. Fix the artifact/audit and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
+            .to_string(),
+    )
+}
+
 fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Value) -> bool {
     let count = final_answer
         .get("summary")
@@ -2687,7 +2906,35 @@ fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Va
         .unwrap_or(0);
     count > 0
         && (looks_like_empty_structured_result(requested_result)
-            || looks_like_placeholder_done_result(requested_result))
+            || looks_like_placeholder_done_result(requested_result)
+            || looks_like_persisted_preview_result(requested_result, final_answer))
+}
+
+fn explicit_result_states_persisted_gaps(result: &str) -> bool {
+    let normalized = result.to_ascii_lowercase();
+    [
+        "blank",
+        "could not",
+        "duplicate",
+        "failed",
+        "gap",
+        "incomplete",
+        "invalid",
+        "missing",
+        "not found",
+        "not ready",
+        "not verified",
+        "null",
+        "partial",
+        "remaining",
+        "unavailable",
+        "unable",
+        "unknown",
+        "unmet",
+        "unresolved",
+    ]
+    .iter()
+    .any(|needle| normalized.contains(needle))
 }
 
 fn looks_like_placeholder_done_result(result: &str) -> bool {
@@ -2698,7 +2945,68 @@ fn looks_like_placeholder_done_result(result: &str) -> bool {
     matches!(
         normalized.as_str(),
         "done" | "complete" | "completed" | "finished"
-    )
+    ) || looks_like_persisted_final_answer_status(&normalized)
+}
+
+fn looks_like_persisted_final_answer_status(normalized: &str) -> bool {
+    (normalized.contains("final answer")
+        && (normalized.contains("persisted")
+            || normalized.contains("stored")
+            || normalized.contains("saved"))
+        && (normalized.contains("use") || normalized.contains("done")))
+        || (normalized.starts_with("need final") && normalized.contains("done"))
+}
+
+fn looks_like_persisted_preview_result(requested_result: &str, final_answer: &Value) -> bool {
+    let requested_result = requested_result.trim();
+    if requested_result.len() < 64 {
+        return false;
+    }
+    let Some(persisted_result) = persisted_final_answer_result(final_answer) else {
+        return false;
+    };
+    let persisted_result = persisted_result.trim();
+    if persisted_result.len() <= requested_result.len() + 64 {
+        return false;
+    }
+    if persisted_result.starts_with(requested_result) {
+        return true;
+    }
+    let Ok(requested_json) = serde_json::from_str::<Value>(requested_result) else {
+        return false;
+    };
+    let Ok(persisted_json) = serde_json::from_str::<Value>(persisted_result) else {
+        return false;
+    };
+    json_value_is_strict_prefix_of(&requested_json, &persisted_json)
+}
+
+fn json_value_is_strict_prefix_of(requested: &Value, persisted: &Value) -> bool {
+    match (requested, persisted) {
+        (Value::Array(requested_items), Value::Array(persisted_items)) => {
+            !requested_items.is_empty()
+                && requested_items.len() < persisted_items.len()
+                && requested_items
+                    .iter()
+                    .zip(persisted_items.iter())
+                    .all(|(requested_item, persisted_item)| requested_item == persisted_item)
+        }
+        (Value::Object(requested_object), Value::Object(persisted_object)) => {
+            let mut found_truncated_collection = false;
+            for (key, requested_value) in requested_object {
+                let Some(persisted_value) = persisted_object.get(key) else {
+                    return false;
+                };
+                if json_value_is_strict_prefix_of(requested_value, persisted_value) {
+                    found_truncated_collection = true;
+                } else if requested_value != persisted_value {
+                    return false;
+                }
+            }
+            found_truncated_collection
+        }
+        _ => false,
+    }
 }
 
 fn looks_like_empty_structured_result(result: &str) -> bool {
@@ -4211,6 +4519,46 @@ mod tests {
     }
 
     #[test]
+    fn provider_loop_records_live_thinking_deltas() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ThinkingDelta {
+                text: "checking ".to_string(),
+                label: Some("reasoning summary".to_string()),
+            },
+            ModelEvent::ThinkingDelta {
+                text: "checking context".to_string(),
+                label: Some("reasoning summary".to_string()),
+            },
+            ModelEvent::TextDelta {
+                text: "final answer".to_string(),
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish with thinking text",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        let thinking_text = events
+            .iter()
+            .filter(|event| event.event_type == "model.thinking_delta")
+            .filter_map(|event| event.payload.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert_eq!(thinking_text, "checking context");
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.thinking_delta"
+                && event.payload["label"] == "reasoning summary"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn provider_loop_respects_external_cancel_before_finalizing() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -5152,6 +5500,226 @@ mod tests {
                 && event.payload["result"]
                     .as_str()
                     .is_some_and(|result| result.contains("\"items\""))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_replaces_final_answer_status_text_with_full_persisted_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_final_status_text".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer({'items': [{'name': 'A', 'value': 'B'}]}, artifact_name='items.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_status_text".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "Final answer persisted. Need done use.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract result counts",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "python.set_final_answer"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("\"name\": \"A\""))
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"] == "Final answer persisted. Need done use."
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_replaces_preview_with_full_persisted_final_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let preview = serde_json::to_string_pretty(&serde_json::json!([
+            {"id": 1, "name": "one"},
+            {"id": 2, "name": "two"}
+        ]))?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_full_final".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "set_final_answer([{'id': 1, 'name': 'one'}, {'id': 2, 'name': 'two'}, {'id': 3, 'name': 'three'}, {'id': 4, 'name': 'four'}], artifact_name='rows.json')",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_preview".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": preview,
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract rows",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.final_answer_used"
+                && event.payload["trigger"] == "assistant_done_result_replaced"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "python.set_final_answer"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("\"name\": \"four\""))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_uses_ready_persisted_final_answer_at_turn_budget() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: "python_final_on_last_turn".to_string(),
+                    name: "python".to_string(),
+                    arguments: serde_json::json!({
+                        "code": "set_final_answer({'answer': 'Example', 'items': [1, 2]}, artifact_name='result.json')",
+                    }),
+                },
+            },
+            ModelEvent::Done,
+        ]]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract result",
+            temp.path(),
+            AgentRunOptions {
+                max_turns: 1,
+                max_context_chars: 80_000,
+                browser_mode: None,
+                python_tool_timeout_seconds: 120,
+                python_env: Vec::new(),
+            },
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.failed"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.final_answer_used"
+                && event.payload["trigger"] == "max_turns_exhausted"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "python.set_final_answer"
+                && event.payload["result"]
+                    .as_str()
+                    .is_some_and(|result| result.contains("\"answer\""))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn done_rejects_persisted_final_answer_when_attached_audit_is_not_ready() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "python_failed_audit_final".to_string(),
+                        name: "python".to_string(),
+                        arguments: serde_json::json!({
+                            "code": "rows=[{'name':''}]\naudit=audit_artifact(records=rows, required_fields=['name'])\nset_final_answer({'rows': rows}, artifact_name='rows.json', audit=audit)",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_failed_audit".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "use_final_answer": true,
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_explicit_gaps".to_string(),
+                        name: "done".to_string(),
+                        arguments: serde_json::json!({
+                            "result": "Partial/incomplete result: the artifact is missing the required name field for one row.",
+                        }),
+                    },
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "extract many items",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["tool_call_id"] == "done_failed_audit"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("attached artifact audit did not pass"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"]
+                    == "Partial/incomplete result: the artifact is missing the required name field for one row."
         }));
         Ok(())
     }

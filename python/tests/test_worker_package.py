@@ -378,6 +378,120 @@ def test_worker_set_final_answer_persists_metadata_and_compact_result(tmp_path: 
     assert '"stores"' in metadata.read_text()
 
 
+def test_worker_audit_artifact_reports_general_quality_checks(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "artifact-audit",
+            "session_id": "task-artifact-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+rows = [
+    {'name': 'A', 'category': 'one', 'score': 10},
+    {'name': '', 'category': 'one', 'score': 7},
+    {'name': 'A', 'category': 'two', 'score': 3},
+]
+audit = audit_artifact(
+    records=rows,
+    required_fields=['name', 'category'],
+    dedupe_fields=['name'],
+    bucket_field='category',
+    bucket_targets={'one': 3, 'two': 1},
+)
+result = audit
+""",
+        }
+    )
+
+    assert response["ok"] is True
+    audit = response["data"]
+    assert audit["ready_for_done"] is False
+    assert audit["generated_by"] == "audit_artifact"
+    assert audit["record_count"] == 3
+    assert audit["checks"]["missing_fields"]["name"]["count"] == 1
+    assert audit["checks"]["dedupe"]["duplicate_count"] == 1
+    assert audit["checks"]["buckets"]["unmet_targets"] == {
+        "one": {"count": 2, "target": 3}
+    }
+    assert Path(audit["audit_path"]).exists()
+    assert response["artifacts"][0]["source_path"] == audit["audit_path"]
+
+
+def test_worker_audit_artifact_zero_records_requires_explicit_empty_proof(
+    tmp_path: Path,
+) -> None:
+    blocked = worker._run(
+        {
+            "id": "artifact-zero-record-audit",
+            "session_id": "task-artifact-zero-record-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": "audit = audit_artifact(records=[], required_fields=['name'])\nresult = audit",
+        }
+    )
+    assert blocked["data"]["ready_for_done"] is False
+    assert blocked["data"]["checks"]["record_count"]["violation"] == "zero_records"
+
+    allowed = worker._run(
+        {
+            "id": "artifact-zero-record-audit-allowed",
+            "session_id": "task-artifact-zero-record-audit-allowed",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts2"),
+            "code": "audit = audit_artifact(records=[], required_fields=['name'], allow_empty=True)\nresult = audit",
+        }
+    )
+    assert allowed["data"]["ready_for_done"] is True
+
+
+def test_worker_set_final_answer_embeds_explicit_audit(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "final-answer-audit",
+            "session_id": "task-final-answer-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": "rows=[{'name':''}]\naudit=audit_artifact(records=rows, required_fields=['name'])\nsummary=set_final_answer({'rows': rows}, artifact_name='rows.json', audit=audit)\nresult=summary",
+        }
+    )
+
+    assert response["ok"] is True
+    assert response["data"]["ready_for_done"] is False
+    assert response["data"]["audit"]["checks"]["missing_fields"]["name"]["count"] == 1
+    assert "audit_ready_for_done=False" in response["outputs"][-1]["text"]
+
+
+def test_worker_audit_artifact_reports_selection_metric_gaps(tmp_path: Path) -> None:
+    response = worker._run(
+        {
+            "id": "artifact-selection-audit",
+            "session_id": "task-artifact-selection-audit",
+            "cwd": str(tmp_path),
+            "artifact_dir": str(tmp_path / "artifacts"),
+            "code": """
+selected = [{'id': 'b', 'score': 7}, {'id': 'a', 'score': 10}]
+pool = [{'id': 'a', 'score': 10}, {'id': 'b', 'score': 7}, {'id': 'c', 'score': 11}]
+audit = audit_artifact(
+    records=selected,
+    selection_metric_field='score',
+    selection_order='desc',
+    selection_limit=2,
+    selection_pool_records=pool,
+    selection_key_fields=['id'],
+)
+result = audit
+""",
+        }
+    )
+
+    audit = response["data"]
+    assert audit["ready_for_done"] is False
+    selection = audit["checks"]["selection"]
+    assert selection["order_violation_count"] == 1
+    assert selection["missing_top_candidate_count"] == 1
+    assert selection["selected_outside_top_count"] == 1
+
+
 def test_managed_browser_does_not_use_system_chromium_without_opt_in(
     tmp_path: Path, monkeypatch
 ) -> None:

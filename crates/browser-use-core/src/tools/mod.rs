@@ -583,6 +583,7 @@ mod tests {
             "attach=True",
             "raw `cdp",
             "Do not import Playwright",
+            "audit_artifact",
         ] {
             assert!(
                 description.contains(expected),
