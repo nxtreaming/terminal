@@ -34,8 +34,11 @@ mod theme;
 
 use composer::Composer;
 use palette::PaletteAction;
+#[cfg(test)]
+use render::native_scrollback_event_lines;
 use render::{
-    lines_plain_text, native_scrollback_event_lines, native_scrollback_lines, render, render_dump,
+    lines_plain_text, native_scrollback_chronological_event_lines, native_scrollback_lines, render,
+    render_dump,
 };
 use runtime::run_agent_thread;
 use settings::{
@@ -47,6 +50,7 @@ use settings::{
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
 const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
+const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -424,21 +428,6 @@ impl AppStateCache {
             .map(Vec::as_slice)
             .unwrap_or_default()
     }
-
-    fn events_after_seq(&self, session_id: &str, after_seq: i64) -> Vec<EventRecord> {
-        self.events_for_session(session_id)
-            .iter()
-            .filter(|event| event.seq > after_seq)
-            .cloned()
-            .collect()
-    }
-
-    fn last_seq_for_session(&self, session_id: &str) -> i64 {
-        self.last_seq_by_session
-            .get(session_id)
-            .copied()
-            .unwrap_or_default()
-    }
 }
 
 fn empty_workbench_state(browser: &str) -> WorkbenchState {
@@ -481,10 +470,20 @@ impl NativeHistoryState {
         self.clear_before_replay = true;
     }
 
+    #[cfg(test)]
     fn reset_for_session(&mut self, session_id: String, last_seq: i64) {
+        self.reset_for_session_with_group(session_id, last_seq, None);
+    }
+
+    fn reset_for_session_with_group(
+        &mut self,
+        session_id: String,
+        last_seq: i64,
+        last_group: Option<String>,
+    ) {
         self.session_id = Some(session_id);
         self.last_seq = last_seq;
-        self.last_group = None;
+        self.last_group = last_group;
         self.clear_before_replay = false;
     }
 
@@ -600,14 +599,6 @@ impl App {
 
     fn cached_events_for_session(&self, session_id: &str) -> &[EventRecord] {
         self.state_cache.events_for_session(session_id)
-    }
-
-    fn cached_events_after_seq(&self, session_id: &str, after_seq: i64) -> Vec<EventRecord> {
-        self.state_cache.events_after_seq(session_id, after_seq)
-    }
-
-    fn cached_last_seq_for_session(&self, session_id: &str) -> i64 {
-        self.state_cache.last_seq_for_session(session_id)
     }
 
     fn empty_workbench_state_with_failure(&self) -> WorkbenchState {
@@ -1726,6 +1717,8 @@ fn run_terminal(mut app: App) -> Result<()> {
     let mut stdout = io::stdout();
     execute!(
         stdout,
+        Clear(ClearType::All),
+        MoveTo(0, 0),
         EnableBracketedPaste,
         PushKeyboardEnhancementFlags(
             KeyboardEnhancementFlags::DISAMBIGUATE_ESCAPE_CODES
@@ -1743,20 +1736,39 @@ fn run_terminal(mut app: App) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut draw_needed = true;
         let mut last_fallback_refresh = Instant::now();
+        let mut pending_resize_at: Option<Instant> = None;
         loop {
             draw_needed |= app.drain_store_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
             }
-            if draw_needed {
+            if let Some(resize_at) = pending_resize_at {
+                if resize_at.elapsed() >= RESIZE_DEBOUNCE_INTERVAL {
+                    settle_terminal_resize(&mut terminal, &mut app)?;
+                    pending_resize_at = None;
+                    draw_needed = true;
+                }
+            }
+            if pending_resize_at.is_none() && draw_needed {
                 draw_terminal_frame(&mut terminal, &mut app)?;
                 draw_needed = false;
             }
-            if !event::poll(INPUT_POLL_INTERVAL)? {
+            let poll_interval = pending_resize_at
+                .map(|resize_at| {
+                    RESIZE_DEBOUNCE_INTERVAL
+                        .saturating_sub(resize_at.elapsed())
+                        .min(INPUT_POLL_INTERVAL)
+                })
+                .unwrap_or(INPUT_POLL_INTERVAL);
+            if !event::poll(poll_interval)? {
                 continue;
             }
             let event = event::read()?;
+            if matches!(event, TermEvent::Resize(_, _)) {
+                pending_resize_at = Some(Instant::now());
+                continue;
+            }
             if handle_terminal_event(event, &mut app, &mut terminal)? {
                 break Ok(());
             }
@@ -1785,14 +1797,32 @@ fn handle_terminal_event(
             app.handle_paste(&text);
             Ok(false)
         }
-        TermEvent::Resize(_, _) => {
-            terminal.autoresize()?;
-            app.native_history.reset_with_clear();
-            clear_native_transcript_screen(terminal)?;
-            Ok(false)
-        }
+        TermEvent::Resize(_, _) => Ok(false),
         _ => Ok(false),
     }
+}
+
+fn settle_terminal_resize(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+) -> Result<()> {
+    reset_inline_terminal_after_resize(terminal)?;
+    app.native_history.reset();
+    Ok(())
+}
+
+fn reset_inline_terminal_after_resize(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+) -> Result<()> {
+    execute!(
+        terminal.backend_mut(),
+        Clear(ClearType::All),
+        Clear(ClearType::Purge),
+        MoveTo(0, 0)
+    )?;
+    terminal.autoresize()?;
+    terminal.clear()?;
+    Ok(())
 }
 
 fn is_escape_prefix_candidate(key: KeyEvent, app: &App) -> bool {
@@ -1859,39 +1889,55 @@ fn maybe_emit_native_transcript(
         return Ok(());
     };
 
-    if !app.native_history.is_active_for(Some(&session.id)) {
-        if session.status.is_active() {
-            app.native_history.reset();
-            return Ok(());
-        }
-        let last_seq = app.cached_last_seq_for_session(&session.id);
-        let lines = native_scrollback_lines(app, size.width)?;
-        if !should_use_native_scrollback(size.height, lines.len()) {
+    let session_id = session.id.clone();
+    let session_is_active = session.status.is_active();
+    let width = native_scrollback_width(size.width);
+    let terminal_height = crossterm::terminal::size()
+        .map(|(_, height)| height)
+        .unwrap_or(size.height);
+
+    if !app.native_history.is_active_for(Some(&session_id)) {
+        let mut last_group = None;
+        let (lines, last_seq) = native_scrollback_chronological_event_lines(
+            app,
+            &state,
+            &session_id,
+            0,
+            width,
+            &mut last_group,
+        );
+        if !session_is_active && !should_use_native_scrollback(terminal_height, lines.len()) {
             app.native_history.reset();
             return Ok(());
         }
         insert_native_lines(terminal, lines)?;
         app.native_history
-            .reset_for_session(session.id.clone(), last_seq);
+            .reset_for_session_with_group(session_id, last_seq, last_group);
         return Ok(());
     }
 
-    let events = app.cached_events_after_seq(&session.id, app.native_history.last_seq);
-    if events.is_empty() {
+    let after_seq = app.native_history.last_seq;
+    let mut last_group = app.native_history.last_group.take();
+    let (lines, last_seq) = native_scrollback_chronological_event_lines(
+        app,
+        &state,
+        &session_id,
+        after_seq,
+        width,
+        &mut last_group,
+    );
+    if last_seq <= after_seq {
+        app.native_history.last_group = last_group;
         return Ok(());
     }
-    let lines = native_scrollback_event_lines(
-        &events,
-        &state,
-        size.width,
-        &mut app.native_history.last_group,
-    );
-    app.native_history.last_seq = events
-        .last()
-        .map(|event| event.seq)
-        .unwrap_or(app.native_history.last_seq);
+    app.native_history.last_seq = last_seq;
+    app.native_history.last_group = last_group;
     insert_native_lines(terminal, lines)?;
     Ok(())
+}
+
+fn native_scrollback_width(terminal_width: u16) -> u16 {
+    terminal_width.saturating_sub(4).max(1)
 }
 
 fn should_use_native_scrollback(viewport_height: u16, line_count: usize) -> bool {
@@ -2192,10 +2238,9 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("inspect cart"));
-        assert!(screen.contains("[box] Task complete"));
-        assert!(screen.contains("browser"));
-        assert!(screen.contains("result"));
-        assert!(screen.contains("source"));
+        assert!(screen.contains(": browser"));
+        assert!(!screen.contains(": answer"));
+        assert!(screen.contains("source https://example.com/cart"));
         assert!(screen.contains("Your cart has 14 items."));
         assert!(screen.contains("Example item (https://example.com/item)"));
         assert!(screen.contains("/tmp/cart.json"));
@@ -2223,15 +2268,14 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(running_session.id);
         let running_screen = render_dump(&mut app)?;
-        let header_row = running_screen
-            .lines()
-            .find(|line| line.contains("[box] Active objective"))
-            .unwrap_or_else(|| panic!("screen did not contain running header\n{running_screen}"));
-        assert!(header_row.contains("working"));
-        let running_status_row = row_containing(&running_screen, "Processing browser task");
+        assert!(running_screen.contains("> run near the top"));
+        assert!(running_screen.contains(": browser"));
+        assert!(!running_screen.contains(": thought"));
         let running_composer_row = row_containing(&running_screen, "Type to steer the agent...");
-        assert!(running_status_row > running_composer_row);
+        assert!(!running_screen.contains("Processing browser task"));
+        assert!(!running_screen.contains("AI ENGINE"));
         let running_activity_row = row_containing(&running_screen, "opened example.com");
+        assert!(running_composer_row > running_activity_row);
         assert!(running_composer_row.saturating_sub(running_activity_row) <= 8);
 
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -2249,16 +2293,24 @@ mod redesign_tests {
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
         assert!(ready_screen.contains("browser-use"));
-        assert!(row_containing(&ready_screen, "RECENT") <= 4);
-        assert!(row_containing(&ready_screen, "Tell the browser what to do...") <= 22);
+        assert!(ready_screen.contains("GPT-5.5 . Codex . Browser Use cloud idle"));
+        assert!(ready_screen.contains("Browser Use"));
+        assert!(ready_screen.contains("/model"));
+        assert!(ready_screen.contains("/browser"));
+        assert!(row_containing(&ready_screen, "recent") <= 14);
+        assert!(ready_screen.contains("Tell the browser what to do..."));
+        assert!(ready_screen.contains("Enter:send"));
+        assert!(ready_screen.contains("Tab:history"));
+        assert!(!ready_screen.contains("[ new task ]"));
 
         app.selected_session_id = Some(session.id);
         let completed_screen = render_dump(&mut app)?;
-        assert!(row_containing(&completed_screen, "[box] Task complete") <= 2);
         assert!(completed_screen.contains("inspect top alignment"));
+        assert!(!completed_screen.contains(": answer"));
+        assert!(!completed_screen.contains(": done"));
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
-        assert!(composer_row.saturating_sub(result_row) <= 7);
+        assert!(composer_row > result_row);
         Ok(())
     }
 
@@ -2295,11 +2347,12 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("whats happening"));
-        assert!(screen.contains("[box] Active objective"));
-        assert!(screen.contains("result"));
+        assert!(screen.contains(": subagent"));
+        assert!(!screen.contains(": answer"));
         assert!(screen.contains("Purpose: Rust-first terminal workbench"));
         assert!(screen.contains("crates/browser-use-tui"));
-        assert!(screen.contains("helper finished"));
+        assert!(screen.contains("repo-explorer started"));
+        assert!(screen.contains("repo-explorer finished"));
         assert!(!screen.contains("helper finished: Repository summary"));
         assert!(!screen.contains("**Purpose:**"));
         Ok(())
@@ -2313,7 +2366,10 @@ mod redesign_tests {
         assert!(app.is_slash_palette_active());
         let screen = render_dump(&mut app)?;
         let input_row = row_containing(&screen, "> /");
-        assert!(row_containing(&screen, "/task") > input_row);
+        assert!(screen
+            .lines()
+            .enumerate()
+            .any(|(idx, line)| idx >= input_row && line.contains("/task")));
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
@@ -2330,9 +2386,11 @@ mod redesign_tests {
         }
         let screen = render_dump(&mut app)?;
         let input_row = row_containing(&screen, "> /mo");
-        assert!(row_containing(&screen, "/model") > input_row);
+        assert!(screen
+            .lines()
+            .enumerate()
+            .any(|(idx, line)| idx >= input_row && line.contains("/model")));
         assert!(screen.contains("/model"));
-        assert!(!screen.contains("/browser"));
         Ok(())
     }
 
@@ -2760,8 +2818,51 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("thinking"));
+        assert!(screen.contains(": thinking"));
+        assert!(!screen.contains(": thought"));
         assert!(screen.contains("waiting for GPT-5.5"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_thinking_deltas_render_as_thought_not_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "think visibly"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Checking ", "label": "inspecting context"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Checking the repository structure.", "label": "inspecting context"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "This is the answer draft."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains(": thinking"));
+        assert!(screen.contains(": thought inspecting context"));
+        assert!(screen.contains("Checking the repository structure."));
+        assert!(!screen.contains("Checking \n"));
+        assert!(!screen.contains(": answer draft"));
+        assert!(screen.contains("This is the answer draft."));
         Ok(())
     }
 
@@ -2783,13 +2884,67 @@ mod redesign_tests {
         app.store.append_event(
             &session.id,
             "model.stream_delta",
+            serde_json::json!({"text": "Streaming "}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
             serde_json::json!({"text": "Streaming draft answer"}),
         )?;
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("streaming"));
+        assert!(!screen.contains(": answer draft"));
         assert!(screen.contains("Streaming draft answer"));
+        assert!(!screen.contains("Streaming \n"));
+        Ok(())
+    }
+
+    #[test]
+    fn native_scrollback_filters_transient_model_events() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "write as it streams"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({"name": "spawn_agent", "arguments": {"nickname": "repo-explorer"}}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "agent.spawned",
+            serde_json::json!({"nickname": "repo-explorer"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Live draft chunk"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?.clone();
+        let events = app.cached_events_for_session(&session.id).to_vec();
+        let mut last_group = None;
+
+        let lines = native_scrollback_event_lines(&events, &state, 100, &mut last_group);
+        let text = lines_plain_text(&lines);
+
+        assert!(text.contains("write as it streams"));
+        assert!(text.contains("repo-explorer started"));
+        assert!(!text.contains("waiting for GPT-5.5"));
+        assert!(!text.contains("start repo-explorer helper"));
+        assert!(!text.contains(": answer draft"));
+        assert!(!text.contains("Live draft chunk"));
         Ok(())
     }
 
@@ -2833,10 +2988,9 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("helpers"));
-        assert!(screen.contains("repo-explorer working"));
-        assert!(screen.contains("repo-explorer: read README.md"));
-        assert!(screen.contains("Mapping the main crates"));
+        assert!(screen.contains(": read"));
+        assert!(screen.contains(": subagent"));
+        assert!(screen.contains("repo-explorer"));
         Ok(())
     }
 
@@ -2902,12 +3056,7 @@ mod redesign_tests {
         assert!(screen.contains("go say hi to aitor"));
         assert!(screen.contains("Hi Aitor"));
         assert!(screen.contains("Ask a follow-up"));
-        assert!(row_containing(&screen, "Ask a follow-up") >= 32);
-        assert!(
-            row_containing(&screen, "Ask a follow-up")
-                .saturating_sub(row_containing(&screen, "Hi Aitor"))
-                <= 8
-        );
+        assert!(row_containing(&screen, "Ask a follow-up") > row_containing(&screen, "Hi Aitor"));
         Ok(())
     }
 
@@ -2938,7 +3087,7 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("[box] Task complete"));
+        assert!(!screen.contains(": answer"));
         assert!(screen.contains("Cargo.toml"));
         Ok(())
     }

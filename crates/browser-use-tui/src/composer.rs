@@ -135,11 +135,15 @@ impl Composer {
             return true;
         }
 
-        if key_pressed(key, KeyCode::Char('w'), KeyModifiers::CONTROL)
-            || key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT)
+        if key_pressed(key, KeyCode::Char('w'), KeyModifiers::CONTROL) {
+            self.delete_backward_word();
+            return true;
+        }
+
+        if key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT)
             || key_pressed(key, KeyCode::Backspace, KeyModifiers::META)
         {
-            self.delete_backward_word();
+            self.delete_backward_token();
             return true;
         }
 
@@ -328,6 +332,19 @@ impl Composer {
             start -= 1;
         }
         while start > 0 && !chars[start - 1].is_whitespace() {
+            start -= 1;
+        }
+        self.delete_char_range(start, self.cursor);
+    }
+
+    fn delete_backward_token(&mut self) {
+        if self.cursor == 0 {
+            return;
+        }
+        let chars = self.chars();
+        let mut start = self.cursor;
+        let class = TokenClass::of(chars[start - 1]);
+        while start > 0 && TokenClass::of(chars[start - 1]) == class {
             start -= 1;
         }
         self.delete_char_range(start, self.cursor);
@@ -573,6 +590,25 @@ fn has_ctrl_or_alt(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META)
 }
 
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum TokenClass {
+    Word,
+    Whitespace,
+    Punctuation,
+}
+
+impl TokenClass {
+    fn of(ch: char) -> Self {
+        if ch == '_' || ch.is_alphanumeric() {
+            Self::Word
+        } else if ch.is_whitespace() {
+            Self::Whitespace
+        } else {
+            Self::Punctuation
+        }
+    }
+}
+
 fn text_char_for_key(event: KeyEvent) -> Option<char> {
     let modifiers = normalized_modifiers(event.modifiers);
     if has_ctrl_or_alt(modifiers) {
@@ -618,5 +654,33 @@ mod tests {
         }
 
         assert_eq!(composer.input(), "AB!c");
+    }
+
+    #[test]
+    fn alt_backspace_deletes_previous_token_by_character_class() {
+        let mut composer = Composer::default();
+
+        composer.set_input("/stuff".to_string());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
+        assert_eq!(composer.input(), "/");
+
+        composer.set_input("something-bla".to_string());
+        for expected in ["something-", "something", ""] {
+            assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
+            assert_eq!(composer.input(), expected);
+        }
+
+        composer.set_input("alpha  ".to_string());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::META)));
+        assert_eq!(composer.input(), "alpha");
+    }
+
+    #[test]
+    fn ctrl_w_keeps_whitespace_delimited_shell_behavior() {
+        let mut composer = Composer::default();
+
+        composer.set_input("something-bla".to_string());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Char('w'), KeyModifiers::CONTROL,)));
+        assert_eq!(composer.input(), "");
     }
 }

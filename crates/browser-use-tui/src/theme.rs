@@ -13,7 +13,7 @@ fn dim_color() -> Color {
 }
 
 fn accent_color() -> Color {
-    Color::Rgb(108, 168, 118)
+    Color::Rgb(126, 158, 255)
 }
 
 fn border_color() -> Color {
@@ -21,15 +21,19 @@ fn border_color() -> Color {
 }
 
 fn done_color() -> Color {
-    accent_color()
+    Color::Rgb(142, 202, 129)
 }
 
 fn running_color() -> Color {
-    Color::Rgb(255, 106, 26)
+    Color::Rgb(220, 171, 78)
 }
 
 fn failed_color() -> Color {
-    running_color()
+    Color::Rgb(255, 112, 132)
+}
+
+fn thought_color() -> Color {
+    Color::Rgb(178, 141, 255)
 }
 
 pub(crate) fn text_style() -> Style {
@@ -72,6 +76,12 @@ pub(crate) fn running() -> Style {
 
 pub(crate) fn failed() -> Style {
     Style::default().fg(failed_color())
+}
+
+pub(crate) fn thought() -> Style {
+    Style::default()
+        .fg(thought_color())
+        .add_modifier(Modifier::BOLD)
 }
 
 pub(crate) fn status_style(status: &str) -> Style {

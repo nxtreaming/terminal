@@ -48,7 +48,9 @@ pub(crate) fn native_scrollback_lines(app: &mut App, width: u16) -> Result<Vec<L
     let product_state = app.product_state(&state);
     let body_width = width.saturating_sub(4).max(1);
     let mut lines = Vec::new();
-    if matches!(
+    if let Some(timeline) = tool_aware_chronological_lines(app, &state, body_width, product_state) {
+        lines.extend(timeline);
+    } else if matches!(
         product_state,
         ProductState::Failed | ProductState::Cancelled
     ) {
@@ -75,6 +77,7 @@ pub(crate) fn lines_plain_text(lines: &[Line<'static>]) -> String {
     out
 }
 
+#[cfg(test)]
 pub(crate) fn native_scrollback_event_lines(
     events: &[EventRecord],
     state: &WorkbenchState,
@@ -83,233 +86,33 @@ pub(crate) fn native_scrollback_event_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     for event in events {
-        match event.event_type.as_str() {
-            "session.input" | "session.followup" => {
-                let Some(prompt) = event
-                    .payload
-                    .get("text")
-                    .and_then(serde_json::Value::as_str)
-                    .map(str::trim)
-                    .filter(|text| !text.is_empty())
-                else {
-                    continue;
-                };
-                last_group.take();
-                push_gap_if_needed(&mut lines);
-                append_prompt_section(&mut lines, prompt);
-            }
-            "session.done" => {
-                last_group.take();
-                if let Some(result) = event
-                    .payload
-                    .get("result")
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                {
-                    push_gap_if_needed(&mut lines);
-                    append_result_block(&mut lines, result, state, width);
-                }
-            }
-            "session.failed" => {
-                last_group.take();
-                let error = event
-                    .payload
-                    .get("error")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("The task failed.");
-                push_gap_if_needed(&mut lines);
-                append_ascii_lines_block(
-                    &mut lines,
-                    "error",
-                    vec![Line::from(Span::styled(
-                        friendly_error_message(error),
-                        muted(),
-                    ))],
-                    Some("saved"),
-                );
-            }
-            "session.cancelled" => {
-                last_group.take();
-                push_gap_if_needed(&mut lines);
-                append_ascii_lines_block(
-                    &mut lines,
-                    "stopped",
-                    vec![Line::from(Span::styled(
-                        "Progress is saved in history.",
-                        muted(),
-                    ))],
-                    Some("saved"),
-                );
-            }
-            "agent.completed" => {
-                if let Some(result) = event
-                    .payload
-                    .get("payload")
-                    .and_then(|payload| payload.get("result"))
-                    .and_then(serde_json::Value::as_str)
-                    .filter(|text| !text.trim().is_empty())
-                {
-                    last_group.take();
-                    push_gap_if_needed(&mut lines);
-                    append_result_block(&mut lines, result, state, width);
-                } else {
-                    append_grouped_event_line(
-                        &mut lines,
-                        last_group,
-                        "explored",
-                        "helper finished",
-                    );
-                }
-            }
-            "agent.failed" => {
-                last_group.take();
-                let error = event
-                    .payload
-                    .get("payload")
-                    .and_then(|payload| payload.get("error"))
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("The agent could not start.");
-                push_gap_if_needed(&mut lines);
-                append_ascii_lines_block(
-                    &mut lines,
-                    "error",
-                    vec![Line::from(Span::styled(error.to_string(), muted()))],
-                    Some("saved"),
-                );
-            }
-            "agent.cancelled" => {
-                append_grouped_event_line(&mut lines, last_group, "explored", "helper stopped");
-            }
-            "browser.connected" => {
-                append_grouped_event_line(&mut lines, last_group, "browser", "browser connected");
-            }
-            "browser.reconnected" => {
-                append_grouped_event_line(&mut lines, last_group, "browser", "browser reconnected");
-            }
-            "browser.target_changed" => {
-                append_grouped_event_line(
-                    &mut lines,
-                    last_group,
-                    "browser",
-                    "browser target changed",
-                );
-            }
-            "browser.disconnected" => {
-                append_grouped_event_line(
-                    &mut lines,
-                    last_group,
-                    "browser",
-                    "browser disconnected",
-                );
-            }
-            "browser.live_url" => {
-                append_grouped_event_line(
-                    &mut lines,
-                    last_group,
-                    "browser",
-                    "connected live browser",
-                );
-            }
-            "browser.page" | "browser.state" => {
-                if let Some(url) = event.payload.get("url").and_then(serde_json::Value::as_str) {
-                    append_grouped_event_line(
-                        &mut lines,
-                        last_group,
-                        "browser",
-                        &format!("opened {}", compact_url_for_render(url)),
-                    );
-                }
-            }
-            "command.started" => {
-                let text = event
-                    .payload
-                    .get("cmd")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("command");
-                append_grouped_event_line(&mut lines, last_group, "ran", text);
-            }
-            "command.finished" => {
-                if event
-                    .payload
-                    .get("success")
-                    .and_then(serde_json::Value::as_bool)
-                    .is_some_and(|success| !success)
-                {
-                    let code = event
-                        .payload
-                        .get("exit_code")
-                        .and_then(serde_json::Value::as_i64)
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    append_grouped_event_line(
-                        &mut lines,
-                        last_group,
-                        "ran",
-                        &format!("command failed with exit {code}"),
-                    );
-                }
-            }
-            "file.read" => {
-                if let Some(path) = event
-                    .payload
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                {
-                    append_grouped_event_line(
-                        &mut lines,
-                        last_group,
-                        "explored",
-                        &format!("read {}", compact_path_for_render(path)),
-                    );
-                }
-            }
-            "file.search" => {
-                let query = event
-                    .payload
-                    .get("query")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("files");
-                append_grouped_event_line(
-                    &mut lines,
-                    last_group,
-                    "explored",
-                    &format!("searched {query:?}"),
-                );
-            }
-            "file.list" => {
-                append_grouped_event_line(&mut lines, last_group, "explored", "listed files");
-            }
-            "patch.file_changed" => {
-                let kind = event
-                    .payload
-                    .get("kind")
-                    .and_then(serde_json::Value::as_str)
-                    .unwrap_or("changed");
-                let path = event
-                    .payload
-                    .get("path")
-                    .and_then(serde_json::Value::as_str)
-                    .map(compact_path_for_render)
-                    .unwrap_or_else(|| "file".to_string());
-                append_grouped_event_line(
-                    &mut lines,
-                    last_group,
-                    "changed",
-                    &format!("{kind} {path}"),
-                );
-            }
-            "agent.spawned" => {
-                append_grouped_event_line(
-                    &mut lines,
-                    last_group,
-                    "explored",
-                    &agent_started_text_for_render(&event.payload),
-                );
-            }
-            _ => {}
-        }
+        append_native_timeline_event(&mut lines, last_group, state, event, width);
     }
     lines
+}
+
+pub(crate) fn native_scrollback_chronological_event_lines(
+    app: &App,
+    state: &WorkbenchState,
+    session_id: &str,
+    after_seq: i64,
+    width: u16,
+    last_group: &mut Option<String>,
+) -> (Vec<Line<'static>>, i64) {
+    let events = chronological_events_for_session(app, session_id)
+        .into_iter()
+        .filter(|event| event.seq > after_seq)
+        .collect::<Vec<_>>();
+    let last_seq = events
+        .iter()
+        .map(|event| event.seq)
+        .max()
+        .unwrap_or(after_seq);
+    let mut lines = Vec::new();
+    for event in events {
+        append_native_timeline_event(&mut lines, last_group, state, event, width);
+    }
+    (lines, last_seq)
 }
 
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
@@ -346,10 +149,12 @@ fn render_main(
 ) {
     let bottom_h = main_bottom_height_for(app, state, app.surface, area, product_state);
     let body_width = area.width;
+    let native_scrollback_active =
+        app.native_scrollback_is_active() && !app.surface.is_bottom_pane();
     let body = if app.surface.is_bottom_pane() {
         Vec::new()
-    } else if app.native_scrollback_is_active() {
-        Vec::new()
+    } else if native_scrollback_active {
+        native_replay_live_lines(app, state, product_state, body_width, u16::MAX)
     } else {
         match product_state {
             ProductState::SetupNeeded => setup_lines(app),
@@ -360,16 +165,18 @@ fn render_main(
             | ProductState::Cancelled => work_lines(state, app, body_width, product_state),
         }
     };
-    let show_footer = !(app.is_slash_palette_active() && !app.surface.is_bottom_pane());
-    let pin_bottom =
-        app.native_scrollback_is_active() && matches!(product_state, ProductState::Result);
+    let show_footer = app.surface.is_bottom_pane()
+        || app
+            .quit_hint_until
+            .is_some_and(|until| std::time::Instant::now() <= until)
+        || app.escape_stop_is_pending();
+    let pin_bottom = should_pin_main_bottom(product_state);
     let (body_area, bottom_area, footer_area) =
         main_layout_areas(area, bottom_h, body.len(), show_footer, pin_bottom);
-    let body = if app.native_scrollback_is_active() && !app.surface.is_bottom_pane() {
-        native_replay_live_lines(app, state, product_state, body_width, body_area.height)
-    } else {
-        body
-    };
+    let mut body = body;
+    if body.len() > body_area.height as usize {
+        body = visible_tail_lines(body, body_area.height);
+    }
     frame.render_widget(
         Paragraph::new(body)
             .style(Style::default().fg(text()))
@@ -398,12 +205,10 @@ fn main_layout_areas(
         .height
         .saturating_sub(bottom_h)
         .saturating_sub(footer_h);
-    let body_h = if max_body_h == 0 {
-        0
-    } else if pin_bottom {
+    let body_h = if pin_bottom {
         max_body_h
     } else {
-        (body_len as u16).clamp(1, max_body_h)
+        (body_len as u16).min(max_body_h)
     };
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -415,6 +220,10 @@ fn main_layout_areas(
         ])
         .split(area);
     (chunks[0], chunks[1], chunks[2])
+}
+
+fn should_pin_main_bottom(_product_state: ProductState) -> bool {
+    false
 }
 
 fn main_bottom_height_for(
@@ -442,9 +251,9 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
     let visual_input_lines = composer_visual_input_lines(app, width);
     let palette_h = slash_palette_pane_height(app);
     if palette_h > 0 {
-        visual_input_lines + palette_h + 7
+        visual_input_lines + palette_h + 2
     } else {
-        visual_input_lines + 8
+        visual_input_lines + 3
     }
 }
 
@@ -531,8 +340,8 @@ fn native_replay_live_lines(
             let mut lines = Vec::new();
             append_ascii_text_block(
                 &mut lines,
-                "working",
-                &[format!("{} running browser task", spinner_frame())],
+                "status",
+                &["running browser task".to_string()],
                 Some("live"),
             );
             if let Some(streaming_text) = current_streaming_text(state) {
@@ -544,7 +353,8 @@ fn native_replay_live_lines(
         ProductState::Failed => {
             let error = state.failure.as_deref().unwrap_or("The task failed.");
             let (primary, secondary) = failure_actions(error);
-            let mut lines = native_plain_transcript_lines(state, width, product_state);
+            let mut lines = tool_aware_chronological_lines(app, state, width, product_state)
+                .unwrap_or_else(|| native_plain_transcript_lines(state, width, product_state));
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
@@ -564,7 +374,8 @@ fn native_replay_live_lines(
             lines
         }
         ProductState::Cancelled => {
-            let mut lines = native_plain_transcript_lines(state, width, product_state);
+            let mut lines = tool_aware_chronological_lines(app, state, width, product_state)
+                .unwrap_or_else(|| native_plain_transcript_lines(state, width, product_state));
             if !lines.is_empty() {
                 lines.push(Line::from(""));
             }
@@ -587,18 +398,19 @@ fn native_replay_live_lines(
             );
             lines
         }
-        ProductState::Result => native_plain_transcript_lines(state, width, product_state),
+        ProductState::Result => tool_aware_chronological_lines(app, state, width, product_state)
+            .unwrap_or_else(|| native_plain_transcript_lines(state, width, product_state)),
         ProductState::Ready => Vec::new(),
         ProductState::SetupNeeded => setup_lines(app),
     };
-    if matches!(product_state, ProductState::Result) {
-        bottom_aligned_tail_lines(lines, height)
+    if lines.len() > height as usize {
+        visible_tail_lines(lines, height)
     } else {
         lines
     }
 }
 
-fn bottom_aligned_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
+fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
     let height = height as usize;
     if height == 0 {
         return Vec::new();
@@ -606,10 +418,7 @@ fn bottom_aligned_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<
     if lines.len() > height {
         lines = lines.split_off(lines.len() - height);
     }
-    let mut out = Vec::with_capacity(height);
-    out.extend(std::iter::repeat_with(|| Line::from("")).take(height.saturating_sub(lines.len())));
-    out.extend(lines);
-    out
+    lines
 }
 
 fn render_surface(
@@ -664,13 +473,13 @@ fn surface_title(surface: Surface) -> &'static str {
 
 fn surface_footer(surface: Surface) -> &'static str {
     match surface {
-        Surface::ApiKey => "enter save   esc cancel",
-        Surface::Telemetry => "enter save   esc cancel",
-        Surface::History => "enter open   r resume   esc back",
-        Surface::Setup => "enter continue   esc quit",
-        Surface::Browser => "enter select   esc back",
-        Surface::Developer => "esc close",
-        _ => "enter select   esc back",
+        Surface::ApiKey => "Enter:save | Esc:cancel",
+        Surface::Telemetry => "Enter:save | Esc:cancel",
+        Surface::History => "Enter:open | R:resume | Esc:back",
+        Surface::Setup => "Enter:continue | Esc:quit",
+        Surface::Browser => "Enter:select | Esc:back",
+        Surface::Developer => "Esc:close",
+        _ => "Enter:select | Esc:back",
     }
 }
 
@@ -751,34 +560,25 @@ fn render_composer(
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(1),
-            Constraint::Length(1),
             Constraint::Length(input_h),
             Constraint::Length(1),
             Constraint::Length(action_h),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
-            Constraint::Length(1),
         ])
         .split(area);
     frame.render_widget(
-        Paragraph::new(composer_label(product_state)).style(muted()),
+        Paragraph::new(input_box_rule(chunks[0].width)).style(border()),
         chunks[0],
     );
-    frame.render_widget(
-        Paragraph::new(input_box_rule(chunks[1].width)).style(border()),
-        chunks[1],
-    );
-    let input_area = chunks[2].inner(Margin {
+    let input_area = chunks[1].inner(Margin {
         vertical: 0,
         horizontal: 2,
     });
     render_composer_input(frame, input_area, app, state.current_session.as_ref());
     frame.render_widget(
-        Paragraph::new(input_box_rule(chunks[3].width)).style(border()),
-        chunks[3],
+        Paragraph::new(input_box_rule(chunks[2].width)).style(border()),
+        chunks[2],
     );
-    let action_area = chunks[4].inner(Margin {
+    let action_area = chunks[3].inner(Margin {
         vertical: 0,
         horizontal: 2,
     });
@@ -789,34 +589,10 @@ fn render_composer(
         );
     } else {
         frame.render_widget(
-            Paragraph::new(chip_row(product_state, action_area.width as usize)),
+            Paragraph::new(hint_row(product_state, action_area.width as usize)),
             action_area,
         );
     }
-
-    let labels_area = chunks[6].inner(Margin {
-        vertical: 0,
-        horizontal: 2,
-    });
-    let values_area = chunks[7].inner(Margin {
-        vertical: 0,
-        horizontal: 2,
-    });
-    let progress_area = chunks[8].inner(Margin {
-        vertical: 0,
-        horizontal: 2,
-    });
-    let (labels, values) = metric_band_lines(app, state, product_state, labels_area.width);
-    frame.render_widget(Paragraph::new(labels), labels_area);
-    frame.render_widget(Paragraph::new(values), values_area);
-    frame.render_widget(
-        Paragraph::new(progress_rail_line(
-            state,
-            product_state,
-            progress_area.width as usize,
-        )),
-        progress_area,
-    );
 }
 
 fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
@@ -864,14 +640,6 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     lines
 }
 
-fn composer_label(product_state: ProductState) -> Line<'static> {
-    let label = match product_state {
-        ProductState::Result | ProductState::Failed | ProductState::Cancelled => "ASK FOLLOW-UP",
-        _ => "ASK",
-    };
-    Line::from(Span::styled(label, muted()))
-}
-
 fn input_box_rule(width: u16) -> String {
     let width = width as usize;
     if width < 2 {
@@ -880,136 +648,45 @@ fn input_box_rule(width: u16) -> String {
     format!("+{}+", "-".repeat(width.saturating_sub(2)))
 }
 
-fn chip_row(product_state: ProductState, width: usize) -> Line<'static> {
-    let chips: &[&str] = match product_state {
-        ProductState::Running => &["pause", "open browser", "rerun", "new task"],
-        ProductState::Result => &["new task", "open browser", "history", "rerun"],
-        ProductState::Failed | ProductState::Cancelled => {
-            &["retry", "follow up", "open browser", "new task"]
-        }
-        _ => &["new task", "history", "change browser", "choose model"],
+fn hint_row(product_state: ProductState, width: usize) -> Line<'static> {
+    let hints: &[(&str, &str)] = match product_state {
+        ProductState::Running => &[("Esc", "stop"), ("F2", "browser"), ("/", "commands")],
+        ProductState::Result => &[
+            ("Enter", "reply"),
+            ("Tab", "history"),
+            ("F2", "browser"),
+            ("/", "commands"),
+            ("Esc", "clear"),
+        ],
+        ProductState::Failed | ProductState::Cancelled => &[
+            ("Enter", "action"),
+            ("F2", "browser"),
+            ("/", "commands"),
+            ("Esc", "clear"),
+        ],
+        _ => &[
+            ("Enter", "send"),
+            ("Tab", "history"),
+            ("/", "commands"),
+            ("Esc", "clear"),
+        ],
     };
     let mut spans = Vec::new();
-    for (idx, chip) in chips.iter().enumerate() {
+    for (idx, (key, action)) in hints.iter().enumerate() {
         if idx > 0 {
-            spans.push(Span::raw("  "));
+            spans.push(Span::styled(" | ", dim()));
         }
-        let text = format!("[ {chip} ]");
+        let text_len = key.chars().count() + action.chars().count() + 1;
         let used: usize = spans
             .iter()
             .map(|span: &Span<'_>| span.content.chars().count())
             .sum();
-        if used + text.chars().count() > width {
+        if used + text_len > width {
             break;
         }
-        spans.push(Span::styled(
-            text,
-            if idx == 0 { text_style() } else { muted() },
-        ));
-    }
-    Line::from(spans)
-}
-
-fn metric_band_lines(
-    app: &App,
-    state: &WorkbenchState,
-    product_state: ProductState,
-    width: u16,
-) -> (Line<'static>, Line<'static>) {
-    let width = width as usize;
-    let columns = if width < 82 { 3 } else { 4 };
-    let col_w = (width.saturating_sub((columns - 1) * 2) / columns).max(14);
-    let elapsed = elapsed_label(state, product_state).unwrap_or_else(|| "idle".to_string());
-    let (session, session_style) = match product_state {
-        ProductState::Running => (format!("{elapsed} . running"), running()),
-        ProductState::Result => (format!("{elapsed} . done"), done()),
-        ProductState::Failed => (format!("{elapsed} . failed"), failed()),
-        ProductState::Cancelled => (format!("{elapsed} . stopped"), failed()),
-        _ => ("idle".to_string(), muted()),
-    };
-    let mut labels = vec!["AI ENGINE", "SESSION", "BROWSER"];
-    let browser_label = browser_ready_label(app, state)
-        .replace(" ready", " . ready")
-        .replace(" connected", " . connected");
-    let mut values: Vec<(String, Style)> = vec![
-        (
-            format!("{} . {}", app.model, compact_account_label(&app.account)),
-            text_style(),
-        ),
-        (session, session_style),
-        (browser_label, browser_status_style(state)),
-    ];
-    if columns > 3 {
-        labels.push("MODE");
-        values.push((mode_label(product_state).to_string(), text_style()));
-    }
-    let mut label_spans = Vec::new();
-    let mut value_spans = Vec::new();
-    for (idx, label) in labels.iter().enumerate() {
-        if idx > 0 {
-            label_spans.push(Span::raw("  "));
-            value_spans.push(Span::raw("  "));
-        }
-        label_spans.push(Span::styled(fit_cell(label, col_w), muted()));
-        let (value, style) = values
-            .get(idx)
-            .cloned()
-            .unwrap_or_else(|| ("".to_string(), text_style()));
-        value_spans.push(Span::styled(fit_cell(&value, col_w), style));
-    }
-    (Line::from(label_spans), Line::from(value_spans))
-}
-
-fn progress_rail_line(
-    _state: &WorkbenchState,
-    product_state: ProductState,
-    width: usize,
-) -> Line<'static> {
-    let width = width.max(8);
-    let label = match product_state {
-        ProductState::Running => "Processing browser task",
-        ProductState::Result => "Task complete",
-        ProductState::Failed => "Task interrupted",
-        ProductState::Cancelled => "Task stopped",
-        ProductState::SetupNeeded => "Setting up browser-use",
-        ProductState::Ready => "Ready",
-    };
-    let label_len = label.chars().count();
-    let bar_w = width.saturating_sub(label_len + 2).max(8);
-    let filled = match product_state {
-        ProductState::Running => bar_w.saturating_mul(34) / 100,
-        ProductState::Result => bar_w,
-        ProductState::Failed | ProductState::Cancelled => bar_w.saturating_mul(28) / 100,
-        _ => 0,
-    };
-    let mut spans = vec![
-        Span::styled(label.to_string(), text_style()),
-        Span::raw("  "),
-    ];
-    match product_state {
-        ProductState::Result => spans.push(Span::styled("|".repeat(bar_w), done())),
-        ProductState::Failed | ProductState::Cancelled => {
-            let prefix = "|".repeat(filled.max(1));
-            let gap = ".".repeat(2.min(bar_w.saturating_sub(prefix.len())));
-            let after = bar_w.saturating_sub(prefix.len() + gap.len());
-            let secondary = after.min(3);
-            spans.push(Span::styled(prefix, failed()));
-            spans.push(Span::styled(gap, dim()));
-            spans.push(Span::styled("|".repeat(secondary), failed()));
-            spans.push(Span::styled(
-                ".".repeat(after.saturating_sub(secondary)),
-                dim(),
-            ));
-        }
-        ProductState::Running => {
-            let filled = filled.max(1);
-            spans.push(Span::styled("|".repeat(filled), running()));
-            spans.push(Span::styled(
-                ".".repeat(bar_w.saturating_sub(filled)),
-                dim(),
-            ));
-        }
-        _ => spans.push(Span::styled("|".repeat(bar_w), dim())),
+        spans.push(Span::styled((*key).to_string(), bold()));
+        spans.push(Span::styled(":".to_string(), dim()));
+        spans.push(Span::styled((*action).to_string(), muted()));
     }
     Line::from(spans)
 }
@@ -1021,25 +698,6 @@ fn compact_account_label(account: &str) -> String {
         "Claude Code".to_string()
     } else {
         account.replace(" API key", "")
-    }
-}
-
-fn browser_status_style(state: &WorkbenchState) -> Style {
-    if state.browser.status == "not connected" {
-        muted()
-    } else {
-        done()
-    }
-}
-
-fn mode_label(product_state: ProductState) -> &'static str {
-    match product_state {
-        ProductState::SetupNeeded => "setup",
-        ProductState::Ready => "build",
-        ProductState::Running => "working",
-        ProductState::Result => "done",
-        ProductState::Failed => "failed",
-        ProductState::Cancelled => "stopped",
     }
 }
 
@@ -1104,7 +762,7 @@ fn render_footer(
         surface_footer(app.surface)
     } else {
         let _ = (state, product_state);
-        "/"
+        ""
     };
     frame.render_widget(
         Paragraph::new(label)
@@ -1376,25 +1034,111 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16) -> Vec<Line<'stati
     }
     lines.push(header_status_line(
         "browser-use",
-        &browser_ready_label(app, state).replace(" ready", " . idle"),
+        &ready_status_label(app, state),
         width as usize,
     ));
+    lines.push(Line::from(""));
+    lines.extend(config_card_lines(app, state, width as usize));
     lines.push(Line::from(""));
 
     if !state.history.is_empty() {
         let total = state.history.len();
-        let header_text = if total > 4 {
-            format!("RECENT  .  {total} total")
+        let header_text = if total > 3 {
+            format!("recent . {total} total")
         } else {
-            "RECENT".to_string()
+            "recent".to_string()
         };
         lines.push(Line::from(Span::styled(header_text, muted())));
-        let rows: Vec<&HistoryRow> = state.history.iter().take(4).collect();
+        let rows: Vec<&HistoryRow> = state.history.iter().take(3).collect();
         for row in rows {
             lines.push(history_plain_row(row, width as usize));
         }
     }
     lines
+}
+
+fn config_card_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
+    let card_w = width.clamp(32, 94);
+    let inner_w = card_w.saturating_sub(2);
+    let mut lines = vec![
+        Line::from(Span::styled(format!("+{}+", "-".repeat(inner_w)), border())),
+        card_text_line("Browser Use", "", "", inner_w),
+        card_blank_line(inner_w),
+        card_kv_line("model", &app.model, "/model", inner_w),
+        card_kv_line(
+            "account",
+            &compact_account_label(&app.account),
+            "/auth",
+            inner_w,
+        ),
+        card_kv_line(
+            "browser",
+            &browser_ready_label(app, state).replace(" ready", " idle"),
+            "/browser",
+            inner_w,
+        ),
+        card_kv_line("cwd", &cwd_label(), "", inner_w),
+        card_kv_line(
+            "telemetry",
+            &app.laminar_status()
+                .unwrap_or_else(|_| "Laminar unavailable".to_string()),
+            "/laminar",
+            inner_w,
+        ),
+    ];
+    lines.push(Line::from(Span::styled(
+        format!("+{}+", "-".repeat(inner_w)),
+        border(),
+    )));
+    lines
+}
+
+fn card_blank_line(inner_w: usize) -> Line<'static> {
+    card_text_line("", "", "", inner_w)
+}
+
+fn card_kv_line(label: &str, value: &str, action: &str, inner_w: usize) -> Line<'static> {
+    let label_w = 10usize.min(inner_w.saturating_sub(2));
+    let action_w = if action.is_empty() {
+        0
+    } else {
+        action.chars().count().saturating_add(2)
+    };
+    let value_w = inner_w
+        .saturating_sub(label_w)
+        .saturating_sub(action_w)
+        .saturating_sub(2)
+        .max(4);
+    let left = format!("{label:<label_w$}{}", truncate(value, value_w));
+    card_text_line(&left, action, "", inner_w)
+}
+
+fn card_text_line(left: &str, right: &str, _extra: &str, inner_w: usize) -> Line<'static> {
+    let right_len = right.chars().count();
+    let left_w = inner_w.saturating_sub(right_len).saturating_sub(1);
+    let left = truncate(left, left_w);
+    let left_len = left.chars().count();
+    let spaces = inner_w.saturating_sub(left_len + right_len);
+    Line::from(vec![
+        Span::styled("|", border()),
+        Span::raw(" "),
+        Span::styled(left, text_style()),
+        Span::raw(" ".repeat(spaces.saturating_sub(1))),
+        Span::styled(right.to_string(), accent()),
+        Span::styled("|", border()),
+    ])
+}
+
+fn cwd_label() -> String {
+    let cwd = std::env::current_dir()
+        .map(|path| path.display().to_string())
+        .unwrap_or_else(|_| ".".to_string());
+    if let Some(home) = std::env::var_os("HOME").and_then(|home| home.into_string().ok()) {
+        if let Some(rest) = cwd.strip_prefix(&home) {
+            return format!("~{rest}");
+        }
+    }
+    cwd
 }
 
 fn header_status_line(left: &str, right: &str, width: usize) -> Line<'static> {
@@ -1409,29 +1153,36 @@ fn header_status_line(left: &str, right: &str, width: usize) -> Line<'static> {
     ])
 }
 
+fn ready_status_label(app: &App, state: &WorkbenchState) -> String {
+    format!(
+        "{} . {} . {}",
+        app.model,
+        compact_account_label(&app.account),
+        browser_ready_label(app, state).replace(" ready", " idle")
+    )
+}
+
 fn history_plain_row(row: &HistoryRow, width: usize) -> Line<'static> {
     let time = relative_time(row.updated_ms);
-    let glyph = status_glyph(row.status.as_str());
-    let prefix_len = glyph.chars().count() + 4;
+    let status = row.status.as_str();
+    let status_label = match status {
+        "done" => "done",
+        "running" | "created" => "running",
+        "failed" => "failed",
+        "cancelled" => "stopped",
+        _ => status,
+    };
+    let prefix = format!(": {status_label:<8}");
+    let prefix_len = prefix.chars().count() + 2;
     let time_len = time.chars().count();
     let task_w = width.saturating_sub(prefix_len + time_len + 2).max(12);
     Line::from(vec![
-        Span::styled(glyph.to_string(), status_style(row.status.as_str())),
+        Span::styled(prefix, status_style(row.status.as_str())),
         Span::raw("  "),
         Span::styled(fit_cell(&row.task, task_w), text_style()),
         Span::raw("  "),
         Span::styled(time, muted()),
     ])
-}
-
-fn status_glyph(status: &str) -> &'static str {
-    match status {
-        "done" => "[x]",
-        "running" | "created" => "[>]",
-        "cancelled" => "[!]",
-        "failed" => "[!]",
-        _ => "[ ]",
-    }
 }
 
 fn work_lines(
@@ -1440,23 +1191,17 @@ fn work_lines(
     width: u16,
     product_state: ProductState,
 ) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    out.extend(objective_tree_lines(state, product_state, width as usize));
-    out.push(Line::from(""));
-    out.extend(runtime_tabs_lines(product_state, width as usize));
-    out.extend(runtime_context_band_lines(app, state, width as usize));
-    out.push(Line::from(""));
-    let outcome = outcome_lines(state, product_state, width as usize);
-    if outcome.is_some() {
-        out.extend(compact_timeline_lines(state, product_state, width as usize));
-    } else {
-        out.extend(timeline_lines(state, product_state, width as usize));
-    }
-    if let Some(block) = outcome {
-        if !running_streaming_preview_is_outcome(state, product_state) {
-            out.push(Line::from(""));
-        }
-        out.extend(block);
+    let mut out =
+        tool_aware_chronological_lines(app, state, width, product_state).unwrap_or_else(|| {
+            transcript_lines(
+                state,
+                width,
+                product_state,
+                matches!(product_state, ProductState::Running),
+            )
+        });
+    if out.is_empty() {
+        append_task_section(&mut out, state);
     }
     if let Some(next) = next_action_lines(state, app, product_state) {
         out.push(Line::from(""));
@@ -1465,403 +1210,1015 @@ fn work_lines(
     out
 }
 
-fn compact_timeline_lines(
-    state: &WorkbenchState,
-    product_state: ProductState,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let activity = visible_activity(
-        &state.activity,
-        product_state == ProductState::Running,
-        true,
-    );
-    let groups = group_activity_for_timeline(&activity);
-    let mut out = Vec::new();
-    for (label, items) in groups.into_iter().filter(|(_, items)| !items.is_empty()) {
-        if product_state == ProductState::Result && label != "helpers" {
-            continue;
-        }
-        let item = items
-            .iter()
-            .take(2)
-            .cloned()
-            .collect::<Vec<_>>()
-            .join(" / ");
-        let text = if item.is_empty() {
-            label.to_string()
-        } else {
-            format!("{label}  {item}")
-        };
-        out.push(Line::from(vec![
-            Span::styled(format!(" {:02}  ", out.len() + 1), muted()),
-            Span::styled(truncate(&text, width.saturating_sub(5)), text_style()),
-        ]));
-        if out.len() >= 2 {
-            break;
-        }
-    }
-    out
-}
-
-fn objective_tree_lines(
-    state: &WorkbenchState,
-    product_state: ProductState,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let (title, status, status_style) = match product_state {
-        ProductState::Running => (
-            "Active objective",
-            elapsed_label(state, product_state)
-                .map(|elapsed| format!("working . {elapsed}"))
-                .unwrap_or_else(|| "working".to_string()),
-            running(),
-        ),
-        ProductState::Result => (
-            "Task complete",
-            elapsed_label(state, product_state)
-                .map(|elapsed| format!("done . {elapsed}"))
-                .unwrap_or_else(|| "done".to_string()),
-            done(),
-        ),
-        ProductState::Failed => ("Task stopped", "failed".to_string(), failed()),
-        ProductState::Cancelled => ("Task stopped", "stopped".to_string(), failed()),
-        _ => ("No objective", "idle".to_string(), muted()),
-    };
-    let left = format!("[box] {title}");
-    let right = status;
-    let rule_w = width.saturating_sub(left.chars().count() + right.chars().count() + 2);
-    let mut out = vec![Line::from(vec![
-        Span::styled(left, bold()),
-        Span::raw(" "),
-        Span::styled("-".repeat(rule_w), dim()),
-        Span::raw(" "),
-        Span::styled(right, status_style),
-    ])];
-
-    let url = state
-        .browser
-        .url
-        .as_deref()
-        .or(state.browser.live_url.as_deref())
-        .filter(|url| is_useful_source(url))
-        .map(compact_activity_url_for_render);
-    let first = url
-        .map(|url| format!("Opened {url}"))
-        .unwrap_or_else(|| "Received task".to_string());
-    out.push(tree_step("|", "[x]", &first, done()));
-    match product_state {
-        ProductState::Running => {
-            let active = current_streaming_text(state)
-                .map(first_line)
-                .unwrap_or_else(|| "Working through browser task".to_string());
-            out.push(tree_step("|", "[>]", &active, running()));
-            out.push(tree_step("'", "[ ]", "Awaiting result", dim()));
-        }
-        ProductState::Result => {
-            out.push(tree_step("'", "[x]", "Prepared result", done()));
-        }
-        ProductState::Failed => {
-            let error = state.failure.as_deref().unwrap_or("The task failed.");
-            out.push(tree_step(
-                "|",
-                "[!]",
-                &friendly_error_message(error),
-                failed(),
-            ));
-            out.push(tree_step("'", "[ ]", "Recover or start a new task", dim()));
-        }
-        ProductState::Cancelled => {
-            out.push(tree_step("|", "[!]", "Stopped before completion", failed()));
-            out.push(tree_step("'", "[ ]", "Progress saved in history", dim()));
-        }
-        _ => out.push(tree_step("'", "[ ]", "idle", dim())),
-    }
-    out
-}
-
-fn tree_step(branch: &'static str, glyph: &'static str, text: &str, style: Style) -> Line<'static> {
-    Line::from(vec![
-        Span::styled(format!(" {branch} "), dim()),
-        Span::styled(glyph.to_string(), style),
-        Span::raw(" "),
-        Span::styled(
-            text.to_string(),
-            if glyph == "[ ]" { dim() } else { text_style() },
-        ),
-    ])
-}
-
-fn runtime_tabs_lines(product_state: ProductState, width: usize) -> Vec<Line<'static>> {
-    let compact = width < 92;
-    let runtime_label = if product_state == ProductState::Running {
-        if compact {
-            "RUN *"
-        } else {
-            "RUNTIME *"
-        }
-    } else if compact {
-        "RUN"
-    } else {
-        "RUNTIME"
-    };
-    let labels = if compact {
-        ["TERM", runtime_label, "BROWSER", "HIST", "DEV"]
-    } else {
-        ["TERMINAL", runtime_label, "BROWSER", "HISTORY", "DEV"]
-    };
-    let mut spans = Vec::new();
-    for (idx, label) in labels.iter().enumerate() {
-        if idx > 0 {
-            spans.push(Span::raw("   "));
-        }
-        let style = if idx == 1 {
-            accent()
-        } else if idx == 4 {
-            dim()
-        } else {
-            text_style()
-        };
-        spans.push(Span::styled(label.to_string(), style));
-    }
-    vec![
-        Line::from(spans),
-        Line::from(Span::styled("-".repeat(width), dim())),
-    ]
-}
-
-fn runtime_context_band_lines(
+fn tool_aware_chronological_lines(
     app: &App,
     state: &WorkbenchState,
-    width: usize,
-) -> Vec<Line<'static>> {
-    let columns = if width < 90 { 3 } else { 4 };
-    let col_w = (width.saturating_sub((columns - 1) * 2) / columns).max(14);
-    let task = current_task_label(state);
-    let labels = if columns == 3 {
-        vec!["AGENT", "MODEL", "BROWSER"]
-    } else {
-        vec!["AGENT", "MODEL", "BROWSER", "TASK"]
-    };
-    let values = if columns == 3 {
-        vec![
-            ("runtime".to_string(), text_style()),
-            (
-                format!("{} . {}", app.model, compact_account_label(&app.account)),
-                text_style(),
-            ),
-            (browser_ready_label(app, state), browser_status_style(state)),
-        ]
-    } else {
-        vec![
-            ("runtime".to_string(), text_style()),
-            (
-                format!("{} . {}", app.model, compact_account_label(&app.account)),
-                text_style(),
-            ),
-            (browser_ready_label(app, state), browser_status_style(state)),
-            (task, text_style()),
-        ]
-    };
-    let mut label_spans = Vec::new();
-    let mut value_spans = Vec::new();
-    for (idx, label) in labels.iter().enumerate() {
-        if idx > 0 {
-            label_spans.push(Span::raw("  "));
-            value_spans.push(Span::raw("  "));
-        }
-        label_spans.push(Span::styled(fit_cell(label, col_w), muted()));
-        let (value, style) = values[idx].clone();
-        value_spans.push(Span::styled(fit_cell(&value, col_w), style));
-    }
-    vec![Line::from(label_spans), Line::from(value_spans)]
-}
-
-fn current_task_label(state: &WorkbenchState) -> String {
-    state
-        .transcript
-        .last()
-        .map(|turn| turn.prompt.clone())
-        .or_else(|| state.task.clone())
-        .unwrap_or_else(|| "browser task".to_string())
-}
-
-fn elapsed_label(state: &WorkbenchState, product_state: ProductState) -> Option<String> {
-    let session = state.current_session.as_ref()?;
-    let end_ms = if matches!(product_state, ProductState::Running) {
-        SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .map(|duration| duration.as_millis() as i64)
-            .unwrap_or(session.updated_ms)
-    } else {
-        session.updated_ms
-    };
-    let elapsed_ms = end_ms.saturating_sub(session.created_ms).max(0);
-    let secs = elapsed_ms / 1000;
-    if secs < 60 {
-        Some(format!("{secs}s"))
-    } else if secs < 3600 {
-        Some(format!("{}m {:02}s", secs / 60, secs % 60))
-    } else {
-        Some(format!("{}h {:02}m", secs / 3600, (secs % 3600) / 60))
-    }
-}
-
-fn timeline_lines(
-    state: &WorkbenchState,
+    width: u16,
     product_state: ProductState,
-    w: usize,
-) -> Vec<Line<'static>> {
-    let activity = visible_activity(
-        &state.activity,
-        product_state == ProductState::Running,
-        true,
-    );
-    let groups = group_activity_for_timeline(&activity);
-    let mut out = Vec::new();
-    let mut n: usize = 0;
-    for (label, items) in groups {
-        if items.is_empty() {
+) -> Option<Vec<Line<'static>>> {
+    let session = state.current_session.as_ref()?;
+    let events = chronological_events_for_session(app, &session.id);
+    if events.is_empty() {
+        return None;
+    }
+
+    let mut lines = Vec::new();
+    append_task_section(&mut lines, state);
+
+    let mut last_group = None;
+    let mut wrote_event = false;
+    let mut pending_delta = PendingDeltaBlock::default();
+    for event in events {
+        if event.session_id == session.id && event.event_type == "session.input" {
             continue;
         }
-        n += 1;
-        out.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled(format!("{n:02}"), muted()),
-            Span::raw("  "),
-            Span::styled(truncate(label, w.saturating_sub(5)), bold()),
-        ]));
-        for item in items {
-            let item = truncate(&item, w.saturating_sub(5).max(8));
-            out.push(Line::from(vec![
-                Span::raw("     "),
-                Span::styled(item, text_style()),
-            ]));
+        if event.event_type == "model.thinking_delta" {
+            let label = thinking_delta_label(event);
+            if pending_delta.should_flush_before(PendingDeltaKind::Thought, label.as_deref()) {
+                pending_delta.flush(&mut lines, &mut last_group, width);
+            }
+            pending_delta.push(PendingDeltaKind::Thought, label, event);
+            continue;
         }
+        pending_delta.flush(&mut lines, &mut last_group, width);
+        let before = lines.len();
+        append_tool_aware_event(&mut lines, &mut last_group, app, state, event, width);
+        wrote_event |= lines.len() != before;
     }
-    if out.is_empty() {
-        let (text, style) = match product_state {
-            ProductState::Running => (
-                format!("{} starting browser task", spinner_frame()),
-                running(),
-            ),
-            _ => ("no recorded steps".to_string(), dim()),
-        };
-        out.push(Line::from(vec![
-            Span::raw(" "),
-            Span::styled("..", muted()),
-            Span::raw("  "),
-            Span::styled(truncate(&text, w.saturating_sub(5).max(8)), style),
-        ]));
-    }
-    out
-}
+    pending_delta.flush(&mut lines, &mut last_group, width);
 
-fn group_activity_for_timeline(activity: &[String]) -> Vec<(&'static str, Vec<String>)> {
-    let mut browser = Vec::new();
-    let mut thinking = Vec::new();
-    let mut helpers = Vec::new();
-    let mut explored = Vec::new();
-    let mut ran = Vec::new();
-    let mut changed = Vec::new();
-    let mut other = Vec::new();
-    for item in activity {
-        let formatted = format_activity_item(item);
-        if is_browser_activity(item) {
-            browser.push(formatted);
-        } else if is_thinking_activity(item) {
-            thinking.push(formatted);
-        } else if is_helper_activity(item) {
-            helpers.push(formatted);
-        } else if is_command_activity(item) {
-            ran.push(formatted);
-        } else if is_change_activity(item) {
-            changed.push(formatted);
-        } else if is_explore_activity(item) {
-            explored.push(formatted);
-        } else {
-            other.push(formatted);
+    match product_state {
+        ProductState::Result => {
+            if let Some(result) = state.result.as_ref() {
+                push_gap_if_needed(&mut lines);
+                append_answer_event_block(&mut lines, result, state, width);
+            }
         }
-    }
-    vec![
-        ("browser", browser),
-        ("thinking", thinking),
-        ("helpers", helpers),
-        ("explored", explored),
-        ("ran", ran),
-        ("changed", changed),
-        ("activity", other),
-    ]
-}
-
-fn outcome_lines(
-    state: &WorkbenchState,
-    product_state: ProductState,
-    width: usize,
-) -> Option<Vec<Line<'static>>> {
-    if matches!(product_state, ProductState::Failed) {
-        let error = state.failure.as_deref().unwrap_or("The task failed.");
-        return Some(vec![
-            Line::from(Span::styled("error", muted())),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled(friendly_error_message(error), failed()),
-            ]),
-        ]);
-    }
-    if matches!(product_state, ProductState::Cancelled) {
-        return Some(vec![
-            Line::from(Span::styled("stopped", muted())),
-            Line::from(vec![
-                Span::raw("  "),
-                Span::styled("Progress is saved in history.", muted()),
-            ]),
-        ]);
-    }
-    if let Some(result) = state
-        .transcript
-        .last()
-        .and_then(|turn| turn.result.as_deref())
-        .or(state.result.as_deref())
-    {
-        let mut out = result_collapsed_lines(result, width);
-        if let Some(source) = state
-            .browser
-            .url
-            .as_ref()
-            .or(state.browser.live_url.as_ref())
-            .filter(|source| is_useful_source(source))
-        {
-            let source = truncate(
-                &compact_source_url_for_render(source),
-                width.saturating_sub(2).max(8),
+        ProductState::Failed => {
+            if let Some(error) = state.failure.as_ref() {
+                push_gap_if_needed(&mut lines);
+                append_ascii_text_block(
+                    &mut lines,
+                    "error",
+                    &[friendly_error_message(error)],
+                    None,
+                );
+            }
+        }
+        ProductState::Cancelled => {
+            push_gap_if_needed(&mut lines);
+            append_ascii_text_block(
+                &mut lines,
+                "stopped",
+                &["Progress is saved in history.".to_string()],
+                None,
             );
-            out.push(Line::from(""));
-            out.push(Line::from(vec![
-                Span::styled("source", muted()),
-                Span::raw("  "),
-                Span::styled(source, link()),
-            ]));
         }
-        return Some(out);
+        ProductState::Running => {
+            if let Some(streaming_text) = current_streaming_text(state) {
+                push_gap_if_needed(&mut lines);
+                append_answer_plain_block(&mut lines, streaming_text.trim_end(), width);
+            }
+        }
+        ProductState::Ready | ProductState::SetupNeeded => {}
     }
-    if matches!(product_state, ProductState::Running) {
-        return current_streaming_text(state).map(|text| streaming_collapsed_lines(text, width));
-    }
-    None
+
+    (wrote_event || matches!(product_state, ProductState::Result | ProductState::Running))
+        .then_some(lines)
 }
 
-fn running_streaming_preview_is_outcome(
+fn chronological_events_for_session<'a>(
+    app: &'a App,
+    root_session_id: &str,
+) -> Vec<&'a EventRecord> {
+    let mut session_ids = vec![root_session_id.to_string()];
+    let mut index = 0;
+    while index < session_ids.len() {
+        let parent_id = session_ids[index].clone();
+        for session in app
+            .state_cache
+            .sessions
+            .iter()
+            .filter(|session| session.parent_id.as_deref() == Some(parent_id.as_str()))
+        {
+            if !session_ids.iter().any(|id| id == &session.id) {
+                session_ids.push(session.id.clone());
+            }
+        }
+        index += 1;
+    }
+
+    let mut events = session_ids
+        .iter()
+        .flat_map(|session_id| app.state_cache.events_for_session(session_id))
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| event.seq);
+    events
+}
+
+fn append_tool_aware_event(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    app: &App,
     state: &WorkbenchState,
-    product_state: ProductState,
-) -> bool {
-    matches!(product_state, ProductState::Running)
-        && state
-            .transcript
-            .last()
-            .and_then(|turn| turn.result.as_deref())
-            .or(state.result.as_deref())
-            .is_none()
-        && current_streaming_text(state).is_some()
+    event: &EventRecord,
+    width: u16,
+) {
+    match event.event_type.as_str() {
+        "session.followup" => {
+            if let Some(prompt) = event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|prompt| !prompt.is_empty())
+            {
+                last_group.take();
+                push_gap_if_needed(lines);
+                append_prompt_section(lines, prompt);
+            }
+        }
+        "agent.spawned" => {
+            let label = event
+                .payload
+                .get("nickname")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("subagent");
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                &format!("{label} started"),
+                width,
+                text_style(),
+            );
+        }
+        "agent.completed" => {
+            let child_id = event
+                .payload
+                .get("child_session_id")
+                .and_then(serde_json::Value::as_str);
+            let label = child_id
+                .map(|id| helper_label_for_session(app, id))
+                .unwrap_or_else(|| "subagent".to_string());
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                &format!("{label} finished"),
+                width,
+                text_style(),
+            );
+            if let Some(result) = event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("result"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|result| !result.is_empty())
+            {
+                append_preview_markdown(lines, last_group, "subagent", result, width, 3);
+            }
+        }
+        "agent.failed" => {
+            let error = event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("subagent failed");
+            append_timeline_item(lines, last_group, "error", error, width, failed());
+        }
+        "agent.cancelled" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                "subagent stopped",
+                width,
+                muted(),
+            );
+        }
+        "model.tool_call" => append_tool_call_intent(lines, last_group, app, event, width),
+        "model.thinking_delta" => {}
+        "tool.failed" => {
+            let name = event
+                .payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let error = event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool failed");
+            append_timeline_item(
+                lines,
+                last_group,
+                "error",
+                &format!("{name} failed: {error}"),
+                width,
+                failed(),
+            );
+        }
+        "model.turn.request" => {
+            let model = event
+                .payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or("model");
+            append_timeline_item(
+                lines,
+                last_group,
+                "thinking",
+                &format!("waiting for {model}"),
+                width,
+                muted(),
+            );
+        }
+        "model.turn.retry" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "thinking",
+                "retrying model request",
+                width,
+                muted(),
+            );
+        }
+        "model.turn.error" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "thinking",
+                "model request hit an error",
+                width,
+                failed(),
+            );
+        }
+        "file.list" => {
+            let path = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| ".".to_string());
+            append_timeline_item(lines, last_group, "list", &path, width, text_style());
+        }
+        "file.read" => {
+            if let Some(path) = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+            {
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    "read",
+                    &display_path(path, state),
+                    width,
+                    text_style(),
+                );
+            }
+        }
+        "file.search" => {
+            let query = event
+                .payload
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("files");
+            let matches = event
+                .payload
+                .get("matches")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            append_timeline_item(
+                lines,
+                last_group,
+                "search",
+                &format!("Search {query:?} ({matches} matches)"),
+                width,
+                text_style(),
+            );
+        }
+        "command.started" => {
+            let cmd = event
+                .payload
+                .get("cmd")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("command");
+            append_timeline_item(lines, last_group, "run", cmd, width, text_style());
+        }
+        "command.output" => {
+            if let Some(text) = event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+            {
+                append_preview_text(lines, last_group, "run", text, width, 4);
+            }
+        }
+        "command.finished" => {
+            if event
+                .payload
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .is_some_and(|success| !success)
+            {
+                let code = event
+                    .payload
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    "run",
+                    &format!("failed with exit {code}"),
+                    width,
+                    failed(),
+                );
+            }
+        }
+        "tool.output_spilled" => {
+            let path = event
+                .payload
+                .get("artifact")
+                .and_then(|artifact| artifact.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| "artifact".to_string());
+            append_timeline_item(
+                lines,
+                last_group,
+                "run",
+                &format!("Full output saved to {path}"),
+                width,
+                muted(),
+            );
+        }
+        "patch.file_changed" => {
+            let kind = event
+                .payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("changed");
+            let path = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| "file".to_string());
+            append_timeline_item(
+                lines,
+                last_group,
+                "edit",
+                &format!("{kind} {path}"),
+                width,
+                text_style(),
+            );
+        }
+        "browser.connected" | "browser.reconnected" | "browser.target_changed" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "browser",
+                "browser connected",
+                width,
+                text_style(),
+            );
+        }
+        "browser.disconnected" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "browser",
+                "browser disconnected",
+                width,
+                muted(),
+            );
+        }
+        "browser.live_url" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "browser",
+                "live view available",
+                width,
+                text_style(),
+            );
+        }
+        "browser.page" | "browser.state" => {
+            if let Some(url) = event.payload.get("url").and_then(serde_json::Value::as_str) {
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    "browser",
+                    &format!("opened {}", compact_activity_url_for_render(url)),
+                    width,
+                    text_style(),
+                );
+            }
+        }
+        "plan.updated" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "plan",
+                "updated plan",
+                width,
+                text_style(),
+            );
+        }
+        _ => {}
+    }
+}
+
+fn append_native_timeline_event(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    state: &WorkbenchState,
+    event: &EventRecord,
+    width: u16,
+) {
+    match event.event_type.as_str() {
+        "session.input" | "session.followup" => {
+            if let Some(prompt) = event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|prompt| !prompt.is_empty())
+            {
+                last_group.take();
+                push_gap_if_needed(lines);
+                append_prompt_section(lines, prompt);
+            }
+        }
+        "session.done" => {
+            if let Some(result) = event
+                .payload
+                .get("result")
+                .and_then(serde_json::Value::as_str)
+                .filter(|result| !result.trim().is_empty())
+            {
+                last_group.take();
+                push_gap_if_needed(lines);
+                append_answer_event_block(lines, result, state, width);
+            }
+        }
+        "session.failed" => {
+            let error = event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("The task failed.");
+            last_group.take();
+            push_gap_if_needed(lines);
+            append_ascii_text_block(lines, "error", &[friendly_error_message(error)], None);
+        }
+        "session.cancelled" => {
+            last_group.take();
+            push_gap_if_needed(lines);
+            append_ascii_text_block(
+                lines,
+                "stopped",
+                &["Progress is saved in history.".to_string()],
+                None,
+            );
+        }
+        "agent.spawned" => {
+            let label = event
+                .payload
+                .get("nickname")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("subagent");
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                &format!("{label} started"),
+                width,
+                text_style(),
+            );
+        }
+        "agent.completed" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                "subagent finished",
+                width,
+                text_style(),
+            );
+            if let Some(result) = event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("result"))
+                .and_then(serde_json::Value::as_str)
+                .map(str::trim)
+                .filter(|result| !result.is_empty())
+            {
+                append_preview_markdown(lines, last_group, "subagent", result, width, 3);
+            }
+        }
+        "agent.failed" => {
+            let error = event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("error"))
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("subagent failed");
+            append_timeline_item(lines, last_group, "error", error, width, failed());
+        }
+        "agent.cancelled" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                "subagent stopped",
+                width,
+                muted(),
+            );
+        }
+        "model.tool_call" | "model.thinking_delta" => {}
+        "tool.failed" => {
+            let name = event
+                .payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let error = event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool failed");
+            append_timeline_item(
+                lines,
+                last_group,
+                "error",
+                &format!("{name} failed: {error}"),
+                width,
+                failed(),
+            );
+        }
+        "model.turn.request" | "model.turn.retry" => {}
+        "model.turn.error" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "error",
+                "model request hit an error",
+                width,
+                failed(),
+            );
+        }
+        "file.list" => {
+            let path = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| ".".to_string());
+            append_timeline_item(lines, last_group, "list", &path, width, text_style());
+        }
+        "file.read" => {
+            if let Some(path) = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+            {
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    "read",
+                    &display_path(path, state),
+                    width,
+                    text_style(),
+                );
+            }
+        }
+        "file.search" => {
+            let query = event
+                .payload
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("files");
+            let matches = event
+                .payload
+                .get("matches")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or(0);
+            append_timeline_item(
+                lines,
+                last_group,
+                "search",
+                &format!("Search {query:?} ({matches} matches)"),
+                width,
+                text_style(),
+            );
+        }
+        "command.started" => {
+            let cmd = event
+                .payload
+                .get("cmd")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("command");
+            append_timeline_item(lines, last_group, "run", cmd, width, text_style());
+        }
+        "command.output" => {
+            if let Some(text) = event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+            {
+                append_preview_text(lines, last_group, "run", text, width, 4);
+            }
+        }
+        "command.finished" => {
+            if event
+                .payload
+                .get("success")
+                .and_then(serde_json::Value::as_bool)
+                .is_some_and(|success| !success)
+            {
+                let code = event
+                    .payload
+                    .get("exit_code")
+                    .and_then(serde_json::Value::as_i64)
+                    .map(|code| code.to_string())
+                    .unwrap_or_else(|| "unknown".to_string());
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    "run",
+                    &format!("failed with exit {code}"),
+                    width,
+                    failed(),
+                );
+            }
+        }
+        "tool.output_spilled" => {
+            let path = event
+                .payload
+                .get("artifact")
+                .and_then(|artifact| artifact.get("path"))
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| "artifact".to_string());
+            append_timeline_item(
+                lines,
+                last_group,
+                "run",
+                &format!("Full output saved to {path}"),
+                width,
+                muted(),
+            );
+        }
+        "patch.file_changed" => {
+            let kind = event
+                .payload
+                .get("kind")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("changed");
+            let path = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| "file".to_string());
+            append_timeline_item(
+                lines,
+                last_group,
+                "edit",
+                &format!("{kind} {path}"),
+                width,
+                text_style(),
+            );
+        }
+        "model.stream_delta" => {}
+        "browser.connected" | "browser.reconnected" | "browser.target_changed" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "browser",
+                "browser connected",
+                width,
+                text_style(),
+            );
+        }
+        "browser.disconnected" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "browser",
+                "browser disconnected",
+                width,
+                muted(),
+            );
+        }
+        "browser.live_url" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "browser",
+                "live view available",
+                width,
+                text_style(),
+            );
+        }
+        "browser.page" | "browser.state" => {
+            if let Some(url) = event.payload.get("url").and_then(serde_json::Value::as_str) {
+                append_timeline_item(
+                    lines,
+                    last_group,
+                    "browser",
+                    &format!("opened {}", compact_activity_url_for_render(url)),
+                    width,
+                    text_style(),
+                );
+            }
+        }
+        _ => {}
+    }
+}
+
+fn append_tool_call_intent(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    app: &App,
+    event: &EventRecord,
+    width: u16,
+) {
+    let Some(name) = event
+        .payload
+        .get("name")
+        .and_then(serde_json::Value::as_str)
+    else {
+        return;
+    };
+    let arguments = event
+        .payload
+        .get("arguments")
+        .unwrap_or(&serde_json::Value::Null);
+    match name {
+        "spawn_agent" => {}
+        "wait_agent" => {
+            append_timeline_item(lines, last_group, "subagent", "wait", width, muted());
+        }
+        "send_input" | "send_message" | "followup_task" => {
+            let target = arguments
+                .get("target")
+                .and_then(serde_json::Value::as_str)
+                .map(|target| helper_label_for_session(app, target))
+                .unwrap_or_else(|| "subagent".to_string());
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                &format!("send input to {target}"),
+                width,
+                muted(),
+            );
+        }
+        "close_agent" => {
+            append_timeline_item(lines, last_group, "subagent", "close", width, muted());
+        }
+        "python" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "python",
+                "run browser Python",
+                width,
+                muted(),
+            );
+        }
+        "view_image" => {
+            append_timeline_item(lines, last_group, "image", "inspect image", width, muted());
+        }
+        "update_plan" => {
+            append_timeline_item(lines, last_group, "plan", "update plan", width, muted());
+        }
+        "done" => {}
+        "exec_command" | "write_stdin" | "read_file" | "search_files" | "list_files"
+        | "apply_patch" => {}
+        _ => append_timeline_item(
+            lines,
+            last_group,
+            "tool",
+            &format!("call {name}"),
+            width,
+            muted(),
+        ),
+    }
+}
+
+fn helper_label_for_session(app: &App, session_id: &str) -> String {
+    for events in app.state_cache.events_by_session.values() {
+        for event in events {
+            if event.event_type == "agent.spawned"
+                && event
+                    .payload
+                    .get("child_session_id")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(session_id)
+            {
+                if let Some(label) = event
+                    .payload
+                    .get("nickname")
+                    .and_then(serde_json::Value::as_str)
+                    .or_else(|| {
+                        event
+                            .payload
+                            .get("role")
+                            .and_then(serde_json::Value::as_str)
+                    })
+                {
+                    return label.to_string();
+                }
+            }
+        }
+    }
+    for event in app.state_cache.events_for_session(session_id) {
+        if event.event_type == "agent.context" {
+            if let Some(label) = event
+                .payload
+                .get("nickname")
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("role")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("agent_path")
+                        .and_then(serde_json::Value::as_str)
+                })
+            {
+                return label.trim_start_matches("/root/").to_string();
+            }
+        }
+    }
+    compact_path_for_render(session_id)
+}
+
+fn display_path(path: &str, state: &WorkbenchState) -> String {
+    let trimmed = path.trim();
+    if trimmed.is_empty() {
+        return ".".to_string();
+    }
+    if let Some(cwd) = state
+        .current_session
+        .as_ref()
+        .map(|session| session.cwd.as_str())
+    {
+        let cwd = cwd.trim_end_matches('/');
+        if let Some(relative) = trimmed
+            .strip_prefix(cwd)
+            .and_then(|path| path.strip_prefix('/'))
+        {
+            if !relative.is_empty() {
+                return relative.to_string();
+            }
+        }
+    }
+    trimmed.to_string()
+}
+
+fn append_timeline_item(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    group: &str,
+    item: &str,
+    width: u16,
+    style: Style,
+) {
+    if last_group.as_deref() != Some(group) {
+        push_gap_if_needed(lines);
+        lines.push(event_marker_line(group));
+        *last_group = Some(group.to_string());
+    }
+    let body_width = width.saturating_sub(4).max(24) as usize;
+    let wrapped = wrap_plain(item.trim_end(), body_width, "");
+    if wrapped.is_empty() {
+        return;
+    }
+    for line in wrapped {
+        lines.push(prefix_block_line(
+            "  ",
+            Line::from(Span::styled(line, style)),
+        ));
+    }
+}
+
+fn append_preview_text(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    group: &str,
+    text: &str,
+    width: u16,
+    max_lines: usize,
+) {
+    let preview_lines = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .collect::<Vec<_>>();
+    for line in preview_lines.iter().take(max_lines) {
+        append_timeline_item(lines, last_group, group, line, width, muted());
+    }
+    if preview_lines.len() > max_lines {
+        append_timeline_item(
+            lines,
+            last_group,
+            group,
+            &format!("... +{} lines", preview_lines.len() - max_lines),
+            width,
+            dim(),
+        );
+    }
+}
+
+fn append_preview_markdown(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    group: &str,
+    text: &str,
+    width: u16,
+    max_lines: usize,
+) {
+    let preview_lines = markdown_result_lines(text, width.saturating_sub(4).max(24))
+        .into_iter()
+        .map(trim_default_markdown_indent)
+        .filter(|line| {
+            line.spans
+                .iter()
+                .any(|span| !span.content.trim().is_empty())
+        })
+        .collect::<Vec<_>>();
+    for line in preview_lines.iter().take(max_lines).cloned() {
+        append_timeline_line(lines, last_group, group, line);
+    }
+    if preview_lines.len() > max_lines {
+        append_timeline_item(
+            lines,
+            last_group,
+            group,
+            &format!("... +{} lines", preview_lines.len() - max_lines),
+            width,
+            dim(),
+        );
+    }
+}
+
+fn append_timeline_line(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    group: &str,
+    line: Line<'static>,
+) {
+    if last_group.as_deref() != Some(group) {
+        push_gap_if_needed(lines);
+        lines.push(event_marker_line(group));
+        *last_group = Some(group.to_string());
+    }
+    lines.push(prefix_block_line("  ", line));
+}
+
+fn append_answer_event_block(
+    lines: &mut Vec<Line<'static>>,
+    result: &str,
+    state: &WorkbenchState,
+    width: u16,
+) {
+    append_answer_plain_block(lines, result, width);
+    if let Some(source) = state
+        .browser
+        .url
+        .as_ref()
+        .or(state.browser.live_url.as_ref())
+        .filter(|source| is_useful_source(source))
+    {
+        append_source_line(lines, source);
+    }
 }
 
 fn current_streaming_text(state: &WorkbenchState) -> Option<&str> {
@@ -1871,30 +2228,6 @@ fn current_streaming_text(state: &WorkbenchState) -> Option<&str> {
         .and_then(|turn| turn.streaming_text.as_deref())
         .map(str::trim_end)
         .filter(|text| !text.trim().is_empty())
-}
-
-fn streaming_collapsed_lines(text: &str, width: usize) -> Vec<Line<'static>> {
-    let body_width = width.saturating_sub(4).max(24) as u16;
-    let body = markdown_result_lines(text, body_width)
-        .into_iter()
-        .map(trim_default_markdown_indent);
-    let mut out = vec![Line::from(Span::styled("streaming", muted()))];
-    for line in body {
-        out.push(prefix_block_line("  ", line));
-    }
-    out
-}
-
-fn result_collapsed_lines(result: &str, width: usize) -> Vec<Line<'static>> {
-    let body_width = width.saturating_sub(4).max(24) as u16;
-    let body = markdown_result_lines(result, body_width)
-        .into_iter()
-        .map(trim_default_markdown_indent);
-    let mut out = vec![Line::from(Span::styled("result", muted()))];
-    for line in body {
-        out.push(prefix_block_line("  ", line));
-    }
-    out
 }
 
 fn next_action_lines(
@@ -1920,7 +2253,7 @@ fn next_action_lines(
     } else {
         app.selected_row
     };
-    let mut out = vec![Line::from(Span::styled("next", muted()))];
+    let mut out = vec![event_marker_line("next")];
     for (idx, label) in actions.iter().enumerate() {
         out.push(prefix_block_line(
             "  ",
@@ -1961,7 +2294,7 @@ fn transcript_lines(
             } else {
                 append_ascii_text_block(
                     &mut lines,
-                    "result",
+                    "answer",
                     &["No result yet.".to_string()],
                     None,
                 );
@@ -2015,7 +2348,7 @@ fn native_plain_transcript_lines(
                 if is_current_turn {
                     append_result_block(&mut lines, result, state, width);
                 } else {
-                    append_markdown_block(&mut lines, "result", result, width, Some("done"));
+                    append_answer_plain_block(&mut lines, result, width);
                 }
             } else if let Some(failure) = turn.failure.as_ref() {
                 if !(is_current_turn && product_state == ProductState::Failed) {
@@ -2208,7 +2541,7 @@ fn append_transcript_turns(
             if idx + 1 == state.transcript.len() {
                 append_result_block(lines, result, state, width);
             } else {
-                append_markdown_block(lines, "result", result, width, Some("done"));
+                append_answer_plain_block(lines, result, width);
             }
         }
     }
@@ -2248,7 +2581,7 @@ fn append_activity_section(lines: &mut Vec<Line<'static>>, state: &WorkbenchStat
         } else {
             "no recorded steps"
         };
-        append_ascii_text_block(lines, "activity", &[fallback.to_string()], Some("pending"));
+        append_ascii_text_block(lines, "status", &[fallback.to_string()], Some("pending"));
         return;
     }
     append_activity_blocks(lines, &activity);
@@ -2266,7 +2599,12 @@ fn visible_activity(
             include_completed_helper_markers
                 || !matches!(
                     item.as_str(),
-                    "helper finished" | "helper failed" | "helper stopped"
+                    "helper finished"
+                        | "helper failed"
+                        | "helper stopped"
+                        | "subagent finished"
+                        | "subagent failed"
+                        | "subagent stopped"
                 )
         })
         .cloned()
@@ -2275,11 +2613,10 @@ fn visible_activity(
 
 fn append_activity_blocks(lines: &mut Vec<Line<'static>>, activity: &[String]) {
     let mut browser = Vec::new();
-    let mut thinking = Vec::new();
-    let mut helpers = Vec::new();
-    let mut explored = Vec::new();
-    let mut ran = Vec::new();
-    let mut changed = Vec::new();
+    let mut status_items = Vec::new();
+    let mut tool = Vec::new();
+    let mut run = Vec::new();
+    let mut edit = Vec::new();
     let mut other = Vec::new();
 
     for item in activity {
@@ -2287,15 +2624,15 @@ fn append_activity_blocks(lines: &mut Vec<Line<'static>>, activity: &[String]) {
         if is_browser_activity(item) {
             browser.push(formatted);
         } else if is_thinking_activity(item) {
-            thinking.push(formatted);
-        } else if is_helper_activity(item) {
-            helpers.push(formatted);
+            status_items.push(formatted);
+        } else if is_subagent_activity(item) {
+            tool.push(formatted);
         } else if is_command_activity(item) {
-            ran.push(formatted);
+            run.push(formatted);
         } else if is_change_activity(item) {
-            changed.push(formatted);
+            edit.push(formatted);
         } else if is_explore_activity(item) {
-            explored.push(formatted);
+            tool.push(formatted);
         } else {
             other.push(formatted);
         }
@@ -2304,12 +2641,11 @@ fn append_activity_blocks(lines: &mut Vec<Line<'static>>, activity: &[String]) {
     let mut wrote = false;
     for (title, items) in [
         ("browser", browser),
-        ("thinking", thinking),
-        ("helpers", helpers),
-        ("explored", explored),
-        ("ran", ran),
-        ("changed", changed),
-        ("activity", other),
+        ("status", status_items),
+        ("tool", tool),
+        ("run", run),
+        ("edit", edit),
+        ("step", other),
     ] {
         if items.is_empty() {
             continue;
@@ -2328,7 +2664,7 @@ fn append_result_block(
     state: &WorkbenchState,
     width: u16,
 ) {
-    append_markdown_block(lines, "result", result, width, None);
+    append_answer_plain_block(lines, result, width);
     if let Some(source) = state
         .browser
         .url
@@ -2336,38 +2672,168 @@ fn append_result_block(
         .or(state.browser.live_url.as_ref())
         .filter(|source| is_useful_source(source))
     {
-        append_ascii_tail(
-            lines,
-            "source",
-            vec![Line::from(Span::styled(source.clone(), link()))],
-        );
-    } else {
-        append_ascii_tail(lines, "done", Vec::new());
+        append_source_line(lines, source);
     }
 }
 
 fn append_streaming_block(lines: &mut Vec<Line<'static>>, text: &str, width: u16) {
-    append_markdown_block(lines, "streaming", text.trim_end(), width, None);
+    append_answer_plain_block(lines, text.trim_end(), width);
+}
+
+fn append_thinking_delta_event_lines(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    text: &str,
+    label: Option<&str>,
+    width: u16,
+) {
+    let title = label
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(|label| format!("thought {label}"))
+        .unwrap_or_else(|| "thought".to_string());
+    append_delta_event_lines(lines, last_group, "thought", &title, text, width);
+}
+
+fn append_delta_event_lines(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    group: &str,
+    title: &str,
+    text: &str,
+    width: u16,
+) {
+    if last_group.as_deref() != Some(group) {
+        push_gap_if_needed(lines);
+        lines.push(event_marker_line(title));
+        *last_group = Some(group.to_string());
+    }
+    let body_width = width.saturating_sub(4).max(24) as usize;
+    for raw_line in text.lines() {
+        if raw_line.trim().is_empty() {
+            continue;
+        }
+        let wrapped = wrap_plain(raw_line.trim_end(), body_width, "");
+        if wrapped.is_empty() {
+            continue;
+        }
+        for line in wrapped {
+            lines.push(prefix_block_line(
+                "  ",
+                Line::from(Span::styled(line, text_style())),
+            ));
+        }
+    }
+}
+
+#[derive(Default)]
+struct PendingDeltaBlock {
+    kind: Option<PendingDeltaKind>,
+    label: Option<String>,
+    text: String,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum PendingDeltaKind {
+    Thought,
+}
+
+impl PendingDeltaBlock {
+    fn should_flush_before(&self, kind: PendingDeltaKind, label: Option<&str>) -> bool {
+        self.kind.is_some() && (self.kind != Some(kind) || self.label.as_deref() != label)
+    }
+
+    fn push(&mut self, kind: PendingDeltaKind, label: Option<String>, event: &EventRecord) {
+        let Some(text) = event_text_payload(event) else {
+            return;
+        };
+        if self.kind.is_none() {
+            self.kind = Some(kind);
+            self.label = label;
+        }
+        append_live_delta_text(&mut self.text, text);
+    }
+
+    fn flush(
+        &mut self,
+        lines: &mut Vec<Line<'static>>,
+        last_group: &mut Option<String>,
+        width: u16,
+    ) {
+        let Some(kind) = self.kind.take() else {
+            return;
+        };
+        let text = self.text.trim_end().to_string();
+        let label = self.label.take();
+        self.text.clear();
+        if text.trim().is_empty() {
+            return;
+        }
+        match kind {
+            PendingDeltaKind::Thought => {
+                append_thinking_delta_event_lines(lines, last_group, &text, label.as_deref(), width)
+            }
+        }
+    }
+}
+
+fn thinking_delta_label(event: &EventRecord) -> Option<String> {
+    event
+        .payload
+        .get("label")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn event_text_payload(event: &EventRecord) -> Option<&str> {
+    event
+        .payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn append_live_delta_text(current: &mut String, incoming: &str) {
+    if current.is_empty() {
+        current.push_str(incoming);
+        return;
+    }
+    if incoming == current || incoming.trim() == current.trim() {
+        return;
+    }
+    if let Some(suffix) = incoming.strip_prefix(current.as_str()) {
+        current.push_str(suffix);
+        return;
+    }
+    if incoming.chars().count() >= 24 && current.ends_with(incoming) {
+        return;
+    }
+    current.push_str(incoming);
+}
+
+fn append_answer_plain_block(lines: &mut Vec<Line<'static>>, markdown: &str, width: u16) {
+    let body_width = width.saturating_sub(2).max(24);
+    for line in markdown_result_lines(markdown, body_width)
+        .into_iter()
+        .map(trim_default_markdown_indent)
+    {
+        lines.push(line);
+    }
+}
+
+fn append_source_line(lines: &mut Vec<Line<'static>>, source: &str) {
+    lines.push(Line::from(""));
+    lines.push(Line::from(vec![
+        Span::styled("source ", muted()),
+        Span::styled(source.to_string(), link()),
+    ]));
 }
 
 fn is_useful_source(source: &str) -> bool {
     let source = source.trim();
     !source.is_empty() && source != "about:blank"
-}
-
-fn append_markdown_block(
-    lines: &mut Vec<Line<'static>>,
-    title: &str,
-    markdown: &str,
-    width: u16,
-    footer: Option<&str>,
-) {
-    let body_width = width.saturating_sub(8).max(24);
-    let body = markdown_result_lines(markdown, body_width)
-        .into_iter()
-        .map(trim_default_markdown_indent)
-        .collect();
-    append_ascii_lines_block(lines, title, body, footer);
 }
 
 fn append_ascii_text_block(
@@ -2389,7 +2855,7 @@ fn append_ascii_lines_block(
     body: Vec<Line<'static>>,
     _footer: Option<&str>,
 ) {
-    lines.push(Line::from(Span::styled(title.to_string(), muted())));
+    lines.push(event_marker_line(title));
     if body.is_empty() {
         lines.push(Line::from(vec![
             Span::raw("  "),
@@ -2402,11 +2868,41 @@ fn append_ascii_lines_block(
     }
 }
 
-fn append_ascii_tail(lines: &mut Vec<Line<'static>>, label: &str, body: Vec<Line<'static>>) {
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled(label.to_string(), muted())));
-    for line in body {
-        lines.push(prefix_block_line("  ", line));
+fn event_marker_line(title: &str) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(": ", event_marker_style(title)),
+        Span::styled(title.to_string(), event_marker_style(title)),
+    ])
+}
+
+fn event_marker_style(title: &str) -> Style {
+    if title.starts_with("thought")
+        || title.starts_with("thinking")
+        || title.starts_with("status")
+        || title.starts_with("edit")
+    {
+        thought()
+    } else if title.starts_with("browser")
+        || title == "run"
+        || title == "image"
+        || title == "plan"
+        || title == "tool"
+        || title == "python"
+    {
+        accent()
+    } else if title.starts_with("answer")
+        || title == "done"
+        || title == "source"
+        || title == "subagent"
+        || title == "list"
+        || title == "read"
+        || title == "search"
+    {
+        done()
+    } else if title == "error" || title == "stopped" {
+        failed()
+    } else {
+        muted()
     }
 }
 
@@ -2414,23 +2910,6 @@ fn push_gap_if_needed(lines: &mut Vec<Line<'static>>) {
     if !lines.is_empty() {
         lines.push(Line::from(""));
     }
-}
-
-fn append_grouped_event_line(
-    lines: &mut Vec<Line<'static>>,
-    last_group: &mut Option<String>,
-    group: &str,
-    item: &str,
-) {
-    if last_group.as_deref() != Some(group) {
-        push_gap_if_needed(lines);
-        lines.push(Line::from(Span::styled(group.to_string(), muted())));
-        *last_group = Some(group.to_string());
-    }
-    lines.push(prefix_block_line(
-        "  ",
-        Line::from(Span::styled(item.to_string(), text_style())),
-    ));
 }
 
 fn prefix_block_line(prefix: &'static str, line: Line<'static>) -> Line<'static> {
@@ -2452,10 +2931,25 @@ fn format_activity_item(item: &str) -> String {
     item.strip_prefix("browsing ")
         .map(|url| format!("opened {}", compact_activity_url_for_render(url)))
         .or_else(|| {
-            if matches!(item, "helper finished" | "helper failed" | "helper stopped") {
-                Some(item.to_string())
+            item.strip_prefix("started ")
+                .and_then(|text| text.strip_suffix(" helper"))
+                .map(|label| format!("{label} started"))
+        })
+        .or_else(|| {
+            if matches!(
+                item,
+                "helper finished"
+                    | "helper failed"
+                    | "helper stopped"
+                    | "subagent finished"
+                    | "subagent failed"
+                    | "subagent stopped"
+            ) {
+                Some(item.replacen("helper", "subagent", 1))
             } else {
-                item.strip_prefix("helper ").map(|text| text.to_string())
+                item.strip_prefix("helper ")
+                    .or_else(|| item.strip_prefix("subagent "))
+                    .map(|text| text.to_string())
             }
         })
         .or_else(|| item.strip_prefix("thinking ").map(|text| text.to_string()))
@@ -2501,15 +2995,6 @@ fn compact_activity_url_for_render(url: &str) -> String {
     }
 }
 
-fn compact_source_url_for_render(url: &str) -> String {
-    let trimmed = url.trim().trim_end_matches('/');
-    if let Some((prefix, _)) = trimmed.split_once('?') {
-        format!("{prefix}?...")
-    } else {
-        trimmed.to_string()
-    }
-}
-
 fn compact_path_for_render(path: &str) -> String {
     let trimmed = path.trim();
     trimmed
@@ -2518,15 +3003,6 @@ fn compact_path_for_render(path: &str) -> String {
         .filter(|tail| !tail.is_empty())
         .unwrap_or(trimmed)
         .to_string()
-}
-
-fn agent_started_text_for_render(payload: &serde_json::Value) -> String {
-    let label = payload
-        .get("nickname")
-        .and_then(serde_json::Value::as_str)
-        .or_else(|| payload.get("role").and_then(serde_json::Value::as_str))
-        .unwrap_or("helper");
-    format!("started {label} helper")
 }
 
 fn is_browser_activity(item: &str) -> bool {
@@ -2539,8 +3015,10 @@ fn is_thinking_activity(item: &str) -> bool {
     item.starts_with("thinking ")
 }
 
-fn is_helper_activity(item: &str) -> bool {
+fn is_subagent_activity(item: &str) -> bool {
     item.starts_with("helper ")
+        || item.starts_with("subagent ")
+        || (item.starts_with("started ") && item.contains(" helper"))
 }
 
 fn is_command_activity(item: &str) -> bool {
@@ -2556,15 +3034,6 @@ fn is_explore_activity(item: &str) -> bool {
         || item.starts_with("searched ")
         || item == "listed files"
         || item.starts_with("started ")
-}
-
-fn spinner_frame() -> &'static str {
-    const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
-    let tick = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|duration| duration.as_millis() / 160)
-        .unwrap_or(0);
-    FRAMES[tick as usize % FRAMES.len()]
 }
 
 fn kv_line(label: &str, value: &str) -> Line<'static> {
