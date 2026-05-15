@@ -313,7 +313,7 @@ fn slash_palette_pane_height(app: &App) -> u16 {
     if items.is_empty() {
         return 0;
     }
-    (items.len() as u16).min(8).saturating_add(5)
+    (items.len() as u16).min(8).saturating_add(4)
 }
 
 fn render_bottom_pane(
@@ -648,10 +648,6 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             Span::styled("actions ", bold()),
             Span::styled("-".repeat(rule_w), dim()),
             Span::styled(" esc close", muted()),
-        ]),
-        Line::from(vec![
-            Span::styled("> ", accent()),
-            Span::styled("filter actions...", dim()),
         ]),
         Line::from(""),
     ];

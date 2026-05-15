@@ -2434,6 +2434,7 @@ mod redesign_tests {
         assert!(screen.contains("/laminar"));
         assert!(screen.contains("start a new task"));
         assert!(screen.contains("change browser backend"));
+        assert!(!screen.contains("filter actions"));
         assert!(!screen.contains("tab history"));
         assert!(!screen.contains("Open browser"));
         assert!(!screen.contains("Reconnect browser"));
