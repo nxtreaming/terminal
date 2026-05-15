@@ -1,7 +1,12 @@
-use std::ffi::OsStr;
+use std::ffi::{OsStr, OsString};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStdin, ChildStdout, Command, Stdio};
+use std::sync::mpsc;
+use std::time::{Duration, Instant};
+
+#[cfg(unix)]
+use std::os::unix::process::CommandExt;
 
 use anyhow::{bail, Context, Result};
 use serde::{Deserialize, Serialize};
@@ -12,6 +17,16 @@ pub struct PythonWorker {
     stdin: ChildStdin,
     stdout: BufReader<ChildStdout>,
     next_id: u64,
+    launch: PythonWorkerLaunch,
+}
+
+#[derive(Clone, Debug)]
+struct PythonWorkerLaunch {
+    program: PathBuf,
+    args: Vec<String>,
+    pythonpath: OsString,
+    browser_mode: Option<String>,
+    extra_env: Vec<(OsString, OsString)>,
 }
 
 #[derive(Debug, Serialize)]
@@ -114,7 +129,7 @@ impl PythonWorker {
     fn start_with_default_runtime(
         pythonpath: impl AsRef<OsStr>,
         browser_mode: Option<&str>,
-        extra_env: &[(std::ffi::OsString, std::ffi::OsString)],
+        extra_env: &[(OsString, OsString)],
     ) -> Result<Self> {
         if std::env::var_os("LLM_BROWSER_PYTHON_WORKER_DIRECT").is_none() {
             let uv = PathBuf::from("uv");
@@ -162,41 +177,85 @@ impl PythonWorker {
         args: &[&str],
         pythonpath: &OsStr,
         browser_mode: Option<&str>,
-        extra_env: &[(std::ffi::OsString, std::ffi::OsString)],
+        extra_env: &[(OsString, OsString)],
     ) -> Result<Self> {
-        let mut command = Command::new(program);
-        command
-            .args(args)
-            .arg("-m")
-            .arg("llm_browser_worker.worker")
-            .env("PYTHONUNBUFFERED", "1")
-            .env("PYTHONPATH", pythonpath);
-        command.envs(extra_env.iter().cloned());
-        if let Some(browser_mode) = browser_mode.filter(|mode| !mode.trim().is_empty()) {
-            command.env("LLM_BROWSER_BROWSER_MODE", browser_mode);
-        }
-        let mut child = command
-            .stdin(Stdio::piped())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped())
-            .spawn()
-            .with_context(|| {
-                format!(
-                    "start python worker via {} with PYTHONPATH={}",
-                    program.display(),
-                    pythonpath.to_string_lossy()
-                )
-            })?;
-        let stdin = child.stdin.take().context("python worker stdin missing")?;
-        let stdout = child
-            .stdout
-            .take()
-            .context("python worker stdout missing")?;
+        let launch = PythonWorkerLaunch {
+            program: program.to_path_buf(),
+            args: args.iter().map(|arg| (*arg).to_string()).collect(),
+            pythonpath: pythonpath.to_os_string(),
+            browser_mode: browser_mode.map(str::to_string),
+            extra_env: extra_env.to_vec(),
+        };
+        let (child, stdin, stdout) = spawn_python_worker(&launch)?;
         Ok(Self {
             child,
             stdin,
-            stdout: BufReader::new(stdout),
+            stdout,
             next_id: 1,
+            launch,
+        })
+    }
+
+    fn restart(&mut self) -> Result<()> {
+        kill_worker_child(&mut self.child);
+        let (child, stdin, stdout) = spawn_python_worker(&self.launch)?;
+        self.child = child;
+        self.stdin = stdin;
+        self.stdout = stdout;
+        Ok(())
+    }
+
+    fn read_response_line(
+        &mut self,
+        request_id: &str,
+        timeout_seconds: Option<f64>,
+        deadline: Option<Instant>,
+    ) -> Result<Option<String>> {
+        let Some(deadline) = deadline else {
+            let mut response = String::new();
+            let bytes = self.stdout.read_line(&mut response)?;
+            if bytes == 0 {
+                bail!("python worker exited before responding");
+            }
+            return Ok(Some(response));
+        };
+
+        let remaining = deadline.saturating_duration_since(Instant::now());
+        if remaining.is_zero() {
+            return Ok(None);
+        }
+
+        let (tx, rx) = mpsc::channel();
+        let child = &mut self.child;
+        let stdout = &mut self.stdout;
+        std::thread::scope(|scope| {
+            scope.spawn(move || {
+                let mut response = String::new();
+                let read = stdout
+                    .read_line(&mut response)
+                    .map(|bytes| (bytes, response));
+                let _ = tx.send(read);
+            });
+
+            match rx.recv_timeout(remaining) {
+                Ok(Ok((0, _))) => bail!("python worker exited before responding"),
+                Ok(Ok((_, response))) => Ok(Some(response)),
+                Ok(Err(err)) => Err(err.into()),
+                Err(mpsc::RecvTimeoutError::Timeout) => {
+                    kill_worker_child(child);
+                    let _ = rx.recv_timeout(Duration::from_secs(5));
+                    Ok(None)
+                }
+                Err(mpsc::RecvTimeoutError::Disconnected) => {
+                    bail!("python worker reader disconnected")
+                }
+            }
+        })
+        .with_context(|| {
+            format!(
+                "read python worker response for {request_id} with timeout {:?}",
+                timeout_seconds
+            )
         })
     }
 
@@ -263,12 +322,33 @@ impl PythonWorker {
         writeln!(self.stdin, "{line}")?;
         self.stdin.flush()?;
 
+        let deadline = timeout_seconds.map(|seconds| {
+            let seconds = seconds.max(0.0);
+            let grace = (seconds * 0.1).clamp(1.0, 2.0);
+            Instant::now() + Duration::from_secs_f64(seconds + grace)
+        });
+
         loop {
-            let mut response = String::new();
-            let bytes = self.stdout.read_line(&mut response)?;
-            if bytes == 0 {
-                bail!("python worker exited before responding");
-            }
+            let Some(response) = self.read_response_line(&request.id, timeout_seconds, deadline)?
+            else {
+                self.restart()?;
+                return Ok(RunPythonResponse {
+                    id: request.id.clone(),
+                    ok: false,
+                    text: String::new(),
+                    error: Some(format!(
+                        "python tool timed out after {} seconds",
+                        timeout_seconds.unwrap_or_default()
+                    )),
+                    data: Value::Null,
+                    outputs: Vec::new(),
+                    artifacts: Vec::new(),
+                    images: Vec::new(),
+                    browser_events: Vec::new(),
+                    browser_harness_available: false,
+                    browser_harness_error: None,
+                });
+            };
             let trimmed = response.trim();
             let value: Value = match serde_json::from_str(trimmed) {
                 Ok(value) => value,
@@ -335,10 +415,63 @@ impl PythonWorker {
     }
 }
 
+fn spawn_python_worker(
+    launch: &PythonWorkerLaunch,
+) -> Result<(Child, ChildStdin, BufReader<ChildStdout>)> {
+    let mut command = Command::new(&launch.program);
+    command
+        .args(&launch.args)
+        .arg("-m")
+        .arg("llm_browser_worker.worker")
+        .env("PYTHONUNBUFFERED", "1")
+        .env("PYTHONPATH", &launch.pythonpath);
+    command.envs(launch.extra_env.iter().cloned());
+    if let Some(browser_mode) = launch
+        .browser_mode
+        .as_deref()
+        .filter(|mode| !mode.trim().is_empty())
+    {
+        command.env("LLM_BROWSER_BROWSER_MODE", browser_mode);
+    }
+    #[cfg(unix)]
+    {
+        command.process_group(0);
+    }
+    let mut child = command
+        .stdin(Stdio::piped())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| {
+            format!(
+                "start python worker via {} with PYTHONPATH={}",
+                launch.program.display(),
+                launch.pythonpath.to_string_lossy()
+            )
+        })?;
+    let stdin = child.stdin.take().context("python worker stdin missing")?;
+    let stdout = child
+        .stdout
+        .take()
+        .context("python worker stdout missing")?;
+    Ok((child, stdin, BufReader::new(stdout)))
+}
+
+fn kill_worker_child(child: &mut Child) {
+    #[cfg(unix)]
+    unsafe {
+        let pid = child.id() as libc::pid_t;
+        if pid > 0 {
+            let _ = libc::kill(-pid, libc::SIGKILL);
+        }
+    }
+    let _ = child.kill();
+    let _ = child.wait();
+}
+
 impl Drop for PythonWorker {
     fn drop(&mut self) {
-        let _ = self.child.kill();
-        let _ = self.child.wait();
+        kill_worker_child(&mut self.child);
     }
 }
 
@@ -411,6 +544,49 @@ mod tests {
         )?;
         assert!(second.ok, "{second:?}");
         assert_eq!(second.data["value"], 7);
+        Ok(())
+    }
+
+    #[test]
+    fn worker_hard_times_out_threadpool_shutdown_hang_and_recovers() -> Result<()> {
+        let repo_root = PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+            .parent()
+            .and_then(Path::parent)
+            .context("repo root")?
+            .to_path_buf();
+        let temp = tempfile::tempdir()?;
+        let mut worker = PythonWorker::start_with_pythonpath("python3", repo_root.join("python"))?;
+
+        let started = Instant::now();
+        let response = worker.run_with_timeout(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import concurrent.futures, time\nwith concurrent.futures.ThreadPoolExecutor(max_workers=1) as executor:\n    executor.submit(time.sleep, 5).result()",
+            Some(0.2),
+        )?;
+        assert!(
+            started.elapsed() < Duration::from_secs(2),
+            "hard timeout should not wait for executor shutdown"
+        );
+        assert!(!response.ok, "{response:?}");
+        assert!(
+            response
+                .error
+                .as_deref()
+                .unwrap_or_default()
+                .contains("timed out"),
+            "{response:?}"
+        );
+
+        let recovered = worker.run(
+            "s1",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "result = {'ok': True}",
+        )?;
+        assert!(recovered.ok, "{recovered:?}");
+        assert_eq!(recovered.data["ok"], true);
         Ok(())
     }
 
