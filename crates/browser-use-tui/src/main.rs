@@ -42,7 +42,7 @@ use composer::Composer;
 use palette::PaletteAction;
 use render::{
     lines_plain_text, main_viewport_height, native_scrollback_lines, render, render_dump,
-    APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
+    session_header_lines, APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
 use runtime::run_agent_thread;
 use settings::{
@@ -2035,7 +2035,8 @@ fn maybe_emit_native_transcript(
     let _model_revision = model.revision;
 
     if !app.native_history.is_active_for(Some(&session_id)) {
-        let lines = transcript::all_terminal_scrollback_lines(&model, width);
+        let mut lines = session_header_lines(app, &state, width);
+        lines.extend(transcript::all_terminal_scrollback_lines(&model, width));
         insert_initial_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session_with_group(session_id, model.last_event_seq, None);

@@ -1032,6 +1032,18 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16) -> Vec<Line<'stati
     lines
 }
 
+/// The Browser Use config card, emitted once at the top of every session
+/// transcript so the model/account/browser context stays visible per session.
+pub(crate) fn session_header_lines(
+    app: &App,
+    state: &WorkbenchState,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let mut lines = config_card_lines(app, state, width as usize);
+    lines.push(Line::from(""));
+    lines
+}
+
 fn config_card_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
     let card_w = width.clamp(32, 94);
     let inner_w = card_w.saturating_sub(2);
