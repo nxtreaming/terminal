@@ -2,6 +2,7 @@ use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
@@ -75,12 +76,40 @@ impl ProviderRunConfig {
 }
 
 #[derive(Clone, Debug)]
+pub struct ChildAgentRunRequest {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+}
+
+#[derive(Clone)]
+pub struct ChildAgentRunner {
+    run: Arc<dyn Fn(ChildAgentRunRequest) -> Result<()> + Send + Sync>,
+}
+
+impl std::fmt::Debug for ChildAgentRunner {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildAgentRunner").finish_non_exhaustive()
+    }
+}
+
+impl ChildAgentRunner {
+    pub fn new(run: impl Fn(ChildAgentRunRequest) -> Result<()> + Send + Sync + 'static) -> Self {
+        Self { run: Arc::new(run) }
+    }
+
+    fn run(&self, request: ChildAgentRunRequest) -> Result<()> {
+        (self.run)(request)
+    }
+}
+
+#[derive(Clone, Debug)]
 pub struct AgentRunOptions {
     pub max_turns: usize,
     pub max_context_chars: usize,
     pub browser_mode: Option<String>,
     pub python_tool_timeout_seconds: u64,
     pub python_env: Vec<(String, String)>,
+    pub child_agent_runner: Option<ChildAgentRunner>,
 }
 
 impl Default for AgentRunOptions {
@@ -91,6 +120,7 @@ impl Default for AgentRunOptions {
             browser_mode: None,
             python_tool_timeout_seconds: 120,
             python_env: Vec::new(),
+            child_agent_runner: None,
         }
     }
 }
@@ -108,6 +138,11 @@ impl AgentRunOptions {
 
     pub fn with_python_env(mut self, env: Vec<(String, String)>) -> Self {
         self.python_env = env;
+        self
+    }
+
+    pub fn with_child_agent_runner(mut self, runner: ChildAgentRunner) -> Self {
+        self.child_agent_runner = Some(runner);
         self
     }
 }
@@ -185,6 +220,21 @@ pub fn run_agent_with_provider<P: ModelProvider>(
     run_loaded_session_with_provider(store, provider, session, messages, options)
 }
 
+pub fn run_agent_from_config(
+    store: &Store,
+    task_text: &str,
+    cwd: impl AsRef<Path>,
+    config: ProviderRunConfig,
+) -> Result<String> {
+    let session = store.create_session(None, cwd.as_ref())?;
+    store.append_event(
+        &session.id,
+        "session.input",
+        serde_json::json!({ "text": task_text }),
+    )?;
+    run_existing_session_from_config(store, &session.id, config)
+}
+
 pub fn run_existing_session_with_provider<P: ModelProvider>(
     store: &Store,
     provider: &P,
@@ -202,8 +252,9 @@ pub fn run_existing_session_with_provider<P: ModelProvider>(
 pub fn run_existing_session_from_config(
     store: &Store,
     session_id: &str,
-    config: ProviderRunConfig,
+    mut config: ProviderRunConfig,
 ) -> Result<String> {
+    install_config_child_agent_runner(store, &mut config);
     match config.backend {
         ProviderBackend::Codex => {
             let provider = codex_provider(store, config.model)?;
@@ -231,6 +282,81 @@ pub fn run_existing_session_from_config(
             run_existing_session_with_provider(store, &provider, session_id, config.options)
         }
         ProviderBackend::None => Ok(session_id.to_string()),
+    }
+}
+
+fn install_config_child_agent_runner(store: &Store, config: &mut ProviderRunConfig) {
+    let mut base_options = config.options.clone();
+    base_options.child_agent_runner = None;
+    config.options.child_agent_runner = Some(config_child_agent_runner(
+        store.state_dir().to_path_buf(),
+        store.notifier(),
+        config.backend,
+        config.model.clone(),
+        config.fake_result.clone(),
+        base_options,
+    ));
+}
+
+fn config_child_agent_runner(
+    state_dir: std::path::PathBuf,
+    notifier: Option<browser_use_store::StoreNotifier>,
+    backend: ProviderBackend,
+    model: String,
+    fake_result: Option<String>,
+    options: AgentRunOptions,
+) -> ChildAgentRunner {
+    ChildAgentRunner::new(move |request| {
+        let store = Store::open_with_optional_notifier(&state_dir, notifier.clone())?;
+        let mut options = options.clone();
+        retarget_managed_child_python_env(&mut options, &request.child_session_id);
+        let config = ProviderRunConfig {
+            backend,
+            model: model.clone(),
+            options,
+            fake_result: fake_result.clone(),
+        };
+        run_existing_session_from_config(&store, &request.child_session_id, config)?;
+        Ok(())
+    })
+}
+
+fn retarget_managed_child_python_env(options: &mut AgentRunOptions, child_session_id: &str) {
+    let has_managed_browser_env = options
+        .python_env
+        .iter()
+        .any(|(key, _)| key == "BU_NAME" || key == "BH_RUNTIME_DIR" || key == "BH_TMP_DIR");
+    if !has_managed_browser_env {
+        return;
+    }
+    let daemon_name = format!("but-tui-{}", safe_agent_env_segment(child_session_id));
+    let runtime_dir = format!("/tmp/{daemon_name}");
+    for (key, value) in &mut options.python_env {
+        match key.as_str() {
+            "BU_NAME" => *value = daemon_name.clone(),
+            "BH_RUNTIME_DIR" | "BH_TMP_DIR" => *value = runtime_dir.clone(),
+            _ => {}
+        }
+    }
+}
+
+fn safe_agent_env_segment(value: &str) -> String {
+    let segment = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
+                ch
+            } else {
+                '-'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('-')
+        .to_string();
+    if segment.is_empty() {
+        "session".to_string()
+    } else {
+        segment
     }
 }
 
@@ -483,8 +609,16 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             )?;
 
             let mut deadline_warning_emitted = false;
+            let mut last_external_session_message_seq =
+                latest_session_message_seq(store, &session.id)?;
             for turn_idx in 0..options.max_turns {
                 ensure_not_cancelled(store, &session.id)?;
+                append_new_external_session_messages(
+                    store,
+                    &session.id,
+                    &mut messages,
+                    &mut last_external_session_message_seq,
+                )?;
                 normalize_provider_messages(&mut messages);
                 maybe_compact_messages(
                     store,
@@ -721,6 +855,33 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                     continue;
                                 }
                             }
+                        }
+                        if let Some(error) = guard_or_close_active_descendants(
+                            store,
+                            &session.id,
+                            &serde_json::json!({}),
+                        )? {
+                            store.append_event(
+                                &session.id,
+                                "tool.failed",
+                                serde_json::json!({
+                                    "name": "done",
+                                    "source": "assistant_text_active_subagents",
+                                    "error": error,
+                                }),
+                            )?;
+                            messages.push(serde_json::json!({
+                                "role": "user",
+                                "content": error,
+                            }));
+                            maybe_compact_messages(
+                                store,
+                                &session.id,
+                                &mut messages,
+                                options.max_context_chars,
+                            )?;
+                            step_span.set_ok();
+                            continue;
                         }
                         store.append_event(
                             &session.id,
@@ -1603,6 +1764,58 @@ fn render_prompt_template(template: &str, replacements: &[(&str, &str)]) -> Stri
         rendered = rendered.replace(placeholder, value);
     }
     rendered
+}
+
+fn latest_session_message_seq(store: &Store, session_id: &str) -> Result<i64> {
+    Ok(store
+        .events_for_session(session_id)?
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup"
+            )
+        })
+        .map(|event| event.seq)
+        .max()
+        .unwrap_or(0))
+}
+
+fn append_new_external_session_messages(
+    store: &Store,
+    session_id: &str,
+    messages: &mut Vec<Value>,
+    last_seq: &mut i64,
+) -> Result<()> {
+    let mut events = store
+        .events_for_session(session_id)?
+        .into_iter()
+        .filter(|event| {
+            event.seq > *last_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| event.seq);
+    for event in events {
+        *last_seq = (*last_seq).max(event.seq);
+        let Some(text) = event
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|text| !text.is_empty())
+        else {
+            continue;
+        };
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": text,
+        }));
+    }
+    Ok(())
 }
 
 fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -> Vec<Value> {
@@ -2737,6 +2950,9 @@ fn dispatch_done_tool(
             "done requires a non-empty result, or use_final_answer=true after python set_final_answer(...)",
         );
     }
+    if let Some(error) = guard_or_close_active_descendants(store, &session.id, &call.arguments)? {
+        return dispatch_tool_validation_error(store, session, call, &error);
+    }
     let use_final_answer = explicit_use_final_answer || should_auto_use_final_answer;
     let final_answer_summary = final_answer
         .as_ref()
@@ -2821,6 +3037,84 @@ fn dispatch_done_tool(
         finished: true,
         messages: Vec::new(),
     })
+}
+
+fn guard_or_close_active_descendants(
+    store: &Store,
+    session_id: &str,
+    arguments: &Value,
+) -> Result<Option<String>> {
+    let active = active_descendant_agents(store, session_id)?;
+    if active.is_empty() {
+        return Ok(None);
+    }
+    if arguments
+        .get("finish_and_close_children")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        close_direct_active_child_subtrees(store, session_id)?;
+        return Ok(None);
+    }
+    let names = active
+        .iter()
+        .map(|agent| {
+            agent
+                .agent_path
+                .clone()
+                .unwrap_or_else(|| agent.child_session_id.clone())
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    Ok(Some(format!(
+        "done cannot finish while subagents are still active: {names}. Call wait_agent, close_agent, or pass finish_and_close_children=true."
+    )))
+}
+
+fn active_descendant_agents(store: &Store, session_id: &str) -> Result<Vec<AgentSummary>> {
+    let mut active = Vec::new();
+    collect_active_descendant_agents(store, session_id, &mut active)?;
+    Ok(active)
+}
+
+fn collect_active_descendant_agents(
+    store: &Store,
+    session_id: &str,
+    active: &mut Vec<AgentSummary>,
+) -> Result<()> {
+    for agent in store.list_child_agents(session_id)? {
+        let child_is_active = store
+            .load_session(&agent.child_session_id)?
+            .is_some_and(|session| session.status.is_active());
+        if child_is_active && agent.status != "closed" {
+            active.push(agent.clone());
+        }
+        collect_active_descendant_agents(store, &agent.child_session_id, active)?;
+    }
+    Ok(())
+}
+
+fn close_direct_active_child_subtrees(store: &Store, session_id: &str) -> Result<()> {
+    for agent in store.list_child_agents(session_id)? {
+        let mut subtree_active = Vec::new();
+        collect_active_descendant_agents(store, &agent.child_session_id, &mut subtree_active)?;
+        let child_is_active = store
+            .load_session(&agent.child_session_id)?
+            .is_some_and(|session| session.status.is_active());
+        if child_is_active || !subtree_active.is_empty() {
+            store.close_child_agent(&agent.child_session_id, "parent finished task")?;
+            store.append_event(
+                session_id,
+                "agent.cancelled",
+                serde_json::json!({
+                    "child_session_id": agent.child_session_id,
+                    "status": "cancelled",
+                    "payload": { "reason": "parent finished task" },
+                }),
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn persisted_final_answer(session: &browser_use_protocol::SessionMeta) -> Result<Option<Value>> {
@@ -3195,6 +3489,12 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "fork_mode": fork_mode,
         }),
     )?;
+    let async_status = if let Some(runner) = options.child_agent_runner.clone() {
+        start_child_agent_background(store, &session.id, &child.id, runner)?;
+        Some("running")
+    } else {
+        None
+    };
     store.append_event(
         &session.id,
         "tool.finished",
@@ -3203,10 +3503,21 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "tool_call_id": call.id,
         }),
     )?;
-    let run_error = run_existing_session_with_provider(store, provider, &child.id, options.clone())
-        .err()
-        .map(|error| format!("{error:#}"));
-    let child_result = update_parent_from_child_run(store, &session.id, &child.id, run_error)?;
+    let child_result = if let Some(status) = async_status {
+        serde_json::json!({
+            "child_session_id": child.id,
+            "status": status,
+            "result": Value::Null,
+            "failure": Value::Null,
+            "background": true,
+        })
+    } else {
+        let run_error =
+            run_existing_session_with_provider(store, provider, &child.id, options.clone())
+                .err()
+                .map(|error| format!("{error:#}"));
+        update_parent_from_child_run(store, &session.id, &child.id, run_error)?
+    };
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
@@ -3265,6 +3576,39 @@ fn update_parent_from_child_run(
         }),
     )?;
     Ok(payload)
+}
+
+fn start_child_agent_background(
+    store: &Store,
+    parent_id: &str,
+    child_id: &str,
+    runner: ChildAgentRunner,
+) -> Result<()> {
+    let state_dir = store.state_dir().to_path_buf();
+    let notifier = store.notifier();
+    let parent_id = parent_id.to_string();
+    let child_id = child_id.to_string();
+    thread::Builder::new()
+        .name(format!("browser-use-child-agent-{child_id}"))
+        .spawn(move || {
+            let run_error = runner
+                .run(ChildAgentRunRequest {
+                    parent_session_id: parent_id.clone(),
+                    child_session_id: child_id.clone(),
+                })
+                .err()
+                .map(|error| format!("{error:#}"));
+            match Store::open_with_optional_notifier(&state_dir, notifier) {
+                Ok(store) => {
+                    let _ = update_parent_from_child_run(&store, &parent_id, &child_id, run_error);
+                }
+                Err(error) => {
+                    eprintln!("failed to open store for child agent completion: {error:#}");
+                }
+            }
+        })
+        .context("spawn child agent thread")?;
+    Ok(())
 }
 
 fn inherited_context_for_spawn(
@@ -3457,29 +3801,31 @@ fn dispatch_wait_agent_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    let Some(child_ref) = call
+    let child_ref = call
         .arguments
         .get("target")
         .or_else(|| call.arguments.get("child_session_id"))
         .and_then(Value::as_str)
-    else {
-        return dispatch_tool_validation_error(store, session, call, "wait_agent requires target");
+        .map(str::trim)
+        .filter(|target| !target.is_empty());
+    let watched_agents = if let Some(child_ref) = child_ref {
+        let Some(child_summary) = resolve_child_agent(store, &session.id, child_ref)? else {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                "wait_agent can only inspect children of the current session",
+            );
+        };
+        vec![child_summary]
+    } else {
+        store.list_child_agents(&session.id)?
     };
-    let Some(child_summary) = resolve_child_agent(store, &session.id, child_ref)? else {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            "wait_agent can only inspect children of the current session",
-        );
-    };
-    let child_session_id = child_summary.child_session_id.clone();
-    let agent_path = child_summary.agent_path.clone();
     let timeout_ms = call
         .arguments
         .get("timeout_ms")
         .and_then(Value::as_u64)
-        .unwrap_or(0)
+        .unwrap_or(300_000)
         .min(300_000);
     store.append_event(
         &session.id,
@@ -3490,34 +3836,57 @@ fn dispatch_wait_agent_tool(
             "arguments": call.arguments,
         }),
     )?;
+    store.append_event(
+        &session.id,
+        "agent.wait.started",
+        serde_json::json!({
+            "tool_call_id": call.id,
+            "target": child_ref,
+            "targets": watched_agents.iter().map(|agent| {
+                serde_json::json!({
+                    "child_session_id": agent.child_session_id,
+                    "task_name": agent.agent_path,
+                    "nickname": agent.agent_nickname,
+                    "role": agent.agent_role,
+                })
+            }).collect::<Vec<_>>(),
+            "timeout_ms": timeout_ms,
+        }),
+    )?;
     let started = Instant::now();
     let timeout = Duration::from_millis(timeout_ms);
-    let (child, timed_out) = loop {
-        let child = store
-            .load_session(&child_session_id)?
-            .with_context(|| format!("unknown child session id: {child_session_id}"))?;
-        if timeout_ms == 0 || !child.status.is_active() {
-            break (child, false);
+    let timed_out = loop {
+        let active_count = count_active_watched_agents(store, &watched_agents)?;
+        let wait_condition_met = if child_ref.is_some() {
+            active_count == 0
+        } else {
+            active_count < watched_agents.len()
+        };
+        if timeout_ms == 0 || wait_condition_met || watched_agents.is_empty() {
+            break false;
         }
         if started.elapsed() >= timeout {
-            break (child, true);
+            break true;
         }
         thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())));
     };
-    let child_events = store.events_for_session(&child_session_id)?;
-    let mut messages = Vec::new();
-    for message in store.messages_for_agent(&child_session_id)? {
-        messages.push(serde_json::json!({
-            "id": message.id,
-            "author_session_id": message.author_session_id,
-            "target_session_id": message.target_session_id,
-            "author_path": display_agent_path_for_session(store, &message.author_session_id)?,
-            "recipient_path": display_agent_path_for_session(store, &message.target_session_id)?,
-            "content": message.content,
-            "trigger_turn": message.trigger_turn,
-            "created_ms": message.created_ms,
-        }));
-    }
+    let waited_ms = started.elapsed().as_millis() as u64;
+    let agents = watched_agents
+        .iter()
+        .map(|agent| agent_status_payload(store, agent))
+        .collect::<Result<Vec<_>>>()?;
+    let active_count = count_active_watched_agents(store, &watched_agents)?;
+    store.append_event(
+        &session.id,
+        "agent.wait.finished",
+        serde_json::json!({
+            "tool_call_id": call.id,
+            "target": child_ref,
+            "timed_out": timed_out,
+            "waited_ms": waited_ms,
+            "active_count": active_count,
+        }),
+    )?;
     store.append_event(
         &session.id,
         "tool.finished",
@@ -3533,17 +3902,86 @@ fn dispatch_wait_agent_tool(
             session,
             call,
             "wait_agent",
-            serde_json::json!({
-                "child_session_id": child_session_id,
-                "task_name": agent_path,
-                "status": child.status.as_str(),
-                "result": result_from_events(&child_events),
-                "failure": failure_from_events(&child_events),
-                "timed_out": timed_out,
-                "messages": messages,
-            }),
+            wait_agent_response_payload(child_ref, agents, timed_out, waited_ms),
         )?],
     })
+}
+
+fn count_active_watched_agents(store: &Store, agents: &[AgentSummary]) -> Result<usize> {
+    let mut active = 0;
+    for agent in agents {
+        if store
+            .load_session(&agent.child_session_id)?
+            .is_some_and(|session| session.status.is_active())
+        {
+            active += 1;
+        }
+    }
+    Ok(active)
+}
+
+fn wait_agent_response_payload(
+    child_ref: Option<&str>,
+    agents: Vec<Value>,
+    timed_out: bool,
+    waited_ms: u64,
+) -> Value {
+    let mut payload = serde_json::json!({
+        "timed_out": timed_out,
+        "waited_ms": waited_ms,
+        "agents": agents,
+    });
+    if child_ref.is_some() {
+        if let Some(agent) = payload
+            .get("agents")
+            .and_then(Value::as_array)
+            .and_then(|agents| agents.first())
+            .cloned()
+        {
+            payload["child_session_id"] = agent
+                .get("child_session_id")
+                .cloned()
+                .unwrap_or(Value::Null);
+            payload["task_name"] = agent.get("task_name").cloned().unwrap_or(Value::Null);
+            payload["status"] = agent.get("status").cloned().unwrap_or(Value::Null);
+            payload["result"] = agent.get("result").cloned().unwrap_or(Value::Null);
+            payload["failure"] = agent.get("failure").cloned().unwrap_or(Value::Null);
+            payload["messages"] = agent.get("messages").cloned().unwrap_or(Value::Null);
+        }
+    }
+    payload
+}
+
+fn agent_status_payload(store: &Store, agent: &AgentSummary) -> Result<Value> {
+    let child = store
+        .load_session(&agent.child_session_id)?
+        .with_context(|| format!("unknown child session id: {}", agent.child_session_id))?;
+    let child_events = store.events_for_session(&agent.child_session_id)?;
+    let mut messages = Vec::new();
+    for message in store.messages_for_agent(&agent.child_session_id)? {
+        messages.push(serde_json::json!({
+            "id": message.id,
+            "author_session_id": message.author_session_id,
+            "target_session_id": message.target_session_id,
+            "author_path": display_agent_path_for_session(store, &message.author_session_id)?,
+            "recipient_path": display_agent_path_for_session(store, &message.target_session_id)?,
+            "content": message.content,
+            "trigger_turn": message.trigger_turn,
+            "created_ms": message.created_ms,
+        }));
+    }
+    Ok(serde_json::json!({
+        "child_session_id": agent.child_session_id,
+        "task_name": agent.agent_path,
+        "nickname": agent.agent_nickname,
+        "role": agent.agent_role,
+        "edge_status": agent.status,
+        "status": child.status.as_str(),
+        "result": result_from_events(&child_events),
+        "failure": failure_from_events(&child_events),
+        "messages": messages,
+        "updated_ms": child.updated_ms,
+    }))
 }
 
 fn dispatch_agent_message_tool<P: ModelProvider>(
@@ -3606,6 +4044,7 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
         .load_session(&child_session_id)?
         .with_context(|| format!("unknown child session id: {child_session_id}"))?;
     debug_assert_eq!(child.parent_id.as_deref(), Some(session.id.as_str()));
+    let child_was_active = child.status.is_active();
     let mail = store.send_agent_message(&session.id, &child_session_id, message, trigger_turn)?;
     let author_path = display_agent_path_for_session(store, &session.id)?;
     let recipient_path = match agent_path.clone() {
@@ -3642,16 +4081,33 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
         }),
     )?;
     let child_result = if trigger_turn {
-        let run_error =
-            run_existing_session_with_provider(store, provider, &child_session_id, options.clone())
-                .err()
-                .map(|error| format!("{error:#}"));
-        Some(update_parent_from_child_run(
-            store,
-            &session.id,
-            &child_session_id,
-            run_error,
-        )?)
+        if let Some(runner) = options.child_agent_runner.clone() {
+            if !child_was_active {
+                start_child_agent_background(store, &session.id, &child_session_id, runner)?;
+            }
+            Some(serde_json::json!({
+                "child_session_id": child_session_id,
+                "status": "running",
+                "result": Value::Null,
+                "failure": Value::Null,
+                "background": true,
+            }))
+        } else {
+            let run_error = run_existing_session_with_provider(
+                store,
+                provider,
+                &child_session_id,
+                options.clone(),
+            )
+            .err()
+            .map(|error| format!("{error:#}"));
+            Some(update_parent_from_child_run(
+                store,
+                &session.id,
+                &child_session_id,
+                run_error,
+            )?)
+        }
     } else {
         None
     };
@@ -5135,6 +5591,7 @@ mod tests {
                 browser_mode: None,
                 python_tool_timeout_seconds: 120,
                 python_env: Vec::new(),
+                child_agent_runner: None,
             },
         )?;
         let events = store.events_for_session(&session_id)?;
@@ -5709,6 +6166,7 @@ mod tests {
                 browser_mode: None,
                 python_tool_timeout_seconds: 120,
                 python_env: Vec::new(),
+                child_agent_runner: None,
             },
         )?;
         let events = store.events_for_session(&session_id)?;
@@ -5819,6 +6277,7 @@ mod tests {
                 browser_mode: None,
                 python_tool_timeout_seconds: 120,
                 python_env: Vec::new(),
+                child_agent_runner: None,
             },
         )?;
         let events = store.events_for_session(&session_id)?;
@@ -5933,6 +6392,271 @@ mod tests {
         assert!(mailbox[1].trigger_turn);
         assert!(mailbox[2].trigger_turn);
         Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_with_child_runner_returns_before_child_finishes_and_wait_blocks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            let store = Store::open(&state_dir)?;
+            std::thread::sleep(Duration::from_millis(120));
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "repo mapped"}),
+            )?;
+            Ok(())
+        });
+        let provider = BlockingExplorerParentProvider::default();
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "understand this repo",
+            temp.path(),
+            AgentRunOptions::default().with_child_agent_runner(runner),
+        )?;
+        let parent_events = store.events_for_session(&session_id)?;
+        let spawn_finished_seq = parent_events
+            .iter()
+            .find(|event| {
+                event.event_type == "tool.finished" && event.payload["name"] == "spawn_agent"
+            })
+            .map(|event| event.seq)
+            .context("spawn_agent finished event")?;
+        let completed_seq = parent_events
+            .iter()
+            .find(|event| event.event_type == "agent.completed")
+            .map(|event| event.seq)
+            .context("agent.completed event")?;
+        assert!(spawn_finished_seq < completed_seq);
+        assert!(parent_events.iter().any(|event| {
+            event.event_type == "agent.wait.started" && event.payload["target"] == "repo_explorer"
+        }));
+        assert!(parent_events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "parent used child"
+        }));
+        let children = store.list_child_agents(&session_id)?;
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].status, "done");
+        Ok(())
+    }
+
+    #[test]
+    fn done_rejects_active_child_agents_unless_explicitly_closing_them() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/repo_explorer"),
+            Some("repo_explorer"),
+            Some("explorer"),
+        )?;
+        store.append_event(
+            &child.id,
+            "session.input",
+            serde_json::json!({"text": "still running"}),
+        )?;
+        let rejected = dispatch_done_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "done_blocked".to_string(),
+                name: "done".to_string(),
+                arguments: serde_json::json!({"result": "parent result"}),
+            },
+        )?;
+        assert!(!rejected.finished);
+        let content = rejected.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        assert!(content.contains("subagents are still active"));
+        assert_eq!(
+            store.load_session(&parent.id)?.expect("parent").status,
+            SessionStatus::Created
+        );
+
+        let closed = dispatch_done_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "done_close_children".to_string(),
+                name: "done".to_string(),
+                arguments: serde_json::json!({
+                    "result": "parent result",
+                    "finish_and_close_children": true,
+                }),
+            },
+        )?;
+        assert!(closed.finished);
+        assert_eq!(
+            store.load_session(&parent.id)?.expect("parent").status,
+            SessionStatus::Done
+        );
+        assert_eq!(
+            store.load_session(&child.id)?.expect("child").status,
+            SessionStatus::Cancelled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_without_target_reports_all_direct_children() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let running = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/running_child"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "still running"}),
+        )?;
+        let done = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/done_child"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &done.id,
+            "session.done",
+            serde_json::json!({"result": "done child result"}),
+        )?;
+        store.set_child_agent_status(&done.id, "done")?;
+
+        let outcome = dispatch_wait_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_all".to_string(),
+                name: "wait_agent".to_string(),
+                arguments: serde_json::json!({"timeout_ms": 0}),
+            },
+        )?;
+        let content = outcome.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        let data: Value = serde_json::from_str(content)?;
+        assert_eq!(data["agents"].as_array().context("agents")?.len(), 2);
+        assert!(data["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["status"] == "running"));
+        assert!(data["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["result"] == "done child result"));
+        Ok(())
+    }
+
+    #[test]
+    fn wait_agent_without_target_wakes_when_any_child_finishes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let first = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/first_child"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &first.id,
+            "session.input",
+            serde_json::json!({"text": "first running"}),
+        )?;
+        let second = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/second_child"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &second.id,
+            "session.input",
+            serde_json::json!({"text": "second running"}),
+        )?;
+        let state_dir = store.state_dir().to_path_buf();
+        let second_id = second.id.clone();
+        std::thread::spawn(move || {
+            std::thread::sleep(Duration::from_millis(80));
+            let store = Store::open(&state_dir).expect("open store");
+            store
+                .append_event(
+                    &second_id,
+                    "session.done",
+                    serde_json::json!({"result": "second finished"}),
+                )
+                .expect("finish child");
+            store
+                .set_child_agent_status(&second_id, "done")
+                .expect("update edge");
+        });
+
+        let outcome = dispatch_wait_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "wait_any".to_string(),
+                name: "wait_agent".to_string(),
+                arguments: serde_json::json!({"timeout_ms": 5_000}),
+            },
+        )?;
+        let content = outcome.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        let data: Value = serde_json::from_str(content)?;
+        assert_eq!(data["timed_out"], false);
+        assert!(data["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["result"] == "second finished"));
+        assert!(data["agents"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|agent| agent["status"] == "running"));
+        Ok(())
+    }
+
+    #[test]
+    fn child_runner_retargets_managed_python_env_to_child_session() {
+        let mut options = AgentRunOptions::default().with_python_env(vec![
+            ("BU_NAME".to_string(), "but-tui-parent".to_string()),
+            (
+                "BH_RUNTIME_DIR".to_string(),
+                "/tmp/but-tui-parent".to_string(),
+            ),
+            ("BH_TMP_DIR".to_string(), "/tmp/but-tui-parent".to_string()),
+            ("UNCHANGED".to_string(), "1".to_string()),
+        ]);
+        retarget_managed_child_python_env(&mut options, "child/123");
+        let value = |key: &str| {
+            options
+                .python_env
+                .iter()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value.as_str())
+        };
+        assert_eq!(value("BU_NAME"), Some("but-tui-child-123"));
+        assert_eq!(value("BH_RUNTIME_DIR"), Some("/tmp/but-tui-child-123"));
+        assert_eq!(value("BH_TMP_DIR"), Some("/tmp/but-tui-child-123"));
+        assert_eq!(value("UNCHANGED"), Some("1"));
     }
 
     #[test]
@@ -6500,6 +7224,71 @@ mod tests {
                 .get("task_name")
                 .and_then(Value::as_str)
                 .map(ToOwned::to_owned)
+        })
+    }
+
+    #[derive(Default)]
+    struct BlockingExplorerParentProvider {
+        step: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for BlockingExplorerParentProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let event = match *step {
+                0 => ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "spawn_blocking_explorer".to_string(),
+                        name: "spawn_agent".to_string(),
+                        arguments: serde_json::json!({
+                            "message": "map the repository",
+                            "task_name": "repo_explorer",
+                            "agent_type": "explorer",
+                        }),
+                    },
+                },
+                1 => {
+                    let spawn = tool_response_json(&turn, "spawn_agent")
+                        .context("spawn_agent tool response")?;
+                    assert_eq!(spawn["status"], "running");
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "wait_blocking_explorer".to_string(),
+                            name: "wait_agent".to_string(),
+                            arguments: serde_json::json!({
+                                "target": "repo_explorer",
+                                "timeout_ms": 5_000,
+                            }),
+                        },
+                    }
+                }
+                2 => {
+                    let wait =
+                        tool_response_json(&turn, "wait_agent").context("wait_agent response")?;
+                    assert_eq!(wait["status"], "done");
+                    assert_eq!(wait["result"], "repo mapped");
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "done_after_blocking_explorer".to_string(),
+                            name: "done".to_string(),
+                            arguments: serde_json::json!({"result": "parent used child"}),
+                        },
+                    }
+                }
+                _ => ModelEvent::Done,
+            };
+            *step += 1;
+            Ok(vec![event, ModelEvent::Done])
+        }
+    }
+
+    fn tool_response_json(turn: &ProviderTurn, name: &str) -> Option<Value> {
+        turn.messages.iter().rev().find_map(|message| {
+            if message.get("name").and_then(Value::as_str) != Some(name) {
+                return None;
+            }
+            let content = message.get("content").and_then(Value::as_str)?;
+            serde_json::from_str(content).ok()
         })
     }
 
