@@ -1,6 +1,12 @@
 use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
-use ratatui::style::Style;
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
+use std::sync::OnceLock;
+use syntect::easy::HighlightLines;
+use syntect::highlighting::{FontStyle, Style as SyntectStyle, Theme};
+use syntect::parsing::{SyntaxReference, SyntaxSet};
+use syntect::util::LinesWithEndings;
+use two_face::theme::EmbeddedThemeName;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::{
@@ -50,6 +56,8 @@ struct MarkdownWriter {
     pending_prefix: Option<Vec<Span<'static>>>,
     quote_depth: usize,
     in_code_block: bool,
+    code_block_lang: Option<String>,
+    code_block_buffer: String,
     needs_blank: bool,
     width: usize,
 }
@@ -66,6 +74,8 @@ impl MarkdownWriter {
             pending_prefix: None,
             quote_depth: 0,
             in_code_block: false,
+            code_block_lang: None,
+            code_block_buffer: String::new(),
             needs_blank: false,
             width: width.max(24),
         }
@@ -158,12 +168,8 @@ impl MarkdownWriter {
                 if !self.lines.is_empty() && !self.last_line_is_blank() {
                     self.push_blank();
                 }
-                let _language = match kind {
-                    CodeBlockKind::Fenced(language) if !language.is_empty() => {
-                        Some(language.to_string())
-                    }
-                    _ => None,
-                };
+                self.code_block_lang = code_block_language(kind);
+                self.code_block_buffer.clear();
                 self.in_code_block = true;
                 self.needs_blank = false;
             }
@@ -247,7 +253,9 @@ impl MarkdownWriter {
                 self.needs_blank = true;
             }
             TagEnd::CodeBlock => {
+                self.flush_code_block();
                 self.in_code_block = false;
+                self.code_block_lang = None;
                 self.needs_blank = true;
             }
             TagEnd::List(_) => {
@@ -298,11 +306,21 @@ impl MarkdownWriter {
     }
 
     fn push_code_text(&mut self, text: &str) {
-        for part in text.split_inclusive('\n') {
-            let line = part.trim_end_matches(['\n', '\r']).to_string();
-            self.lines
-                .push(Line::from(Span::styled(line, markdown_code_block())));
+        self.code_block_buffer.push_str(text);
+    }
+
+    fn flush_code_block(&mut self) {
+        let code = std::mem::take(&mut self.code_block_buffer);
+        if code.is_empty() {
+            return;
         }
+        if let Some(lang) = self.code_block_lang.as_deref() {
+            if let Some(lines) = highlight_code_to_lines(&code, lang) {
+                self.lines.extend(lines);
+                return;
+            }
+        }
+        self.lines.extend(plain_code_lines(&code));
     }
 
     fn ensure_prefix(&mut self) {
@@ -783,6 +801,100 @@ fn looks_like_path(value: &str) -> bool {
     value.starts_with('/') || value.starts_with("~/") || value.starts_with("./")
 }
 
+fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
+    match kind {
+        CodeBlockKind::Fenced(language) => language
+            .split([',', ' ', '\t'])
+            .next()
+            .map(str::trim)
+            .filter(|language| !language.is_empty())
+            .map(ToOwned::to_owned),
+        CodeBlockKind::Indented => None,
+    }
+}
+
+fn plain_code_lines(code: &str) -> Vec<Line<'static>> {
+    code.lines()
+        .map(|line| Line::from(Span::styled(line.to_string(), markdown_code_block())))
+        .collect()
+}
+
+const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
+const MAX_HIGHLIGHT_LINES: usize = 10_000;
+
+fn highlight_code_to_lines(code: &str, lang: &str) -> Option<Vec<Line<'static>>> {
+    if code.len() > MAX_HIGHLIGHT_BYTES || code.lines().count() > MAX_HIGHLIGHT_LINES {
+        return None;
+    }
+    let syntax = find_syntax(lang)?;
+    let mut highlighter = HighlightLines::new(syntax, syntax_theme());
+    let mut lines = Vec::new();
+
+    for line in LinesWithEndings::from(code) {
+        let ranges = highlighter.highlight_line(line, syntax_set()).ok()?;
+        let mut spans = Vec::new();
+        for (style, text) in ranges {
+            let text = text.trim_end_matches(['\n', '\r']);
+            if !text.is_empty() {
+                spans.push(Span::styled(text.to_string(), convert_syntect_style(style)));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    (!lines.is_empty()).then_some(lines)
+}
+
+fn syntax_set() -> &'static SyntaxSet {
+    static SYNTAX_SET: OnceLock<SyntaxSet> = OnceLock::new();
+    SYNTAX_SET.get_or_init(two_face::syntax::extra_newlines)
+}
+
+fn syntax_theme() -> &'static Theme {
+    static THEME: OnceLock<Theme> = OnceLock::new();
+    THEME.get_or_init(|| {
+        two_face::theme::extra()
+            .get(EmbeddedThemeName::CatppuccinMocha)
+            .clone()
+    })
+}
+
+fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
+    let syntax_set = syntax_set();
+    let patched = match lang {
+        "csharp" | "c-sharp" => "c#",
+        "golang" => "go",
+        "python3" => "python",
+        "shell" | "sh" | "zsh" => "bash",
+        _ => lang,
+    };
+
+    syntax_set
+        .find_syntax_by_token(patched)
+        .or_else(|| syntax_set.find_syntax_by_name(patched))
+        .or_else(|| {
+            let lower = patched.to_ascii_lowercase();
+            syntax_set
+                .syntaxes()
+                .iter()
+                .find(|syntax| syntax.name.to_ascii_lowercase() == lower)
+        })
+        .or_else(|| syntax_set.find_syntax_by_extension(lang))
+}
+
+fn convert_syntect_style(style: SyntectStyle) -> Style {
+    let mut converted = markdown_code_block().fg(Color::Rgb(
+        style.foreground.r,
+        style.foreground.g,
+        style.foreground.b,
+    ));
+
+    if style.font_style.contains(FontStyle::BOLD) {
+        converted = converted.add_modifier(Modifier::BOLD);
+    }
+    converted
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -816,6 +928,40 @@ mod tests {
         assert!(text.contains("cargo test"));
         assert!(!text.contains("code bash"));
         assert!(!text.contains("```"));
+    }
+
+    #[test]
+    fn known_code_fences_are_syntax_highlighted() {
+        let lines =
+            render_markdown_lines("```rust\nfn main() {\n    let url = \"x\";\n}\n```\n", 80);
+        let text = plain(&lines);
+        assert!(text.contains("fn main()"));
+        assert!(lines.iter().any(|line| {
+            line.spans.iter().any(|span| {
+                span.content == "fn"
+                    && span
+                        .style
+                        .fg
+                        .is_some_and(|color| color != crate::theme::text())
+            })
+        }));
+        let colors = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().filter_map(|span| span.style.fg))
+            .collect::<Vec<_>>();
+        assert!(colors
+            .first()
+            .is_some_and(|first| colors.iter().any(|color| color != first)));
+    }
+
+    #[test]
+    fn unknown_code_fences_fall_back_to_plain_code_style() {
+        let lines = render_markdown_lines("```not-a-real-language\nhello\n```\n", 80);
+        assert_eq!(plain(&lines), "hello");
+        assert!(lines[0]
+            .spans
+            .iter()
+            .all(|span| span.style.fg == markdown_code_block().fg));
     }
 
     #[test]

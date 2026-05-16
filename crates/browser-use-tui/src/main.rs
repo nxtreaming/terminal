@@ -33,19 +33,19 @@ mod composer;
 mod markdown;
 mod palette;
 mod render;
+mod renderer_v2;
 mod runtime;
 mod settings;
 mod theme;
 
 use composer::Composer;
 use palette::PaletteAction;
-#[cfg(test)]
-use render::native_scrollback_event_lines;
 use render::{
-    lines_plain_text, main_viewport_height, native_scrollback_chronological_event_lines,
-    native_scrollback_lines, render, render_dump, APP_HORIZONTAL_MARGIN,
-    NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
+    lines_plain_text, main_viewport_height, native_scrollback_lines, render, render_dump,
+    APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
+#[cfg(test)]
+use render::{native_scrollback_chronological_event_lines, native_scrollback_event_lines};
 use runtime::run_agent_thread;
 use settings::{
     is_claude_code_account, provider_model_for_display, AgentBackend, ACCOUNT_ANTHROPIC,
@@ -1709,8 +1709,14 @@ fn print_native_transcript(app: &mut App) -> Result<()> {
     let width = crossterm::terminal::size()
         .map(|(width, _)| width)
         .unwrap_or(app.args.width);
-    let lines = native_scrollback_lines(app, width)?;
-    print!("{}", lines_plain_text(&lines));
+    app.drain_store_notifications()?;
+    let state = app.workbench_state()?;
+    if let Some(model) = renderer_v2::transcript_model(app, &state) {
+        print!("{}", renderer_v2::model_plain_text(&model));
+    } else {
+        let lines = native_scrollback_lines(app, width)?;
+        print!("{}", lines_plain_text(&lines));
+    }
     io::stdout().flush()?;
     Ok(())
 }
@@ -1730,7 +1736,7 @@ fn run_terminal(mut app: App) -> Result<()> {
                 | KeyboardEnhancementFlags::REPORT_ALTERNATE_KEYS
         )
     )?;
-    let mut terminal = new_inline_terminal(viewport_height)?;
+    let mut terminal_driver = TerminalDriver::new(viewport_height)?;
     let result = (|| -> Result<()> {
         let mut draw_needed = true;
         let mut last_fallback_refresh = Instant::now();
@@ -1743,20 +1749,14 @@ fn run_terminal(mut app: App) -> Result<()> {
             }
             if let Some(resize_at) = pending_resize_at {
                 if resize_at.elapsed() >= RESIZE_DEBOUNCE_INTERVAL {
-                    settle_terminal_resize(&mut terminal, &mut app)?;
+                    terminal_driver.settle_resize(&mut app)?;
                     pending_resize_at = None;
                     draw_needed = true;
                 }
             }
             if pending_resize_at.is_none() && draw_needed {
-                let desired_height = desired_terminal_viewport_height(&mut app)?;
-                if desired_height != viewport_height {
-                    reset_terminal_screen(terminal.backend_mut(), ClearType::Purge)?;
-                    terminal = new_inline_terminal(desired_height)?;
-                    viewport_height = desired_height;
-                    app.native_history.reset();
-                }
-                draw_terminal_frame(&mut terminal, &mut app)?;
+                viewport_height = terminal_driver.resize_if_needed(&mut app, viewport_height)?;
+                terminal_driver.draw(&mut app)?;
                 draw_needed = false;
             }
             let poll_interval = pending_resize_at
@@ -1774,18 +1774,61 @@ fn run_terminal(mut app: App) -> Result<()> {
                 pending_resize_at = Some(Instant::now());
                 continue;
             }
-            if handle_terminal_event(event, &mut app, &mut terminal)? {
+            if handle_terminal_event(event, &mut app, &mut terminal_driver)? {
                 break Ok(());
             }
             draw_needed = true;
         }
     })();
-    let restore_result = restore_terminal(terminal.backend_mut());
-    let cursor_result = terminal.show_cursor();
+    let restore_result = terminal_driver.restore_terminal_state();
+    let cursor_result = terminal_driver.show_cursor();
     restore_result?;
     cursor_result?;
     result?;
     Ok(())
+}
+
+struct TerminalDriver {
+    terminal: Terminal<CrosstermBackend<io::Stdout>>,
+}
+
+impl TerminalDriver {
+    fn new(height: u16) -> Result<Self> {
+        Ok(Self {
+            terminal: new_inline_terminal(height)?,
+        })
+    }
+
+    fn resize_if_needed(&mut self, app: &mut App, current_height: u16) -> Result<u16> {
+        let desired_height = desired_terminal_viewport_height(app)?;
+        if desired_height == current_height {
+            return Ok(current_height);
+        }
+        reset_terminal_screen(self.terminal.backend_mut(), ClearType::Purge)?;
+        self.terminal = new_inline_terminal(desired_height)?;
+        app.native_history.reset();
+        Ok(desired_height)
+    }
+
+    fn settle_resize(&mut self, app: &mut App) -> Result<()> {
+        reset_inline_terminal_after_resize(&mut self.terminal)?;
+        app.native_history.reset();
+        Ok(())
+    }
+
+    fn draw(&mut self, app: &mut App) -> Result<()> {
+        maybe_emit_v2_transcript(&mut self.terminal, app)?;
+        self.terminal.draw(|frame| render(frame, app))?;
+        Ok(())
+    }
+
+    fn restore_terminal_state(&mut self) -> Result<()> {
+        restore_terminal(self.terminal.backend_mut())
+    }
+
+    fn show_cursor(&mut self) -> io::Result<()> {
+        self.terminal.show_cursor()
+    }
 }
 
 fn new_inline_terminal(height: u16) -> Result<Terminal<CrosstermBackend<io::Stdout>>> {
@@ -1801,8 +1844,6 @@ fn new_inline_terminal(height: u16) -> Result<Terminal<CrosstermBackend<io::Stdo
 fn desired_terminal_viewport_height(app: &mut App) -> Result<u16> {
     let (terminal_width, terminal_height) =
         crossterm::terminal::size().unwrap_or((app.args.width, app.args.height));
-    let state = app.workbench_state()?;
-    let product_state = app.product_state(&state);
     let full_height = terminal_height
         .saturating_sub(1)
         .max(app.live_viewport_height());
@@ -1810,37 +1851,32 @@ fn desired_terminal_viewport_height(app: &mut App) -> Result<u16> {
         .saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2))
         .max(1);
     let dock_height = main_viewport_height(app, app_width);
-    let inactive_height = match product_state {
-        ProductState::Failed | ProductState::Cancelled => {
-            dock_height.max(app.live_viewport_height())
-        }
-        _ => dock_height,
-    };
-    let selected_status = app.selected_session_id.as_deref().and_then(|id| {
-        app.state_cache
-            .sessions
-            .iter()
-            .find(|session| session.id == id)
-            .map(|session| &session.status)
-    });
-    if app.surface != Surface::Main
-        || app.is_first_run_setup_visible()?
-        || app.selected_session_id.is_none()
-        || selected_status.is_some_and(SessionStatus::is_active)
-    {
+    if app.is_first_run_setup_visible()? || app.selected_session_id.is_none() {
         return Ok(full_height);
     }
-    Ok(inactive_height)
+    let selected_is_active = app
+        .refresh_cached_projection()
+        .current_session
+        .as_ref()
+        .is_some_and(|session| session.status.is_active());
+    let active_body_reserve = if selected_is_active {
+        renderer_v2::ACTIVE_BODY_RESERVE
+    } else {
+        0
+    };
+    Ok(dock_height
+        .saturating_add(active_body_reserve)
+        .min(full_height))
 }
 
 fn handle_terminal_event(
     event: TermEvent,
     app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal_driver: &mut TerminalDriver,
 ) -> Result<bool> {
     match event {
         TermEvent::Key(key) if is_escape_prefix_candidate(key, app) => {
-            handle_escape_prefix_key(key, app, terminal)
+            handle_escape_prefix_key(key, app, terminal_driver)
         }
         TermEvent::Key(key) => app.handle_key(key),
         TermEvent::Paste(text) => {
@@ -1850,15 +1886,6 @@ fn handle_terminal_event(
         TermEvent::Resize(_, _) => Ok(false),
         _ => Ok(false),
     }
-}
-
-fn settle_terminal_resize(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> Result<()> {
-    reset_inline_terminal_after_resize(terminal)?;
-    app.native_history.reset();
-    Ok(())
 }
 
 fn reset_inline_terminal_after_resize(
@@ -1881,7 +1908,7 @@ fn is_escape_prefix_candidate(key: KeyEvent, app: &App) -> bool {
 fn handle_escape_prefix_key(
     escape_key: KeyEvent,
     app: &mut App,
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    terminal_driver: &mut TerminalDriver,
 ) -> Result<bool> {
     if event::poll(Duration::ZERO)? {
         let next_event = event::read()?;
@@ -1892,7 +1919,7 @@ fn handle_escape_prefix_key(
         if should_quit {
             return Ok(true);
         }
-        return handle_terminal_event(next_event, app, terminal);
+        return handle_terminal_event(next_event, app, terminal_driver);
     }
     app.handle_key(escape_key)
 }
@@ -1909,30 +1936,13 @@ fn is_unmodified_enter_event(event: &TermEvent) -> bool {
     )
 }
 
-fn draw_terminal_frame(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
-) -> Result<()> {
-    maybe_emit_native_transcript(terminal, app)?;
-    terminal.draw(|frame| render(frame, app))?;
-    Ok(())
-}
-
-fn maybe_emit_native_transcript(
+fn maybe_emit_v2_transcript(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
     app: &mut App,
 ) -> Result<()> {
     let size = terminal.size()?;
     let state = app.workbench_state()?;
     if !app.surface.uses_main_view() || app.is_first_run_setup_visible()? {
-        return Ok(());
-    }
-    if app.is_slash_palette_active()
-        && state
-            .current_session
-            .as_ref()
-            .is_none_or(|session| session.status.is_active())
-    {
         return Ok(());
     }
     let should_clear = app.native_history.take_clear_before_replay();
@@ -1945,39 +1955,27 @@ fn maybe_emit_native_transcript(
 
     let session_id = session.id.clone();
     let width = native_scrollback_width(size.width);
+    let Some(model) = renderer_v2::transcript_model(app, &state) else {
+        return Ok(());
+    };
+    debug_assert_eq!(model.session_id, session_id);
+    let _model_revision = model.revision;
 
     if !app.native_history.is_active_for(Some(&session_id)) {
-        let mut last_group = None;
-        let (lines, last_seq) = native_scrollback_chronological_event_lines(
-            app,
-            &state,
-            &session_id,
-            0,
-            width,
-            &mut last_group,
-        );
+        let lines = renderer_v2::all_scrollback_lines(&model, width);
         insert_initial_native_lines(terminal, lines)?;
         app.native_history
-            .reset_for_session_with_group(session_id, last_seq, last_group);
+            .reset_for_session_with_group(session_id, model.last_event_seq, None);
         return Ok(());
     }
 
     let after_seq = app.native_history.last_seq;
-    let mut last_group = app.native_history.last_group.take();
-    let (lines, last_seq) = native_scrollback_chronological_event_lines(
-        app,
-        &state,
-        &session_id,
-        after_seq,
-        width,
-        &mut last_group,
-    );
-    if last_seq <= after_seq {
-        app.native_history.last_group = last_group;
+    if model.last_event_seq <= after_seq {
         return Ok(());
     }
-    app.native_history.last_seq = last_seq;
-    app.native_history.last_group = last_group;
+    let lines = renderer_v2::scrollback_lines_since(&model, after_seq, width);
+    app.native_history.last_seq = model.last_event_seq;
+    app.native_history.last_group = None;
     insert_native_lines(terminal, lines)?;
     Ok(())
 }
@@ -2597,7 +2595,7 @@ mod redesign_tests {
         assert!(!screen.contains(": answer"));
         assert!(screen.contains("Purpose: Rust-first terminal workbench"));
         assert!(screen.contains("crates/browser-use-tui"));
-        assert!(screen.contains("started"));
+        assert!(screen.contains(": subagent repo-explorer"));
         assert!(screen.contains("finished"));
         assert!(!screen.contains("repo-explorer started"));
         assert!(!screen.contains("repo-explorer finished"));
@@ -3326,8 +3324,6 @@ mod redesign_tests {
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("write as it streams"));
-        assert!(text.contains(": subagent repo-explorer"));
-        assert!(text.contains("started"));
         assert!(!text.contains("repo-explorer started"));
         assert!(!text.contains("waiting for GPT-5.5"));
         assert!(!text.contains("start repo-explorer helper"));
@@ -3395,6 +3391,16 @@ mod redesign_tests {
             "session.input",
             serde_json::json!({"text": "explain this repo"}),
         )?;
+        app.store.append_event(
+            &parent.id,
+            "model.tool_call",
+            serde_json::json!({"name": "spawn_agent"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "tool.started",
+            serde_json::json!({"name": "spawn_agent"}),
+        )?;
         let child = app.store.create_child_session(
             &parent.id,
             std::env::current_dir()?,
@@ -3413,6 +3419,11 @@ mod redesign_tests {
             serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer", "role": "explorer"}),
         )?;
         app.store.append_event(
+            &parent.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "parent is waiting"}),
+        )?;
+        app.store.append_event(
             &child.id,
             "file.read",
             serde_json::json!({"path": "/repo/README.md"}),
@@ -3428,8 +3439,76 @@ mod redesign_tests {
         assert!(screen.contains(": subagent"));
         assert!(screen.contains("repo-explorer"));
         assert!(screen.contains(": subagent repo-explorer"));
+        assert!(screen.contains("working"));
         assert!(screen.contains("read /repo/README.md"));
+        assert!(!screen.contains("writing Mapping the main crates."));
         assert!(!screen.contains("Mapping the main crates."));
+        assert!(!screen.contains("spawn_agent requested"));
+        assert!(!screen.contains("spawn_agent started"));
+        assert!(!screen.contains("parent is waiting"));
+        Ok(())
+    }
+
+    #[test]
+    fn renderer_v2_active_child_owns_live_view() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "explain this repo"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "model.tool_call",
+            serde_json::json!({"name": "spawn_agent"}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo-explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "agent.context",
+            serde_json::json!({"nickname": "repo-explorer", "role": "explorer"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer", "role": "explorer"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "parent is waiting"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "file.read",
+            serde_json::json!({"path": "/repo/README.md"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Mapping the main crates."}),
+        )?;
+        app.selected_session_id = Some(parent.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = renderer_v2::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&renderer_v2::active_viewport_lines(Some(&model), 100, 20));
+
+        assert!(text.contains(": subagent repo-explorer"));
+        assert!(text.contains("working"));
+        assert!(text.contains("read /repo/README.md"));
+        assert!(!text.contains("writing Mapping the main crates."));
+        assert!(!text.contains("Mapping the main crates."));
+        assert!(!text.contains("spawn_agent requested"));
+        assert!(!text.contains("parent is waiting"));
         Ok(())
     }
 
@@ -3543,11 +3622,10 @@ mod redesign_tests {
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("explain this repo"));
+        assert!(!text.contains("repo-explorer started"));
         assert!(text.contains("subagent repo-explorer"));
-        assert!(text.contains("started"));
         assert!(text.contains("read /repo/README.md"));
         assert!(text.contains("finished"));
-        assert!(!text.contains("repo-explorer started"));
         assert!(!text.contains("subagent finished"));
         assert!(text.contains("Short helper summary"));
         assert!(!text.contains("read every repo file"));
@@ -3678,6 +3756,90 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))?);
         let after = desired_terminal_viewport_height(&mut app)?;
         assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn selected_session_surfaces_do_not_resize_inline_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+
+        let before = desired_terminal_viewport_height(&mut app)?;
+        app.open_surface(Surface::History);
+        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
+        app.open_surface(Surface::Model);
+        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
+        app.open_surface(Surface::Browser);
+        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
+        Ok(())
+    }
+
+    #[test]
+    fn renderer_v2_does_not_commit_child_events_as_parent_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "inspect repository"}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            None,
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer"}),
+        )?;
+        app.store.append_event(
+            &child.id,
+            "file.read",
+            serde_json::json!({"path": "SECRET_CHILD_ONLY.md"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.completed",
+            serde_json::json!({
+                "child_session_id": child.id,
+                "status": "done",
+                "payload": {"result": "Repository inspected read-only."}
+            }),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "This repo is a Rust terminal workbench."}),
+        )?;
+        app.selected_session_id = Some(parent.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = renderer_v2::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&renderer_v2::all_scrollback_lines(&model, 100));
+
+        assert!(text.contains("subagent repo-explorer"));
+        assert!(text.contains("finished"));
+        assert!(!text.contains("repo-explorer started"));
+        assert!(text.contains("Repository inspected read-only."));
+        assert!(text.contains("This repo is a Rust terminal workbench."));
+        assert!(!text.contains("SECRET_CHILD_ONLY.md"));
         Ok(())
     }
 

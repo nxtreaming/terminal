@@ -13,6 +13,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::composer::composer_rule;
 use crate::markdown::render_markdown_lines;
 use crate::palette;
+use crate::renderer_v2;
 use crate::settings::{
     is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CLAUDE_CODE, ACCOUNT_CODEX,
     ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, MODEL_CHOICES,
@@ -98,6 +99,7 @@ pub(crate) fn native_scrollback_event_lines(
     lines
 }
 
+#[cfg(test)]
 pub(crate) fn native_scrollback_chronological_event_lines(
     app: &App,
     state: &WorkbenchState,
@@ -181,10 +183,22 @@ fn render_main(
         .height
         .saturating_sub(bottom_h)
         .saturating_sub(footer_h);
+    let v2_model = if native_scrollback_active {
+        renderer_v2::transcript_model(app, state)
+    } else {
+        None
+    };
     let body = if app.surface.is_bottom_pane() {
         Vec::new()
     } else if native_scrollback_active {
-        native_replay_live_lines(app, state, product_state, body_width, max_body_h)
+        let mut lines =
+            renderer_v2::active_viewport_lines(v2_model.as_ref(), body_width, max_body_h);
+        if lines.is_empty() {
+            if let Some(next) = next_action_lines(state, app, product_state) {
+                lines = next;
+            }
+        }
+        lines
     } else {
         match product_state {
             ProductState::SetupNeeded => setup_lines(app),
@@ -195,7 +209,8 @@ fn render_main(
             | ProductState::Cancelled => work_lines(state, app, body_width, product_state),
         }
     };
-    let pin_bottom = should_pin_main_bottom(product_state, native_scrollback_active);
+    let pin_bottom = should_pin_main_bottom(product_state, native_scrollback_active)
+        && !app.surface.is_bottom_pane();
     let (body_area, bottom_area, footer_area) =
         main_layout_areas(area, bottom_h, body.len(), show_footer, pin_bottom);
     let mut body = body;
@@ -211,6 +226,15 @@ fn render_main(
             ProductState::Result => empty_rows.saturating_sub(4).min(8),
             ProductState::Running | ProductState::Failed | ProductState::Cancelled => empty_rows,
             ProductState::Ready | ProductState::SetupNeeded => 0,
+        };
+        let top_gap = if native_scrollback_active
+            && matches!(
+                product_state,
+                ProductState::Failed | ProductState::Cancelled
+            ) {
+            0
+        } else {
+            top_gap
         };
         Rect {
             y: body_area.y.saturating_add(top_gap),
@@ -266,11 +290,13 @@ fn main_layout_areas(
 }
 
 fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active: bool) -> bool {
-    (native_scrollback_active && product_state != ProductState::Result)
-        || matches!(
-            product_state,
-            ProductState::Running | ProductState::Failed | ProductState::Cancelled
-        )
+    if native_scrollback_active {
+        return false;
+    }
+    matches!(
+        product_state,
+        ProductState::Running | ProductState::Failed | ProductState::Cancelled
+    )
 }
 
 pub(crate) fn main_viewport_height(app: &App, width: u16) -> u16 {
@@ -381,72 +407,6 @@ fn pane_header_line(title: &str, width: u16) -> Line<'static> {
         Span::styled(title, bold()),
         Span::styled("-".repeat(width.saturating_sub(title_len)), dim()),
     ])
-}
-
-fn native_replay_live_lines(
-    app: &App,
-    state: &WorkbenchState,
-    product_state: ProductState,
-    width: u16,
-    height: u16,
-) -> Vec<Line<'static>> {
-    let lines = match product_state {
-        ProductState::Running => {
-            if let Some(streaming_text) = current_streaming_text(state) {
-                let mut lines = Vec::new();
-                append_streaming_block(&mut lines, streaming_text, width);
-                lines
-            } else {
-                let mut lines = Vec::new();
-                append_ascii_text_block(
-                    &mut lines,
-                    "status",
-                    &["running browser task".to_string()],
-                    Some("live"),
-                );
-                lines
-            }
-        }
-        ProductState::Failed => {
-            let error = state.failure.as_deref().unwrap_or("The task failed.");
-            let (primary, secondary) = failure_actions(error);
-            let mut next_lines = Vec::new();
-            append_ascii_lines_block(
-                &mut next_lines,
-                "next",
-                vec![
-                    selected(primary, 0, app.selected_row),
-                    selected(secondary, 1, app.selected_row),
-                    selected("Retry", 2, app.selected_row),
-                    selected("New task", 3, app.selected_row),
-                ],
-                None,
-            );
-            next_lines
-        }
-        ProductState::Cancelled => {
-            let mut next_lines = Vec::new();
-            append_ascii_lines_block(
-                &mut next_lines,
-                "next",
-                vec![
-                    selected("Continue with a follow-up", 0, app.selected_row),
-                    selected("Start a new task", 1, app.selected_row),
-                    selected("Previous work", 2, app.selected_row),
-                ],
-                None,
-            );
-            next_lines
-        }
-        ProductState::Result => Vec::new(),
-        ProductState::Ready => Vec::new(),
-        ProductState::SetupNeeded => setup_lines(app),
-    };
-    if lines.len() > height as usize {
-        visible_tail_lines(lines, height)
-    } else {
-        lines
-    }
 }
 
 fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
@@ -1284,6 +1244,8 @@ fn tool_aware_chronological_lines(
     let mut lines = Vec::new();
     append_task_section(&mut lines, state);
 
+    let active_child = active_child_session(app, &session.id)
+        .map(|child| (child.id.clone(), helper_label_for_session(app, &child.id)));
     let mut last_group = None;
     let mut wrote_event = false;
     let mut pending_delta = PendingDeltaBlock::default();
@@ -1299,6 +1261,9 @@ fn tool_aware_chronological_lines(
             continue;
         }
         if event.event_type == "model.thinking_delta" {
+            if active_child.is_some() {
+                continue;
+            }
             let label = thinking_delta_label(event);
             if pending_delta.should_flush_before(PendingDeltaKind::Thought, label.as_deref()) {
                 pending_delta.flush(&mut lines, &mut last_group, width);
@@ -1341,7 +1306,28 @@ fn tool_aware_chronological_lines(
             );
         }
         ProductState::Running => {
-            if let Some(streaming_text) = current_streaming_text(state) {
+            if let Some((child_id, label)) = active_child.as_ref() {
+                let group = format!("subagent {label}");
+                push_gap_if_needed(&mut lines);
+                append_timeline_item(
+                    &mut lines,
+                    &mut last_group,
+                    &group,
+                    "working",
+                    width,
+                    muted(),
+                );
+                for line in recent_active_child_live_lines(app, state, child_id, 5) {
+                    append_timeline_item(
+                        &mut lines,
+                        &mut last_group,
+                        &group,
+                        &line,
+                        width,
+                        muted(),
+                    );
+                }
+            } else if let Some(streaming_text) = current_streaming_text(state) {
                 push_gap_if_needed(&mut lines);
                 append_answer_plain_block(&mut lines, streaming_text.trim_end(), width);
             }
@@ -1404,21 +1390,7 @@ fn append_tool_aware_event(
                 append_prompt_section(lines, prompt);
             }
         }
-        "agent.spawned" => {
-            let label = event
-                .payload
-                .get("nickname")
-                .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    event
-                        .payload
-                        .get("role")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .unwrap_or("subagent");
-            let group = subagent_timeline_group(label);
-            append_timeline_item(lines, last_group, &group, "started", width, text_style());
-        }
+        "agent.spawned" => {}
         "agent.completed" => {
             let child_id = event
                 .payload
@@ -1728,6 +1700,7 @@ fn append_tool_aware_event(
     }
 }
 
+#[cfg(test)]
 fn append_native_timeline_event(
     lines: &mut Vec<Line<'static>>,
     last_group: &mut Option<String>,
@@ -1788,30 +1761,13 @@ fn append_native_timeline_event(
                 None,
             );
         }
-        "agent.spawned" => {
+        "agent.spawned" => {}
+        "agent.completed" => {
             let label = event
                 .payload
-                .get("nickname")
+                .get("child_session_id")
                 .and_then(serde_json::Value::as_str)
-                .or_else(|| {
-                    event
-                        .payload
-                        .get("role")
-                        .and_then(serde_json::Value::as_str)
-                })
-                .unwrap_or("subagent");
-            let group = subagent_timeline_group(label);
-            append_timeline_item(lines, last_group, &group, "started", width, text_style());
-        }
-        "agent.completed" => {
-            let label = app
-                .and_then(|app| {
-                    event
-                        .payload
-                        .get("child_session_id")
-                        .and_then(serde_json::Value::as_str)
-                        .map(|id| helper_label_for_session(app, id))
-                })
+                .and_then(|id| app.map(|app| helper_label_for_session(app, id)))
                 .unwrap_or_else(|| "subagent".to_string());
             let group = subagent_timeline_group(&label);
             append_timeline_item(lines, last_group, &group, "finished", width, text_style());
@@ -2370,6 +2326,130 @@ fn append_child_timeline_event(
     }
 }
 
+fn active_child_session<'a>(app: &'a App, root_id: &str) -> Option<&'a SessionMeta> {
+    app.state_cache
+        .sessions
+        .iter()
+        .filter(|session| session.parent_id.as_deref() == Some(root_id))
+        .find(|session| session.status.is_active())
+}
+
+fn recent_active_child_live_lines(
+    app: &App,
+    state: &WorkbenchState,
+    child_id: &str,
+    limit: usize,
+) -> Vec<String> {
+    let mut lines = Vec::new();
+    for event in app.state_cache.events_for_session(child_id).iter().rev() {
+        if let Some(line) = child_live_activity_line(event, state) {
+            lines.push(line);
+        }
+        if lines.len() >= limit {
+            break;
+        }
+    }
+    lines.reverse();
+    lines
+}
+
+fn child_live_activity_line(event: &EventRecord, state: &WorkbenchState) -> Option<String> {
+    match event.event_type.as_str() {
+        "model.turn.request" => {
+            let model = event
+                .payload
+                .get("model")
+                .and_then(serde_json::Value::as_str)
+                .filter(|model| !model.trim().is_empty())
+                .unwrap_or("model");
+            Some(format!("waiting for {model}"))
+        }
+        "model.turn.retry" => Some("retrying model request".to_string()),
+        "model.thinking_delta" | "model.stream_delta" => None,
+        "model.tool_call" => {
+            let name = event
+                .payload
+                .get("call")
+                .and_then(|call| call.get("name"))
+                .and_then(serde_json::Value::as_str)
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("name")
+                        .and_then(serde_json::Value::as_str)
+                })
+                .unwrap_or("tool");
+            (!is_subagent_management_tool(name)).then(|| format!("{name} requested"))
+        }
+        "tool.started" => {
+            let name = event
+                .payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            (!is_subagent_management_tool(name)).then(|| format!("{name} started"))
+        }
+        "tool.failed" => {
+            let name = event
+                .payload
+                .get("name")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool");
+            let error = event
+                .payload
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("tool failed");
+            Some(format!(
+                "{name} failed: {}",
+                truncate_for_status(error.trim(), 96)
+            ))
+        }
+        "command.started" => event
+            .payload
+            .get("cmd")
+            .and_then(serde_json::Value::as_str)
+            .map(|cmd| format!("run {}", truncate_for_status(cmd.trim(), 96))),
+        "file.read" => event
+            .payload
+            .get("path")
+            .and_then(serde_json::Value::as_str)
+            .map(|path| format!("read {}", display_path(path, state))),
+        "file.list" => {
+            let path = event
+                .payload
+                .get("path")
+                .and_then(serde_json::Value::as_str)
+                .map(|path| display_path(path, state))
+                .unwrap_or_else(|| ".".to_string());
+            Some(format!("list {path}"))
+        }
+        "file.search" => {
+            let query = event
+                .payload
+                .get("query")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("files");
+            Some(format!("search {query:?}"))
+        }
+        "plan.updated" => Some("updated plan".to_string()),
+        _ => None,
+    }
+}
+
+fn truncate_for_status(value: &str, max: usize) -> String {
+    if value.chars().count() <= max {
+        return value.to_string();
+    }
+    if max <= 3 {
+        return value.chars().take(max).collect();
+    }
+    let mut out = value.chars().take(max - 3).collect::<String>();
+    out.push_str("...");
+    out
+}
+
+#[cfg(test)]
 fn is_root_session_event(state: &WorkbenchState, event: &EventRecord) -> bool {
     state
         .current_session
@@ -2391,6 +2471,9 @@ fn append_tool_call_intent(
     else {
         return;
     };
+    if is_subagent_management_tool(name) {
+        return;
+    }
     let arguments = event
         .payload
         .get("arguments")
@@ -2494,6 +2577,20 @@ fn short_agent_label(value: &str) -> String {
         .filter(|segment| !segment.is_empty() && *segment != "root")
         .unwrap_or(value)
         .to_string()
+}
+
+fn is_subagent_management_tool(name: &str) -> bool {
+    matches!(
+        name,
+        "spawn_agent"
+            | "wait_agent"
+            | "send_input"
+            | "send_message"
+            | "followup_task"
+            | "close_agent"
+            | "resume_agent"
+            | "list_agents"
+    )
 }
 
 fn helper_label_for_session(app: &App, session_id: &str) -> String {
