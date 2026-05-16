@@ -1440,6 +1440,35 @@ fn append_tool_aware_event(
                 append_preview_markdown(lines, last_group, &group, result, width, 3);
             }
         }
+        "agent.wait.started" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                &wait_agent_started_label(&event.payload),
+                width,
+                muted(),
+            );
+        }
+        "agent.wait.finished" => {
+            let timed_out = event
+                .payload
+                .get("timed_out")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                if timed_out {
+                    "wait timed out"
+                } else {
+                    "wait finished"
+                },
+                width,
+                muted(),
+            );
+        }
         "agent.failed" => {
             let error = event
                 .payload
@@ -1796,6 +1825,35 @@ fn append_native_timeline_event(
             {
                 append_preview_markdown(lines, last_group, &group, result, width, 3);
             }
+        }
+        "agent.wait.started" => {
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                &wait_agent_started_label(&event.payload),
+                width,
+                muted(),
+            );
+        }
+        "agent.wait.finished" => {
+            let timed_out = event
+                .payload
+                .get("timed_out")
+                .and_then(serde_json::Value::as_bool)
+                .unwrap_or(false);
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                if timed_out {
+                    "wait timed out"
+                } else {
+                    "wait finished"
+                },
+                width,
+                muted(),
+            );
         }
         "agent.failed" => {
             let error = event
@@ -2340,7 +2398,14 @@ fn append_tool_call_intent(
     match name {
         "spawn_agent" => {}
         "wait_agent" => {
-            append_timeline_item(lines, last_group, "subagent", "wait", width, muted());
+            append_timeline_item(
+                lines,
+                last_group,
+                "subagent",
+                &wait_agent_started_label(arguments),
+                width,
+                muted(),
+            );
         }
         "send_input" | "send_message" | "followup_task" => {
             let target = arguments
@@ -2388,6 +2453,47 @@ fn append_tool_call_intent(
             muted(),
         ),
     }
+}
+
+fn wait_agent_started_label(payload: &serde_json::Value) -> String {
+    if let Some(target) = payload
+        .get("target")
+        .and_then(serde_json::Value::as_str)
+        .map(short_agent_label)
+    {
+        return format!("waiting on {target}");
+    }
+    if let Some(targets) = payload.get("targets").and_then(serde_json::Value::as_array) {
+        return match targets.len() {
+            0 => "waiting on subagents".to_string(),
+            1 => {
+                let target = targets
+                    .first()
+                    .and_then(|target| {
+                        target
+                            .get("nickname")
+                            .and_then(serde_json::Value::as_str)
+                            .or_else(|| target.get("task_name").and_then(serde_json::Value::as_str))
+                    })
+                    .map(short_agent_label)
+                    .unwrap_or_else(|| "subagent".to_string());
+                format!("waiting on {target}")
+            }
+            count => format!("waiting on {count} subagents"),
+        };
+    }
+    "waiting on subagents".to_string()
+}
+
+fn short_agent_label(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty() && *segment != "root")
+        .unwrap_or(value)
+        .to_string()
 }
 
 fn helper_label_for_session(app: &App, session_id: &str) -> String {

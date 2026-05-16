@@ -334,6 +334,10 @@ fn done_tool_spec() -> ToolSpec {
                 "use_final_answer": {
                     "type": "boolean",
                     "description": "Use the final answer persisted by Python set_final_answer(...)."
+                },
+                "finish_and_close_children": {
+                    "type": "boolean",
+                    "description": "If true, cancel active child agents before finishing. Otherwise done() is rejected while children are active."
                 }
             },
             "required": [],
@@ -430,23 +434,25 @@ fn spawn_agent_tool_spec() -> ToolSpec {
 fn wait_agent_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "wait_agent".to_string(),
-        description:
-            "Read, and optionally briefly wait for, the compact status and final result for a helper session."
-                .to_string(),
+        description: concat!(
+            "Wait for a helper session, or for all direct helper sessions when target is omitted. ",
+            "Use timeout_ms=0 for a non-blocking status poll."
+        )
+        .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "target": {
                     "type": "string",
-                    "description": "The relative or canonical task name returned by spawn_agent."
+                    "description": "Optional relative or canonical task name returned by spawn_agent."
                 },
                 "timeout_ms": {
                     "type": "integer",
                     "minimum": 0,
-                    "description": "Optional maximum time to wait for an active helper to finish before returning its current status."
+                    "description": "Maximum time to wait for active helpers to finish before returning current status. Defaults to 300000."
                 }
             },
-            "required": ["target"],
+            "required": [],
             "additionalProperties": false
         }),
     }

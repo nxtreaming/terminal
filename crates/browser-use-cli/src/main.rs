@@ -8,8 +8,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
-    record_python_response_final_event, record_python_worker_event, run_agent_with_provider,
-    run_existing_session_with_provider, run_fake_agent, AgentRunOptions, FakeAgentOptions,
+    record_python_response_final_event, record_python_worker_event, run_agent_from_config,
+    run_existing_session_from_config, run_existing_session_with_provider, run_fake_agent,
+    AgentRunOptions, FakeAgentOptions, ProviderBackend, ProviderRunConfig,
 };
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, result_from_events,
@@ -766,89 +767,69 @@ fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
 }
 
 fn run_openai(store: &Store, text: String, model: String) -> Result<()> {
-    let provider = openai_provider(store, model)?;
-    let session_id = run_agent_with_provider(
-        store,
-        &provider,
-        &text,
-        std::env::current_dir()?,
-        cli_agent_options(),
-    )?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Openai, model).with_options(cli_agent_options());
+    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
     Ok(())
 }
 
 fn run_codex(store: &Store, text: String, model: String) -> Result<()> {
-    let provider = codex_provider(store, model)?;
-    let session_id = run_agent_with_provider(
-        store,
-        &provider,
-        &text,
-        std::env::current_dir()?,
-        cli_agent_options(),
-    )?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options());
+    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
     Ok(())
 }
 
 fn run_anthropic(store: &Store, text: String, model: String) -> Result<()> {
-    let provider = anthropic_provider(store, model)?;
-    let session_id = run_agent_with_provider(
-        store,
-        &provider,
-        &text,
-        std::env::current_dir()?,
-        cli_agent_options(),
-    )?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options());
+    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
     Ok(())
 }
 
 fn run_openrouter(store: &Store, text: String, model: String) -> Result<()> {
-    let provider = openrouter_provider(store, model)?;
-    let session_id = run_agent_with_provider(
-        store,
-        &provider,
-        &text,
-        std::env::current_dir()?,
-        cli_agent_options(),
-    )?;
+    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model)
+        .with_options(cli_agent_options());
+    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
     Ok(())
 }
 
 fn run_openai_session(store: &Store, task_id: &str, model: String) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let provider = openai_provider(store, model)?;
-    let session_id =
-        run_existing_session_with_provider(store, &provider, task_id, cli_agent_options())?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Openai, model).with_options(cli_agent_options());
+    let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
 
 fn run_codex_session(store: &Store, task_id: &str, model: String) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let provider = codex_provider(store, model)?;
-    let session_id =
-        run_existing_session_with_provider(store, &provider, task_id, cli_agent_options())?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options());
+    let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
 
 fn run_anthropic_session(store: &Store, task_id: &str, model: String) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let provider = anthropic_provider(store, model)?;
-    let session_id =
-        run_existing_session_with_provider(store, &provider, task_id, cli_agent_options())?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options());
+    let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
 
 fn run_openrouter_session(store: &Store, task_id: &str, model: String) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let provider = openrouter_provider(store, model)?;
-    let session_id =
-        run_existing_session_with_provider(store, &provider, task_id, cli_agent_options())?;
+    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model)
+        .with_options(cli_agent_options());
+    let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
@@ -2289,6 +2270,7 @@ fn run_dataset_case_with_provider<P: ModelProvider>(
         browser_mode: Some(config.browser_mode.clone()),
         python_tool_timeout_seconds: config.python_timeout_seconds,
         python_env: dataset_python_env(run_id, case, attempt, &paths, &config),
+        child_agent_runner: None,
     };
     let run_error = run_existing_session_with_provider(store, provider, &session_id, agent_options)
         .err()

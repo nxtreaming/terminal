@@ -3434,6 +3434,55 @@ mod redesign_tests {
     }
 
     #[test]
+    fn parent_live_view_shows_subagent_wait_target() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "explain this repo"}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo_explorer"),
+            Some("repo_explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo_explorer", "role": "explorer"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "wait_repo_explorer",
+                "name": "wait_agent",
+                "arguments": {"target": "repo_explorer", "timeout_ms": 300000},
+            }),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.wait.started",
+            serde_json::json!({
+                "tool_call_id": "wait_repo_explorer",
+                "target": "repo_explorer",
+                "targets": [{"child_session_id": child.id, "task_name": "/root/repo_explorer", "nickname": "repo_explorer"}],
+                "timeout_ms": 300000,
+            }),
+        )?;
+        app.selected_session_id = Some(parent.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains(": subagent"));
+        assert!(screen.contains("waiting on repo_explorer"));
+        Ok(())
+    }
+
+    #[test]
     fn native_parent_scrollback_does_not_replay_child_session_turns() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;

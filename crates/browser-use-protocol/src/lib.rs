@@ -609,6 +609,21 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
             }
             "file.list" => push_activity(&mut activity, "listed files"),
             "agent.spawned" => push_activity(&mut activity, agent_started_text(&event.payload)),
+            "agent.wait.started" => {
+                push_activity(&mut activity, agent_wait_started_text(&event.payload))
+            }
+            "agent.wait.finished" => {
+                if event
+                    .payload
+                    .get("timed_out")
+                    .and_then(Value::as_bool)
+                    .unwrap_or(false)
+                {
+                    push_activity(&mut activity, "subagent wait timed out");
+                } else {
+                    push_activity(&mut activity, "subagent wait finished");
+                }
+            }
             "agent.completed" => push_activity(&mut activity, "subagent finished"),
             "agent.failed" => push_activity(&mut activity, "subagent failed"),
             "agent.cancelled" => push_activity(&mut activity, "subagent stopped"),
@@ -828,6 +843,46 @@ fn agent_started_text(payload: &Value) -> String {
         .or_else(|| payload.get("role").and_then(Value::as_str))
         .unwrap_or("subagent");
     format!("subagent {label} started")
+}
+
+fn agent_wait_started_text(payload: &Value) -> String {
+    let label = payload
+        .get("target")
+        .and_then(Value::as_str)
+        .map(short_agent_path)
+        .or_else(|| {
+            payload
+                .get("targets")
+                .and_then(Value::as_array)
+                .map(|targets| {
+                    if targets.len() == 1 {
+                        targets
+                            .first()
+                            .and_then(|target| {
+                                target
+                                    .get("nickname")
+                                    .and_then(Value::as_str)
+                                    .or_else(|| target.get("task_name").and_then(Value::as_str))
+                            })
+                            .map(short_agent_path)
+                            .unwrap_or_else(|| "subagent".to_string())
+                    } else {
+                        format!("{} subagents", targets.len())
+                    }
+                })
+        })
+        .unwrap_or_else(|| "subagents".to_string());
+    format!("subagent waiting on {label}")
+}
+
+fn short_agent_path(path: &str) -> String {
+    path.trim()
+        .trim_matches('/')
+        .rsplit('/')
+        .next()
+        .filter(|segment| !segment.is_empty() && *segment != "root")
+        .unwrap_or(path)
+        .to_string()
 }
 
 fn activity_with_child_agents(
@@ -1540,6 +1595,42 @@ mod tests {
         assert_eq!(
             result_from_events(&events).as_deref(),
             Some("checkout flow documented"),
+        );
+    }
+
+    #[test]
+    fn projects_agent_wait_events_as_compact_activity() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 1,
+                event_type: "agent.wait.started".to_string(),
+                payload: json!({
+                    "target": "/root/repo_explorer",
+                    "targets": [{
+                        "child_session_id": "c1",
+                        "task_name": "/root/repo_explorer",
+                        "nickname": "repo_explorer",
+                    }],
+                }),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "s1".to_string(),
+                ts_ms: 2,
+                event_type: "agent.wait.finished".to_string(),
+                payload: json!({"timed_out": false}),
+            },
+        ];
+        assert_eq!(
+            activity_from_events(&events),
+            vec![
+                "subagent waiting on repo_explorer",
+                "subagent wait finished"
+            ]
         );
     }
 
