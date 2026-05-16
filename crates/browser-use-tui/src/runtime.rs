@@ -1,10 +1,13 @@
 use std::path::PathBuf;
 
-use anyhow::Result;
+use anyhow::{bail, Result};
 use browser_use_core::{run_existing_session_from_config, AgentRunOptions, ProviderRunConfig};
 use browser_use_store::{Store, StoreNotifier};
 
-use crate::settings::AgentBackend;
+use crate::settings::{
+    browser_use_cloud_env_key_present, AgentBackend, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
+};
 
 pub(crate) fn run_agent_thread(
     state_dir: PathBuf,
@@ -15,8 +18,26 @@ pub(crate) fn run_agent_thread(
     notifier: Option<StoreNotifier>,
 ) -> Result<()> {
     let store = Store::open_with_optional_notifier(&state_dir, notifier)?;
+    let browser_use_cloud_api_key = if browser == BROWSER_USE_CLOUD {
+        browser_use_cloud_api_key(&store)?
+    } else {
+        None
+    };
+    if browser == BROWSER_USE_CLOUD && browser_use_cloud_api_key.is_none() {
+        let error = "Browser Use cloud selected, but BROWSER_USE_API_KEY is not set";
+        let _ = store.append_event(
+            &session_id,
+            "session.failed",
+            serde_json::json!({ "error": error }),
+        );
+        bail!(error);
+    }
     let config = ProviderRunConfig::new(backend.into(), model)
-        .with_options(tui_agent_options(&browser, &session_id))
+        .with_options(tui_agent_options(
+            &browser,
+            &session_id,
+            browser_use_cloud_api_key.as_deref(),
+        ))
         .with_fake_result("Fake result from the Rust TUI agent loop.");
     let result = run_existing_session_from_config(&store, &session_id, config);
     if let Err(error) = result {
@@ -30,12 +51,40 @@ pub(crate) fn run_agent_thread(
     Ok(())
 }
 
-fn tui_agent_options(browser: &str, session_id: &str) -> AgentRunOptions {
+fn browser_use_cloud_api_key(store: &Store) -> Result<Option<String>> {
+    if let Some(value) = store
+        .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(Some(value));
+    }
+    if browser_use_cloud_env_key_present() {
+        return Ok(std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok());
+    }
+    Ok(None)
+}
+
+fn tui_agent_options(
+    browser: &str,
+    session_id: &str,
+    browser_use_cloud_api_key: Option<&str>,
+) -> AgentRunOptions {
     match browser {
         "Headless Chromium" => AgentRunOptions::default()
             .with_browser_mode("headless")
             .with_python_env(managed_browser_env(session_id, false)),
-        "Browser Use cloud" => AgentRunOptions::default().with_browser_mode("cloud"),
+        BROWSER_USE_CLOUD => {
+            let mut options = AgentRunOptions::default().with_browser_mode("cloud");
+            if let Some(api_key) =
+                browser_use_cloud_api_key.filter(|value| !value.trim().is_empty())
+            {
+                options = options.with_python_env(vec![(
+                    BROWSER_USE_CLOUD_API_KEY_ENV.to_string(),
+                    api_key.to_string(),
+                )]);
+            }
+            options
+        }
         _ => AgentRunOptions::default()
             .with_browser_mode("local")
             .with_python_env(managed_browser_env(session_id, true)),
@@ -102,7 +151,7 @@ mod tests {
 
     #[test]
     fn local_chrome_overrides_cloud_dotenv_mode() {
-        let options = tui_agent_options("Local Chrome", "abc123");
+        let options = tui_agent_options("Local Chrome", "abc123", None);
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
         assert_eq!(env_value(&options, "BU_CDP_URL"), Some(""));
         assert_eq!(env_value(&options, "BU_CDP_WS"), Some(""));
@@ -121,7 +170,7 @@ mod tests {
 
     #[test]
     fn headless_chromium_uses_managed_browser_not_inherited_cdp() {
-        let options = tui_agent_options("Headless Chromium", "abc123");
+        let options = tui_agent_options("Headless Chromium", "abc123", None);
         assert_eq!(options.browser_mode.as_deref(), Some("headless"));
         assert_eq!(env_value(&options, "BU_CDP_URL"), Some(""));
         assert_eq!(env_value(&options, "BU_CDP_WS"), Some(""));
@@ -136,14 +185,24 @@ mod tests {
 
     #[test]
     fn browser_use_cloud_keeps_cloud_mode() {
-        let options = tui_agent_options("Browser Use cloud", "abc123");
+        let options = tui_agent_options("Browser Use cloud", "abc123", None);
         assert_eq!(options.browser_mode.as_deref(), Some("cloud"));
         assert!(options.python_env.is_empty());
     }
 
     #[test]
+    fn browser_use_cloud_passes_stored_key_to_worker_env() {
+        let options = tui_agent_options("Browser Use cloud", "abc123", Some("bu-test"));
+        assert_eq!(options.browser_mode.as_deref(), Some("cloud"));
+        assert_eq!(
+            env_value(&options, BROWSER_USE_CLOUD_API_KEY_ENV),
+            Some("bu-test")
+        );
+    }
+
+    #[test]
     fn local_chrome_sanitizes_session_id_for_daemon_name() {
-        let options = tui_agent_options("Local Chrome", "abc/123 !?");
+        let options = tui_agent_options("Local Chrome", "abc/123 !?", None);
         assert_eq!(env_value(&options, "BU_NAME"), Some("but-tui-abc-123"));
         assert_eq!(
             env_value(&options, "BH_RUNTIME_DIR"),

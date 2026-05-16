@@ -72,8 +72,15 @@ pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
     ACCOUNT_OPENROUTER,
 ];
 
+pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use cloud";
+pub(crate) const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
+pub(crate) const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
 pub(crate) const BROWSER_CHOICES: [&str; 3] =
-    ["Browser Use cloud", "Local Chrome", "Headless Chromium"];
+    [BROWSER_USE_CLOUD, "Local Chrome", "Headless Chromium"];
+
+pub(crate) fn browser_use_cloud_env_key_present() -> bool {
+    std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).is_ok_and(|value| !value.trim().is_empty())
+}
 
 pub(crate) fn is_claude_code_account(account: &str) -> bool {
     account == ACCOUNT_CLAUDE_CODE || account == ACCOUNT_CLAUDE_CODE_LEGACY

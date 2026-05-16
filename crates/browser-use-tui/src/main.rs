@@ -46,8 +46,9 @@ use render::{
 };
 use runtime::run_agent_thread;
 use settings::{
-    is_claude_code_account, provider_model_for_display, AgentBackend, ACCOUNT_ANTHROPIC,
-    ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES,
+    browser_use_cloud_env_key_present, is_claude_code_account, provider_model_for_display,
+    AgentBackend, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_SETTING,
     MODEL_CHOICES,
 };
 
@@ -627,7 +628,7 @@ impl App {
     }
 
     fn submit(&mut self) -> Result<()> {
-        let text = self.composer.take_trimmed();
+        let text = self.composer.input().trim().to_string();
         if text.is_empty() {
             if let Some(session) = self
                 .selected_session_id
@@ -659,12 +660,21 @@ impl App {
             })
             .cloned()
         {
+            let active = session.status.is_active();
+            if !active && !self.ensure_agent_ready()? {
+                return Ok(());
+            }
+            let text = self.composer.take_trimmed();
             self.dispatch(AppCommand::SendFollowup {
                 session_id: session.id,
                 text,
             })?;
             return Ok(());
         }
+        if !self.ensure_agent_ready()? {
+            return Ok(());
+        }
+        let text = self.composer.take_trimmed();
         self.dispatch(AppCommand::StartTask(text))?;
         Ok(())
     }
@@ -673,6 +683,11 @@ impl App {
         if let Some(notice) = self.auth_notice()? {
             self.status_notice = Some(notice);
             self.open_surface(Surface::Account);
+            return Ok(false);
+        }
+        if let Some(notice) = self.browser_notice()? {
+            self.status_notice = Some(notice);
+            self.start_auth_entry(BROWSER_USE_CLOUD.to_string());
             return Ok(false);
         }
         self.status_notice = None;
@@ -1186,6 +1201,11 @@ impl App {
         }
         self.status_notice = Some(format!("Model set to {}.", self.model));
         if !self.setup_complete {
+            if let Some(notice) = self.browser_notice()? {
+                self.status_notice = Some(notice);
+                self.start_auth_entry(BROWSER_USE_CLOUD.to_string());
+                return Ok(());
+            }
             self.setup_complete = true;
             self.store.set_setting("setup.complete", "1")?;
             self.persist_runtime_settings()?;
@@ -1200,6 +1220,13 @@ impl App {
             .unwrap_or(&BROWSER_CHOICES[0]);
         self.browser = (*choice).to_string();
         self.persist_runtime_settings()?;
+        if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
+            self.status_notice = Some(
+                "Browser Use cloud key is required before cloud browser tasks can run.".to_string(),
+            );
+            self.start_auth_entry(BROWSER_USE_CLOUD.to_string());
+            return Ok(());
+        }
         self.status_notice = Some(format!("Browser set to {}.", self.browser));
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
             self.setup_complete = true;
@@ -1221,6 +1248,22 @@ impl App {
         if secret.trim().is_empty() {
             self.status_notice = Some(format!("{} is required.", auth_secret_label(&account)));
             self.open_surface(Surface::ApiKey);
+            return Ok(());
+        }
+        if account == BROWSER_USE_CLOUD {
+            self.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, secret.trim())?;
+            self.browser = BROWSER_USE_CLOUD.to_string();
+            self.persist_runtime_settings()?;
+            self.api_key_account = None;
+            self.status_notice = Some("Saved Browser Use cloud key.".to_string());
+            if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
+                self.setup_complete = true;
+                self.store.set_setting("setup.complete", "1")?;
+                self.close_surface();
+            } else {
+                self.close_surface();
+            }
             return Ok(());
         }
         self.store
@@ -1521,6 +1564,28 @@ impl App {
         Ok(notice.map(str::to_string))
     }
 
+    fn browser_notice(&self) -> Result<Option<String>> {
+        if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
+            Ok(Some(
+                "Browser Use cloud key is missing. Set BROWSER_USE_API_KEY or choose Local Chrome."
+                    .to_string(),
+            ))
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn browser_use_cloud_key_ready(&self) -> Result<bool> {
+        if self
+            .store
+            .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+            .is_some_and(|value| !value.trim().is_empty())
+        {
+            return Ok(true);
+        }
+        Ok(browser_use_cloud_env_key_present())
+    }
+
     fn has_stored_or_env(&self, setting_key: &str, env_names: &[&str]) -> Result<bool> {
         if self
             .store
@@ -1569,6 +1634,7 @@ fn auth_setting_key(account: &str) -> &'static str {
         ACCOUNT_OPENAI => "auth.openai.api_key",
         ACCOUNT_OPENROUTER => "auth.openrouter.api_key",
         ACCOUNT_ANTHROPIC => "auth.anthropic.api_key",
+        BROWSER_USE_CLOUD => BROWSER_USE_CLOUD_API_KEY_SETTING,
         account if is_claude_code_account(account) => "auth.claude_code.access_token",
         _ => "auth.codex.placeholder",
     }
@@ -1579,6 +1645,7 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENAI => "OpenAI API key",
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
+        BROWSER_USE_CLOUD => "Browser Use cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "credential",
     }
@@ -2340,7 +2407,9 @@ mod redesign_tests {
         let mut app = App::new(args(temp))?;
         app.setup_complete = true;
         app.model_configured = true;
+        app.browser = "Local Chrome".to_string();
         app.store.set_setting("setup.complete", "1")?;
+        app.store.set_setting("browser", "Local Chrome")?;
         Ok(app)
     }
 
@@ -2408,16 +2477,113 @@ mod redesign_tests {
         }
         assert_eq!(app.selected_row, 0);
 
-        // Default row 0 = Codex login -> single-model account -> auto-pick GPT-5.5 and finish setup.
+        // Default row 0 = Codex login -> single-model account -> auto-pick GPT-5.5,
+        // then ask for the selected cloud browser's key before setup is complete.
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::Main);
-        assert!(app.setup_complete);
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert!(!app.setup_complete);
         assert_eq!(app.account, "Codex login");
         assert_eq!(app.model, "GPT-5.5");
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Tell the browser what to do..."));
-        assert!(screen.contains("Browser Use cloud"));
+        assert!(screen.contains("Browser Use cloud key"));
         Ok(())
+    }
+
+    #[test]
+    fn cloud_browser_without_key_is_not_reported_ready() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = App::new(args(&temp))?;
+            app.setup_complete = true;
+            app.model_configured = true;
+            app.store.set_setting("setup.complete", "1")?;
+
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Browser Use cloud needs key"));
+
+            app.open_surface(Surface::BrowserSelect);
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("Browser Use cloud . needs key"));
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn cloud_browser_without_key_blocks_task_submission() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = App::new(args(&temp))?;
+            app.setup_complete = true;
+            app.model_configured = true;
+            app.store.set_setting("setup.complete", "1")?;
+
+            app.set_input("open example.com".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.store.list_sessions()?.len(), 0);
+            assert!(app
+                .status_notice
+                .as_deref()
+                .is_some_and(|notice| notice.contains("Browser Use cloud key is missing")));
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn browser_use_cloud_key_can_be_saved_from_tui() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = App::new(args(&temp))?;
+            app.setup_complete = true;
+            app.model_configured = true;
+            app.store.set_setting("setup.complete", "1")?;
+            app.open_surface(Surface::BrowserSelect);
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+            app.set_input("bu-test-key".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(
+                app.store
+                    .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+                    .as_deref(),
+                Some("bu-test-key")
+            );
+            assert_eq!(app.browser, BROWSER_USE_CLOUD);
+            assert!(app.browser_use_cloud_key_ready()?);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
     }
 
     #[test]
@@ -2543,7 +2709,7 @@ mod redesign_tests {
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
         assert!(ready_screen.contains("browser-use"));
-        assert!(ready_screen.contains("GPT-5.5 . Codex . Browser Use cloud idle"));
+        assert!(ready_screen.contains("GPT-5.5 . Codex . Local Chrome idle"));
         assert!(ready_screen.contains("Browser Use"));
         assert!(ready_screen.contains("/model"));
         assert!(ready_screen.contains("/browser"));
@@ -4131,6 +4297,7 @@ mod redesign_tests {
             select_latest: true,
             seed_demo: Some("done".to_string()),
             agent: AgentBackend::Fake,
+            browser: "Local Chrome".to_string(),
             ..args(&temp)
         };
         let mut app = App::new(app_args)?;

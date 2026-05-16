@@ -237,7 +237,8 @@ def start_session(
     select_arg = "--select-latest " if select_latest else ""
     command = (
         f"cd {ROOT} && {binary} "
-        f"--state-dir {state_dir} --seed-demo {seed_demo} {select_arg}--agent none --height 28"
+        f"--state-dir {state_dir} --seed-demo {seed_demo} {select_arg}"
+        "--agent none --browser 'Local Chrome' --height 28"
     )
     tmux_send(session, command, "C-m")
     first_visible_text = "Type to steer the agent" if select_latest else "Tell the browser what to do..."
@@ -445,7 +446,8 @@ def smoke_tall_terminal_keeps_running_controls_attached_to_content(binary: Path)
         tmux("new-session", "-d", "-s", session, "-x", "120", "-y", "40")
         command = (
             f"cd {ROOT} && {binary} "
-            f"--state-dir {state_dir} --seed-demo running --select-latest --agent none"
+            f"--state-dir {state_dir} --seed-demo running --select-latest "
+            "--agent none --browser 'Local Chrome'"
         )
         tmux_send(session, command, "C-m")
         wait_for(session, "Type to steer the agent", "height-120x40-history")
@@ -834,6 +836,8 @@ def smoke_completed_plain_output(binary: Path) -> None:
                 "--select-latest",
                 "--agent",
                 "none",
+                "--browser",
+                "Local Chrome",
             ]
         ).stdout
         ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)

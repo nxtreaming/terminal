@@ -390,6 +390,7 @@ enum SessionsCommand {
 enum AuthAccount {
     Codex,
     ClaudeCode,
+    BrowserUseCloud,
     Openai,
     Anthropic,
     Openrouter,
@@ -1063,9 +1064,17 @@ fn is_secret_setting(key: &str) -> bool {
             || key.ends_with(".auth_token"))
 }
 
+const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
+
 fn auth(store: &Store, command: AuthCommand) -> Result<()> {
     match command {
         AuthCommand::Status => {
+            print_api_key_status(
+                store,
+                "Browser Use cloud key",
+                BROWSER_USE_CLOUD_API_KEY_SETTING,
+                &["BROWSER_USE_API_KEY"],
+            )?;
             print_api_key_status(
                 store,
                 "OpenAI API key",
@@ -1147,6 +1156,15 @@ fn auth_login(
     no_browser: bool,
 ) -> Result<()> {
     match account {
+        AuthAccount::BrowserUseCloud => {
+            let api_key =
+                read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
+            let key = api_key_setting(account).context("account does not use an API key")?;
+            store.set_setting(key, api_key.trim())?;
+            store.set_setting("browser", "Browser Use cloud")?;
+            println!("{}: connected (stored)", auth_account_label(account));
+            Ok(())
+        }
         AuthAccount::Openai | AuthAccount::Anthropic | AuthAccount::Openrouter => {
             let api_key =
                 read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
@@ -1192,6 +1210,9 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
             if let Some(key) = api_key_setting(account) {
                 store.delete_setting(key)?;
             }
+        }
+        AuthAccount::BrowserUseCloud => {
+            store.delete_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?;
         }
         AuthAccount::ClaudeCode => {
             store.delete_setting("auth.claude_code.access_token")?;
@@ -1664,6 +1685,7 @@ fn api_key_setting(account: AuthAccount) -> Option<&'static str> {
         AuthAccount::Openai => Some("auth.openai.api_key"),
         AuthAccount::Anthropic => Some("auth.anthropic.api_key"),
         AuthAccount::Openrouter => Some("auth.openrouter.api_key"),
+        AuthAccount::BrowserUseCloud => Some(BROWSER_USE_CLOUD_API_KEY_SETTING),
         AuthAccount::Codex | AuthAccount::ClaudeCode => None,
     }
 }
@@ -1672,6 +1694,7 @@ fn auth_account_label(account: AuthAccount) -> &'static str {
     match account {
         AuthAccount::Codex => "Codex login",
         AuthAccount::ClaudeCode => "Claude Code login",
+        AuthAccount::BrowserUseCloud => "Browser Use cloud",
         AuthAccount::Openai => "OpenAI API key",
         AuthAccount::Anthropic => "Anthropic API key",
         AuthAccount::Openrouter => "OpenRouter API key",

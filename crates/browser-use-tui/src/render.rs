@@ -12,7 +12,7 @@ use crate::composer::composer_rule;
 use crate::palette;
 use crate::settings::{
     is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CLAUDE_CODE, ACCOUNT_CODEX,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, MODEL_CHOICES,
+    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -494,8 +494,11 @@ fn header_lines(app: &App, state: &WorkbenchState, title: &str, width: u16) -> V
 }
 
 fn browser_header_label(app: &App, state: &WorkbenchState) -> String {
+    if cloud_browser_needs_key(app) {
+        return format!("{} needs key", app.browser);
+    }
     let status = if state.browser.status == "not connected" {
-        if app.browser == "Browser Use cloud" {
+        if app.browser == BROWSER_USE_CLOUD {
             "ready"
         } else {
             "connected"
@@ -817,7 +820,13 @@ fn api_key_lines(app: &App) -> Vec<Line<'static>> {
     let account = app.api_key_account.as_deref().unwrap_or("selected account");
     let mut lines = vec![Line::from(Span::styled(auth_secret_label(account), bold()))];
     lines.push(Line::from(""));
-    if is_claude_code_account(account) {
+    if account == BROWSER_USE_CLOUD {
+        lines.extend([
+            Line::from("  Browser Use cloud runs a remote browser with live view."),
+            Line::from("  Add this key once, or export BROWSER_USE_API_KEY before launch."),
+            Line::from(""),
+        ]);
+    } else if is_claude_code_account(account) {
         lines.extend([
             Line::from("  Claude Code uses Browser Use's Anthropic OAuth login."),
             Line::from("  Run this in another terminal to open the browser sign-in:"),
@@ -839,7 +848,9 @@ fn api_key_lines(app: &App) -> Vec<Line<'static>> {
         )),
         Line::from(""),
         Line::from(Span::styled(
-            if is_claude_code_account(account) {
+            if account == BROWSER_USE_CLOUD {
+                "  Stored locally and passed to browser worker as BROWSER_USE_API_KEY."
+            } else if is_claude_code_account(account) {
                 "  Pasted values are treated as legacy access tokens. Prefer the login command above."
             } else {
                 "  This key is stored locally in browser-use state."
@@ -958,8 +969,13 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(Span::styled("CHOOSE BROWSER", muted())),
         Line::from(""),
     ];
+    let cloud_description = if !app.browser_use_cloud_key_ready().unwrap_or(false) {
+        "needs Browser Use key"
+    } else {
+        "remote browser with live view"
+    };
     let descriptions = [
-        "remote browser with live view",
+        cloud_description,
         "visible browser on this machine",
         "background browser",
     ];
@@ -976,7 +992,10 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
         Line::from(vec![
             Span::raw("  "),
             Span::styled(app.browser.clone(), text_style()),
-            Span::styled(" . ready", done()),
+            Span::styled(
+                format!(" . {}", browser_current_status_for_select(app)),
+                browser_current_status_style(app),
+            ),
         ]),
     ]);
     lines
@@ -1440,11 +1459,34 @@ fn append_telemetry_detail_lines(lines: &mut Vec<Line<'static>>, telemetry: &Tel
 }
 
 fn browser_ready_label(app: &App, state: &WorkbenchState) -> String {
+    if cloud_browser_needs_key(app) {
+        return format!("{} needs key", app.browser);
+    }
     if state.browser.status == "not connected" {
         format!("{} ready", app.browser)
     } else {
         format!("{} {}", app.browser, state.browser.status)
     }
+}
+
+fn browser_current_status_for_select(app: &App) -> &'static str {
+    if cloud_browser_needs_key(app) {
+        "needs key"
+    } else {
+        "ready"
+    }
+}
+
+fn browser_current_status_style(app: &App) -> Style {
+    if cloud_browser_needs_key(app) {
+        failed()
+    } else {
+        done()
+    }
+}
+
+fn cloud_browser_needs_key(app: &App) -> bool {
+    app.browser == BROWSER_USE_CLOUD && !app.browser_use_cloud_key_ready().unwrap_or(false)
 }
 
 fn masked_secret(value: &str) -> String {
@@ -1472,6 +1514,7 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENAI => "OpenAI API key",
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
+        BROWSER_USE_CLOUD => "Browser Use cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "Credential",
     }
