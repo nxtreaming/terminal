@@ -33,10 +33,10 @@ mod composer;
 mod markdown;
 mod palette;
 mod render;
-mod renderer_v2;
 mod runtime;
 mod settings;
 mod theme;
+mod transcript;
 
 use composer::Composer;
 use palette::PaletteAction;
@@ -44,8 +44,6 @@ use render::{
     lines_plain_text, main_viewport_height, native_scrollback_lines, render, render_dump,
     APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
-#[cfg(test)]
-use render::{native_scrollback_chronological_event_lines, native_scrollback_event_lines};
 use runtime::run_agent_thread;
 use settings::{
     is_claude_code_account, provider_model_for_display, AgentBackend, ACCOUNT_ANTHROPIC,
@@ -1711,8 +1709,8 @@ fn print_native_transcript(app: &mut App) -> Result<()> {
         .unwrap_or(app.args.width);
     app.drain_store_notifications()?;
     let state = app.workbench_state()?;
-    if let Some(model) = renderer_v2::transcript_model(app, &state) {
-        print!("{}", renderer_v2::model_plain_text(&model));
+    if let Some(model) = transcript::transcript_model(app, &state) {
+        print!("{}", transcript::model_plain_text(&model));
     } else {
         let lines = native_scrollback_lines(app, width)?;
         print!("{}", lines_plain_text(&lines));
@@ -1963,14 +1961,14 @@ fn maybe_emit_v2_transcript(
 
     let session_id = session.id.clone();
     let width = native_scrollback_width(size.width);
-    let Some(model) = renderer_v2::transcript_model(app, &state) else {
+    let Some(model) = transcript::transcript_model(app, &state) else {
         return Ok(());
     };
     debug_assert_eq!(model.session_id, session_id);
     let _model_revision = model.revision;
 
     if !app.native_history.is_active_for(Some(&session_id)) {
-        let lines = renderer_v2::all_terminal_scrollback_lines(&model, width);
+        let lines = transcript::all_terminal_scrollback_lines(&model, width);
         insert_initial_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session_with_group(session_id, model.last_event_seq, None);
@@ -1981,7 +1979,7 @@ fn maybe_emit_v2_transcript(
     if model.last_event_seq <= after_seq {
         return Ok(());
     }
-    let lines = renderer_v2::terminal_scrollback_lines_since(&model, after_seq, width);
+    let lines = transcript::terminal_scrollback_lines_since(&model, after_seq, width);
     app.native_history.last_seq = model.last_event_seq;
     app.native_history.last_group = None;
     insert_native_lines(terminal, lines)?;
@@ -3394,11 +3392,9 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id.clone());
         app.drain_store_notifications()?;
-        let state = app.workbench_state()?.clone();
-        let events = app.cached_events_for_session(&session.id).to_vec();
-        let mut last_group = None;
-
-        let lines = native_scrollback_event_lines(&events, &state, 100, &mut last_group);
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let lines = transcript::all_scrollback_lines(&model, 100);
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("write as it streams"));
@@ -3528,7 +3524,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn renderer_v2_active_child_owns_live_view() -> Result<()> {
+    fn transcript_active_child_owns_live_view() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -3577,8 +3573,8 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
         app.drain_store_notifications()?;
         let state = app.workbench_state()?;
-        let model = renderer_v2::transcript_model(&app, &state).expect("model");
-        let text = lines_plain_text(&renderer_v2::active_viewport_lines(Some(&model), 100, 20));
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
 
         assert!(text.contains(": subagent repo-explorer"));
         assert!(text.contains("working"));
@@ -3591,7 +3587,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn renderer_v2_hides_lifecycle_events_and_groups_semantic_activity() -> Result<()> {
+    fn transcript_hides_lifecycle_events_and_groups_semantic_activity() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let cwd = std::env::current_dir()?;
@@ -3699,10 +3695,10 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         app.drain_store_notifications()?;
         let state = app.workbench_state()?;
-        let model = renderer_v2::transcript_model(&app, &state).expect("model");
-        let text = lines_plain_text(&renderer_v2::all_scrollback_lines(&model, 120));
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::all_scrollback_lines(&model, 120));
         let terminal_text =
-            lines_plain_text(&renderer_v2::all_terminal_scrollback_lines(&model, 120));
+            lines_plain_text(&transcript::all_terminal_scrollback_lines(&model, 120));
 
         assert!(text.contains(": explored"));
         assert_eq!(text.matches(": explored").count(), 1, "{text}");
@@ -3720,7 +3716,7 @@ mod redesign_tests {
         assert!(!text.contains("README raw body should stay out"));
         assert!(!text.contains("trace exporter unavailable"));
         assert!(!text.contains("token_budget"));
-        assert!(text.contains("waiting for GPT-5.5"));
+        assert!(!text.contains("waiting for GPT-5.5"));
         assert!(!terminal_text.contains("waiting for GPT-5.5"));
         assert!(terminal_text.contains("read README.md"));
         Ok(())
@@ -3822,17 +3818,9 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(parent.id.clone());
         app.drain_store_notifications()?;
-        let state = app.workbench_state()?.clone();
-        let mut last_group = None;
-
-        let (lines, _) = native_scrollback_chronological_event_lines(
-            &app,
-            &state,
-            &parent.id,
-            0,
-            100,
-            &mut last_group,
-        );
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let lines = transcript::all_scrollback_lines(&model, 100);
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("explain this repo"));
@@ -4002,7 +3990,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn renderer_v2_does_not_commit_child_events_as_parent_output() -> Result<()> {
+    fn transcript_does_not_commit_child_events_as_parent_output() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4045,8 +4033,8 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
         app.drain_store_notifications()?;
         let state = app.workbench_state()?;
-        let model = renderer_v2::transcript_model(&app, &state).expect("model");
-        let text = lines_plain_text(&renderer_v2::all_scrollback_lines(&model, 100));
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::all_scrollback_lines(&model, 100));
 
         assert!(text.contains("subagent repo-explorer"));
         assert!(text.contains("finished"));
