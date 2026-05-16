@@ -21,7 +21,15 @@ fn link_color() -> Color {
 }
 
 fn code_color() -> Color {
-    Color::Rgb(236, 174, 91)
+    Color::Rgb(173, 215, 190)
+}
+
+fn code_background_color() -> Color {
+    Color::Rgb(39, 47, 42)
+}
+
+fn heading_color() -> Color {
+    Color::Rgb(220, 171, 78)
 }
 
 fn quote_color() -> Color {
@@ -81,7 +89,9 @@ pub(crate) fn link() -> Style {
 }
 
 pub(crate) fn markdown_code() -> Style {
-    Style::default().fg(code_color())
+    Style::default()
+        .fg(code_color())
+        .bg(code_background_color())
 }
 
 pub(crate) fn markdown_code_block() -> Style {
@@ -93,19 +103,23 @@ pub(crate) fn markdown_emphasis() -> Style {
 }
 
 pub(crate) fn markdown_strong() -> Style {
-    Style::default()
-        .fg(code_color())
-        .add_modifier(Modifier::BOLD)
+    bold()
 }
 
 pub(crate) fn markdown_marker() -> Style {
-    done()
+    muted()
 }
 
 pub(crate) fn markdown_quote() -> Style {
     Style::default()
         .fg(quote_color())
         .add_modifier(Modifier::ITALIC)
+}
+
+pub(crate) fn markdown_heading() -> Style {
+    Style::default()
+        .fg(heading_color())
+        .add_modifier(Modifier::BOLD)
 }
 
 pub(crate) fn done() -> Style {

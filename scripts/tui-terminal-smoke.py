@@ -589,6 +589,33 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
             3,
             "short completed composer should stay attached to the result",
         )
+        tmux_send_literal(session, "alpha")
+        tmux_send_shift_enter(session)
+        tmux_send_literal(session, "beta")
+        multiline = wait_for(session, "beta", "short-done-multiline-followup")
+        visible_multiline = capture_after_idle(
+            session,
+            "short-done-multiline-followup-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            multiline,
+            "Top 5 Hacker News posts",
+            "completed transcript should remain while editing multiline follow-up",
+        )
+        assert_contains(visible_multiline, "> alpha", "completed follow-up first line")
+        assert_contains(visible_multiline, "  beta", "completed follow-up second line")
+        assert_not_contains(
+            visible_multiline,
+            "Follow-up\n    alpha",
+            "shift-enter in completed history must not submit",
+        )
+        assert_no_legacy_dashboard_chrome(
+            visible_multiline,
+            "completed multiline edit should not show old dashboard chrome",
+        )
+        tmux_send(session, "C-c")
+        wait_for(session, "Ask a follow-up", "short-done-after-multiline-clear")
         tmux_send(session, "/")
         slash = wait_for(session, "/task", "short-done-slash-palette")
         assert_contains(slash, "Top 5 Hacker News posts", "slash palette should not clear completed transcript")

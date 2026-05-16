@@ -1,15 +1,16 @@
-use pulldown_cmark::{CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
+use pulldown_cmark::{Alignment, CodeBlockKind, Event, HeadingLevel, Options, Parser, Tag, TagEnd};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::{
-    bold, link, markdown_code, markdown_code_block, markdown_emphasis, markdown_marker,
+    link, markdown_code, markdown_code_block, markdown_emphasis, markdown_heading, markdown_marker,
     markdown_quote, markdown_strong, muted, text_style,
 };
 
 pub(crate) fn render_markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
     let mut options = Options::empty();
+    options.insert(Options::ENABLE_TABLES);
     options.insert(Options::ENABLE_STRIKETHROUGH);
 
     let mut writer = MarkdownWriter::new(width as usize);
@@ -24,12 +25,28 @@ struct ListState {
     next: Option<u64>,
 }
 
+#[derive(Clone, Debug)]
+struct TableRow {
+    cells: Vec<Vec<Span<'static>>>,
+    is_header: bool,
+}
+
+#[derive(Clone, Debug)]
+struct TableState {
+    alignments: Vec<Alignment>,
+    rows: Vec<TableRow>,
+    current_row: Option<Vec<Vec<Span<'static>>>>,
+    current_cell: Option<Vec<Span<'static>>>,
+    in_header: bool,
+}
+
 struct MarkdownWriter {
     lines: Vec<Line<'static>>,
     current: Vec<Span<'static>>,
     style_stack: Vec<Style>,
     list_stack: Vec<ListState>,
     link_stack: Vec<String>,
+    table: Option<TableState>,
     pending_prefix: Option<Vec<Span<'static>>>,
     quote_depth: usize,
     in_code_block: bool,
@@ -45,6 +62,7 @@ impl MarkdownWriter {
             style_stack: Vec::new(),
             list_stack: Vec::new(),
             link_stack: Vec::new(),
+            table: None,
             pending_prefix: None,
             quote_depth: 0,
             in_code_block: false,
@@ -65,9 +83,7 @@ impl MarkdownWriter {
                 }
             }
             Event::Code(code) => {
-                self.ensure_prefix();
-                self.current
-                    .push(Span::styled(code.to_string(), markdown_code()));
+                self.push_span(Span::styled(code.to_string(), markdown_code()));
             }
             Event::SoftBreak | Event::HardBreak => self.flush_current(),
             Event::Rule => {
@@ -79,9 +95,7 @@ impl MarkdownWriter {
             Event::Html(html) | Event::InlineHtml(html) => self.push_text(&html),
             Event::FootnoteReference(text) => self.push_text(&format!("[{text}]")),
             Event::TaskListMarker(checked) => {
-                self.ensure_prefix();
-                self.current
-                    .push(Span::styled(if checked { "[x] " } else { "[ ] " }, muted()));
+                self.push_span(Span::styled(if checked { "[x] " } else { "[ ] " }, muted()));
             }
         }
     }
@@ -99,9 +113,6 @@ impl MarkdownWriter {
                 if !self.lines.is_empty() {
                     self.push_blank();
                 }
-                let marker = format!("{} ", "#".repeat(level as usize));
-                self.current
-                    .push(Span::styled(marker, heading_marker_style(level)));
                 self.push_style(heading_text_style(level));
             }
             Tag::BlockQuote => {
@@ -111,6 +122,36 @@ impl MarkdownWriter {
                     self.needs_blank = false;
                 }
                 self.quote_depth += 1;
+            }
+            Tag::Table(alignments) => {
+                self.flush_current();
+                if !self.lines.is_empty() && !self.last_line_is_blank() {
+                    self.push_blank();
+                }
+                self.table = Some(TableState {
+                    alignments,
+                    rows: Vec::new(),
+                    current_row: None,
+                    current_cell: None,
+                    in_header: false,
+                });
+                self.needs_blank = false;
+            }
+            Tag::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    table.in_header = true;
+                    table.current_row = Some(Vec::new());
+                }
+            }
+            Tag::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    table.current_row = Some(Vec::new());
+                }
+            }
+            Tag::TableCell => {
+                if let Some(table) = self.table.as_mut() {
+                    table.current_cell = Some(Vec::new());
+                }
             }
             Tag::CodeBlock(kind) => {
                 self.flush_current();
@@ -145,22 +186,14 @@ impl MarkdownWriter {
             Tag::Image {
                 title, dest_url, ..
             } => {
-                self.ensure_prefix();
                 let label = if title.is_empty() {
                     dest_url.to_string()
                 } else {
                     title.to_string()
                 };
-                self.current
-                    .push(Span::styled(format!("[image: {label}]"), muted()));
+                self.push_span(Span::styled(format!("[image: {label}]"), muted()));
             }
-            Tag::FootnoteDefinition(_)
-            | Tag::HtmlBlock
-            | Tag::Table(_)
-            | Tag::TableHead
-            | Tag::TableRow
-            | Tag::TableCell
-            | Tag::MetadataBlock(_) => {}
+            Tag::FootnoteDefinition(_) | Tag::HtmlBlock | Tag::MetadataBlock(_) => {}
         }
     }
 
@@ -180,6 +213,39 @@ impl MarkdownWriter {
                 self.quote_depth = self.quote_depth.saturating_sub(1);
                 self.needs_blank = true;
             }
+            TagEnd::TableCell => {
+                if let Some(table) = self.table.as_mut() {
+                    let cell = table.current_cell.take().unwrap_or_default();
+                    if let Some(row) = table.current_row.as_mut() {
+                        row.push(cell);
+                    }
+                }
+            }
+            TagEnd::TableRow => {
+                if let Some(table) = self.table.as_mut() {
+                    let cells = table.current_row.take().unwrap_or_default();
+                    table.rows.push(TableRow {
+                        cells,
+                        is_header: table.in_header,
+                    });
+                }
+            }
+            TagEnd::TableHead => {
+                if let Some(table) = self.table.as_mut() {
+                    let cells = table.current_row.take().unwrap_or_default();
+                    if !cells.is_empty() {
+                        table.rows.push(TableRow {
+                            cells,
+                            is_header: true,
+                        });
+                    }
+                    table.in_header = false;
+                }
+            }
+            TagEnd::Table => {
+                self.flush_table();
+                self.needs_blank = true;
+            }
             TagEnd::CodeBlock => {
                 self.in_code_block = false;
                 self.needs_blank = true;
@@ -197,33 +263,36 @@ impl MarkdownWriter {
             TagEnd::Link => {
                 self.pop_style();
                 if let Some(dest) = self.link_stack.pop() {
-                    self.current.push(Span::raw(" ("));
-                    self.current.push(Span::styled(dest, link()));
-                    self.current.push(Span::raw(")"));
+                    self.push_span(Span::raw(" ("));
+                    self.push_span(Span::styled(dest, link()));
+                    self.push_span(Span::raw(")"));
                 }
             }
             TagEnd::Image
             | TagEnd::FootnoteDefinition
             | TagEnd::HtmlBlock
-            | TagEnd::Table
-            | TagEnd::TableHead
-            | TagEnd::TableRow
-            | TagEnd::TableCell
             | TagEnd::MetadataBlock(_) => {}
         }
     }
 
     fn push_text(&mut self, text: &str) {
+        if self.in_table_cell() {
+            let normalized = text.replace(['\n', '\r'], " ");
+            if !normalized.is_empty() {
+                let style = self.current_style();
+                self.push_span(Span::styled(normalized, style));
+            }
+            return;
+        }
         for (idx, line) in text.lines().enumerate() {
             if idx > 0 {
                 self.flush_current();
             }
-            self.ensure_prefix();
             let style = self.current_style();
             if looks_like_bare_link(line) || looks_like_path(line) {
-                self.current.push(Span::styled(line.to_string(), link()));
+                self.push_span(Span::styled(line.to_string(), link()));
             } else {
-                self.current.push(Span::styled(line.to_string(), style));
+                self.push_span(Span::styled(line.to_string(), style));
             }
         }
     }
@@ -242,11 +311,24 @@ impl MarkdownWriter {
         }
         for _ in 0..self.quote_depth {
             self.current
-                .push(Span::styled("> ".to_string(), markdown_quote()));
+                .push(Span::styled("| ".to_string(), markdown_quote()));
         }
         if let Some(prefix) = self.pending_prefix.take() {
             self.current.extend(prefix);
         }
+    }
+
+    fn push_span(&mut self, span: Span<'static>) {
+        if let Some(cell) = self
+            .table
+            .as_mut()
+            .and_then(|table| table.current_cell.as_mut())
+        {
+            cell.push(span);
+            return;
+        }
+        self.ensure_prefix();
+        self.current.push(span);
     }
 
     fn flush_current(&mut self) {
@@ -309,6 +391,22 @@ impl MarkdownWriter {
 
     fn current_style(&self) -> Style {
         self.style_stack.last().copied().unwrap_or_else(text_style)
+    }
+
+    fn in_table_cell(&self) -> bool {
+        self.table
+            .as_ref()
+            .is_some_and(|table| table.current_cell.is_some())
+    }
+
+    fn flush_table(&mut self) {
+        let Some(table) = self.table.take() else {
+            return;
+        };
+        let rendered = render_table_lines(table, self.width);
+        for line in rendered {
+            self.lines.push(line);
+        }
     }
 
     fn finish(mut self) -> Vec<Line<'static>> {
@@ -476,7 +574,7 @@ impl StyledLineBuilder {
 fn continuation_indent_width(text: &str) -> usize {
     let leading = text.chars().take_while(|ch| ch.is_whitespace()).count();
     let trimmed = text.trim_start();
-    let quote_prefix_width = if let Some(rest) = trimmed.strip_prefix("> ") {
+    let quote_prefix_width = if let Some(rest) = trimmed.strip_prefix("| ") {
         let nested = continuation_indent_width(rest);
         return leading + 2 + nested;
     } else {
@@ -503,17 +601,176 @@ fn display_width(text: &str) -> usize {
     UnicodeWidthStr::width(text)
 }
 
-fn heading_marker_style(level: HeadingLevel) -> Style {
-    match level {
-        HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => bold(),
-        HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => muted(),
+fn render_table_lines(table: TableState, width: usize) -> Vec<Line<'static>> {
+    let column_count = table
+        .rows
+        .iter()
+        .map(|row| row.cells.len())
+        .max()
+        .unwrap_or(0)
+        .max(table.alignments.len());
+    if column_count == 0 {
+        return Vec::new();
     }
+
+    let column_widths = table_column_widths(&table.rows, column_count, width);
+    let mut out = Vec::new();
+    let mut rendered_header_separator = false;
+
+    for (idx, row) in table.rows.iter().enumerate() {
+        if !row.is_header && idx > 0 && !rendered_header_separator {
+            out.push(table_separator_line(&column_widths));
+            rendered_header_separator = true;
+        }
+        out.push(table_row_line(
+            row,
+            &table.alignments,
+            &column_widths,
+            row.is_header,
+        ));
+    }
+
+    out
+}
+
+fn table_column_widths(rows: &[TableRow], column_count: usize, max_width: usize) -> Vec<usize> {
+    let gap_width = column_count.saturating_sub(1) * 2;
+    let available = max_width.saturating_sub(gap_width).max(column_count);
+    let mut widths = vec![3; column_count];
+
+    for row in rows {
+        for (idx, cell) in row.cells.iter().enumerate().take(column_count) {
+            widths[idx] = widths[idx].max(cell_width(cell));
+        }
+    }
+
+    while widths.iter().sum::<usize>() > available {
+        let Some((idx, width)) = widths
+            .iter()
+            .copied()
+            .enumerate()
+            .filter(|(_, width)| *width > 3)
+            .max_by_key(|(_, width)| *width)
+        else {
+            break;
+        };
+        widths[idx] = width.saturating_sub(1);
+    }
+
+    widths
+}
+
+fn table_row_line(
+    row: &TableRow,
+    alignments: &[Alignment],
+    column_widths: &[usize],
+    is_header: bool,
+) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (idx, width) in column_widths.iter().copied().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let cell = row.cells.get(idx).map(Vec::as_slice).unwrap_or(&[]);
+        spans.extend(aligned_table_cell(
+            cell,
+            width,
+            alignments.get(idx).copied().unwrap_or(Alignment::None),
+            is_header,
+        ));
+    }
+    Line::from(spans)
+}
+
+fn table_separator_line(column_widths: &[usize]) -> Line<'static> {
+    let mut spans = Vec::new();
+    for (idx, width) in column_widths.iter().copied().enumerate() {
+        if idx > 0 {
+            spans.push(Span::raw("  "));
+        }
+        spans.push(Span::styled("-".repeat(width), muted()));
+    }
+    Line::from(spans)
+}
+
+fn aligned_table_cell(
+    cell: &[Span<'static>],
+    width: usize,
+    alignment: Alignment,
+    is_header: bool,
+) -> Vec<Span<'static>> {
+    let content = truncate_table_cell(cell, width, is_header);
+    let content_width = spans_width(&content);
+    let padding = width.saturating_sub(content_width);
+    let (left, right) = match alignment {
+        Alignment::Right => (padding, 0),
+        Alignment::Center => (padding / 2, padding - (padding / 2)),
+        Alignment::None | Alignment::Left => (0, padding),
+    };
+
+    let mut spans = Vec::new();
+    if left > 0 {
+        spans.push(Span::raw(" ".repeat(left)));
+    }
+    spans.extend(content);
+    if right > 0 {
+        spans.push(Span::raw(" ".repeat(right)));
+    }
+    spans
+}
+
+fn truncate_table_cell(
+    cell: &[Span<'static>],
+    width: usize,
+    is_header: bool,
+) -> Vec<Span<'static>> {
+    let mut remaining = width;
+    let mut out = Vec::new();
+
+    for span in cell {
+        if remaining == 0 {
+            break;
+        }
+        let mut text = String::new();
+        let mut text_width = 0;
+        for ch in span.content.chars() {
+            let ch_width = ch.width().unwrap_or(0);
+            if text_width + ch_width > remaining {
+                break;
+            }
+            text.push(ch);
+            text_width += ch_width;
+        }
+        if !text.is_empty() {
+            let style = if is_header && span.style == text_style() {
+                markdown_strong()
+            } else {
+                span.style
+            };
+            out.push(Span::styled(text, style));
+            remaining = remaining.saturating_sub(text_width);
+        }
+    }
+
+    out
+}
+
+fn cell_width(cell: &[Span<'static>]) -> usize {
+    cell.iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
+}
+
+fn spans_width(spans: &[Span<'static>]) -> usize {
+    spans
+        .iter()
+        .map(|span| display_width(span.content.as_ref()))
+        .sum()
 }
 
 fn heading_text_style(level: HeadingLevel) -> Style {
     match level {
-        HeadingLevel::H1 | HeadingLevel::H2 => bold(),
-        HeadingLevel::H3 => markdown_strong(),
+        HeadingLevel::H1 | HeadingLevel::H2 | HeadingLevel::H3 => markdown_heading(),
         HeadingLevel::H4 | HeadingLevel::H5 | HeadingLevel::H6 => text_style(),
     }
 }
@@ -559,6 +816,42 @@ mod tests {
         assert!(text.contains("cargo test"));
         assert!(!text.contains("code bash"));
         assert!(!text.contains("```"));
+    }
+
+    #[test]
+    fn headings_render_as_text_not_source_markers() {
+        let lines = render_markdown_lines("### What it does\n\nBody", 80);
+        let text = plain(&lines);
+        assert!(text.contains("What it does"));
+        assert!(!text.contains("###"));
+    }
+
+    #[test]
+    fn blockquotes_render_as_quote_blocks_not_source_markers() {
+        let lines = render_markdown_lines(
+            "> Quote with **formatting**\n> - quoted list item\n>\n> > nested quote",
+            80,
+        );
+        let text = plain(&lines);
+        assert!(text.contains("| Quote with formatting"));
+        assert!(text.contains("| - quoted list item"));
+        assert!(text.contains("| | nested quote"));
+        assert!(!text.contains("> Quote"));
+    }
+
+    #[test]
+    fn tables_render_as_aligned_rows_not_pipe_source() {
+        let lines = render_markdown_lines(
+            "| Name | Count |\n| --- | ---: |\n| **Apples** | `12` |\n| Pears | 3 |",
+            80,
+        );
+        let text = plain(&lines);
+        assert!(text.contains("Name"), "{text:?}");
+        assert!(text.contains("Count"));
+        assert!(text.contains("Apples"));
+        assert!(text.contains("12"));
+        assert!(!text.contains("| Name | Count |"));
+        assert!(!text.contains("---:"));
     }
 
     #[test]

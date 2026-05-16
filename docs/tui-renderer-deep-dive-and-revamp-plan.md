@@ -2,6 +2,8 @@
 
 This document explains how the current `browser-use-tui` renderer works, why it becomes fragile, how Codex handles the same terminal UI problems, and how to rebuild this renderer around clearer ownership and better performance.
 
+Important target-state assumption: live Rust runtime memory should be canonical for the currently running app. SQLite should be durable persistence, crash recovery, old-session hydration, and audit/replay storage. The renderer should not treat SQLite as the live source of truth.
+
 ## Part 1: Current Browser-Use TUI Renderer
 
 ### Runtime Shape
@@ -45,6 +47,8 @@ That split is central to the current jank.
 - `NativeHistoryState`.
 
 The renderer does not read SQLite directly. It asks `App` for a projected `WorkbenchState`.
+
+This is how the current implementation works. It is not the ideal architecture. The current shape comes from the earlier split where Python owned the volatile runner state and Rust rebuilt product state from persisted events. In the Rust-owned stack, live session/runtime state should be held in memory and flushed to SQLite, not discovered from SQLite on every UI update.
 
 ### State Cache
 
@@ -1203,7 +1207,10 @@ For the normal chat mode:
 - committed transcript owner: terminal scrollback;
 - active output owner: live viewport active cell;
 - input/status owner: dock/bottom pane;
-- full history browsing owner: full-screen overlay.
+- history/task picker owner: full-screen overlay;
+- optional structured transcript inspector owner: full-screen overlay.
+
+Native scrollback remains the primary transcript UX. A transcript overlay can still make sense, but as a structured inspector for search, folding, child-session expansion, metadata, and export. It should not be required for normal reading.
 
 ### Target Architecture
 
@@ -1324,7 +1331,7 @@ The viewport height should be measured from active cell + dock, not set to nearl
 Make these full-screen surfaces:
 
 - history/task picker;
-- full transcript;
+- optional structured transcript inspector;
 - browser;
 - developer/debug;
 - model/provider/account setup if large enough.
@@ -1364,7 +1371,7 @@ To display entire history robustly:
 2. Insert finalized cells into terminal scrollback as they finalize.
 3. On selecting a completed task, clear owned scrollback and replay all retained cells once.
 4. Keep the live viewport small and control-focused.
-5. Use full-screen transcript overlay for interactive browsing/search/copy.
+5. Use an optional full-screen transcript inspector for structured search/folding/expansion, not as the primary transcript view.
 6. On resize, rebuild scrollback from source cells.
 7. Cap replay only by an explicit setting, never accidentally via viewport height.
 
@@ -1477,7 +1484,7 @@ Add focused scenarios:
 - load latest completed task;
 - select task from history;
 - press `Tab`, open/close history;
-- open full transcript overlay;
+- open optional structured transcript inspector if enabled;
 - resize terminal;
 - paste multi-line text;
 - run subagent task;
@@ -1740,21 +1747,27 @@ The ideal renderer should instead have one job:
 
 ### Ideal Renderer Principles
 
-1. Events are not UI.
-2. Transcript is source-backed and typed.
-3. Rendering is mode-based.
-4. Normal chat uses terminal scrollback for committed history.
-5. The live viewport renders only active work and controls.
-6. Full history browsing is a full-screen overlay.
-7. Resize rebuilds from source, not from terminal output.
-8. Rendering has measurement and drawing phases.
-9. Keyboard routing follows active surface ownership.
-10. Dumps, snapshots, and real terminal smoke tests all exercise different renderer layers.
+1. Live memory is canonical for running state.
+2. SQLite is persistence/hydration, not the live UI source.
+3. Events are not UI.
+4. Transcript is source-backed and typed.
+5. Rendering is mode-based.
+6. Normal chat uses terminal scrollback for committed history.
+7. The live viewport renders only active work and controls.
+8. Full history/task browsing is a full-screen overlay.
+9. Transcript inspector is optional structured navigation, not the primary transcript.
+10. Resize rebuilds from source, not from terminal output.
+11. Rendering has measurement and drawing phases.
+12. Keyboard routing follows active surface ownership.
+13. Dumps, snapshots, and real terminal smoke tests all exercise different renderer layers.
 
 ### High-Level Architecture
 
 ```text
-SQLite event log
+                           SQLite persistence
+                         hydrate ^   | flush/checkpoint
+                                 |   v
+Rust RuntimeState / SessionStore / EventJournal
       |
       v
 SessionProjector
@@ -1768,11 +1781,11 @@ RenderModel
       v
 Renderer
       |
-      +--> TerminalScrollback  (committed history)
+      +--> TerminalScrollback  (primary committed transcript)
       |
       +--> LiveViewport        (active work + dock)
       |
-      +--> OverlayViewport     (history/browser/debug/setup)
+      +--> OverlayViewport     (history/browser/debug/setup/optional inspector)
       |
       +--> PlainPrinter        (print-and-exit/export)
       |
@@ -1780,6 +1793,64 @@ Renderer
 ```
 
 Each arrow is a boundary. Data gets more visual as it moves downward. It should never move backward.
+
+### Live State Vs SQLite
+
+The ideal app should not build current UI by treating SQLite as the live source of truth.
+
+The live runtime should own:
+
+- sessions;
+- turns;
+- event journal;
+- tool calls;
+- active tool state;
+- active model streams;
+- subagent graph;
+- browser state;
+- artifacts;
+- transcript nodes;
+- render cells or render-cell inputs.
+
+SQLite should own:
+
+- durable event persistence;
+- crash recovery;
+- old conversation loading;
+- migration/import/export;
+- audit/replay;
+- startup hydration;
+- periodic snapshots/checkpoints if needed.
+
+The live path should be:
+
+```text
+agent/runtime event
+    |
+    v
+commit to in-memory SessionStore
+    |
+    +--> notify renderer immediately
+    |
+    +--> flush durable record to SQLite
+```
+
+Loading an old conversation should be:
+
+```text
+select old session
+    |
+    v
+hydrate in-memory SessionStore from SQLite
+    |
+    v
+project TranscriptModel
+    |
+    v
+render/replay from memory
+```
+
+The renderer only consumes memory. Persistence is a lower-level durability concern.
 
 ### Proposed Modules
 
@@ -1980,7 +2051,8 @@ When loading a completed task:
 select session
     |
     v
-load events
+hydrate in-memory session model
+from SQLite only if not already loaded
     |
     v
 project TranscriptModel
@@ -2053,7 +2125,7 @@ Overlay mode
 ├────────────────────────────────────────────────────┤
 │ overlay content                                    │
 │ - history picker                                   │
-│ - full transcript                                  │
+│ - optional transcript inspector                    │
 │ - browser state                                    │
 │ - debug/developer info                             │
 │ - setup/provider/auth                              │
@@ -2095,13 +2167,14 @@ HistoryOverlay
 
 Selecting a row closes the overlay and replays that session into scrollback once.
 
-### Ideal Full Transcript Overlay
+### Ideal Optional Transcript Inspector
 
-Full transcript is different from normal scrollback:
+The transcript inspector is different from normal scrollback:
 
 - scrollback is terminal-native and always available;
-- transcript overlay is structured, searchable, and width-aware;
+- transcript inspector is structured, searchable, and width-aware;
 - it can include folded sections, child session expansion, and metadata.
+- it is optional; normal reading should not depend on it.
 
 ```text
 Ctrl+T
@@ -2124,7 +2197,7 @@ Ctrl+T
 └────────────────────────────────────────────────────┘
 ```
 
-Normal mode scrollback is for reading/selecting text. Transcript overlay is for structured navigation.
+Normal mode scrollback is for reading/selecting text. Transcript inspector is for structured navigation. If it has tmux/alternate-screen problems, the primary product still works because native scrollback remains the main transcript view.
 
 ### Ideal Terminal Driver
 
@@ -2189,7 +2262,12 @@ Rules:
 App receives event
     |
     v
-SessionProjector updates TranscriptModel
+Rust runtime commits to in-memory SessionStore
+    |
+    +--> durable flush/checkpoint to SQLite
+    |
+    v
+SessionProjector updates TranscriptModel from memory
     |
     v
 Renderer receives RendererUpdate
@@ -2294,7 +2372,7 @@ assistant:
 subagent repo-explorer:
   status: completed
   summary: found project structure...
-  [expand in transcript overlay for details]
+  [expand in optional transcript inspector for details]
 
 assistant:
   final synthesis...
@@ -2306,7 +2384,7 @@ Rules:
 - child final answers do not render as parent assistant final answers;
 - child sessions do not appear as top-level history rows;
 - parent gets a `SubagentResultCell`;
-- full transcript overlay can expand child details;
+- optional transcript inspector can expand child details;
 - developer/debug overlay can show raw child event stream.
 
 ### Ideal Plain Output
@@ -2314,7 +2392,7 @@ Rules:
 Print/export should use the same cells:
 
 ```text
-TranscriptModel -> RenderCells -> PlainPrinter
+in-memory TranscriptModel -> RenderCells -> PlainPrinter
 ```
 
 No separate event renderer.
@@ -2367,24 +2445,27 @@ Do not rewrite everything in one massive PR. Build the new renderer beside the o
 
 Recommended sequence:
 
-1. Add transcript node projection and golden tests.
-2. Add render cells for the highest-value nodes.
-3. Add new full-screen history overlay.
-4. Add terminal driver abstraction, initially wrapping current terminal behavior.
-5. Add scrollback manager with replay for completed sessions.
-6. Add `LiveInline` mode where committed transcript is scrollback-only.
-7. Port active/running task UI to active cells.
-8. Add resize reflow.
-9. Port print-and-exit to cells.
-10. Delete old event-to-line renderers.
-11. Delete old bottom-pane history surface.
+1. Add an in-memory `SessionStore` / `RuntimeState` as the live canonical state.
+2. Define SQLite hydration/flush/checkpoint boundaries around that memory model.
+3. Add transcript node projection and golden tests.
+4. Add render cells for the highest-value nodes.
+5. Add new full-screen history overlay.
+6. Add terminal driver abstraction, initially wrapping current terminal behavior.
+7. Add scrollback manager with replay for completed sessions.
+8. Add `LiveInline` mode where committed transcript is scrollback-only.
+9. Port active/running task UI to active cells.
+10. Add resize reflow.
+11. Port print-and-exit to cells.
+12. Delete old event-to-line renderers.
+13. Delete old bottom-pane history surface.
 
 This is a rewrite by architecture, not a reckless rewrite by file deletion.
 
 ### Ideal End State
 
 ```text
-                 events
+          in-memory RuntimeState
+          SQLite hydrates/flushes
                    |
                    v
           source-backed transcript
@@ -2404,3 +2485,582 @@ This is a rewrite by architecture, not a reckless rewrite by file deletion.
 ```
 
 The renderer becomes predictable because every mode has one content owner. That is the main thing we need.
+
+## Part 7: Concrete Implementation Plan
+
+This is the execution plan for getting from the current renderer to the ideal renderer without a dangerous big-bang replacement.
+
+### Strategy
+
+Build Renderer V2 beside the current renderer, behind a feature flag or runtime config:
+
+```text
+renderer_v1 = current render.rs path
+renderer_v2 = new memory-backed, scrollback-first renderer
+```
+
+The switch should happen surface by surface:
+
+1. prove the data model;
+2. prove rendering cells;
+3. prove terminal scrollback replay;
+4. prove normal completed task loading;
+5. prove running task streaming;
+6. retire old duplicate render paths.
+
+The first useful milestone is not "all UI rewritten". The first useful milestone is:
+
+> completed task replay uses in-memory transcript cells, writes native scrollback once, and the live viewport shows only the dock/composer.
+
+That milestone directly kills the duplication class shown in the screenshots.
+
+### Phase 0: Baseline And Fixtures
+
+Goal: preserve current broken and expected behavior as test fixtures before changing architecture.
+
+Work:
+
+- capture a fixture for the latest completed task that reproduces duplicated output;
+- create a fixture with a parent session and child/subagent session;
+- create a fixture with long tool output;
+- create a fixture with long URLs and wide terminal widths;
+- create a fixture with narrow width wrapping;
+- add a small test harness that can load these fixtures without running a live model.
+
+Suggested files:
+
+```text
+tests/golden-events/
+  completed-task.json
+  subagent-task.json
+  long-tool-output.json
+  long-url.json
+
+crates/browser-use-tui/src/renderer_v2/tests.rs
+```
+
+Acceptance:
+
+- fixtures load deterministically;
+- current duplicated behavior can be reproduced by a real terminal smoke case;
+- no production behavior changes yet.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui renderer_fixture
+scripts/tui-terminal-smoke.py
+```
+
+### Phase 1: In-Memory Runtime State Boundary
+
+Goal: define the live canonical state that renderer V2 consumes.
+
+Work:
+
+- introduce `RuntimeState` or `SessionStore` as an in-memory owner for sessions/events;
+- define append/update APIs for session lifecycle, events, artifacts, browser state, and subagents;
+- define SQLite hydration into memory;
+- define SQLite flush/checkpoint from memory;
+- make current store-backed path able to populate this memory model;
+- do not yet change rendering.
+
+Suggested modules:
+
+```text
+crates/browser-use-core/src/runtime_state.rs
+crates/browser-use-core/src/session_store.rs
+crates/browser-use-store/src/hydrate.rs
+crates/browser-use-store/src/checkpoint.rs
+```
+
+Core API sketch:
+
+```rust
+struct SessionStore {
+    sessions: BTreeMap<SessionId, SessionRuntime>,
+    event_log: EventJournal,
+}
+
+impl SessionStore {
+    fn apply_event(&mut self, event: Event);
+    fn session(&self, id: SessionId) -> Option<&SessionRuntime>;
+    fn descendants(&self, id: SessionId) -> Vec<SessionId>;
+    fn hydrate_from_store(...);
+    fn checkpoint_to_store(...);
+}
+```
+
+Acceptance:
+
+- renderer can get selected session state from memory;
+- old conversations can hydrate from SQLite into memory;
+- live events update memory before renderer notification;
+- SQLite remains durable backing, not renderer source.
+
+Verification:
+
+```bash
+cargo test -p browser-use-core session_store
+cargo test -p browser-use-store hydrate checkpoint
+```
+
+### Phase 2: Transcript Projection
+
+Goal: interpret runtime events once into typed transcript nodes.
+
+Work:
+
+- add `TranscriptModel`;
+- add `TranscriptNode`;
+- add projection from `SessionStore` to transcript nodes;
+- encode parent/child session ownership explicitly;
+- prevent child terminal events from becoming parent top-level transcript nodes;
+- add golden tests for normal task, subagent task, failed task, cancelled task.
+
+Suggested modules:
+
+```text
+crates/browser-use-tui/src/transcript/mod.rs
+crates/browser-use-tui/src/transcript/node.rs
+crates/browser-use-tui/src/transcript/projector.rs
+crates/browser-use-tui/src/transcript/child_sessions.rs
+```
+
+Acceptance:
+
+- a parent final answer appears once;
+- a subagent result appears once as a parent summary node;
+- child details remain accessible for inspector/debug;
+- projection output is stable for golden fixtures.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui transcript_projection
+```
+
+### Phase 3: Render Cells
+
+Goal: convert transcript nodes into width-aware renderable cells.
+
+Work:
+
+- add `RenderCell` trait;
+- implement cells for session header, user prompt, assistant message, tool call, tool result, subagent summary, error, artifact;
+- centralize wrapping using `unicode-width` and `textwrap`;
+- add rich and raw display modes;
+- add line/height caching keyed by cell id, width, display mode, revision.
+
+Suggested modules:
+
+```text
+crates/browser-use-tui/src/transcript/cell.rs
+crates/browser-use-tui/src/renderer/wrapping.rs
+crates/browser-use-tui/src/renderer/style.rs
+```
+
+Acceptance:
+
+- all fixture nodes render to cells;
+- cell height matches rendered lines at narrow/normal widths;
+- long URLs remain usable;
+- raw mode produces clean selectable text;
+- no duplicated event-to-line renderer is added.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui render_cell
+cargo test -p browser-use-tui wrapping
+```
+
+### Phase 4: Renderer V2 Skeleton
+
+Goal: create the new renderer structure without changing default behavior.
+
+Work:
+
+- add `RendererMode`;
+- add `RendererV2`;
+- add `TerminalDriver` wrapper that initially delegates to current terminal behavior;
+- add `LiveViewport`, `DockSurface`, and `OverlaySurface` skeletons;
+- add config/feature flag to opt into renderer V2;
+- keep renderer V1 as default.
+
+Suggested modules:
+
+```text
+crates/browser-use-tui/src/renderer/mod.rs
+crates/browser-use-tui/src/renderer/mode.rs
+crates/browser-use-tui/src/renderer/driver.rs
+crates/browser-use-tui/src/renderer/viewport.rs
+crates/browser-use-tui/src/surfaces/dock.rs
+```
+
+Acceptance:
+
+- app can instantiate renderer V2;
+- V2 can draw a minimal dock/composer viewport;
+- V1 behavior unchanged by default;
+- feature flag can select V2 in deterministic tests.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui renderer_v2
+cargo run -q -p browser-use-tui -- --dump-screen
+```
+
+### Phase 5: Full-Screen History Overlay
+
+Goal: remove history picker from bottom-pane ownership in renderer V2.
+
+Work:
+
+- implement `HistoryOverlay`;
+- render task list full-screen;
+- route keys to overlay while open;
+- open with `Tab`;
+- close with `Esc`;
+- select with `Enter`;
+- preserve old behavior in renderer V1.
+
+Acceptance:
+
+- pressing `Tab` in V2 does not render history inside the main layout;
+- overlay owns the whole screen;
+- selecting a task returns a session id to the app;
+- no duplicate app chrome appears after open/close.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui history_overlay
+scripts/tui-terminal-smoke.py
+```
+
+### Phase 6: Scrollback Manager MVP
+
+Goal: replay completed transcript into native scrollback exactly once.
+
+Work:
+
+- add `ScrollbackManager`;
+- add pending scrollback batches;
+- add clear-owned-scrollback operation;
+- add replay-all operation from render cells;
+- add terminal insertion helper with explicit viewport accounting;
+- initially support the common terminal path;
+- add Zellij/tmux fallback after MVP if needed.
+
+Suggested modules:
+
+```text
+crates/browser-use-tui/src/renderer/scrollback.rs
+crates/browser-use-tui/src/renderer/driver.rs
+```
+
+Acceptance:
+
+- completed task load clears renderer-owned scrollback;
+- committed cells are inserted once;
+- live viewport does not render committed cells;
+- user can select/copy transcript from terminal scrollback;
+- no duplicated transcript after selecting latest task.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui scrollback
+scripts/tui-terminal-smoke.py
+```
+
+### Phase 7: LiveInline Completed Task Path
+
+Goal: make renderer V2 useful for completed tasks.
+
+Work:
+
+- wire selected completed session through memory -> transcript nodes -> render cells;
+- replay render cells through `ScrollbackManager`;
+- draw only dock/composer in inline viewport;
+- remove V2 calls to old native replay functions;
+- add ownership assertions for completed tasks.
+
+Acceptance:
+
+- latest completed task opens with transcript once;
+- history selection opens completed task with transcript once;
+- viewport shows only controls/follow-up composer;
+- screenshots from the original bug no longer reproduce in V2.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui completed_task_renderer_v2
+scripts/tui-terminal-smoke.py
+scripts/verify-terminal-ui.sh
+```
+
+### Phase 8: Running Task Path
+
+Goal: support active sessions without redrawing committed history in the viewport.
+
+Work:
+
+- create active cell model for streaming assistant/tool output;
+- commit finalized active cells to `SessionStore`;
+- append finalized cells to scrollback;
+- clear or replace active viewport after commit;
+- keep composer/status dock responsive;
+- support cancellation/failure/result transitions.
+
+Acceptance:
+
+- running task shows active work in viewport;
+- finalized work moves to scrollback;
+- active content does not remain duplicated after finalization;
+- cancellation/failure final states render once;
+- user can continue follow-up after completion.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui running_task_renderer_v2
+scripts/tui-terminal-smoke.py
+scripts/verify-terminal-ui.sh
+```
+
+### Phase 9: Resize Reflow
+
+Goal: rebuild terminal scrollback from render cells when terminal dimensions change.
+
+Work:
+
+- track rendered scrollback width;
+- debounce resize events;
+- clear renderer-owned scrollback;
+- replay committed cells at new width;
+- preserve active viewport/dock;
+- handle resize during streaming by forcing a final reflow after stream finalization.
+
+Acceptance:
+
+- resizing terminal does not leave stale wrapped rows;
+- long URLs and tool output reflow correctly;
+- resize during streaming does not duplicate transient cells;
+- tmux smoke captures remain clean.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui resize_reflow
+scripts/tui-terminal-smoke.py
+scripts/verify-terminal-ui.sh
+```
+
+### Phase 10: Optional Transcript Inspector
+
+Goal: add structured transcript navigation without making it the primary transcript.
+
+Work:
+
+- implement `TranscriptInspectorOverlay`;
+- read from `TranscriptModel` / render cells;
+- support scroll, search, jump by turn, expand/collapse subagents/tool output;
+- include optional live tail for active cell if needed;
+- make it explicitly optional.
+
+Acceptance:
+
+- native scrollback remains the primary transcript;
+- inspector can be ignored and app still works;
+- opening inspector does not mutate scrollback;
+- closing inspector restores inline viewport cleanly.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui transcript_inspector
+scripts/tui-terminal-smoke.py
+```
+
+### Phase 11: Plain Output And Export
+
+Goal: make print-and-exit/export use the same render cells.
+
+Work:
+
+- implement `PlainPrinter`;
+- convert render cells to plain lines;
+- remove separate plain transcript event renderer;
+- preserve current CLI output expectations;
+- add raw output snapshots.
+
+Acceptance:
+
+- print-and-exit output matches renderer semantics;
+- subagent output appears once;
+- tool output formatting is consistent with UI raw mode;
+- no ANSI escapes leak into plain output.
+
+Verification:
+
+```bash
+cargo test -p browser-use-tui plain_printer
+uv run --with pytest python -m pytest -q
+```
+
+### Phase 12: Default-On Cutover
+
+Goal: make renderer V2 the default after parity and bug-fix gates pass.
+
+Cutover requirements:
+
+- completed task path passes;
+- running task path passes;
+- history overlay passes;
+- resize reflow passes;
+- print-and-exit passes;
+- original duplication reproduction is fixed;
+- subagent duplication reproduction is fixed;
+- V2 works in tmux smoke;
+- deterministic dumps exist for setup, ready, running, result, history overlay, browser overlay, developer overlay.
+
+Verification:
+
+```bash
+cargo fmt --check
+cargo test
+uv run --with pytest python -m pytest -q
+scripts/verify-terminal-ui.sh
+```
+
+### Phase 13: Delete Old Renderer Paths
+
+Goal: remove architecture that can recreate the same bug.
+
+Delete or retire:
+
+- old native replay line builders;
+- duplicate event-to-line transcript renderers;
+- history-as-bottom-pane path;
+- any normal-mode path that renders committed transcript in the live viewport;
+- SQLite-as-live-render-source assumptions;
+- print-and-exit renderer that bypasses cells.
+
+Acceptance:
+
+- one event-to-transcript interpretation path remains;
+- one committed-history owner exists in `LiveInline`;
+- renderer V1 flag is removed;
+- old bug cannot be represented by the new ownership model.
+
+Verification:
+
+```bash
+rg "append_native_timeline_event|native_replay_live_lines|Surface::History" crates/browser-use-tui/src
+cargo fmt --check
+cargo test
+scripts/verify-terminal-ui.sh
+```
+
+Final tmux-driven manual pass:
+
+Use a real tmux session and control the UI by sending keys. This is required because the renderer is a terminal product, and the important failures happen in real scrollback, keyboard routing, paste handling, and redraw behavior.
+
+Example harness shape:
+
+```bash
+tmux new-session -d -s but-renderer-v2 -x 160 -y 48
+tmux send-keys -t but-renderer-v2 'uv run but' Enter
+tmux capture-pane -p -t but-renderer-v2 -S - > /tmp/but-design-loop/manual-start.txt
+```
+
+Drive normal keyboard flows with `tmux send-keys`:
+
+```bash
+tmux send-keys -t but-renderer-v2 'what is the capital of france?' Enter
+# wait until the live model answers; captured output must contain Paris
+tmux capture-pane -p -t but-renderer-v2 -S - > /tmp/but-design-loop/manual-live-llm.txt
+
+tmux send-keys -t but-renderer-v2 Tab
+tmux capture-pane -p -t but-renderer-v2 -S - > /tmp/but-design-loop/manual-history-overlay.txt
+
+tmux send-keys -t but-renderer-v2 Escape
+tmux send-keys -t but-renderer-v2 F2
+tmux capture-pane -p -t but-renderer-v2 -S - > /tmp/but-design-loop/manual-browser-overlay.txt
+
+tmux send-keys -t but-renderer-v2 Escape
+tmux send-keys -t but-renderer-v2 C-e
+tmux capture-pane -p -t but-renderer-v2 -S - > /tmp/but-design-loop/manual-developer-overlay.txt
+```
+
+Required manual flows:
+
+- launch in tmux with a real PTY;
+- submit a live LLM prompt such as `what is the capital of france?`;
+- wait for the answer and assert the captured pane contains `Paris`;
+- open history with `Tab`;
+- select the latest completed task with keyboard only;
+- verify the transcript appears once in native scrollback;
+- verify the live viewport shows only active/dock/composer content, not a duplicate transcript;
+- open and close browser overlay with `F2`;
+- open and close developer overlay with `Ctrl-E`;
+- test `Esc`, `Enter`, arrow keys, `Ctrl-C`, `Ctrl-Q`;
+- paste a multi-line prompt using tmux paste/send-keys and verify no bracketed paste markers leak;
+- resize the tmux pane and verify scrollback is reflowed or remains coherent;
+- capture panes into `/tmp/but-design-loop/` after every meaningful action.
+
+Manual failure checks:
+
+- no duplicate transcript blocks;
+- no duplicate app chrome;
+- no leaked escape sequences;
+- no visible `^[[A`, `^[[B`, or bracketed paste markers;
+- no stale overlay after closing;
+- no unconsumed keys printed into the composer;
+- no ANSI escapes in plain completed output;
+- terminal scrollback remains selectable text.
+
+### MVP Slice
+
+If we want the fastest meaningful implementation, do this first:
+
+1. transcript projection for completed sessions;
+2. render cells for user/assistant/tool/subagent summary;
+3. full-screen history overlay;
+4. scrollback replay for completed sessions;
+5. small dock-only live viewport after completed replay.
+
+This MVP should fix the exact visible failure:
+
+```text
+select latest completed task
+    |
+    v
+transcript appears once in native scrollback
+    |
+    v
+live viewport shows only follow-up controls
+```
+
+### Definition Of Done
+
+The renderer revamp is done when:
+
+- current running sessions use in-memory state as renderer input;
+- SQLite is only hydration/persistence for renderer purposes;
+- committed transcript in normal mode is native scrollback only;
+- live viewport never redraws committed transcript;
+- history picker is full-screen;
+- optional transcript inspector is secondary;
+- resize reflows from render cells;
+- plain output uses the same cells;
+- subagent output appears once in parent view;
+- `scripts/verify-terminal-ui.sh` passes;
+- final tmux-driven keyboard/manual pass is captured under `/tmp/but-design-loop/`;
+- live LLM smoke prompt answers correctly in tmux, for example `Paris` for `what is the capital of france?`;
+- original screenshots cannot be reproduced.
+

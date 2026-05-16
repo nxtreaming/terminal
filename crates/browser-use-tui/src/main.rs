@@ -22,9 +22,12 @@ use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::Command;
 use ratatui::backend::CrosstermBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Position, Rect};
+use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use unicode_width::UnicodeWidthStr;
 
 mod composer;
 mod markdown;
@@ -2019,25 +2022,201 @@ fn reset_inline_viewport_origin(
 
 fn insert_native_lines(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    lines: Vec<ratatui::text::Line<'static>>,
+    lines: Vec<Line<'static>>,
 ) -> Result<()> {
     if lines.is_empty() {
         return Ok(());
     }
     let height = lines.len().try_into().unwrap_or(u16::MAX).max(1);
+    let hyperlinks = collect_native_hyperlink_segments(&lines);
     terminal.insert_before(height, |buf| {
         let area = buf.area.inner(Margin {
             vertical: 0,
             horizontal: NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
         });
         Paragraph::new(lines).render(area, buf);
+        apply_native_hyperlinks(buf, area, &hyperlinks);
     })?;
     Ok(())
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct NativeHyperlinkSegment {
+    line: usize,
+    start_col: usize,
+    width: usize,
+    target: String,
+}
+
+#[derive(Clone, Debug)]
+struct PendingNativeHyperlink {
+    target: String,
+    segments: Vec<NativeHyperlinkSegment>,
+}
+
+#[derive(Clone, Debug)]
+struct LinkSpanFragment {
+    start_col: usize,
+    width: usize,
+    text: String,
+}
+
+fn collect_native_hyperlink_segments(lines: &[Line<'static>]) -> Vec<NativeHyperlinkSegment> {
+    let mut out = Vec::new();
+    let mut pending: Option<PendingNativeHyperlink> = None;
+
+    for (line_idx, line) in lines.iter().enumerate() {
+        let fragments = link_span_fragments(line);
+        let line_is_wrapped_link = !fragments.is_empty() && line_has_only_link_text(line);
+
+        if !line_is_wrapped_link {
+            flush_pending_hyperlink(&mut out, &mut pending);
+            for fragment in fragments {
+                let trimmed = fragment.text.trim();
+                if looks_like_clickable_url(trimmed) {
+                    out.push(NativeHyperlinkSegment {
+                        line: line_idx,
+                        start_col: fragment.start_col,
+                        width: fragment.width,
+                        target: trimmed.to_string(),
+                    });
+                }
+            }
+            continue;
+        }
+
+        let Some(first_fragment) = fragments.first() else {
+            continue;
+        };
+        let first_text = first_fragment.text.trim();
+        if looks_like_clickable_url(first_text) {
+            flush_pending_hyperlink(&mut out, &mut pending);
+            pending = Some(PendingNativeHyperlink {
+                target: String::new(),
+                segments: Vec::new(),
+            });
+        } else if pending.is_none() {
+            continue;
+        }
+
+        if let Some(group) = pending.as_mut() {
+            for fragment in fragments {
+                group.target.push_str(fragment.text.trim());
+                group.segments.push(NativeHyperlinkSegment {
+                    line: line_idx,
+                    start_col: fragment.start_col,
+                    width: fragment.width,
+                    target: String::new(),
+                });
+            }
+        }
+    }
+
+    flush_pending_hyperlink(&mut out, &mut pending);
+    out
+}
+
+fn flush_pending_hyperlink(
+    out: &mut Vec<NativeHyperlinkSegment>,
+    pending: &mut Option<PendingNativeHyperlink>,
+) {
+    let Some(group) = pending.take() else {
+        return;
+    };
+    if !looks_like_clickable_url(&group.target) {
+        return;
+    }
+    out.extend(
+        group
+            .segments
+            .into_iter()
+            .map(|segment| NativeHyperlinkSegment {
+                target: group.target.clone(),
+                ..segment
+            }),
+    );
+}
+
+fn link_span_fragments(line: &Line<'static>) -> Vec<LinkSpanFragment> {
+    let mut fragments = Vec::new();
+    let mut col = 0;
+    for span in &line.spans {
+        let text = span.content.as_ref();
+        let width = UnicodeWidthStr::width(text);
+        if span.style == theme::link() && !text.trim().is_empty() && width > 0 {
+            fragments.push(LinkSpanFragment {
+                start_col: col,
+                width,
+                text: text.to_string(),
+            });
+        }
+        col += width;
+    }
+    fragments
+}
+
+fn line_has_only_link_text(line: &Line<'static>) -> bool {
+    line.spans
+        .iter()
+        .all(|span| span.content.trim().is_empty() || span.style == theme::link())
+}
+
+fn looks_like_clickable_url(value: &str) -> bool {
+    value.starts_with("https://") || value.starts_with("http://")
+}
+
+fn apply_native_hyperlinks(buf: &mut Buffer, area: Rect, hyperlinks: &[NativeHyperlinkSegment]) {
+    for segment in hyperlinks {
+        let Some(y) = area.y.checked_add(segment.line as u16) else {
+            continue;
+        };
+        if y >= area.bottom() {
+            continue;
+        }
+        let Some(start_x) = area.x.checked_add(segment.start_col as u16) else {
+            continue;
+        };
+        if start_x >= area.right() {
+            continue;
+        }
+        let visible_width = segment
+            .width
+            .min(area.right().saturating_sub(start_x) as usize);
+        if visible_width == 0 {
+            continue;
+        }
+        let end_x = start_x + visible_width as u16 - 1;
+        let Some(target) = osc8_safe_url(&segment.target) else {
+            continue;
+        };
+        let open = format!("\x1b]8;;{target}\x1b\\");
+        let close = "\x1b]8;;\x1b\\";
+
+        if start_x == end_x {
+            let symbol = buf[(start_x, y)].symbol().to_string();
+            buf[(start_x, y)].set_symbol(&format!("{open}{symbol}{close}"));
+            continue;
+        }
+
+        let first_symbol = buf[(start_x, y)].symbol().to_string();
+        buf[(start_x, y)].set_symbol(&format!("{open}{first_symbol}"));
+
+        let last_symbol = buf[(end_x, y)].symbol().to_string();
+        buf[(end_x, y)].set_symbol(&format!("{last_symbol}{close}"));
+    }
+}
+
+fn osc8_safe_url(value: &str) -> Option<String> {
+    let value = value.trim();
+    if !looks_like_clickable_url(value) || value.chars().any(char::is_control) {
+        return None;
+    }
+    Some(value.replace('\\', "%5C"))
+}
+
 fn insert_initial_native_lines(
     terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    lines: Vec<ratatui::text::Line<'static>>,
+    lines: Vec<Line<'static>>,
 ) -> Result<()> {
     insert_native_lines(terminal, lines)
 }
@@ -3061,6 +3240,55 @@ mod redesign_tests {
     }
 
     #[test]
+    fn wrapped_native_links_use_the_full_url_for_each_visible_fragment() {
+        let lines = vec![
+            Line::from(ratatui::text::Span::styled(
+                "https://en.wikiped",
+                theme::link(),
+            )),
+            Line::from(ratatui::text::Span::styled(
+                "ia.org/wiki/Apple_Inc.",
+                theme::link(),
+            )),
+        ];
+
+        let hyperlinks = collect_native_hyperlink_segments(&lines);
+        assert_eq!(hyperlinks.len(), 2);
+        assert_eq!(
+            hyperlinks[0].target,
+            "https://en.wikipedia.org/wiki/Apple_Inc."
+        );
+        assert_eq!(hyperlinks[1].target, hyperlinks[0].target);
+        assert_eq!(hyperlinks[0].line, 0);
+        assert_eq!(hyperlinks[1].line, 1);
+    }
+
+    #[test]
+    fn native_link_escape_annotation_keeps_visible_symbols_clickable() {
+        let lines = vec![
+            Line::from(ratatui::text::Span::styled(
+                "https://example",
+                theme::link(),
+            )),
+            Line::from(ratatui::text::Span::styled(".com/docs", theme::link())),
+        ];
+        let hyperlinks = collect_native_hyperlink_segments(&lines);
+        let mut buffer = Buffer::empty(Rect::new(0, 0, 40, 2));
+        let area = buffer.area;
+        Paragraph::new(lines).render(area, &mut buffer);
+        apply_native_hyperlinks(&mut buffer, area, &hyperlinks);
+
+        assert!(buffer[(0, 0)]
+            .symbol()
+            .starts_with("\x1b]8;;https://example.com/docs\x1b\\h"));
+        assert!(buffer[(14, 0)].symbol().ends_with("\x1b]8;;\x1b\\"));
+        assert!(buffer[(0, 1)]
+            .symbol()
+            .starts_with("\x1b]8;;https://example.com/docs\x1b\\."));
+        assert!(buffer[(8, 1)].symbol().ends_with("\x1b]8;;\x1b\\"));
+    }
+
+    #[test]
     fn child_agent_progress_is_summarized_in_parent_live_view() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -3270,6 +3498,35 @@ mod redesign_tests {
         let before = desired_terminal_viewport_height(&mut app)?;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         assert!(app.is_slash_palette_active());
+        let after = desired_terminal_viewport_height(&mut app)?;
+        assert_eq!(before, after);
+        Ok(())
+    }
+
+    #[test]
+    fn multiline_composer_does_not_resize_completed_history_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(session.id, last_seq);
+
+        let before = desired_terminal_viewport_height(&mut app)?;
+        app.set_input("first line".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::SHIFT))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('s'), KeyModifiers::NONE))?);
         let after = desired_terminal_viewport_height(&mut app)?;
         assert_eq!(before, after);
         Ok(())

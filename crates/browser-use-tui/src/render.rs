@@ -274,9 +274,9 @@ fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active:
 
 pub(crate) fn main_viewport_height(app: &App, width: u16) -> u16 {
     let current = composer_pane_height(app, ProductState::Ready, width);
-    let input_h = composer_visual_input_lines(app, width);
+    let reserved_input_h = 1_u16;
     let palette_h = (palette::max_item_count() as u16).min(8).saturating_add(3);
-    let max_palette = input_h.saturating_add(palette_h).saturating_add(2);
+    let max_palette = reserved_input_h.saturating_add(palette_h).saturating_add(1);
     current.max(max_palette)
 }
 
@@ -305,9 +305,9 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
     let visual_input_lines = composer_visual_input_lines(app, width);
     let palette_h = slash_palette_pane_height(app);
     if palette_h > 0 {
-        visual_input_lines + palette_h + 2
+        visual_input_lines + palette_h + 1
     } else {
-        visual_input_lines + 3
+        visual_input_lines + 2
     }
 }
 
@@ -624,7 +624,6 @@ fn render_composer(
         .constraints([
             Constraint::Length(1),
             Constraint::Length(input_h),
-            Constraint::Length(1),
             Constraint::Length(action_h),
         ])
         .split(area);
@@ -637,11 +636,7 @@ fn render_composer(
         horizontal: 2,
     });
     render_composer_input(frame, input_area, app, state.current_session.as_ref());
-    frame.render_widget(
-        Paragraph::new(input_box_rule(chunks[2].width)).style(border()),
-        chunks[2],
-    );
-    let action_area = chunks[3].inner(Margin {
+    let action_area = chunks[2].inner(Margin {
         vertical: 0,
         horizontal: 2,
     });
@@ -697,11 +692,7 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
 }
 
 fn input_box_rule(width: u16) -> String {
-    let width = width as usize;
-    if width < 2 {
-        return "+".repeat(width);
-    }
-    format!("+{}+", "-".repeat(width.saturating_sub(2)))
+    "-".repeat(width as usize)
 }
 
 fn hint_row(product_state: ProductState, width: usize) -> Line<'static> {
@@ -2531,7 +2522,6 @@ fn append_preview_markdown(
 ) {
     let preview_lines = render_markdown_lines(text, width.saturating_sub(4).max(24))
         .into_iter()
-        .map(trim_default_markdown_indent)
         .filter(|line| {
             line.spans
                 .iter()
@@ -3179,10 +3169,7 @@ fn append_live_delta_text(current: &mut String, incoming: &str) {
 
 fn append_answer_plain_block(lines: &mut Vec<Line<'static>>, markdown: &str, width: u16) {
     let body_width = width.saturating_sub(2).max(24);
-    for line in render_markdown_lines(markdown, body_width)
-        .into_iter()
-        .map(trim_default_markdown_indent)
-    {
+    for line in render_markdown_lines(markdown, body_width) {
         lines.push(line);
     }
 }
@@ -3280,15 +3267,6 @@ fn prefix_block_line(prefix: &'static str, line: Line<'static>) -> Line<'static>
     let mut spans = vec![Span::styled(prefix, dim())];
     spans.extend(line.spans);
     Line::from(spans)
-}
-
-fn trim_default_markdown_indent(mut line: Line<'static>) -> Line<'static> {
-    if let Some(first) = line.spans.first_mut() {
-        if let Some(rest) = first.content.strip_prefix("  ") {
-            first.content = rest.to_string().into();
-        }
-    }
-    line
 }
 
 fn wrap_plain(text: &str, width: usize, continuation_indent: &str) -> Vec<String> {
@@ -3617,4 +3595,40 @@ fn truncate(value: &str, max: usize) -> String {
 
 fn first_line(value: &str) -> String {
     value.lines().next().unwrap_or(value).to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn plain_lines(lines: &[Line<'static>]) -> Vec<String> {
+        lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect()
+    }
+
+    #[test]
+    fn answer_markdown_keeps_list_continuation_indent() {
+        let mut lines = Vec::new();
+        append_answer_plain_block(
+            &mut lines,
+            "- Provider integrations for OpenAI, Codex, Anthropic, Claude Code OAuth, OpenRouter, and fake providers",
+            46,
+        );
+        let rendered = plain_lines(&lines)
+            .into_iter()
+            .filter(|line| !line.trim().is_empty())
+            .collect::<Vec<_>>();
+        assert!(rendered.len() > 1, "{rendered:?}");
+        assert!(
+            rendered[1].starts_with("  "),
+            "continuation line lost list indent: {rendered:?}"
+        );
+    }
 }
