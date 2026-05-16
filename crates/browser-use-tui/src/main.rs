@@ -1844,6 +1844,14 @@ fn new_inline_terminal(height: u16) -> Result<Terminal<CrosstermBackend<io::Stdo
 fn desired_terminal_viewport_height(app: &mut App) -> Result<u16> {
     let (terminal_width, terminal_height) =
         crossterm::terminal::size().unwrap_or((app.args.width, app.args.height));
+    desired_terminal_viewport_height_for(app, terminal_width, terminal_height)
+}
+
+fn desired_terminal_viewport_height_for(
+    app: &mut App,
+    terminal_width: u16,
+    terminal_height: u16,
+) -> Result<u16> {
     let full_height = terminal_height
         .saturating_sub(1)
         .max(app.live_viewport_height());
@@ -1854,13 +1862,13 @@ fn desired_terminal_viewport_height(app: &mut App) -> Result<u16> {
     if app.is_first_run_setup_visible()? || app.selected_session_id.is_none() {
         return Ok(full_height);
     }
-    let selected_is_active = app
-        .refresh_cached_projection()
+    let state = app.refresh_cached_projection().clone();
+    let selected_is_active = state
         .current_session
         .as_ref()
         .is_some_and(|session| session.status.is_active());
     let active_body_reserve = if selected_is_active {
-        renderer_v2::ACTIVE_BODY_RESERVE
+        full_height.saturating_sub(dock_height)
     } else {
         0
     };
@@ -1962,7 +1970,7 @@ fn maybe_emit_v2_transcript(
     let _model_revision = model.revision;
 
     if !app.native_history.is_active_for(Some(&session_id)) {
-        let lines = renderer_v2::all_scrollback_lines(&model, width);
+        let lines = renderer_v2::all_terminal_scrollback_lines(&model, width);
         insert_initial_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session_with_group(session_id, model.last_event_seq, None);
@@ -1973,7 +1981,7 @@ fn maybe_emit_v2_transcript(
     if model.last_event_seq <= after_seq {
         return Ok(());
     }
-    let lines = renderer_v2::scrollback_lines_since(&model, after_seq, width);
+    let lines = renderer_v2::terminal_scrollback_lines_since(&model, after_seq, width);
     app.native_history.last_seq = model.last_event_seq;
     app.native_history.last_group = None;
     insert_native_lines(terminal, lines)?;
@@ -3171,7 +3179,6 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(screen.contains(": thinking"));
-        assert!(screen.contains(": thought inspecting context"));
         assert!(screen.contains("Checking the repository structure."));
         assert!(!screen.contains("Checking \n"));
         assert!(!screen.contains(": answer draft"));
@@ -3210,6 +3217,55 @@ mod redesign_tests {
         assert!(!screen.contains(": answer draft"));
         assert!(screen.contains("Streaming draft answer"));
         assert!(!screen.contains("Streaming \n"));
+        Ok(())
+    }
+
+    #[test]
+    fn active_streaming_viewport_stays_stable_while_message_grows() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "write a long answer"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "line 01"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        let terminal_width = 120_u16;
+        let terminal_height = 80_u16;
+        let full_height = terminal_height
+            .saturating_sub(1)
+            .max(app.live_viewport_height());
+        let initial_desired =
+            desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
+        assert_eq!(initial_desired, full_height);
+
+        let streamed = (1..=18)
+            .map(|idx| format!("line {idx:02}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": streamed}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let grown_desired =
+            desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
+        assert_eq!(grown_desired, initial_desired);
         Ok(())
     }
 
@@ -3531,6 +3587,142 @@ mod redesign_tests {
         assert!(!text.contains("Mapping the main crates."));
         assert!(!text.contains("spawn_agent requested"));
         assert!(!text.contains("parent is waiting"));
+        Ok(())
+    }
+
+    #[test]
+    fn renderer_v2_hides_lifecycle_events_and_groups_semantic_activity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let session = app.store.create_session(None, &cwd)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect repository"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.config",
+            serde_json::json!({"provider": "codex", "model": "GPT-5.5"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({"name": "read_file", "arguments": {"path": "README.md"}}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.started",
+            serde_json::json!({"name": "read_file", "tool_call_id": "read_1"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": cwd.join("README.md").display().to_string()}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.output",
+            serde_json::json!({"name": "read_file", "text": "README raw body should stay out"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.finished",
+            serde_json::json!({"name": "read_file", "tool_call_id": "read_1"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.batch_started",
+            serde_json::json!({"mode": "parallel", "tools": ["read_file", "list_files"]}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": cwd.join("Cargo.toml").display().to_string()}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.list",
+            serde_json::json!({"path": cwd.display().to_string(), "count": 12}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.search",
+            serde_json::json!({"query": "renderer", "matches": 7}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "tool.batch_finished",
+            serde_json::json!({"mode": "parallel", "count": 2}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.compaction_started",
+            serde_json::json!({"reason": "token_budget"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.compacted",
+            serde_json::json!({"reason": "token_budget"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "telemetry.failed",
+            serde_json::json!({"error": "trace exporter unavailable"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "patch.started",
+            serde_json::json!({"tool_call_id": "patch_1"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "patch.file_changed",
+            serde_json::json!({"kind": "changed", "path": cwd.join("README.md").display().to_string()}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "patch.finished",
+            serde_json::json!({"changed_files": 1}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Repository inspected."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = renderer_v2::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&renderer_v2::all_scrollback_lines(&model, 120));
+        let terminal_text =
+            lines_plain_text(&renderer_v2::all_terminal_scrollback_lines(&model, 120));
+
+        assert!(text.contains(": explored"));
+        assert_eq!(text.matches(": explored").count(), 1, "{text}");
+        assert!(text.contains("read README.md"));
+        assert!(text.contains("read Cargo.toml"));
+        assert!(text.contains("list "));
+        assert!(text.contains("search \"renderer\" (7 matches)"));
+        assert!(text.contains(": edit"));
+        assert!(text.contains("changed README.md"));
+        assert!(text.contains("Repository inspected."));
+        assert!(!text.contains("read_file requested"));
+        assert!(!text.contains("read_file started"));
+        assert!(!text.contains("read_file finished"));
+        assert!(!text.contains("batch_started"));
+        assert!(!text.contains("README raw body should stay out"));
+        assert!(!text.contains("trace exporter unavailable"));
+        assert!(!text.contains("token_budget"));
+        assert!(text.contains("waiting for GPT-5.5"));
+        assert!(!terminal_text.contains("waiting for GPT-5.5"));
+        assert!(terminal_text.contains("read README.md"));
         Ok(())
     }
 

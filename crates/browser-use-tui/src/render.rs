@@ -53,6 +53,13 @@ fn buffer_to_string(buffer: &ratatui::buffer::Buffer) -> String {
 pub(crate) fn native_scrollback_lines(app: &mut App, width: u16) -> Result<Vec<Line<'static>>> {
     app.drain_store_notifications()?;
     let state = app.workbench_state()?;
+    if let Some(model) = renderer_v2::transcript_model(app, &state) {
+        let mut lines =
+            renderer_v2::all_terminal_scrollback_lines(&model, width.saturating_sub(4).max(1));
+        lines.push(Line::from(""));
+        return Ok(lines);
+    }
+
     let product_state = app.product_state(&state);
     let body_width = width.saturating_sub(4).max(1);
     let mut lines = Vec::new();
@@ -1201,15 +1208,26 @@ fn work_lines(
     width: u16,
     product_state: ProductState,
 ) -> Vec<Line<'static>> {
-    let mut out =
-        tool_aware_chronological_lines(app, state, width, product_state).unwrap_or_else(|| {
-            transcript_lines(
-                state,
-                width,
-                product_state,
-                matches!(product_state, ProductState::Running),
-            )
-        });
+    let mut out = if let Some(model) = renderer_v2::transcript_model(app, state) {
+        let mut lines = renderer_v2::all_scrollback_lines(&model, width);
+        if matches!(product_state, ProductState::Running) {
+            let active = renderer_v2::active_viewport_lines(Some(&model), width, u16::MAX);
+            if !active.is_empty() {
+                if !lines.is_empty() {
+                    lines.push(Line::from(""));
+                }
+                lines.extend(active);
+            }
+        }
+        lines
+    } else {
+        transcript_lines(
+            state,
+            width,
+            product_state,
+            matches!(product_state, ProductState::Running),
+        )
+    };
     if out.is_empty() {
         append_task_section(&mut out, state);
     }
