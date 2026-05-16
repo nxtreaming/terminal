@@ -2593,12 +2593,14 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("whats happening"));
-        assert!(screen.contains(": subagent"));
+        assert!(screen.contains(": subagent repo-explorer"));
         assert!(!screen.contains(": answer"));
         assert!(screen.contains("Purpose: Rust-first terminal workbench"));
         assert!(screen.contains("crates/browser-use-tui"));
-        assert!(screen.contains("repo-explorer started"));
-        assert!(screen.contains("repo-explorer finished"));
+        assert!(screen.contains("started"));
+        assert!(screen.contains("finished"));
+        assert!(!screen.contains("repo-explorer started"));
+        assert!(!screen.contains("repo-explorer finished"));
         assert!(!screen.contains("helper finished: Repository summary"));
         assert!(!screen.contains("**Purpose:**"));
         Ok(())
@@ -3192,6 +3194,99 @@ mod redesign_tests {
     }
 
     #[test]
+    fn pre_tool_streaming_text_renders_as_model_note_not_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Need", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": " more targeted.", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"turn_idx": 0, "tool_call_count": 1, "text_delta_chars": 19}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({"name": "read_file", "arguments": {"path": "README.md"}}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "/repo/README.md"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Final answer from session.done."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains(": note"));
+        assert!(screen.contains("note: Need more targeted."));
+        assert!(screen.contains("Final answer from session.done."));
+        assert!(!screen.contains(": answer draft"));
+        Ok(())
+    }
+
+    #[test]
+    fn completed_final_stream_does_not_duplicate_session_done_answer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "answer directly"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Draft answer that should not replay.", "turn_idx": 0}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"turn_idx": 0, "tool_call_count": 0, "text_delta_chars": 36}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Canonical final answer."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Canonical final answer."));
+        assert!(!screen.contains("Draft answer that should not replay."));
+        Ok(())
+    }
+
+    #[test]
     fn native_scrollback_filters_transient_model_events() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -3231,7 +3326,9 @@ mod redesign_tests {
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("write as it streams"));
-        assert!(text.contains("repo-explorer started"));
+        assert!(text.contains(": subagent repo-explorer"));
+        assert!(text.contains("started"));
+        assert!(!text.contains("repo-explorer started"));
         assert!(!text.contains("waiting for GPT-5.5"));
         assert!(!text.contains("start repo-explorer helper"));
         assert!(!text.contains(": answer draft"));
@@ -3397,10 +3494,12 @@ mod redesign_tests {
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("explain this repo"));
-        assert!(text.contains("repo-explorer started"));
         assert!(text.contains("subagent repo-explorer"));
+        assert!(text.contains("started"));
         assert!(text.contains("read /repo/README.md"));
-        assert!(text.contains("subagent finished"));
+        assert!(text.contains("finished"));
+        assert!(!text.contains("repo-explorer started"));
+        assert!(!text.contains("subagent finished"));
         assert!(text.contains("Short helper summary"));
         assert!(!text.contains("read every repo file"));
         assert!(!text.contains("CHILD FULL DETAILS SHOULD NOT BE TOP LEVEL"));
@@ -3466,8 +3565,9 @@ mod redesign_tests {
         app.native_history.reset_for_session(session.id, last_seq);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Ask a follow-up"));
-        assert!(screen.contains("Enter:reply"));
+        let composer_row = row_containing(&screen, "Ask a follow-up");
+        let hint_row = row_containing(&screen, "Enter:reply");
+        assert!(hint_row >= composer_row + 2);
         assert!(!screen.contains("describe this repo"));
         assert!(!screen.contains("go say hi to aitor"));
         assert!(!screen.contains("It is a Rust browser-agent workbench."));

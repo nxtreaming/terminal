@@ -25,6 +25,7 @@ pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
 const CONTENT_HORIZONTAL_MARGIN: u16 = 2;
 pub(crate) const NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN: u16 =
     APP_HORIZONTAL_MARGIN + CONTENT_HORIZONTAL_MARGIN;
+const COMPOSER_HINT_GAP: u16 = 1;
 
 pub(crate) fn render_dump(app: &mut App) -> Result<String> {
     app.drain_store_notifications()?;
@@ -307,7 +308,7 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
     if palette_h > 0 {
         visual_input_lines + palette_h + 1
     } else {
-        visual_input_lines + 2
+        visual_input_lines + COMPOSER_HINT_GAP + 2
     }
 }
 
@@ -619,13 +620,23 @@ fn render_composer(
     let palette_h = slash_palette_pane_height(app);
     let input_h = composer_visual_input_lines(app, area.width.saturating_sub(4));
     let action_h = if palette_h > 0 { palette_h } else { 1 };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
+    let constraints = if palette_h > 0 {
+        vec![
             Constraint::Length(1),
             Constraint::Length(input_h),
             Constraint::Length(action_h),
-        ])
+        ]
+    } else {
+        vec![
+            Constraint::Length(1),
+            Constraint::Length(input_h),
+            Constraint::Length(COMPOSER_HINT_GAP),
+            Constraint::Length(action_h),
+        ]
+    };
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints(constraints)
         .split(area);
     frame.render_widget(
         Paragraph::new(input_box_rule(chunks[0].width)).style(border()),
@@ -636,7 +647,8 @@ fn render_composer(
         horizontal: 2,
     });
     render_composer_input(frame, input_area, app, state.current_session.as_ref());
-    let action_area = chunks[2].inner(Margin {
+    let action_chunk = if palette_h > 0 { chunks[2] } else { chunks[3] };
+    let action_area = action_chunk.inner(Margin {
         vertical: 0,
         horizontal: 2,
     });
@@ -1404,14 +1416,8 @@ fn append_tool_aware_event(
                         .and_then(serde_json::Value::as_str)
                 })
                 .unwrap_or("subagent");
-            append_timeline_item(
-                lines,
-                last_group,
-                "subagent",
-                &format!("{label} started"),
-                width,
-                text_style(),
-            );
+            let group = subagent_timeline_group(label);
+            append_timeline_item(lines, last_group, &group, "started", width, text_style());
         }
         "agent.completed" => {
             let child_id = event
@@ -1421,14 +1427,8 @@ fn append_tool_aware_event(
             let label = child_id
                 .map(|id| helper_label_for_session(app, id))
                 .unwrap_or_else(|| "subagent".to_string());
-            append_timeline_item(
-                lines,
-                last_group,
-                "subagent",
-                &format!("{label} finished"),
-                width,
-                text_style(),
-            );
+            let group = subagent_timeline_group(&label);
+            append_timeline_item(lines, last_group, &group, "finished", width, text_style());
             if let Some(result) = event
                 .payload
                 .get("payload")
@@ -1437,7 +1437,7 @@ fn append_tool_aware_event(
                 .map(str::trim)
                 .filter(|result| !result.is_empty())
             {
-                append_preview_markdown(lines, last_group, "subagent", result, width, 3);
+                append_preview_markdown(lines, last_group, &group, result, width, 3);
             }
         }
         "agent.failed" => {
@@ -1460,6 +1460,9 @@ fn append_tool_aware_event(
             );
         }
         "model.tool_call" => append_tool_call_intent(lines, last_group, app, event, width),
+        "model.turn.response" => {
+            append_model_turn_response_notes(lines, last_group, app, event, "note", width)
+        }
         "model.thinking_delta" => {}
         "tool.failed" => {
             let name = event
@@ -1768,24 +1771,21 @@ fn append_native_timeline_event(
                         .and_then(serde_json::Value::as_str)
                 })
                 .unwrap_or("subagent");
-            append_timeline_item(
-                lines,
-                last_group,
-                "subagent",
-                &format!("{label} started"),
-                width,
-                text_style(),
-            );
+            let group = subagent_timeline_group(label);
+            append_timeline_item(lines, last_group, &group, "started", width, text_style());
         }
         "agent.completed" => {
-            append_timeline_item(
-                lines,
-                last_group,
-                "subagent",
-                "subagent finished",
-                width,
-                text_style(),
-            );
+            let label = app
+                .and_then(|app| {
+                    event
+                        .payload
+                        .get("child_session_id")
+                        .and_then(serde_json::Value::as_str)
+                        .map(|id| helper_label_for_session(app, id))
+                })
+                .unwrap_or_else(|| "subagent".to_string());
+            let group = subagent_timeline_group(&label);
+            append_timeline_item(lines, last_group, &group, "finished", width, text_style());
             if let Some(result) = event
                 .payload
                 .get("payload")
@@ -1794,7 +1794,7 @@ fn append_native_timeline_event(
                 .map(str::trim)
                 .filter(|result| !result.is_empty())
             {
-                append_preview_markdown(lines, last_group, "subagent", result, width, 3);
+                append_preview_markdown(lines, last_group, &group, result, width, 3);
             }
         }
         "agent.failed" => {
@@ -1815,6 +1815,11 @@ fn append_native_timeline_event(
                 width,
                 muted(),
             );
+        }
+        "model.turn.response" => {
+            if let Some(app) = app {
+                append_model_turn_response_notes(lines, last_group, app, event, "note", width);
+            }
         }
         "model.tool_call" | "model.thinking_delta" => {}
         "tool.failed" => {
@@ -2038,7 +2043,6 @@ fn append_child_timeline_event(
         | "model.delta"
         | "model.stream_delta"
         | "model.thinking_delta"
-        | "model.turn.response"
         | "model.usage"
         | "model.tool_call"
         | "tool.started"
@@ -2071,6 +2075,9 @@ fn append_child_timeline_event(
                 width,
                 muted(),
             );
+        }
+        "model.turn.response" => {
+            append_model_turn_response_notes(lines, last_group, app, event, &group, width);
         }
         "model.turn.error" => {
             append_timeline_item(
@@ -2435,6 +2442,15 @@ fn helper_label_for_session(app: &App, session_id: &str) -> String {
     compact_path_for_render(session_id)
 }
 
+fn subagent_timeline_group(label: &str) -> String {
+    let label = label.trim();
+    if label.is_empty() || label == "subagent" {
+        "subagent".to_string()
+    } else {
+        format!("subagent {label}")
+    }
+}
+
 fn display_path(path: &str, state: &WorkbenchState) -> String {
     let trimmed = path.trim();
     if trimmed.is_empty() {
@@ -2582,6 +2598,78 @@ fn current_streaming_text(state: &WorkbenchState) -> Option<&str> {
         .and_then(|turn| turn.streaming_text.as_deref())
         .map(str::trim_end)
         .filter(|text| !text.trim().is_empty())
+}
+
+fn append_model_turn_response_notes(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    app: &App,
+    response_event: &EventRecord,
+    group: &str,
+    width: u16,
+) {
+    if model_response_tool_call_count(response_event) == 0 {
+        return;
+    }
+    let Some(text) = model_stream_text_for_response(app, response_event) else {
+        return;
+    };
+    append_model_note_lines(lines, last_group, group, &text, width);
+}
+
+fn model_response_tool_call_count(event: &EventRecord) -> u64 {
+    event
+        .payload
+        .get("tool_call_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0)
+}
+
+fn model_stream_text_for_response(app: &App, response_event: &EventRecord) -> Option<String> {
+    let turn_idx = event_turn_idx(response_event)?;
+    let mut text = String::new();
+    for event in app
+        .state_cache
+        .events_for_session(&response_event.session_id)
+    {
+        if event.seq > response_event.seq {
+            break;
+        }
+        if event.event_type != "model.stream_delta" || event_turn_idx(event) != Some(turn_idx) {
+            continue;
+        }
+        if let Some(delta) = event_text_payload(event) {
+            append_live_delta_text(&mut text, delta);
+        }
+    }
+    let text = text.trim_end().to_string();
+    (!text.trim().is_empty()).then_some(text)
+}
+
+fn event_turn_idx(event: &EventRecord) -> Option<i64> {
+    event
+        .payload
+        .get("turn_idx")
+        .and_then(serde_json::Value::as_i64)
+}
+
+fn append_model_note_lines(
+    lines: &mut Vec<Line<'static>>,
+    last_group: &mut Option<String>,
+    group: &str,
+    text: &str,
+    width: u16,
+) {
+    let mut wrote = false;
+    for raw_line in text.lines().map(str::trim).filter(|line| !line.is_empty()) {
+        let item = if wrote {
+            raw_line.to_string()
+        } else {
+            format!("note: {raw_line}")
+        };
+        append_timeline_item(lines, last_group, group, &item, width, muted());
+        wrote = true;
+    }
 }
 
 fn next_action_lines(
