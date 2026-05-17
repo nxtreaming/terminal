@@ -591,25 +591,37 @@ const CONTEXT_BAR_WIDTH: usize = 10;
 /// the active model, a context-fill bar, and accumulated session cost.
 fn status_bar_line(app: &App, state: &WorkbenchState, width: usize) -> Line<'static> {
     let usage = session_usage(app, state);
-    let mut spans = vec![Span::styled(app.model.clone(), accent())];
-    // Always show the context bar in a session — empty (0/60k) before the first turn.
-    spans.push(status_separator());
-    spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
-    if usage.cost_usd > 0.0 {
-        spans.push(status_separator());
-        spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
-    }
+
+    // Segments in priority order after the model; each is appended only if the
+    // whole segment still fits, so a narrow terminal degrades gracefully
+    // (drops the cost, then the branch, then the bar) rather than collapsing.
+    let mut segments: Vec<Vec<Span<'static>>> = Vec::new();
+
+    let mut bar = vec![status_separator()];
+    bar.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
+    segments.push(bar);
+
     if let Some(branch) = git_branch() {
-        spans.push(status_separator());
-        spans.push(Span::styled(branch, done()));
+        segments.push(vec![status_separator(), Span::styled(branch, done())]);
     }
-    let used: usize = spans
-        .iter()
-        .map(|span: &Span<'_>| span.content.chars().count())
-        .sum();
-    if used > width {
-        // The model name alone always fits; drop the usage segments rather than wrap.
-        return Line::from(Span::styled(truncate(&app.model, width), accent()));
+    if usage.cost_usd > 0.0 {
+        segments.push(vec![
+            status_separator(),
+            Span::styled(format!("${:.4}", usage.cost_usd), muted()),
+        ]);
+    }
+
+    let mut spans = vec![Span::styled(app.model.clone(), accent())];
+    let mut used = app.model.chars().count();
+    for segment in segments {
+        let segment_len: usize = segment
+            .iter()
+            .map(|span: &Span<'_>| span.content.chars().count())
+            .sum();
+        if used + segment_len <= width {
+            used += segment_len;
+            spans.extend(segment);
+        }
     }
     Line::from(spans)
 }
@@ -1150,37 +1162,71 @@ pub(crate) fn session_header_lines(
 fn config_card_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'static>> {
     let card_w = width.clamp(32, 94);
     let inner_w = card_w.saturating_sub(2);
-    let mut lines = vec![
-        Line::from(Span::styled(format!("+{}+", "-".repeat(inner_w)), border())),
-        card_text_line("Browser Use", "", "", inner_w),
-        card_blank_line(inner_w),
-        card_kv_line("model", &app.model, "/model", inner_w),
-        card_kv_line(
-            "account",
-            &compact_account_label(&app.account),
-            "/auth",
-            inner_w,
-        ),
-        card_kv_line(
-            "browser",
-            &browser_ready_label(app, state).replace(" ready", " idle"),
-            "/browser",
-            inner_w,
-        ),
-        card_kv_line("directory", &cwd_label(), "", inner_w),
-        card_kv_line(
-            "telemetry",
-            &app.laminar_status()
-                .unwrap_or_else(|_| "Laminar unavailable".to_string()),
-            "/laminar",
-            inner_w,
-        ),
-    ];
-    lines.push(Line::from(Span::styled(
-        format!("+{}+", "-".repeat(inner_w)),
-        border(),
-    )));
+    let rule = || Line::from(Span::styled(format!("+{}+", "-".repeat(inner_w)), border()));
+    let mut lines = vec![rule()];
+    lines.extend(card_logo_lines(inner_w));
+    lines.push(card_blank_line(inner_w));
+    lines.push(card_kv_line("model", &app.model, "/model", inner_w));
+    lines.push(card_kv_line(
+        "account",
+        &compact_account_label(&app.account),
+        "/auth",
+        inner_w,
+    ));
+    lines.push(card_kv_line(
+        "browser",
+        &browser_ready_label(app, state).replace(" ready", " idle"),
+        "/browser",
+        inner_w,
+    ));
+    lines.push(card_kv_line("directory", &cwd_label(), "", inner_w));
+    lines.push(card_kv_line(
+        "telemetry",
+        &app.laminar_status()
+            .unwrap_or_else(|_| "Laminar unavailable".to_string()),
+        "/laminar",
+        inner_w,
+    ));
+    lines.push(rule());
     lines
+}
+
+/// The Browser Use orbit mark — two crossed elliptical rings downsampled from
+/// the brand SVG into a symmetric 4-row block-character sprite — paired with
+/// the product name as the visual anchor of the session config card.
+fn card_logo_lines(inner_w: usize) -> Vec<Line<'static>> {
+    const SPRITE: [&str; 4] = [
+        "▟▀▜██▛▀▙",
+        "▜▟▀  ▀▙▛",
+        "▟▜▄  ▄▛▙",
+        "▜▄▟██▙▄▛",
+    ];
+    /// Sprite row the product name sits beside (vertically centered).
+    const TITLE_ROW: usize = 1;
+    /// Blank columns between the sprite and the product name.
+    const GAP: usize = 3;
+
+    SPRITE
+        .iter()
+        .enumerate()
+        .map(|(row, art)| {
+            let title = if row == TITLE_ROW { "Browser Use" } else { "" };
+            let used = 1 + art.chars().count() + GAP + title.chars().count();
+            let pad = inner_w.saturating_sub(used);
+            let mut spans = vec![
+                Span::styled("|", border()),
+                Span::raw(" "),
+                Span::styled((*art).to_string(), text_style()),
+                Span::raw(" ".repeat(GAP)),
+            ];
+            if !title.is_empty() {
+                spans.push(Span::styled(title.to_string(), bold()));
+            }
+            spans.push(Span::raw(" ".repeat(pad)));
+            spans.push(Span::styled("|", border()));
+            Line::from(spans)
+        })
+        .collect()
 }
 
 fn card_blank_line(inner_w: usize) -> Line<'static> {
