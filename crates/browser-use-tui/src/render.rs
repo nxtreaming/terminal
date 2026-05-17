@@ -438,7 +438,7 @@ fn surface_footer(surface: Surface) -> &'static str {
     match surface {
         Surface::ApiKey => "Enter:save | Esc:cancel",
         Surface::Telemetry => "Enter:save | Esc:cancel",
-        Surface::History => "Enter:open | R:resume | Esc:back",
+        Surface::History => "",
         Surface::Setup => "Enter:continue | Esc:quit",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::Developer => "Esc:close",
@@ -593,24 +593,15 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let desc_style = if is_selected { text_style() } else { muted() };
         let desc_max = width.saturating_sub(cmd_col + 4).max(8);
         let description = truncate(item.description, desc_max);
-        let mut line = Line::from(vec![
-            Span::raw("  "),
-            Span::styled(format!("{:<cmd_col$}", item.command), cmd_style),
-            Span::raw("  "),
-            Span::styled(description, desc_style),
-        ]);
-        if is_selected {
-            let used: usize = line
-                .spans
-                .iter()
-                .map(|span| span.content.chars().count())
-                .sum();
-            if used < width {
-                line.spans.push(Span::raw(" ".repeat(width - used)));
-            }
-            line = line.style(selection());
-        }
-        lines.push(line);
+        lines.push(highlight_selectable_row(
+            vec![
+                Span::styled(format!("{:<cmd_col$}", item.command), cmd_style),
+                Span::raw("  "),
+                Span::styled(description, desc_style),
+            ],
+            is_selected,
+            width,
+        ));
     }
     lines.push(Line::from(Span::styled("-".repeat(rule_w), dim())));
     lines.push(Line::from(Span::styled(
@@ -1563,21 +1554,46 @@ fn history_overlay_line(
     width: usize,
 ) -> Line<'static> {
     let task_width = width.saturating_sub(22).max(12);
-    Line::from(vec![
-        Span::styled(
-            if idx == selected_row { "> " } else { "  " },
-            if idx == selected_row { accent() } else { dim() },
-        ),
-        Span::styled(
-            format!("{:<task_width$}", truncate(&row.task, task_width)),
-            text_style(),
-        ),
-        Span::styled(
-            format!("{:<10}", row.status.as_str()),
-            status_style(row.status.as_str()),
-        ),
-        Span::styled(relative_time(row.updated_ms), muted()),
-    ])
+    highlight_selectable_row(
+        vec![
+            Span::styled(
+                format!("{:<task_width$}", truncate(&row.task, task_width)),
+                text_style(),
+            ),
+            Span::styled(
+                format!("{:<10}", row.status.as_str()),
+                status_style(row.status.as_str()),
+            ),
+            Span::styled(relative_time(row.updated_ms), muted()),
+        ],
+        idx == selected_row,
+        width,
+    )
+}
+
+/// The single source of truth for selectable-row styling: a 2-space indent and,
+/// when selected, a full-width background highlight. Shared by the slash palette
+/// and the history list so selection looks identical everywhere.
+fn highlight_selectable_row(
+    content: Vec<Span<'static>>,
+    is_selected: bool,
+    width: usize,
+) -> Line<'static> {
+    let mut spans = vec![Span::raw("  ")];
+    spans.extend(content);
+    let mut line = Line::from(spans);
+    if is_selected {
+        let used: usize = line
+            .spans
+            .iter()
+            .map(|span| span.content.chars().count())
+            .sum();
+        if used < width {
+            line.spans.push(Span::raw(" ".repeat(width - used)));
+        }
+        line = line.style(selection());
+    }
+    line
 }
 
 fn selected(text: &str, idx: usize, selected: usize) -> Line<'static> {
