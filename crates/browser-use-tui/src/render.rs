@@ -589,39 +589,18 @@ const CONTEXT_BAR_WIDTH: usize = 10;
 
 /// Compact Claude-Code-style status bar rendered as the composer footer:
 /// the active model, a context-fill bar, and accumulated session cost.
-fn status_bar_line(app: &App, state: &WorkbenchState, width: usize) -> Line<'static> {
+fn status_bar_line(app: &App, state: &WorkbenchState, _width: usize) -> Line<'static> {
     let usage = session_usage(app, state);
-
-    // Segments in priority order after the model; each is appended only if the
-    // whole segment still fits, so a narrow terminal degrades gracefully
-    // (drops the cost, then the branch, then the bar) rather than collapsing.
-    let mut segments: Vec<Vec<Span<'static>>> = Vec::new();
-
-    let mut bar = vec![status_separator()];
-    bar.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
-    segments.push(bar);
-
+    let mut spans = vec![Span::styled(app.model.clone(), accent())];
+    spans.push(status_separator());
+    spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
     if let Some(branch) = git_branch() {
-        segments.push(vec![status_separator(), Span::styled(branch, done())]);
+        spans.push(status_separator());
+        spans.push(Span::styled(branch, done()));
     }
     if usage.cost_usd > 0.0 {
-        segments.push(vec![
-            status_separator(),
-            Span::styled(format!("${:.4}", usage.cost_usd), muted()),
-        ]);
-    }
-
-    let mut spans = vec![Span::styled(app.model.clone(), accent())];
-    let mut used = app.model.chars().count();
-    for segment in segments {
-        let segment_len: usize = segment
-            .iter()
-            .map(|span: &Span<'_>| span.content.chars().count())
-            .sum();
-        if used + segment_len <= width {
-            used += segment_len;
-            spans.extend(segment);
-        }
+        spans.push(status_separator());
+        spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
     }
     Line::from(spans)
 }
