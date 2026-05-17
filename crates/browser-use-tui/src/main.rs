@@ -2706,6 +2706,11 @@ mod redesign_tests {
             "session.done",
             serde_json::json!({"result": "Everything should sit near the top."}),
         )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"input_tokens": 24500, "cost_usd": 0.0731}),
+        )?;
 
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
@@ -2716,6 +2721,7 @@ mod redesign_tests {
         assert!(ready_screen.contains("/browser"));
         assert!(row_containing(&ready_screen, "recent") <= 14);
         assert!(ready_screen.contains("Tell the browser what to do..."));
+        // Home screen keeps the command hints in the footer.
         assert!(ready_screen.contains("Enter:send"));
         assert!(ready_screen.contains("Tab:history"));
         assert!(!ready_screen.contains("[ new task ]"));
@@ -2725,6 +2731,8 @@ mod redesign_tests {
         assert!(completed_screen.contains("inspect top alignment"));
         assert!(!completed_screen.contains(": answer"));
         assert!(!completed_screen.contains(": done"));
+        // Footer status bar surfaces the active model and a context-fill bar.
+        assert!(completed_screen.contains("24.5k/60k"));
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
         assert!(composer_row > result_row);
@@ -4055,6 +4063,11 @@ mod redesign_tests {
             "session.done",
             serde_json::json!({"result": "Hi Aitor - this is the short summary."}),
         )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"input_tokens": 18234, "cost_usd": 0.0412}),
+        )?;
         let events = app.store.events_for_session(&session.id)?;
         let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
         app.selected_session_id = Some(session.id.clone());
@@ -4062,8 +4075,8 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         let composer_row = row_containing(&screen, "Ask a follow-up");
-        let hint_row = row_containing(&screen, "Enter:reply");
-        assert!(hint_row >= composer_row + 2);
+        let status_row = row_containing(&screen, "/60k");
+        assert!(status_row >= composer_row + 2);
         assert!(!screen.contains("describe this repo"));
         assert!(!screen.contains("go say hi to aitor"));
         assert!(!screen.contains("It is a Rust browser-agent workbench."));

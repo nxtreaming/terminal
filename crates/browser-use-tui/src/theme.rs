@@ -140,6 +140,10 @@ pub(crate) fn thought() -> Style {
         .add_modifier(Modifier::BOLD)
 }
 
+pub(crate) fn selection() -> Style {
+    Style::default().bg(Color::Rgb(45, 52, 66))
+}
+
 pub(crate) fn status_style(status: &str) -> Style {
     match status {
         "done" => done(),
