@@ -514,7 +514,7 @@ fn render_composer(
     area: Rect,
     app: &App,
     state: &WorkbenchState,
-    product_state: ProductState,
+    _product_state: ProductState,
 ) {
     if area.width == 0 || area.height == 0 {
         return;
@@ -559,9 +559,16 @@ fn render_composer(
             Paragraph::new(slash_palette_lines(app, action_area.width as usize)),
             action_area,
         );
-    } else {
+    } else if state.current_session.is_some() {
+        // Inside a session: the compact model/context/cost status bar.
         frame.render_widget(
-            Paragraph::new(hint_row(product_state, action_area.width as usize)),
+            Paragraph::new(status_bar_line(app, state, action_area.width as usize)),
+            action_area,
+        );
+    } else {
+        // Home screen: the command key hints.
+        frame.render_widget(
+            Paragraph::new(hint_row(action_area.width as usize)),
             action_area,
         );
     }
@@ -575,9 +582,8 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0)
         .max(8);
-    let rule_w = width.saturating_sub(28);
+    let rule_w = width.saturating_sub(11);
     let mut lines = vec![Line::from(vec![
-        Span::styled("actions ", bold()),
         Span::styled("-".repeat(rule_w), dim()),
         Span::styled(" esc close", muted()),
     ])];
@@ -587,15 +593,24 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         let desc_style = if is_selected { text_style() } else { muted() };
         let desc_max = width.saturating_sub(cmd_col + 4).max(8);
         let description = truncate(item.description, desc_max);
-        lines.push(Line::from(vec![
-            Span::styled(
-                if is_selected { "> " } else { "  " },
-                if is_selected { accent() } else { dim() },
-            ),
+        let mut line = Line::from(vec![
+            Span::raw("  "),
             Span::styled(format!("{:<cmd_col$}", item.command), cmd_style),
             Span::raw("  "),
             Span::styled(description, desc_style),
-        ]));
+        ]);
+        if is_selected {
+            let used: usize = line
+                .spans
+                .iter()
+                .map(|span| span.content.chars().count())
+                .sum();
+            if used < width {
+                line.spans.push(Span::raw(" ".repeat(width - used)));
+            }
+            line = line.style(selection());
+        }
+        lines.push(line);
     }
     lines.push(Line::from(Span::styled("-".repeat(rule_w), dim())));
     lines.push(Line::from(Span::styled(
@@ -609,29 +624,166 @@ fn input_box_rule(width: u16) -> String {
     "-".repeat(width as usize)
 }
 
-fn hint_row(product_state: ProductState, width: usize) -> Line<'static> {
-    let hints: &[(&str, &str)] = match product_state {
-        ProductState::Running => &[("Esc", "stop"), ("F2", "browser"), ("/", "commands")],
-        ProductState::Result => &[
-            ("Enter", "reply"),
-            ("Tab", "history"),
-            ("F2", "browser"),
-            ("/", "commands"),
-            ("Esc", "clear"),
-        ],
-        ProductState::Failed | ProductState::Cancelled => &[
-            ("Enter", "action"),
-            ("F2", "browser"),
-            ("/", "commands"),
-            ("Esc", "clear"),
-        ],
-        _ => &[
-            ("Enter", "send"),
-            ("Tab", "history"),
-            ("/", "commands"),
-            ("Esc", "clear"),
-        ],
+/// Token budget the context bar fills toward. `browser-use-core` compacts the
+/// conversation at `max_context_chars` (240_000) / `APPROX_CHARS_PER_TOKEN` (4),
+/// so the agent operates within ~60k tokens regardless of the underlying model.
+const CONTEXT_BUDGET_TOKENS: i64 = 60_000;
+
+/// Width, in cells, of the filled/empty context bar.
+const CONTEXT_BAR_WIDTH: usize = 10;
+
+/// Compact Claude-Code-style status bar rendered as the composer footer:
+/// the active model, a context-fill bar, and accumulated session cost.
+fn status_bar_line(app: &App, state: &WorkbenchState, width: usize) -> Line<'static> {
+    let usage = session_usage(app, state);
+    let mut spans = vec![Span::styled(app.model.clone(), accent())];
+    // Always show the context bar in a session — empty (0/60k) before the first turn.
+    spans.push(status_separator());
+    spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
+    if usage.cost_usd > 0.0 {
+        spans.push(status_separator());
+        spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
+    }
+    if let Some(branch) = git_branch() {
+        spans.push(status_separator());
+        spans.push(Span::styled(branch, done()));
+    }
+    let used: usize = spans
+        .iter()
+        .map(|span: &Span<'_>| span.content.chars().count())
+        .sum();
+    if used > width {
+        // The model name alone always fits; drop the usage segments rather than wrap.
+        return Line::from(Span::styled(truncate(&app.model, width), accent()));
+    }
+    Line::from(spans)
+}
+
+/// A plain context bar — solid `█` fill over a `░` track — followed by the
+/// `used/budget` token counts. Turns red as the conversation nears the
+/// compaction budget.
+fn context_bar_spans(used_tokens: i64) -> Vec<Span<'static>> {
+    let used_tokens = used_tokens.max(0);
+    let ratio = (used_tokens as f64 / CONTEXT_BUDGET_TOKENS as f64).clamp(0.0, 1.0);
+    let fill_style = if ratio >= 0.9 { failed() } else { accent() };
+
+    let filled = ((ratio * CONTEXT_BAR_WIDTH as f64).round() as usize).min(CONTEXT_BAR_WIDTH);
+    vec![
+        Span::styled("█".repeat(filled), fill_style),
+        Span::styled("░".repeat(CONTEXT_BAR_WIDTH - filled), dim()),
+        Span::raw("  "),
+        Span::styled(
+            format!(
+                "{}/{}",
+                format_token_count(used_tokens),
+                format_token_count(CONTEXT_BUDGET_TOKENS)
+            ),
+            muted(),
+        ),
+    ]
+}
+
+fn status_separator() -> Span<'static> {
+    Span::styled("  ·  ", dim())
+}
+
+/// Per-session token and cost totals derived from `model.usage` store events.
+struct SessionUsage {
+    /// Prompt tokens of the most recent model turn — i.e. current context occupancy.
+    context_tokens: Option<i64>,
+    /// Accumulated estimated cost across the whole session, in USD.
+    cost_usd: f64,
+}
+
+fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
+    let mut usage = SessionUsage {
+        context_tokens: None,
+        cost_usd: 0.0,
     };
+    let Some(session) = state.current_session.as_ref() else {
+        return usage;
+    };
+    for event in app.cached_events_for_session(&session.id) {
+        if event.event_type != "model.usage" {
+            continue;
+        }
+        if let Some(input_tokens) = event
+            .payload
+            .get("input_tokens")
+            .and_then(serde_json::Value::as_i64)
+        {
+            usage.context_tokens = Some(input_tokens);
+        }
+        if let Some(cost) = event
+            .payload
+            .get("cost_usd")
+            .and_then(serde_json::Value::as_f64)
+        {
+            usage.cost_usd += cost;
+        }
+    }
+    usage
+}
+
+/// Current git branch of the working directory, or `None` outside a repo.
+/// Walks up from the cwd to locate `.git` (directory or worktree pointer file).
+fn git_branch() -> Option<String> {
+    let mut dir = std::env::current_dir().ok()?;
+    loop {
+        let git_path = dir.join(".git");
+        if git_path.is_dir() {
+            return branch_from_git_dir(&git_path);
+        }
+        if git_path.is_file() {
+            // Worktree/submodule: `.git` is a file holding `gitdir: <path>`.
+            let contents = std::fs::read_to_string(&git_path).ok()?;
+            let gitdir = contents.strip_prefix("gitdir:")?.trim();
+            return branch_from_git_dir(std::path::Path::new(gitdir));
+        }
+        if !dir.pop() {
+            return None;
+        }
+    }
+}
+
+fn branch_from_git_dir(git_dir: &std::path::Path) -> Option<String> {
+    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
+    let head = head.trim();
+    if let Some(reference) = head.strip_prefix("ref:") {
+        let reference = reference.trim();
+        return Some(
+            reference
+                .strip_prefix("refs/heads/")
+                .unwrap_or(reference)
+                .to_string(),
+        );
+    }
+    // Detached HEAD — fall back to a short commit hash.
+    (head.len() >= 7).then(|| head[..7].to_string())
+}
+
+fn format_token_count(tokens: i64) -> String {
+    let tokens = tokens.max(0);
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    let thousands = tokens as f64 / 1_000.0;
+    if thousands.fract().abs() < 0.05 {
+        format!("{}k", thousands.round() as i64)
+    } else {
+        format!("{thousands:.1}k")
+    }
+}
+
+/// Command key hints shown in the composer footer on the home screen, where
+/// there is no active session and therefore no usage data to surface.
+fn hint_row(width: usize) -> Line<'static> {
+    let hints = [
+        ("Enter", "send"),
+        ("Tab", "history"),
+        ("/", "commands"),
+        ("Esc", "clear"),
+    ];
     let mut spans = Vec::new();
     for (idx, (key, action)) in hints.iter().enumerate() {
         if idx > 0 {
