@@ -1086,10 +1086,15 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
         "background browser",
     ];
     for (idx, browser) in BROWSER_CHOICES.iter().enumerate() {
-        lines.push(selected(
-            &format!("{browser:<24} {}", descriptions[idx]),
-            idx,
-            app.selected_row,
+        let is_selected = idx == app.selected_row;
+        let name_style = if is_selected { bold() } else { text_style() };
+        lines.push(highlight_selectable_row(
+            vec![
+                Span::styled(format!("{browser:<24}"), name_style),
+                Span::styled(descriptions[idx].to_string(), muted()),
+            ],
+            is_selected,
+            88,
         ));
     }
     lines.extend([
