@@ -1027,12 +1027,10 @@ fn model_lines(app: &App) -> Vec<Line<'static>> {
 
 fn model_row(idx: usize, app: &App) -> Line<'static> {
     let choice = MODEL_CHOICES[idx];
-    let selected = idx == app.selected_row;
+    let is_selected = idx == app.selected_row;
     let current =
         app.model_configured && app.model == choice.display && app.account == choice.account;
-    let chev = if selected { ">" } else { " " };
-    let chev_style = if selected { accent() } else { dim() };
-    let name_style = if selected { bold() } else { text_style() };
+    let name_style = if is_selected { bold() } else { text_style() };
     let access = access_label(choice.account);
     let descriptor = descriptor_for(idx);
     let descriptor_style = if descriptor == "needs key" {
@@ -1040,15 +1038,16 @@ fn model_row(idx: usize, app: &App) -> Line<'static> {
     } else {
         muted()
     };
-    Line::from(vec![
-        Span::raw("  "),
-        Span::styled(chev.to_string(), chev_style),
-        Span::raw(" "),
-        Span::styled(format!("{:<20}", choice.display), name_style),
-        Span::styled(format!("{:<22}", access), muted()),
-        Span::styled(format!("{:<22}", descriptor), descriptor_style),
-        Span::styled(if current { "*" } else { "" }.to_string(), done()),
-    ])
+    highlight_selectable_row(
+        vec![
+            Span::styled(format!("{:<20}", choice.display), name_style),
+            Span::styled(format!("{:<22}", access), muted()),
+            Span::styled(format!("{:<22}", descriptor), descriptor_style),
+            Span::styled(if current { " *" } else { "" }.to_string(), done()),
+        ],
+        is_selected,
+        88,
+    )
 }
 
 fn access_label(account: &'static str) -> &'static str {

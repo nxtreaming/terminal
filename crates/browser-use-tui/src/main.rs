@@ -3084,7 +3084,7 @@ mod redesign_tests {
         }
         assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("> DeepSeek V4 Pro"));
+        assert!(screen.contains("DeepSeek V4 Pro"));
         Ok(())
     }
 
