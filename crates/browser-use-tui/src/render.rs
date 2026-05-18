@@ -1037,7 +1037,10 @@ fn model_row(idx: usize, app: &App) -> Line<'static> {
             Span::styled(if current { " *" } else { "" }.to_string(), done()),
         ],
         is_selected,
-        88,
+        // 2-space indent + 20 + 22 + 22 columns + " *" — width of the longest
+        // possible row (one with the current-selection marker), so every row
+        // highlights to the same end column.
+        68,
     )
 }
 
