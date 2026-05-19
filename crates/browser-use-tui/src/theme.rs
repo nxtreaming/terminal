@@ -88,6 +88,22 @@ pub(crate) fn input_rule() -> Style {
     Style::default().fg(Color::Rgb(176, 179, 173))
 }
 
+fn user_prompt_background_color() -> Color {
+    Color::Rgb(38, 42, 38)
+}
+
+/// Background fill for a user prompt block in the transcript, so the message
+/// the user sent stands apart from the agent's replies.
+pub(crate) fn user_prompt_text() -> Style {
+    text_style().bg(user_prompt_background_color())
+}
+
+/// The accent-colored `>` prefix on a user prompt, sharing the prompt's
+/// highlight background.
+pub(crate) fn user_prompt_accent() -> Style {
+    accent().bg(user_prompt_background_color())
+}
+
 pub(crate) fn link() -> Style {
     Style::default()
         .fg(link_color())

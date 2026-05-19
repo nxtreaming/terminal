@@ -4,7 +4,9 @@ use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::render_markdown_lines;
-use crate::theme::{accent, dim, failed, link, muted, text_style, thought};
+use crate::theme::{
+    dim, failed, link, muted, text_style, thought, user_prompt_accent, user_prompt_text,
+};
 
 use super::App;
 
@@ -1125,20 +1127,31 @@ fn timeline_node(
 }
 
 fn prompt_lines(text: &str, _followup: bool, width: u16) -> Vec<Line<'static>> {
+    let content_width = width.saturating_sub(2).max(1) as usize;
+    // Pad the content to the full width so the highlight background reads as a
+    // solid block rather than only wrapping the glyphs.
+    let pad_to_width = |value: &str| -> String {
+        let used: usize = value.chars().map(|ch| ch.width().unwrap_or(0).max(1)).sum();
+        let mut out = value.to_string();
+        out.extend(std::iter::repeat(' ').take(content_width.saturating_sub(used)));
+        out
+    };
     let mut lines = Vec::new();
     for (idx, source) in text.lines().enumerate() {
         let prefix = if idx == 0 { "> " } else { "  " };
-        let content_width = width.saturating_sub(2).max(1);
-        for (wrap_idx, wrapped) in wrap_plain(source, content_width) {
+        for (wrap_idx, wrapped) in wrap_plain(source, content_width as u16) {
             let visible_prefix = if wrap_idx == 0 { prefix } else { "  " };
             lines.push(Line::from(vec![
-                Span::styled(visible_prefix.to_string(), accent()),
-                Span::styled(wrapped, text_style()),
+                Span::styled(visible_prefix.to_string(), user_prompt_accent()),
+                Span::styled(pad_to_width(&wrapped), user_prompt_text()),
             ]));
         }
     }
     if lines.is_empty() {
-        lines.push(Line::from(Span::styled("> ", accent())));
+        lines.push(Line::from(vec![
+            Span::styled("> ", user_prompt_accent()),
+            Span::styled(pad_to_width(""), user_prompt_text()),
+        ]));
     }
     lines
 }
