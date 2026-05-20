@@ -231,11 +231,20 @@ fn render_main(
         body_area
     };
     trim_trailing_whitespace(&mut body);
+    let body_content_rect = content_area(body_render_area);
+    if matches!(product_state, ProductState::Ready) && app.is_welcome_surface() {
+        app.welcome_logo_rect.set(Some(crate::welcome::logo_screen_rect(
+            body_content_rect,
+            app.status_notice.is_some(),
+        )));
+    } else {
+        app.welcome_logo_rect.set(None);
+    }
     frame.render_widget(
         Paragraph::new(body)
             .style(Style::default().fg(text()))
             .wrap(Wrap { trim: false }),
-        content_area(body_render_area),
+        body_content_rect,
     );
     if layout_surface.is_bottom_pane() {
         render_bottom_pane(frame, bottom_area, app, state, layout_surface);
@@ -326,8 +335,8 @@ fn main_bottom_height_for(
 
 fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> u16 {
     let visual_input_lines = composer_visual_input_lines(app, width.saturating_sub(4).max(1));
-    // top border + input rows + bottom border. No hint row beneath.
-    visual_input_lines + 2
+    // top border + input rows + bottom border + status row beneath.
+    visual_input_lines + 3
 }
 
 fn composer_input_area_width(width: u16) -> u16 {
@@ -822,10 +831,11 @@ fn surface_lines(
 /// the bottom when the dropdown takes over the top), cwd on the bottom-left,
 /// branch on the bottom-right. A single hint/status row renders just below
 /// the box.
-/// Minimal composer: a single rounded bordered box wrapping the input
-/// area. No metadata punched into the borders, no hint row below. The
-/// composer's only job is to hold the input — surrounding chrome lives
-/// elsewhere (welcome screen, status surfaces).
+/// Bordered composer with the current git branch punched into the
+/// bottom border, and a single muted status row beneath showing the
+/// active model and the context-fill bar. No browser, no cwd, no key
+/// hints — the only ambient metadata is what the user explicitly asked
+/// to see.
 fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -839,6 +849,7 @@ fn render_composer(
     let input_inner_w = area.width.saturating_sub(4).max(1);
     let input_h = composer_visual_input_lines(app, input_inner_w);
     let box_h = input_h.saturating_add(2).min(area.height);
+    let status_h: u16 = if area.height > box_h { 1 } else { 0 };
 
     let box_area = Rect {
         x: area.x,
@@ -846,22 +857,99 @@ fn render_composer(
         width: area.width,
         height: box_h,
     };
+
+    // Top border + side borders via a standard Block; the bottom border
+    // is drawn manually so we can punch the branch tag through it.
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_type(BorderType::Rounded)
         .border_style(border());
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
-    if inner.width <= 2 || inner.height == 0 {
-        return;
-    }
-    let input_area = Rect {
-        x: inner.x.saturating_add(1),
-        y: inner.y,
-        width: inner.width.saturating_sub(2),
-        height: inner.height,
+
+    let bottom_y = box_area.y + box_area.height.saturating_sub(1);
+    let bottom_area = Rect {
+        x: box_area.x,
+        y: bottom_y,
+        width: box_area.width,
+        height: 1,
     };
-    render_composer_input(frame, input_area, app, state.current_session.as_ref());
+    frame.render_widget(
+        Paragraph::new(composer_bottom_border(box_area.width)),
+        bottom_area,
+    );
+
+    if inner.width > 2 && inner.height > 0 {
+        let input_area = Rect {
+            x: inner.x.saturating_add(1),
+            y: inner.y,
+            width: inner.width.saturating_sub(2),
+            height: inner.height,
+        };
+        render_composer_input(frame, input_area, app, state.current_session.as_ref());
+    }
+
+    if status_h > 0 {
+        let status_area = Rect {
+            x: area.x,
+            y: box_area.y + box_area.height,
+            width: area.width,
+            height: status_h,
+        };
+        let status_inner = status_area.inner(Margin {
+            vertical: 0,
+            horizontal: 2,
+        });
+        frame.render_widget(
+            Paragraph::new(composer_status_line(app, state, status_inner.width as usize)),
+            status_inner,
+        );
+    }
+}
+
+/// Bottom border line for the composer, with the git branch tag punched
+/// through it on the right. `╰─── ⎇ branch ─╯` when a branch exists,
+/// `╰────╯` otherwise.
+fn composer_bottom_border(width: u16) -> Line<'static> {
+    if width < 2 {
+        return Line::from("");
+    }
+    let inner_w = width.saturating_sub(2) as usize;
+    let mut spans: Vec<Span<'static>> = vec![Span::styled("╰", border())];
+    if let Some(branch) = git_branch() {
+        let branch_color = Style::default().fg(ratatui::style::Color::Rgb(192, 132, 252));
+        let tag: Vec<Span<'static>> = vec![
+            Span::raw(" "),
+            Span::styled("⎇ ", muted()),
+            Span::styled(branch, branch_color),
+            Span::raw(" "),
+        ];
+        let tag_w: usize = tag.iter().map(|s| s.content.chars().count()).sum();
+        let trail = 2usize.min(inner_w.saturating_sub(tag_w));
+        let lead = inner_w.saturating_sub(tag_w + trail);
+        spans.push(Span::styled("─".repeat(lead), border()));
+        spans.extend(tag);
+        spans.push(Span::styled("─".repeat(trail), border()));
+    } else {
+        spans.push(Span::styled("─".repeat(inner_w), border()));
+    }
+    spans.push(Span::styled("╯", border()));
+    Line::from(spans)
+}
+
+/// Status row below the composer: active model name plus the context
+/// fill bar. Cost is appended once the session has spent something. No
+/// branch (that lives on the bottom border), no browser.
+fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Line<'static> {
+    let usage = session_usage(app, state);
+    let mut spans = vec![Span::styled(app.model.clone(), accent())];
+    spans.push(status_separator());
+    spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
+    if usage.cost_usd > 0.0 {
+        spans.push(status_separator());
+        spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
+    }
+    Line::from(spans)
 }
 
 /// Build the top border line for the fused composer. Punches one tag
@@ -1684,19 +1772,12 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16) -> Vec<Line<'stati
         lines.push(Line::from(""));
     }
 
-    let branch = git_branch().unwrap_or_else(|| "no branch".to_string());
-    let cwd = cwd_label();
-    let version = env!("CARGO_PKG_VERSION");
-    let elapsed = app.startup_instant.elapsed().as_secs_f32();
     lines.extend(crate::welcome::welcome_lines(
         width,
-        &branch,
-        &cwd,
-        version,
-        elapsed,
+        &app.welcome_anim,
         app.selected_row,
     ));
-    let _ = state; // recent worktree list removed from welcome screen
+    let _ = state;
     lines
 }
 
