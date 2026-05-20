@@ -36,6 +36,10 @@ pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
 }
 
+pub fn install_process_crypto_provider() {
+    let _ = rustls::crypto::aws_lc_rs::default_provider().install_default();
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderBackend {
     Codex,
@@ -7663,5 +7667,11 @@ mod tests {
             1
         );
         Ok(())
+    }
+
+    #[test]
+    fn rustls_crypto_provider_install_is_idempotent() {
+        install_process_crypto_provider();
+        install_process_crypto_provider();
     }
 }

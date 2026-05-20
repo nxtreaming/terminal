@@ -8,9 +8,10 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
-    record_python_response_final_event, record_python_worker_event, run_agent_from_config,
-    run_existing_session_from_config, run_existing_session_with_provider, run_fake_agent,
-    AgentRunOptions, FakeAgentOptions, ProviderBackend, ProviderRunConfig,
+    install_process_crypto_provider, record_python_response_final_event,
+    record_python_worker_event, run_agent_from_config, run_existing_session_from_config,
+    run_existing_session_with_provider, run_fake_agent, AgentRunOptions, FakeAgentOptions,
+    ProviderBackend, ProviderRunConfig,
 };
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, result_from_events,
@@ -441,6 +442,7 @@ struct DatasetTaskPaths {
 }
 
 fn main() -> Result<()> {
+    install_process_crypto_provider();
     load_dotenv()?;
     let args = Args::parse();
     let store = Store::open(&args.state_dir)?;

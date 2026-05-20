@@ -215,6 +215,7 @@ dependencies = [
  "opentelemetry-otlp",
  "opentelemetry_sdk",
  "portable-pty",
+ "rustls",
  "serde_json",
  "tempfile",
 ]

@@ -1,16 +1,18 @@
 use std::collections::HashMap;
 use std::fmt;
 use std::io::{self, Write};
+use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
-use std::sync::mpsc;
+use std::sync::{mpsc, Once};
 use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use browser_use_core::install_process_crypto_provider;
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
-use browser_use_store::{Store, StoreNotification};
+use browser_use_store::{Store, StoreNotification, StoreNotifier};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
@@ -777,10 +779,21 @@ impl App {
         thread::Builder::new()
             .name(format!("browser-use-agent-{session_id}"))
             .spawn(move || {
-                if let Err(error) =
+                let failure_state_dir = state_dir.clone();
+                let failure_session_id = session_id.clone();
+                let failure_notifier = notifier.clone();
+                let result = catch_unwind(AssertUnwindSafe(|| {
                     run_agent_thread(state_dir, session_id, backend, model, browser, notifier)
-                {
-                    eprintln!("agent thread failed: {error:#}");
+                }));
+                match result {
+                    Ok(Ok(())) => {}
+                    Ok(Err(error)) => eprintln!("agent thread failed: {error:#}"),
+                    Err(panic) => record_agent_panic(
+                        failure_state_dir,
+                        failure_session_id,
+                        failure_notifier,
+                        panic_payload_message(panic),
+                    ),
                 }
             })
             .context("spawn agent thread")?;
@@ -1712,7 +1725,51 @@ impl Command for DisableModifyOtherKeys {
     }
 }
 
+static AGENT_PANIC_HOOK: Once = Once::new();
+
+fn install_agent_panic_hook() {
+    AGENT_PANIC_HOOK.call_once(|| {
+        let previous = std::panic::take_hook();
+        std::panic::set_hook(Box::new(move |info| {
+            let is_agent_thread = thread::current()
+                .name()
+                .is_some_and(|name| name.starts_with("browser-use-agent-"));
+            if !is_agent_thread {
+                previous(info);
+            }
+        }));
+    });
+}
+
+fn record_agent_panic(
+    state_dir: PathBuf,
+    session_id: String,
+    notifier: Option<StoreNotifier>,
+    message: String,
+) {
+    let error = format!("agent thread panicked: {message}");
+    if let Ok(store) = Store::open_with_optional_notifier(state_dir, notifier) {
+        let _ = store.append_event(
+            &session_id,
+            "session.failed",
+            serde_json::json!({ "error": error }),
+        );
+    }
+}
+
+fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
+    if let Some(message) = payload.downcast_ref::<&str>() {
+        return (*message).to_string();
+    }
+    if let Some(message) = payload.downcast_ref::<String>() {
+        return message.clone();
+    }
+    "non-string panic payload".to_string()
+}
+
 fn main() -> Result<()> {
+    install_process_crypto_provider();
+    install_agent_panic_hook();
     load_dotenv()?;
     let args = Args::parse();
     if args.dump_screen {
@@ -4330,6 +4387,43 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("developer"));
         assert!(screen.contains("Events"));
+        Ok(())
+    }
+
+    #[test]
+    fn agent_panic_records_failed_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, std::env::current_dir()?)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "panic"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.status",
+            serde_json::json!({"status": "running"}),
+        )?;
+
+        record_agent_panic(
+            temp.path().to_path_buf(),
+            session.id.clone(),
+            None,
+            "test panic".to_string(),
+        );
+
+        let session = store.load_session(&session.id)?.context("session")?;
+        assert_eq!(session.status, SessionStatus::Failed);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.failed"
+                && event
+                    .payload
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .is_some_and(|error| error.contains("test panic"))
+        }));
         Ok(())
     }
 
