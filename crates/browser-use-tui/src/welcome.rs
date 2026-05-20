@@ -210,26 +210,36 @@ pub const LOGO_H: usize = 9; // braille: 9 cells × 4 sub-rows = 36 sub-rows; ri
 const LOGO_R: f32 = 14.0;
 const LOGO_STROKE: f32 = 1.15;
 
+// Boxed splash: logo, product name, version, shortcuts hint — all centered.
+const LOGO_TO_TITLE_GAP: usize = 1;
+const VERSION_TO_HINT_GAP: usize = 2;
+const TITLE: &str = "Browser Use";
+const VERSION: &str = "v0.1.0";
+const HINT_PREFIX: &str = "press ";
+const HINT_KEY: &str = "/";
+const HINT_SUFFIX: &str = " for shortcuts";
+
+fn hint_width() -> usize {
+    HINT_PREFIX.chars().count() + HINT_KEY.chars().count() + HINT_SUFFIX.chars().count()
+}
+
+fn splash_block_h() -> usize {
+    // logo + gap + title(1) + version(1) + gap + hint(1)
+    LOGO_H + LOGO_TO_TITLE_GAP + 1 + 1 + VERSION_TO_HINT_GAP + 1
+}
+
 /// Compute the on-screen rect of the logo inside the welcome surface so the
 /// mouse handler can hit-test clicks against just the logo, not the whole
-/// panel. Must mirror the exact row offsets used by `welcome_lines`, since
-/// the logo is no longer at a fixed top offset — it's vertically centered
-/// in the body area below the header.
+/// panel.
 pub fn logo_screen_rect(
     body_rect: ratatui::layout::Rect,
     has_status_notice: bool,
 ) -> ratatui::layout::Rect {
-    // Rows ready_lines prepends before invoking welcome_lines.
     let status_notice_rows: u16 = if has_status_notice { 2 } else { 0 };
-    // welcome_lines outputs: header(1) + pad_top blanks + logo(LOGO_H) + ...
-    // Recompute pad_top using the same formula welcome_lines uses, where
-    // `target_h` was `body_rect.height - status_notice_rows`.
-    const LOGO_TO_MENU_GAP: u16 = 2;
-    const MENU_ROWS: u16 = 3;
     const HEADER_H: u16 = 1;
     let target = body_rect.height.saturating_sub(status_notice_rows);
     let available_below_header = target.saturating_sub(HEADER_H);
-    let block_h = LOGO_H as u16 + LOGO_TO_MENU_GAP + MENU_ROWS;
+    let block_h = splash_block_h() as u16;
     let pad_top = (available_below_header.saturating_sub(block_h) / 2).max(1);
     let top_offset = status_notice_rows + HEADER_H + pad_top;
     let col_offset = body_rect.width.saturating_sub(LOGO_W as u16) / 2;
@@ -241,82 +251,70 @@ pub fn logo_screen_rect(
     }
 }
 
-/// Build the centered welcome screen lines. `elapsed_secs` drives the y-axis spin
-/// for the logo; the tilt is constant (the logo "starts in the right position"
-/// and slowly rotates around y).
+/// Build the welcome screen lines: header + centered boxed splash.
 pub fn welcome_lines(
     width: u16,
     anim: &WelcomeAnim,
-    selected_idx: usize,
+    _selected_idx: usize,
     target_h: u16,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let width = width as usize;
 
-    // Header: left-aligned at the very top, `Browser Use Terminal · ~/cwd`.
-    let cwd = short_cwd();
-    let title = "Browser Use Terminal";
-    let sep = " · ";
-    out.push(Line::from(vec![
-        Span::styled(title.to_string(), bold()),
-        Span::styled(sep.to_string(), muted()),
-        Span::styled(cwd, muted()),
-    ]));
+    // Header: just the cwd, muted.
+    out.push(Line::from(Span::styled(short_cwd(), muted())));
 
-    // Logo + menu form the centered block; we balance the padding above
-    // the logo against the trailing padding below the menu so the gap
-    // looks symmetric within the body area.
-    const LOGO_TO_MENU_GAP: usize = 2;
-    const MENU_ROWS: usize = 3;
-    let block_h = LOGO_H + LOGO_TO_MENU_GAP + MENU_ROWS;
+    let block_h = splash_block_h();
     let header_h = 1_usize;
     let target = target_h as usize;
     let available_below_header = target.saturating_sub(header_h);
-    let pad_top = available_below_header.saturating_sub(block_h) / 2;
-    let pad_top = pad_top.max(1);
+    let pad_top = (available_below_header.saturating_sub(block_h) / 2).max(1);
 
     for _ in 0..pad_top {
         out.push(Line::from(""));
     }
 
+    // Logo, centered.
     let logo_rows = render_braille_logo(LOGO_W, LOGO_H, LOGO_R, LOGO_STROKE, anim.rx, anim.ry);
-    let pad_logo = " ".repeat(width.saturating_sub(LOGO_W) / 2);
+    let logo_pad = " ".repeat(width.saturating_sub(LOGO_W) / 2);
     for row in logo_rows {
-        let mut text = String::with_capacity(pad_logo.len() + row.len());
-        text.push_str(&pad_logo);
+        let mut text = String::with_capacity(logo_pad.len() + row.len());
+        text.push_str(&logo_pad);
         text.push_str(&row);
         out.push(Line::from(Span::styled(text, text_style())));
     }
 
-    for _ in 0..LOGO_TO_MENU_GAP {
+    for _ in 0..LOGO_TO_TITLE_GAP {
         out.push(Line::from(""));
     }
 
-    // menu — 3 rows, centered
-    let menu_w: usize = 38;
-    let pad_menu = " ".repeat(width.saturating_sub(menu_w) / 2);
-    let items: [(&str, &str); 3] = [
-        ("New worktree", "ctrl-w"),
-        ("Resume session", "ctrl-s"),
-        ("Quit", "ctrl-q"),
-    ];
-    for (i, (label, kbd)) in items.iter().enumerate() {
-        let gap = menu_w.saturating_sub(label.len() + kbd.len());
-        let label_style = if i == selected_idx {
-            bold()
-        } else {
-            text_style()
-        };
-        out.push(Line::from(vec![
-            Span::raw(pad_menu.clone()),
-            Span::styled(label.to_string(), label_style),
-            Span::raw(" ".repeat(gap)),
-            Span::styled(kbd.to_string(), muted()),
-        ]));
+    // Title — "Browser Use" bold, centered.
+    let title_pad = " ".repeat(width.saturating_sub(TITLE.chars().count()) / 2);
+    out.push(Line::from(vec![
+        Span::raw(title_pad),
+        Span::styled(TITLE.to_string(), bold()),
+    ]));
+
+    // Version — muted, centered.
+    let version_pad = " ".repeat(width.saturating_sub(VERSION.chars().count()) / 2);
+    out.push(Line::from(vec![
+        Span::raw(version_pad),
+        Span::styled(VERSION.to_string(), muted()),
+    ]));
+
+    for _ in 0..VERSION_TO_HINT_GAP {
+        out.push(Line::from(""));
     }
 
-    // Trailing padding matches pad_top so the gap below the menu mirrors
-    // the gap above the logo.
+    // "press / for shortcuts" — / is bold/accent, surrounding text muted.
+    let hint_pad = " ".repeat(width.saturating_sub(hint_width()) / 2);
+    out.push(Line::from(vec![
+        Span::raw(hint_pad),
+        Span::styled(HINT_PREFIX.to_string(), muted()),
+        Span::styled(HINT_KEY.to_string(), bold()),
+        Span::styled(HINT_SUFFIX.to_string(), muted()),
+    ]));
+
     let used = header_h + pad_top + block_h;
     let pad_bottom = target.saturating_sub(used);
     for _ in 0..pad_bottom {

@@ -11,7 +11,7 @@ use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::theme::{
     link, markdown_code, markdown_code_block, markdown_emphasis, markdown_heading, markdown_marker,
-    markdown_quote, markdown_strong, muted, text_style,
+    markdown_quote, markdown_strong, muted, path_reference, text_style,
 };
 
 pub(crate) fn render_markdown_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
@@ -24,6 +24,30 @@ pub(crate) fn render_markdown_lines(markdown: &str, width: u16) -> Vec<Line<'sta
         writer.handle_event(event);
     }
     writer.finish()
+}
+
+pub(crate) fn render_code_lines(
+    code: &str,
+    language_hint: Option<&str>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let width = usize::from(width.max(1)).max(24);
+    let lines =
+        highlight_code_to_lines(code, language_hint).unwrap_or_else(|| plain_code_lines(code));
+    lines
+        .into_iter()
+        .flat_map(|line| wrap_line_preserving_spans(line, width))
+        .collect()
+}
+
+pub(crate) fn highlight_code_line_spans(
+    line: &str,
+    language_hint: Option<&str>,
+) -> Option<Vec<Span<'static>>> {
+    let syntax = language_hint
+        .and_then(find_syntax)
+        .or_else(|| guess_syntax_for_code(line))?;
+    highlight_line_to_spans(line, syntax)
 }
 
 #[derive(Clone, Debug)]
@@ -297,8 +321,10 @@ impl MarkdownWriter {
                 self.flush_current();
             }
             let style = self.current_style();
-            if looks_like_bare_link(line) || looks_like_path(line) {
+            if looks_like_bare_link(line) {
                 self.push_span(Span::styled(line.to_string(), link()));
+            } else if looks_like_path(line) {
+                self.push_span(Span::styled(line.to_string(), path_reference()));
             } else {
                 self.push_span(Span::styled(line.to_string(), style));
             }
@@ -314,13 +340,11 @@ impl MarkdownWriter {
         if code.is_empty() {
             return;
         }
-        if let Some(lang) = self.code_block_lang.as_deref() {
-            if let Some(lines) = highlight_code_to_lines(&code, lang) {
-                self.lines.extend(lines);
-                return;
-            }
-        }
-        self.lines.extend(plain_code_lines(&code));
+        self.lines.extend(render_code_lines(
+            &code,
+            self.code_block_lang.as_deref(),
+            self.width as u16,
+        ));
     }
 
     fn ensure_prefix(&mut self) {
@@ -803,12 +827,10 @@ fn looks_like_path(value: &str) -> bool {
 
 fn code_block_language(kind: CodeBlockKind<'_>) -> Option<String> {
     match kind {
-        CodeBlockKind::Fenced(language) => language
-            .split([',', ' ', '\t'])
-            .next()
-            .map(str::trim)
-            .filter(|language| !language.is_empty())
-            .map(ToOwned::to_owned),
+        CodeBlockKind::Fenced(language) => {
+            let language = language.as_ref().trim();
+            (!language.is_empty()).then(|| language.to_string())
+        }
         CodeBlockKind::Indented => None,
     }
 }
@@ -822,27 +844,44 @@ fn plain_code_lines(code: &str) -> Vec<Line<'static>> {
 const MAX_HIGHLIGHT_BYTES: usize = 512 * 1024;
 const MAX_HIGHLIGHT_LINES: usize = 10_000;
 
-fn highlight_code_to_lines(code: &str, lang: &str) -> Option<Vec<Line<'static>>> {
+fn highlight_code_to_lines(code: &str, language_hint: Option<&str>) -> Option<Vec<Line<'static>>> {
     if code.len() > MAX_HIGHLIGHT_BYTES || code.lines().count() > MAX_HIGHLIGHT_LINES {
         return None;
     }
-    let syntax = find_syntax(lang)?;
+    let syntax = language_hint
+        .and_then(find_syntax)
+        .or_else(|| guess_syntax_for_code(code))?;
     let mut highlighter = HighlightLines::new(syntax, syntax_theme());
     let mut lines = Vec::new();
 
     for line in LinesWithEndings::from(code) {
-        let ranges = highlighter.highlight_line(line, syntax_set()).ok()?;
-        let mut spans = Vec::new();
-        for (style, text) in ranges {
-            let text = text.trim_end_matches(['\n', '\r']);
-            if !text.is_empty() {
-                spans.push(Span::styled(text.to_string(), convert_syntect_style(style)));
-            }
-        }
-        lines.push(Line::from(spans));
+        lines.push(Line::from(highlight_line_with(&mut highlighter, line)?));
     }
 
     (!lines.is_empty()).then_some(lines)
+}
+
+fn highlight_line_to_spans(line: &str, syntax: &SyntaxReference) -> Option<Vec<Span<'static>>> {
+    if line.len() > MAX_HIGHLIGHT_BYTES {
+        return None;
+    }
+    let mut highlighter = HighlightLines::new(syntax, syntax_theme());
+    highlight_line_with(&mut highlighter, line)
+}
+
+fn highlight_line_with(
+    highlighter: &mut HighlightLines<'_>,
+    line: &str,
+) -> Option<Vec<Span<'static>>> {
+    let ranges = highlighter.highlight_line(line, syntax_set()).ok()?;
+    let mut spans = Vec::new();
+    for (style, text) in ranges {
+        let text = text.trim_end_matches(['\n', '\r']);
+        if !text.is_empty() {
+            spans.push(Span::styled(text.to_string(), convert_syntect_style(style)));
+        }
+    }
+    Some(spans)
 }
 
 fn syntax_set() -> &'static SyntaxSet {
@@ -861,25 +900,339 @@ fn syntax_theme() -> &'static Theme {
 
 fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
     let syntax_set = syntax_set();
-    let patched = match lang {
-        "csharp" | "c-sharp" => "c#",
-        "golang" => "go",
-        "python3" => "python",
-        "shell" | "sh" | "zsh" => "bash",
-        _ => lang,
-    };
+    syntax_candidates(lang).into_iter().find_map(|candidate| {
+        syntax_set
+            .find_syntax_by_token(&candidate)
+            .or_else(|| syntax_set.find_syntax_by_name(&candidate))
+            .or_else(|| syntax_set.find_syntax_by_extension(&candidate))
+            .or_else(|| {
+                let lower = candidate.to_ascii_lowercase();
+                syntax_set
+                    .syntaxes()
+                    .iter()
+                    .find(|syntax| syntax.name.to_ascii_lowercase() == lower)
+            })
+    })
+}
 
-    syntax_set
-        .find_syntax_by_token(patched)
-        .or_else(|| syntax_set.find_syntax_by_name(patched))
-        .or_else(|| {
-            let lower = patched.to_ascii_lowercase();
-            syntax_set
-                .syntaxes()
-                .iter()
-                .find(|syntax| syntax.name.to_ascii_lowercase() == lower)
+fn syntax_candidates(raw: &str) -> Vec<String> {
+    let mut candidates = Vec::new();
+    for token in raw.split([',', ' ', '\t']) {
+        add_syntax_candidate(token, &mut candidates);
+    }
+    candidates
+}
+
+fn add_syntax_candidate(raw: &str, candidates: &mut Vec<String>) {
+    let token = clean_syntax_token(raw);
+    if token.is_empty() {
+        return;
+    }
+    if let Some((key, value)) = token.split_once('=') {
+        if matches!(
+            key.to_ascii_lowercase().as_str(),
+            "file" | "filename" | "lang" | "language" | "path" | "title"
+        ) {
+            add_syntax_candidate(value, candidates);
+        }
+        return;
+    }
+    let token = token
+        .strip_prefix("language-")
+        .or_else(|| token.strip_prefix("lang-"))
+        .unwrap_or(&token)
+        .trim_start_matches('.');
+    if token.is_empty() {
+        return;
+    }
+    push_candidate(candidates, token);
+    if let Some(alias) = syntax_alias(token) {
+        push_candidate(candidates, alias);
+    }
+    if let Some(extension) = file_extension_hint(token) {
+        push_candidate(candidates, extension);
+        if let Some(alias) = syntax_alias(extension) {
+            push_candidate(candidates, alias);
+        }
+    }
+}
+
+fn clean_syntax_token(raw: &str) -> String {
+    raw.trim()
+        .trim_matches(['{', '}', '[', ']', '(', ')', '"', '\'', '`'])
+        .trim_start_matches('.')
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn push_candidate(candidates: &mut Vec<String>, candidate: &str) {
+    let candidate = candidate.trim();
+    if candidate.is_empty() || candidates.iter().any(|existing| existing == candidate) {
+        return;
+    }
+    candidates.push(candidate.to_string());
+}
+
+fn file_extension_hint(token: &str) -> Option<&str> {
+    let filename = token.rsplit('/').next().unwrap_or(token);
+    let (_, extension) = filename.rsplit_once('.')?;
+    extension
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
+        .then_some(extension)
+}
+
+fn syntax_alias(token: &str) -> Option<&'static str> {
+    match token {
+        "c++" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => Some("c++"),
+        "c#" | "csharp" | "c-sharp" | "cs" => Some("c#"),
+        "golang" => Some("go"),
+        "py" | "python3" | "py3" | "python-repl" => Some("python"),
+        "shell" | "sh" | "zsh" | "fish" | "ksh" | "terminal" | "console" | "shell-session"
+        | "session" => Some("bash"),
+        "ps1" | "powershell" => Some("powershell"),
+        "javascript" | "js" | "jsx" | "node" | "mjs" | "cjs" => Some("javascript"),
+        "typescript" | "ts" | "tsx" => Some("typescript"),
+        "jsonc" | "json5" | "geojson" => Some("json"),
+        "yml" => Some("yaml"),
+        "md" | "mdx" => Some("markdown"),
+        "rb" => Some("ruby"),
+        "rs" => Some("rust"),
+        "kt" | "kts" => Some("kotlin"),
+        "ex" | "exs" => Some("elixir"),
+        "erl" | "hrl" => Some("erlang"),
+        "fs" | "fsi" | "fsx" => Some("f#"),
+        "hs" => Some("haskell"),
+        "jl" => Some("julia"),
+        "lua" => Some("lua"),
+        "nim" => Some("nim"),
+        "pl" | "pm" => Some("perl"),
+        "r" | "rscript" => Some("r"),
+        "scala" | "sc" => Some("scala"),
+        "swift" => Some("swift"),
+        "tf" | "tfvars" | "hcl" => Some("terraform"),
+        "docker" | "containerfile" => Some("dockerfile"),
+        "make" | "mk" => Some("makefile"),
+        "sql" | "pgsql" | "postgres" | "postgresql" | "mysql" | "sqlite" => Some("sql"),
+        "html" | "htm" | "xhtml" => Some("html"),
+        "css" | "scss" | "sass" | "less" => Some("css"),
+        "xml" | "svg" | "plist" => Some("xml"),
+        "diff" | "patch" => Some("diff"),
+        "toml" | "lock" => Some("toml"),
+        _ => None,
+    }
+}
+
+fn guess_syntax_for_code(code: &str) -> Option<&'static SyntaxReference> {
+    let trimmed = code.trim_start();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let first_line = trimmed.lines().next().unwrap_or("").trim();
+    if let Some(shebang) = first_line.strip_prefix("#!") {
+        return guess_syntax_from_shebang(shebang);
+    }
+    if looks_like_json(trimmed) {
+        return find_syntax("json");
+    }
+    if looks_like_diff(trimmed) {
+        return find_syntax("diff");
+    }
+    if looks_like_html_or_xml(trimmed) {
+        return find_syntax("html").or_else(|| find_syntax("xml"));
+    }
+    if looks_like_sql(trimmed) {
+        return find_syntax("sql");
+    }
+    if looks_like_toml(trimmed) {
+        return find_syntax("toml");
+    }
+    if looks_like_yaml(trimmed) {
+        return find_syntax("yaml");
+    }
+    if looks_like_dockerfile(trimmed) {
+        return find_syntax("dockerfile");
+    }
+    if looks_like_rust(trimmed) {
+        return find_syntax("rust");
+    }
+    if looks_like_python(trimmed) {
+        return find_syntax("python");
+    }
+    if looks_like_javascript_or_typescript(trimmed) {
+        return find_syntax("typescript").or_else(|| find_syntax("javascript"));
+    }
+    if looks_like_shell(trimmed) {
+        return find_syntax("bash");
+    }
+    None
+}
+
+fn guess_syntax_from_shebang(shebang: &str) -> Option<&'static SyntaxReference> {
+    let lower = shebang.to_ascii_lowercase();
+    if lower.contains("python") {
+        find_syntax("python")
+    } else if lower.contains("node") || lower.contains("deno") || lower.contains("bun") {
+        find_syntax("javascript")
+    } else if lower.contains("ruby") {
+        find_syntax("ruby")
+    } else if lower.contains("perl") {
+        find_syntax("perl")
+    } else if lower.contains("php") {
+        find_syntax("php")
+    } else if lower.contains("bash")
+        || lower.contains("zsh")
+        || lower.contains("fish")
+        || lower.contains("sh")
+    {
+        find_syntax("bash")
+    } else {
+        None
+    }
+}
+
+fn looks_like_json(value: &str) -> bool {
+    matches!(value.as_bytes().first(), Some(b'{') | Some(b'['))
+        && serde_json::from_str::<serde_json::Value>(value).is_ok()
+}
+
+fn looks_like_diff(value: &str) -> bool {
+    value.starts_with("diff --git")
+        || value.starts_with("@@ ")
+        || value.lines().take(4).any(|line| {
+            line.starts_with("+++ ")
+                || line.starts_with("--- ")
+                || line.starts_with("Index: ")
+                || line.starts_with("rename from ")
         })
-        .or_else(|| syntax_set.find_syntax_by_extension(lang))
+}
+
+fn looks_like_html_or_xml(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    lower.starts_with("<!doctype")
+        || lower.starts_with("<html")
+        || lower.starts_with("<?xml")
+        || (lower.starts_with('<') && lower.contains("</"))
+}
+
+fn looks_like_sql(value: &str) -> bool {
+    let lower = value.trim_start().to_ascii_lowercase();
+    [
+        "select ", "with ", "insert ", "update ", "delete ", "create ", "alter ", "drop ",
+        "pragma ",
+    ]
+    .iter()
+    .any(|prefix| lower.starts_with(prefix))
+}
+
+fn looks_like_toml(value: &str) -> bool {
+    value.lines().take(8).any(|line| {
+        let trimmed = line.trim();
+        (trimmed.starts_with('[') && trimmed.ends_with(']'))
+            || trimmed.starts_with("version =")
+            || trimmed.starts_with("edition =")
+            || trimmed.starts_with("workspace =")
+    })
+}
+
+fn looks_like_yaml(value: &str) -> bool {
+    let mut meaningful = value
+        .lines()
+        .map(str::trim)
+        .filter(|line| !line.is_empty() && !line.starts_with('#'));
+    let Some(first) = meaningful.next() else {
+        return false;
+    };
+    first == "---"
+        || first.starts_with("- ")
+        || (first.contains(": ") && !first.ends_with(';') && !first.contains("://"))
+}
+
+fn looks_like_dockerfile(value: &str) -> bool {
+    value.lines().take(8).any(|line| {
+        matches!(
+            line.trim_start()
+                .split_whitespace()
+                .next()
+                .unwrap_or("")
+                .to_ascii_uppercase()
+                .as_str(),
+            "FROM" | "RUN" | "COPY" | "ADD" | "ENV" | "ARG" | "WORKDIR" | "ENTRYPOINT" | "CMD"
+        )
+    })
+}
+
+fn looks_like_rust(value: &str) -> bool {
+    value.lines().take(12).any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("use ")
+            || trimmed.starts_with("pub ")
+            || trimmed.starts_with("impl ")
+            || trimmed.starts_with("fn ")
+            || trimmed.starts_with("async fn ")
+            || trimmed.starts_with("mod ")
+            || trimmed.starts_with("#[")
+            || trimmed.contains("::")
+    })
+}
+
+fn looks_like_python(value: &str) -> bool {
+    value.lines().take(12).any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("def ")
+            || trimmed.starts_with("class ")
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("from ")
+            || trimmed.starts_with("async def ")
+            || trimmed.starts_with("if __name__ ==")
+    })
+}
+
+fn looks_like_javascript_or_typescript(value: &str) -> bool {
+    value.lines().take(12).any(|line| {
+        let trimmed = line.trim_start();
+        trimmed.starts_with("const ")
+            || trimmed.starts_with("let ")
+            || trimmed.starts_with("var ")
+            || trimmed.starts_with("import ")
+            || trimmed.starts_with("export ")
+            || trimmed.starts_with("function ")
+            || trimmed.contains("=>")
+            || trimmed.contains("console.log")
+    })
+}
+
+fn looks_like_shell(value: &str) -> bool {
+    value.lines().take(8).any(|line| {
+        let trimmed = line.trim_start().trim_start_matches("$ ");
+        matches!(
+            trimmed.split_whitespace().next().unwrap_or(""),
+            "cargo"
+                | "git"
+                | "rg"
+                | "grep"
+                | "find"
+                | "sed"
+                | "awk"
+                | "cat"
+                | "ls"
+                | "cd"
+                | "pwd"
+                | "uv"
+                | "python"
+                | "python3"
+                | "node"
+                | "npm"
+                | "pnpm"
+                | "yarn"
+                | "bun"
+                | "curl"
+                | "ssh"
+                | "docker"
+                | "task"
+                | "sqlite3"
+        )
+    })
 }
 
 fn convert_syntect_style(style: SyntectStyle) -> Style {
@@ -891,6 +1244,12 @@ fn convert_syntect_style(style: SyntectStyle) -> Style {
 
     if style.font_style.contains(FontStyle::BOLD) {
         converted = converted.add_modifier(Modifier::BOLD);
+    }
+    if style.font_style.contains(FontStyle::ITALIC) {
+        converted = converted.add_modifier(Modifier::ITALIC);
+    }
+    if style.font_style.contains(FontStyle::UNDERLINE) {
+        converted = converted.add_modifier(Modifier::UNDERLINED);
     }
     converted
 }
@@ -919,6 +1278,34 @@ mod tests {
         assert!(text.contains("- Example (https://example.com)"));
         assert!(!text.contains("**important**"));
         assert!(!text.contains("`coupon.json`"));
+    }
+
+    #[test]
+    fn inline_code_urls_and_paths_have_distinct_styles() {
+        let lines = render_markdown_lines(
+            "`@browser-use`\n\nhttps://example.com\n\n./Cargo.toml\n\n/in/reaganh",
+            80,
+        );
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content == "@browser-use" && span.style == markdown_code())
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content == "https://example.com" && span.style == link())
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content == "./Cargo.toml" && span.style == path_reference())
+        }));
+        assert!(lines.iter().any(|line| {
+            line.spans
+                .iter()
+                .any(|span| span.content == "/in/reaganh" && span.style == path_reference())
+        }));
     }
 
     #[test]
@@ -952,6 +1339,31 @@ mod tests {
         assert!(colors
             .first()
             .is_some_and(|first| colors.iter().any(|color| color != first)));
+    }
+
+    #[test]
+    fn code_fence_language_aliases_and_filenames_are_highlighted() {
+        let alias_lines = render_markdown_lines("```rs\nfn main() {}\n```\n", 80);
+        assert!(has_multiple_code_colors(&alias_lines));
+
+        let file_hint_lines = render_markdown_lines(
+            "```filename=crates/browser-use-tui/src/main.rs\nfn main() {}\n```\n",
+            80,
+        );
+        assert!(has_multiple_code_colors(&file_hint_lines));
+    }
+
+    #[test]
+    fn unlabeled_structured_code_blocks_are_highlighted() {
+        let json_lines = render_markdown_lines(
+            "```\n{\"name\":\"browser-use-terminal\",\"count\":2}\n```\n",
+            80,
+        );
+        assert_eq!(
+            plain(&json_lines),
+            "{\"name\":\"browser-use-terminal\",\"count\":2}"
+        );
+        assert!(has_multiple_code_colors(&json_lines));
     }
 
     #[test]
@@ -1015,5 +1427,15 @@ mod tests {
             .iter()
             .any(|span| span.content == "browser-use-terminal"
                 && span.style.add_modifier.contains(Modifier::BOLD)));
+    }
+
+    fn has_multiple_code_colors(lines: &[Line<'static>]) -> bool {
+        let colors = lines
+            .iter()
+            .flat_map(|line| line.spans.iter().filter_map(|span| span.style.fg))
+            .collect::<Vec<_>>();
+        colors
+            .first()
+            .is_some_and(|first| colors.iter().any(|color| color != first))
     }
 }

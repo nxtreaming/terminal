@@ -1,7 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::{Line, Span};
 
-use crate::theme::{accent, bold, dim};
+use crate::theme::{accent, dim};
 
 #[derive(Debug, Default)]
 pub(crate) struct Composer {
@@ -214,7 +214,7 @@ impl Composer {
                 let prefix = if idx == 0 { "> " } else { "  " };
                 Line::from(vec![
                     Span::styled(prefix, accent()),
-                    Span::styled(source_line.to_string(), bold()),
+                    Span::raw(source_line.to_string()),
                 ])
             })
             .collect()
@@ -236,7 +236,7 @@ impl Composer {
                 };
                 lines.push(Line::from(vec![
                     Span::styled(prefix, accent()),
-                    Span::styled(chunk, bold()),
+                    Span::raw(chunk),
                 ]));
             }
         }

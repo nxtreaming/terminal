@@ -3146,16 +3146,14 @@ mod redesign_tests {
 
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
-        // New welcome screen: a centered logo + a small menu.
-        assert!(ready_screen.contains("New worktree"));
-        assert!(ready_screen.contains("Resume session"));
+        // Current welcome screen: centered logo plus the shortcut hint.
+        assert!(ready_screen.contains("Browser Use"));
+        assert!(ready_screen.contains("v0.1.0"));
+        assert!(ready_screen.contains("press / for shortcuts"));
         // Fused composer carries model metadata in the status row.
         assert!(ready_screen.contains("GPT-5.5"));
         // Composer placeholder stays the same so users see the prompt-to-act.
         assert!(ready_screen.contains("Tell the browser what to do..."));
-        // Home screen keeps direct action hints in the welcome menu.
-        assert!(ready_screen.contains("ctrl-w"));
-        assert!(ready_screen.contains("ctrl-s"));
         assert!(!ready_screen.contains("[ new task ]"));
 
         app.selected_session_id = Some(session.id);
