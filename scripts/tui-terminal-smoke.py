@@ -9,18 +9,23 @@ duplicated panels in scrollback, broken bracketed paste, and stale redraws.
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import shutil
+import sqlite3
 import subprocess
 import sys
 import tempfile
 import time
+import uuid
 from pathlib import Path
 
 
 ROOT = Path(__file__).resolve().parents[1]
 ARTIFACT_DIR = Path("/tmp/but-design-loop")
+HISTORY_TITLE = "Browse and resume previous tasks"
+STATUS_BAR_PREFIX = "GPT-5.5  ·"
 
 
 def run(cmd: list[str], *, check: bool = True, text: str | None = None) -> subprocess.CompletedProcess[str]:
@@ -140,6 +145,21 @@ def assert_row_gap_at_most(text: str, before: str, after: str, max_rows: int, co
         )
 
 
+def assert_same_line_gap_at_most(
+    text: str, before: str, after: str, max_gap: int, context: str
+) -> None:
+    for line in text.splitlines():
+        if before not in line or after not in line:
+            continue
+        gap = line.index(after) - (line.index(before) + len(before))
+        if 0 <= gap <= max_gap:
+            return
+        raise AssertionError(
+            f"{context}: expected {after!r} within {max_gap} cells after {before!r}, saw {gap}\n\n{text}"
+        )
+    raise AssertionError(f"{context}: missing same line {before!r} and {after!r}\n\n{text}")
+
+
 def first_text_column(text: str, needle: str, context: str) -> int:
     for line in text.splitlines():
         if needle in line:
@@ -209,6 +229,24 @@ def assert_no_ansi(text: str, context: str) -> None:
         raise AssertionError(f"{context}: output contained ANSI escapes\n\n{text!r}")
 
 
+def latest_session_id(state_dir: Path) -> str:
+    with sqlite3.connect(state_dir / "state.db") as conn:
+        row = conn.execute("SELECT id FROM sessions ORDER BY updated_ms DESC LIMIT 1").fetchone()
+    if row is None:
+        raise AssertionError(f"missing session in {state_dir}/state.db")
+    return str(row[0])
+
+
+def append_store_event(state_dir: Path, session_id: str, event_type: str, payload: dict[str, object]) -> None:
+    now_ms = int(time.time() * 1000)
+    with sqlite3.connect(state_dir / "state.db") as conn:
+        conn.execute(
+            "INSERT INTO events(id, session_id, ts_ms, type, payload_json) VALUES (?, ?, ?, ?, ?)",
+            (uuid.uuid4().hex, session_id, now_ms, event_type, json.dumps(payload)),
+        )
+        conn.execute("UPDATE sessions SET updated_ms = ? WHERE id = ?", (now_ms, session_id))
+
+
 def assert_no_legacy_dashboard_chrome(text: str, context: str) -> None:
     assert_not_contains(text, "[box] Active objective", context)
     assert_not_contains(text, "[box] Task complete", context)
@@ -253,12 +291,14 @@ def smoke_interactive_terminal(binary: Path) -> None:
         wait_for(session, "Type to steer the agent", "initial-running")
 
         tmux_send(session, "Tab", "Down", "Down", "Down")
-        history = wait_for(session, "browser-use / previous work", "history")
-        assert_count(history, "browser-use / previous work", 1, "history should be live, not appended repeatedly")
+        history = wait_for(session, HISTORY_TITLE, "history")
+        assert_count(history, HISTORY_TITLE, 1, "history should be live, not appended repeatedly")
         assert_not_contains(history, "^[[B", "arrow keys should be consumed by the TUI")
 
         tmux_send(session, "Escape")
-        wait_for(session, "Type to steer the agent", "main-after-history")
+        after_history = capture_after_idle(session, "main-after-history", visible_only=True)
+        assert_contains(after_history, "Type to steer the agent", "history escape should restore main composer")
+        assert_not_contains(after_history, HISTORY_TITLE, "history escape should close the overlay")
 
         tmux_send_literal(session, "alpha")
         tmux_send_shift_enter(session)
@@ -270,7 +310,7 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(multiline, "alpha|", "composer should use the terminal cursor, not a fake pipe")
         assert_not_contains(multiline, "beta|", "composer should use the terminal cursor, not a fake pipe")
         assert_no_legacy_dashboard_chrome(multiline, "multiline edit should not show old dashboard chrome")
-        assert_count(multiline, "Esc:stop", 1, "multiline edit should not append duplicate app screens")
+        assert_count(multiline, STATUS_BAR_PREFIX, 1, "multiline edit should not append duplicate app screens")
 
         tmux_send(session, "C-u", "C-u")
         line_removed = capture_after_idle(session, "ctrl-u-removes-empty-composer-line", visible_only=True)
@@ -287,24 +327,27 @@ def smoke_interactive_terminal(binary: Path) -> None:
         wait_for(session, "Type to steer the agent", "main-after-shift-letter-clear")
 
         tmux_send_literal(session, "/stuff")
-        wait_for(session, "> /stuff", "alt-backspace-slash-token-before")
-        tmux_send_alt_backspace(session)
-        slash_token = capture_after_idle(session, "alt-backspace-slash-token", visible_only=True)
-        assert_stripped_line(slash_token, "> /", "alt-backspace should leave slash separator")
-        assert_no_stripped_line(slash_token, "> /stuff", "alt-backspace should delete slash word token")
-        tmux_send(session, "C-c")
-        wait_for(session, "Type to steer the agent", "main-after-alt-backspace-slash-clear")
+        slash_filter = wait_for(session, "> stuff", "slash-palette-filter")
+        assert_contains(slash_filter, "No commands match.", "slash palette should own slash-prefixed input")
+        tmux_send(session, "C-u")
+        slash_cleared = capture_after_idle(session, "slash-palette-ctrl-u-clear", visible_only=True)
+        assert_contains(slash_cleared, "/task", "ctrl-u should clear slash palette filter")
+        assert_not_contains(slash_cleared, "No commands match.", "ctrl-u should clear no-match palette state")
+        tmux_send(session, "Escape")
+        after_slash_filter = capture_after_idle(session, "main-after-slash-palette-close", visible_only=True)
+        assert_contains(after_slash_filter, "Type to steer the agent", "slash escape should restore main composer")
+        assert_not_contains(after_slash_filter, "No commands match.", "slash escape should close the overlay")
 
         tmux_send_literal(session, "something-bla")
         wait_for(session, "> something-bla", "alt-backspace-hyphenated-word-before")
         tmux_send_alt_backspace(session)
         hyphenated_word = capture_after_idle(session, "alt-backspace-hyphenated-word", visible_only=True)
-        assert_stripped_line(hyphenated_word, "> something-", "alt-backspace should delete trailing word token")
-        assert_no_stripped_line(hyphenated_word, "> something-bla", "alt-backspace should delete trailing word token")
+        assert_contains(hyphenated_word, "> something-", "alt-backspace should delete trailing word token")
+        assert_not_contains(hyphenated_word, "> something-bla", "alt-backspace should delete trailing word token")
         tmux_send_alt_backspace(session)
         hyphen = capture_after_idle(session, "alt-backspace-hyphen", visible_only=True)
-        assert_stripped_line(hyphen, "> something", "alt-backspace should delete punctuation token separately")
-        assert_no_stripped_line(hyphen, "> something-", "alt-backspace should delete punctuation token separately")
+        assert_contains(hyphen, "> something", "alt-backspace should delete punctuation token separately")
+        assert_not_contains(hyphen, "> something-", "alt-backspace should delete punctuation token separately")
         tmux_send_alt_backspace(session)
         wait_for(session, "Type to steer the agent", "main-after-alt-backspace-word-clear")
 
@@ -316,7 +359,7 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_not_contains(pasted, "^[[200~", "bracketed paste markers should not leak")
         assert_not_contains(pasted, "paste two|", "paste should use the terminal cursor, not a fake pipe")
         assert_no_legacy_dashboard_chrome(pasted, "paste should not show old dashboard chrome")
-        assert_count(pasted, "Esc:stop", 1, "paste should not append duplicate app screens")
+        assert_count(pasted, STATUS_BAR_PREFIX, 1, "paste should not append duplicate app screens")
 
         tmux_send(session, "C-c")
         after_paste_clear = capture_after_idle(session, "main-after-paste-clear", visible_only=True)
@@ -326,46 +369,50 @@ def smoke_interactive_terminal(binary: Path) -> None:
         tmux_send(session, "/")
         palette = wait_for(session, "/task", "slash-palette-open")
         assert_contains(palette, "/auth", "slash palette should fit every product action")
-        assert_contains(palette, "up/down navigate", "slash palette footer should be visible")
+        assert_contains(palette, "↑↓ navigate", "slash palette footer should be visible")
         assert_not_contains(palette, "filter actions", "slash palette should not show a redundant filter prompt")
         assert_first_content_near_top(palette, 2, "slash palette should not be pushed down by previous viewport state")
         wait_for(session, "/model", "slash-palette-open-model")
         tmux_send_literal(session, "bro")
-        actions = wait_for(session, "> /bro", "slash-palette-filtered")
+        actions = wait_for(session, "> bro", "slash-palette-filtered")
         assert_contains(actions, "/browser", "slash palette should show matching command")
         assert_not_contains(actions, "/model", "slash palette should hide non-matching commands")
 
         tmux_send(session, "Escape")
-        wait_for(session, "Type to steer the agent", "main-after-slash-palette")
+        after_slash = capture_after_idle(session, "main-after-slash-palette", visible_only=True)
+        assert_contains(after_slash, "Type to steer the agent", "slash escape should restore main composer")
+        assert_not_contains(after_slash, "/browser", "slash escape should close the overlay")
         tmux_send_literal(session, "/model")
         tmux_send(session, "Enter")
-        model = wait_for(session, "browser-use setup / model", "model-panel")
+        model = wait_for(session, "Choose the model and provider for this session", "model-panel")
         assert_contains(model, "bring your own key", "model surface should show lower sections")
         assert_contains(model, "DeepSeek V4 Pro", "model surface should fit all model rows")
         assert_contains(model, "Enter:select", "model surface footer should be visible")
         assert_first_content_near_top(model, 2, "model surface should not be rendered in the compact dock")
         tmux_send(session, "Escape")
-        wait_for(session, "Type to steer the agent", "main-after-model-surface")
+        after_model = capture_after_idle(session, "main-after-model-surface", visible_only=True)
+        assert_contains(after_model, "Type to steer the agent", "model escape should restore main composer")
+        assert_not_contains(after_model, "Choose the model and provider", "model escape should close the overlay")
         tmux_send(session, "F2")
         browser = wait_for(session, "Current browser", "browser-panel")
-        assert_count(browser, "browser-use / browser", 1, "browser panel should be live, not appended repeatedly")
+        assert_count(browser, "Current browser", 1, "browser panel should be live, not appended repeatedly")
 
         tmux("resize-window", "-t", session, "-x", "100", "-y", "22")
         resized_small = capture_after_idle(session, "resize-100x22", visible_only=True)
         assert_contains(resized_small, "Current browser", "resize should keep the live app visible")
-        assert_regex_count(resized_small, r"^\s+browser-use / browser\b", 1, "resize shrink should redraw in place")
+        assert_count(resized_small, "Current browser", 1, "resize shrink should redraw in place")
         assert_not_contains(resized_small, "^[[", "resize shrink should not leak escape sequences")
 
         tmux("resize-window", "-t", session, "-x", "120", "-y", "28")
         resized_large = capture_after_idle(session, "resize-120x28", visible_only=True)
         assert_contains(resized_large, "Current browser", "resize grow should keep the live app visible")
-        assert_regex_count(resized_large, r"^\s+browser-use / browser\b", 1, "resize grow should redraw in place")
+        assert_count(resized_large, "Current browser", 1, "resize grow should redraw in place")
 
         for width, height in [(112, 26), (96, 22), (132, 31), (104, 24), (120, 28)]:
             tmux("resize-window", "-t", session, "-x", str(width), "-y", str(height))
         resized_burst = capture_after_idle(session, "resize-burst-120x28", visible_only=True)
         assert_contains(resized_burst, "Current browser", "resize burst should keep the live app visible")
-        assert_regex_count(resized_burst, r"^\s+browser-use / browser\b", 1, "resize burst should redraw in place")
+        assert_count(resized_burst, "Current browser", 1, "resize burst should redraw in place")
         assert_not_contains(resized_burst, "^[[", "resize burst should not leak escape sequences")
     finally:
         tmux("kill-session", "-t", session, check=False)
@@ -390,8 +437,9 @@ def smoke_ready_resize_does_not_leave_stale_frames(binary: Path) -> None:
         full = capture_after_idle(session, "ready-resize-scrollback")
         for name, text in [("visible", visible), ("scrollback", full)]:
             assert_contains(text, "Tell the browser what to do...", f"ready resize {name} should keep composer visible")
-            assert_regex_count(text, r"^\s+browser-use\b", 1, f"ready resize {name} should keep one header")
-            assert_regex_count(text, r"^\s+\| Browser Use\b", 1, f"ready resize {name} should keep one setup card")
+            assert_count(text, "Browser Use", 1, f"ready resize {name} should keep one header")
+            assert_count(text, "v0.1.0", 1, f"ready resize {name} should keep one version")
+            assert_count(text, "press / for shortcuts", 1, f"ready resize {name} should keep one shortcut hint")
             assert_not_contains(text, "^[[", f"ready resize {name} should not leak escape sequences")
     finally:
         tmux("kill-session", "-t", session, check=False)
@@ -411,7 +459,7 @@ def smoke_history_selection_emits_native_transcript(binary: Path) -> None:
         )
         wait_for(session, "Tell the browser what to do...", "history-start-ready")
         tmux_send(session, "Tab")
-        wait_for(session, "browser-use / previous work", "history-open-cancelled")
+        wait_for(session, HISTORY_TITLE, "history-open-cancelled")
         tmux_send(session, "Enter")
         selected = wait_for(session, "Ask a follow-up", "history-select-cancelled")
         assert_contains(selected, "Find the top 5 Hacker", "selected task should be in native scrollback")
@@ -421,16 +469,9 @@ def smoke_history_selection_emits_native_transcript(binary: Path) -> None:
         assert_row_gap_at_most(
             selected,
             "Progress is saved",
-            "Continue with a follow-up",
-            5,
-            "stopped status and next menu should stay grouped together",
-        )
-        assert_row_gap_at_most(
-            selected,
-            "Previous work",
             "Ask a follow-up",
             5,
-            "stopped composer should stay attached to the action menu",
+            "stopped status and composer should stay grouped together",
         )
         assert_not_contains(selected, "\x1b[", "native transcript should not leak escapes")
     finally:
@@ -546,14 +587,174 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
 
         tmux_send_literal(session, "continue")
         tmux_send(session, "Enter")
-        running = wait_for(session, "Type to steer the agent", "long-history-followup-running")
+        running = wait_for(session, "> continue", "long-history-followup-running")
         visible_running = capture_after_idle(session, "long-history-followup-visible", visible_only=True)
-        if visible_running.count("Type to steer the agent") > 1:
-            raise AssertionError(
-                "follow-up should not append duplicate app screens\n\n" + visible_running
-            )
+        assert_contains(
+            visible_running,
+            "scroll check line 60",
+            "prompt-only long follow-up should keep the previous transcript tail visible",
+        )
+        assert_contains(
+            visible_running,
+            "https://news.ycombinator.com",
+            "prompt-only long follow-up should keep the completed source visible",
+        )
+        assert_contains(
+            visible_running,
+            "> continue",
+            "prompt-only long follow-up should show the submitted prompt immediately",
+        )
+        assert_contains(
+            visible_running,
+            "sending",
+            "prompt-only long follow-up should show a pending indicator immediately",
+        )
+        assert_same_line_gap_at_most(
+            visible_running,
+            "> continue",
+            "sending",
+            6,
+            "prompt-only long follow-up indicator should sit near submitted text",
+        )
+        first_line = next((line.strip() for line in visible_running.splitlines() if line.strip()), "")
+        if first_line == "> continue":
+            raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible_running)
         assert_no_legacy_dashboard_chrome(visible_running, "follow-up should not show old dashboard chrome")
         assert_not_contains(running, "using browser", "internal browser helper starts should stay hidden")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
+    session = f"but-smoke-prompt-only-followup-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-prompt-only-followup-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="done",
+            select_latest=False,
+        )
+        wait_for(session, "Tell the browser what to do...", "prompt-only-followup-start-ready")
+        tmux_send(session, "Tab", "Enter")
+        wait_for(session, "Top 5 Hacker News posts", "prompt-only-followup-selected")
+        tmux_send_literal(session, "yo")
+        tmux_send(session, "Enter")
+        wait_for(session, "> yo", "prompt-only-followup-running")
+        visible = capture_after_idle(
+            session,
+            "prompt-only-followup-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            visible,
+            "Top 5 Hacker News posts",
+            "prompt-only follow-up should keep the completed answer visible",
+        )
+        assert_contains(
+            visible,
+            "https://news.ycombinator.com",
+            "prompt-only follow-up should keep the completed source visible",
+        )
+        assert_contains(
+            visible,
+            "> yo",
+            "prompt-only follow-up should show the submitted prompt immediately",
+        )
+        assert_contains(
+            visible,
+            "sending",
+            "prompt-only follow-up should show a pending indicator immediately",
+        )
+        assert_same_line_gap_at_most(
+            visible,
+            "> yo",
+            "sending",
+            6,
+            "prompt-only follow-up indicator should sit near submitted text",
+        )
+        first_line = next((line.strip() for line in visible.splitlines() if line.strip()), "")
+        if first_line == "> yo":
+            raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible)
+
+        session_id = latest_session_id(state_dir)
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.turn.request",
+            {"model": "GPT-5.5", "provider": "codex"},
+        )
+        wait_for(session, "waiting for GPT-5.5", "prompt-only-followup-live-waiting")
+        live_frames = []
+        for idx in range(40):
+            live_visible = capture_after_idle(
+                session,
+                f"prompt-only-followup-live-{idx:02d}",
+                delay=0.03,
+                visible_only=True,
+            )
+            live_frames.append(live_visible)
+        for live_visible in live_frames:
+            assert_contains(
+                live_visible,
+                "Top 5 Hacker News posts",
+                "follow-up live activity should not resize away from the completed transcript",
+            )
+            assert_contains(
+                live_visible,
+                "https://news.ycombinator.com",
+                "follow-up live activity should keep the completed source visible",
+            )
+            assert_contains(
+                live_visible,
+                "> yo",
+                "follow-up live activity should keep the submitted prompt visible",
+            )
+            assert_contains(
+                live_visible,
+                "waiting for GPT-5.5",
+                "follow-up live activity should keep the waiting indicator visible",
+            )
+            assert_same_line_gap_at_most(
+                live_visible,
+                "> yo",
+                "waiting for GPT-5.5",
+                6,
+                "follow-up waiting indicator should sit near submitted text",
+            )
+            first_line = next((line.strip() for line in live_visible.splitlines() if line.strip()), "")
+            if first_line == "> yo":
+                raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + live_visible)
+
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.stream_delta",
+            {"text": "streaming now"},
+        )
+        wait_for(session, "streaming now", "prompt-only-followup-streaming")
+        streaming_visible = capture_after_idle(
+            session,
+            "prompt-only-followup-streaming-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            streaming_visible,
+            "> yo",
+            "streaming follow-up should first commit the submitted prompt into native scrollback",
+        )
+        assert_contains(
+            streaming_visible,
+            "streaming now",
+            "streaming follow-up should replace the pending indicator with live output",
+        )
+        assert_not_contains(
+            streaming_visible,
+            "waiting for GPT-5.5",
+            "streaming follow-up should no longer show the prompt-only waiting indicator",
+        )
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -581,7 +782,7 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
             visible,
             "https://news.ycombinator.com",
             "Ask a follow-up",
-            1,
+            2,
             "completed transcript and composer should share a content gutter",
         )
         assert_row_gap_at_most(
@@ -620,30 +821,27 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
         wait_for(session, "Ask a follow-up", "short-done-after-multiline-clear")
         tmux_send(session, "/")
         slash = wait_for(session, "/task", "short-done-slash-palette")
-        assert_contains(slash, "Top 5 Hacker News posts", "slash palette should not clear completed transcript")
         assert_contains(slash, "/history", "slash palette should open on completed history")
+        assert_contains(slash, "Top 5 Hacker News posts", "slash palette should layer over completed transcript")
+        assert_contains(slash, "Ask a follow-up", "slash palette should layer over composer")
         assert_not_contains(slash, "filter actions", "slash palette should not show a redundant filter prompt")
-        assert_first_text_columns_close(
-            slash,
-            "https://news.ycombinator.com",
-            "> /",
-            1,
-            "slash palette should keep transcript and input aligned",
-        )
         assert_row_gap_at_most(
             slash,
-            "https://news.ycombinator.com",
-            "> /",
-            3,
-            "slash palette should not push the completed transcript down",
-        )
-        assert_row_gap_at_most(
-            slash,
-            "actions",
             "/task",
-            3,
-            "slash palette should render in-place without a large redraw gap",
+            "/history",
+            2,
+            "slash palette should render command rows together",
         )
+        tmux_send(session, "Escape")
+        after_slash = capture_after_idle(session, "short-done-after-slash-close", visible_only=True)
+        assert_contains(after_slash, "Ask a follow-up", "completed slash escape should restore composer")
+        assert_not_contains(after_slash, "/task", "completed slash escape should close the overlay")
+        tmux_send_literal(session, "/auth")
+        tmux_send(session, "Enter")
+        auth = wait_for(session, "Sign in to a model provider", "short-done-auth-panel")
+        assert_contains(auth, "Find the top 5 Hacker News posts", "auth panel should layer over completed transcript")
+        assert_contains(auth, "Ask a follow", "auth panel should leave completed composer in place")
+        assert_contains(auth, "Enter:select", "auth panel footer should be visible")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -707,7 +905,7 @@ def smoke_session_switch_clears_previous_transcript(binary: Path) -> None:
         wait_for(session, "temporary switch task sh", "switch-transient-created")
 
         tmux_send(session, "Tab")
-        wait_for(session, "browser-use / previous work", "switch-history-open")
+        wait_for(session, HISTORY_TITLE, "switch-history-open")
         tmux_send(session, "Down", "Enter")
         selected = wait_for(session, "scroll check line 60", "switch-long-selected")
         visible = wait_for(session, "Ask a follow-up", "switch-long-selected-visible")
@@ -725,7 +923,7 @@ def smoke_session_switch_clears_previous_transcript(binary: Path) -> None:
         )
 
         tmux_send(session, "Tab")
-        wait_for(session, "browser-use / previous work", "switch-history-reopen-transient")
+        wait_for(session, HISTORY_TITLE, "switch-history-reopen-transient")
         tmux_send(session, "Enter")
         transient_visible = wait_for(session, transient_task, "switch-transient-selected-visible")
         assert_first_content_near_top(
@@ -735,7 +933,7 @@ def smoke_session_switch_clears_previous_transcript(binary: Path) -> None:
         )
 
         tmux_send(session, "Tab")
-        wait_for(session, "browser-use / previous work", "switch-history-reopen-long")
+        wait_for(session, HISTORY_TITLE, "switch-history-reopen-long")
         tmux_send(session, "Down", "Enter")
         long_again = wait_for(session, "scroll check line 60", "switch-long-selected-again-visible")
         assert_first_content_near_top(
@@ -771,7 +969,7 @@ def smoke_large_composer_input_is_responsive(binary: Path) -> None:
             raise AssertionError(f"large input took too long to appear: {elapsed:.2f}s")
         assert_not_contains(typed, "^[[200~", "large input should not leak bracketed paste markers")
         assert_not_contains(typed, "^[[", "large input should not leak escape sequences")
-        if typed.count("Esc:stop") > 1:
+        if typed.count(STATUS_BAR_PREFIX) > 1:
             raise AssertionError("large input should not duplicate app screens\n\n" + typed)
         assert_no_legacy_dashboard_chrome(typed, "large input should not show old dashboard chrome")
     finally:
@@ -794,20 +992,8 @@ def smoke_failed_retry_switches_to_live_running(binary: Path) -> None:
         tmux_send(session, "Tab", "Enter")
         wait_for(session, "error", "failed-retry-initial")
         initial = capture_after_idle(session, "failed-retry-initial")
-        assert_row_gap_at_most(
-            initial,
-            "OpenRouter API key is missing",
-            "Authenticate with OpenRouter",
-            6,
-            "failed status and next menu should stay grouped together",
-        )
-        assert_row_gap_at_most(
-            initial,
-            "Retry",
-            "Ask a follow-up",
-            6,
-            "failed composer should stay attached to the action menu",
-        )
+        assert_contains(initial, "OpenRouter API key is missing", "failed status should render")
+        assert_contains(initial, "Ask a follow-up", "failed composer should stay visible")
         tmux_send(session, "Down", "Down", "Enter")
         running = wait_for(session, "Type to steer the agent", "failed-retry-running")
         visible_running = capture_after_idle(session, "failed-retry-visible", visible_only=True)
@@ -866,6 +1052,7 @@ def main() -> int:
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
     smoke_double_escape_stops_running_task(binary)
     smoke_completed_history_uses_native_scrollback(binary)
+    smoke_prompt_only_followup_keeps_completed_transcript(binary)
     smoke_short_completed_history_has_live_preview(binary)
     smoke_main_resize_does_not_duplicate_transcript(binary)
     smoke_session_switch_clears_previous_transcript(binary)

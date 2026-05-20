@@ -12,18 +12,24 @@ use browser_use_protocol::{
 };
 use browser_use_store::{Store, StoreNotification};
 use clap::{Parser, ValueEnum};
-use crossterm::cursor::MoveTo;
+use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as TermEvent,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::queue;
+use crossterm::style::{
+    Attribute, Color as CrosstermColor, Print, ResetColor, SetAttribute, SetBackgroundColor,
+    SetForegroundColor,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::Command;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Position, Rect};
+use ratatui::style::{Color as RatatuiColor, Modifier};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -37,6 +43,7 @@ mod runtime;
 mod settings;
 mod theme;
 mod transcript;
+mod welcome;
 
 use composer::Composer;
 use palette::PaletteAction;
@@ -56,6 +63,9 @@ const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
 const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
+const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
+const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
+const NATIVE_FOLLOWUP_LIVE_RESERVE_HEIGHT: u16 = 1;
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -100,11 +110,34 @@ enum Surface {
 
 impl Surface {
     fn is_bottom_pane(self) -> bool {
-        false
+        matches!(
+            self,
+            Self::Account
+                | Self::ApiKey
+                | Self::Telemetry
+                | Self::Model
+                | Self::Browser
+                | Self::BrowserSelect
+                | Self::History
+                | Self::Developer
+        )
+    }
+
+    /// Surfaces that render as a centered floating popup overlay on top of the
+    /// main view, rather than as a fullscreen surface or an inline bottom pane.
+    fn is_popup(self) -> bool {
+        self.is_bottom_pane()
+    }
+
+    /// Popups that read text input from the shared composer buffer. While one
+    /// of these is active the composer must not also be rendered underneath —
+    /// the popup itself is the input field, with its own cursor.
+    fn is_text_input_popup(self) -> bool {
+        matches!(self, Self::ApiKey | Self::Telemetry)
     }
 
     fn uses_main_view(self) -> bool {
-        self == Self::Main
+        self == Self::Main || self.is_bottom_pane()
     }
 }
 
@@ -187,6 +220,18 @@ struct App {
     quit_hint_until: Option<Instant>,
     escape_stop_until: Option<Instant>,
     native_history: NativeHistoryState,
+    welcome_anim: welcome::WelcomeAnim,
+    live_spinner_frame: usize,
+    /// Last-rendered logo bounding box on screen (terminal cells). Set by
+    /// render.rs each frame and read by the mouse click handler.
+    welcome_logo_rect: std::cell::Cell<Option<ratatui::layout::Rect>>,
+    /// Whether the slash command palette popup is currently open. Independent
+    /// of the composer's content — `/` opens it, Esc closes it, and the
+    /// composer is never touched.
+    palette_open: bool,
+    /// Filter text shown inside the palette popup. Edited by typing while the
+    /// palette is open; cleared whenever the palette is opened or closed.
+    palette_filter: String,
 }
 
 #[derive(Debug)]
@@ -558,6 +603,11 @@ impl App {
             quit_hint_until: None,
             escape_stop_until: None,
             native_history: NativeHistoryState::default(),
+            welcome_anim: welcome::WelcomeAnim::new(),
+            live_spinner_frame: 0,
+            welcome_logo_rect: std::cell::Cell::new(None),
+            palette_open: false,
+            palette_filter: String::new(),
         };
         app.refresh_cached_projection();
         Ok(app)
@@ -880,8 +930,7 @@ impl App {
                 code: KeyCode::Esc, ..
             } if self.is_slash_palette_active() => {
                 self.escape_stop_until = None;
-                self.composer.clear();
-                self.selected_row = 0;
+                self.close_slash_palette();
             }
             KeyEvent {
                 code: KeyCode::Esc, ..
@@ -996,6 +1045,42 @@ impl App {
             } => self.submit()?,
             _ if matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
                 && self.handle_api_key_key(key) => {}
+            // `/` opens the slash palette popup. The slash itself is not
+            // typed into the composer — the popup owns its own filter
+            // buffer, separate from the composer.
+            KeyEvent {
+                code: KeyCode::Char('/'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.surface == Surface::Main && !self.palette_open => {
+                self.open_slash_palette();
+            }
+            // While the palette is open every typed character is appended
+            // to its filter (printable ASCII only — control sequences fall
+            // through to other handlers). Backspace pops a character; the
+            // popup stays open even when the filter is empty.
+            KeyEvent { .. } if self.is_slash_palette_active() && is_popup_clear_key(key) => {
+                self.palette_filter.clear();
+                self.clamp_slash_palette_selection();
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if self.is_slash_palette_active()
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.palette_filter.push(ch);
+                self.clamp_slash_palette_selection();
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if self.is_slash_palette_active() => {
+                self.palette_filter.pop();
+                self.clamp_slash_palette_selection();
+            }
             _ if self.surface == Surface::Main && self.composer.handle_key(key) => {
                 if self.is_slash_palette_active() {
                     self.clamp_slash_palette_selection();
@@ -1013,12 +1098,14 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) {
+        if self.is_slash_palette_active() {
+            self.palette_filter.push_str(text);
+            self.clamp_slash_palette_selection();
+            return;
+        }
         match self.surface {
             Surface::Main => {
                 self.composer.insert_paste(text);
-                if self.is_slash_palette_active() {
-                    self.clamp_slash_palette_selection();
-                }
             }
             Surface::ApiKey | Surface::Telemetry => {
                 self.composer.insert_paste(text);
@@ -1034,6 +1121,37 @@ impl App {
             && self.selected_session_id.is_none()
             && self.composer.is_empty()
             && self.state_cache.sessions.is_empty())
+    }
+
+    /// True when the centered welcome screen is showing — drives the
+    /// animation-tick redraw so the BU logo can spin while idle.
+    fn is_welcome_surface(&self) -> bool {
+        self.surface == Surface::Main && self.selected_session_id.is_none()
+    }
+
+    fn should_capture_welcome_mouse(&self) -> bool {
+        self.is_welcome_surface()
+            && self.composer.is_empty()
+            && !self.is_slash_palette_active()
+            && self.welcome_logo_rect.get().is_some()
+    }
+
+    fn handle_welcome_logo_click(&mut self, column: u16, row: u16) -> bool {
+        if !self.should_capture_welcome_mouse() {
+            return false;
+        }
+        let Some(rect) = self.welcome_logo_rect.get() else {
+            return false;
+        };
+        if column < rect.x
+            || column >= rect.x.saturating_add(rect.width)
+            || row < rect.y
+            || row >= rect.y.saturating_add(rect.height)
+        {
+            return false;
+        }
+        self.welcome_anim.throw();
+        true
     }
 
     fn execute_surface_selection(&mut self) -> Result<()> {
@@ -1395,11 +1513,27 @@ impl App {
     }
 
     fn is_slash_palette_active(&self) -> bool {
-        self.surface == Surface::Main && palette::is_slash_input(self.composer.input())
+        self.surface == Surface::Main && self.palette_open
+    }
+
+    pub(crate) fn palette_filter(&self) -> &str {
+        &self.palette_filter
+    }
+
+    fn open_slash_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_filter.clear();
+        self.selected_row = 0;
+    }
+
+    fn close_slash_palette(&mut self) {
+        self.palette_open = false;
+        self.palette_filter.clear();
+        self.selected_row = 0;
     }
 
     fn slash_palette_items(&self) -> Vec<palette::PaletteItem> {
-        palette::items_filtered(self.composer.input())
+        palette::items_filtered(&self.palette_filter)
     }
 
     fn move_slash_palette_selection(&mut self, delta: isize) {
@@ -1408,8 +1542,9 @@ impl App {
             self.selected_row = 0;
             return;
         }
-        let max = count.saturating_sub(1) as isize;
-        self.selected_row = (self.selected_row as isize + delta).clamp(0, max) as usize;
+        // Wrap around the ends rather than stopping at them.
+        self.selected_row =
+            (self.selected_row as isize + delta).rem_euclid(count as isize) as usize;
     }
 
     fn clamp_slash_palette_selection(&mut self) {
@@ -1422,10 +1557,9 @@ impl App {
     }
 
     fn execute_slash_palette_selection(&mut self) -> Result<()> {
-        let action = palette::selected_action(self.composer.input(), self.selected_row);
+        let action = palette::selected_action(&self.palette_filter, self.selected_row);
         if let Some(action) = action {
-            self.composer.clear();
-            self.selected_row = 0;
+            self.close_slash_palette();
             self.execute_palette_action(action)?;
         }
         Ok(())
@@ -1446,8 +1580,9 @@ impl App {
             self.selected_row = 0;
             return Ok(());
         }
-        let max = count.saturating_sub(1) as isize;
-        self.selected_row = (self.selected_row as isize + delta).clamp(0, max) as usize;
+        // Wrap around the ends — Down past the last row lands on the first.
+        self.selected_row =
+            (self.selected_row as isize + delta).rem_euclid(count as isize) as usize;
         Ok(())
     }
 
@@ -1465,6 +1600,19 @@ impl App {
             && self
                 .native_history
                 .is_active_for(self.selected_session_id.as_deref())
+    }
+
+    fn should_animate_live_spinner(&mut self) -> bool {
+        if !self.native_scrollback_is_active() {
+            return false;
+        }
+        let state = self.refresh_cached_projection().clone();
+        let model = transcript::transcript_model(self, &state);
+        transcript::has_pending_followup_indicator(model.as_ref())
+    }
+
+    fn tick_live_spinner(&mut self) {
+        self.live_spinner_frame = self.live_spinner_frame.wrapping_add(1);
     }
 
     #[cfg(test)]
@@ -1691,6 +1839,18 @@ impl Command for ResetKeyboardEnhancementFlags {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EnableMouseClickCapture;
+
+impl Command for EnableMouseClickCapture {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        // Crossterm's built-in EnableMouseCapture also enables drag and
+        // all-motion tracking, which blocks ordinary terminal text selection.
+        // The welcome logo only needs button press/release coordinates.
+        f.write_str(concat!("\x1b[?1000h", "\x1b[?1006h"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DisableModifyOtherKeys;
 
 impl Command for DisableModifyOtherKeys {
@@ -1805,6 +1965,8 @@ fn run_terminal(mut app: App) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut draw_needed = true;
         let mut last_fallback_refresh = Instant::now();
+        let mut last_anim_tick = Instant::now();
+        let mut last_live_spinner_tick = Instant::now();
         let mut pending_resize_at: Option<Instant> = None;
         loop {
             draw_needed |= app.drain_store_notifications()?;
@@ -1824,14 +1986,38 @@ fn run_terminal(mut app: App) -> Result<()> {
                 terminal_driver.draw(&mut app)?;
                 draw_needed = false;
             }
-            let poll_interval = pending_resize_at
+            let mut poll_interval = pending_resize_at
                 .map(|resize_at| {
                     RESIZE_DEBOUNCE_INTERVAL
                         .saturating_sub(resize_at.elapsed())
                         .min(INPUT_POLL_INTERVAL)
                 })
                 .unwrap_or(INPUT_POLL_INTERVAL);
+            // While the welcome animation is running, don't block on input
+            // longer than one anim frame — otherwise the redraw rate is
+            // capped by INPUT_POLL_INTERVAL instead of ANIM_TICK_INTERVAL.
+            if app.is_welcome_surface() {
+                poll_interval = poll_interval.min(ANIM_TICK_INTERVAL);
+            }
+            if app.should_animate_live_spinner() {
+                poll_interval = poll_interval.min(LIVE_SPINNER_TICK_INTERVAL);
+            }
             if !event::poll(poll_interval)? {
+                // Animate the welcome-screen logo by advancing the anim and
+                // triggering a redraw every ~70ms while the welcome surface
+                // is up. No-op on other surfaces.
+                if app.is_welcome_surface() && last_anim_tick.elapsed() >= ANIM_TICK_INTERVAL {
+                    app.welcome_anim.tick();
+                    draw_needed = true;
+                    last_anim_tick = Instant::now();
+                }
+                if app.should_animate_live_spinner()
+                    && last_live_spinner_tick.elapsed() >= LIVE_SPINNER_TICK_INTERVAL
+                {
+                    app.tick_live_spinner();
+                    draw_needed = true;
+                    last_live_spinner_tick = Instant::now();
+                }
                 continue;
             }
             let event = event::read()?;
@@ -1855,12 +2041,16 @@ fn run_terminal(mut app: App) -> Result<()> {
 
 struct TerminalDriver {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    mouse_capture_enabled: bool,
+    manual_modal_overlay_visible: bool,
 }
 
 impl TerminalDriver {
     fn new(height: u16) -> Result<Self> {
         Ok(Self {
             terminal: new_inline_terminal(height)?,
+            mouse_capture_enabled: false,
+            manual_modal_overlay_visible: false,
         })
     }
 
@@ -1872,18 +2062,34 @@ impl TerminalDriver {
         reset_terminal_screen(self.terminal.backend_mut(), ClearType::Purge)?;
         self.terminal = new_inline_terminal(desired_height)?;
         app.native_history.reset();
+        self.manual_modal_overlay_visible = false;
         Ok(desired_height)
     }
 
     fn settle_resize(&mut self, app: &mut App) -> Result<()> {
         reset_inline_terminal_after_resize(&mut self.terminal)?;
         app.native_history.reset();
+        self.manual_modal_overlay_visible = false;
         Ok(())
     }
 
     fn draw(&mut self, app: &mut App) -> Result<()> {
+        let manual_overlay_active = should_draw_manual_modal_overlay(app);
+        let overlay_state = if manual_overlay_active {
+            Some(app.workbench_state()?)
+        } else {
+            None
+        };
+        if self.manual_modal_overlay_visible && !manual_overlay_active {
+            app.native_history.reset_with_clear();
+        }
         maybe_emit_native_transcript(&mut self.terminal, app)?;
         self.terminal.draw(|frame| render(frame, app))?;
+        if let Some(state) = overlay_state.as_ref() {
+            draw_manual_modal_overlay(self.terminal.backend_mut(), app, state)?;
+        }
+        self.manual_modal_overlay_visible = manual_overlay_active;
+        self.sync_mouse_capture(app)?;
         Ok(())
     }
 
@@ -1893,6 +2099,20 @@ impl TerminalDriver {
 
     fn show_cursor(&mut self) -> io::Result<()> {
         self.terminal.show_cursor()
+    }
+
+    fn sync_mouse_capture(&mut self, app: &App) -> Result<()> {
+        let should_capture = app.should_capture_welcome_mouse();
+        if should_capture == self.mouse_capture_enabled {
+            return Ok(());
+        }
+        if should_capture {
+            execute!(self.terminal.backend_mut(), EnableMouseClickCapture)?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_capture_enabled = should_capture;
+        Ok(())
     }
 }
 
@@ -1924,7 +2144,10 @@ fn desired_terminal_viewport_height_for(
         .saturating_sub(APP_HORIZONTAL_MARGIN.saturating_mul(2))
         .max(1);
     let dock_height = main_viewport_height(app, app_width);
-    if app.is_first_run_setup_visible()? || app.selected_session_id.is_none() {
+    if app.is_first_run_setup_visible()?
+        || app.selected_session_id.is_none()
+        || (app.surface.is_bottom_pane() && !app.native_scrollback_is_active())
+    {
         return Ok(full_height);
     }
     let state = app.refresh_cached_projection().clone();
@@ -1932,14 +2155,139 @@ fn desired_terminal_viewport_height_for(
         .current_session
         .as_ref()
         .is_some_and(|session| session.status.is_active());
-    let active_body_reserve = if selected_is_active {
-        full_height.saturating_sub(dock_height)
+    let transcript_model = transcript::transcript_model(app, &state);
+    let active_viewport_has_live_content =
+        transcript::active_viewport_has_live_content(transcript_model.as_ref());
+    let suppress_followup_resize =
+        transcript::has_followup_over_scrollback(transcript_model.as_ref());
+    let stable_followup_reserve = if app.native_scrollback_is_active() {
+        NATIVE_FOLLOWUP_LIVE_RESERVE_HEIGHT
     } else {
         0
     };
+    let active_body_reserve =
+        if selected_is_active && active_viewport_has_live_content && !suppress_followup_resize {
+            full_height.saturating_sub(dock_height)
+        } else {
+            stable_followup_reserve
+        };
     Ok(dock_height
         .saturating_add(active_body_reserve)
         .min(full_height))
+}
+
+fn should_draw_manual_modal_overlay(app: &App) -> bool {
+    (app.is_slash_palette_active() || app.surface.is_popup()) && app.native_scrollback_is_active()
+}
+
+fn draw_manual_modal_overlay(
+    target: &mut CrosstermBackend<io::Stdout>,
+    app: &App,
+    state: &WorkbenchState,
+) -> Result<()> {
+    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((app.args.width, app.args.height));
+    if term_w == 0 || term_h == 0 {
+        return Ok(());
+    }
+    let area = Rect::new(0, 0, term_w, term_h);
+    let Some(overlay) = render::active_modal_overlay(app, state, area) else {
+        return Ok(());
+    };
+
+    for y in 0..overlay.rect.height {
+        let row = overlay.rect.y.saturating_add(y);
+        if row >= term_h {
+            break;
+        }
+        for x in 0..overlay.rect.width {
+            let col = overlay.rect.x.saturating_add(x);
+            if col >= term_w {
+                break;
+            }
+            let cell = &overlay.buffer[(x, y)];
+            queue_ratatui_cell_style(target, cell.fg, cell.bg, cell.modifier)?;
+            queue!(target, MoveTo(col, row), Print(cell.symbol()))?;
+        }
+    }
+    queue!(target, ResetColor, SetAttribute(Attribute::Reset))?;
+    if let Some(cursor) = overlay.cursor {
+        queue!(
+            target,
+            MoveTo(
+                cursor.x.min(term_w.saturating_sub(1)),
+                cursor.y.min(term_h.saturating_sub(1))
+            ),
+            Show
+        )?;
+    }
+    target.flush()?;
+    Ok(())
+}
+
+fn queue_ratatui_cell_style(
+    target: &mut CrosstermBackend<io::Stdout>,
+    fg: RatatuiColor,
+    bg: RatatuiColor,
+    modifier: Modifier,
+) -> io::Result<()> {
+    queue!(
+        target,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(ratatui_color_to_crossterm(fg)),
+        SetBackgroundColor(ratatui_color_to_crossterm(bg))
+    )?;
+    if modifier.contains(Modifier::BOLD) {
+        queue!(target, SetAttribute(Attribute::Bold))?;
+    }
+    if modifier.contains(Modifier::DIM) {
+        queue!(target, SetAttribute(Attribute::Dim))?;
+    }
+    if modifier.contains(Modifier::ITALIC) {
+        queue!(target, SetAttribute(Attribute::Italic))?;
+    }
+    if modifier.contains(Modifier::UNDERLINED) {
+        queue!(target, SetAttribute(Attribute::Underlined))?;
+    }
+    if modifier.contains(Modifier::SLOW_BLINK) {
+        queue!(target, SetAttribute(Attribute::SlowBlink))?;
+    }
+    if modifier.contains(Modifier::RAPID_BLINK) {
+        queue!(target, SetAttribute(Attribute::RapidBlink))?;
+    }
+    if modifier.contains(Modifier::REVERSED) {
+        queue!(target, SetAttribute(Attribute::Reverse))?;
+    }
+    if modifier.contains(Modifier::HIDDEN) {
+        queue!(target, SetAttribute(Attribute::Hidden))?;
+    }
+    if modifier.contains(Modifier::CROSSED_OUT) {
+        queue!(target, SetAttribute(Attribute::CrossedOut))?;
+    }
+    Ok(())
+}
+
+fn ratatui_color_to_crossterm(color: RatatuiColor) -> CrosstermColor {
+    match color {
+        RatatuiColor::Reset => CrosstermColor::Reset,
+        RatatuiColor::Black => CrosstermColor::Black,
+        RatatuiColor::Red => CrosstermColor::DarkRed,
+        RatatuiColor::Green => CrosstermColor::DarkGreen,
+        RatatuiColor::Yellow => CrosstermColor::DarkYellow,
+        RatatuiColor::Blue => CrosstermColor::DarkBlue,
+        RatatuiColor::Magenta => CrosstermColor::DarkMagenta,
+        RatatuiColor::Cyan => CrosstermColor::DarkCyan,
+        RatatuiColor::Gray => CrosstermColor::Grey,
+        RatatuiColor::DarkGray => CrosstermColor::DarkGrey,
+        RatatuiColor::LightRed => CrosstermColor::Red,
+        RatatuiColor::LightGreen => CrosstermColor::Green,
+        RatatuiColor::LightYellow => CrosstermColor::Yellow,
+        RatatuiColor::LightBlue => CrosstermColor::Blue,
+        RatatuiColor::LightMagenta => CrosstermColor::Magenta,
+        RatatuiColor::LightCyan => CrosstermColor::Cyan,
+        RatatuiColor::White => CrosstermColor::White,
+        RatatuiColor::Indexed(value) => CrosstermColor::AnsiValue(value),
+        RatatuiColor::Rgb(r, g, b) => CrosstermColor::Rgb { r, g, b },
+    }
 }
 
 fn handle_terminal_event(
@@ -1954,6 +2302,15 @@ fn handle_terminal_event(
         TermEvent::Key(key) => app.handle_key(key),
         TermEvent::Paste(text) => {
             app.handle_paste(&text);
+            Ok(false)
+        }
+        TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(_),
+            column,
+            row,
+            ..
+        }) => {
+            app.handle_welcome_logo_click(column, row);
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -1997,6 +2354,17 @@ fn handle_escape_prefix_key(
     app.handle_key(escape_key)
 }
 
+fn is_popup_clear_key(key: KeyEvent) -> bool {
+    let command_delete = key
+        .modifiers
+        .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
+        && matches!(key.code, KeyCode::Backspace | KeyCode::Delete);
+    let ctrl_u = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('u' | 'U'));
+    let raw_ctrl_u = key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('\u{15}'));
+    command_delete || ctrl_u || raw_ctrl_u
+}
+
 fn is_unmodified_enter_event(event: &TermEvent) -> bool {
     matches!(
         event,
@@ -2015,7 +2383,11 @@ fn maybe_emit_native_transcript(
 ) -> Result<()> {
     let size = terminal.size()?;
     let state = app.workbench_state()?;
-    if !app.surface.uses_main_view() || app.is_first_run_setup_visible()? {
+    if !app.surface.uses_main_view()
+        || app.is_first_run_setup_visible()?
+        || app.surface.is_popup()
+        || app.is_slash_palette_active()
+    {
         return Ok(());
     }
     let should_clear = app.native_history.take_clear_before_replay();
@@ -2033,12 +2405,18 @@ fn maybe_emit_native_transcript(
     };
     debug_assert_eq!(model.session_id, session_id);
     let _model_revision = model.revision;
+    let defer_pending_prompt = session.status.is_active();
 
     if !app.native_history.is_active_for(Some(&session_id)) {
-        let lines = transcript::all_terminal_scrollback_lines(&model, width);
-        insert_initial_native_lines(terminal, lines)?;
+        // No session header card — the transcript starts straight with
+        // the conversation content.
+        let emission =
+            transcript::terminal_scrollback_emission_since(&model, 0, width, defer_pending_prompt);
+        if !emission.lines.is_empty() {
+            insert_initial_native_lines(terminal, emission.lines)?;
+        }
         app.native_history
-            .reset_for_session_with_group(session_id, model.last_event_seq, None);
+            .reset_for_session_with_group(session_id, emission.last_seq, None);
         return Ok(());
     }
 
@@ -2046,10 +2424,18 @@ fn maybe_emit_native_transcript(
     if model.last_event_seq <= after_seq {
         return Ok(());
     }
-    let lines = transcript::terminal_scrollback_lines_since(&model, after_seq, width);
-    app.native_history.last_seq = model.last_event_seq;
+    let emission = transcript::terminal_scrollback_emission_since(
+        &model,
+        after_seq,
+        width,
+        defer_pending_prompt,
+    );
+    if emission.lines.is_empty() {
+        return Ok(());
+    }
+    app.native_history.last_seq = emission.last_seq;
     app.native_history.last_group = None;
-    insert_native_lines(terminal, lines)?;
+    insert_native_lines(terminal, emission.lines)?;
     Ok(())
 }
 
@@ -2300,6 +2686,7 @@ fn restore_terminal(mut target: impl io::Write) -> Result<()> {
         ResetKeyboardEnhancementFlags,
         DisableModifyOtherKeys,
         DisableBracketedPaste,
+        DisableMouseCapture,
     )?;
     Ok(())
 }
@@ -2413,11 +2800,101 @@ mod redesign_tests {
         Ok(app)
     }
 
+    #[test]
+    fn welcome_logo_click_spins_only_inside_armed_logo_rect() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let _screen = render_dump(&mut app)?;
+        let rect = app.welcome_logo_rect.get().context("welcome logo rect")?;
+
+        assert!(app.should_capture_welcome_mouse());
+        let initial_vy = app.welcome_anim.vy;
+        assert!(app.handle_welcome_logo_click(
+            rect.x.saturating_add(rect.width / 2),
+            rect.y.saturating_add(rect.height / 2),
+        ));
+        assert!(app.welcome_anim.vy > initial_vy);
+
+        let after_click = (app.welcome_anim.vx, app.welcome_anim.vy);
+        assert!(!app.handle_welcome_logo_click(rect.x.saturating_add(rect.width), rect.y));
+        assert_eq!((app.welcome_anim.vx, app.welcome_anim.vy), after_click);
+
+        app.set_input("typing should keep terminal text selection native".to_string());
+        assert!(!app.should_capture_welcome_mouse());
+        assert!(!app.handle_welcome_logo_click(
+            rect.x.saturating_add(rect.width / 2),
+            rect.y.saturating_add(rect.height / 2),
+        ));
+        assert_eq!((app.welcome_anim.vx, app.welcome_anim.vy), after_click);
+        Ok(())
+    }
+
+    #[test]
+    fn welcome_mouse_capture_is_scoped_to_rendered_empty_welcome_surface() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        assert!(!app.should_capture_welcome_mouse());
+        let _screen = render_dump(&mut app)?;
+        assert!(app.should_capture_welcome_mouse());
+
+        app.set_input("open example.com".to_string());
+        assert!(!app.should_capture_welcome_mouse());
+        app.set_input(String::new());
+
+        app.open_surface(Surface::History);
+        assert!(!app.should_capture_welcome_mouse());
+        app.close_surface();
+
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id);
+        assert!(!app.should_capture_welcome_mouse());
+        Ok(())
+    }
+
+    #[test]
+    fn welcome_mouse_capture_does_not_enable_drag_tracking() -> Result<()> {
+        let mut sequence = String::new();
+        EnableMouseClickCapture.write_ansi(&mut sequence)?;
+
+        assert!(sequence.contains("\x1b[?1000h"));
+        assert!(sequence.contains("\x1b[?1006h"));
+        assert!(!sequence.contains("\x1b[?1002h"));
+        assert!(!sequence.contains("\x1b[?1003h"));
+        Ok(())
+    }
+
     fn row_containing(screen: &str, needle: &str) -> usize {
         screen
             .lines()
             .position(|line| line.contains(needle))
             .unwrap_or_else(|| panic!("screen did not contain {needle:?}\n{screen}"))
+    }
+
+    fn buffer_symbols(buffer: &Buffer) -> String {
+        let area = buffer.area;
+        let mut out = String::new();
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn surface_heading_for_test(surface: Surface) -> &'static str {
+        match surface {
+            Surface::Account => "Authenticate",
+            Surface::Model => "Model",
+            Surface::Browser | Surface::BrowserSelect => "Browser",
+            Surface::History => "History",
+            Surface::Developer => "Developer",
+            Surface::ApiKey => "API key",
+            Surface::Telemetry => "Laminar",
+            Surface::Setup => "Setup",
+            Surface::Main => "",
+        }
     }
 
     #[test]
@@ -2466,13 +2943,17 @@ mod redesign_tests {
         assert!(screen.contains("OpenRouter API key"));
         assert!(!screen.contains("[needs]"));
 
-        // Up/Down must navigate the 5 onboarding rows and clamp at edges.
+        // Up/Down navigate the 5 onboarding rows and wrap around the edges.
         assert_eq!(app.selected_row, 0);
-        for _ in 0..50 {
+        for _ in 0..ACCOUNT_CHOICES.len() - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
         assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
-        for _ in 0..50 {
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, 0);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, ACCOUNT_CHOICES.len() - 1);
+        for _ in 0..ACCOUNT_CHOICES.len() - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
         }
         assert_eq!(app.selected_row, 0);
@@ -2502,8 +2983,11 @@ mod redesign_tests {
             app.model_configured = true;
             app.store.set_setting("setup.complete", "1")?;
 
-            let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Browser Use cloud needs key"));
+            let _screen = render_dump(&mut app)?;
+            // NOTE: the ready/welcome screen no longer carries the
+            // "Browser Use cloud needs key" warning. That warning still
+            // shows on the BrowserSelect surface (asserted below); the
+            // welcome screen redesign needs a follow-up surface for it.
 
             app.open_surface(Surface::BrowserSelect);
             let screen = render_dump(&mut app)?;
@@ -2705,18 +3189,22 @@ mod redesign_tests {
             "session.done",
             serde_json::json!({"result": "Everything should sit near the top."}),
         )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"input_tokens": 24500, "cost_usd": 0.0731}),
+        )?;
 
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
-        assert!(ready_screen.contains("browser-use"));
-        assert!(ready_screen.contains("GPT-5.5 . Codex . Local Chrome idle"));
+        // Current welcome screen: centered logo plus the shortcut hint.
         assert!(ready_screen.contains("Browser Use"));
-        assert!(ready_screen.contains("/model"));
-        assert!(ready_screen.contains("/browser"));
-        assert!(row_containing(&ready_screen, "recent") <= 14);
+        assert!(ready_screen.contains("v0.1.0"));
+        assert!(ready_screen.contains("press / for shortcuts"));
+        // Fused composer carries model metadata in the status row.
+        assert!(ready_screen.contains("GPT-5.5"));
+        // Composer placeholder stays the same so users see the prompt-to-act.
         assert!(ready_screen.contains("Tell the browser what to do..."));
-        assert!(ready_screen.contains("Enter:send"));
-        assert!(ready_screen.contains("Tab:history"));
         assert!(!ready_screen.contains("[ new task ]"));
 
         app.selected_session_id = Some(session.id);
@@ -2724,6 +3212,8 @@ mod redesign_tests {
         assert!(completed_screen.contains("inspect top alignment"));
         assert!(!completed_screen.contains(": answer"));
         assert!(!completed_screen.contains(": done"));
+        // Footer status bar surfaces the active model and a context-fill bar.
+        assert!(completed_screen.contains("24.5k/60k"));
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
         assert!(composer_row > result_row);
@@ -2783,11 +3273,13 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         assert!(app.is_slash_palette_active());
         let screen = render_dump(&mut app)?;
-        let input_row = row_containing(&screen, "> /");
+        let input_row = row_containing(&screen, "> ");
+        // The palette owns its own input row, with command items rendered just
+        // below it.
         assert!(screen
             .lines()
             .enumerate()
-            .any(|(idx, line)| idx >= input_row && line.contains("/task")));
+            .any(|(idx, line)| idx > input_row && line.contains("/task")));
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
@@ -2804,12 +3296,129 @@ mod redesign_tests {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
         }
         let screen = render_dump(&mut app)?;
-        let input_row = row_containing(&screen, "> /mo");
+        let input_row = row_containing(&screen, "> mo");
         assert!(screen
             .lines()
             .enumerate()
-            .any(|(idx, line)| idx >= input_row && line.contains("/model")));
+            .any(|(idx, line)| idx > input_row && line.contains("/model")));
         assert!(screen.contains("/model"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::SUPER))?);
+        assert_eq!(app.palette_filter(), "");
+        let screen = render_dump(&mut app)?;
+        let input_row = row_containing(&screen, "> ");
+        assert!(screen
+            .lines()
+            .enumerate()
+            .any(|(idx, line)| idx > input_row && line.contains("/task")));
+        assert!(screen.contains("/history"));
+        for ch in "bro".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.palette_filter(), "bro");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.palette_filter(), "");
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("/task"));
+        assert!(screen.contains("/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn popup_text_inputs_handle_command_delete() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.open_surface(Surface::Account);
+        app.selected_row = 4;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::ApiKey);
+        for ch in "sk-or-v1-test".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.composer.input(), "sk-or-v1-test");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::META))?);
+        assert_eq!(app.composer.input(), "");
+        assert_eq!(app.surface, Surface::ApiKey);
+        Ok(())
+    }
+
+    #[test]
+    fn slash_palette_layers_over_running_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "tell me about this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Reading the repository layout..."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("/task"));
+        assert!(screen.contains("Reading the repository layout"));
+        assert!(screen.contains("Type to steer the agent"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_palette_layers_over_completed_native_transcript() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 28;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "This is a Rust terminal UI with native scrollback."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(session.id, last_seq);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(!screen.contains("/task"));
+        assert!(screen.contains("Ask a follow-up"));
+        let overlay = render::command_palette_overlay(&app, Rect::new(0, 0, 72, 11))
+            .expect("command palette overlay should render");
+        let overlay = buffer_symbols(&overlay.buffer);
+        assert!(overlay.contains("/task"));
+        assert!(overlay.contains("start a new task"));
+        Ok(())
+    }
+
+    #[test]
+    fn settings_popups_layer_over_running_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "tell me about this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Reading the repository layout..."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.open_surface(Surface::Browser);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Current browser"));
         Ok(())
     }
 
@@ -2954,14 +3563,15 @@ mod redesign_tests {
     fn up_down_keys_navigate_every_choice_menu() -> Result<()> {
         fn assert_nav(app: &mut App, expected_count: usize) -> Result<()> {
             app.selected_row = 0;
-            for _ in 0..50 {
+            for _ in 0..expected_count - 1 {
                 assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
             }
             assert_eq!(app.selected_row, expected_count - 1);
-            for _ in 0..50 {
-                assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-            }
+            // Down past the last row wraps to the first; Up past the first wraps back.
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
             assert_eq!(app.selected_row, 0);
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.selected_row, expected_count - 1);
             Ok(())
         }
 
@@ -3010,8 +3620,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         let slash_palette_count = app.slash_palette_items().len();
         assert_nav(&mut app, slash_palette_count)?;
-        app.composer.clear();
-        app.selected_row = 0;
+        app.close_slash_palette();
 
         let failed = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
@@ -3040,29 +3649,36 @@ mod redesign_tests {
     }
 
     #[test]
-    fn action_and_model_selection_clamp_at_edges() -> Result<()> {
+    fn palette_and_settings_selection_wrap_at_edges() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
 
+        // The slash palette wraps around both ends.
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
-        for _ in 0..50 {
+        let palette_count = app.slash_palette_items().len();
+        for _ in 0..palette_count - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, app.slash_palette_items().len() - 1);
-        for _ in 0..50 {
-            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-        }
+        assert_eq!(app.selected_row, palette_count - 1);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.selected_row, 0);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, palette_count - 1);
         app.composer.clear();
         app.selected_row = 0;
 
+        // The model picker wraps the same way.
         app.open_surface(Surface::Model);
-        for _ in 0..50 {
+        for _ in 0..MODEL_CHOICES.len() - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
         assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("> DeepSeek V4 Pro"));
+        assert!(screen.contains("DeepSeek V4 Pro"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, 0);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+        assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
         Ok(())
     }
 
@@ -3347,6 +3963,39 @@ mod redesign_tests {
         assert!(!screen.contains("Checking \n"));
         assert!(!screen.contains(": answer draft"));
         assert!(screen.contains("This is the answer draft."));
+        Ok(())
+    }
+
+    #[test]
+    fn live_thinking_uses_available_viewport_before_summarizing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "think through the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        let thinking = (1..=12)
+            .map(|idx| format!("thinking line {idx}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        app.store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": thinking, "label": "reasoning"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("thinking line 1"));
+        assert!(screen.contains("thinking line 12"));
+        assert!(!screen.contains("... +"));
         Ok(())
     }
 
@@ -3753,6 +4402,49 @@ mod redesign_tests {
     }
 
     #[test]
+    fn active_child_progress_uses_available_viewport_before_summarizing() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "tell me about this repo"}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo-explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "agent.spawned",
+            serde_json::json!({"child_session_id": child.id, "nickname": "repo-explorer", "role": "explorer"}),
+        )?;
+        for idx in 1..=12 {
+            app.store.append_event(
+                &child.id,
+                "file.read",
+                serde_json::json!({"path": format!("/repo/file-{idx}.rs")}),
+            )?;
+        }
+        app.store.append_event(
+            &child.id,
+            "model.turn.request",
+            serde_json::json!({"model": "gpt-5.5"}),
+        )?;
+        app.selected_session_id = Some(parent.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("read /repo/file-1.rs"));
+        assert!(screen.contains("read /repo/file-12.rs"));
+        assert!(screen.contains("waiting for gpt-5.5"));
+        Ok(())
+    }
+
+    #[test]
     fn transcript_hides_lifecycle_events_and_groups_semantic_activity() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -4054,6 +4746,11 @@ mod redesign_tests {
             "session.done",
             serde_json::json!({"result": "Hi Aitor - this is the short summary."}),
         )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"input_tokens": 18234, "cost_usd": 0.0412}),
+        )?;
         let events = app.store.events_for_session(&session.id)?;
         let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
         app.selected_session_id = Some(session.id.clone());
@@ -4061,8 +4758,8 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         let composer_row = row_containing(&screen, "Ask a follow-up");
-        let hint_row = row_containing(&screen, "Enter:reply");
-        assert!(hint_row >= composer_row + 2);
+        let status_row = row_containing(&screen, "/60k");
+        assert!(status_row >= composer_row + 2);
         assert!(!screen.contains("describe this repo"));
         assert!(!screen.contains("go say hi to aitor"));
         assert!(!screen.contains("It is a Rust browser-agent workbench."));
@@ -4071,7 +4768,92 @@ mod redesign_tests {
     }
 
     #[test]
+    fn native_scrollback_running_live_view_stays_attached_to_committed_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 28;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "Find the top 5 Hacker News posts"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.page",
+            serde_json::json!({
+                "url": "https://news.ycombinator.com",
+                "title": "Hacker News",
+            }),
+        )?;
+        let committed_seq = app
+            .store
+            .events_for_session(&session.id)?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or_default();
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Reading the page and preparing the next browser action..."}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id, committed_seq);
+
+        let screen = render_dump(&mut app)?;
+        let live_row = row_containing(&screen, "Reading the page and preparing");
+        let composer_row = row_containing(&screen, "Type to steer the agent");
+        assert!(
+            live_row <= 2,
+            "live reasoning should render directly under native scrollback, not after a large gap\n{screen}"
+        );
+        assert!(
+            composer_row > live_row,
+            "composer should stay below live reasoning\n{screen}"
+        );
+        assert!(
+            composer_row.saturating_sub(live_row) <= 8,
+            "live reasoning and composer should not be separated by a large blank gap\n{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn slash_palette_does_not_resize_completed_history_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.state",
+            serde_json::json!({"url": "https://example.com", "title": "Example"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(session.id, last_seq);
+
+        let before = desired_terminal_viewport_height(&mut app)?;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        assert!(app.is_slash_palette_active());
+        let after = desired_terminal_viewport_height(&mut app)?;
+        assert_eq!(after, before);
+        Ok(())
+    }
+
+    #[test]
+    fn followup_over_native_scrollback_keeps_viewport_docked_through_live_activity() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4088,14 +4870,74 @@ mod redesign_tests {
         let events = app.store.events_for_session(&session.id)?;
         let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
         app.selected_session_id = Some(session.id.clone());
-        app.native_history.reset_for_session(session.id, last_seq);
+        app.native_history
+            .reset_for_session(session.id.clone(), last_seq);
 
-        let before = desired_terminal_viewport_height(&mut app)?;
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
-        assert!(app.is_slash_palette_active());
-        let after = desired_terminal_viewport_height(&mut app)?;
-        assert_eq!(before, after);
+        let docked = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "yo".to_string(),
+        })?;
+        app.drain_store_notifications()?;
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+        let prompt_only = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
+        assert_eq!(prompt_only, docked);
+        let prompt_only_screen = render_dump(&mut app)?;
+        assert!(prompt_only_screen.contains("> yo"));
+        assert!(prompt_only_screen.contains("sending"));
+        assert!(same_line_gap(&prompt_only_screen, "> yo", "sending").is_some_and(|gap| gap <= 6));
+        assert!(prompt_only_screen.contains("Type to steer the agent"));
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        assert!(transcript::active_viewport_has_live_content(Some(&model)));
+        assert!(transcript::has_followup_over_scrollback(Some(&model)));
+
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.drain_store_notifications()?;
+        let waiting = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
+        assert_eq!(waiting, docked);
+        let waiting_screen = render_dump(&mut app)?;
+        assert!(waiting_screen.contains("> yo"));
+        assert!(waiting_screen.contains("waiting for GPT-5.5"));
+        assert!(
+            same_line_gap(&waiting_screen, "> yo", "waiting for GPT-5.5")
+                .is_some_and(|gap| gap <= 6)
+        );
+
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "streaming now"}),
+        )?;
+        app.drain_store_notifications()?;
+        let streaming = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
+        assert_eq!(streaming, docked);
+        let streaming_screen = render_dump(&mut app)?;
+        assert!(streaming_screen.contains("streaming now"));
+        assert!(!streaming_screen.contains("waiting for GPT-5.5"));
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let emission = transcript::terminal_scrollback_emission_since(&model, last_seq, 120, true);
+        assert!(lines_plain_text(&emission.lines).contains("> yo"));
         Ok(())
+    }
+
+    fn same_line_gap(text: &str, before: &str, after: &str) -> Option<usize> {
+        text.lines().find_map(|line| {
+            let before_idx = line.find(before)?;
+            let after_idx = line.find(after)?;
+            after_idx.checked_sub(before_idx.saturating_add(before.len()))
+        })
     }
 
     #[test]
@@ -4128,7 +4970,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn selected_session_surfaces_do_not_resize_inline_viewport() -> Result<()> {
+    fn completed_session_popups_do_not_resize_native_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4142,16 +4984,27 @@ mod redesign_tests {
             "session.done",
             serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
         )?;
-        app.selected_session_id = Some(session.id);
-        app.drain_store_notifications()?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(session.id, last_seq);
 
-        let before = desired_terminal_viewport_height(&mut app)?;
-        app.open_surface(Surface::History);
-        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
-        app.open_surface(Surface::Model);
-        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
-        app.open_surface(Surface::Browser);
-        assert_eq!(before, desired_terminal_viewport_height(&mut app)?);
+        let docked = desired_terminal_viewport_height(&mut app)?;
+        for surface in [
+            Surface::History,
+            Surface::Model,
+            Surface::Browser,
+            Surface::BrowserSelect,
+            Surface::Account,
+        ] {
+            app.open_surface(surface);
+            assert_eq!(desired_terminal_viewport_height(&mut app)?, docked);
+            let state = app.workbench_state()?;
+            let overlay = render::active_modal_overlay(&app, &state, Rect::new(0, 0, 100, 28))
+                .expect("surface should render as a modal overlay");
+            let overlay = buffer_symbols(&overlay.buffer);
+            assert!(overlay.contains(surface_heading_for_test(surface)));
+        }
         Ok(())
     }
 
@@ -4328,7 +5181,7 @@ mod redesign_tests {
 
         app.open_surface(Surface::Developer);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("developer"));
+        assert!(screen.contains("Laminar"));
         assert!(screen.contains("Events"));
         Ok(())
     }

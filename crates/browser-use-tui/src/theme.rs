@@ -20,6 +20,10 @@ fn link_color() -> Color {
     Color::Rgb(119, 196, 255)
 }
 
+fn path_reference_color() -> Color {
+    Color::Rgb(197, 177, 116)
+}
+
 fn code_color() -> Color {
     Color::Rgb(173, 215, 190)
 }
@@ -82,10 +86,34 @@ pub(crate) fn border() -> Style {
     Style::default().fg(border_color())
 }
 
+fn user_prompt_background_color() -> Color {
+    Color::Rgb(38, 42, 38)
+}
+
+/// Background fill for a user prompt block in the transcript, so the message
+/// the user sent stands apart from the agent's replies.
+pub(crate) fn user_prompt_text() -> Style {
+    text_style().bg(user_prompt_background_color())
+}
+
+pub(crate) fn user_prompt_muted() -> Style {
+    muted().bg(user_prompt_background_color())
+}
+
+/// The accent-colored `>` prefix on a user prompt, sharing the prompt's
+/// highlight background.
+pub(crate) fn user_prompt_accent() -> Style {
+    accent().bg(user_prompt_background_color())
+}
+
 pub(crate) fn link() -> Style {
     Style::default()
         .fg(link_color())
         .add_modifier(Modifier::UNDERLINED)
+}
+
+pub(crate) fn path_reference() -> Style {
+    Style::default().fg(path_reference_color())
 }
 
 pub(crate) fn markdown_code() -> Style {
@@ -138,6 +166,10 @@ pub(crate) fn thought() -> Style {
     Style::default()
         .fg(thought_color())
         .add_modifier(Modifier::BOLD)
+}
+
+pub(crate) fn selection() -> Style {
+    Style::default().bg(Color::Rgb(45, 52, 66))
 }
 
 pub(crate) fn status_style(status: &str) -> Style {

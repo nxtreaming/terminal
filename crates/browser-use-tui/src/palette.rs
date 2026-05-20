@@ -69,7 +69,3 @@ pub(crate) fn selected_action(filter: &str, selected_row: usize) -> Option<Palet
         .get(selected_row)
         .map(|item| item.action)
 }
-
-pub(crate) fn is_slash_input(input: &str) -> bool {
-    input.starts_with('/') && !input.contains('\n')
-}

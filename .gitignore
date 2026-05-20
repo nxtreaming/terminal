@@ -15,3 +15,5 @@ node_modules/
 dist/
 build/
 target/
+.harness/signals/
+.omc/

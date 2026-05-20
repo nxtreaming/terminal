@@ -1,11 +1,7 @@
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::{Line, Span};
 
-use crate::theme::{accent, bold, dim};
-
-pub(crate) fn composer_rule(width: u16) -> String {
-    "-".repeat(width as usize)
-}
+use crate::theme::{accent, dim};
 
 #[derive(Debug, Default)]
 pub(crate) struct Composer {
@@ -146,19 +142,22 @@ impl Composer {
             return true;
         }
 
-        if key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT)
-            || key_pressed(key, KeyCode::Backspace, KeyModifiers::META)
-        {
-            self.delete_backward_token();
-            return true;
-        }
-
+        // Cmd/Super/Meta + Backspace deletes the whole line (macOS-style).
+        // This has to be checked before the ALT branch because some
+        // terminals report Cmd as META instead of SUPER, and we don't want
+        // Cmd+Backspace to fall through to the word-delete handler.
         if key
             .modifiers
-            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER)
+            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
             && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
         {
             self.kill_current_line();
+            return true;
+        }
+
+        // Option/Alt + Backspace deletes the previous word.
+        if key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT) {
+            self.delete_backward_token();
             return true;
         }
 
@@ -215,7 +214,7 @@ impl Composer {
                 let prefix = if idx == 0 { "> " } else { "  " };
                 Line::from(vec![
                     Span::styled(prefix, accent()),
-                    Span::styled(source_line.to_string(), bold()),
+                    Span::raw(source_line.to_string()),
                 ])
             })
             .collect()
@@ -237,7 +236,7 @@ impl Composer {
                 };
                 lines.push(Line::from(vec![
                     Span::styled(prefix, accent()),
-                    Span::styled(chunk, bold()),
+                    Span::raw(chunk),
                 ]));
             }
         }
@@ -698,8 +697,12 @@ mod tests {
         }
 
         composer.set_input("alpha  ".to_string());
-        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::META)));
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
         assert_eq!(composer.input(), "alpha");
+
+        composer.set_input("alpha  ".to_string());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::META)));
+        assert_eq!(composer.input(), "");
     }
 
     #[test]
