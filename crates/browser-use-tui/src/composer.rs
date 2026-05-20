@@ -142,19 +142,22 @@ impl Composer {
             return true;
         }
 
-        if key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT)
-            || key_pressed(key, KeyCode::Backspace, KeyModifiers::META)
-        {
-            self.delete_backward_token();
-            return true;
-        }
-
+        // Cmd/Super/Meta + Backspace deletes the whole line (macOS-style).
+        // This has to be checked before the ALT branch because some
+        // terminals report Cmd as META instead of SUPER, and we don't want
+        // Cmd+Backspace to fall through to the word-delete handler.
         if key
             .modifiers
-            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER)
+            .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
             && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
         {
             self.kill_current_line();
+            return true;
+        }
+
+        // Option/Alt + Backspace deletes the previous word.
+        if key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT) {
+            self.delete_backward_token();
             return true;
         }
 
