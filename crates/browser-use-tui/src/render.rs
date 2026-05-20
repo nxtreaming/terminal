@@ -269,16 +269,19 @@ fn main_layout_areas(
     } else {
         (body_len as u16).min(max_body_h)
     };
+    // Body lives at the top of the area, the composer (bottom pane) is
+    // pinned to the bottom of the terminal with a flex spacer between
+    // them, and the optional footer sits as the very last row.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
             Constraint::Length(body_h),
+            Constraint::Min(0),
             Constraint::Length(bottom_h),
             Constraint::Length(footer_h),
-            Constraint::Min(0),
         ])
         .split(area);
-    (chunks[0], chunks[1], chunks[2])
+    (chunks[0], chunks[2], chunks[3])
 }
 
 fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active: bool) -> bool {
@@ -292,16 +295,10 @@ fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active:
 }
 
 pub(crate) fn main_viewport_height(app: &App, width: u16) -> u16 {
-    let current = composer_pane_height(app, ProductState::Ready, width);
-    // Worst-case fused-composer height with the palette open: input floor +
-    // dropdown rows (capped at 8) + top border + separator + bottom border +
-    // hint = COMPOSER_INPUT_MIN_ROWS + items + 4. We reserve this so opening
-    // the palette never resizes the viewport underneath the user.
-    let palette_items = (palette::max_item_count() as u16).min(8);
-    let max_palette_pane = COMPOSER_INPUT_MIN_ROWS
-        .saturating_add(palette_items)
-        .saturating_add(4);
-    current.max(max_palette_pane)
+    // The palette is now a floating popup over the main view — it doesn't
+    // grow the composer pane. So the composer's own height is the only
+    // contributor to the bottom-pane reserve.
+    composer_pane_height(app, ProductState::Ready, width)
 }
 
 fn main_bottom_height_for(
@@ -329,9 +326,8 @@ fn main_bottom_height_for(
 
 fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> u16 {
     let visual_input_lines = composer_visual_input_lines(app, width.saturating_sub(4).max(1));
-    // top border + input + bottom border + hint. The slash palette floats as
-    // a popup over the body, so the composer's own height never changes.
-    visual_input_lines + 3
+    // top border + input rows + bottom border. No hint row beneath.
+    visual_input_lines + 2
 }
 
 fn composer_input_area_width(width: u16) -> u16 {
@@ -826,6 +822,10 @@ fn surface_lines(
 /// the bottom when the dropdown takes over the top), cwd on the bottom-left,
 /// branch on the bottom-right. A single hint/status row renders just below
 /// the box.
+/// Minimal composer: a single rounded bordered box wrapping the input
+/// area. No metadata punched into the borders, no hint row below. The
+/// composer's only job is to hold the input — surrounding chrome lives
+/// elsewhere (welcome screen, status surfaces).
 fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -836,21 +836,9 @@ fn render_composer(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    // The slash palette renders as a floating popup over the body now, so
-    // the composer is always a single bordered input box — no inline
-    // dropdown half stacked on top of it. Keeping the local name `palette_open`
-    // false means the top border carries model+browser regardless and the
-    // bottom border carries cwd+branch.
-    let palette_open = false;
-    let _ = palette_open;
-
-    // Inside the box we reserve 1 cell of horizontal padding on each side,
-    // plus the 1-cell border, so the input lives in `width - 4`.
     let input_inner_w = area.width.saturating_sub(4).max(1);
     let input_h = composer_visual_input_lines(app, input_inner_w);
-    let inner_h = input_h;
-    let box_h = inner_h.saturating_add(2).min(area.height);
-    let hint_h: u16 = if area.height > box_h { 1 } else { 0 };
+    let box_h = input_h.saturating_add(2).min(area.height);
 
     let box_area = Rect {
         x: area.x,
@@ -858,94 +846,22 @@ fn render_composer(
         width: area.width,
         height: box_h,
     };
-
-    // Top border, with metadata or palette tag punched through.
-    let top_y = box_area.y;
-    frame.render_widget(
-        Paragraph::new(top_border_line(box_area.width, app, palette_open)),
-        Rect {
-            x: box_area.x,
-            y: top_y,
-            width: box_area.width,
-            height: 1,
-        },
-    );
-
-    // Bottom border, with cwd + branch (and model/browser when the palette
-    // pushed it off the top).
-    let bottom_y = box_area.y + box_area.height.saturating_sub(1);
-    frame.render_widget(
-        Paragraph::new(bottom_border_line(box_area.width, app, palette_open)),
-        Rect {
-            x: box_area.x,
-            y: bottom_y,
-            width: box_area.width,
-            height: 1,
-        },
-    );
-
-    // Side borders for every row between top and bottom.
-    if box_area.height > 2 {
-        for row in 1..box_area.height.saturating_sub(1) {
-            let y = box_area.y + row;
-            frame.render_widget(
-                Paragraph::new(Span::styled("│", border())),
-                Rect {
-                    x: box_area.x,
-                    y,
-                    width: 1,
-                    height: 1,
-                },
-            );
-            frame.render_widget(
-                Paragraph::new(Span::styled("│", border())),
-                Rect {
-                    x: box_area.x + box_area.width.saturating_sub(1),
-                    y,
-                    width: 1,
-                    height: 1,
-                },
-            );
-        }
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border());
+    let inner = block.inner(box_area);
+    frame.render_widget(block, box_area);
+    if inner.width <= 2 || inner.height == 0 {
+        return;
     }
-
-    let row_y = box_area.y + 1;
-    let inner_x = box_area.x + 1;
-    let inner_w = box_area.width.saturating_sub(2);
-
-    if input_h > 0 && inner_w > 2 {
-        let input_area = Rect {
-            x: inner_x + 1,
-            y: row_y,
-            width: inner_w.saturating_sub(2),
-            height: input_h,
-        };
-        render_composer_input(frame, input_area, app, state.current_session.as_ref());
-    }
-
-    if hint_h > 0 {
-        let hint_area = Rect {
-            x: area.x,
-            y: box_area.y + box_area.height,
-            width: area.width,
-            height: hint_h,
-        };
-        let hint_inner = hint_area.inner(Margin {
-            vertical: 0,
-            horizontal: 2,
-        });
-        if state.current_session.is_some() {
-            frame.render_widget(
-                Paragraph::new(status_bar_line(app, state, hint_inner.width as usize)),
-                hint_inner,
-            );
-        } else {
-            frame.render_widget(
-                Paragraph::new(hint_row(hint_inner.width as usize)),
-                hint_inner,
-            );
-        }
-    }
+    let input_area = Rect {
+        x: inner.x.saturating_add(1),
+        y: inner.y,
+        width: inner.width.saturating_sub(2),
+        height: inner.height,
+    };
+    render_composer_input(frame, input_area, app, state.current_session.as_ref());
 }
 
 /// Build the top border line for the fused composer. Punches one tag

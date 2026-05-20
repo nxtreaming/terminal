@@ -183,18 +183,8 @@ pub fn welcome_lines(
     }
     out.push(Line::from(""));
     out.push(Line::from(""));
-
-    // breathing room above the version footer
-    out.push(Line::from(""));
-    out.push(Line::from(""));
-
-    // version (right-aligned within width)
-    let v_text = format!("{} Beta", version);
-    let v_pad = " ".repeat(width.saturating_sub(v_text.len() + 2));
-    out.push(Line::from(vec![
-        Span::raw(v_pad),
-        Span::styled(v_text, muted()),
-    ]));
+    let _ = version;
+    let _ = width;
 
     out
 }
