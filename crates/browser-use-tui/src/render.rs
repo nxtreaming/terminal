@@ -114,7 +114,12 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
             render_main(frame, area, app, &state, product_state);
             render_popup_overlay(frame, area, app, &state, surface);
         }
-        surface if surface.uses_main_view() => render_main(frame, area, app, &state, product_state),
+        surface if surface.uses_main_view() => {
+            render_main(frame, area, app, &state, product_state);
+            if app.is_slash_palette_active() {
+                render_command_palette_popup(frame, area, app);
+            }
+        }
         surface => render_surface(frame, area, app, &state, surface),
     }
 }
@@ -324,14 +329,9 @@ fn main_bottom_height_for(
 
 fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> u16 {
     let visual_input_lines = composer_visual_input_lines(app, width.saturating_sub(4).max(1));
-    let palette_items = slash_palette_pane_height(app);
-    if palette_items > 0 {
-        // top border + dropdown items + dashed separator + input + bottom border + hint
-        visual_input_lines + palette_items + 4
-    } else {
-        // top border + input + bottom border + hint
-        visual_input_lines + 3
-    }
+    // top border + input + bottom border + hint. The slash palette floats as
+    // a popup over the body, so the composer's own height never changes.
+    visual_input_lines + 3
 }
 
 fn composer_input_area_width(width: u16) -> u16 {
@@ -546,6 +546,124 @@ fn render_popup_overlay(
     }
 }
 
+/// Floating command palette: appears the moment the composer starts with
+/// `/`, listing all slash commands (filtered by what the user has typed
+/// after the slash). Centered horizontally, anchored just above the
+/// composer so it reads as the dropdown for the input below.
+fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    if area.width == 0 || area.height == 0 {
+        return;
+    }
+
+    const MIN_W: u16 = 40;
+    const MIN_H: u16 = 8;
+    const MAX_W: u16 = 72;
+    const H_MARGIN: u16 = 4;
+
+    let items = app.slash_palette_items();
+    let item_count = items.len() as u16;
+
+    // Chrome above/below the row list: border(2) + header(2) + footer(1) = 5.
+    // Add the item count for the visible body.
+    let desired_h = item_count.saturating_add(5).max(MIN_H);
+
+    let popup_w = if area.width <= MIN_W {
+        area.width
+    } else {
+        area.width
+            .saturating_sub(H_MARGIN.saturating_mul(2))
+            .min(MAX_W)
+            .max(MIN_W)
+    };
+    let composer_h = composer_pane_height(app, ProductState::Ready, area.width);
+    let composer_top = area.y + area.height.saturating_sub(composer_h);
+    // Cap height so the popup never overlaps the composer below.
+    let available_h = composer_top.saturating_sub(area.y).saturating_sub(1).max(MIN_H);
+    let popup_h = desired_h.min(available_h).max(MIN_H.min(available_h));
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    // Anchor to just above the composer.
+    let popup_y = composer_top.saturating_sub(popup_h).saturating_sub(1).max(area.y);
+    let popup_rect = Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    };
+
+    frame.render_widget(Clear, popup_rect);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border());
+    let inner = block.inner(popup_rect);
+    frame.render_widget(block, popup_rect);
+    if inner.width == 0 || inner.height == 0 {
+        return;
+    }
+
+    // Header: `/ command palette` + filter summary.
+    let header = Line::from(vec![
+        Span::raw(" "),
+        Span::styled("/", accent()),
+        Span::styled(" command palette ", muted()),
+    ]);
+    let filter_text = app.composer.input();
+    let filter_summary = if filter_text.len() > 1 {
+        format!(" filter: {filter_text}")
+    } else {
+        format!(" {} of {}", item_count, palette::max_item_count())
+    };
+    let header_lines = vec![
+        Line::from(vec![
+            Span::raw("  "),
+            Span::styled("/", accent()),
+            Span::styled(" command palette", muted()),
+            Span::styled(filter_summary, dim()),
+        ]),
+        Line::from(""),
+    ];
+    let _ = header;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .split(inner);
+
+    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+
+    if items.is_empty() {
+        frame.render_widget(
+            Paragraph::new(Line::from(Span::styled(
+                "  No commands match.",
+                muted(),
+            ))),
+            chunks[1],
+        );
+    } else {
+        let rows = slash_palette_rows(app, chunks[1].width as usize);
+        let mut visible = rows;
+        let body_h = chunks[1].height as usize;
+        if body_h > 0 && app.selected_row >= body_h {
+            let skip = app.selected_row + 1 - body_h;
+            visible = visible.into_iter().skip(skip).collect();
+        }
+        frame.render_widget(
+            Paragraph::new(visible)
+                .style(Style::default().fg(text()))
+                .wrap(Wrap { trim: false }),
+            chunks[1],
+        );
+    }
+
+    frame.render_widget(
+        Paragraph::new(Line::from(Span::styled(
+            " ↑↓ navigate · ⏎ select · esc close",
+            muted(),
+        )))
+        .alignment(Alignment::Right),
+        chunks[2],
+    );
+}
+
 fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {
     let height = height as usize;
     if height == 0 {
@@ -702,20 +820,19 @@ fn render_composer(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let palette_items = if app.is_slash_palette_active() {
-        app.slash_palette_items()
-    } else {
-        Vec::new()
-    };
-    let palette_h = palette_items.len() as u16;
-    let palette_open = palette_h > 0;
-    let sep_h: u16 = if palette_open { 1 } else { 0 };
+    // The slash palette renders as a floating popup over the body now, so
+    // the composer is always a single bordered input box — no inline
+    // dropdown half stacked on top of it. Keeping the local name `palette_open`
+    // false means the top border carries model+browser regardless and the
+    // bottom border carries cwd+branch.
+    let palette_open = false;
+    let _ = palette_open;
 
     // Inside the box we reserve 1 cell of horizontal padding on each side,
     // plus the 1-cell border, so the input lives in `width - 4`.
     let input_inner_w = area.width.saturating_sub(4).max(1);
     let input_h = composer_visual_input_lines(app, input_inner_w);
-    let inner_h = palette_h + sep_h + input_h;
+    let inner_h = input_h;
     let box_h = inner_h.saturating_add(2).min(area.height);
     let hint_h: u16 = if area.height > box_h { 1 } else { 0 };
 
@@ -776,37 +893,9 @@ fn render_composer(
         }
     }
 
-    let mut row_y = box_area.y + 1;
+    let row_y = box_area.y + 1;
     let inner_x = box_area.x + 1;
     let inner_w = box_area.width.saturating_sub(2);
-
-    if palette_open && inner_w > 0 && palette_h > 0 {
-        let palette_area = Rect {
-            x: inner_x + 1,
-            y: row_y,
-            width: inner_w.saturating_sub(2),
-            height: palette_h,
-        };
-        frame.render_widget(
-            Paragraph::new(slash_palette_rows(app, palette_area.width as usize)),
-            palette_area,
-        );
-        row_y += palette_h;
-
-        // Dashed separator that breaks the top half (dropdown) from the
-        // bottom half (input), with ├ / ┤ joins at the box edges.
-        let sep_area = Rect {
-            x: box_area.x,
-            y: row_y,
-            width: box_area.width,
-            height: 1,
-        };
-        frame.render_widget(
-            Paragraph::new(separator_line(box_area.width)),
-            sep_area,
-        );
-        row_y += 1;
-    }
 
     if input_h > 0 && inner_w > 2 {
         let input_area = Rect {
