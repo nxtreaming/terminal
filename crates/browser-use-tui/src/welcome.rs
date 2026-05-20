@@ -26,12 +26,16 @@ impl WelcomeAnim {
             .map(|d| d.subsec_nanos())
             .unwrap_or(1)
             | 1;
+        // Start at the canonical Browser Use orbit-mark orientation
+        // (no global rotation applied — the ring `base_a`/`base_b`
+        // already carry the right tilt/roll), then let the gentle
+        // y-axis drift take over.
         Self {
-            rx: 0.55,
+            rx: 0.0,
             ry: 0.0,
             vx: 0.0,
             vy: 0.0,
-            base_rx: 0.55,
+            base_rx: 0.0,
             target_vy: 0.4,
             last_tick: Instant::now(),
             rng: seed,
