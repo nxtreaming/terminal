@@ -8,7 +8,7 @@
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs;
 use std::io::{BufRead, BufReader, Write};
-use std::net::{TcpListener, TcpStream};
+use std::net::{Shutdown, TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, Command, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -2279,7 +2279,7 @@ fn run_bridge(listener: TcpListener, session_id: String, stop: Arc<AtomicBool>) 
 
 fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
     let _ = stream.set_read_timeout(Some(Duration::from_secs(30)));
-    let _ = stream.set_write_timeout(Some(Duration::from_secs(30)));
+    let _ = stream.set_write_timeout(Some(Duration::from_secs(120)));
     let mut line = String::new();
     BufReader::new(stream.try_clone()?).read_line(&mut line)?;
     let request: Value = serde_json::from_str(&line)?;
@@ -2287,7 +2287,11 @@ fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
         Ok(value) => json!({ "ok": true, "result": value }),
         Err(error) => json!({ "ok": false, "error": format!("{error:#}") }),
     };
-    writeln!(stream, "{}", serde_json::to_string(&response)?)?;
+    let response_bytes = serde_json::to_vec(&response)?;
+    write!(stream, "{}\n", response_bytes.len())?;
+    stream.write_all(&response_bytes)?;
+    stream.flush()?;
+    let _ = stream.shutdown(Shutdown::Write);
     Ok(())
 }
 
@@ -2369,15 +2373,38 @@ def _jsonable(value):
         return repr(value)
 
 def _bridge(payload):
-    with socket.create_connection(("127.0.0.1", BRIDGE_PORT), timeout=30) as sock:
+    with socket.create_connection(("127.0.0.1", BRIDGE_PORT), timeout=120) as sock:
         sock.sendall((json.dumps(payload) + "\n").encode())
-        chunks = []
+        sock.shutdown(socket.SHUT_WR)
+        header = bytearray()
         while True:
-            data = sock.recv(65536)
-            if not data:
+            byte = sock.recv(1)
+            if not byte:
+                raise RuntimeError("browser bridge closed before response length header")
+            if byte == b"\n":
                 break
+            header.extend(byte)
+            if len(header) > 32:
+                raise RuntimeError("browser bridge response length header is too large")
+        try:
+            expected = int(header.decode("ascii"))
+        except ValueError as exc:
+            raise RuntimeError("browser bridge returned invalid response length header: %r" % bytes(header)) from exc
+        chunks = []
+        remaining = expected
+        while remaining:
+            data = sock.recv(min(65536, remaining))
+            if not data:
+                got = expected - remaining
+                raise RuntimeError(f"browser bridge response ended early: expected {{expected}} bytes, got {{got}}")
             chunks.append(data)
-    response = json.loads(b"".join(chunks).decode())
+            remaining -= len(data)
+    raw_response = b"".join(chunks)
+    try:
+        response = json.loads(raw_response.decode())
+    except json.JSONDecodeError as exc:
+        sample = raw_response[:200].decode("utf-8", "replace")
+        raise RuntimeError(f"browser bridge returned invalid JSON: {{exc}}; first bytes: {{sample!r}}") from exc
     if not response.get("ok"):
         raise RuntimeError(response.get("error") or "browser bridge failed")
     return response.get("result")
@@ -3015,8 +3042,36 @@ mod tests {
             temp.path(),
             &artifacts,
             r##"
-goto_url("data:text/html,<title>Browser Smoke</title><h1 id='ok'>Browser Smoke</h1>")
+goto_url("about:blank")
+js("""
+(() => {
+  document.title = "Browser Smoke";
+  document.body.style.margin = "0";
+  document.body.innerHTML = '<canvas id="ok" width="1280" height="900"></canvas>';
+  const canvas = document.querySelector("#ok");
+  canvas.style.display = "block";
+  canvas.style.width = "1280px";
+  canvas.style.height = "900px";
+  const ctx = canvas.getContext("2d");
+  const img = ctx.createImageData(canvas.width, canvas.height);
+  let seed = 0x12345678;
+  for (let i = 0; i < img.data.length; i += 4) {
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    img.data[i] = seed & 255;
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    img.data[i + 1] = seed & 255;
+    seed = (Math.imul(seed, 1664525) + 1013904223) >>> 0;
+    img.data[i + 2] = seed & 255;
+    img.data[i + 3] = 255;
+  }
+  ctx.putImageData(img, 0, 0);
+  return true;
+})()
+""")
 wait_for_element("#ok")
+time.sleep(0.5)
+large = js("'x'.repeat(200000)")
+assert len(large) == 200000, len(large)
 info = page_info()
 print(info)
 screenshot("managed_smoke")
