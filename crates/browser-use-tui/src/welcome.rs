@@ -232,6 +232,7 @@ pub fn welcome_lines(
     width: u16,
     anim: &WelcomeAnim,
     selected_idx: usize,
+    target_h: u16,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let width = width as usize;
@@ -240,14 +241,27 @@ pub fn welcome_lines(
     let cwd = short_cwd();
     let title = "Browser Use Terminal";
     let sep = " · ";
-    let _ = width;
     out.push(Line::from(vec![
         Span::styled(title.to_string(), bold()),
         Span::styled(sep.to_string(), muted()),
         Span::styled(cwd, muted()),
     ]));
-    out.push(Line::from(""));
-    out.push(Line::from(""));
+
+    // Logo + menu form the centered block; we balance the padding above
+    // the logo against the trailing padding below the menu so the gap
+    // looks symmetric within the body area.
+    const LOGO_TO_MENU_GAP: usize = 2;
+    const MENU_ROWS: usize = 3;
+    let block_h = LOGO_H + LOGO_TO_MENU_GAP + MENU_ROWS;
+    let header_h = 1_usize;
+    let target = target_h as usize;
+    let available_below_header = target.saturating_sub(header_h);
+    let pad_top = available_below_header.saturating_sub(block_h) / 2;
+    let pad_top = pad_top.max(1);
+
+    for _ in 0..pad_top {
+        out.push(Line::from(""));
+    }
 
     let logo_rows = render_braille_logo(LOGO_W, LOGO_H, LOGO_R, LOGO_STROKE, anim.rx, anim.ry);
     let pad_logo = " ".repeat(width.saturating_sub(LOGO_W) / 2);
@@ -257,8 +271,10 @@ pub fn welcome_lines(
         text.push_str(&row);
         out.push(Line::from(Span::styled(text, text_style())));
     }
-    out.push(Line::from(""));
-    out.push(Line::from(""));
+
+    for _ in 0..LOGO_TO_MENU_GAP {
+        out.push(Line::from(""));
+    }
 
     // menu — 3 rows, centered
     let menu_w: usize = 38;
@@ -278,8 +294,14 @@ pub fn welcome_lines(
             Span::styled(kbd.to_string(), muted()),
         ]));
     }
-    out.push(Line::from(""));
-    out.push(Line::from(""));
+
+    // Trailing padding matches pad_top so the gap below the menu mirrors
+    // the gap above the logo.
+    let used = header_h + pad_top + block_h;
+    let pad_bottom = target.saturating_sub(used);
+    for _ in 0..pad_bottom {
+        out.push(Line::from(""));
+    }
 
     out
 }
