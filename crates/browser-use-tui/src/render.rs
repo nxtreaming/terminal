@@ -288,10 +288,15 @@ fn should_pin_main_bottom(product_state: ProductState, native_scrollback_active:
 
 pub(crate) fn main_viewport_height(app: &App, width: u16) -> u16 {
     let current = composer_pane_height(app, ProductState::Ready, width);
-    let reserved_input_h = 1_u16;
-    let palette_h = (palette::max_item_count() as u16).min(8).saturating_add(3);
-    let max_palette = reserved_input_h.saturating_add(palette_h).saturating_add(1);
-    current.max(max_palette)
+    // Worst-case fused-composer height with the palette open: input floor +
+    // dropdown rows (capped at 8) + top border + separator + bottom border +
+    // hint = COMPOSER_INPUT_MIN_ROWS + items + 4. We reserve this so opening
+    // the palette never resizes the viewport underneath the user.
+    let palette_items = (palette::max_item_count() as u16).min(8);
+    let max_palette_pane = COMPOSER_INPUT_MIN_ROWS
+        .saturating_add(palette_items)
+        .saturating_add(4);
+    current.max(max_palette_pane)
 }
 
 fn main_bottom_height_for(
@@ -333,11 +338,18 @@ fn composer_input_area_width(width: u16) -> u16 {
     width.saturating_sub(4).max(1)
 }
 
+/// Visual rows the input area inside the fused composer should occupy.
+/// Floored at 3 so the box has comfortable breathing room when empty, and
+/// capped at 10 so a long pasted prompt doesn't push the rest of the UI
+/// off-screen.
+const COMPOSER_INPUT_MIN_ROWS: u16 = 3;
+const COMPOSER_INPUT_MAX_ROWS: u16 = 10;
+
 fn composer_visual_input_lines(app: &App, input_area_width: u16) -> u16 {
     let visual_input_lines = app
         .composer
-        .visual_line_count_wrapped(input_area_width as usize);
-    visual_input_lines.clamp(1, 10) as u16
+        .visual_line_count_wrapped(input_area_width as usize) as u16;
+    visual_input_lines.clamp(COMPOSER_INPUT_MIN_ROWS, COMPOSER_INPUT_MAX_ROWS)
 }
 
 /// Number of dropdown item rows the slash palette would render (0 when the
