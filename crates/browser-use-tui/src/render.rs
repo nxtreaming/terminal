@@ -188,7 +188,7 @@ fn render_main(
     } else {
         match product_state {
             ProductState::SetupNeeded => setup_lines(app),
-            ProductState::Ready => ready_lines(app, state, body_width),
+            ProductState::Ready => ready_lines(app, state, body_width, max_body_h),
             ProductState::Running
             | ProductState::Result
             | ProductState::Failed
@@ -278,9 +278,9 @@ fn main_layout_areas(
     } else {
         (body_len as u16).min(max_body_h)
     };
-    // Body lives at the top of the area, the composer (bottom pane) is
-    // pinned to the bottom of the terminal with a flex spacer between
-    // them, and the optional footer sits as the very last row.
+    // Body sits at the top of the area; the composer is pinned to the
+    // bottom of the terminal with a flex spacer between them; the
+    // optional footer is the very last row.
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
@@ -1765,17 +1765,25 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-fn ready_lines(app: &App, state: &WorkbenchState, width: u16) -> Vec<Line<'static>> {
+fn ready_lines(
+    app: &App,
+    state: &WorkbenchState,
+    width: u16,
+    max_h: u16,
+) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     if let Some(notice) = app.status_notice.as_ref() {
         lines.push(Line::from(Span::styled(notice.clone(), failed())));
         lines.push(Line::from(""));
     }
-
+    // Pass the remaining body height to the welcome renderer so it can
+    // balance the gap above the logo with the gap below the menu.
+    let remaining = max_h.saturating_sub(lines.len() as u16);
     lines.extend(crate::welcome::welcome_lines(
         width,
         &app.welcome_anim,
         app.selected_row,
+        remaining,
     ));
     let _ = state;
     lines
