@@ -155,6 +155,36 @@ fn is_cloud_browser_mode(mode: Option<&str>) -> bool {
     .unwrap_or(false)
 }
 
+fn browser_mode_instruction(mode: &str) -> String {
+    let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "local" | "local-chrome" => concat!(
+            "Selected browser mode: Local Chrome. Use `browser connect local` before page work. ",
+            "This attaches to the user's already-open browser after remote debugging is enabled. ",
+            "If connection is blocked, run `browser local setup` and wait for the user to approve remote debugging."
+        )
+        .to_string(),
+        "headless" | "headless-chromium" | "managed-headless" => concat!(
+            "Selected browser mode: Headless Chromium. Use `browser connect managed --headless` before page work. ",
+            "This starts a Rust-owned managed browser with an isolated automation profile."
+        )
+        .to_string(),
+        "managed" | "managed-headed" => concat!(
+            "Selected browser mode: managed headed browser. Use `browser connect managed --headed` before page work. ",
+            "This starts a Rust-owned visible browser with an isolated automation profile."
+        )
+        .to_string(),
+        "cloud" | "browser-use-cloud" => concat!(
+            "Selected browser mode: Browser Use cloud. Use `browser remote start` before page work. ",
+            "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
+        )
+        .to_string(),
+        other => format!(
+            "Selected browser mode: {other}. Use `browser status --json` first, then choose an explicit browser connect command."
+        ),
+    }
+}
+
 pub fn run_fake_agent(
     store: &Store,
     task_text: &str,
@@ -567,6 +597,15 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         }
     };
     let task_text = task_text_from_provider_messages(&messages);
+    if let Some(browser_mode) = options.browser_mode.as_deref() {
+        messages.insert(
+            0,
+            serde_json::json!({
+                "role": "system",
+                "content": browser_mode_instruction(browser_mode),
+            }),
+        );
+    }
     let agent_span = telemetry.start_agent_span(
         &session.id,
         session.parent_id.as_deref(),
@@ -968,6 +1007,14 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 &session.id,
                 "command.cleaned_up",
                 serde_json::json!({ "count": cleaned_commands }),
+            )?;
+        }
+        let cleaned_browser = browser_use_browser::cleanup_session(&session.id);
+        if cleaned_browser > 0 {
+            store.append_event(
+                &session.id,
+                "browser.runtime_cleaned_up",
+                serde_json::json!({ "count": cleaned_browser }),
             )?;
         }
         run_result
@@ -2607,10 +2654,7 @@ fn dispatch_parallel_tool_call(
 fn tool_call_supports_parallel(registry: &ToolRegistry, call: &ToolCall) -> bool {
     match registry.handler_for(&call.name) {
         Some(
-            ToolHandlerKind::ReadFile
-            | ToolHandlerKind::SearchFiles
-            | ToolHandlerKind::ListFiles
-            | ToolHandlerKind::ViewImage,
+            ToolHandlerKind::ReadFile | ToolHandlerKind::SearchFiles | ToolHandlerKind::ListFiles,
         ) => true,
         Some(ToolHandlerKind::ExecCommand) => {
             tools::command::exec_command_is_known_read_only(&call.arguments)
@@ -2638,11 +2682,18 @@ fn dispatch_tool_call<P: ModelProvider>(
     options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
     let registry = ToolRegistry::browser_agent();
-    let Some(handler) = registry.handler_for(&call.name) else {
+    let Some(handler) = registry
+        .handler_for(&call.name)
+        .or_else(|| (call.name == "python").then_some(ToolHandlerKind::Python))
+    else {
         return dispatch_unknown_tool(store, session, call);
     };
     match handler {
         ToolHandlerKind::Done => dispatch_done_tool(store, session, call),
+        ToolHandlerKind::Browser => dispatch_browser_tool(store, session, call),
+        ToolHandlerKind::BrowserScript => {
+            dispatch_browser_script_tool(store, session, call, options.python_tool_timeout_seconds)
+        }
         ToolHandlerKind::Python => dispatch_python_tool(
             store,
             session,
@@ -2810,6 +2861,119 @@ fn dispatch_view_image_tool(
             call,
             "view_image",
             result.content,
+        )?],
+    })
+}
+
+fn dispatch_browser_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    let cmd = call
+        .arguments
+        .get("cmd")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if cmd.is_empty() {
+        return dispatch_tool_validation_error(store, session, call, "browser requires cmd");
+    }
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "browser",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let output = browser_use_browser::run_browser_command(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        cmd,
+    )?;
+    for event in &output.events {
+        record_python_browser_event(store, &session.id, event)?;
+    }
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "browser",
+            "tool_call_id": call.id,
+            "output": output.content,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser",
+            output.content,
+        )?],
+    })
+}
+
+fn dispatch_browser_script_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    timeout_seconds: u64,
+) -> Result<ToolDispatchOutcome> {
+    let code = call
+        .arguments
+        .get("code")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "browser_script",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let response = browser_use_browser::run_browser_script(
+        &session.id,
+        &session.cwd,
+        &session.artifact_root,
+        code,
+        timeout_seconds,
+    )?;
+    record_browser_script_response_events(store, &session.id, &response)?;
+    if response.ok {
+        store.append_event(
+            &session.id,
+            "tool.finished",
+            serde_json::json!({
+                "name": "browser_script",
+                "tool_call_id": call.id,
+            }),
+        )?;
+    } else {
+        store.append_event(
+            &session.id,
+            "tool.failed",
+            serde_json::json!({
+                "name": "browser_script",
+                "tool_call_id": call.id,
+                "error": response.error,
+            }),
+        )?;
+    }
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "browser_script",
+            browser_script_tool_message_content_value(&response)?,
         )?],
     })
 }
@@ -4620,6 +4784,80 @@ fn python_tool_image_output_parts(response: &RunPythonResponse) -> Result<Option
     Ok(Some(parts))
 }
 
+fn browser_script_tool_message_content(
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> String {
+    if response.ok {
+        let mut parts = Vec::new();
+        if !response.text.trim().is_empty() {
+            parts.push(response.text.trim().to_string());
+        }
+        if !response.data.is_null() && response.data != serde_json::json!({}) {
+            parts.push(format!("data: {}", response.data));
+        }
+        if parts.is_empty() {
+            "browser_script completed".to_string()
+        } else {
+            parts.join("\n")
+        }
+    } else {
+        format!(
+            "browser_script failed: {}",
+            response
+                .error
+                .as_deref()
+                .unwrap_or("unknown browser_script error")
+        )
+    }
+}
+
+fn browser_script_tool_message_content_value(
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> Result<Value> {
+    let text = browser_script_tool_message_content(response);
+    let Some(image_parts) = browser_script_image_output_parts(response)? else {
+        return Ok(Value::String(text));
+    };
+    let mut parts = vec![serde_json::json!({
+        "type": "output_text",
+        "text": text,
+    })];
+    parts.extend(image_parts);
+    Ok(Value::Array(parts))
+}
+
+fn browser_script_image_output_parts(
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> Result<Option<Vec<Value>>> {
+    if !response.ok || response.images.is_empty() {
+        return Ok(None);
+    }
+    let mut parts = Vec::new();
+    for image in &response.images {
+        let Some(path) = image.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let bytes = std::fs::read(path).with_context(|| format!("read image artifact {path}"))?;
+        let mime_type = image
+            .get("mime_type")
+            .and_then(Value::as_str)
+            .or_else(|| image.get("mime").and_then(Value::as_str))
+            .unwrap_or("image/png");
+        parts.push(serde_json::json!({
+            "type": "input_image",
+            "image_url": format!("data:{mime_type};base64,{}", general_purpose::STANDARD.encode(bytes)),
+            "detail": image
+                .get("detail")
+                .and_then(Value::as_str)
+                .unwrap_or("auto"),
+        }));
+    }
+    if parts.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(parts))
+}
+
 pub fn record_python_response_events(
     store: &Store,
     session_id: &str,
@@ -4634,6 +4872,57 @@ pub fn record_python_response_final_event(
     response: &RunPythonResponse,
 ) -> Result<Option<Value>> {
     record_python_response_events_inner(store, session_id, response, false)
+}
+
+fn record_browser_script_response_events(
+    store: &Store,
+    session_id: &str,
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> Result<()> {
+    for browser_event in &response.browser_events {
+        record_python_browser_event(store, session_id, browser_event)?;
+    }
+    let image_paths = response
+        .images
+        .iter()
+        .filter_map(|image| image.get("path").and_then(Value::as_str))
+        .collect::<std::collections::HashSet<_>>();
+    for image in &response.images {
+        record_tool_image(store, session_id, "browser_script", image)?;
+    }
+    for artifact in &response.artifacts {
+        let Some(path) = artifact.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        if image_paths.contains(path) {
+            continue;
+        }
+        record_tool_artifact(store, session_id, "browser_script", artifact)?;
+    }
+    if let Some(final_answer) = response.data.get("final_answer") {
+        store.append_event(
+            session_id,
+            "session.final_answer_ready",
+            serde_json::json!({
+                "source": "browser_script.set_final_answer",
+                "final_answer": final_answer,
+            }),
+        )?;
+    }
+    store.append_event(
+        session_id,
+        "tool.output",
+        serde_json::json!({
+            "name": "browser_script",
+            "ok": response.ok,
+            "text": response.text,
+            "data": response.data,
+            "images": response.images,
+            "artifacts": response.artifacts,
+            "error": response.error,
+        }),
+    )?;
+    Ok(())
 }
 
 pub fn record_python_worker_event(
@@ -4758,11 +5047,15 @@ fn record_python_browser_event(
 }
 
 fn record_python_image(store: &Store, session_id: &str, image: &Value) -> Result<()> {
+    record_tool_image(store, session_id, "python", image)
+}
+
+fn record_tool_image(store: &Store, session_id: &str, name: &str, image: &Value) -> Result<()> {
     let event = store.append_event(
         session_id,
         "tool.image",
         serde_json::json!({
-            "name": "python",
+            "name": name,
             "image": image,
         }),
     )?;
@@ -4780,6 +5073,15 @@ fn record_python_image(store: &Store, session_id: &str, image: &Value) -> Result
 }
 
 fn record_python_artifact(store: &Store, session_id: &str, artifact: &Value) -> Result<()> {
+    record_tool_artifact(store, session_id, "python", artifact)
+}
+
+fn record_tool_artifact(
+    store: &Store,
+    session_id: &str,
+    name: &str,
+    artifact: &Value,
+) -> Result<()> {
     let Some(path) = artifact.get("path").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -4791,7 +5093,7 @@ fn record_python_artifact(store: &Store, session_id: &str, artifact: &Value) -> 
         session_id,
         "artifact.created",
         serde_json::json!({
-            "name": "python",
+            "name": name,
             "artifact": artifact,
         }),
     )?;

@@ -32,6 +32,14 @@ pub(crate) fn run_agent_thread(
         );
         bail!(error);
     }
+    if let Some(api_key) = browser_use_cloud_api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        // Browser runtime is Rust-owned now, so the cloud API key must also be
+        // visible to Rust-side Browser Use API calls, not only the legacy Python worker.
+        std::env::set_var(BROWSER_USE_CLOUD_API_KEY_ENV, api_key);
+    }
     let config = ProviderRunConfig::new(backend.into(), model)
         .with_options(tui_agent_options(
             &browser,
@@ -66,13 +74,11 @@ fn browser_use_cloud_api_key(store: &Store) -> Result<Option<String>> {
 
 fn tui_agent_options(
     browser: &str,
-    session_id: &str,
+    _session_id: &str,
     browser_use_cloud_api_key: Option<&str>,
 ) -> AgentRunOptions {
     match browser {
-        "Headless Chromium" => AgentRunOptions::default()
-            .with_browser_mode("headless")
-            .with_python_env(managed_browser_env(session_id, false)),
+        "Headless Chromium" => AgentRunOptions::default().with_browser_mode("managed-headless"),
         BROWSER_USE_CLOUD => {
             let mut options = AgentRunOptions::default().with_browser_mode("cloud");
             if let Some(api_key) =
@@ -85,55 +91,7 @@ fn tui_agent_options(
             }
             options
         }
-        _ => AgentRunOptions::default()
-            .with_browser_mode("local")
-            .with_python_env(managed_browser_env(session_id, true)),
-    }
-}
-
-fn clear_cdp_env() -> Vec<(String, String)> {
-    [("BU_CDP_URL", ""), ("BU_CDP_WS", ""), ("BU_BROWSER_ID", "")]
-        .into_iter()
-        .map(|(key, value)| (key.to_string(), value.to_string()))
-        .collect()
-}
-
-fn managed_browser_env(session_id: &str, visible: bool) -> Vec<(String, String)> {
-    let mut env = clear_cdp_env();
-    let daemon_name = format!("but-tui-{}", safe_env_segment(session_id));
-    let runtime_dir = format!("/tmp/{daemon_name}");
-    env.extend([
-        ("BU_NAME".to_string(), daemon_name),
-        ("BH_RUNTIME_DIR".to_string(), runtime_dir.clone()),
-        ("BH_TMP_DIR".to_string(), runtime_dir),
-        ("LLM_BROWSER_AUTO_CHROME".to_string(), "1".to_string()),
-    ]);
-    if visible {
-        env.push((
-            "LLM_BROWSER_MANAGED_CHROME_VISIBLE".to_string(),
-            "1".to_string(),
-        ));
-    }
-    env
-}
-
-fn safe_env_segment(value: &str) -> String {
-    let segment = value
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_') {
-                ch
-            } else {
-                '-'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('-')
-        .to_string();
-    if segment.is_empty() {
-        "session".to_string()
-    } else {
-        segment
+        _ => AgentRunOptions::default().with_browser_mode("local"),
     }
 }
 
@@ -153,34 +111,14 @@ mod tests {
     fn local_chrome_overrides_cloud_dotenv_mode() {
         let options = tui_agent_options("Local Chrome", "abc123", None);
         assert_eq!(options.browser_mode.as_deref(), Some("local"));
-        assert_eq!(env_value(&options, "BU_CDP_URL"), Some(""));
-        assert_eq!(env_value(&options, "BU_CDP_WS"), Some(""));
-        assert_eq!(env_value(&options, "BU_BROWSER_ID"), Some(""));
-        assert_eq!(env_value(&options, "LLM_BROWSER_AUTO_CHROME"), Some("1"));
-        assert_eq!(
-            env_value(&options, "LLM_BROWSER_MANAGED_CHROME_VISIBLE"),
-            Some("1")
-        );
-        assert_eq!(env_value(&options, "BU_NAME"), Some("but-tui-abc123"));
-        assert_eq!(
-            env_value(&options, "BH_RUNTIME_DIR"),
-            Some("/tmp/but-tui-abc123")
-        );
+        assert!(options.python_env.is_empty());
     }
 
     #[test]
     fn headless_chromium_uses_managed_browser_not_inherited_cdp() {
         let options = tui_agent_options("Headless Chromium", "abc123", None);
-        assert_eq!(options.browser_mode.as_deref(), Some("headless"));
-        assert_eq!(env_value(&options, "BU_CDP_URL"), Some(""));
-        assert_eq!(env_value(&options, "BU_CDP_WS"), Some(""));
-        assert_eq!(env_value(&options, "BU_BROWSER_ID"), Some(""));
-        assert_eq!(env_value(&options, "BU_NAME"), Some("but-tui-abc123"));
-        assert_eq!(env_value(&options, "LLM_BROWSER_AUTO_CHROME"), Some("1"));
-        assert_eq!(
-            env_value(&options, "LLM_BROWSER_MANAGED_CHROME_VISIBLE"),
-            None
-        );
+        assert_eq!(options.browser_mode.as_deref(), Some("managed-headless"));
+        assert!(options.python_env.is_empty());
     }
 
     #[test]
@@ -197,16 +135,6 @@ mod tests {
         assert_eq!(
             env_value(&options, BROWSER_USE_CLOUD_API_KEY_ENV),
             Some("bu-test")
-        );
-    }
-
-    #[test]
-    fn local_chrome_sanitizes_session_id_for_daemon_name() {
-        let options = tui_agent_options("Local Chrome", "abc/123 !?", None);
-        assert_eq!(env_value(&options, "BU_NAME"), Some("but-tui-abc-123"));
-        assert_eq!(
-            env_value(&options, "BH_RUNTIME_DIR"),
-            Some("/tmp/but-tui-abc-123")
         );
     }
 }

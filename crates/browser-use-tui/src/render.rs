@@ -976,8 +976,8 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
     };
     let descriptions = [
         cloud_description,
-        "visible browser on this machine",
-        "background browser",
+        "attach to already-open browser",
+        "Rust-owned background browser",
     ];
     for (idx, browser) in BROWSER_CHOICES.iter().enumerate() {
         lines.push(selected(

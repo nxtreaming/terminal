@@ -728,20 +728,28 @@ We will implement:
 ## Checklist
 
 - [x] Commit this plan before implementation.
-- [ ] Add Rust browser runtime in `crates/browser-use-browser`.
-- [ ] Add `browser` CLI-style tool and README-like tool description.
-- [ ] Add `browser_script` fresh Python runner and helper preload.
-- [ ] Move browser connection ownership out of persistent Python state.
-- [ ] Support local attach, managed browser, remote CDP, and Browser Use cloud start/connect.
-- [ ] Add status, doctor, recovery, runtime logs, ownership, and stale cleanup commands.
-- [ ] Mark `view_image` sequential/not parallel-safe.
-- [ ] Update TUI/settings/state to reflect local attach vs managed launch.
-- [ ] Add unit/integration tests for parser, status, doctor, recovery, and scripting.
-- [ ] Run `cargo fmt --check`.
-- [ ] Run `cargo test`.
-- [ ] Run `uv run --with pytest python -m pytest -q`.
-- [ ] Run `scripts/verify-terminal-ui.sh` for TUI coverage.
-- [ ] Run bounded real-LLM smoke test if credentials are available; otherwise record blocker.
+- [x] Add Rust browser runtime in `crates/browser-use-browser`.
+- [x] Add `browser` CLI-style tool and README-like tool description.
+- [x] Add `browser_script` fresh Python runner and helper preload.
+- [x] Move browser connection ownership out of persistent Python state.
+- [x] Support local attach, managed browser, remote CDP, and Browser Use cloud start/connect.
+- [x] Add status, doctor, recovery, runtime logs, ownership, and stale cleanup commands.
+- [x] Mark `view_image` sequential/not parallel-safe.
+- [x] Update TUI/settings/state to reflect local attach vs managed launch.
+- [x] Add unit/integration tests for parser, status, doctor, recovery, and scripting.
+  - Added contract tests for the LLM-visible `browser`, `browser_script`, and sequential `view_image` descriptions.
+  - Added browser runtime tests for command parsing, status shape, doctor output, explicit recovery failure, fresh `browser_script`, and an ignored real managed-browser smoke.
+- [x] Run `cargo fmt --check`.
+  - Passed.
+- [x] Run `cargo test`.
+  - Passed.
+- [x] Run `uv run --with pytest python -m pytest -q`.
+  - Passed: 19 tests.
+- [x] Run `scripts/verify-terminal-ui.sh` for TUI coverage.
+  - Passed. Artifacts inspected under `/tmp/but-design-loop/`.
+- [x] Run bounded real-LLM smoke test if credentials are available; otherwise record blocker.
+  - Passed with Codex `gpt-5.4-mini`, state dir `/tmp/but-real-llm-smoke`, session `2208a8d6ebb7`.
+  - The model called `browser status --json`, `browser connect managed --headless`, `browser_script`, created screenshot artifact `llm_smoke`, read `document.title`, and finished with `title=LLM Browser Smoke`.
 
 ## Interface
 
