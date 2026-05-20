@@ -212,14 +212,27 @@ const LOGO_R: f32 = 14.0;
 const LOGO_STROKE: f32 = 1.15;
 
 /// Compute the on-screen rect of the logo inside the welcome surface so the
-/// mouse handler can hit-test clicks against just the logo, not the whole panel.
+/// mouse handler can hit-test clicks against just the logo, not the whole
+/// panel. Must mirror the exact row offsets used by `welcome_lines`, since
+/// the logo is no longer at a fixed top offset — it's vertically centered
+/// in the body area below the header.
 pub fn logo_screen_rect(
     body_rect: ratatui::layout::Rect,
     has_status_notice: bool,
 ) -> ratatui::layout::Rect {
-    // Welcome layout: optional 2-line status notice (notice + blank), then one
-    // leading blank, then the logo. So the logo's top row is +1 (or +3 with notice).
-    let top_offset = if has_status_notice { 3 } else { 1 };
+    // Rows ready_lines prepends before invoking welcome_lines.
+    let status_notice_rows: u16 = if has_status_notice { 2 } else { 0 };
+    // welcome_lines outputs: header(1) + pad_top blanks + logo(LOGO_H) + ...
+    // Recompute pad_top using the same formula welcome_lines uses, where
+    // `target_h` was `body_rect.height - status_notice_rows`.
+    const LOGO_TO_MENU_GAP: u16 = 2;
+    const MENU_ROWS: u16 = 3;
+    const HEADER_H: u16 = 1;
+    let target = body_rect.height.saturating_sub(status_notice_rows);
+    let available_below_header = target.saturating_sub(HEADER_H);
+    let block_h = LOGO_H as u16 + LOGO_TO_MENU_GAP + MENU_ROWS;
+    let pad_top = (available_below_header.saturating_sub(block_h) / 2).max(1);
+    let top_offset = status_notice_rows + HEADER_H + pad_top;
     let col_offset = body_rect.width.saturating_sub(LOGO_W as u16) / 2;
     ratatui::layout::Rect {
         x: body_rect.x.saturating_add(col_offset),
