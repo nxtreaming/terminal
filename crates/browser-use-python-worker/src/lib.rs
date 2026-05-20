@@ -142,8 +142,6 @@ impl PythonWorker {
                 "fetch-use==0.4.0",
                 "--with",
                 "pillow==12.2.0",
-                "--with",
-                "websockets==15.0.1",
                 "python",
             ];
             if let Ok(worker) = Self::start_with_program_args(

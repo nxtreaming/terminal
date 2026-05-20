@@ -6,6 +6,8 @@ pub(crate) mod files;
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum ToolHandlerKind {
     Done,
+    Browser,
+    BrowserScript,
     Python,
     ExecCommand,
     WriteStdin,
@@ -46,7 +48,8 @@ impl ToolRegistry {
         registry.register(list_files_tool_spec(), ToolHandlerKind::ListFiles);
         registry.register(view_image_tool_spec(), ToolHandlerKind::ViewImage);
         registry.register(update_plan_tool_spec(), ToolHandlerKind::UpdatePlan);
-        registry.register(python_tool_spec(), ToolHandlerKind::Python);
+        registry.register(browser_tool_spec(), ToolHandlerKind::Browser);
+        registry.register(browser_script_tool_spec(), ToolHandlerKind::BrowserScript);
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
         registry.register(spawn_agent_tool_spec(), ToolHandlerKind::SpawnAgent);
         registry.register(wait_agent_tool_spec(), ToolHandlerKind::WaitAgent);
@@ -278,8 +281,15 @@ fn list_files_tool_spec() -> ToolSpec {
 fn view_image_tool_spec() -> ToolSpec {
     ToolSpec {
         name: "view_image".to_string(),
-        description: "Inspect a local image file and pass it back to the model when supported."
-            .to_string(),
+        description: concat!(
+            "Sequential local image inspection tool. Use this only for images already saved ",
+            "on disk, such as screenshots or artifacts. This tool is not parallel-safe: visual ",
+            "context should be inspected in order with the browser actions that produced it. ",
+            "It must not be called in parallel with browser actions or other image views. ",
+            "It is not a browser screenshot command; use browser_script screenshot helpers ",
+            "to create browser screenshots first."
+        )
+        .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -298,26 +308,44 @@ fn view_image_tool_spec() -> ToolSpec {
     }
 }
 
-fn python_tool_spec() -> ToolSpec {
+fn browser_tool_spec() -> ToolSpec {
     ToolSpec {
-        name: "python".to_string(),
-        description: browser_harness_python_tool_description().to_string(),
+        name: "browser".to_string(),
+        description: include_str!("../../../../prompts/browser-tool-description.md")
+            .trim()
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "cmd": {
+                    "type": "string",
+                    "description": "CLI-like browser command. The leading word `browser` is optional, e.g. `status --json` or `browser connect local`."
+                }
+            },
+            "required": ["cmd"],
+            "additionalProperties": false
+        }),
+    }
+}
+
+fn browser_script_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "browser_script".to_string(),
+        description: include_str!("../../../../prompts/browser-script-tool-description.md")
+            .trim()
+            .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
                 "code": {
                     "type": "string",
-                    "description": "Python code to run in the persistent browser namespace."
+                    "description": "Python code to run in a fresh process with browser helpers preimported."
                 }
             },
             "required": ["code"],
             "additionalProperties": false
         }),
     }
-}
-
-fn browser_harness_python_tool_description() -> &'static str {
-    include_str!("../../../../prompts/python-tool-description.md").trim()
 }
 
 fn done_tool_spec() -> ToolSpec {
@@ -569,26 +597,66 @@ mod tests {
     use super::*;
 
     #[test]
-    fn python_tool_description_preserves_browser_harness_cdp_contract() {
-        let description = browser_harness_python_tool_description();
+    fn browser_script_tool_description_preserves_raw_cdp_contract() {
+        let description = browser_script_tool_spec().description;
         for expected in [
-            "raw-CDP",
-            "browser interaction tool",
             "CDP is the source of truth",
+            "browser interaction tool",
             "new_tab(url)",
-            "not `goto_url(url)`",
             "coordinate clicks",
             "click_at_xy",
             "screenshot(label)",
-            "attach=True",
-            "raw `cdp",
+            "cdp(...)",
             "Do not import Playwright",
             "audit_artifact",
         ] {
             assert!(
                 description.contains(expected),
-                "missing {expected:?} from python tool description:\n{description}"
+                "missing {expected:?} from browser_script tool description:\n{description}"
             );
         }
+    }
+
+    #[test]
+    fn browser_tool_description_preserves_llm_control_plane_contract() {
+        let description = browser_tool_spec().description;
+        for expected in [
+            "browser control plane",
+            "The input is a single CLI-like command string",
+            "Remote start means start and connect",
+            "Nothing reloads, relaunches, closes, or switches tabs silently",
+            "browser connect local",
+            "browser connect managed",
+            "browser remote start",
+            "browser doctor --json",
+            "browser recover reconnect-websocket",
+            "browser runtime ownership --json",
+            "External user Chrome is never killed or relaunched",
+        ] {
+            assert!(
+                description.contains(expected),
+                "missing {expected:?} from browser tool description:\n{description}"
+            );
+        }
+    }
+
+    #[test]
+    fn view_image_tool_description_marks_sequential_contract() {
+        let description = view_image_tool_spec().description;
+        assert!(description.to_ascii_lowercase().contains("sequential"));
+        assert!(description.contains("not parallel-safe"));
+        assert!(description.contains("must not be called in parallel"));
+    }
+
+    #[test]
+    fn browser_registry_exposes_browser_interfaces_not_legacy_python() {
+        let names = ToolRegistry::browser_agent()
+            .specs()
+            .into_iter()
+            .map(|spec| spec.name)
+            .collect::<Vec<_>>();
+        assert!(names.contains(&"browser".to_string()));
+        assert!(names.contains(&"browser_script".to_string()));
+        assert!(!names.contains(&"python".to_string()));
     }
 }
