@@ -556,16 +556,17 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     const MIN_W: u16 = 40;
-    const MIN_H: u16 = 8;
+    const MIN_H: u16 = 10;
     const MAX_W: u16 = 72;
     const H_MARGIN: u16 = 4;
 
     let items = app.slash_palette_items();
     let item_count = items.len() as u16;
 
-    // Chrome above/below the row list: border(2) + header(2) + footer(1) = 5.
-    // Add the item count for the visible body.
-    let desired_h = item_count.saturating_add(5).max(MIN_H);
+    // Chrome above/below the row list:
+    //   border(2) + title row(1) + input row(1) + blank(1) + footer(1) = 6.
+    // Plus the item count for the visible body.
+    let desired_h = item_count.saturating_add(6).max(MIN_H);
 
     let popup_w = if area.width <= MIN_W {
         area.width
@@ -601,29 +602,61 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    // Header: just the palette title + match-count summary. The user can
-    // see what they typed in the composer below the popup — echoing the
-    // filter text here too would be duplication.
+    // Layout inside the popup:
+    //   title row       — `/ command palette  N of M`
+    //   input row       — `> /fffff` (with cursor)
+    //   blank
+    //   items body      — filtered command rows
+    //   footer hint
     let summary = if item_count == palette::max_item_count() as u16 {
         format!(" {} commands", item_count)
     } else {
         format!(" {} of {}", item_count, palette::max_item_count())
     };
-    let header_lines = vec![
-        Line::from(vec![
-            Span::raw("  "),
-            Span::styled("/", accent()),
-            Span::styled(" command palette", muted()),
-            Span::styled(summary, dim()),
-        ]),
-        Line::from(""),
-    ];
+    let title_line = Line::from(vec![
+        Span::raw("  "),
+        Span::styled("/", accent()),
+        Span::styled(" command palette", muted()),
+        Span::styled(summary, dim()),
+    ]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
+        .constraints([
+            Constraint::Length(1), // title
+            Constraint::Length(1), // input
+            Constraint::Length(1), // blank
+            Constraint::Min(1),    // items
+            Constraint::Length(1), // footer hint
+        ])
         .split(inner);
 
-    frame.render_widget(Paragraph::new(header_lines), chunks[0]);
+    frame.render_widget(Paragraph::new(title_line), chunks[0]);
+
+    // Input row inside the popup, mirroring the composer's `> text` style,
+    // with the cursor placed at the typed offset.
+    let typed = app.composer.input().to_string();
+    let input_area = chunks[1];
+    let input_inner = Rect {
+        x: input_area.x.saturating_add(2),
+        y: input_area.y,
+        width: input_area.width.saturating_sub(2),
+        height: 1,
+    };
+    let input_line = Line::from(vec![
+        Span::styled("> ", accent()),
+        Span::styled(typed.clone(), text_style()),
+    ]);
+    frame.render_widget(Paragraph::new(input_line), input_area);
+    let cursor_offset = typed.chars().count() as u16;
+    if input_inner.width > 0 {
+        frame.set_cursor_position(Position {
+            x: input_inner.x.saturating_add(cursor_offset.min(input_inner.width)),
+            y: input_inner.y,
+        });
+    }
+
+    let body_chunk = chunks[3];
+    let footer_chunk = chunks[4];
 
     if items.is_empty() {
         frame.render_widget(
@@ -631,12 +664,12 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
                 "  No commands match.",
                 muted(),
             ))),
-            chunks[1],
+            body_chunk,
         );
     } else {
-        let rows = slash_palette_rows(app, chunks[1].width as usize);
+        let rows = slash_palette_rows(app, body_chunk.width as usize);
         let mut visible = rows;
-        let body_h = chunks[1].height as usize;
+        let body_h = body_chunk.height as usize;
         if body_h > 0 && app.selected_row >= body_h {
             let skip = app.selected_row + 1 - body_h;
             visible = visible.into_iter().skip(skip).collect();
@@ -645,7 +678,7 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Paragraph::new(visible)
                 .style(Style::default().fg(text()))
                 .wrap(Wrap { trim: false }),
-            chunks[1],
+            body_chunk,
         );
     }
 
@@ -655,7 +688,7 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
             muted(),
         )))
         .alignment(Alignment::Right),
-        chunks[2],
+        footer_chunk,
     );
 }
 
@@ -1405,16 +1438,28 @@ fn render_composer_input(
         "Tell the browser what to do..."
     };
     let max_lines = area.height.max(1) as usize;
+    // While the slash palette is open, the popup is the input — render the
+    // composer as if it were empty (just the placeholder, no `/text`) and
+    // skip cursor placement here so the popup owns it.
+    let palette_owns_input = app.is_slash_palette_active();
+    let lines: Vec<Line<'static>> = if palette_owns_input {
+        vec![Line::from(vec![
+            Span::styled("> ", dim()),
+            Span::styled(placeholder.to_string(), dim()),
+        ])]
+    } else {
+        app.composer
+            .render_lines_wrapped(max_lines, area.width as usize, placeholder)
+    };
     frame.render_widget(
-        Paragraph::new(app.composer.render_lines_wrapped(
-            max_lines,
-            area.width as usize,
-            placeholder,
-        ))
-        .style(Style::default().fg(text()))
-        .wrap(Wrap { trim: false }),
+        Paragraph::new(lines)
+            .style(Style::default().fg(text()))
+            .wrap(Wrap { trim: false }),
         area,
     );
+    if palette_owns_input {
+        return;
+    }
     if area.width > 0 && area.height > 0 {
         let (cursor_x, cursor_y) = app
             .composer

@@ -2849,11 +2849,12 @@ mod redesign_tests {
         assert!(app.is_slash_palette_active());
         let screen = render_dump(&mut app)?;
         let input_row = row_containing(&screen, "> /");
-        // Dropdown rows live above the input in the fused composer.
+        // The dropdown is now a popup whose input row shows `> /`, with
+        // command items rendered just below it.
         assert!(screen
             .lines()
             .enumerate()
-            .any(|(idx, line)| idx < input_row && line.contains("/task")));
+            .any(|(idx, line)| idx > input_row && line.contains("/task")));
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
@@ -2874,7 +2875,7 @@ mod redesign_tests {
         assert!(screen
             .lines()
             .enumerate()
-            .any(|(idx, line)| idx < input_row && line.contains("/model")));
+            .any(|(idx, line)| idx > input_row && line.contains("/model")));
         assert!(screen.contains("/model"));
         Ok(())
     }
