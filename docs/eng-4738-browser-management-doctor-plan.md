@@ -109,10 +109,10 @@ Important facts from `install.md`, `admin.py`, and `daemon.py`:
 - Browser-harness `attach_first_page()` filters internal pages and creates `about:blank` if no real page exists.
 - Browser-harness `attach_known_target()` reattaches an existing target after stale session errors.
 - Browser-harness handles `"Session with given id not found"` by reattaching the known target before falling back to the first page.
-- Browser-harness `run_doctor()` is read-only and reports platform, Chrome process, daemon, active page, `profile-use`, and API key state.
+- Browser-harness `run_doctor()` is read-only and reports platform, Chrome process, daemon, active page, local profile tooling, and API key state.
 - Browser-harness `list_cloud_profiles()` returns `id`, `name`, `userId`, `cookieDomains`, and `lastUsedAt`.
 - Browser-harness `start_remote_daemon()` creates a Browser Use cloud browser, resolves profile names, resolves `cdpUrl` to websocket, starts daemon, and returns browser details including `liveUrl`.
-- Browser-harness `list_local_profiles()` shells out to `profile-use list --json`.
+- Browser-harness `list_local_profiles()` shells out to `profile-use list --json`, but this terminal implementation now replaces that with native Rust filesystem discovery.
 - Browser-harness `sync_local_profile()` exists, but local-to-cloud profile sync is not part of this ticket.
 
 ### Linear Project Context
@@ -400,13 +400,13 @@ Local profile commands are allowed, but raw cookies are not dumped by default.
 
 `browser local profiles --json`:
 
-- Uses `profile-use list --json` when installed.
+- Uses native Rust filesystem discovery.
 - Returns detected profile names/paths/browser names.
-- If `profile-use` is missing, returns an install/setup message.
+- Does not require `profile-use` or any other external CLI.
 
-`browser local profiles inspect <profile-name> --domains-only`:
+`browser local profiles inspect <profile-id-or-name> --domains-only`:
 
-- Uses profile-use inspect-style behavior when available.
+- Copies the selected profile into a temporary user-data-dir, launches that temporary copy with CDP, and reads cookies through `Storage.getCookies`.
 - Shows domains/counts/expiry summaries only.
 - Does not expose raw cookie values by default.
 
@@ -456,7 +456,7 @@ Doctor is read-only.
 - Session attachment health.
 - Browser Use API key presence.
 - Browser Use API reachability when needed.
-- `profile-use` installation.
+- Rust local profile discovery.
 - Cloud profile list access when needed.
 - Stale runtime files that can be safely cleaned.
 
@@ -750,6 +750,35 @@ We will implement:
 - [x] Run bounded real-LLM smoke test if credentials are available; otherwise record blocker.
   - Passed with Codex `gpt-5.4-mini`, state dir `/tmp/but-real-llm-smoke`, session `2208a8d6ebb7`.
   - The model called `browser status --json`, `browser connect managed --headless`, `browser_script`, created screenshot artifact `llm_smoke`, read `document.title`, and finished with `title=LLM Browser Smoke`.
+
+## Native Local Profile Follow-Up
+
+Problem found after the first implementation:
+
+- The LLM-visible flow said local profiles were unavailable unless `profile-use` was installed.
+- That is the wrong dependency boundary. The terminal must not rely on an external Browser Use CLI for its own browser-profile inventory.
+- The old `profile-use` repo only provided the pieces we need as filesystem scanning, Local State parsing, temporary profile copy, browser launch, and CDP cookie-domain summary.
+
+Implemented now:
+
+- [x] Replaced `profile-use list --json` with native Rust filesystem discovery.
+- [x] Added Chromium-family profile roots for Chrome, Chrome Canary, Chromium, Edge, Brave, Arc, Dia, Comet, Opera, Vivaldi, Yandex, Iridium, Helium, Sidekick, Thorium, SigmaOS, Wavebox, Ghost Browser, and Blisk where known.
+- [x] Read profile display names from Chromium `Local State` `profile.info_cache`.
+- [x] Return stable profile ids such as `google-chrome:Default` and include browser/profile paths in JSON output.
+- [x] Replaced local profile inspect with native Rust temporary-profile copy plus CDP `Storage.getCookies`.
+- [x] Return domain/count/session/expiry summaries only.
+- [x] Never return raw cookie names or values by default.
+- [x] Updated LLM-visible descriptions to say local profile discovery is Rust built-in and to explain quoted profile ids.
+- [x] Updated doctor to check Rust local profile discovery instead of `profile-use` installation.
+- [x] Added tests for native profile command dispatch, Local State names, ambiguous profile resolution, temporary profile copy skips, and cookie summary redaction.
+- [x] Verified with `cargo fmt --check`, `cargo test`, `uv run --with pytest python -m pytest -q`, and the ignored managed-browser smoke.
+
+Still deferred:
+
+- Custom browser-family config UI.
+- Local-to-cloud profile sync.
+- Raw cookie export.
+- Launching the user's real default profile with remote-debugging flags.
 
 ## Interface
 

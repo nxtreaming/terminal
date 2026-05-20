@@ -4,8 +4,8 @@ Profile sync from local Chrome into Browser Use cloud is deferred for this termi
 
 What is available now:
 
-- `browser local profiles --json`: list local profiles through `profile-use` when installed.
-- `browser local profiles inspect <profile-name> --domains-only`: show domain-level cookie summaries only. Never dump raw cookies by default.
+- `browser local profiles --json`: list local profiles with built-in Rust filesystem discovery. No external CLI is required.
+- `browser local profiles inspect <profile-id-or-name> --domains-only`: copy the selected profile to a temporary profile, inspect cookies through CDP, and show domain-level cookie summaries only. Never dump raw cookies by default.
 - `browser remote profiles --json`: list Browser Use cloud profiles with ID/name/domain summary/last-used metadata.
 - `browser remote start --profile-id <uuid>`: start and connect a cloud browser using an existing cloud profile.
 - `browser remote start --profile-name <name>`: resolve one exact cloud profile name and start/connect it.

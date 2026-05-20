@@ -30,6 +30,15 @@ Local real browser:
 - If Chrome blocks the connection, run `browser local setup`. The user must enable `chrome://inspect/#remote-debugging` and accept any Chrome permission prompt. Then run `browser connect local` again.
 - Do not launch the user's real default Chrome profile with remote-debugging flags. Real logged-in profiles are attached while already open.
 
+Local profiles:
+
+- `browser local profiles --json` is built into Rust. It scans Chromium-family profile folders on disk and does not require any external CLI.
+- Use local profile listing when the user asks which local browser profiles exist or which profile likely contains a login.
+- Profiles have stable ids like `google-chrome:Default`; use that id for inspection when possible.
+- If a profile id or name contains spaces, quote it like `browser local profiles inspect 'google-chrome:Profile 2' --domains-only`.
+- `browser local profiles inspect <profile-id-or-name> --domains-only` copies the selected profile into a temporary browser profile, starts that temporary copy with CDP, and returns only cookie domain/count/expiry metadata.
+- Raw cookie values are never returned by default. Profile inspection is for choosing the right profile, not for dumping secrets.
+
 Managed browser:
 
 - `browser connect managed` starts a Rust-owned browser with a temp profile by default.
@@ -48,7 +57,7 @@ Remote browsers:
 Doctor:
 
 - `browser doctor` and `browser doctor --json` are read-only.
-- Doctor checks runtime state, local browser candidates, profile-use, API key, CDP websocket health, current target health, and safe next steps.
+- Doctor checks runtime state, local browser candidates, Rust local profile discovery, API key, CDP websocket health, current target health, and safe next steps.
 - Doctor never fixes state by itself. If a fix is available it prints an explicit command.
 
 Recovery:
@@ -76,7 +85,7 @@ browser connect remote-cdp --ws <ws-url>
 browser local list --json
 browser local setup
 browser local profiles --json
-browser local profiles inspect <profile-name> --domains-only
+browser local profiles inspect <profile-id-or-name> --domains-only
 
 browser remote start [--profile-id <uuid>|--profile-name <name>] [--timeout <minutes>] [--proxy-country <iso2|none>]
 browser remote stop

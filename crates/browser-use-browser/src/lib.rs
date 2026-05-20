@@ -123,6 +123,25 @@ struct ManagedBrowser {
     launch: ManagedLaunch,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct LocalBrowserInstall {
+    browser_name: String,
+    browser_path: PathBuf,
+    user_data_dir: PathBuf,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct LocalBrowserProfile {
+    id: String,
+    browser_name: String,
+    browser_path: PathBuf,
+    user_data_dir: PathBuf,
+    profile_dir: String,
+    profile_name: String,
+    profile_path: PathBuf,
+    display_name: String,
+}
+
 struct BrowserSession {
     mode: BrowserMode,
     owner: BrowserOwner,
@@ -884,10 +903,13 @@ impl BrowserSession {
             "count": candidates.len(),
             "next_step": if candidates.is_empty() { "browser local setup" } else { "browser connect local" },
         }));
+        let profiles = detect_local_profiles();
         checks.push(json!({
-            "name": "profile-use installed",
-            "ok": which("profile-use").is_some(),
-            "next_step": if which("profile-use").is_none() { "curl -fsSL https://browser-use.com/profile.sh | sh" } else { "" },
+            "name": "local browser profiles",
+            "ok": !profiles.is_empty(),
+            "count": profiles.len(),
+            "detail": "Rust filesystem profile discovery; no external CLI required",
+            "next_step": if profiles.is_empty() { "Use `browser local profiles --json` to see scan details." } else { "browser local profiles --json" },
         }));
         checks.push(json!({
             "name": "Browser Use API key",
@@ -1086,6 +1108,15 @@ impl CdpConnection {
                 _ => {}
             }
         }
+    }
+
+    fn cdp_storage_cookies(&mut self) -> Result<Vec<Value>> {
+        Ok(self
+            .call("Storage.getCookies", None, json!({}))?
+            .get("cookies")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default())
     }
 }
 
@@ -1448,103 +1479,704 @@ fn free_port() -> Result<u16> {
 }
 
 fn list_local_profiles() -> Result<Value> {
-    let Some(profile_use) = which("profile-use") else {
-        return Ok(json!({
-            "status": "unavailable",
-            "error": "profile-use not installed",
-            "next_step": "curl -fsSL https://browser-use.com/profile.sh | sh",
-        }));
-    };
-    let output = Command::new(profile_use)
-        .args(["list", "--json"])
-        .output()
-        .context("run profile-use list --json")?;
-    if !output.status.success() {
-        return Ok(json!({
-            "status": "failed",
-            "stderr": String::from_utf8_lossy(&output.stderr),
-        }));
-    }
-    let value: Value = serde_json::from_slice(&output.stdout)
-        .unwrap_or_else(|_| json!({ "raw": String::from_utf8_lossy(&output.stdout).to_string() }));
-    Ok(json!({ "status": "ok", "profiles": value }))
-}
-
-fn inspect_local_profile(profile: &str, domains_only: bool) -> Result<Value> {
-    let Some(profile_use) = which("profile-use") else {
-        return Ok(json!({
-            "status": "unavailable",
-            "error": "profile-use not installed",
-            "next_step": "curl -fsSL https://browser-use.com/profile.sh | sh",
-        }));
-    };
-    let attempts = [
-        vec!["inspect", "--profile", profile, "--json"],
-        vec!["inspect", profile, "--json"],
-    ];
-    for args in attempts {
-        let output = Command::new(&profile_use).args(args).output();
-        let Ok(output) = output else {
-            continue;
-        };
-        if !output.status.success() {
-            continue;
-        }
-        let mut value: Value = serde_json::from_slice(&output.stdout).unwrap_or_else(
-            |_| json!({ "raw": String::from_utf8_lossy(&output.stdout).to_string() }),
-        );
-        if domains_only {
-            value = domain_summary(value);
-        }
-        return Ok(
-            json!({ "status": "ok", "profile": profile, "domains_only": domains_only, "summary": value }),
-        );
-    }
     Ok(json!({
-        "status": "failed",
-        "profile": profile,
-        "error": "profile-use inspect failed for this profile",
+        "status": "ok",
+        "source": "rust-local-filesystem",
+        "profiles": detect_local_profiles(),
     }))
 }
 
-fn domain_summary(value: Value) -> Value {
-    let mut domains = HashMap::<String, usize>::new();
-    collect_domains(&value, &mut domains);
-    let mut rows = domains
-        .into_iter()
-        .map(|(domain, count)| json!({ "domain": domain, "count": count }))
-        .collect::<Vec<_>>();
-    rows.sort_by(|a, b| {
-        a.get("domain")
-            .and_then(Value::as_str)
-            .cmp(&b.get("domain").and_then(Value::as_str))
-    });
-    Value::Array(rows)
+fn inspect_local_profile(profile: &str, domains_only: bool) -> Result<Value> {
+    let profiles = detect_local_profiles();
+    let selected = match resolve_local_profile(&profiles, profile) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return Ok(json!({
+                "status": "failed",
+                "profile_ref": profile,
+                "error": format!("{error:#}"),
+                "available_profiles": profiles,
+            }));
+        }
+    };
+    match inspect_local_profile_cookies(&selected) {
+        Ok(summary) => Ok(json!({
+            "status": "ok",
+            "source": "rust-local-cdp",
+            "profile": selected,
+            "domains_only": domains_only,
+            "raw_cookie_values_returned": false,
+            "cookie_summary": summary,
+        })),
+        Err(error) => Ok(json!({
+            "status": "failed",
+            "source": "rust-local-cdp",
+            "profile": selected,
+            "raw_cookie_values_returned": false,
+            "error": format!("{error:#}"),
+        })),
+    }
 }
 
-fn collect_domains(value: &Value, domains: &mut HashMap<String, usize>) {
-    match value {
-        Value::Object(map) => {
-            if let Some(domain) = map
-                .get("domain")
-                .or_else(|| map.get("Domain"))
-                .and_then(Value::as_str)
-            {
-                *domains
-                    .entry(domain.trim_start_matches('.').to_string())
-                    .or_default() += 1;
-            }
-            for value in map.values() {
-                collect_domains(value, domains);
-            }
+fn detect_local_profiles() -> Vec<LocalBrowserProfile> {
+    detect_profiles_from_installs(known_local_browser_installs())
+}
+
+fn detect_profiles_from_installs(installs: Vec<LocalBrowserInstall>) -> Vec<LocalBrowserProfile> {
+    let mut profiles = Vec::new();
+    let mut seen = HashSet::new();
+    for install in installs {
+        if !install.user_data_dir.exists() {
+            continue;
         }
-        Value::Array(items) => {
-            for value in items {
-                collect_domains(value, domains);
+        let profile_names = load_profile_names_from_local_state(&install.user_data_dir);
+        let Ok(entries) = fs::read_dir(&install.user_data_dir) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if !file_type.is_dir() {
+                continue;
             }
+            let profile_dir = entry.file_name().to_string_lossy().to_string();
+            let profile_path = entry.path();
+            if !is_valid_local_profile_dir(&profile_path) {
+                continue;
+            }
+            if !seen.insert((install.user_data_dir.clone(), profile_dir.clone())) {
+                continue;
+            }
+            let profile_name = profile_names
+                .get(&profile_dir)
+                .filter(|name| !name.trim().is_empty())
+                .cloned()
+                .unwrap_or_else(|| profile_dir.clone());
+            profiles.push(LocalBrowserProfile {
+                id: format!("{}:{profile_dir}", browser_slug(&install.browser_name)),
+                browser_name: install.browser_name.clone(),
+                browser_path: install.browser_path.clone(),
+                user_data_dir: install.user_data_dir.clone(),
+                profile_dir,
+                profile_name: profile_name.clone(),
+                profile_path,
+                display_name: format!("{} - {profile_name}", install.browser_name),
+            });
         }
-        _ => {}
     }
+    profiles.sort_by(|a, b| {
+        a.browser_name
+            .cmp(&b.browser_name)
+            .then_with(|| {
+                profile_dir_sort_key(&a.profile_dir).cmp(&profile_dir_sort_key(&b.profile_dir))
+            })
+            .then_with(|| natural_cmp(&a.profile_name, &b.profile_name))
+    });
+    profiles
+}
+
+fn known_local_browser_installs() -> Vec<LocalBrowserInstall> {
+    let home = std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."));
+    let program_files = std::env::var_os("ProgramFiles")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/Program Files"));
+    let program_files_x86 = std::env::var_os("ProgramFiles(x86)")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("C:/Program Files (x86)"));
+    let local_app_data = std::env::var_os("LOCALAPPDATA")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| home.join("AppData/Local"));
+    let candidates = vec![
+        (
+            "Google Chrome",
+            PathBuf::from("/Applications/Google Chrome.app/Contents/MacOS/Google Chrome"),
+            home.join("Library/Application Support/Google/Chrome"),
+        ),
+        (
+            "Chrome Canary",
+            PathBuf::from(
+                "/Applications/Google Chrome Canary.app/Contents/MacOS/Google Chrome Canary",
+            ),
+            home.join("Library/Application Support/Google/Chrome Canary"),
+        ),
+        (
+            "Brave",
+            PathBuf::from("/Applications/Brave Browser.app/Contents/MacOS/Brave Browser"),
+            home.join("Library/Application Support/BraveSoftware/Brave-Browser"),
+        ),
+        (
+            "Microsoft Edge",
+            PathBuf::from("/Applications/Microsoft Edge.app/Contents/MacOS/Microsoft Edge"),
+            home.join("Library/Application Support/Microsoft Edge"),
+        ),
+        (
+            "Chromium",
+            PathBuf::from("/Applications/Chromium.app/Contents/MacOS/Chromium"),
+            home.join("Library/Application Support/Chromium"),
+        ),
+        (
+            "Arc",
+            PathBuf::from("/Applications/Arc.app/Contents/MacOS/Arc"),
+            home.join("Library/Application Support/Arc/User Data"),
+        ),
+        (
+            "Dia",
+            PathBuf::from("/Applications/Dia.app/Contents/MacOS/Dia"),
+            home.join("Library/Application Support/Dia"),
+        ),
+        (
+            "Comet",
+            PathBuf::from("/Applications/Comet.app/Contents/MacOS/Comet"),
+            home.join("Library/Application Support/Comet"),
+        ),
+        (
+            "Helium",
+            PathBuf::from("/Applications/Helium.app/Contents/MacOS/Helium"),
+            home.join("Library/Application Support/Helium"),
+        ),
+        (
+            "Sidekick",
+            PathBuf::from("/Applications/Sidekick.app/Contents/MacOS/Sidekick"),
+            home.join("Library/Application Support/Sidekick"),
+        ),
+        (
+            "Thorium",
+            PathBuf::from("/Applications/Thorium.app/Contents/MacOS/Thorium"),
+            home.join("Library/Application Support/Thorium"),
+        ),
+        (
+            "SigmaOS",
+            PathBuf::from("/Applications/SigmaOS.app/Contents/MacOS/SigmaOS"),
+            home.join("Library/Application Support/SigmaOS/User Data"),
+        ),
+        (
+            "Wavebox",
+            PathBuf::from("/Applications/Wavebox.app/Contents/MacOS/Wavebox"),
+            home.join("Library/Application Support/WaveboxApp"),
+        ),
+        (
+            "Ghost Browser",
+            PathBuf::from("/Applications/Ghost Browser.app/Contents/MacOS/Ghost Browser"),
+            home.join("Library/Application Support/Ghost Browser"),
+        ),
+        (
+            "Blisk",
+            PathBuf::from("/Applications/Blisk.app/Contents/MacOS/Blisk"),
+            home.join("Library/Application Support/Blisk"),
+        ),
+        (
+            "Opera",
+            PathBuf::from("/Applications/Opera.app/Contents/MacOS/Opera"),
+            home.join("Library/Application Support/com.operasoftware.Opera"),
+        ),
+        (
+            "Vivaldi",
+            PathBuf::from("/Applications/Vivaldi.app/Contents/MacOS/Vivaldi"),
+            home.join("Library/Application Support/Vivaldi"),
+        ),
+        (
+            "Yandex",
+            PathBuf::from("/Applications/Yandex.app/Contents/MacOS/Yandex"),
+            home.join("Library/Application Support/Yandex/YandexBrowser"),
+        ),
+        (
+            "Iridium",
+            PathBuf::from("/Applications/Iridium.app/Contents/MacOS/Iridium"),
+            home.join("Library/Application Support/Iridium"),
+        ),
+        (
+            "Google Chrome",
+            PathBuf::from("/usr/bin/google-chrome"),
+            home.join(".config/google-chrome"),
+        ),
+        (
+            "Google Chrome",
+            PathBuf::from("/usr/bin/google-chrome-stable"),
+            home.join(".config/google-chrome"),
+        ),
+        (
+            "Brave",
+            PathBuf::from("/usr/bin/brave-browser"),
+            home.join(".config/BraveSoftware/Brave-Browser"),
+        ),
+        (
+            "Brave",
+            PathBuf::from("/usr/bin/brave"),
+            home.join(".config/BraveSoftware/Brave-Browser"),
+        ),
+        (
+            "Brave",
+            PathBuf::from("/snap/bin/brave"),
+            home.join(".config/BraveSoftware/Brave-Browser"),
+        ),
+        (
+            "Microsoft Edge",
+            PathBuf::from("/usr/bin/microsoft-edge"),
+            home.join(".config/microsoft-edge"),
+        ),
+        (
+            "Microsoft Edge",
+            PathBuf::from("/usr/bin/microsoft-edge-stable"),
+            home.join(".config/microsoft-edge"),
+        ),
+        (
+            "Chromium",
+            PathBuf::from("/usr/bin/chromium"),
+            home.join(".config/chromium"),
+        ),
+        (
+            "Chromium",
+            PathBuf::from("/usr/bin/chromium-browser"),
+            home.join(".config/chromium"),
+        ),
+        (
+            "Chromium",
+            PathBuf::from("/snap/bin/chromium"),
+            home.join(".config/chromium"),
+        ),
+        (
+            "Opera",
+            PathBuf::from("/usr/bin/opera"),
+            home.join(".config/opera"),
+        ),
+        (
+            "Opera",
+            PathBuf::from("/snap/bin/opera"),
+            home.join(".config/opera"),
+        ),
+        (
+            "Vivaldi",
+            PathBuf::from("/usr/bin/vivaldi"),
+            home.join(".config/vivaldi"),
+        ),
+        (
+            "Vivaldi",
+            PathBuf::from("/usr/bin/vivaldi-stable"),
+            home.join(".config/vivaldi"),
+        ),
+        (
+            "Vivaldi",
+            PathBuf::from("/snap/bin/vivaldi"),
+            home.join(".config/vivaldi"),
+        ),
+        (
+            "Yandex",
+            PathBuf::from("/usr/bin/yandex-browser"),
+            home.join(".config/yandex-browser"),
+        ),
+        (
+            "Yandex",
+            PathBuf::from("/usr/bin/yandex-browser-stable"),
+            home.join(".config/yandex-browser"),
+        ),
+        (
+            "Iridium",
+            PathBuf::from("/usr/bin/iridium-browser"),
+            home.join(".config/iridium"),
+        ),
+        (
+            "Ungoogled Chromium",
+            PathBuf::from("/usr/bin/ungoogled-chromium"),
+            home.join(".config/chromium"),
+        ),
+        (
+            "Thorium",
+            PathBuf::from("/usr/bin/thorium-browser"),
+            home.join(".config/thorium"),
+        ),
+        (
+            "Sidekick",
+            home.join(".local/share/sidekick/sidekick"),
+            home.join(".config/Sidekick"),
+        ),
+        (
+            "Wavebox",
+            PathBuf::from("/usr/bin/wavebox"),
+            home.join(".config/Wavebox"),
+        ),
+        (
+            "Google Chrome",
+            program_files.join("Google/Chrome/Application/chrome.exe"),
+            local_app_data.join("Google/Chrome/User Data"),
+        ),
+        (
+            "Google Chrome",
+            program_files_x86.join("Google/Chrome/Application/chrome.exe"),
+            local_app_data.join("Google/Chrome/User Data"),
+        ),
+        (
+            "Google Chrome",
+            local_app_data.join("Google/Chrome/Application/chrome.exe"),
+            local_app_data.join("Google/Chrome/User Data"),
+        ),
+        (
+            "Brave",
+            program_files.join("BraveSoftware/Brave-Browser/Application/brave.exe"),
+            local_app_data.join("BraveSoftware/Brave-Browser/User Data"),
+        ),
+        (
+            "Brave",
+            local_app_data.join("BraveSoftware/Brave-Browser/Application/brave.exe"),
+            local_app_data.join("BraveSoftware/Brave-Browser/User Data"),
+        ),
+        (
+            "Microsoft Edge",
+            program_files.join("Microsoft/Edge/Application/msedge.exe"),
+            local_app_data.join("Microsoft/Edge/User Data"),
+        ),
+        (
+            "Microsoft Edge",
+            program_files_x86.join("Microsoft/Edge/Application/msedge.exe"),
+            local_app_data.join("Microsoft/Edge/User Data"),
+        ),
+        (
+            "Chromium",
+            local_app_data.join("Chromium/Application/chrome.exe"),
+            local_app_data.join("Chromium/User Data"),
+        ),
+        (
+            "Opera",
+            local_app_data.join("Programs/Opera/opera.exe"),
+            home.join("AppData/Roaming/Opera Software/Opera Stable"),
+        ),
+        (
+            "Opera",
+            program_files.join("Opera/opera.exe"),
+            home.join("AppData/Roaming/Opera Software/Opera Stable"),
+        ),
+        (
+            "Vivaldi",
+            local_app_data.join("Vivaldi/Application/vivaldi.exe"),
+            local_app_data.join("Vivaldi/User Data"),
+        ),
+        (
+            "Vivaldi",
+            program_files.join("Vivaldi/Application/vivaldi.exe"),
+            local_app_data.join("Vivaldi/User Data"),
+        ),
+        (
+            "Yandex",
+            local_app_data.join("Yandex/YandexBrowser/Application/browser.exe"),
+            local_app_data.join("Yandex/YandexBrowser/User Data"),
+        ),
+        (
+            "Iridium",
+            local_app_data.join("Iridium/Application/iridium.exe"),
+            local_app_data.join("Iridium/User Data"),
+        ),
+        (
+            "Sidekick",
+            local_app_data.join("Sidekick/Application/sidekick.exe"),
+            local_app_data.join("Sidekick/User Data"),
+        ),
+        (
+            "Thorium",
+            local_app_data.join("Thorium/Application/thorium.exe"),
+            local_app_data.join("Thorium/User Data"),
+        ),
+        (
+            "Wavebox",
+            local_app_data.join("WaveboxApp/Application/wavebox.exe"),
+            local_app_data.join("WaveboxApp/User Data"),
+        ),
+        (
+            "Blisk",
+            local_app_data.join("Blisk/Application/blisk.exe"),
+            local_app_data.join("Blisk/User Data"),
+        ),
+    ];
+    let mut installs: Vec<LocalBrowserInstall> = Vec::new();
+    let mut seen: HashMap<(String, PathBuf), usize> = HashMap::new();
+    for (browser_name, browser_path, user_data_dir) in candidates {
+        if !browser_path.exists() && !user_data_dir.exists() {
+            continue;
+        }
+        let key = (browser_name.to_string(), user_data_dir.clone());
+        let candidate = LocalBrowserInstall {
+            browser_name: browser_name.to_string(),
+            browser_path,
+            user_data_dir,
+        };
+        if let Some(index) = seen.get(&key).copied() {
+            if !installs[index].browser_path.exists() && candidate.browser_path.exists() {
+                installs[index] = candidate;
+            }
+        } else {
+            seen.insert(key, installs.len());
+            installs.push(candidate);
+        }
+    }
+    installs
+}
+
+fn load_profile_names_from_local_state(user_data_dir: &Path) -> HashMap<String, String> {
+    let Ok(raw) = fs::read_to_string(user_data_dir.join("Local State")) else {
+        return HashMap::new();
+    };
+    let Ok(value) = serde_json::from_str::<Value>(&raw) else {
+        return HashMap::new();
+    };
+    value
+        .pointer("/profile/info_cache")
+        .and_then(Value::as_object)
+        .into_iter()
+        .flatten()
+        .filter_map(|(profile_dir, info)| {
+            info.get("name")
+                .and_then(Value::as_str)
+                .filter(|name| !name.trim().is_empty())
+                .map(|name| (profile_dir.clone(), name.to_string()))
+        })
+        .collect()
+}
+
+fn is_valid_local_profile_dir(path: &Path) -> bool {
+    ["Preferences", "Cookies", "History", "Network/Cookies"]
+        .iter()
+        .any(|relative| path.join(relative).exists())
+}
+
+fn browser_slug(name: &str) -> String {
+    let mut slug = String::new();
+    let mut last_dash = false;
+    for ch in name.chars().flat_map(char::to_lowercase) {
+        if ch.is_ascii_alphanumeric() {
+            slug.push(ch);
+            last_dash = false;
+        } else if !last_dash {
+            slug.push('-');
+            last_dash = true;
+        }
+    }
+    slug.trim_matches('-').to_string()
+}
+
+fn profile_dir_sort_key(profile_dir: &str) -> (u8, String) {
+    if profile_dir == "Default" {
+        (0, String::new())
+    } else {
+        (1, profile_dir.to_string())
+    }
+}
+
+fn natural_cmp(a: &str, b: &str) -> std::cmp::Ordering {
+    let a_bytes = a.as_bytes();
+    let b_bytes = b.as_bytes();
+    let mut ia = 0;
+    let mut ib = 0;
+    while ia < a_bytes.len() && ib < b_bytes.len() {
+        if a_bytes[ia].is_ascii_digit() && b_bytes[ib].is_ascii_digit() {
+            let (na, next_a) = parse_ascii_number(a_bytes, ia);
+            let (nb, next_b) = parse_ascii_number(b_bytes, ib);
+            match na.cmp(&nb) {
+                std::cmp::Ordering::Equal => {
+                    ia = next_a;
+                    ib = next_b;
+                }
+                other => return other,
+            }
+        } else {
+            match a_bytes[ia].cmp(&b_bytes[ib]) {
+                std::cmp::Ordering::Equal => {
+                    ia += 1;
+                    ib += 1;
+                }
+                other => return other,
+            }
+        }
+    }
+    a_bytes.len().cmp(&b_bytes.len())
+}
+
+fn parse_ascii_number(bytes: &[u8], mut index: usize) -> (u64, usize) {
+    let mut number = 0_u64;
+    while index < bytes.len() && bytes[index].is_ascii_digit() {
+        number = number
+            .saturating_mul(10)
+            .saturating_add((bytes[index] - b'0') as u64);
+        index += 1;
+    }
+    (number, index)
+}
+
+fn resolve_local_profile(
+    profiles: &[LocalBrowserProfile],
+    profile_ref: &str,
+) -> Result<LocalBrowserProfile> {
+    if let Some(profile) = profiles.iter().find(|profile| profile.id == profile_ref) {
+        return Ok(profile.clone());
+    }
+    let matches = profiles
+        .iter()
+        .filter(|profile| {
+            profile.profile_name == profile_ref
+                || profile.profile_dir == profile_ref
+                || profile.display_name == profile_ref
+        })
+        .cloned()
+        .collect::<Vec<_>>();
+    match matches.as_slice() {
+        [profile] => Ok(profile.clone()),
+        [] => {
+            bail!("no local profile matched {profile_ref:?}; run `browser local profiles --json`")
+        }
+        _ => bail!("multiple local profiles matched {profile_ref:?}; pass the exact profile id"),
+    }
+}
+
+fn inspect_local_profile_cookies(profile: &LocalBrowserProfile) -> Result<Value> {
+    let temp = tempfile::Builder::new()
+        .prefix("but-profile-inspect.")
+        .tempdir()
+        .context("create temp profile inspection dir")?;
+    copy_local_state_for_profile(&profile.user_data_dir, temp.path())?;
+    copy_profile_dir_for_inspection(&profile.profile_path, &temp.path().join("Default"))?;
+    let launch = ManagedLaunch {
+        executable: profile.browser_path.display().to_string(),
+        profile: ManagedProfile::Path(temp.path().to_path_buf()),
+        headless: true,
+        extra_args: vec!["--no-startup-window".to_string()],
+    };
+    let (mut managed, http_url) = launch_managed_browser(launch)?;
+    let result = (|| -> Result<Value> {
+        let ws_url = resolve_ws_from_http(&http_url)?;
+        let mut connection = CdpConnection::connect(&ws_url)?;
+        let cookies = connection.cdp_storage_cookies()?;
+        Ok(cookie_domain_summary(&cookies))
+    })();
+    let _ = managed.child.kill();
+    let _ = managed.child.wait();
+    result
+}
+
+fn copy_local_state_for_profile(src_user_data_dir: &Path, dst_user_data_dir: &Path) -> Result<()> {
+    fs::create_dir_all(dst_user_data_dir)
+        .with_context(|| format!("create temp user data dir {}", dst_user_data_dir.display()))?;
+    let src = src_user_data_dir.join("Local State");
+    if src.exists() {
+        let _ = fs::copy(&src, dst_user_data_dir.join("Local State"));
+    }
+    Ok(())
+}
+
+fn copy_profile_dir_for_inspection(src: &Path, dst: &Path) -> Result<()> {
+    const SKIP_DIRS: &[&str] = &[
+        "Service Worker",
+        "Extensions",
+        "IndexedDB",
+        "Local Extension Settings",
+        "Local Storage",
+        "GPUCache",
+        "Shared Dictionary",
+        "SharedCache",
+    ];
+    const SKIP_FILES: &[&str] = &[
+        "SingletonLock",
+        "SingletonSocket",
+        "SingletonCookie",
+        "lockfile",
+        "RunningChromeVersion",
+        "History",
+    ];
+    fn copy_inner(src: &Path, dst: &Path) -> Result<()> {
+        fs::create_dir_all(dst).with_context(|| format!("create {}", dst.display()))?;
+        let entries = fs::read_dir(src).with_context(|| format!("read {}", src.display()))?;
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let name = entry.file_name().to_string_lossy().to_string();
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_dir() {
+                if SKIP_DIRS.contains(&name.as_str()) {
+                    continue;
+                }
+                let _ = copy_inner(&path, &dst.join(&name));
+            } else if file_type.is_file() {
+                if SKIP_FILES.contains(&name.as_str()) {
+                    continue;
+                }
+                let _ = fs::copy(&path, dst.join(&name));
+            }
+        }
+        Ok(())
+    }
+    copy_inner(src, dst)
+}
+
+fn cookie_domain_summary(cookies: &[Value]) -> Value {
+    #[derive(Default)]
+    struct DomainStats {
+        count: usize,
+        session_count: usize,
+        persistent_count: usize,
+        earliest_expiry: Option<i64>,
+        latest_expiry: Option<i64>,
+    }
+
+    let mut domains = HashMap::<String, DomainStats>::new();
+    for cookie in cookies {
+        let Some(domain) = cookie.get("domain").and_then(Value::as_str) else {
+            continue;
+        };
+        let domain = domain.trim_start_matches('.').to_string();
+        if domain.is_empty() {
+            continue;
+        }
+        let stats = domains.entry(domain).or_default();
+        stats.count += 1;
+        let session = cookie
+            .get("session")
+            .and_then(Value::as_bool)
+            .unwrap_or(false);
+        if session {
+            stats.session_count += 1;
+        } else {
+            stats.persistent_count += 1;
+            if let Some(expiry) = cookie.get("expires").and_then(Value::as_f64) {
+                if expiry > 0.0 {
+                    let expiry = expiry as i64;
+                    stats.earliest_expiry = Some(
+                        stats
+                            .earliest_expiry
+                            .map_or(expiry, |current| current.min(expiry)),
+                    );
+                    stats.latest_expiry = Some(
+                        stats
+                            .latest_expiry
+                            .map_or(expiry, |current| current.max(expiry)),
+                    );
+                }
+            }
+        }
+    }
+    let mut rows = domains
+        .into_iter()
+        .map(|(domain, stats)| {
+            json!({
+                "domain": domain,
+                "count": stats.count,
+                "session_count": stats.session_count,
+                "persistent_count": stats.persistent_count,
+                "earliest_expiry": stats.earliest_expiry,
+                "latest_expiry": stats.latest_expiry,
+            })
+        })
+        .collect::<Vec<_>>();
+    rows.sort_by(|a, b| {
+        b.get("count")
+            .and_then(Value::as_u64)
+            .cmp(&a.get("count").and_then(Value::as_u64))
+            .then_with(|| {
+                a.get("domain")
+                    .and_then(Value::as_str)
+                    .cmp(&b.get("domain").and_then(Value::as_str))
+            })
+    });
+    Value::Array(rows)
 }
 
 fn list_cloud_profiles() -> Result<Value> {
@@ -2204,6 +2836,157 @@ mod tests {
             .artifacts
             .iter()
             .any(|artifact| artifact["path"].as_str().unwrap().ends_with("answer.json")));
+    }
+
+    #[test]
+    fn local_profiles_command_uses_native_rust_detector() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_command(
+            "profiles-list",
+            temp.path(),
+            temp.path(),
+            "browser local profiles --json",
+        )
+        .unwrap();
+        assert_eq!(output.content["source"], "rust-local-filesystem");
+        assert!(output.content["profiles"].is_array());
+        assert!(!output.content.to_string().contains("profile-use"));
+    }
+
+    #[test]
+    fn local_profiles_inspect_missing_profile_never_mentions_external_cli() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_command(
+            "profiles-inspect-missing",
+            temp.path(),
+            temp.path(),
+            "browser local profiles inspect 'missing profile' --domains-only",
+        )
+        .unwrap();
+        assert_eq!(output.content["status"], "failed");
+        assert!(output.content.get("available_profiles").is_some());
+        assert!(!output.content.to_string().contains("profile-use"));
+    }
+
+    #[test]
+    fn local_profile_detection_reads_local_state_names_and_stable_ids() {
+        let temp = tempfile::tempdir().unwrap();
+        let user_data_dir = temp.path().join("Chrome");
+        fs::create_dir_all(user_data_dir.join("Default")).unwrap();
+        fs::create_dir_all(user_data_dir.join("Profile 10")).unwrap();
+        fs::write(user_data_dir.join("Default/Preferences"), "{}").unwrap();
+        fs::write(user_data_dir.join("Profile 10/Preferences"), "{}").unwrap();
+        fs::write(
+            user_data_dir.join("Local State"),
+            r#"{
+              "profile": {
+                "info_cache": {
+                  "Default": { "name": "Personal" },
+                  "Profile 10": { "name": "Work" }
+                }
+              }
+            }"#,
+        )
+        .unwrap();
+        let profiles = detect_profiles_from_installs(vec![LocalBrowserInstall {
+            browser_name: "Google Chrome".to_string(),
+            browser_path: temp.path().join("Chrome.app"),
+            user_data_dir: user_data_dir.clone(),
+        }]);
+        assert_eq!(profiles.len(), 2);
+        assert_eq!(profiles[0].id, "google-chrome:Default");
+        assert_eq!(profiles[0].profile_name, "Personal");
+        assert_eq!(profiles[1].id, "google-chrome:Profile 10");
+        assert_eq!(profiles[1].display_name, "Google Chrome - Work");
+    }
+
+    #[test]
+    fn local_profile_resolution_requires_exact_id_when_names_collide() {
+        let profiles = vec![
+            LocalBrowserProfile {
+                id: "chrome:Default".to_string(),
+                browser_name: "Chrome".to_string(),
+                browser_path: PathBuf::from("/chrome"),
+                user_data_dir: PathBuf::from("/profiles/chrome"),
+                profile_dir: "Default".to_string(),
+                profile_name: "Work".to_string(),
+                profile_path: PathBuf::from("/profiles/chrome/Default"),
+                display_name: "Chrome - Work".to_string(),
+            },
+            LocalBrowserProfile {
+                id: "brave:Default".to_string(),
+                browser_name: "Brave".to_string(),
+                browser_path: PathBuf::from("/brave"),
+                user_data_dir: PathBuf::from("/profiles/brave"),
+                profile_dir: "Default".to_string(),
+                profile_name: "Work".to_string(),
+                profile_path: PathBuf::from("/profiles/brave/Default"),
+                display_name: "Brave - Work".to_string(),
+            },
+        ];
+        assert!(resolve_local_profile(&profiles, "Work")
+            .unwrap_err()
+            .to_string()
+            .contains("multiple local profiles"));
+        assert_eq!(
+            resolve_local_profile(&profiles, "brave:Default")
+                .unwrap()
+                .browser_name,
+            "Brave"
+        );
+    }
+
+    #[test]
+    fn profile_inspection_copy_skips_heavy_and_lock_files() {
+        let temp = tempfile::tempdir().unwrap();
+        let src = temp.path().join("src");
+        let dst = temp.path().join("dst");
+        fs::create_dir_all(src.join("Network")).unwrap();
+        fs::create_dir_all(src.join("IndexedDB")).unwrap();
+        fs::write(src.join("Preferences"), "{}").unwrap();
+        fs::write(src.join("History"), "skip").unwrap();
+        fs::write(src.join("SingletonLock"), "skip").unwrap();
+        fs::write(src.join("Network/Cookies"), "copy").unwrap();
+        fs::write(src.join("IndexedDB/data"), "skip").unwrap();
+        copy_profile_dir_for_inspection(&src, &dst).unwrap();
+        assert!(dst.join("Preferences").exists());
+        assert!(dst.join("Network/Cookies").exists());
+        assert!(!dst.join("History").exists());
+        assert!(!dst.join("SingletonLock").exists());
+        assert!(!dst.join("IndexedDB").exists());
+    }
+
+    #[test]
+    fn cookie_domain_summary_never_returns_cookie_values() {
+        let cookies = vec![
+            json!({
+                "name": "sid",
+                "value": "secret",
+                "domain": ".gusto.com",
+                "session": false,
+                "expires": 2000.0
+            }),
+            json!({
+                "name": "tmp",
+                "value": "secret2",
+                "domain": "gusto.com",
+                "session": true
+            }),
+            json!({
+                "name": "other",
+                "value": "secret3",
+                "domain": "example.com",
+                "session": false,
+                "expires": 3000.0
+            }),
+        ];
+        let summary = cookie_domain_summary(&cookies);
+        let text = serde_json::to_string(&summary).unwrap();
+        assert!(!text.contains("secret"));
+        assert_eq!(summary[0]["domain"], "gusto.com");
+        assert_eq!(summary[0]["count"], 2);
+        assert_eq!(summary[0]["session_count"], 1);
+        assert_eq!(summary[0]["persistent_count"], 1);
     }
 
     #[test]
