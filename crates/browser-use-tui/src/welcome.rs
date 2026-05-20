@@ -184,11 +184,7 @@ pub fn welcome_lines(
     out.push(Line::from(""));
     out.push(Line::from(""));
 
-    // tip
-    let tip = "  Tip: Press Ctrl-W to start a parallel task in its own worktree.";
-    out.push(Line::from(Span::styled(tip.to_string(), muted())));
-
-    // breathing room above prompt + version footer
+    // breathing room above the version footer
     out.push(Line::from(""));
     out.push(Line::from(""));
 
