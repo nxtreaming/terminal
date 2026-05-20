@@ -14,9 +14,9 @@ use browser_use_store::{Store, StoreNotification};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::MoveTo;
 use crossterm::event::{
-    self, DisableBracketedPaste, EnableBracketedPaste, Event as TermEvent, KeyCode, KeyEvent,
-    KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, PopKeyboardEnhancementFlags,
-    PushKeyboardEnhancementFlags,
+    self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as TermEvent,
+    KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
+    MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
@@ -1115,6 +1115,31 @@ impl App {
         self.surface == Surface::Main && self.selected_session_id.is_none()
     }
 
+    fn should_capture_welcome_mouse(&self) -> bool {
+        self.is_welcome_surface()
+            && self.composer.is_empty()
+            && !self.is_slash_palette_active()
+            && self.welcome_logo_rect.get().is_some()
+    }
+
+    fn handle_welcome_logo_click(&mut self, column: u16, row: u16) -> bool {
+        if !self.should_capture_welcome_mouse() {
+            return false;
+        }
+        let Some(rect) = self.welcome_logo_rect.get() else {
+            return false;
+        };
+        if column < rect.x
+            || column >= rect.x.saturating_add(rect.width)
+            || row < rect.y
+            || row >= rect.y.saturating_add(rect.height)
+        {
+            return false;
+        }
+        self.welcome_anim.throw();
+        true
+    }
+
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
             Surface::History => {
@@ -1787,6 +1812,18 @@ impl Command for ResetKeyboardEnhancementFlags {
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
+struct EnableMouseClickCapture;
+
+impl Command for EnableMouseClickCapture {
+    fn write_ansi(&self, f: &mut impl fmt::Write) -> fmt::Result {
+        // Crossterm's built-in EnableMouseCapture also enables drag and
+        // all-motion tracking, which blocks ordinary terminal text selection.
+        // The welcome logo only needs button press/release coordinates.
+        f.write_str(concat!("\x1b[?1000h", "\x1b[?1006h"))
+    }
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
 struct DisableModifyOtherKeys;
 
 impl Command for DisableModifyOtherKeys {
@@ -1966,12 +2003,14 @@ fn run_terminal(mut app: App) -> Result<()> {
 
 struct TerminalDriver {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
+    mouse_capture_enabled: bool,
 }
 
 impl TerminalDriver {
     fn new(height: u16) -> Result<Self> {
         Ok(Self {
             terminal: new_inline_terminal(height)?,
+            mouse_capture_enabled: false,
         })
     }
 
@@ -1995,6 +2034,7 @@ impl TerminalDriver {
     fn draw(&mut self, app: &mut App) -> Result<()> {
         maybe_emit_native_transcript(&mut self.terminal, app)?;
         self.terminal.draw(|frame| render(frame, app))?;
+        self.sync_mouse_capture(app)?;
         Ok(())
     }
 
@@ -2004,6 +2044,20 @@ impl TerminalDriver {
 
     fn show_cursor(&mut self) -> io::Result<()> {
         self.terminal.show_cursor()
+    }
+
+    fn sync_mouse_capture(&mut self, app: &App) -> Result<()> {
+        let should_capture = app.should_capture_welcome_mouse();
+        if should_capture == self.mouse_capture_enabled {
+            return Ok(());
+        }
+        if should_capture {
+            execute!(self.terminal.backend_mut(), EnableMouseClickCapture)?;
+        } else {
+            execute!(self.terminal.backend_mut(), DisableMouseCapture)?;
+        }
+        self.mouse_capture_enabled = should_capture;
+        Ok(())
     }
 }
 
@@ -2069,6 +2123,15 @@ fn handle_terminal_event(
         TermEvent::Key(key) => app.handle_key(key),
         TermEvent::Paste(text) => {
             app.handle_paste(&text);
+            Ok(false)
+        }
+        TermEvent::Mouse(MouseEvent {
+            kind: MouseEventKind::Down(_),
+            column,
+            row,
+            ..
+        }) => {
+            app.handle_welcome_logo_click(column, row);
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
@@ -2421,6 +2484,7 @@ fn restore_terminal(mut target: impl io::Write) -> Result<()> {
         ResetKeyboardEnhancementFlags,
         DisableModifyOtherKeys,
         DisableBracketedPaste,
+        DisableMouseCapture,
     )?;
     Ok(())
 }
@@ -2532,6 +2596,70 @@ mod redesign_tests {
         app.store.set_setting("setup.complete", "1")?;
         app.store.set_setting("browser", "Local Chrome")?;
         Ok(app)
+    }
+
+    #[test]
+    fn welcome_logo_click_spins_only_inside_armed_logo_rect() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let _screen = render_dump(&mut app)?;
+        let rect = app.welcome_logo_rect.get().context("welcome logo rect")?;
+
+        assert!(app.should_capture_welcome_mouse());
+        let initial_vy = app.welcome_anim.vy;
+        assert!(app.handle_welcome_logo_click(
+            rect.x.saturating_add(rect.width / 2),
+            rect.y.saturating_add(rect.height / 2),
+        ));
+        assert!(app.welcome_anim.vy > initial_vy);
+
+        let after_click = (app.welcome_anim.vx, app.welcome_anim.vy);
+        assert!(!app.handle_welcome_logo_click(rect.x.saturating_add(rect.width), rect.y));
+        assert_eq!((app.welcome_anim.vx, app.welcome_anim.vy), after_click);
+
+        app.set_input("typing should keep terminal text selection native".to_string());
+        assert!(!app.should_capture_welcome_mouse());
+        assert!(!app.handle_welcome_logo_click(
+            rect.x.saturating_add(rect.width / 2),
+            rect.y.saturating_add(rect.height / 2),
+        ));
+        assert_eq!((app.welcome_anim.vx, app.welcome_anim.vy), after_click);
+        Ok(())
+    }
+
+    #[test]
+    fn welcome_mouse_capture_is_scoped_to_rendered_empty_welcome_surface() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        assert!(!app.should_capture_welcome_mouse());
+        let _screen = render_dump(&mut app)?;
+        assert!(app.should_capture_welcome_mouse());
+
+        app.set_input("open example.com".to_string());
+        assert!(!app.should_capture_welcome_mouse());
+        app.set_input(String::new());
+
+        app.open_surface(Surface::History);
+        assert!(!app.should_capture_welcome_mouse());
+        app.close_surface();
+
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id);
+        assert!(!app.should_capture_welcome_mouse());
+        Ok(())
+    }
+
+    #[test]
+    fn welcome_mouse_capture_does_not_enable_drag_tracking() -> Result<()> {
+        let mut sequence = String::new();
+        EnableMouseClickCapture.write_ansi(&mut sequence)?;
+
+        assert!(sequence.contains("\x1b[?1000h"));
+        assert!(sequence.contains("\x1b[?1006h"));
+        assert!(!sequence.contains("\x1b[?1002h"));
+        assert!(!sequence.contains("\x1b[?1003h"));
+        Ok(())
     }
 
     fn row_containing(screen: &str, needle: &str) -> usize {

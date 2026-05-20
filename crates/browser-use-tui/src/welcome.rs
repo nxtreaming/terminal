@@ -16,10 +16,16 @@ pub struct WelcomeAnim {
     pub base_rx: f32,
     pub target_vy: f32,
     pub last_tick: Instant,
+    rng: u32,
 }
 
 impl WelcomeAnim {
     pub fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(1)
+            | 1;
         // Start at the canonical Browser Use orbit-mark orientation
         // (no global rotation applied — the ring `base_a`/`base_b`
         // already carry the right tilt/roll), then let the gentle
@@ -32,7 +38,18 @@ impl WelcomeAnim {
             base_rx: 0.0,
             target_vy: 0.4,
             last_tick: Instant::now(),
+            rng: seed,
         }
+    }
+
+    fn rand(&mut self) -> f32 {
+        // xorshift32
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        (x as f32) / (u32::MAX as f32)
     }
 
     /// Advance the animation; call ~14fps from the event loop.
@@ -46,6 +63,13 @@ impl WelcomeAnim {
         self.vy = self.vy * decay + self.target_vy * (1.0 - decay);
         // gentle spring back to the resting tilt so post-click rx returns home
         self.rx += (self.base_rx - self.rx) * (1.0 - (-dt * 1.2_f32).exp());
+    }
+
+    pub fn throw(&mut self) {
+        let rx_imp = (self.rand() * 2.0 - 1.0) * 9.0 + 5.0;
+        let ry_imp = (self.rand() * 2.0 - 1.0) * 7.0 + 7.0;
+        self.vx += rx_imp;
+        self.vy += ry_imp;
     }
 }
 
