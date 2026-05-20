@@ -1,10 +1,11 @@
 use anyhow::Result;
 use browser_use_protocol::{HistoryRow, SessionMeta, TelemetrySummary, WorkbenchState};
 use ratatui::backend::TestBackend;
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph, Widget, Wrap};
 use ratatui::{Frame, Terminal};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -111,12 +112,14 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     match app.surface {
         surface if surface.is_popup() => {
             render_main(frame, area, app, &state, product_state);
-            render_popup_overlay(frame, full_area, app, &state, surface);
+            if !app.native_scrollback_is_active() {
+                render_active_modal_overlay(frame, full_area, app, &state);
+            }
         }
         surface if surface.uses_main_view() => {
-            if app.is_slash_palette_active() {
+            if app.is_slash_palette_active() && !app.native_scrollback_is_active() {
                 render_main(frame, area, app, &state, product_state);
-                render_command_palette_popup(frame, full_area, app);
+                render_active_modal_overlay(frame, full_area, app, &state);
             } else {
                 render_main(frame, area, app, &state, product_state);
             }
@@ -161,7 +164,7 @@ fn render_main(
     };
     let bottom_h = main_bottom_height_for(app, state, layout_surface, area, product_state);
     let body_width = content_width(area.width);
-    let modal_overlay_active = app.surface.is_popup() || app.is_slash_palette_active();
+    let modal_overlay_active = app.surface.is_popup() && !app.native_scrollback_is_active();
     let native_scrollback_active = app.native_scrollback_is_active() && !modal_overlay_active;
     let show_footer = layout_surface.is_bottom_pane()
         || app
@@ -432,18 +435,92 @@ fn render_bottom_pane(
     );
 }
 
-/// Centered floating popup overlay for slash-command-launched surfaces
-/// (history, browser, model, auth, telemetry, developer). Responsive: shrinks
-/// to fit small terminals and caps to a comfortable max on large ones.
-fn render_popup_overlay(
+pub(crate) struct ModalOverlay {
+    pub(crate) rect: Rect,
+    pub(crate) buffer: Buffer,
+    pub(crate) cursor: Option<Position>,
+}
+
+pub(crate) fn active_modal_overlay(
+    app: &App,
+    state: &WorkbenchState,
+    area: Rect,
+) -> Option<ModalOverlay> {
+    if app.is_slash_palette_active() {
+        return command_palette_overlay(app, area);
+    }
+    if app.surface.is_popup() {
+        return surface_popup_overlay(app, state, area, app.surface);
+    }
+    None
+}
+
+fn render_active_modal_overlay(
     frame: &mut Frame<'_>,
     area: Rect,
     app: &App,
     state: &WorkbenchState,
-    surface: Surface,
 ) {
-    if area.width == 0 || area.height == 0 {
+    let Some(overlay) = active_modal_overlay(app, state, area) else {
         return;
+    };
+    overlay.buffer.merge_into(frame.buffer_mut(), overlay.rect);
+    if let Some(cursor) = overlay.cursor {
+        frame.set_cursor_position(cursor);
+    }
+}
+
+trait BufferOverlayExt {
+    fn merge_into(&self, target: &mut Buffer, target_rect: Rect);
+}
+
+impl BufferOverlayExt for Buffer {
+    fn merge_into(&self, target: &mut Buffer, target_rect: Rect) {
+        for y in 0..self.area.height {
+            for x in 0..self.area.width {
+                if let Some(target_cell) = target.cell_mut((
+                    target_rect.x.saturating_add(x),
+                    target_rect.y.saturating_add(y),
+                )) {
+                    *target_cell = self[(x, y)].clone();
+                }
+            }
+        }
+    }
+}
+
+fn surface_popup_overlay(
+    app: &App,
+    state: &WorkbenchState,
+    area: Rect,
+    surface: Surface,
+) -> Option<ModalOverlay> {
+    let rect = surface_popup_rect(app, state, area, surface)?;
+    let local_rect = Rect::new(0, 0, rect.width, rect.height);
+    let mut buffer = Buffer::empty(local_rect);
+    let local_cursor = render_surface_popup_box(&mut buffer, local_rect, app, state, surface);
+    let cursor = local_cursor.map(|position| Position {
+        x: rect.x.saturating_add(position.x),
+        y: rect.y.saturating_add(position.y),
+    });
+    Some(ModalOverlay {
+        rect,
+        buffer,
+        cursor,
+    })
+}
+
+/// Centered floating popup overlay for slash-command-launched surfaces
+/// (history, browser, model, auth, telemetry, developer). Responsive: shrinks
+/// to fit small terminals and caps to a comfortable max on large ones.
+fn surface_popup_rect(
+    app: &App,
+    state: &WorkbenchState,
+    area: Rect,
+    surface: Surface,
+) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
     }
 
     const MIN_W: u16 = 40;
@@ -481,24 +558,32 @@ fn render_popup_overlay(
 
     let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
     let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
-    let popup_rect = Rect {
+    Some(Rect {
         x: popup_x,
         y: popup_y,
         width: popup_w,
         height: popup_h,
-    };
+    })
+}
 
-    frame.render_widget(Clear, popup_rect);
+fn render_surface_popup_box(
+    buffer: &mut Buffer,
+    popup_rect: Rect,
+    app: &App,
+    state: &WorkbenchState,
+    surface: Surface,
+) -> Option<Position> {
+    Clear.render(popup_rect, buffer);
 
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border());
     let inner = block.inner(popup_rect);
-    frame.render_widget(block, popup_rect);
+    block.render(popup_rect, buffer);
 
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return None;
     }
 
     // Layout inside the popup: header lines, body, footer line.
@@ -520,7 +605,7 @@ fn render_popup_overlay(
         ])
         .split(inner);
 
-    frame.render_widget(Paragraph::new(header), content_area(chunks[0]));
+    Paragraph::new(header).render(content_area(chunks[0]), buffer);
 
     let body_area = content_area(chunks[1]);
     let mut lines = surface_lines(surface, app, state, body_area.width as usize);
@@ -533,7 +618,7 @@ fn render_popup_overlay(
     }
     // For text-input popups, position the terminal cursor at the end of the
     // masked secret line so the user sees a blinking caret in the input field.
-    let cursor_pos: Option<(u16, u16)> = if surface.is_text_input_popup() {
+    let cursor_pos: Option<Position> = if surface.is_text_input_popup() {
         let masked = match surface {
             Surface::Telemetry => masked_secret(app.composer.input()),
             Surface::ApiKey => {
@@ -552,10 +637,10 @@ fn render_popup_overlay(
             .find_map(|(row, line)| {
                 let plain: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
                 if plain.starts_with(&target) {
-                    Some((
-                        body_area.x.saturating_add(cursor_col.min(body_area.width)),
-                        body_area.y.saturating_add(row as u16),
-                    ))
+                    Some(Position {
+                        x: body_area.x.saturating_add(cursor_col.min(body_area.width)),
+                        y: body_area.y.saturating_add(row as u16),
+                    })
                 } else {
                     None
                 }
@@ -564,43 +649,45 @@ fn render_popup_overlay(
         None
     };
     trim_trailing_whitespace(&mut lines);
-    frame.render_widget(
-        Paragraph::new(lines)
-            .style(Style::default().fg(text()))
-            .wrap(Wrap { trim: false }),
-        body_area,
-    );
-    if let Some((x, y)) = cursor_pos {
-        frame.set_cursor_position(Position { x, y });
-    }
+    Paragraph::new(lines)
+        .style(Style::default().fg(text()))
+        .wrap(Wrap { trim: false })
+        .render(body_area, buffer);
 
     if footer_h > 0 {
-        frame.render_widget(
-            Paragraph::new(footer_text)
-                .style(muted())
-                .alignment(Alignment::Right),
-            content_area(chunks[2]),
-        );
+        Paragraph::new(footer_text)
+            .style(muted())
+            .alignment(Alignment::Right)
+            .render(content_area(chunks[2]), buffer);
     }
+    cursor_pos
 }
 
-/// Floating command palette: appears the moment the user presses `/`, listing
-/// all slash commands filtered by what they type next. It is a true modal over
-/// the full terminal frame; the underlying transcript/composer is hidden while
-/// the palette owns input.
-fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
-    if area.width == 0 || area.height == 0 {
-        return;
-    }
+pub(crate) fn command_palette_overlay(app: &App, area: Rect) -> Option<ModalOverlay> {
+    let rect = command_palette_popup_rect(area)?;
+    let local_rect = Rect::new(0, 0, rect.width, rect.height);
+    let mut buffer = Buffer::empty(local_rect);
+    let local_cursor = render_command_palette_box(&mut buffer, local_rect, app)?;
+    let cursor = Position {
+        x: rect.x.saturating_add(local_cursor.x),
+        y: rect.y.saturating_add(local_cursor.y),
+    };
+    Some(ModalOverlay {
+        rect,
+        buffer,
+        cursor: Some(cursor),
+    })
+}
 
+fn command_palette_popup_rect(area: Rect) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
     const MIN_W: u16 = 40;
     const MIN_H: u16 = 10;
     const MAX_W: u16 = 72;
     const H_MARGIN: u16 = 4;
     const V_MARGIN: u16 = 2;
-
-    let items = app.slash_palette_items();
-    let item_count = items.len() as u16;
 
     // The popup size is fixed at the full command count so the box never
     // resizes as the user filters — empty slots stay blank below the rows.
@@ -624,22 +711,28 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let popup_h = desired_h.min(available_h).max(MIN_H.min(available_h));
     let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
     let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
-    let popup_rect = Rect {
+    Some(Rect {
         x: popup_x,
         y: popup_y,
         width: popup_w,
         height: popup_h,
-    };
+    })
+}
 
-    frame.render_widget(Clear, popup_rect);
+fn render_command_palette_box(
+    buffer: &mut Buffer,
+    popup_rect: Rect,
+    app: &App,
+) -> Option<Position> {
+    Clear.render(popup_rect, buffer);
     let block = Block::default()
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border());
     let inner = block.inner(popup_rect);
-    frame.render_widget(block, popup_rect);
+    block.render(popup_rect, buffer);
     if inner.width == 0 || inner.height == 0 {
-        return;
+        return None;
     }
 
     // Layout inside the popup:
@@ -671,26 +764,25 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
         Span::styled("> ", accent()),
         Span::styled(typed.clone(), text_style()),
     ]);
-    frame.render_widget(Paragraph::new(input_line), input_area);
+    Paragraph::new(input_line).render(input_area, buffer);
     let cursor_offset = typed.chars().count() as u16;
+    let mut cursor = None;
     if input_inner.width > 0 {
-        frame.set_cursor_position(Position {
+        cursor = Some(Position {
             x: input_inner
                 .x
                 .saturating_add(cursor_offset.min(input_inner.width)),
             y: input_inner.y,
         });
     }
-    let _ = item_count;
 
     let body_chunk = chunks[2];
     let footer_chunk = chunks[3];
+    let items = app.slash_palette_items();
 
     if items.is_empty() {
-        frame.render_widget(
-            Paragraph::new(Line::from(Span::styled("  No commands match.", muted()))),
-            body_chunk,
-        );
+        Paragraph::new(Line::from(Span::styled("  No commands match.", muted())))
+            .render(body_chunk, buffer);
     } else {
         let rows = slash_palette_rows(app, body_chunk.width as usize);
         let mut visible = rows;
@@ -699,22 +791,19 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
             let skip = app.selected_row + 1 - body_h;
             visible = visible.into_iter().skip(skip).collect();
         }
-        frame.render_widget(
-            Paragraph::new(visible)
-                .style(Style::default().fg(text()))
-                .wrap(Wrap { trim: false }),
-            body_chunk,
-        );
+        Paragraph::new(visible)
+            .style(Style::default().fg(text()))
+            .wrap(Wrap { trim: false })
+            .render(body_chunk, buffer);
     }
 
-    frame.render_widget(
-        Paragraph::new(Line::from(Span::styled(
-            " ↑↓ navigate · ⏎ select · esc close",
-            muted(),
-        )))
-        .alignment(Alignment::Right),
-        footer_chunk,
-    );
+    Paragraph::new(Line::from(Span::styled(
+        " ↑↓ navigate · ⏎ select · esc close",
+        muted(),
+    )))
+    .alignment(Alignment::Right)
+    .render(footer_chunk, buffer);
+    cursor
 }
 
 fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {

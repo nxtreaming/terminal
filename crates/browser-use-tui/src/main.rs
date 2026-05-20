@@ -12,18 +12,24 @@ use browser_use_protocol::{
 };
 use browser_use_store::{Store, StoreNotification};
 use clap::{Parser, ValueEnum};
-use crossterm::cursor::MoveTo;
+use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
     self, DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, Event as TermEvent,
     KeyCode, KeyEvent, KeyEventKind, KeyModifiers, KeyboardEnhancementFlags, MouseEvent,
     MouseEventKind, PopKeyboardEnhancementFlags, PushKeyboardEnhancementFlags,
 };
 use crossterm::execute;
+use crossterm::queue;
+use crossterm::style::{
+    Attribute, Color as CrosstermColor, Print, ResetColor, SetAttribute, SetBackgroundColor,
+    SetForegroundColor,
+};
 use crossterm::terminal::{disable_raw_mode, enable_raw_mode, Clear, ClearType};
 use crossterm::Command;
 use ratatui::backend::CrosstermBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Margin, Position, Rect};
+use ratatui::style::{Color as RatatuiColor, Modifier};
 use ratatui::text::Line;
 use ratatui::widgets::{Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
@@ -2004,6 +2010,7 @@ fn run_terminal(mut app: App) -> Result<()> {
 struct TerminalDriver {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     mouse_capture_enabled: bool,
+    manual_modal_overlay_visible: bool,
 }
 
 impl TerminalDriver {
@@ -2011,6 +2018,7 @@ impl TerminalDriver {
         Ok(Self {
             terminal: new_inline_terminal(height)?,
             mouse_capture_enabled: false,
+            manual_modal_overlay_visible: false,
         })
     }
 
@@ -2022,18 +2030,33 @@ impl TerminalDriver {
         reset_terminal_screen(self.terminal.backend_mut(), ClearType::Purge)?;
         self.terminal = new_inline_terminal(desired_height)?;
         app.native_history.reset();
+        self.manual_modal_overlay_visible = false;
         Ok(desired_height)
     }
 
     fn settle_resize(&mut self, app: &mut App) -> Result<()> {
         reset_inline_terminal_after_resize(&mut self.terminal)?;
         app.native_history.reset();
+        self.manual_modal_overlay_visible = false;
         Ok(())
     }
 
     fn draw(&mut self, app: &mut App) -> Result<()> {
+        let manual_overlay_active = should_draw_manual_modal_overlay(app);
+        let overlay_state = if manual_overlay_active {
+            Some(app.workbench_state()?)
+        } else {
+            None
+        };
+        if self.manual_modal_overlay_visible && !manual_overlay_active {
+            app.native_history.reset_with_clear();
+        }
         maybe_emit_native_transcript(&mut self.terminal, app)?;
         self.terminal.draw(|frame| render(frame, app))?;
+        if let Some(state) = overlay_state.as_ref() {
+            draw_manual_modal_overlay(self.terminal.backend_mut(), app, state)?;
+        }
+        self.manual_modal_overlay_visible = manual_overlay_active;
         self.sync_mouse_capture(app)?;
         Ok(())
     }
@@ -2091,8 +2114,7 @@ fn desired_terminal_viewport_height_for(
     let dock_height = main_viewport_height(app, app_width);
     if app.is_first_run_setup_visible()?
         || app.selected_session_id.is_none()
-        || app.surface.is_bottom_pane()
-        || app.is_slash_palette_active()
+        || (app.surface.is_bottom_pane() && !app.native_scrollback_is_active())
     {
         return Ok(full_height);
     }
@@ -2109,6 +2131,120 @@ fn desired_terminal_viewport_height_for(
     Ok(dock_height
         .saturating_add(active_body_reserve)
         .min(full_height))
+}
+
+fn should_draw_manual_modal_overlay(app: &App) -> bool {
+    (app.is_slash_palette_active() || app.surface.is_popup()) && app.native_scrollback_is_active()
+}
+
+fn draw_manual_modal_overlay(
+    target: &mut CrosstermBackend<io::Stdout>,
+    app: &App,
+    state: &WorkbenchState,
+) -> Result<()> {
+    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((app.args.width, app.args.height));
+    if term_w == 0 || term_h == 0 {
+        return Ok(());
+    }
+    let area = Rect::new(0, 0, term_w, term_h);
+    let Some(overlay) = render::active_modal_overlay(app, state, area) else {
+        return Ok(());
+    };
+
+    for y in 0..overlay.rect.height {
+        let row = overlay.rect.y.saturating_add(y);
+        if row >= term_h {
+            break;
+        }
+        for x in 0..overlay.rect.width {
+            let col = overlay.rect.x.saturating_add(x);
+            if col >= term_w {
+                break;
+            }
+            let cell = &overlay.buffer[(x, y)];
+            queue_ratatui_cell_style(target, cell.fg, cell.bg, cell.modifier)?;
+            queue!(target, MoveTo(col, row), Print(cell.symbol()))?;
+        }
+    }
+    queue!(target, ResetColor, SetAttribute(Attribute::Reset))?;
+    if let Some(cursor) = overlay.cursor {
+        queue!(
+            target,
+            MoveTo(
+                cursor.x.min(term_w.saturating_sub(1)),
+                cursor.y.min(term_h.saturating_sub(1))
+            ),
+            Show
+        )?;
+    }
+    target.flush()?;
+    Ok(())
+}
+
+fn queue_ratatui_cell_style(
+    target: &mut CrosstermBackend<io::Stdout>,
+    fg: RatatuiColor,
+    bg: RatatuiColor,
+    modifier: Modifier,
+) -> io::Result<()> {
+    queue!(
+        target,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(ratatui_color_to_crossterm(fg)),
+        SetBackgroundColor(ratatui_color_to_crossterm(bg))
+    )?;
+    if modifier.contains(Modifier::BOLD) {
+        queue!(target, SetAttribute(Attribute::Bold))?;
+    }
+    if modifier.contains(Modifier::DIM) {
+        queue!(target, SetAttribute(Attribute::Dim))?;
+    }
+    if modifier.contains(Modifier::ITALIC) {
+        queue!(target, SetAttribute(Attribute::Italic))?;
+    }
+    if modifier.contains(Modifier::UNDERLINED) {
+        queue!(target, SetAttribute(Attribute::Underlined))?;
+    }
+    if modifier.contains(Modifier::SLOW_BLINK) {
+        queue!(target, SetAttribute(Attribute::SlowBlink))?;
+    }
+    if modifier.contains(Modifier::RAPID_BLINK) {
+        queue!(target, SetAttribute(Attribute::RapidBlink))?;
+    }
+    if modifier.contains(Modifier::REVERSED) {
+        queue!(target, SetAttribute(Attribute::Reverse))?;
+    }
+    if modifier.contains(Modifier::HIDDEN) {
+        queue!(target, SetAttribute(Attribute::Hidden))?;
+    }
+    if modifier.contains(Modifier::CROSSED_OUT) {
+        queue!(target, SetAttribute(Attribute::CrossedOut))?;
+    }
+    Ok(())
+}
+
+fn ratatui_color_to_crossterm(color: RatatuiColor) -> CrosstermColor {
+    match color {
+        RatatuiColor::Reset => CrosstermColor::Reset,
+        RatatuiColor::Black => CrosstermColor::Black,
+        RatatuiColor::Red => CrosstermColor::DarkRed,
+        RatatuiColor::Green => CrosstermColor::DarkGreen,
+        RatatuiColor::Yellow => CrosstermColor::DarkYellow,
+        RatatuiColor::Blue => CrosstermColor::DarkBlue,
+        RatatuiColor::Magenta => CrosstermColor::DarkMagenta,
+        RatatuiColor::Cyan => CrosstermColor::DarkCyan,
+        RatatuiColor::Gray => CrosstermColor::Grey,
+        RatatuiColor::DarkGray => CrosstermColor::DarkGrey,
+        RatatuiColor::LightRed => CrosstermColor::Red,
+        RatatuiColor::LightGreen => CrosstermColor::Green,
+        RatatuiColor::LightYellow => CrosstermColor::Yellow,
+        RatatuiColor::LightBlue => CrosstermColor::Blue,
+        RatatuiColor::LightMagenta => CrosstermColor::Magenta,
+        RatatuiColor::LightCyan => CrosstermColor::Cyan,
+        RatatuiColor::White => CrosstermColor::White,
+        RatatuiColor::Indexed(value) => CrosstermColor::AnsiValue(value),
+        RatatuiColor::Rgb(r, g, b) => CrosstermColor::Rgb { r, g, b },
+    }
 }
 
 fn handle_terminal_event(
@@ -2669,6 +2805,32 @@ mod redesign_tests {
             .unwrap_or_else(|| panic!("screen did not contain {needle:?}\n{screen}"))
     }
 
+    fn buffer_symbols(buffer: &Buffer) -> String {
+        let area = buffer.area;
+        let mut out = String::new();
+        for y in area.y..area.y.saturating_add(area.height) {
+            for x in area.x..area.x.saturating_add(area.width) {
+                out.push_str(buffer[(x, y)].symbol());
+            }
+            out.push('\n');
+        }
+        out
+    }
+
+    fn surface_heading_for_test(surface: Surface) -> &'static str {
+        match surface {
+            Surface::Account => "Authenticate",
+            Surface::Model => "Model",
+            Surface::Browser | Surface::BrowserSelect => "Browser",
+            Surface::History => "History",
+            Surface::Developer => "Developer",
+            Surface::ApiKey => "API key",
+            Surface::Telemetry => "Laminar",
+            Surface::Setup => "Setup",
+            Surface::Main => "",
+        }
+    }
+
     #[test]
     fn dotenv_loader_sets_missing_env_vars_without_overriding_existing_values() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -3127,8 +3289,13 @@ mod redesign_tests {
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("/task"));
-        assert!(screen.contains("This is a Rust terminal UI with native scrollback."));
+        assert!(!screen.contains("/task"));
+        assert!(screen.contains("Ask a follow-up"));
+        let overlay = render::command_palette_overlay(&app, Rect::new(0, 0, 72, 11))
+            .expect("command palette overlay should render");
+        let overlay = buffer_symbols(&overlay.buffer);
+        assert!(overlay.contains("/task"));
+        assert!(overlay.contains("start a new task"));
         Ok(())
     }
 
@@ -4553,7 +4720,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn slash_palette_expands_completed_history_viewport_for_modal() -> Result<()> {
+    fn slash_palette_does_not_resize_completed_history_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4576,7 +4743,7 @@ mod redesign_tests {
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         assert!(app.is_slash_palette_active());
         let after = desired_terminal_viewport_height(&mut app)?;
-        assert!(after > before);
+        assert_eq!(after, before);
         Ok(())
     }
 
@@ -4610,7 +4777,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn selected_session_surfaces_expand_inline_viewport() -> Result<()> {
+    fn completed_session_popups_do_not_resize_native_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -4624,19 +4791,27 @@ mod redesign_tests {
             "session.done",
             serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
         )?;
-        app.selected_session_id = Some(session.id);
-        app.drain_store_notifications()?;
+        let events = app.store.events_for_session(&session.id)?;
+        let last_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(session.id, last_seq);
 
-        // Opening a dropdown surface expands the inline viewport so the panel
-        // has room; every dropdown expands to the same height.
         let docked = desired_terminal_viewport_height(&mut app)?;
-        app.open_surface(Surface::History);
-        let expanded = desired_terminal_viewport_height(&mut app)?;
-        assert!(expanded >= docked);
-        app.open_surface(Surface::Model);
-        assert_eq!(desired_terminal_viewport_height(&mut app)?, expanded);
-        app.open_surface(Surface::Browser);
-        assert_eq!(desired_terminal_viewport_height(&mut app)?, expanded);
+        for surface in [
+            Surface::History,
+            Surface::Model,
+            Surface::Browser,
+            Surface::BrowserSelect,
+            Surface::Account,
+        ] {
+            app.open_surface(surface);
+            assert_eq!(desired_terminal_viewport_height(&mut app)?, docked);
+            let state = app.workbench_state()?;
+            let overlay = render::active_modal_overlay(&app, &state, Rect::new(0, 0, 100, 28))
+                .expect("surface should render as a modal overlay");
+            let overlay = buffer_symbols(&overlay.buffer);
+            assert!(overlay.contains(surface_heading_for_test(surface)));
+        }
         Ok(())
     }
 
