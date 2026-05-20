@@ -563,10 +563,12 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     let items = app.slash_palette_items();
     let item_count = items.len() as u16;
 
-    // Chrome above/below the row list:
-    //   border(2) + title row(1) + input row(1) + blank(1) + footer(1) = 6.
-    // Plus the item count for the visible body.
-    let desired_h = item_count.saturating_add(6).max(MIN_H);
+    // The popup size is fixed at the full command count so the box never
+    // resizes as the user filters — empty slots stay blank below the rows.
+    // Chrome: border(2) + input row(1) + blank(1) + footer(1) = 5.
+    let desired_h = (palette::max_item_count() as u16)
+        .saturating_add(5)
+        .max(MIN_H);
 
     let popup_w = if area.width <= MIN_W {
         area.width
@@ -603,26 +605,13 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
     }
 
     // Layout inside the popup:
-    //   title row       — `/ command palette  N of M`
-    //   input row       — `> /fffff` (with cursor)
+    //   input row       — `> filter` (with cursor)
     //   blank
     //   items body      — filtered command rows
     //   footer hint
-    let summary = if item_count == palette::max_item_count() as u16 {
-        format!(" {} commands", item_count)
-    } else {
-        format!(" {} of {}", item_count, palette::max_item_count())
-    };
-    let title_line = Line::from(vec![
-        Span::raw("  "),
-        Span::styled("/", accent()),
-        Span::styled(" command palette", muted()),
-        Span::styled(summary, dim()),
-    ]);
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([
-            Constraint::Length(1), // title
             Constraint::Length(1), // input
             Constraint::Length(1), // blank
             Constraint::Min(1),    // items
@@ -630,12 +619,10 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
         ])
         .split(inner);
 
-    frame.render_widget(Paragraph::new(title_line), chunks[0]);
-
-    // Input row inside the popup, mirroring the composer's `> text` style,
-    // with the cursor placed at the typed offset.
-    let typed = app.composer.input().to_string();
-    let input_area = chunks[1];
+    // Input row. The popup owns its own filter — the composer underneath
+    // is untouched while the palette is open.
+    let typed = app.palette_filter().to_string();
+    let input_area = chunks[0];
     let input_inner = Rect {
         x: input_area.x.saturating_add(2),
         y: input_area.y,
@@ -654,9 +641,10 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
             y: input_inner.y,
         });
     }
+    let _ = item_count;
 
-    let body_chunk = chunks[3];
-    let footer_chunk = chunks[4];
+    let body_chunk = chunks[2];
+    let footer_chunk = chunks[3];
 
     if items.is_empty() {
         frame.render_widget(

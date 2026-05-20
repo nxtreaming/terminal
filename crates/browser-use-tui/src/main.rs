@@ -213,6 +213,13 @@ struct App {
     escape_stop_until: Option<Instant>,
     native_history: NativeHistoryState,
     startup_instant: Instant,
+    /// Whether the slash command palette popup is currently open. Independent
+    /// of the composer's content — `/` opens it, Esc closes it, and the
+    /// composer is never touched.
+    palette_open: bool,
+    /// Filter text shown inside the palette popup. Edited by typing while the
+    /// palette is open; cleared whenever the palette is opened or closed.
+    palette_filter: String,
 }
 
 #[derive(Debug)]
@@ -585,6 +592,8 @@ impl App {
             escape_stop_until: None,
             native_history: NativeHistoryState::default(),
             startup_instant: Instant::now(),
+            palette_open: false,
+            palette_filter: String::new(),
         };
         app.refresh_cached_projection();
         Ok(app)
@@ -907,8 +916,7 @@ impl App {
                 code: KeyCode::Esc, ..
             } if self.is_slash_palette_active() => {
                 self.escape_stop_until = None;
-                self.composer.clear();
-                self.selected_row = 0;
+                self.close_slash_palette();
             }
             KeyEvent {
                 code: KeyCode::Esc, ..
@@ -1023,6 +1031,38 @@ impl App {
             } => self.submit()?,
             _ if matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
                 && self.handle_api_key_key(key) => {}
+            // `/` opens the slash palette popup. The slash itself is not
+            // typed into the composer — the popup owns its own filter
+            // buffer, separate from the composer.
+            KeyEvent {
+                code: KeyCode::Char('/'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.surface == Surface::Main && !self.palette_open => {
+                self.open_slash_palette();
+            }
+            // While the palette is open every typed character is appended
+            // to its filter (printable ASCII only — control sequences fall
+            // through to other handlers). Backspace pops a character; the
+            // popup stays open even when the filter is empty.
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if self.is_slash_palette_active()
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                self.palette_filter.push(ch);
+                self.clamp_slash_palette_selection();
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } if self.is_slash_palette_active() => {
+                self.palette_filter.pop();
+                self.clamp_slash_palette_selection();
+            }
             _ if self.surface == Surface::Main && self.composer.handle_key(key) => {
                 if self.is_slash_palette_active() {
                     self.clamp_slash_palette_selection();
@@ -1040,12 +1080,14 @@ impl App {
     }
 
     fn handle_paste(&mut self, text: &str) {
+        if self.is_slash_palette_active() {
+            self.palette_filter.push_str(text);
+            self.clamp_slash_palette_selection();
+            return;
+        }
         match self.surface {
             Surface::Main => {
                 self.composer.insert_paste(text);
-                if self.is_slash_palette_active() {
-                    self.clamp_slash_palette_selection();
-                }
             }
             Surface::ApiKey | Surface::Telemetry => {
                 self.composer.insert_paste(text);
@@ -1428,11 +1470,27 @@ impl App {
     }
 
     fn is_slash_palette_active(&self) -> bool {
-        self.surface == Surface::Main && palette::is_slash_input(self.composer.input())
+        self.surface == Surface::Main && self.palette_open
+    }
+
+    pub(crate) fn palette_filter(&self) -> &str {
+        &self.palette_filter
+    }
+
+    fn open_slash_palette(&mut self) {
+        self.palette_open = true;
+        self.palette_filter.clear();
+        self.selected_row = 0;
+    }
+
+    fn close_slash_palette(&mut self) {
+        self.palette_open = false;
+        self.palette_filter.clear();
+        self.selected_row = 0;
     }
 
     fn slash_palette_items(&self) -> Vec<palette::PaletteItem> {
-        palette::items_filtered(self.composer.input())
+        palette::items_filtered(&self.palette_filter)
     }
 
     fn move_slash_palette_selection(&mut self, delta: isize) {
@@ -1456,10 +1514,9 @@ impl App {
     }
 
     fn execute_slash_palette_selection(&mut self) -> Result<()> {
-        let action = palette::selected_action(self.composer.input(), self.selected_row);
+        let action = palette::selected_action(&self.palette_filter, self.selected_row);
         if let Some(action) = action {
-            self.composer.clear();
-            self.selected_row = 0;
+            self.close_slash_palette();
             self.execute_palette_action(action)?;
         }
         Ok(())
