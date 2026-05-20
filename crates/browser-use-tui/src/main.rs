@@ -37,6 +37,7 @@ mod runtime;
 mod settings;
 mod theme;
 mod transcript;
+mod welcome;
 
 use composer::Composer;
 use palette::PaletteAction;
@@ -56,6 +57,7 @@ const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
 const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
+const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(70);
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -210,6 +212,7 @@ struct App {
     quit_hint_until: Option<Instant>,
     escape_stop_until: Option<Instant>,
     native_history: NativeHistoryState,
+    startup_instant: Instant,
 }
 
 #[derive(Debug)]
@@ -581,6 +584,7 @@ impl App {
             quit_hint_until: None,
             escape_stop_until: None,
             native_history: NativeHistoryState::default(),
+            startup_instant: Instant::now(),
         };
         app.refresh_cached_projection();
         Ok(app)
@@ -1057,6 +1061,12 @@ impl App {
             && self.selected_session_id.is_none()
             && self.composer.is_empty()
             && self.state_cache.sessions.is_empty())
+    }
+
+    /// True when the centered welcome screen is showing — drives the
+    /// animation-tick redraw so the BU logo can spin while idle.
+    fn is_welcome_surface(&self) -> bool {
+        self.surface == Surface::Main && self.selected_session_id.is_none()
     }
 
     fn execute_surface_selection(&mut self) -> Result<()> {
@@ -1830,6 +1840,7 @@ fn run_terminal(mut app: App) -> Result<()> {
     let result = (|| -> Result<()> {
         let mut draw_needed = true;
         let mut last_fallback_refresh = Instant::now();
+        let mut last_anim_tick = Instant::now();
         let mut pending_resize_at: Option<Instant> = None;
         loop {
             draw_needed |= app.drain_store_notifications()?;
@@ -1857,6 +1868,14 @@ fn run_terminal(mut app: App) -> Result<()> {
                 })
                 .unwrap_or(INPUT_POLL_INTERVAL);
             if !event::poll(poll_interval)? {
+                // Animate the welcome-screen logo by triggering a redraw every
+                // ~70ms when idle. Only ticks when the welcome surface is up
+                // (Workbench surface, no active task) so we don't burn CPU on
+                // an active session.
+                if app.is_welcome_surface() && last_anim_tick.elapsed() >= ANIM_TICK_INTERVAL {
+                    draw_needed = true;
+                    last_anim_tick = Instant::now();
+                }
                 continue;
             }
             let event = event::read()?;
@@ -2535,8 +2554,11 @@ mod redesign_tests {
             app.model_configured = true;
             app.store.set_setting("setup.complete", "1")?;
 
-            let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Browser Use cloud needs key"));
+            let _screen = render_dump(&mut app)?;
+            // NOTE: the ready/welcome screen no longer carries the
+            // "Browser Use cloud needs key" warning. That warning still
+            // shows on the BrowserSelect surface (asserted below); the
+            // welcome screen redesign needs a follow-up surface for it.
 
             app.open_surface(Surface::BrowserSelect);
             let screen = render_dump(&mut app)?;
@@ -2746,12 +2768,14 @@ mod redesign_tests {
 
         app.selected_session_id = None;
         let ready_screen = render_dump(&mut app)?;
-        assert!(ready_screen.contains("Browser Use"));
+        // New welcome screen: a centered logo + a small menu and a tip.
+        assert!(ready_screen.contains("New worktree"));
+        assert!(ready_screen.contains("Resume session"));
+        assert!(ready_screen.contains("Tip:"));
+        // Fused composer carries model + browser metadata in its top border.
         assert!(ready_screen.contains("GPT-5.5"));
-        assert!(ready_screen.contains("Local Chrome idle"));
-        assert!(ready_screen.contains("/model"));
-        assert!(ready_screen.contains("/browser"));
-        assert!(row_containing(&ready_screen, "recent") <= 14);
+        assert!(ready_screen.contains("Local Chrome"));
+        // Composer placeholder stays the same so users see the prompt-to-act.
         assert!(ready_screen.contains("Tell the browser what to do..."));
         // Home screen keeps the command hints in the footer.
         assert!(ready_screen.contains("Enter:send"));
@@ -2825,10 +2849,11 @@ mod redesign_tests {
         assert!(app.is_slash_palette_active());
         let screen = render_dump(&mut app)?;
         let input_row = row_containing(&screen, "> /");
+        // Dropdown rows live above the input in the fused composer.
         assert!(screen
             .lines()
             .enumerate()
-            .any(|(idx, line)| idx >= input_row && line.contains("/task")));
+            .any(|(idx, line)| idx < input_row && line.contains("/task")));
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
@@ -2849,7 +2874,7 @@ mod redesign_tests {
         assert!(screen
             .lines()
             .enumerate()
-            .any(|(idx, line)| idx >= input_row && line.contains("/model")));
+            .any(|(idx, line)| idx < input_row && line.contains("/model")));
         assert!(screen.contains("/model"));
         Ok(())
     }
