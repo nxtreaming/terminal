@@ -1,12 +1,83 @@
-//! Centered "Grok-style" welcome screen: branch+cwd top bar, animated 3D braille
-//! BU logo, menu, tip, version footer. Port of mockup A from the HTML compare page.
+//! Centered "Grok-style" welcome screen: animated 3D braille BU logo + menu.
+//! Port of mockup A from the HTML compare page.
+
+use std::time::Instant;
 
 use ratatui::text::{Line, Span};
 
 use crate::theme::{bold, muted, text_style};
 
+// ─────────────────────────── Anim state ───────────────────────────
+pub struct WelcomeAnim {
+    pub rx: f32,
+    pub ry: f32,
+    pub vx: f32,
+    pub vy: f32,
+    pub base_rx: f32,
+    pub target_vy: f32,
+    pub last_tick: Instant,
+    rng: u32,
+}
+
+impl WelcomeAnim {
+    pub fn new() -> Self {
+        let seed = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(1)
+            | 1;
+        Self {
+            rx: 0.55,
+            ry: 0.0,
+            vx: 0.0,
+            vy: 0.0,
+            base_rx: 0.55,
+            target_vy: 0.4,
+            last_tick: Instant::now(),
+            rng: seed,
+        }
+    }
+
+    fn rand(&mut self) -> f32 {
+        // xorshift32
+        let mut x = self.rng;
+        x ^= x << 13;
+        x ^= x >> 17;
+        x ^= x << 5;
+        self.rng = x;
+        (x as f32) / (u32::MAX as f32)
+    }
+
+    /// Advance the animation; call ~14fps from the event loop.
+    pub fn tick(&mut self) {
+        let dt = self.last_tick.elapsed().as_secs_f32().min(0.1);
+        self.last_tick = Instant::now();
+        self.rx += self.vx * dt;
+        self.ry += self.vy * dt;
+        let decay = 0.5_f32.powf(dt / 1.0);
+        self.vx *= decay;
+        self.vy = self.vy * decay + self.target_vy * (1.0 - decay);
+        // gentle spring back to the resting tilt so post-click rx returns home
+        self.rx += (self.base_rx - self.rx) * (1.0 - (-dt * 1.2_f32).exp());
+    }
+
+    /// Click impulse — tumble the logo with random angular velocity.
+    pub fn throw(&mut self) {
+        let rx_imp = (self.rand() * 2.0 - 1.0) * 9.0 + 5.0;
+        let ry_imp = (self.rand() * 2.0 - 1.0) * 7.0 + 7.0;
+        self.vx += rx_imp;
+        self.vy += ry_imp;
+    }
+}
+
+impl Default for WelcomeAnim {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
 // ─────────────────────────── Geometry ───────────────────────────
-const RING_SAMPLES: usize = 220;
+const RING_SAMPLES: usize = 120;
 const Y_SQUASH_BASE: f32 = 0.55; // monospace cell aspect for 2×2 supersample
 const TILT: f32 = std::f32::consts::PI / 3.0;
 const ROLL: f32 = std::f32::consts::PI / 4.0;
@@ -101,13 +172,17 @@ pub fn render_braille_logo(
                     let py = (cy_idx * sub_y + dy) as f32 - cy + 0.5;
                     let mut min2 = f32::INFINITY;
                     for p in &pts_a {
-                        let d = (p[0] - px).powi(2) + (p[1] - py).powi(2);
+                        let dx = p[0] - px;
+                        let dy = p[1] - py;
+                        let d = dx * dx + dy * dy;
                         if d < min2 {
                             min2 = d;
                         }
                     }
                     for p in &pts_b {
-                        let d = (p[0] - px).powi(2) + (p[1] - py).powi(2);
+                        let dx = p[0] - px;
+                        let dy = p[1] - py;
+                        let d = dx * dx + dy * dy;
                         if d < min2 {
                             min2 = d;
                         }
@@ -127,32 +202,54 @@ pub fn render_braille_logo(
 
 // ─────────────────────────── Layout ───────────────────────────
 
-const LOGO_W: usize = 22;
-const LOGO_H: usize = 9; // braille: 9 cells × 4 sub-rows = 36 sub-rows; ring max-y at R=14 is ~15.4, fits with margin
+pub const LOGO_W: usize = 22;
+pub const LOGO_H: usize = 9; // braille: 9 cells × 4 sub-rows = 36 sub-rows; ring max-y at R=14 is ~15.4, fits with margin
 const LOGO_R: f32 = 14.0;
 const LOGO_STROKE: f32 = 1.15;
+
+/// Compute the on-screen rect of the logo inside the welcome surface so the
+/// mouse handler can hit-test clicks against just the logo, not the whole panel.
+pub fn logo_screen_rect(
+    body_rect: ratatui::layout::Rect,
+    has_status_notice: bool,
+) -> ratatui::layout::Rect {
+    // Welcome layout: optional 2-line status notice (notice + blank), then one
+    // leading blank, then the logo. So the logo's top row is +1 (or +3 with notice).
+    let top_offset = if has_status_notice { 3 } else { 1 };
+    let col_offset = body_rect.width.saturating_sub(LOGO_W as u16) / 2;
+    ratatui::layout::Rect {
+        x: body_rect.x.saturating_add(col_offset),
+        y: body_rect.y.saturating_add(top_offset),
+        width: LOGO_W as u16,
+        height: LOGO_H as u16,
+    }
+}
 
 /// Build the centered welcome screen lines. `elapsed_secs` drives the y-axis spin
 /// for the logo; the tilt is constant (the logo "starts in the right position"
 /// and slowly rotates around y).
 pub fn welcome_lines(
     width: u16,
-    _branch: &str,
-    _cwd: &str,
-    version: &str,
-    elapsed_secs: f32,
+    anim: &WelcomeAnim,
     selected_idx: usize,
 ) -> Vec<Line<'static>> {
     let mut out: Vec<Line<'static>> = Vec::new();
     let width = width as usize;
 
-    // (top branch+cwd bar removed — metadata will live in the input border instead)
+    // Header: left-aligned at the very top, `Browser Use Terminal · ~/cwd`.
+    let cwd = short_cwd();
+    let title = "Browser Use Terminal";
+    let sep = " · ";
+    let _ = width;
+    out.push(Line::from(vec![
+        Span::styled(title.to_string(), bold()),
+        Span::styled(sep.to_string(), muted()),
+        Span::styled(cwd, muted()),
+    ]));
+    out.push(Line::from(""));
     out.push(Line::from(""));
 
-    // logo — constant tilt, slow y-axis drift
-    let rx = 0.55_f32;
-    let ry = elapsed_secs * 0.4;
-    let logo_rows = render_braille_logo(LOGO_W, LOGO_H, LOGO_R, LOGO_STROKE, rx, ry);
+    let logo_rows = render_braille_logo(LOGO_W, LOGO_H, LOGO_R, LOGO_STROKE, anim.rx, anim.ry);
     let pad_logo = " ".repeat(width.saturating_sub(LOGO_W) / 2);
     for row in logo_rows {
         let mut text = String::with_capacity(pad_logo.len() + row.len());
@@ -183,8 +280,21 @@ pub fn welcome_lines(
     }
     out.push(Line::from(""));
     out.push(Line::from(""));
-    let _ = version;
-    let _ = width;
 
     out
+}
+
+/// Current working directory as a friendly short label. Replaces the home
+/// prefix with `~` so paths like `/Users/foo/projects/bar` render as
+/// `~/projects/bar`.
+fn short_cwd() -> String {
+    let cwd = std::env::current_dir()
+        .map(|p| p.to_string_lossy().to_string())
+        .unwrap_or_default();
+    if let Ok(home) = std::env::var("HOME") {
+        if !home.is_empty() && cwd.starts_with(&home) {
+            return format!("~{}", &cwd[home.len()..]);
+        }
+    }
+    cwd
 }
