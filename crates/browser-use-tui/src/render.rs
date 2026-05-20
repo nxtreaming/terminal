@@ -858,26 +858,12 @@ fn render_composer(
         height: box_h,
     };
 
-    // Top border + side borders via a standard Block; the bottom border
-    // is drawn manually so we can punch the branch tag through it.
     let block = Block::default()
-        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
+        .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .border_style(border());
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
-
-    let bottom_y = box_area.y + box_area.height.saturating_sub(1);
-    let bottom_area = Rect {
-        x: box_area.x,
-        y: bottom_y,
-        width: box_area.width,
-        height: 1,
-    };
-    frame.render_widget(
-        Paragraph::new(composer_bottom_border(box_area.width)),
-        bottom_area,
-    );
 
     if inner.width > 2 && inner.height > 0 {
         let input_area = Rect {
@@ -937,14 +923,18 @@ fn composer_bottom_border(width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Status row below the composer: active model name plus the context
-/// fill bar. Cost is appended once the session has spent something. No
-/// branch (that lives on the bottom border), no browser.
+/// Status row below the composer: active model, context-fill bar, the
+/// current git branch (plain text), and the running cost when there is
+/// one. No browser, no cwd.
 fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Line<'static> {
     let usage = session_usage(app, state);
     let mut spans = vec![Span::styled(app.model.clone(), accent())];
     spans.push(status_separator());
     spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
+    if let Some(branch) = git_branch() {
+        spans.push(status_separator());
+        spans.push(Span::styled(branch, text_style()));
+    }
     if usage.cost_usd > 0.0 {
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
