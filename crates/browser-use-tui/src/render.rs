@@ -858,12 +858,26 @@ fn render_composer(
         height: box_h,
     };
 
+    // Top + sides via Block, bottom border drawn manually so the branch
+    // tag punches through it in white while the dashes/corners keep the
+    // same gray border() color as the rest of the box.
     let block = Block::default()
-        .borders(Borders::ALL)
+        .borders(Borders::TOP | Borders::LEFT | Borders::RIGHT)
         .border_type(BorderType::Rounded)
         .border_style(border());
     let inner = block.inner(box_area);
     frame.render_widget(block, box_area);
+
+    let bottom_area = Rect {
+        x: box_area.x,
+        y: box_area.y + box_area.height.saturating_sub(1),
+        width: box_area.width,
+        height: 1,
+    };
+    frame.render_widget(
+        Paragraph::new(composer_bottom_border(box_area.width)),
+        bottom_area,
+    );
 
     if inner.width > 2 && inner.height > 0 {
         let input_area = Rect {
@@ -894,8 +908,8 @@ fn render_composer(
 }
 
 /// Bottom border line for the composer, with the git branch tag punched
-/// through it on the right. `╰─── ⎇ branch ─╯` when a branch exists,
-/// `╰────╯` otherwise.
+/// through it on the right. Corners and dashes use the same gray
+/// `border()` style as the rest of the box; the branch text is white.
 fn composer_bottom_border(width: u16) -> Line<'static> {
     if width < 2 {
         return Line::from("");
@@ -903,11 +917,11 @@ fn composer_bottom_border(width: u16) -> Line<'static> {
     let inner_w = width.saturating_sub(2) as usize;
     let mut spans: Vec<Span<'static>> = vec![Span::styled("╰", border())];
     if let Some(branch) = git_branch() {
-        let branch_color = Style::default().fg(ratatui::style::Color::Rgb(192, 132, 252));
+        // ` branch ` with one cell of dash padding on each side, so the
+        // background dashes hug right up to the spaces around the tag.
         let tag: Vec<Span<'static>> = vec![
             Span::raw(" "),
-            Span::styled("⎇ ", muted()),
-            Span::styled(branch, branch_color),
+            Span::styled(branch, text_style()),
             Span::raw(" "),
         ];
         let tag_w: usize = tag.iter().map(|s| s.content.chars().count()).sum();
@@ -923,18 +937,14 @@ fn composer_bottom_border(width: u16) -> Line<'static> {
     Line::from(spans)
 }
 
-/// Status row below the composer: active model, context-fill bar, the
-/// current git branch (plain text), and the running cost when there is
-/// one. No browser, no cwd.
+/// Status row below the composer: active model and context-fill bar,
+/// plus running cost when there is one. The branch lives on the box's
+/// bottom border, not here.
 fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Line<'static> {
     let usage = session_usage(app, state);
     let mut spans = vec![Span::styled(app.model.clone(), accent())];
     spans.push(status_separator());
     spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
-    if let Some(branch) = git_branch() {
-        spans.push(status_separator());
-        spans.push(Span::styled(branch, text_style()));
-    }
     if usage.cost_usd > 0.0 {
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
