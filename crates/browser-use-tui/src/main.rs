@@ -1055,7 +1055,7 @@ impl App {
             // to its filter (printable ASCII only — control sequences fall
             // through to other handlers). Backspace pops a character; the
             // popup stays open even when the filter is empty.
-            KeyEvent { .. } if self.is_slash_palette_active() && is_command_delete_key(key) => {
+            KeyEvent { .. } if self.is_slash_palette_active() && is_popup_clear_key(key) => {
                 self.palette_filter.clear();
                 self.clamp_slash_palette_selection();
             }
@@ -2315,10 +2315,15 @@ fn handle_escape_prefix_key(
     app.handle_key(escape_key)
 }
 
-fn is_command_delete_key(key: KeyEvent) -> bool {
-    key.modifiers
+fn is_popup_clear_key(key: KeyEvent) -> bool {
+    let command_delete = key
+        .modifiers
         .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META)
-        && matches!(key.code, KeyCode::Backspace | KeyCode::Delete)
+        && matches!(key.code, KeyCode::Backspace | KeyCode::Delete);
+    let ctrl_u = key.modifiers.contains(KeyModifiers::CONTROL)
+        && matches!(key.code, KeyCode::Char('u' | 'U'));
+    let raw_ctrl_u = key.modifiers.is_empty() && matches!(key.code, KeyCode::Char('\u{15}'));
+    command_delete || ctrl_u || raw_ctrl_u
 }
 
 fn is_unmodified_enter_event(event: &TermEvent) -> bool {
@@ -3257,6 +3262,15 @@ mod redesign_tests {
             .enumerate()
             .any(|(idx, line)| idx > input_row && line.contains("/task")));
         assert!(screen.contains("/history"));
+        for ch in "bro".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        assert_eq!(app.palette_filter(), "bro");
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.palette_filter(), "");
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("/task"));
+        assert!(screen.contains("/model"));
         Ok(())
     }
 
