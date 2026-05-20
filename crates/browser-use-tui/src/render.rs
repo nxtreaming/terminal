@@ -318,12 +318,14 @@ fn main_bottom_height_for(
 }
 
 fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> u16 {
-    let visual_input_lines = composer_visual_input_lines(app, composer_input_area_width(width));
-    let palette_h = slash_palette_pane_height(app);
-    if palette_h > 0 {
-        visual_input_lines + palette_h + 1
+    let visual_input_lines = composer_visual_input_lines(app, width.saturating_sub(4).max(1));
+    let palette_items = slash_palette_pane_height(app);
+    if palette_items > 0 {
+        // top border + dropdown items + dashed separator + input + bottom border + hint
+        visual_input_lines + palette_items + 4
     } else {
-        visual_input_lines + COMPOSER_HINT_GAP + 2
+        // top border + input + bottom border + hint
+        visual_input_lines + 3
     }
 }
 
@@ -338,15 +340,16 @@ fn composer_visual_input_lines(app: &App, input_area_width: u16) -> u16 {
     visual_input_lines.clamp(1, 10) as u16
 }
 
+/// Number of dropdown item rows the slash palette would render (0 when the
+/// palette is closed). The fused composer absorbs its own chrome — top
+/// border, separator, hint — so this is just the row count, not a pane
+/// height including borders.
 fn slash_palette_pane_height(app: &App) -> u16 {
     if !app.is_slash_palette_active() {
         return 0;
     }
     let items = app.slash_palette_items();
-    if items.is_empty() {
-        return 0;
-    }
-    (items.len() as u16).min(8).saturating_add(3)
+    (items.len() as u16).min(8)
 }
 
 fn render_bottom_pane(
@@ -670,6 +673,13 @@ fn surface_lines(
     }
 }
 
+/// Fused bordered composer: a single rounded box that contains the input area
+/// and — when the slash palette is open — the dropdown rows sitting above the
+/// input, separated by a thin dashed rule. Session metadata is punched
+/// through the box's borders: model + browser on the top edge (or moves to
+/// the bottom when the dropdown takes over the top), cwd on the bottom-left,
+/// branch on the bottom-right. A single hint/status row renders just below
+/// the box.
 fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -680,69 +690,391 @@ fn render_composer(
     if area.width == 0 || area.height == 0 {
         return;
     }
-    let palette_h = slash_palette_pane_height(app);
-    let input_h = composer_visual_input_lines(app, composer_input_area_width(area.width));
-    let action_h = if palette_h > 0 { palette_h } else { 1 };
-    let constraints = if palette_h > 0 {
-        vec![
-            Constraint::Length(1),
-            Constraint::Length(input_h),
-            Constraint::Length(action_h),
-        ]
+    let palette_items = if app.is_slash_palette_active() {
+        app.slash_palette_items()
     } else {
-        vec![
-            Constraint::Length(1),
-            Constraint::Length(input_h),
-            Constraint::Length(COMPOSER_HINT_GAP),
-            Constraint::Length(action_h),
-        ]
+        Vec::new()
     };
-    let chunks = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints(constraints)
-        .split(area);
+    let palette_h = palette_items.len() as u16;
+    let palette_open = palette_h > 0;
+    let sep_h: u16 = if palette_open { 1 } else { 0 };
+
+    // Inside the box we reserve 1 cell of horizontal padding on each side,
+    // plus the 1-cell border, so the input lives in `width - 4`.
+    let input_inner_w = area.width.saturating_sub(4).max(1);
+    let input_h = composer_visual_input_lines(app, input_inner_w);
+    let inner_h = palette_h + sep_h + input_h;
+    let box_h = inner_h.saturating_add(2).min(area.height);
+    let hint_h: u16 = if area.height > box_h { 1 } else { 0 };
+
+    let box_area = Rect {
+        x: area.x,
+        y: area.y,
+        width: area.width,
+        height: box_h,
+    };
+
+    // Top border, with metadata or palette tag punched through.
+    let top_y = box_area.y;
     frame.render_widget(
-        Paragraph::new(input_box_rule(chunks[0].width)).style(input_rule()),
-        chunks[0],
+        Paragraph::new(top_border_line(box_area.width, app, palette_open)),
+        Rect {
+            x: box_area.x,
+            y: top_y,
+            width: box_area.width,
+            height: 1,
+        },
     );
-    let input_area = chunks[1].inner(Margin {
-        vertical: 0,
-        horizontal: 2,
-    });
-    render_composer_input(frame, input_area, app, state.current_session.as_ref());
-    if palette_h == 0 {
-        // Bottom rule, mirroring the rule above the input box.
-        frame.render_widget(
-            Paragraph::new(input_box_rule(chunks[2].width)).style(input_rule()),
-            chunks[2],
-        );
+
+    // Bottom border, with cwd + branch (and model/browser when the palette
+    // pushed it off the top).
+    let bottom_y = box_area.y + box_area.height.saturating_sub(1);
+    frame.render_widget(
+        Paragraph::new(bottom_border_line(box_area.width, app, palette_open)),
+        Rect {
+            x: box_area.x,
+            y: bottom_y,
+            width: box_area.width,
+            height: 1,
+        },
+    );
+
+    // Side borders for every row between top and bottom.
+    if box_area.height > 2 {
+        for row in 1..box_area.height.saturating_sub(1) {
+            let y = box_area.y + row;
+            frame.render_widget(
+                Paragraph::new(Span::styled("│", border())),
+                Rect {
+                    x: box_area.x,
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+            frame.render_widget(
+                Paragraph::new(Span::styled("│", border())),
+                Rect {
+                    x: box_area.x + box_area.width.saturating_sub(1),
+                    y,
+                    width: 1,
+                    height: 1,
+                },
+            );
+        }
     }
-    let action_chunk = if palette_h > 0 { chunks[2] } else { chunks[3] };
-    let action_area = action_chunk.inner(Margin {
-        vertical: 0,
-        horizontal: 2,
-    });
-    if palette_h > 0 {
+
+    let mut row_y = box_area.y + 1;
+    let inner_x = box_area.x + 1;
+    let inner_w = box_area.width.saturating_sub(2);
+
+    if palette_open && inner_w > 0 && palette_h > 0 {
+        let palette_area = Rect {
+            x: inner_x + 1,
+            y: row_y,
+            width: inner_w.saturating_sub(2),
+            height: palette_h,
+        };
         frame.render_widget(
-            Paragraph::new(slash_palette_lines(app, action_area.width as usize)),
-            action_area,
+            Paragraph::new(slash_palette_rows(app, palette_area.width as usize)),
+            palette_area,
         );
-    } else if state.current_session.is_some() {
-        // Inside a session: the compact model/context/cost status bar.
+        row_y += palette_h;
+
+        // Dashed separator that breaks the top half (dropdown) from the
+        // bottom half (input), with ├ / ┤ joins at the box edges.
+        let sep_area = Rect {
+            x: box_area.x,
+            y: row_y,
+            width: box_area.width,
+            height: 1,
+        };
         frame.render_widget(
-            Paragraph::new(status_bar_line(app, state, action_area.width as usize)),
-            action_area,
+            Paragraph::new(separator_line(box_area.width)),
+            sep_area,
         );
-    } else {
-        // Home screen: the command key hints.
-        frame.render_widget(
-            Paragraph::new(hint_row(action_area.width as usize)),
-            action_area,
-        );
+        row_y += 1;
+    }
+
+    if input_h > 0 && inner_w > 2 {
+        let input_area = Rect {
+            x: inner_x + 1,
+            y: row_y,
+            width: inner_w.saturating_sub(2),
+            height: input_h,
+        };
+        render_composer_input(frame, input_area, app, state.current_session.as_ref());
+    }
+
+    if hint_h > 0 {
+        let hint_area = Rect {
+            x: area.x,
+            y: box_area.y + box_area.height,
+            width: area.width,
+            height: hint_h,
+        };
+        let hint_inner = hint_area.inner(Margin {
+            vertical: 0,
+            horizontal: 2,
+        });
+        if state.current_session.is_some() {
+            frame.render_widget(
+                Paragraph::new(status_bar_line(app, state, hint_inner.width as usize)),
+                hint_inner,
+            );
+        } else {
+            frame.render_widget(
+                Paragraph::new(hint_row(hint_inner.width as usize)),
+                hint_inner,
+            );
+        }
     }
 }
 
-fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+/// Build the top border line for the fused composer. Punches one tag
+/// through it: `/ command palette` when the palette is open, otherwise the
+/// model + browser metadata. Each tag is dropped or shortened to fit when
+/// the terminal narrows.
+fn top_border_line(width: u16, app: &App, palette_open: bool) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled("╭", border()));
+    let inner_w = width.saturating_sub(2) as usize;
+    if palette_open {
+        let mut tag_spans = vec![
+            Span::raw(" "),
+            Span::styled("/", accent()),
+            Span::styled(" command palette ", muted()),
+        ];
+        let tag_w: usize = tag_spans.iter().map(|s| s.content.chars().count()).sum();
+        // 2-cell dash lead-in before the tag, fill the rest with dashes.
+        let lead = 2usize.min(inner_w.saturating_sub(tag_w));
+        spans.push(Span::styled("─".repeat(lead), border()));
+        spans.append(&mut tag_spans);
+        let trail = inner_w.saturating_sub(lead + tag_w);
+        spans.push(Span::styled("─".repeat(trail), border()));
+    } else {
+        let tag = top_metadata_spans(app, inner_w);
+        let tag_w: usize = tag.iter().map(|s| s.content.chars().count()).sum();
+        // Right-align the metadata tag: dashes, then tag, then 2-dash trail.
+        let trail = 2usize.min(inner_w.saturating_sub(tag_w));
+        let lead = inner_w.saturating_sub(tag_w + trail);
+        spans.push(Span::styled("─".repeat(lead), border()));
+        spans.extend(tag);
+        spans.push(Span::styled("─".repeat(trail), border()));
+    }
+    spans.push(Span::styled("╮", border()));
+    Line::from(spans)
+}
+
+/// Build the bottom border line. Always shows cwd on the left and branch on
+/// the right (when there is one). When the palette has displaced the
+/// model/browser tag off the top, the bottom takes it too — inserted between
+/// cwd and branch.
+fn bottom_border_line(width: u16, app: &App, palette_open: bool) -> Line<'static> {
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    spans.push(Span::styled("╰", border()));
+    let inner_w = width.saturating_sub(2) as usize;
+
+    let mut left_spans = bottom_left_spans();
+    let mut right_spans = bottom_right_spans();
+    let mut center_spans: Vec<Span<'static>> = Vec::new();
+    if palette_open {
+        center_spans = top_metadata_spans(app, inner_w);
+    }
+
+    let left_w: usize = left_spans.iter().map(|s| s.content.chars().count()).sum();
+    let right_w: usize = right_spans.iter().map(|s| s.content.chars().count()).sum();
+    let center_w: usize = center_spans.iter().map(|s| s.content.chars().count()).sum();
+
+    // Floor: 2-cell dash lead-in on the left, 2 between segments. If we can't
+    // fit a segment we drop it, smallest-priority first: branch, then
+    // center (palette-displaced metadata), then cwd.
+    let needed = |segments: &[usize]| -> usize {
+        let dashes = 2 + segments.len().saturating_sub(1) * 2 + 2; // lead + gaps + trail
+        segments.iter().sum::<usize>() + dashes
+    };
+
+    // Build present segments list (left, optional center, optional right).
+    let mut segments: Vec<Vec<Span<'static>>> = vec![left_spans.clone()];
+    if !center_spans.is_empty() {
+        segments.push(center_spans.clone());
+    }
+    if !right_spans.is_empty() {
+        segments.push(right_spans.clone());
+    }
+    let widths: Vec<usize> = segments
+        .iter()
+        .map(|s| s.iter().map(|sp| sp.content.chars().count()).sum())
+        .collect();
+    let mut drop_right = false;
+    let mut drop_center = false;
+    let mut drop_left = false;
+    if needed(&widths) > inner_w {
+        // Drop the rightmost-priority segment first.
+        if widths.len() == 3 {
+            drop_right = true;
+            let trimmed: Vec<usize> = widths[..2].to_vec();
+            if needed(&trimmed) > inner_w {
+                drop_center = true;
+                let trimmed2: Vec<usize> = vec![widths[0]];
+                if needed(&trimmed2) > inner_w {
+                    drop_left = true;
+                }
+            }
+        } else if widths.len() == 2 {
+            drop_right = true;
+            if needed(&[widths[0]]) > inner_w {
+                drop_left = true;
+            }
+        } else if widths.len() == 1 && needed(&widths) > inner_w {
+            drop_left = true;
+        }
+    }
+    if drop_right {
+        right_spans.clear();
+    }
+    if drop_center {
+        center_spans.clear();
+    }
+    if drop_left {
+        left_spans.clear();
+    }
+
+    let left_w = left_spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let right_w = right_spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+    let center_w = center_spans.iter().map(|s| s.content.chars().count()).sum::<usize>();
+
+    // Layout: [lead dashes] [left] [mid dashes] [center] [mid dashes] [right] [trail dashes]
+    // collapse missing segments and their dash gaps.
+    let lead = 2.min(inner_w.saturating_sub(left_w + center_w + right_w));
+    spans.push(Span::styled("─".repeat(lead), border()));
+    let mut used = lead;
+    if !left_spans.is_empty() {
+        spans.extend(left_spans.clone());
+        used += left_w;
+    }
+    if !center_spans.is_empty() {
+        let gap = inner_w
+            .saturating_sub(used + center_w + right_w + 2)
+            .min(usize::MAX);
+        let gap = gap.max(2);
+        spans.push(Span::styled("─".repeat(gap), border()));
+        spans.extend(center_spans.clone());
+        used += gap + center_w;
+    }
+    if !right_spans.is_empty() {
+        let gap = inner_w.saturating_sub(used + right_w + 2).max(2);
+        spans.push(Span::styled("─".repeat(gap), border()));
+        spans.extend(right_spans.clone());
+        used += gap + right_w;
+    }
+    let trail = inner_w.saturating_sub(used);
+    spans.push(Span::styled("─".repeat(trail), border()));
+    spans.push(Span::styled("╯", border()));
+    Line::from(spans)
+}
+
+/// The dashed separator that sits between the slash-command dropdown and the
+/// input area when the palette is open. `├╌╌...╌╌┤` so the box reads as one
+/// continuous frame split into two halves.
+fn separator_line(width: u16) -> Line<'static> {
+    let inner = width.saturating_sub(2) as usize;
+    Line::from(vec![
+        Span::styled("├", border()),
+        Span::styled("╌".repeat(inner), border()),
+        Span::styled("┤", border()),
+    ])
+}
+
+/// Model + browser, in their warm/cool accent colors, separated by a muted
+/// `·`. Used on the top edge by default, or on the bottom edge when the
+/// palette has taken over the top.
+fn top_metadata_spans(app: &App, max_width: usize) -> Vec<Span<'static>> {
+    let model = short_model(&app.model);
+    let browser = short_browser(&app.browser);
+    let model_color = Style::default().fg(ratatui::style::Color::Rgb(251, 191, 36));
+    let browser_color = Style::default().fg(ratatui::style::Color::Rgb(96, 165, 250));
+    let full = vec![
+        Span::raw(" "),
+        Span::styled(model.clone(), model_color),
+        Span::styled(" · ", muted()),
+        Span::styled(browser.clone(), browser_color),
+        Span::raw(" "),
+    ];
+    let full_w: usize = full.iter().map(|s| s.content.chars().count()).sum();
+    if full_w + 4 <= max_width {
+        return full;
+    }
+    // Tight: drop the browser, keep just the model.
+    let model_only = vec![Span::raw(" "), Span::styled(model.clone(), model_color), Span::raw(" ")];
+    let model_w: usize = model_only.iter().map(|s| s.content.chars().count()).sum();
+    if model_w + 4 <= max_width {
+        return model_only;
+    }
+    Vec::new()
+}
+
+fn bottom_left_spans() -> Vec<Span<'static>> {
+    let cwd = short_cwd(&cwd_label());
+    vec![Span::raw(" "), Span::styled(cwd, muted()), Span::raw(" ")]
+}
+
+fn bottom_right_spans() -> Vec<Span<'static>> {
+    if let Some(branch) = git_branch() {
+        let branch_color = Style::default().fg(ratatui::style::Color::Rgb(192, 132, 252));
+        vec![
+            Span::raw(" "),
+            Span::styled("⎇ ", muted()),
+            Span::styled(branch, branch_color),
+            Span::raw(" "),
+        ]
+    } else {
+        Vec::new()
+    }
+}
+
+/// Compact display name for the model, used on the input border.
+fn short_model(model: &str) -> String {
+    if model.is_empty() {
+        return "—".to_string();
+    }
+    model.to_string()
+}
+
+/// Compact display name for the browser backend.
+fn short_browser(browser: &str) -> String {
+    if browser.is_empty() {
+        return "—".to_string();
+    }
+    browser.to_string()
+}
+
+/// Path string for the bottom-left of the input. Replaces the home prefix
+/// with `~` and, if the path is still long, keeps the last two path
+/// components with a leading ellipsis.
+fn short_cwd(cwd: &str) -> String {
+    let home = std::env::var("HOME").unwrap_or_default();
+    let with_tilde = if !home.is_empty() && cwd.starts_with(&home) {
+        format!("~{}", &cwd[home.len()..])
+    } else {
+        cwd.to_string()
+    };
+    if with_tilde.chars().count() <= 48 {
+        return with_tilde;
+    }
+    let parts: Vec<&str> = with_tilde.split('/').filter(|s| !s.is_empty()).collect();
+    if parts.len() <= 2 {
+        return with_tilde;
+    }
+    let tail = parts[parts.len() - 2..].join("/");
+    format!("…/{tail}")
+}
+
+/// Dropdown rows used by the fused composer. No top/bottom rules and no
+/// hint footer — those are provided by the box around it. Each row is
+/// `marker · command · description` with the marker column reserved for the
+/// `›` cursor on the active item.
+fn slash_palette_rows(app: &App, width: usize) -> Vec<Line<'static>> {
     let items = app.slash_palette_items();
     let cmd_col = items
         .iter()
@@ -750,33 +1082,28 @@ fn slash_palette_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         .max()
         .unwrap_or(0)
         .max(8);
-    let rule_w = width.saturating_sub(11);
-    let mut lines = vec![Line::from(vec![
-        Span::styled("-".repeat(rule_w), dim()),
-        Span::styled(" esc close", muted()),
-    ])];
-    for (idx, item) in items.iter().enumerate() {
-        let is_selected = idx == app.selected_row;
-        let cmd_style = if is_selected { accent() } else { text_style() };
-        let desc_style = if is_selected { text_style() } else { muted() };
-        let desc_max = width.saturating_sub(cmd_col + 4).max(8);
-        let description = truncate(item.description, desc_max);
-        lines.push(highlight_selectable_row(
-            vec![
-                Span::styled(format!("{:<cmd_col$}", item.command), cmd_style),
-                Span::raw("  "),
-                Span::styled(description, desc_style),
-            ],
-            is_selected,
-            width,
-        ));
-    }
-    lines.push(Line::from(Span::styled("-".repeat(rule_w), dim())));
-    lines.push(Line::from(Span::styled(
-        "up/down navigate . enter select",
-        muted(),
-    )));
-    lines
+    items
+        .iter()
+        .enumerate()
+        .map(|(idx, item)| {
+            let is_selected = idx == app.selected_row;
+            let marker = if is_selected { "› " } else { "  " };
+            let cmd_style = if is_selected { accent() } else { text_style() };
+            let desc_style = if is_selected { text_style() } else { muted() };
+            let desc_max = width.saturating_sub(cmd_col + 4).max(4);
+            let description = truncate(item.description, desc_max);
+            highlight_selectable_row(
+                vec![
+                    Span::styled(marker, accent()),
+                    Span::styled(format!("{:<cmd_col$}", item.command), cmd_style),
+                    Span::raw("  "),
+                    Span::styled(description, desc_style),
+                ],
+                is_selected,
+                width,
+            )
+        })
+        .collect()
 }
 
 fn input_box_rule(width: u16) -> String {
@@ -1311,25 +1638,20 @@ fn ready_lines(app: &App, state: &WorkbenchState, width: u16) -> Vec<Line<'stati
         lines.push(Line::from(Span::styled(notice.clone(), failed())));
         lines.push(Line::from(""));
     }
-    lines.extend(config_card_lines(app, state, width as usize));
-    lines.push(Line::from(""));
 
-    if !state.history.is_empty() {
-        let total = state.history.len();
-        let header_text = if total > 3 {
-            format!("recent . {total} total")
-        } else {
-            "recent".to_string()
-        };
-        lines.push(Line::from(Span::styled(header_text, muted())));
-        let rows: Vec<&HistoryRow> = state.history.iter().take(3).collect();
-        for row in rows {
-            lines.push(history_plain_row(row, width as usize));
-        }
-        // Breathing room between the recent task list and the input box below.
-        lines.push(Line::from(""));
-        lines.push(Line::from(""));
-    }
+    let branch = git_branch().unwrap_or_else(|| "no branch".to_string());
+    let cwd = cwd_label();
+    let version = env!("CARGO_PKG_VERSION");
+    let elapsed = app.startup_instant.elapsed().as_secs_f32();
+    lines.extend(crate::welcome::welcome_lines(
+        width,
+        &branch,
+        &cwd,
+        version,
+        elapsed,
+        app.selected_row,
+    ));
+    let _ = state; // recent worktree list removed from welcome screen
     lines
 }
 
