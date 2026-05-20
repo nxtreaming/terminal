@@ -601,15 +601,11 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
         return;
     }
 
-    // Header: `/ command palette` + filter summary.
-    let header = Line::from(vec![
-        Span::raw(" "),
-        Span::styled("/", accent()),
-        Span::styled(" command palette ", muted()),
-    ]);
-    let filter_text = app.composer.input();
-    let filter_summary = if filter_text.len() > 1 {
-        format!(" filter: {filter_text}")
+    // Header: just the palette title + match-count summary. The user can
+    // see what they typed in the composer below the popup — echoing the
+    // filter text here too would be duplication.
+    let summary = if item_count == palette::max_item_count() as u16 {
+        format!(" {} commands", item_count)
     } else {
         format!(" {} of {}", item_count, palette::max_item_count())
     };
@@ -618,11 +614,10 @@ fn render_command_palette_popup(frame: &mut Frame<'_>, area: Rect, app: &App) {
             Span::raw("  "),
             Span::styled("/", accent()),
             Span::styled(" command palette", muted()),
-            Span::styled(filter_summary, dim()),
+            Span::styled(summary, dim()),
         ]),
         Line::from(""),
     ];
-    let _ = header;
     let chunks = Layout::default()
         .direction(Direction::Vertical)
         .constraints([Constraint::Length(2), Constraint::Min(1), Constraint::Length(1)])
