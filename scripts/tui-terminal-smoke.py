@@ -145,17 +145,39 @@ def assert_row_gap_at_most(text: str, before: str, after: str, max_rows: int, co
         )
 
 
+def assert_line_directly_followed_by(text: str, before: str, after: str, context: str) -> None:
+    lines = text.splitlines()
+    for idx, line in enumerate(lines[:-1]):
+        if before in line and after in lines[idx + 1]:
+            return
+    raise AssertionError(
+        f"{context}: expected a line containing {before!r} to be directly followed by {after!r}\n\n{text}"
+    )
+
+
 def assert_same_line_gap_at_most(
     text: str, before: str, after: str, max_gap: int, context: str
 ) -> None:
+    invalid_gaps: list[int] = []
     for line in text.splitlines():
         if before not in line or after not in line:
             continue
-        gap = line.index(after) - (line.index(before) + len(before))
-        if 0 <= gap <= max_gap:
-            return
+        search_from = 0
+        while True:
+            before_idx = line.find(before, search_from)
+            if before_idx < 0:
+                break
+            after_idx = line.find(after, before_idx + len(before))
+            if after_idx >= 0:
+                gap = after_idx - (before_idx + len(before))
+                if gap <= max_gap:
+                    return
+                invalid_gaps.append(gap)
+            search_from = before_idx + 1
+    if invalid_gaps:
+        closest_gap = min(invalid_gaps)
         raise AssertionError(
-            f"{context}: expected {after!r} within {max_gap} cells after {before!r}, saw {gap}\n\n{text}"
+            f"{context}: expected {after!r} within {max_gap} cells after {before!r}, saw closest gap {closest_gap}\n\n{text}"
         )
     raise AssertionError(f"{context}: missing same line {before!r} and {after!r}\n\n{text}")
 

@@ -1,6 +1,7 @@
 //! Centered "Grok-style" welcome screen: animated 3D braille BU logo + menu.
 //! Port of mockup A from the HTML compare page.
 
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ratatui::text::{Line, Span};
@@ -328,13 +329,39 @@ pub fn welcome_lines(
 /// prefix with `~` so paths like `/Users/foo/projects/bar` render as
 /// `~/projects/bar`.
 fn short_cwd() -> String {
-    let cwd = std::env::current_dir()
-        .map(|p| p.to_string_lossy().to_string())
-        .unwrap_or_default();
-    if let Ok(home) = std::env::var("HOME") {
-        if !home.is_empty() && cwd.starts_with(&home) {
-            return format!("~{}", &cwd[home.len()..]);
+    let cwd = std::env::current_dir().unwrap_or_default();
+    let home = std::env::var_os("HOME").map(PathBuf::from);
+    shorten_cwd(&cwd, home.as_deref())
+}
+
+fn shorten_cwd(cwd: &Path, home: Option<&Path>) -> String {
+    if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
+        if let Ok(relative) = cwd.strip_prefix(home) {
+            if relative.as_os_str().is_empty() {
+                return "~".to_string();
+            }
+            return format!("~/{}", relative.to_string_lossy());
         }
     }
-    cwd
+    cwd.to_string_lossy().to_string()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cwd_shortening_only_applies_to_real_home_children() {
+        let home = Path::new("/Users/reagan");
+
+        assert_eq!(
+            shorten_cwd(Path::new("/Users/reagan/project"), Some(home)),
+            "~/project"
+        );
+        assert_eq!(shorten_cwd(home, Some(home)), "~");
+        assert_eq!(
+            shorten_cwd(Path::new("/Users/reaganomics/project"), Some(home)),
+            "/Users/reaganomics/project"
+        );
+    }
 }
