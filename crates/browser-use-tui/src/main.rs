@@ -4348,6 +4348,18 @@ mod redesign_tests {
     }
 
     #[test]
+    fn composer_border_shows_current_browser() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.browser = BROWSER_USE_CLOUD.to_string();
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains(BROWSER_USE_CLOUD));
+        Ok(())
+    }
+
+    #[test]
     fn helper_completion_renders_as_result_not_activity_blob() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
