@@ -563,9 +563,7 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
                     push_activity(&mut activity, format!("browsing {}", compact_url(url)));
                 }
             }
-            "model.turn.request" => {
-                push_activity(&mut activity, model_turn_request_activity(&event.payload));
-            }
+            "model.turn.request" => {}
             "model.turn.retry" => {
                 push_activity(&mut activity, model_turn_retry_activity(&event.payload));
             }
@@ -663,15 +661,6 @@ fn push_activity(activity: &mut Vec<String>, item: impl Into<String>) {
         return;
     }
     activity.push(item);
-}
-
-fn model_turn_request_activity(payload: &Value) -> String {
-    let model = payload
-        .get("model")
-        .and_then(Value::as_str)
-        .filter(|value| !value.trim().is_empty())
-        .unwrap_or("model");
-    format!("thinking waiting for {model}")
 }
 
 fn model_turn_retry_activity(payload: &Value) -> String {
@@ -1364,7 +1353,7 @@ mod tests {
     }
 
     #[test]
-    fn projects_model_waits_and_retries_as_activity() {
+    fn hides_model_waits_but_keeps_retries_as_activity() {
         let events = vec![
             EventRecord {
                 seq: 1,
@@ -1395,7 +1384,6 @@ mod tests {
         assert_eq!(
             activity_from_events(&events),
             vec![
-                "thinking waiting for GPT-5.5",
                 "thinking model request hit a transient error",
                 "thinking retrying model request 1/5",
             ]

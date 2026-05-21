@@ -40,16 +40,6 @@ pub(crate) fn render_code_lines(
         .collect()
 }
 
-pub(crate) fn highlight_code_line_spans(
-    line: &str,
-    language_hint: Option<&str>,
-) -> Option<Vec<Span<'static>>> {
-    let syntax = language_hint
-        .and_then(find_syntax)
-        .or_else(|| guess_syntax_for_code(line))?;
-    highlight_line_to_spans(line, syntax)
-}
-
 #[derive(Clone, Debug)]
 struct ListState {
     next: Option<u64>,
@@ -848,9 +838,7 @@ fn highlight_code_to_lines(code: &str, language_hint: Option<&str>) -> Option<Ve
     if code.len() > MAX_HIGHLIGHT_BYTES || code.lines().count() > MAX_HIGHLIGHT_LINES {
         return None;
     }
-    let syntax = language_hint
-        .and_then(find_syntax)
-        .or_else(|| guess_syntax_for_code(code))?;
+    let syntax = language_hint.and_then(find_syntax)?;
     let mut highlighter = HighlightLines::new(syntax, syntax_theme());
     let mut lines = Vec::new();
 
@@ -859,14 +847,6 @@ fn highlight_code_to_lines(code: &str, language_hint: Option<&str>) -> Option<Ve
     }
 
     (!lines.is_empty()).then_some(lines)
-}
-
-fn highlight_line_to_spans(line: &str, syntax: &SyntaxReference) -> Option<Vec<Span<'static>>> {
-    if line.len() > MAX_HIGHLIGHT_BYTES {
-        return None;
-    }
-    let mut highlighter = HighlightLines::new(syntax, syntax_theme());
-    highlight_line_with(&mut highlighter, line)
 }
 
 fn highlight_line_with(
@@ -899,8 +879,14 @@ fn syntax_theme() -> &'static Theme {
 }
 
 fn find_syntax(lang: &str) -> Option<&'static SyntaxReference> {
+    if is_plain_text_language(lang) {
+        return None;
+    }
     let syntax_set = syntax_set();
     syntax_candidates(lang).into_iter().find_map(|candidate| {
+        if is_plain_text_language(&candidate) {
+            return None;
+        }
         syntax_set
             .find_syntax_by_token(&candidate)
             .or_else(|| syntax_set.find_syntax_by_name(&candidate))
@@ -929,10 +915,7 @@ fn add_syntax_candidate(raw: &str, candidates: &mut Vec<String>) {
         return;
     }
     if let Some((key, value)) = token.split_once('=') {
-        if matches!(
-            key.to_ascii_lowercase().as_str(),
-            "file" | "filename" | "lang" | "language" | "path" | "title"
-        ) {
+        if matches!(key.to_ascii_lowercase().as_str(), "lang" | "language") {
             add_syntax_candidate(value, candidates);
         }
         return;
@@ -948,12 +931,6 @@ fn add_syntax_candidate(raw: &str, candidates: &mut Vec<String>) {
     push_candidate(candidates, token);
     if let Some(alias) = syntax_alias(token) {
         push_candidate(candidates, alias);
-    }
-    if let Some(extension) = file_extension_hint(token) {
-        push_candidate(candidates, extension);
-        if let Some(alias) = syntax_alias(extension) {
-            push_candidate(candidates, alias);
-        }
     }
 }
 
@@ -973,23 +950,13 @@ fn push_candidate(candidates: &mut Vec<String>, candidate: &str) {
     candidates.push(candidate.to_string());
 }
 
-fn file_extension_hint(token: &str) -> Option<&str> {
-    let filename = token.rsplit('/').next().unwrap_or(token);
-    let (_, extension) = filename.rsplit_once('.')?;
-    extension
-        .chars()
-        .all(|ch| ch.is_ascii_alphanumeric() || ch == '-')
-        .then_some(extension)
-}
-
 fn syntax_alias(token: &str) -> Option<&'static str> {
     match token {
         "c++" | "cpp" | "cc" | "cxx" | "hpp" | "hxx" => Some("c++"),
         "c#" | "csharp" | "c-sharp" | "cs" => Some("c#"),
         "golang" => Some("go"),
         "py" | "python3" | "py3" | "python-repl" => Some("python"),
-        "shell" | "sh" | "zsh" | "fish" | "ksh" | "terminal" | "console" | "shell-session"
-        | "session" => Some("bash"),
+        "shell" | "sh" | "zsh" | "fish" | "ksh" => Some("bash"),
         "ps1" | "powershell" => Some("powershell"),
         "javascript" | "js" | "jsx" | "node" | "mjs" | "cjs" => Some("javascript"),
         "typescript" | "ts" | "tsx" => Some("typescript"),
@@ -1023,216 +990,11 @@ fn syntax_alias(token: &str) -> Option<&'static str> {
     }
 }
 
-fn guess_syntax_for_code(code: &str) -> Option<&'static SyntaxReference> {
-    let trimmed = code.trim_start();
-    if trimmed.is_empty() {
-        return None;
-    }
-    let first_line = trimmed.lines().next().unwrap_or("").trim();
-    if let Some(shebang) = first_line.strip_prefix("#!") {
-        return guess_syntax_from_shebang(shebang);
-    }
-    if looks_like_json(trimmed) {
-        return find_syntax("json");
-    }
-    if looks_like_diff(trimmed) {
-        return find_syntax("diff");
-    }
-    if looks_like_html_or_xml(trimmed) {
-        return find_syntax("html").or_else(|| find_syntax("xml"));
-    }
-    if looks_like_sql(trimmed) {
-        return find_syntax("sql");
-    }
-    if looks_like_toml(trimmed) {
-        return find_syntax("toml");
-    }
-    if looks_like_yaml(trimmed) {
-        return find_syntax("yaml");
-    }
-    if looks_like_dockerfile(trimmed) {
-        return find_syntax("dockerfile");
-    }
-    if looks_like_rust(trimmed) {
-        return find_syntax("rust");
-    }
-    if looks_like_python(trimmed) {
-        return find_syntax("python");
-    }
-    if looks_like_javascript_or_typescript(trimmed) {
-        return find_syntax("typescript").or_else(|| find_syntax("javascript"));
-    }
-    if looks_like_shell(trimmed) {
-        return find_syntax("bash");
-    }
-    None
-}
-
-fn guess_syntax_from_shebang(shebang: &str) -> Option<&'static SyntaxReference> {
-    let lower = shebang.to_ascii_lowercase();
-    if lower.contains("python") {
-        find_syntax("python")
-    } else if lower.contains("node") || lower.contains("deno") || lower.contains("bun") {
-        find_syntax("javascript")
-    } else if lower.contains("ruby") {
-        find_syntax("ruby")
-    } else if lower.contains("perl") {
-        find_syntax("perl")
-    } else if lower.contains("php") {
-        find_syntax("php")
-    } else if lower.contains("bash")
-        || lower.contains("zsh")
-        || lower.contains("fish")
-        || lower.contains("sh")
-    {
-        find_syntax("bash")
-    } else {
-        None
-    }
-}
-
-fn looks_like_json(value: &str) -> bool {
-    matches!(value.as_bytes().first(), Some(b'{') | Some(b'['))
-        && serde_json::from_str::<serde_json::Value>(value).is_ok()
-}
-
-fn looks_like_diff(value: &str) -> bool {
-    value.starts_with("diff --git")
-        || value.starts_with("@@ ")
-        || value.lines().take(4).any(|line| {
-            line.starts_with("+++ ")
-                || line.starts_with("--- ")
-                || line.starts_with("Index: ")
-                || line.starts_with("rename from ")
-        })
-}
-
-fn looks_like_html_or_xml(value: &str) -> bool {
-    let lower = value.trim_start().to_ascii_lowercase();
-    lower.starts_with("<!doctype")
-        || lower.starts_with("<html")
-        || lower.starts_with("<?xml")
-        || (lower.starts_with('<') && lower.contains("</"))
-}
-
-fn looks_like_sql(value: &str) -> bool {
-    let lower = value.trim_start().to_ascii_lowercase();
-    [
-        "select ", "with ", "insert ", "update ", "delete ", "create ", "alter ", "drop ",
-        "pragma ",
-    ]
-    .iter()
-    .any(|prefix| lower.starts_with(prefix))
-}
-
-fn looks_like_toml(value: &str) -> bool {
-    value.lines().take(8).any(|line| {
-        let trimmed = line.trim();
-        (trimmed.starts_with('[') && trimmed.ends_with(']'))
-            || trimmed.starts_with("version =")
-            || trimmed.starts_with("edition =")
-            || trimmed.starts_with("workspace =")
-    })
-}
-
-fn looks_like_yaml(value: &str) -> bool {
-    let mut meaningful = value
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty() && !line.starts_with('#'));
-    let Some(first) = meaningful.next() else {
-        return false;
-    };
-    first == "---"
-        || first.starts_with("- ")
-        || (first.contains(": ") && !first.ends_with(';') && !first.contains("://"))
-}
-
-fn looks_like_dockerfile(value: &str) -> bool {
-    value.lines().take(8).any(|line| {
-        matches!(
-            line.trim_start()
-                .split_whitespace()
-                .next()
-                .unwrap_or("")
-                .to_ascii_uppercase()
-                .as_str(),
-            "FROM" | "RUN" | "COPY" | "ADD" | "ENV" | "ARG" | "WORKDIR" | "ENTRYPOINT" | "CMD"
-        )
-    })
-}
-
-fn looks_like_rust(value: &str) -> bool {
-    value.lines().take(12).any(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with("use ")
-            || trimmed.starts_with("pub ")
-            || trimmed.starts_with("impl ")
-            || trimmed.starts_with("fn ")
-            || trimmed.starts_with("async fn ")
-            || trimmed.starts_with("mod ")
-            || trimmed.starts_with("#[")
-            || trimmed.contains("::")
-    })
-}
-
-fn looks_like_python(value: &str) -> bool {
-    value.lines().take(12).any(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with("def ")
-            || trimmed.starts_with("class ")
-            || trimmed.starts_with("import ")
-            || trimmed.starts_with("from ")
-            || trimmed.starts_with("async def ")
-            || trimmed.starts_with("if __name__ ==")
-    })
-}
-
-fn looks_like_javascript_or_typescript(value: &str) -> bool {
-    value.lines().take(12).any(|line| {
-        let trimmed = line.trim_start();
-        trimmed.starts_with("const ")
-            || trimmed.starts_with("let ")
-            || trimmed.starts_with("var ")
-            || trimmed.starts_with("import ")
-            || trimmed.starts_with("export ")
-            || trimmed.starts_with("function ")
-            || trimmed.contains("=>")
-            || trimmed.contains("console.log")
-    })
-}
-
-fn looks_like_shell(value: &str) -> bool {
-    value.lines().take(8).any(|line| {
-        let trimmed = line.trim_start().trim_start_matches("$ ");
-        matches!(
-            trimmed.split_whitespace().next().unwrap_or(""),
-            "cargo"
-                | "git"
-                | "rg"
-                | "grep"
-                | "find"
-                | "sed"
-                | "awk"
-                | "cat"
-                | "ls"
-                | "cd"
-                | "pwd"
-                | "uv"
-                | "python"
-                | "python3"
-                | "node"
-                | "npm"
-                | "pnpm"
-                | "yarn"
-                | "bun"
-                | "curl"
-                | "ssh"
-                | "docker"
-                | "task"
-                | "sqlite3"
-        )
-    })
+fn is_plain_text_language(lang: &str) -> bool {
+    matches!(
+        clean_syntax_token(lang).as_str(),
+        "text" | "txt" | "plain" | "plaintext" | "none" | "nohighlight" | "no-highlight"
+    )
 }
 
 fn convert_syntect_style(style: SyntectStyle) -> Style {
@@ -1342,19 +1104,23 @@ mod tests {
     }
 
     #[test]
-    fn code_fence_language_aliases_and_filenames_are_highlighted() {
+    fn code_fence_language_aliases_and_language_metadata_are_highlighted() {
         let alias_lines = render_markdown_lines("```rs\nfn main() {}\n```\n", 80);
         assert!(has_multiple_code_colors(&alias_lines));
 
-        let file_hint_lines = render_markdown_lines(
+        let language_hint_lines =
+            render_markdown_lines("```language=rust\nfn main() {}\n```\n", 80);
+        assert!(has_multiple_code_colors(&language_hint_lines));
+
+        let file_hint_only_lines = render_markdown_lines(
             "```filename=crates/browser-use-tui/src/main.rs\nfn main() {}\n```\n",
             80,
         );
-        assert!(has_multiple_code_colors(&file_hint_lines));
+        assert!(!has_multiple_code_colors(&file_hint_only_lines));
     }
 
     #[test]
-    fn unlabeled_structured_code_blocks_are_highlighted() {
+    fn unlabeled_structured_code_blocks_use_plain_code_style() {
         let json_lines = render_markdown_lines(
             "```\n{\"name\":\"browser-use-terminal\",\"count\":2}\n```\n",
             80,
@@ -1363,7 +1129,20 @@ mod tests {
             plain(&json_lines),
             "{\"name\":\"browser-use-terminal\",\"count\":2}"
         );
-        assert!(has_multiple_code_colors(&json_lines));
+        assert!(json_lines[0]
+            .spans
+            .iter()
+            .all(|span| span.style.fg == markdown_code_block().fg));
+    }
+
+    #[test]
+    fn plain_text_code_fences_do_not_syntax_highlight() {
+        let lines = render_markdown_lines("```text\ncrates/\n  browser-use-tui\n```\n", 80);
+        assert_eq!(plain(&lines), "crates/\n  browser-use-tui");
+        assert!(lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .all(|span| span.style.fg == markdown_code_block().fg));
     }
 
     #[test]
