@@ -1,6 +1,7 @@
-use browser_use_protocol::{EventRecord, SessionMeta, WorkbenchState};
+use browser_use_protocol::{normalize_result_text, EventRecord, SessionMeta, WorkbenchState};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::{highlight_code_line_spans, render_markdown_lines};
@@ -378,14 +379,46 @@ fn cells_to_lines<'a>(
     mode: DisplayMode,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    let mut previous_kind = None;
     for node in nodes {
         let _ = (node.id(), node.revision());
-        if !out.is_empty() && !matches!(node.kind, TranscriptKind::Prompt { .. }) {
-            out.push(Line::from(""));
+        if !out.is_empty() {
+            let gap = previous_kind
+                .map(|previous| gap_lines_between(previous, &node.kind))
+                .unwrap_or(0);
+            out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
         }
         out.extend(node.display_lines(width, mode));
+        previous_kind = Some(&node.kind);
     }
     out
+}
+
+pub(crate) fn gap_before_active(model: &TranscriptModel) -> usize {
+    let Some(previous) = model.committed.last() else {
+        return 0;
+    };
+    let Some(active) = model.active.as_ref() else {
+        return 0;
+    };
+    gap_lines_between(&previous.kind, &active.kind)
+}
+
+fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize {
+    match (previous, next) {
+        (_, TranscriptKind::Prompt { .. } | TranscriptKind::PendingPrompt { .. }) => 1,
+        (
+            TranscriptKind::Prompt { .. } | TranscriptKind::PendingPrompt { .. },
+            TranscriptKind::Assistant { .. }
+            | TranscriptKind::StreamingAssistant { .. }
+            | TranscriptKind::Timeline { .. }
+            | TranscriptKind::ActiveStatus { .. }
+            | TranscriptKind::Error { .. }
+            | TranscriptKind::Cancelled { .. }
+            | TranscriptKind::Stack { .. },
+        ) => 2,
+        _ => 1,
+    }
 }
 
 fn committed_node_for_event(
@@ -412,7 +445,7 @@ fn committed_node_for_event(
             })
         }
         "session.done" => {
-            let result = payload_string(event, "result")?;
+            let result = session_done_result_text(event, state)?;
             Some(TranscriptNode {
                 id,
                 seq: event.seq,
@@ -514,7 +547,7 @@ fn committed_node_for_event(
         "tool.image" => Some(timeline_node(
             event,
             "image",
-            vec!["received image artifact".to_string()],
+            vec![tool_image_label(event, state)],
             NodeStyle::Normal,
         )),
         "tool.failed" => {
@@ -634,7 +667,7 @@ fn committed_node_for_event(
             Some(timeline_node(
                 event,
                 "browser",
-                vec!["browser connected".to_string()],
+                vec![browser_event_label(event)],
                 NodeStyle::Normal,
             ))
         }
@@ -824,8 +857,21 @@ fn model_response_tool_call_count(event: &EventRecord) -> u64 {
 
 fn model_stream_text_for_response(app: &App, response_event: &EventRecord) -> Option<String> {
     let turn_idx = event_turn_idx(response_event)?;
+    let request_seq = app
+        .cached_events_for_session(&response_event.session_id)
+        .iter()
+        .rev()
+        .find(|event| {
+            event.seq < response_event.seq
+                && event.event_type == "model.turn.request"
+                && event_turn_idx(event) == Some(turn_idx)
+        })
+        .map(|event| event.seq)?;
     let mut text = String::new();
     for event in app.cached_events_for_session(&response_event.session_id) {
+        if event.seq <= request_seq {
+            continue;
+        }
         if event.seq > response_event.seq {
             break;
         }
@@ -1884,6 +1930,90 @@ fn display_path(path: &str, state: &WorkbenchState) -> String {
         .to_string()
 }
 
+fn session_done_result_text(event: &EventRecord, state: &WorkbenchState) -> Option<String> {
+    if event.payload.get("result_file").is_some() {
+        return Some(session_done_result_file_text(event, state));
+    }
+    payload_string(event, "result").map(|result| normalize_result_text(&result))
+}
+
+fn session_done_result_file_text(event: &EventRecord, state: &WorkbenchState) -> String {
+    let file_path = payload_string(event, "result_file_path")
+        .or_else(|| resolved_result_file_path(event, state).map(|path| path.display().to_string()))
+        .or_else(|| payload_string(event, "result_file"))
+        .unwrap_or_else(|| "<unknown>".to_string());
+    let directory_path = payload_string(event, "result_file_directory").or_else(|| {
+        resolved_result_file_path(event, state)
+            .and_then(|path| path.parent().map(|path| path.display().to_string()))
+    });
+    let bytes = event
+        .payload
+        .get("result_file_bytes")
+        .and_then(serde_json::Value::as_u64);
+    let mime = payload_string(event, "result_file_mime");
+
+    let file_display = display_path(&file_path, state);
+    let mut text = format!("Saved result file\n\nFile      {file_display}");
+    if let Some(directory_path) = directory_path {
+        text.push_str(&format!(
+            "\nFolder    {}",
+            display_path(&directory_path, state)
+        ));
+    }
+    match (bytes, mime.as_deref()) {
+        (Some(bytes), Some(mime)) => {
+            text.push_str(&format!("\nSize      {} · {mime}", format_bytes(bytes)));
+        }
+        (Some(bytes), None) => {
+            text.push_str(&format!("\nSize      {}", format_bytes(bytes)));
+        }
+        (None, Some(mime)) => {
+            text.push_str(&format!("\nType      {mime}"));
+        }
+        (None, None) => {}
+    }
+    text.push_str("\n\nFull contents are saved on disk, not inlined into the terminal.");
+    text
+}
+
+fn resolved_result_file_path(event: &EventRecord, state: &WorkbenchState) -> Option<PathBuf> {
+    if let Some(path) = payload_string(event, "result_file_path") {
+        return Some(PathBuf::from(path));
+    }
+    let requested = payload_string(event, "result_file")?;
+    let requested_path = Path::new(&requested);
+    if requested_path.is_absolute() {
+        return Some(requested_path.to_path_buf());
+    }
+    let session = state.current_session.as_ref()?;
+    let candidates = [
+        Path::new(&session.cwd).join(&requested),
+        Path::new(&session.artifact_root).join(&requested),
+        requested_path.to_path_buf(),
+    ];
+    candidates
+        .iter()
+        .find(|candidate| candidate.exists())
+        .cloned()
+        .or_else(|| Some(Path::new(&session.artifact_root).join(&requested)))
+}
+
+fn format_bytes(bytes: u64) -> String {
+    const KB: f64 = 1024.0;
+    const MB: f64 = 1024.0 * 1024.0;
+    const GB: f64 = 1024.0 * 1024.0 * 1024.0;
+    let bytes_f = bytes as f64;
+    if bytes_f >= GB {
+        format!("{:.1} GB", bytes_f / GB)
+    } else if bytes_f >= MB {
+        format!("{:.1} MB", bytes_f / MB)
+    } else if bytes_f >= KB {
+        format!("{:.1} KB", bytes_f / KB)
+    } else {
+        format!("{bytes} B")
+    }
+}
+
 fn compact_url(url: &str) -> String {
     const MAX: usize = 72;
     let compact = url
@@ -2208,7 +2338,7 @@ fn child_activity_line(event: &EventRecord, state: &WorkbenchState) -> Option<St
             let error = payload_string(event, "error").unwrap_or_else(|| "tool failed".to_string());
             Some(format!("{name} failed: {}", truncate_text(&error, 96)))
         }
-        "tool.image" => Some("received image artifact".to_string()),
+        "tool.image" => Some(tool_image_label(event, state)),
         "artifact.created" => event
             .payload
             .get("artifact")
@@ -2240,9 +2370,98 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
+fn tool_image_label(event: &EventRecord, state: &WorkbenchState) -> String {
+    event
+        .payload
+        .get("image")
+        .and_then(|image| image.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .map(|path| format!("image {}", display_path(path, state)))
+        .unwrap_or_else(|| "received image artifact".to_string())
+}
+
+fn browser_event_label(event: &EventRecord) -> String {
+    match event.event_type.as_str() {
+        "browser.reconnected" => "browser reconnected",
+        "browser.target_changed" => "browser target changed",
+        _ => "browser connected",
+    }
+    .to_string()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn line_text(line: &Line<'static>) -> String {
+        line.spans
+            .iter()
+            .map(|span| span.content.as_ref())
+            .collect::<String>()
+            .trim_end()
+            .to_string()
+    }
+
+    #[test]
+    fn prompt_output_pairs_have_extra_vertical_space() {
+        let prompt = TranscriptNode {
+            id: "prompt".to_string(),
+            seq: 1,
+            revision: 1,
+            kind: TranscriptKind::Prompt {
+                text: "go to gusto".to_string(),
+                followup: false,
+            },
+        };
+        let answer = TranscriptNode {
+            id: "answer".to_string(),
+            seq: 2,
+            revision: 2,
+            kind: TranscriptKind::Assistant {
+                markdown: "Please open Chrome first.".to_string(),
+                source: None,
+            },
+        };
+
+        let lines = cells_to_lines([&prompt, &answer].into_iter(), 80, DisplayMode::Scrollback);
+
+        assert_eq!(line_text(&lines[0]), "> go to gusto");
+        assert_eq!(line_text(&lines[1]), "");
+        assert_eq!(line_text(&lines[2]), "");
+        assert_eq!(line_text(&lines[3]), "Please open Chrome first.");
+    }
+
+    #[test]
+    fn followup_prompts_keep_a_gap_after_previous_output() {
+        let answer = TranscriptNode {
+            id: "answer".to_string(),
+            seq: 1,
+            revision: 1,
+            kind: TranscriptKind::Assistant {
+                markdown: "First answer.".to_string(),
+                source: None,
+            },
+        };
+        let followup = TranscriptNode {
+            id: "followup".to_string(),
+            seq: 2,
+            revision: 2,
+            kind: TranscriptKind::Prompt {
+                text: "which chrome profiles do i have".to_string(),
+                followup: true,
+            },
+        };
+
+        let lines = cells_to_lines(
+            [&answer, &followup].into_iter(),
+            80,
+            DisplayMode::Scrollback,
+        );
+
+        assert_eq!(line_text(&lines[0]), "First answer.");
+        assert_eq!(line_text(&lines[1]), "");
+        assert_eq!(line_text(&lines[2]), "> which chrome profiles do i have");
+    }
 
     #[test]
     fn url_lines_keep_link_style_after_wrapping() {

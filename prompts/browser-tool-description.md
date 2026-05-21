@@ -8,8 +8,8 @@ The input is a single CLI-like command string. You may include the leading word 
 browser status --json
 browser preference --json
 browser preference use local
-browser profile suggest --domain gusto.com --json
-browser profile remember --domain gusto.com --profile google-chrome:Profile 2
+browser profile suggest --domain example.com --json
+browser profile remember --domain example.com --profile google-chrome:Profile 2
 browser connect
 browser connect local
 browser local list --json
@@ -36,14 +36,15 @@ Preferences:
 - `browser profile remember --domain <domain> --profile <profile-id> [--mode local|cloud]` stores the profile to use next time for that domain.
 - If a site likely needs login and no profile is remembered, ask the user which profile/browser to use before connecting.
 - Do not silently attach to a different local profile when a profile is remembered.
+- Tool commands returned in `next_step` are internal actions for you to run. Never tell the user to run `browser ...` commands manually.
 
 Local real browser:
 
 - `browser connect local` attaches to an already-running Chromium-family browser after the user enables remote debugging.
 - Do not guess a browser family flag. The tool auto-detects Chrome, Chrome Canary, Chromium, Edge, Brave, Arc, Dia, Comet, and common forks through DevToolsActivePort.
 - If one candidate exists, it connects. If multiple candidates exist, ask the user which candidate to use, then run `browser connect local --candidate <id>`.
-- If Chrome blocks the connection with permission evidence such as 403, run `browser local setup`. The user must enable `chrome://inspect/#remote-debugging` and accept any Chrome permission prompt. Then run `browser connect local` again.
-- If the port is closed or `DevToolsActivePort` is stale, Chrome is not exposing CDP right now. Do not tell the user remote debugging is disabled; ask them to open Chrome with the selected profile, or run `browser local setup --profile <profile-id>` if profile is known.
+- If Chrome blocks the connection with permission evidence such as 403, call `browser local setup` yourself. Ask the user only to enable the Chrome checkbox or accept the Chrome permission prompt in the browser window that opens. Then call `browser connect local` again.
+- If the port is closed or `DevToolsActivePort` is stale, Chrome is not exposing CDP right now. Do not tell the user remote debugging is disabled. If a profile is known, call `browser local setup --profile <profile-id>` yourself; otherwise ask which local profile/browser to use.
 - Do not launch the user's real default Chrome profile with remote-debugging flags. Real logged-in profiles are attached while already open.
 
 Local profiles:

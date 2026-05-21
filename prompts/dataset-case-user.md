@@ -12,7 +12,7 @@ Filesystem contract: if the task asks you to save files, use `/home/user/outputs
 
 Output-shape contract: follow the requested final format literally. If the task asks for JSON, a table, or a schema-shaped response, the final answer must be in that shape unless the task also explicitly asks for a file path or artifact summary. Saving a full artifact is fine, but a path/count/sample summary is not a substitute for requested inline structured output.
 
-Persisted-answer contract: after `set_final_answer(...)` prints a compact count/preview, do not paste that preview into `done`. Use `done(use_final_answer=true)` or `done(result="__use_final_answer__")` so the full persisted answer is returned.
+File result contract: after writing a complete JSON/CSV/text result file, do not paste a preview into `done`. Use `done(result_file="/path/to/result.json")` so the full file content is returned.
 
 Remote browser contract: browser automation may run on a different machine from the local filesystem. Files downloaded by the remote browser are not automatically available under `/home/user/outputs`. If a task needs a downloaded file locally, transfer or fetch it into `/home/user/outputs` or another local path, then verify the local path exists before referencing, opening, or finalizing it. For uploads, make sure the file you intend to upload is available to the browser context you are controlling.
 

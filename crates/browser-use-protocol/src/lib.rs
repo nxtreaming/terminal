@@ -264,11 +264,7 @@ pub fn result_from_events(events: &[EventRecord]) -> Option<String> {
         .iter()
         .rev()
         .find_map(|event| match event.event_type.as_str() {
-            "session.done" => event
-                .payload
-                .get("result")
-                .and_then(Value::as_str)
-                .map(clean_result_text),
+            "session.done" => session_done_result_text(&event.payload),
             "agent.completed" => event
                 .payload
                 .get("payload")
@@ -276,12 +272,40 @@ pub fn result_from_events(events: &[EventRecord]) -> Option<String> {
                 .and_then(Value::as_str)
                 .map(str::trim)
                 .filter(|result| !result.is_empty())
-                .map(clean_result_text),
+                .map(normalize_result_text),
             _ => None,
         })
 }
 
-fn clean_result_text(text: &str) -> String {
+fn session_done_result_text(payload: &Value) -> Option<String> {
+    if payload.get("result_file").is_some() {
+        let file = payload
+            .get("result_file_url")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("result_file_path").and_then(Value::as_str))
+            .or_else(|| payload.get("result_file").and_then(Value::as_str))
+            .unwrap_or("<unknown>");
+        let directory = payload
+            .get("result_file_directory_url")
+            .and_then(Value::as_str)
+            .or_else(|| payload.get("result_file_directory").and_then(Value::as_str));
+        let bytes = payload.get("result_file_bytes").and_then(Value::as_u64);
+        let mut text = format!("Saved result file.\n\nFile:\n{file}");
+        if let Some(directory) = directory {
+            text.push_str(&format!("\n\nDirectory:\n{directory}"));
+        }
+        if let Some(bytes) = bytes {
+            text.push_str(&format!("\n\nSize: {bytes} bytes"));
+        }
+        return Some(text);
+    }
+    payload
+        .get("result")
+        .and_then(Value::as_str)
+        .map(normalize_result_text)
+}
+
+pub fn normalize_result_text(text: &str) -> String {
     let mut cleaned = text.trim_end().to_string();
     loop {
         let chars = cleaned.chars().collect::<Vec<_>>();
@@ -1237,6 +1261,32 @@ mod tests {
             payload: json!({"result": format!("{answer}{answer}")}),
         }];
         assert_eq!(result_from_events(&events).as_deref(), Some(answer));
+    }
+
+    #[test]
+    fn result_projection_uses_pointer_for_done_result_file() {
+        let events = vec![EventRecord {
+            seq: 1,
+            id: "e1".to_string(),
+            session_id: "s1".to_string(),
+            ts_ms: 1,
+            event_type: "session.done".to_string(),
+            payload: json!({
+                "source": "done.result_file",
+                "result_file": "answer.json",
+                "result_file_url": "file:///tmp/but/answer.json",
+                "result_file_directory_url": "file:///tmp/but",
+                "result_file_bytes": 123,
+                "result": "SHOULD_NOT_RENDER ".repeat(100),
+            }),
+        }];
+        let result = result_from_events(&events).expect("result");
+
+        assert!(result.contains("Saved result file."));
+        assert!(result.contains("file:///tmp/but/answer.json"));
+        assert!(result.contains("file:///tmp/but"));
+        assert!(result.contains("123 bytes"));
+        assert!(!result.contains("SHOULD_NOT_RENDER"));
     }
 
     #[test]

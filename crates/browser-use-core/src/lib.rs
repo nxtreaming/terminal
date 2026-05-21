@@ -1,6 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::hash::{Hash, Hasher};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -34,6 +34,14 @@ const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
 const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
 static TOOL_OUTPUT_ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Debug, Clone)]
+struct DoneResultFile {
+    requested_path: String,
+    path: PathBuf,
+    bytes: u64,
+    mime: &'static str,
+}
 
 pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
@@ -152,14 +160,6 @@ impl AgentRunOptions {
         self.child_agent_runner = Some(runner);
         self
     }
-}
-
-fn is_cloud_browser_mode(mode: Option<&str>) -> bool {
-    mode.map(|value| {
-        let normalized = value.to_ascii_lowercase().replace(['_', ' '], "-");
-        normalized == "cloud"
-    })
-    .unwrap_or(false)
 }
 
 fn browser_mode_instruction(mode: &str) -> String {
@@ -831,77 +831,6 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 if tool_calls.is_empty() {
                     if !assistant_text.trim().is_empty() {
                         let requested_result = assistant_text.trim_end();
-                        if looks_like_placeholder_done_result(requested_result) {
-                            if let Some(final_answer) = persisted_final_answer(&session)? {
-                                if let Some(error) =
-                                    persisted_final_answer_not_ready_message(&final_answer)
-                                {
-                                    store.append_event(
-                                        &session.id,
-                                        "tool.failed",
-                                        serde_json::json!({
-                                            "name": "done",
-                                            "source": "assistant_text_placeholder",
-                                            "error": error,
-                                        }),
-                                    )?;
-                                    messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": error,
-                                    }));
-                                    maybe_compact_messages(
-                                        store,
-                                        &session.id,
-                                        &mut messages,
-                                        options.max_context_chars,
-                                    )?;
-                                    step_span.set_ok();
-                                    continue;
-                                }
-                                if append_done_from_persisted_final_answer(
-                                    store,
-                                    &session.id,
-                                    &final_answer,
-                                    "assistant_text_placeholder",
-                                    None,
-                                )? {
-                                    step_span.set_ok();
-                                    return Ok(session.id.clone());
-                                }
-                            }
-                        }
-                        if let Some(final_answer) = persisted_final_answer(&session)? {
-                            if let Some(error) =
-                                persisted_final_answer_not_ready_message(&final_answer)
-                            {
-                                if !explicit_result_states_persisted_gaps(requested_result) {
-                                    let error = format!(
-                                        "{error} Your explicit final result does not clearly state that the persisted artifact is partial/incomplete or name the remaining gaps. Either fix the artifact/audit and call set_final_answer(..., audit=audit) again, or finalize with an explicit partial answer that leads with the unresolved gaps."
-                                    );
-                                    store.append_event(
-                                        &session.id,
-                                        "tool.failed",
-                                        serde_json::json!({
-                                            "name": "done",
-                                            "source": "assistant_text_final_answer_not_ready",
-                                            "error": error,
-                                        }),
-                                    )?;
-                                    messages.push(serde_json::json!({
-                                        "role": "user",
-                                        "content": error,
-                                    }));
-                                    maybe_compact_messages(
-                                        store,
-                                        &session.id,
-                                        &mut messages,
-                                        options.max_context_chars,
-                                    )?;
-                                    step_span.set_ok();
-                                    continue;
-                                }
-                            }
-                        }
                         if let Some(error) = guard_or_close_active_descendants(
                             store,
                             &session.id,
@@ -967,23 +896,6 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 step_span.set_ok();
             }
 
-            if let Some(final_answer) = persisted_final_answer(&session)? {
-                if let Some(error) = persisted_final_answer_not_ready_message(&final_answer) {
-                    store.append_event(
-                        &session.id,
-                        "session.final_answer_not_ready_at_max_turns",
-                        serde_json::json!({ "error": error }),
-                    )?;
-                } else if append_done_from_persisted_final_answer(
-                    store,
-                    &session.id,
-                    &final_answer,
-                    "max_turns_exhausted",
-                    None,
-                )? {
-                    return Ok(session.id.clone());
-                }
-            }
             store.append_event(
                 &session.id,
                 "session.failed",
@@ -991,37 +903,16 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             )?;
             bail!("agent exceeded maximum provider turns");
         })();
-        if is_cloud_browser_mode(options.browser_mode.as_deref()) {
-            match worker.shutdown_owned_cloud_browser() {
-                Ok(Some(summary)) => {
-                    if summary.get("stopped").and_then(Value::as_bool) == Some(true) {
-                        store.append_event(&session.id, "browser.cloud_shutdown", summary)?;
-                    }
-                }
-                Ok(None) => {}
-                Err(error) => {
-                    store.append_event(
-                        &session.id,
-                        "browser.cloud_shutdown_failed",
-                        serde_json::json!({ "error": format!("{error:#}") }),
-                    )?;
-                }
-            }
-        }
+        // Browser state is session-level, not run-level. Keep local, managed, and
+        // remote browser ownership alive across normal task completion so follow-ups
+        // can inspect/recover the same browser. Explicit close/stop actions own
+        // teardown.
         let cleaned_commands = tools::command::cleanup_session_commands(&session.id);
         if cleaned_commands > 0 {
             store.append_event(
                 &session.id,
                 "command.cleaned_up",
                 serde_json::json!({ "count": cleaned_commands }),
-            )?;
-        }
-        let cleaned_browser = browser_use_browser::cleanup_session(&session.id);
-        if cleaned_browser > 0 {
-            store.append_event(
-                &session.id,
-                "browser.runtime_cleaned_up",
-                serde_json::json!({ "count": cleaned_browser }),
             )?;
         }
         run_result
@@ -3374,74 +3265,41 @@ fn dispatch_done_tool(
         .unwrap_or("")
         .trim()
         .to_string();
-    let final_answer = persisted_final_answer(session)?;
-    let explicit_use_final_answer = call
+    let requested_result_file = call
         .arguments
-        .get("use_final_answer")
-        .and_then(Value::as_bool)
-        .unwrap_or(false)
+        .get("result_file")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|path| !path.is_empty());
+    let result_file = requested_result_file
+        .map(|path| done_result_file_info(session, path))
+        .transpose()?;
+    if call.arguments.get("use_final_answer").is_some()
         || matches!(
             requested_result.as_str(),
             "__use_final_answer__" | "__final_answer__" | "FINAL_ANSWER"
-        );
-    let should_auto_use_final_answer = final_answer
-        .as_ref()
-        .is_some_and(|answer| should_replace_with_persisted_final(&requested_result, answer));
-    if explicit_use_final_answer && final_answer.is_none() {
+        )
+    {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            "done requested use_final_answer=true, but no persisted final answer exists. Call python set_final_answer(...) first, or pass a non-empty result.",
+            "done no longer supports persisted final-answer state. Pass result_file for saved browser_script output, or pass a non-empty result.",
         );
     }
-    if requested_result.is_empty() && !explicit_use_final_answer {
+    if requested_result.is_empty() && result_file.is_none() {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            "done requires a non-empty result, or use_final_answer=true after python set_final_answer(...)",
+            "done requires a non-empty result or result_file",
         );
     }
     if let Some(error) = guard_or_close_active_descendants(store, &session.id, &call.arguments)? {
         return dispatch_tool_validation_error(store, session, call, &error);
     }
-    let use_final_answer = explicit_use_final_answer || should_auto_use_final_answer;
-    let final_answer_summary = final_answer
-        .as_ref()
-        .and_then(|answer| answer.get("summary"))
-        .cloned();
-    if let Some(answer) = final_answer.as_ref() {
-        if let Some(error) = persisted_final_answer_not_ready_message(answer) {
-            if use_final_answer {
-                return dispatch_tool_validation_error(store, session, call, &error);
-            }
-            if !explicit_result_states_persisted_gaps(&requested_result) {
-                let error = format!(
-                    "{error} Your explicit final result does not clearly state that the persisted artifact is partial/incomplete or name the remaining gaps. Either fix the artifact/audit and call set_final_answer(..., audit=audit) again, or finalize with an explicit partial answer that leads with the unresolved gaps."
-                );
-                return dispatch_tool_validation_error(store, session, call, &error);
-            }
-        }
-    }
-    let result = if use_final_answer {
-        let Some(answer) = final_answer.as_ref() else {
-            return dispatch_tool_validation_error(
-                store,
-                session,
-                call,
-                "done could not load the persisted final answer",
-            );
-        };
-        let Some(result) = persisted_final_answer_result(answer) else {
-            return dispatch_tool_validation_error(
-                store,
-                session,
-                call,
-                "persisted final answer is missing a non-empty result",
-            );
-        };
-        result.to_string()
+    let result = if let Some(result_file) = result_file.as_ref() {
+        done_result_file_message(result_file)
     } else {
         requested_result
     };
@@ -3454,22 +3312,6 @@ fn dispatch_done_tool(
             "arguments": call.arguments,
         }),
     )?;
-    if use_final_answer {
-        let trigger = if should_auto_use_final_answer && !explicit_use_final_answer {
-            "assistant_done_result_replaced"
-        } else {
-            "done_use_final_answer"
-        };
-        store.append_event(
-            &session.id,
-            "session.final_answer_used",
-            serde_json::json!({
-                "source": "python.set_final_answer",
-                "tool_call_id": call.id,
-                "trigger": trigger,
-            }),
-        )?;
-    }
     store.append_event(
         &session.id,
         "tool.finished",
@@ -3479,17 +3321,127 @@ fn dispatch_done_tool(
         }),
     )?;
     let mut done_payload = serde_json::json!({ "result": result });
-    if use_final_answer {
-        done_payload["source"] = Value::String("python.set_final_answer".to_string());
-        if let Some(summary) = final_answer_summary {
-            done_payload["final_answer_summary"] = summary;
-        }
+    if let Some(result_file) = result_file.as_ref() {
+        let directory = result_file
+            .path
+            .parent()
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."));
+        let artifact = serde_json::json!({
+            "kind": "file",
+            "path": result_file.path.display().to_string(),
+            "mime": result_file.mime,
+            "bytes": result_file.bytes,
+            "source": "done.result_file",
+        });
+        record_tool_artifact(store, &session.id, "done", &artifact)?;
+        done_payload["source"] = Value::String("done.result_file".to_string());
+        done_payload["result_file"] = Value::String(result_file.requested_path.clone());
+        done_payload["result_file_path"] = Value::String(result_file.path.display().to_string());
+        done_payload["result_file_url"] = Value::String(file_url(&result_file.path));
+        done_payload["result_file_directory"] = Value::String(directory.display().to_string());
+        done_payload["result_file_directory_url"] = Value::String(file_url(&directory));
+        done_payload["result_file_bytes"] = Value::from(result_file.bytes);
+        done_payload["result_file_mime"] = Value::String(result_file.mime.to_string());
     }
     store.append_event(&session.id, "session.done", done_payload)?;
     Ok(ToolDispatchOutcome {
         finished: true,
         messages: Vec::new(),
     })
+}
+
+fn done_result_file_info(
+    session: &browser_use_protocol::SessionMeta,
+    requested_path: &str,
+) -> Result<DoneResultFile> {
+    let path = resolve_done_result_file(session, requested_path);
+    let path = path
+        .into_iter()
+        .find(|candidate| candidate.is_file())
+        .ok_or_else(|| {
+            anyhow!("done result_file does not exist or is not a file: {requested_path}")
+        })?;
+    let metadata =
+        std::fs::metadata(&path).with_context(|| format!("read metadata {}", path.display()))?;
+    if metadata.len() == 0 {
+        bail!("done result_file is empty: {}", path.display());
+    }
+    Ok(DoneResultFile {
+        requested_path: requested_path.to_string(),
+        mime: guess_mime_from_path(&path),
+        path,
+        bytes: metadata.len(),
+    })
+}
+
+fn done_result_file_message(result_file: &DoneResultFile) -> String {
+    let directory = result_file.path.parent().unwrap_or_else(|| Path::new("."));
+    format!(
+        "Saved result file.\n\nFile:\n{}\n\nDirectory:\n{}\n\nLocal path:\n{}\nSize: {} bytes\nMIME: {}\n\nThe full result is in the file above. It is not inlined here so the terminal stays responsive.",
+        file_url(&result_file.path),
+        file_url(directory),
+        result_file.path.display(),
+        result_file.bytes,
+        result_file.mime,
+    )
+}
+
+fn guess_mime_from_path(path: &Path) -> &'static str {
+    match path
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or_default()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "json" => "application/json",
+        "csv" => "text/csv",
+        "html" | "htm" => "text/html",
+        "md" => "text/markdown",
+        "png" => "image/png",
+        "jpg" | "jpeg" => "image/jpeg",
+        "txt" | "log" => "text/plain",
+        _ => "application/octet-stream",
+    }
+}
+
+fn file_url(path: &Path) -> String {
+    let path = path.display().to_string().replace('\\', "/");
+    let prefix = if path.starts_with('/') {
+        "file://"
+    } else {
+        "file:///"
+    };
+    format!("{prefix}{}", encode_file_url_path(&path))
+}
+
+fn encode_file_url_path(path: &str) -> String {
+    let mut out = String::new();
+    for byte in path.as_bytes() {
+        match *byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'/' | b':' | b'.' | b'-' | b'_' | b'~' => {
+                out.push(*byte as char)
+            }
+            other => out.push_str(&format!("%{other:02X}")),
+        }
+    }
+    out
+}
+
+fn resolve_done_result_file(
+    session: &browser_use_protocol::SessionMeta,
+    requested_path: &str,
+) -> Vec<PathBuf> {
+    let path = Path::new(requested_path);
+    if path.is_absolute() {
+        return vec![path.to_path_buf()];
+    }
+    vec![
+        Path::new(&session.cwd).join(path),
+        Path::new(&session.artifact_root).join(path),
+        path.to_path_buf(),
+    ]
 }
 
 fn guard_or_close_active_descendants(
@@ -3568,217 +3520,6 @@ fn close_direct_active_child_subtrees(store: &Store, session_id: &str) -> Result
         }
     }
     Ok(())
-}
-
-fn persisted_final_answer(session: &browser_use_protocol::SessionMeta) -> Result<Option<Value>> {
-    let path = Path::new(&session.artifact_root).join(".final_answer.json");
-    if !path.exists() {
-        return Ok(None);
-    }
-    let contents = std::fs::read_to_string(&path)
-        .with_context(|| format!("read persisted final answer {}", path.display()))?;
-    let value: Value = serde_json::from_str(&contents)
-        .with_context(|| format!("parse persisted final answer {}", path.display()))?;
-    Ok(Some(value))
-}
-
-fn persisted_final_answer_result(final_answer: &Value) -> Option<String> {
-    final_answer
-        .get("result")
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|result| !result.is_empty())
-        .map(str::to_string)
-}
-
-fn append_done_from_persisted_final_answer(
-    store: &Store,
-    session_id: &str,
-    final_answer: &Value,
-    trigger: &str,
-    tool_call_id: Option<&str>,
-) -> Result<bool> {
-    let Some(result) = persisted_final_answer_result(final_answer) else {
-        return Ok(false);
-    };
-    let mut used_payload = serde_json::json!({
-        "source": "python.set_final_answer",
-        "trigger": trigger,
-    });
-    if let Some(tool_call_id) = tool_call_id {
-        used_payload["tool_call_id"] = Value::String(tool_call_id.to_string());
-    }
-    store.append_event(session_id, "session.final_answer_used", used_payload)?;
-    let mut done_payload = serde_json::json!({
-        "result": result,
-        "source": "python.set_final_answer",
-    });
-    if let Some(summary) = final_answer.get("summary").cloned() {
-        done_payload["final_answer_summary"] = summary;
-    }
-    store.append_event(session_id, "session.done", done_payload)?;
-    Ok(true)
-}
-
-fn persisted_final_answer_not_ready_message(final_answer: &Value) -> Option<String> {
-    let summary = final_answer.get("summary")?;
-    if summary
-        .get("ready_for_done")
-        .and_then(Value::as_bool)
-        .unwrap_or(true)
-    {
-        return None;
-    }
-    if let Some(note) = summary.get("audit_note").and_then(Value::as_str) {
-        return Some(format!(
-            "The persisted final answer is not ready for done. {note} Fix the artifact/audit and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
-        ));
-    }
-    if let Some(audit_path) = summary
-        .get("audit")
-        .and_then(|audit| audit.get("audit_path"))
-        .and_then(Value::as_str)
-    {
-        return Some(format!(
-            "The persisted final answer is not ready for done because the attached artifact audit did not pass ({audit_path}). Review the audit checks, fix the artifact, and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
-        ));
-    }
-    Some(
-        "The persisted final answer is not ready for done. Fix the artifact/audit and call set_final_answer(..., audit=audit) again, or pass an explicit final result that states the remaining gaps."
-            .to_string(),
-    )
-}
-
-fn should_replace_with_persisted_final(requested_result: &str, final_answer: &Value) -> bool {
-    let count = final_answer
-        .get("summary")
-        .and_then(|summary| summary.get("count"))
-        .and_then(Value::as_u64)
-        .unwrap_or(0);
-    count > 0
-        && (looks_like_empty_structured_result(requested_result)
-            || looks_like_placeholder_done_result(requested_result)
-            || looks_like_persisted_preview_result(requested_result, final_answer))
-}
-
-fn explicit_result_states_persisted_gaps(result: &str) -> bool {
-    let normalized = result.to_ascii_lowercase();
-    [
-        "blank",
-        "could not",
-        "duplicate",
-        "failed",
-        "gap",
-        "incomplete",
-        "invalid",
-        "missing",
-        "not found",
-        "not ready",
-        "not verified",
-        "null",
-        "partial",
-        "remaining",
-        "unavailable",
-        "unable",
-        "unknown",
-        "unmet",
-        "unresolved",
-    ]
-    .iter()
-    .any(|needle| normalized.contains(needle))
-}
-
-fn looks_like_placeholder_done_result(result: &str) -> bool {
-    let trimmed = result.trim();
-    let normalized = trimmed
-        .trim_matches(|ch: char| ch == '.' || ch == '!' || ch.is_whitespace())
-        .to_ascii_lowercase();
-    matches!(
-        normalized.as_str(),
-        "done" | "complete" | "completed" | "finished"
-    ) || looks_like_persisted_final_answer_status(&normalized)
-}
-
-fn looks_like_persisted_final_answer_status(normalized: &str) -> bool {
-    (normalized.contains("final answer")
-        && (normalized.contains("persisted")
-            || normalized.contains("stored")
-            || normalized.contains("saved"))
-        && (normalized.contains("use") || normalized.contains("done")))
-        || (normalized.starts_with("need final") && normalized.contains("done"))
-}
-
-fn looks_like_persisted_preview_result(requested_result: &str, final_answer: &Value) -> bool {
-    let requested_result = requested_result.trim();
-    if requested_result.len() < 64 {
-        return false;
-    }
-    let Some(persisted_result) = persisted_final_answer_result(final_answer) else {
-        return false;
-    };
-    let persisted_result = persisted_result.trim();
-    if persisted_result.len() <= requested_result.len() + 64 {
-        return false;
-    }
-    if persisted_result.starts_with(requested_result) {
-        return true;
-    }
-    let Ok(requested_json) = serde_json::from_str::<Value>(requested_result) else {
-        return false;
-    };
-    let Ok(persisted_json) = serde_json::from_str::<Value>(persisted_result) else {
-        return false;
-    };
-    json_value_is_strict_prefix_of(&requested_json, &persisted_json)
-}
-
-fn json_value_is_strict_prefix_of(requested: &Value, persisted: &Value) -> bool {
-    match (requested, persisted) {
-        (Value::Array(requested_items), Value::Array(persisted_items)) => {
-            !requested_items.is_empty()
-                && requested_items.len() < persisted_items.len()
-                && requested_items
-                    .iter()
-                    .zip(persisted_items.iter())
-                    .all(|(requested_item, persisted_item)| requested_item == persisted_item)
-        }
-        (Value::Object(requested_object), Value::Object(persisted_object)) => {
-            let mut found_truncated_collection = false;
-            for (key, requested_value) in requested_object {
-                let Some(persisted_value) = persisted_object.get(key) else {
-                    return false;
-                };
-                if json_value_is_strict_prefix_of(requested_value, persisted_value) {
-                    found_truncated_collection = true;
-                } else if requested_value != persisted_value {
-                    return false;
-                }
-            }
-            found_truncated_collection
-        }
-        _ => false,
-    }
-}
-
-fn looks_like_empty_structured_result(result: &str) -> bool {
-    let trimmed = result.trim();
-    if trimmed.is_empty() || matches!(trimmed, "{}" | "[]" | "null") {
-        return true;
-    }
-    let Ok(value) = serde_json::from_str::<Value>(trimmed) else {
-        return false;
-    };
-    json_value_is_empty(&value)
-}
-
-fn json_value_is_empty(value: &Value) -> bool {
-    match value {
-        Value::Null => true,
-        Value::String(text) => text.trim().is_empty(),
-        Value::Array(items) => items.is_empty(),
-        Value::Object(map) => map.values().all(json_value_is_empty),
-        _ => false,
-    }
 }
 
 fn dispatch_python_tool(
@@ -5188,16 +4929,6 @@ fn record_browser_script_response_events(
         }
         record_tool_artifact(store, session_id, "browser_script", artifact)?;
     }
-    if let Some(final_answer) = response.data.get("final_answer") {
-        store.append_event(
-            session_id,
-            "session.final_answer_ready",
-            serde_json::json!({
-                "source": "browser_script.set_final_answer",
-                "final_answer": final_answer,
-            }),
-        )?;
-    }
     store.append_event(
         session_id,
         "tool.output",
@@ -5277,16 +5008,6 @@ fn record_python_response_events_inner(
     if let Some(artifact) = text_artifact.as_ref() {
         payload["text_truncated"] = Value::Bool(true);
         payload["text_artifact"] = artifact.clone();
-    }
-    if let Some(final_answer) = response.data.get("final_answer") {
-        store.append_event(
-            session_id,
-            "session.final_answer_ready",
-            serde_json::json!({
-                "source": "python.set_final_answer",
-                "final_answer": final_answer,
-            }),
-        )?;
     }
     store.append_event(session_id, "tool.output", payload)?;
     Ok(text_artifact)
@@ -6334,6 +6055,7 @@ mod tests {
         );
         assert!(message.contains("Raw CDP is the center"));
         assert!(message.contains("Do not call `screenshot` repeatedly on an unchanged viewport"));
+        assert!(message.contains("The user does not see the pixels inline in the terminal"));
         assert!(message.contains("Loaded Browser-Harness Interaction Skills"));
         assert!(message.contains("interaction-skills/screenshots.md"));
         assert!(message.contains("interaction-skills/tabs.md"));
@@ -6515,374 +6237,64 @@ mod tests {
     }
 
     #[test]
-    fn done_can_use_persisted_python_final_answer() -> Result<()> {
+    fn done_can_use_result_file_from_artifact_root() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_final".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "set_final_answer({'stores': [{'name': 'A', 'address': 'B'}]}, artifact_name='stores.json')",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_final".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "result": "{\"stores\":[]}",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract stores",
-            temp.path(),
-            AgentRunOptions::default(),
+        let session = store.create_session(None, temp.path())?;
+        std::fs::write(
+            Path::new(&session.artifact_root).join("answer.json"),
+            r#"{"items":[{"id":1},{"id":2}]}"#,
         )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "session.final_answer_used"));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.final_answer_ready"
-                && event.payload["final_answer"]["count"] == 1
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("\"name\": \"A\""))
-        }));
-        Ok(())
-    }
 
-    #[test]
-    fn done_use_final_answer_requires_persisted_answer() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_missing_final".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "use_final_answer": true,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_after_missing_final".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({"result": "explicit fallback"}),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
+        let outcome = dispatch_done_tool(
             &store,
-            &provider,
-            "finish without final answer",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "tool.failed"
-                && event.payload["tool_call_id"] == "done_missing_final"
-                && event.payload["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("no persisted final answer"))
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done" && event.payload["result"] == "explicit fallback"
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn done_can_use_persisted_final_answer_without_dummy_result() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_final_no_dummy".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "set_final_answer({'items': [1, 2, 3]}, artifact_name='items.json')",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_final_no_dummy".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "use_final_answer": true,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract items",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["source"] == "python.set_final_answer"
-                && event.payload["final_answer_summary"]["count"] == 3
-                && event.payload["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("\"items\""))
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn done_replaces_final_answer_status_text_with_full_persisted_answer() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_final_status_text".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "set_final_answer({'items': [{'name': 'A', 'value': 'B'}]}, artifact_name='items.json')",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_status_text".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "result": "Final answer persisted. Need done use.",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract result counts",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["source"] == "python.set_final_answer"
-                && event.payload["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("\"name\": \"A\""))
-        }));
-        assert!(!events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["result"] == "Final answer persisted. Need done use."
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn done_replaces_preview_with_full_persisted_final_answer() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let preview = serde_json::to_string_pretty(&serde_json::json!([
-            {"id": 1, "name": "one"},
-            {"id": 2, "name": "two"}
-        ]))?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_full_final".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "set_final_answer([{'id': 1, 'name': 'one'}, {'id': 2, 'name': 'two'}, {'id': 3, 'name': 'three'}, {'id': 4, 'name': 'four'}], artifact_name='rows.json')",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_preview".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "result": preview,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract rows",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.final_answer_used"
-                && event.payload["trigger"] == "assistant_done_result_replaced"
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["source"] == "python.set_final_answer"
-                && event.payload["result"]
-                    .as_str()
-                    .is_some_and(|result| result.contains("\"name\": \"four\""))
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn provider_loop_uses_ready_persisted_final_answer_at_turn_budget() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![vec![
-            ModelEvent::ToolCall {
-                call: ToolCall {
-                    id: "python_final_on_last_turn".to_string(),
-                    name: "python".to_string(),
-                    arguments: serde_json::json!({
-                        "code": "set_final_answer({'answer': 'Example', 'items': [1, 2]}, artifact_name='result.json')",
-                    }),
-                },
-            },
-            ModelEvent::Done,
-        ]]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract result",
-            temp.path(),
-            AgentRunOptions {
-                max_turns: 1,
-                max_context_chars: 80_000,
-                browser_mode: None,
-                python_tool_timeout_seconds: 120,
-                python_env: Vec::new(),
-                child_agent_runner: None,
+            &session,
+            &ToolCall {
+                id: "done_result_file".to_string(),
+                name: "done".to_string(),
+                arguments: serde_json::json!({
+                    "result_file": "answer.json",
+                }),
             },
         )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(!events
+        assert!(outcome.finished);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["source"] == "done.result_file"
+                && event.payload["result_file"] == "answer.json"
+        }));
+        let done = events
             .iter()
-            .any(|event| event.event_type == "session.failed"));
+            .find(|event| event.event_type == "session.done")
+            .context("missing session.done")?;
+        let result = done.payload["result"].as_str().context("result text")?;
+        assert!(result.contains("Saved result file."));
+        assert!(result.contains("answer.json"));
+        assert!(!result.contains("\"id\":2"));
+        assert!(done.payload["result_file_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("answer.json")));
+        assert!(done.payload["result_file_url"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("file://")));
+        assert!(done.payload["result_file_directory_url"]
+            .as_str()
+            .is_some_and(|path| path.starts_with("file://")));
+        assert!(
+            done.payload["result_file_bytes"]
+                .as_u64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert_eq!(done.payload["result_file_mime"], "application/json");
         assert!(events.iter().any(|event| {
-            event.event_type == "session.final_answer_used"
-                && event.payload["trigger"] == "max_turns_exhausted"
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["source"] == "python.set_final_answer"
-                && event.payload["result"]
+            event.event_type == "artifact.created"
+                && event.payload["name"] == "done"
+                && event.payload["artifact"]["source"] == "done.result_file"
+                && event.payload["artifact"]["path"]
                     .as_str()
-                    .is_some_and(|result| result.contains("\"answer\""))
-        }));
-        Ok(())
-    }
-
-    #[test]
-    fn done_rejects_persisted_final_answer_when_attached_audit_is_not_ready() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "python_failed_audit_final".to_string(),
-                        name: "python".to_string(),
-                        arguments: serde_json::json!({
-                            "code": "rows=[{'name':''}]\naudit=audit_artifact(records=rows, required_fields=['name'])\nset_final_answer({'rows': rows}, artifact_name='rows.json', audit=audit)",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_failed_audit".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "use_final_answer": true,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_explicit_gaps".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({
-                            "result": "Partial/incomplete result: the artifact is missing the required name field for one row.",
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "extract many items",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "tool.failed"
-                && event.payload["tool_call_id"] == "done_failed_audit"
-                && event.payload["error"]
-                    .as_str()
-                    .is_some_and(|error| error.contains("attached artifact audit did not pass"))
-        }));
-        assert!(events.iter().any(|event| {
-            event.event_type == "session.done"
-                && event.payload["result"]
-                    == "Partial/incomplete result: the artifact is missing the required name field for one row."
+                    .is_some_and(|path| path.ends_with("answer.json"))
         }));
         Ok(())
     }

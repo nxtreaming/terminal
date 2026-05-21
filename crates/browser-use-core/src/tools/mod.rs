@@ -357,11 +357,11 @@ fn done_tool_spec() -> ToolSpec {
             "properties": {
                 "result": {
                     "type": "string",
-                    "description": "Final answer for the user. If Python set_final_answer(...) was used, pass \"__use_final_answer__\" or set use_final_answer=true to finish with that persisted answer."
+                    "description": "Final answer for the user. Use result_file when the answer was written to a file."
                 },
-                "use_final_answer": {
-                    "type": "boolean",
-                    "description": "Use the final answer persisted by Python set_final_answer(...)."
+                "result_file": {
+                    "type": "string",
+                    "description": "Path to a text/JSON/CSV result file to use as the final answer. Prefer this for large browser_script outputs saved under outputs_dir() or artifact_root()."
                 },
                 "finish_and_close_children": {
                     "type": "boolean",
@@ -606,6 +606,7 @@ mod tests {
             "coordinate clicks",
             "click_at_xy",
             "screenshot(label)",
+            "The user does not see those pixels inline",
             "cdp(...)",
             "Do not import Playwright",
             "audit_artifact",

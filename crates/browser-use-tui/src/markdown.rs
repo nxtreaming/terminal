@@ -818,7 +818,7 @@ fn heading_text_style(level: HeadingLevel) -> Style {
 }
 
 fn looks_like_bare_link(value: &str) -> bool {
-    value.starts_with("http://") || value.starts_with("https://")
+    value.starts_with("http://") || value.starts_with("https://") || value.starts_with("file://")
 }
 
 fn looks_like_path(value: &str) -> bool {

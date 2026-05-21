@@ -1,6 +1,6 @@
 # Screenshots
 
-`screenshot(label)` and `capture_screenshot(...)` write a PNG of the current viewport and attach it to the next model turn. The file is in **device pixels** — on a 2x display a 2296x1143 CSS viewport produces a 4592x2286 PNG.
+`screenshot(label)` and `capture_screenshot(...)` write a PNG of the current viewport and attach it to the next model turn. The user does not see the pixels inline in the terminal; inspect the image yourself and summarize what it shows, or provide the saved artifact path when the user asks for the screenshot. The file is in **device pixels** — on a 2x display a 2296x1143 CSS viewport produces a 4592x2286 PNG.
 
 That matters for two reasons:
 

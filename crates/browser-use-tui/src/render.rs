@@ -1622,7 +1622,9 @@ fn work_lines(
                 let active = transcript::active_viewport_lines(Some(&model), width, u16::MAX);
                 if !active.is_empty() {
                     if !lines.is_empty() {
-                        lines.push(Line::from(""));
+                        for _ in 0..transcript::gap_before_active(&model) {
+                            lines.push(Line::from(""));
+                        }
                     }
                     lines.extend(active);
                 }
