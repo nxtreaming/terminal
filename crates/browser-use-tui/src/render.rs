@@ -982,13 +982,12 @@ fn surface_lines(
 /// input, separated by a thin dashed rule. Session metadata is punched
 /// through the box's borders: model + browser on the top edge (or moves to
 /// the bottom when the dropdown takes over the top), cwd on the bottom-left,
-/// branch on the bottom-right. A single hint/status row renders just below
+/// browser on the bottom-right. A single hint/status row renders just below
 /// the box.
-/// Bordered composer with the current git branch punched into the
+/// Bordered composer with the current browser punched into the
 /// bottom border, and a single muted status row beneath showing the
-/// active model and the context-fill bar. No browser, no cwd, no key
-/// hints — the only ambient metadata is what the user explicitly asked
-/// to see.
+/// active model and the context-fill bar. No cwd, no key hints — the
+/// only ambient metadata is what the user explicitly asked to see.
 fn render_composer(
     frame: &mut Frame<'_>,
     area: Rect,
@@ -1011,7 +1010,7 @@ fn render_composer(
         height: box_h,
     };
 
-    // Top + sides via Block, bottom border drawn manually so the branch
+    // Top + sides via Block, bottom border drawn manually so the browser
     // tag punches through it in white while the dashes/corners keep the
     // same gray border() color as the rest of the box.
     let block = Block::default()
@@ -1042,7 +1041,7 @@ fn render_composer(
         height: 1,
     };
     frame.render_widget(
-        Paragraph::new(composer_bottom_border(box_area.width)).style(border()),
+        Paragraph::new(composer_bottom_border(box_area.width, app)).style(border()),
         bottom_area,
     );
 
@@ -1068,21 +1067,23 @@ fn render_composer(
     }
 }
 
-/// Bottom border line for the composer, with the git branch tag punched
+/// Bottom border line for the composer, with the browser tag punched
 /// through it on the right. Corners and dashes use the same gray
-/// `border()` style as the rest of the box; the branch text is white.
-fn composer_bottom_border(width: u16) -> Line<'static> {
+/// `border()` style as the rest of the box; the browser text is white.
+fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
     if width < 2 {
         return Line::from("");
     }
     let inner_w = width.saturating_sub(2) as usize;
     let mut spans: Vec<Span<'static>> = vec![Span::styled("╰", border())];
-    if let Some(branch) = git_branch() {
-        // ` branch ` with one cell of dash padding on each side, so the
+    let browser = app.browser.trim();
+    if !browser.is_empty() {
+        // ` browser ` with one cell of dash padding on each side, so the
         // background dashes hug right up to the spaces around the tag.
+        let label = truncate(browser, inner_w.saturating_sub(4).max(1));
         let tag: Vec<Span<'static>> = vec![
             Span::raw(" "),
-            Span::styled(branch, text_style()),
+            Span::styled(label, text_style()),
             Span::raw(" "),
         ];
         let tag_w: usize = tag.iter().map(|s| s.content.chars().count()).sum();
@@ -1099,7 +1100,7 @@ fn composer_bottom_border(width: u16) -> Line<'static> {
 }
 
 /// Status row below the composer: active model and context-fill bar,
-/// plus running cost when there is one. The branch lives on the box's
+/// plus running cost when there is one. The browser lives on the box's
 /// bottom border, not here.
 fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Line<'static> {
     let usage = session_usage(app, state);
@@ -1224,43 +1225,6 @@ fn session_usage(app: &App, state: &WorkbenchState) -> SessionUsage {
         }
     }
     usage
-}
-
-/// Current git branch of the working directory, or `None` outside a repo.
-/// Walks up from the cwd to locate `.git` (directory or worktree pointer file).
-fn git_branch() -> Option<String> {
-    let mut dir = std::env::current_dir().ok()?;
-    loop {
-        let git_path = dir.join(".git");
-        if git_path.is_dir() {
-            return branch_from_git_dir(&git_path);
-        }
-        if git_path.is_file() {
-            // Worktree/submodule: `.git` is a file holding `gitdir: <path>`.
-            let contents = std::fs::read_to_string(&git_path).ok()?;
-            let gitdir = contents.strip_prefix("gitdir:")?.trim();
-            return branch_from_git_dir(std::path::Path::new(gitdir));
-        }
-        if !dir.pop() {
-            return None;
-        }
-    }
-}
-
-fn branch_from_git_dir(git_dir: &std::path::Path) -> Option<String> {
-    let head = std::fs::read_to_string(git_dir.join("HEAD")).ok()?;
-    let head = head.trim();
-    if let Some(reference) = head.strip_prefix("ref:") {
-        let reference = reference.trim();
-        return Some(
-            reference
-                .strip_prefix("refs/heads/")
-                .unwrap_or(reference)
-                .to_string(),
-        );
-    }
-    // Detached HEAD — fall back to a short commit hash.
-    (head.len() >= 7).then(|| head[..7].to_string())
 }
 
 fn format_token_count(tokens: i64) -> String {
