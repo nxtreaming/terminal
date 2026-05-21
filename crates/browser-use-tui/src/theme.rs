@@ -13,19 +13,19 @@ fn dim_color() -> Color {
 }
 
 fn accent_color() -> Color {
-    Color::Rgb(126, 158, 255)
+    Color::Rgb(133, 151, 194)
 }
 
 fn link_color() -> Color {
-    Color::Rgb(119, 196, 255)
+    Color::Rgb(126, 168, 197)
 }
 
 fn path_reference_color() -> Color {
-    Color::Rgb(197, 177, 116)
+    Color::Rgb(169, 155, 112)
 }
 
 fn code_color() -> Color {
-    Color::Rgb(173, 215, 190)
+    Color::Rgb(165, 190, 171)
 }
 
 fn code_background_color() -> Color {
@@ -33,7 +33,7 @@ fn code_background_color() -> Color {
 }
 
 fn heading_color() -> Color {
-    Color::Rgb(220, 171, 78)
+    Color::Rgb(185, 153, 99)
 }
 
 fn quote_color() -> Color {
@@ -45,19 +45,19 @@ fn border_color() -> Color {
 }
 
 fn done_color() -> Color {
-    Color::Rgb(142, 202, 129)
+    Color::Rgb(143, 174, 134)
 }
 
 fn running_color() -> Color {
-    Color::Rgb(220, 171, 78)
+    Color::Rgb(185, 153, 99)
 }
 
 fn failed_color() -> Color {
-    Color::Rgb(255, 112, 132)
+    Color::Rgb(216, 134, 145)
 }
 
 fn thought_color() -> Color {
-    Color::Rgb(178, 141, 255)
+    Color::Rgb(151, 138, 181)
 }
 
 pub(crate) fn text_style() -> Style {
@@ -163,9 +163,7 @@ pub(crate) fn failed() -> Style {
 }
 
 pub(crate) fn thought() -> Style {
-    Style::default()
-        .fg(thought_color())
-        .add_modifier(Modifier::BOLD)
+    Style::default().fg(thought_color())
 }
 
 pub(crate) fn selection() -> Style {
