@@ -360,6 +360,18 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_contains(after_slash_filter, "Type to steer the agent", "slash escape should restore main composer")
         assert_not_contains(after_slash_filter, "No commands match.", "slash escape should close the overlay")
 
+        tmux_send_literal(session, "open http:/")
+        nonleading_slash = capture_after_idle(session, "main-nonleading-slash-input", visible_only=True)
+        assert_contains(nonleading_slash, "> open http:/", "slash after prompt text should stay in composer")
+        assert_not_contains(nonleading_slash, "/task", "slash after prompt text should not open slash palette")
+        assert_not_contains(
+            nonleading_slash,
+            "No commands match.",
+            "slash after prompt text should not filter slash palette",
+        )
+        tmux_send(session, "C-c")
+        wait_for(session, "Type to steer the agent", "main-after-nonleading-slash-clear")
+
         tmux_send_literal(session, "something-bla")
         wait_for(session, "> something-bla", "alt-backspace-hyphenated-word-before")
         tmux_send_alt_backspace(session)
@@ -631,11 +643,11 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
             "sending",
             "prompt-only long follow-up should show a pending indicator immediately",
         )
-        assert_same_line_gap_at_most(
+        assert_row_gap_at_most(
             visible_running,
             "> continue",
             "sending",
-            6,
+            2,
             "prompt-only long follow-up indicator should sit near submitted text",
         )
         first_line = next((line.strip() for line in visible_running.splitlines() if line.strip()), "")
@@ -643,6 +655,99 @@ def smoke_completed_history_uses_native_scrollback(binary: Path) -> None:
             raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + visible_running)
         assert_no_legacy_dashboard_chrome(visible_running, "follow-up should not show old dashboard chrome")
         assert_not_contains(running, "using browser", "internal browser helper starts should stay hidden")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_streaming_transcript_scrolls_above_composer(binary: Path) -> None:
+    session = f"but-smoke-transcript-scroll-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-transcript-scroll-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="long",
+            select_latest=False,
+        )
+        wait_for(session, "Tell the browser what to do...", "transcript-scroll-start-ready")
+        tmux_send(session, "Tab", "Enter")
+        wait_for(session, "scroll check line 60", "transcript-scroll-selected")
+        tmux_send_literal(session, "continue")
+        tmux_send(session, "Enter")
+        wait_for(session, "> continue", "transcript-scroll-after-enter")
+
+        session_id = latest_session_id(state_dir)
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.turn.request",
+            {"model": "GPT-5.5", "provider": "codex", "turn_idx": 1},
+        )
+        long_stream = "\n".join(f"live output line {idx:02}" for idx in range(1, 41))
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.stream_delta",
+            {"text": long_stream, "turn_idx": 1},
+        )
+        wait_for(session, "live output line 40", "transcript-scroll-streaming")
+        visible = capture_after_idle(
+            session,
+            "transcript-scroll-streaming-visible",
+            visible_only=True,
+        )
+        full = capture_after_idle(
+            session,
+            "transcript-scroll-streaming-full",
+            visible_only=False,
+        )
+        assert_contains(
+            full,
+            "https://news.ycombinator.com",
+            "streaming should keep native transcript tail in scrollback",
+        )
+        assert_contains(
+            full,
+            "> continue",
+            "streaming should keep submitted prompt in scrollback",
+        )
+        assert_contains(
+            full,
+            "live output line 01",
+            "streaming should preserve early live rows in native scrollback",
+        )
+        assert_contains(
+            visible,
+            "live output line 40",
+            "streaming should show the latest live row",
+        )
+        assert_contains(
+            visible,
+            "Type to steer the agent",
+            "streaming should keep composer docked below the transcript body",
+        )
+        append_store_event(
+            state_dir,
+            session_id,
+            "session.done",
+            {"result": long_stream},
+        )
+        time.sleep(0.5)
+        done_full = capture(session, "transcript-scroll-done-full")
+        assert_count(
+            done_full,
+            "live output line 01",
+            1,
+            "final committed answer should not duplicate already streamed native rows",
+        )
+        assert_count(
+            done_full,
+            "live output line 40",
+            1,
+            "final committed answer should not duplicate the streamed tail row",
+        )
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -690,11 +795,11 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "sending",
             "prompt-only follow-up should show a pending indicator immediately",
         )
-        assert_same_line_gap_at_most(
+        assert_row_gap_at_most(
             visible,
             "> yo",
             "sending",
-            6,
+            2,
             "prompt-only follow-up indicator should sit near submitted text",
         )
         first_line = next((line.strip() for line in visible.splitlines() if line.strip()), "")
@@ -706,9 +811,9 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             state_dir,
             session_id,
             "model.turn.request",
-            {"model": "GPT-5.5", "provider": "codex"},
+            {"model": "GPT-5.5", "provider": "codex", "turn_idx": 1},
         )
-        wait_for(session, "waiting for GPT-5.5", "prompt-only-followup-live-waiting")
+        wait_for(session, "thinking", "prompt-only-followup-live-thinking")
         live_frames = []
         for idx in range(40):
             live_visible = capture_after_idle(
@@ -736,15 +841,20 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             )
             assert_contains(
                 live_visible,
-                "waiting for GPT-5.5",
-                "follow-up live activity should keep the waiting indicator visible",
+                "thinking",
+                "follow-up live activity should keep the thinking indicator visible",
             )
-            assert_same_line_gap_at_most(
+            assert_row_gap_at_most(
                 live_visible,
                 "> yo",
+                "thinking",
+                2,
+                "follow-up thinking indicator should sit near submitted text",
+            )
+            assert_not_contains(
+                live_visible,
                 "waiting for GPT-5.5",
-                6,
-                "follow-up waiting indicator should sit near submitted text",
+                "follow-up live activity should not show model wait text",
             )
             first_line = next((line.strip() for line in live_visible.splitlines() if line.strip()), "")
             if first_line == "> yo":
@@ -754,7 +864,7 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             state_dir,
             session_id,
             "model.stream_delta",
-            {"text": "streaming now"},
+            {"text": "streaming now", "turn_idx": 1},
         )
         wait_for(session, "streaming now", "prompt-only-followup-streaming")
         streaming_visible = capture_after_idle(
@@ -774,8 +884,37 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         )
         assert_not_contains(
             streaming_visible,
+            "thinking",
+            "streaming follow-up should no longer show the prompt-only thinking indicator",
+        )
+        assert_not_contains(
+            streaming_visible,
             "waiting for GPT-5.5",
-            "streaming follow-up should no longer show the prompt-only waiting indicator",
+            "streaming follow-up should not show model wait text",
+        )
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.turn.response",
+            {"tool_call_count": 1, "turn_idx": 1},
+        )
+        wait_for(session, ": note", "prompt-only-followup-note")
+        note_visible = capture_after_idle(
+            session,
+            "prompt-only-followup-note-visible",
+            visible_only=True,
+        )
+        assert_line_directly_followed_by(
+            note_visible,
+            "> yo",
+            ": note",
+            "note commit should not inject a blank line after the submitted prompt",
+        )
+        assert_count(
+            note_visible,
+            "streaming now",
+            1,
+            "streaming text committed as a note should not remain duplicated in active viewport",
         )
     finally:
         tmux("kill-session", "-t", session, check=False)
@@ -1074,6 +1213,7 @@ def main() -> int:
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
     smoke_double_escape_stops_running_task(binary)
     smoke_completed_history_uses_native_scrollback(binary)
+    smoke_streaming_transcript_scrolls_above_composer(binary)
     smoke_prompt_only_followup_keeps_completed_transcript(binary)
     smoke_short_completed_history_has_live_preview(binary)
     smoke_main_resize_does_not_duplicate_transcript(binary)
