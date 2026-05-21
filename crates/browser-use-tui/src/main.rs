@@ -7,6 +7,8 @@ use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
+#[cfg(not(test))]
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::{mpsc, Once};
 use std::thread;
 use std::time::{Duration, Instant};
@@ -81,6 +83,7 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
+const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -231,6 +234,29 @@ impl Drop for ClaudeCodeOAuthFlow {
     }
 }
 
+#[derive(Debug)]
+enum CodexLoginEvent {
+    Output(String),
+    Finished(Result<CodexAuth, String>),
+}
+
+#[derive(Debug)]
+struct CodexLoginFlow {
+    account: String,
+    output: String,
+    started_at: Instant,
+    stop_tx: mpsc::Sender<()>,
+    rx: mpsc::Receiver<CodexLoginEvent>,
+    #[cfg(test)]
+    event_tx_guard: Option<mpsc::Sender<CodexLoginEvent>>,
+}
+
+impl Drop for CodexLoginFlow {
+    fn drop(&mut self) {
+        let _ = self.stop_tx.send(());
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppCommand {
     StartTask(String),
@@ -272,6 +298,7 @@ struct App {
     setup_pending_account: Option<String>,
     setup_result: Option<SetupResult>,
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
+    codex_login: Option<CodexLoginFlow>,
     browser_notice: Option<String>,
     status_notice: Option<String>,
     agent_backend: AgentBackend,
@@ -702,6 +729,7 @@ impl App {
             setup_pending_account: None,
             setup_result: None,
             claude_code_oauth: None,
+            codex_login: None,
             browser_notice: None,
             status_notice: None,
             agent_backend,
@@ -786,6 +814,55 @@ impl App {
         Ok(true)
     }
 
+    fn drain_codex_login_notifications(&mut self) -> Result<bool> {
+        let mut events = Vec::new();
+        if let Some(flow) = self.codex_login.as_ref() {
+            while let Ok(event) = flow.rx.try_recv() {
+                events.push(event);
+            }
+        }
+        if events.is_empty() {
+            return Ok(false);
+        }
+        for event in events {
+            match event {
+                CodexLoginEvent::Output(text) => {
+                    if let Some(flow) = self.codex_login.as_mut() {
+                        flow.output.push_str(&strip_ansi(&text));
+                    }
+                }
+                CodexLoginEvent::Finished(result) => {
+                    let account = self
+                        .codex_login
+                        .as_ref()
+                        .map(|flow| flow.account.clone())
+                        .unwrap_or_else(|| ACCOUNT_CODEX.to_string());
+                    self.codex_login = None;
+                    match result {
+                        Ok(auth) => {
+                            self.store_codex_auth(&auth)?;
+                            self.account = account.clone();
+                            self.persist_runtime_settings()?;
+                            self.show_setup_result(
+                                SetupResultKind::Success,
+                                account,
+                                "Connected with Codex auth.".to_string(),
+                            );
+                        }
+                        Err(error) => {
+                            self.show_setup_result(
+                                SetupResultKind::Failure,
+                                account,
+                                format!("Codex login failed: {error}"),
+                            );
+                        }
+                    }
+                }
+            }
+        }
+        Ok(true)
+    }
+
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
         let changed = self.state_cache.refresh_all(&self.store)?;
         if changed {
@@ -823,6 +900,7 @@ impl App {
             self.setup_pending_account = None;
             self.setup_result = None;
             self.claude_code_oauth = None;
+            self.codex_login = None;
         }
         self.surface = Surface::Main;
         self.selected_row = 0;
@@ -1404,7 +1482,7 @@ impl App {
             return Ok(());
         };
         if account == ACCOUNT_CODEX {
-            self.show_codex_setup_result(account)?;
+            self.start_codex_auth(account)?;
         } else if is_claude_code_account(&account) {
             self.account = account.clone();
             self.persist_runtime_settings()?;
@@ -1428,7 +1506,7 @@ impl App {
             SetupResultKind::Success => self.continue_after_setup_success(result.account),
             SetupResultKind::Failure if self.selected_row.min(1) == 0 => {
                 if result.account == ACCOUNT_CODEX {
-                    self.show_codex_setup_result(result.account)?;
+                    self.start_codex_auth(result.account)?;
                 } else if is_claude_code_account(&result.account) {
                     self.start_claude_code_oauth(result.account)?;
                 } else {
@@ -1437,11 +1515,16 @@ impl App {
                 Ok(())
             }
             SetupResultKind::Pending if self.selected_row.min(1) == 0 => {
-                self.reopen_claude_code_oauth_url();
+                if result.account == ACCOUNT_CODEX {
+                    self.reopen_codex_device_auth_url();
+                } else {
+                    self.reopen_claude_code_oauth_url();
+                }
                 Ok(())
             }
             SetupResultKind::Pending => {
                 self.claude_code_oauth = None;
+                self.codex_login = None;
                 self.setup_result = None;
                 self.setup_pending_account = None;
                 self.close_surface();
@@ -1469,6 +1552,15 @@ impl App {
                 account,
                 "Could not find a Claude Code login.".to_string(),
             );
+        }
+        Ok(())
+    }
+
+    fn start_codex_auth(&mut self, account: String) -> Result<()> {
+        if self.account_ready(&account)? {
+            self.show_codex_setup_result(account)?;
+        } else {
+            self.start_codex_device_login(account)?;
         }
         Ok(())
     }
@@ -1569,7 +1661,7 @@ impl App {
 
     fn save_account(&mut self, account: String) -> Result<()> {
         if account == ACCOUNT_CODEX {
-            self.show_codex_setup_result(account)?;
+            self.start_codex_auth(account)?;
             return Ok(());
         }
         self.account = account.clone();
@@ -1611,11 +1703,10 @@ impl App {
         if self.account == ACCOUNT_CODEX {
             if let Err(error) = self.ensure_codex_auth_imported() {
                 self.pending_model_after_auth = Some(index);
-                self.show_setup_result(
-                    SetupResultKind::Failure,
-                    self.account.clone(),
-                    format!("Could not find a Codex login: {error:#}"),
-                );
+                self.start_codex_device_login(self.account.clone())
+                    .with_context(|| {
+                        format!("start Codex login after auth import failed: {error:#}")
+                    })?;
                 return Ok(());
             }
         }
@@ -1715,7 +1806,7 @@ impl App {
 
     fn start_auth_flow(&mut self, account: String) -> Result<()> {
         if account == ACCOUNT_CODEX {
-            self.show_codex_setup_result(account)?;
+            self.start_codex_auth(account)?;
             return Ok(());
         }
         if is_claude_code_account(&account) {
@@ -1775,6 +1866,40 @@ impl App {
         };
         let message = match open_external_url(&url) {
             Ok(()) => "Waiting for Claude Code OAuth sign-in.".to_string(),
+            Err(error) => format!("Could not open browser automatically: {error}"),
+        };
+        if let Some(result) = self.setup_result.as_mut() {
+            result.message = message;
+        }
+    }
+
+    fn start_codex_device_login(&mut self, account: String) -> Result<()> {
+        self.api_key_account = None;
+        self.composer.clear();
+        self.codex_login = None;
+        let flow = match start_codex_login_flow(account.clone()) {
+            Ok(flow) => flow,
+            Err(error) => {
+                self.show_setup_result(
+                    SetupResultKind::Failure,
+                    account,
+                    format!("Could not start Codex login: {error:#}"),
+                );
+                return Ok(());
+            }
+        };
+        self.codex_login = Some(flow);
+        self.show_setup_result(
+            SetupResultKind::Pending,
+            account,
+            "Waiting for Codex device sign-in.".to_string(),
+        );
+        Ok(())
+    }
+
+    fn reopen_codex_device_auth_url(&mut self) {
+        let message = match open_external_url(CODEX_DEVICE_AUTH_URL) {
+            Ok(()) => "Waiting for Codex device sign-in.".to_string(),
             Err(error) => format!("Could not open browser automatically: {error}"),
         };
         if let Some(result) = self.setup_result.as_mut() {
@@ -2244,6 +2369,27 @@ impl App {
             .map(|flow| flow.started_at.elapsed().as_secs())
     }
 
+    pub(crate) fn codex_login_elapsed_seconds(&self) -> Option<u64> {
+        self.codex_login
+            .as_ref()
+            .map(|flow| flow.started_at.elapsed().as_secs())
+    }
+
+    pub(crate) fn codex_login_output_lines(&self) -> Vec<String> {
+        self.codex_login
+            .as_ref()
+            .map(|flow| {
+                flow.output
+                    .lines()
+                    .filter_map(|line| {
+                        let line = line.trim();
+                        (!line.is_empty()).then(|| line.to_string())
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
     fn laminar_status(&self) -> Result<String> {
         if self
             .store
@@ -2347,6 +2493,100 @@ fn start_claude_code_oauth_flow(account: String) -> Result<ClaudeCodeOAuthFlow> 
         stop_tx,
         rx,
         browser_open_error: None,
+        event_tx_guard: Some(event_tx),
+    })
+}
+
+#[cfg(not(test))]
+fn start_codex_login_flow(account: String) -> Result<CodexLoginFlow> {
+    let mut child = ProcessCommand::new("codex")
+        .args(["login", "--device-auth"])
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .context("start `codex login --device-auth`")?;
+    let stdout = child.stdout.take();
+    let stderr = child.stderr.take();
+    let (stop_tx, stop_rx) = mpsc::channel();
+    let (event_tx, rx) = mpsc::channel();
+    if let Some(stdout) = stdout {
+        spawn_codex_output_reader(stdout, event_tx.clone());
+    }
+    if let Some(stderr) = stderr {
+        spawn_codex_output_reader(stderr, event_tx.clone());
+    }
+    thread::Builder::new()
+        .name("browser-use-codex-login".to_string())
+        .spawn(move || loop {
+            if stop_rx.try_recv().is_ok() {
+                let _ = child.kill();
+                let _ = child.wait();
+                let _ = event_tx.send(CodexLoginEvent::Finished(Err(
+                    "Codex device sign-in was cancelled".to_string(),
+                )));
+                return;
+            }
+            match child.try_wait() {
+                Ok(Some(status)) => {
+                    let result = if status.success() {
+                        load_codex_auth()
+                            .context("load Codex auth after device sign-in")
+                            .map_err(|error| format!("{error:#}"))
+                    } else {
+                        Err(format!("`codex login --device-auth` exited with {status}"))
+                    };
+                    let _ = event_tx.send(CodexLoginEvent::Finished(result));
+                    return;
+                }
+                Ok(None) => thread::sleep(Duration::from_millis(100)),
+                Err(error) => {
+                    let _ = event_tx.send(CodexLoginEvent::Finished(Err(format!(
+                        "wait for Codex login process: {error}"
+                    ))));
+                    return;
+                }
+            }
+        })
+        .context("spawn Codex device login watcher")?;
+    Ok(CodexLoginFlow {
+        account,
+        output: String::new(),
+        started_at: Instant::now(),
+        stop_tx,
+        rx,
+    })
+}
+
+#[cfg(not(test))]
+fn spawn_codex_output_reader<R>(mut reader: R, event_tx: mpsc::Sender<CodexLoginEvent>)
+where
+    R: Read + Send + 'static,
+{
+    thread::spawn(move || {
+        let mut buffer = [0_u8; 1024];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => return,
+                Ok(read) => {
+                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
+                    let _ = event_tx.send(CodexLoginEvent::Output(text));
+                }
+                Err(_) => return,
+            }
+        }
+    });
+}
+
+#[cfg(test)]
+fn start_codex_login_flow(account: String) -> Result<CodexLoginFlow> {
+    let (stop_tx, _stop_rx) = mpsc::channel();
+    let (event_tx, rx) = mpsc::channel();
+    Ok(CodexLoginFlow {
+        account,
+        output: String::new(),
+        started_at: Instant::now(),
+        stop_tx,
+        rx,
         event_tx_guard: Some(event_tx),
     })
 }
@@ -2593,6 +2833,26 @@ fn unquote_env_value(value: &str) -> String {
     }
 }
 
+fn strip_ansi(input: &str) -> String {
+    let mut output = String::with_capacity(input.len());
+    let mut chars = input.chars().peekable();
+    while let Some(ch) = chars.next() {
+        if ch != '\x1b' {
+            output.push(ch);
+            continue;
+        }
+        if chars.peek() == Some(&'[') {
+            chars.next();
+            for next in chars.by_ref() {
+                if ('@'..='~').contains(&next) {
+                    break;
+                }
+            }
+        }
+    }
+    output
+}
+
 fn print_native_transcript(app: &mut App) -> Result<()> {
     let width = crossterm::terminal::size()
         .map(|(width, _)| width)
@@ -2634,6 +2894,7 @@ fn run_terminal(mut app: App) -> Result<()> {
         loop {
             draw_needed |= app.drain_store_notifications()?;
             draw_needed |= app.drain_oauth_notifications()?;
+            draw_needed |= app.drain_codex_login_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -4521,6 +4782,61 @@ mod redesign_tests {
             app.store.get_setting("auth.claude_code.expires_ms")?,
             Some("1234".to_string())
         );
+        Ok(())
+    }
+
+    #[test]
+    fn codex_device_login_output_stores_auth_and_uses_default_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+
+        app.start_codex_device_login(settings::ACCOUNT_CODEX.to_string())?;
+        assert_eq!(app.surface, Surface::SetupResult);
+        assert_eq!(
+            app.setup_result.as_ref().map(|result| &result.kind),
+            Some(&SetupResultKind::Pending)
+        );
+        let tx = app
+            .codex_login
+            .as_ref()
+            .and_then(|flow| flow.event_tx_guard.as_ref())
+            .expect("test Codex login sender")
+            .clone();
+        tx.send(CodexLoginEvent::Output(
+            "\u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n\u{1b}[94mABCD-EFGH\u{1b}[0m\n"
+                .to_string(),
+        ))
+        .expect("send test Codex output");
+
+        assert!(app.drain_codex_login_notifications()?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("https://auth.openai.com/codex/device"));
+        assert!(screen.contains("ABCD-EFGH"));
+        assert!(!screen.contains("\u{1b}[94m"));
+
+        tx.send(CodexLoginEvent::Finished(Ok(CodexAuth {
+            access_token: "codex-access".to_string(),
+            account_id: "codex-account".to_string(),
+        })))
+        .expect("send test Codex auth result");
+        assert!(app.drain_codex_login_notifications()?);
+        assert_eq!(
+            app.store.get_setting("auth.codex.access_token")?,
+            Some("codex-access".to_string())
+        );
+        assert_eq!(
+            app.store.get_setting("auth.codex.account_id")?,
+            Some("codex-account".to_string())
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Connected with Codex auth."));
+        assert!(screen.contains("A default model will be selected automatically."));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Main);
+        assert!(app.setup_complete);
+        assert_eq!(app.account, settings::ACCOUNT_CODEX);
+        assert_eq!(app.model, "GPT-5.5");
         Ok(())
     }
 

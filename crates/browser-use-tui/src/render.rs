@@ -1596,28 +1596,61 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             selected("Continue", 0, app.selected_row),
         ]);
     } else if is_pending {
-        if let Some(seconds) = app.claude_code_oauth_elapsed_seconds() {
-            lines.push(Line::from(Span::styled(
-                format!("  Waiting for callback ({seconds}s)."),
-                muted(),
-            )));
-        }
-        if let Some(error) = app.claude_code_oauth_open_error() {
-            lines.push(Line::from(Span::styled(
-                format!("  Could not open browser automatically: {error}"),
-                failed(),
-            )));
+        if result.account == ACCOUNT_CODEX {
+            if let Some(seconds) = app.codex_login_elapsed_seconds() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Waiting for device sign-in ({seconds}s)."),
+                    muted(),
+                )));
+            }
+            let output_lines = app.codex_login_output_lines();
+            if output_lines.is_empty() {
+                lines.push(Line::from("  Starting Codex device sign-in..."));
+            } else {
+                lines.push(Line::from(""));
+                for line in output_lines
+                    .into_iter()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    push_wrapped_prefixed_text(&mut lines, "  ", &line, width);
+                }
+            }
         } else {
-            lines.push(Line::from("  Browser sign-in opened."));
-        }
-        if let Some(url) = app.claude_code_oauth_url() {
-            lines.push(Line::from(""));
-            lines.push(Line::from("  OAuth link:"));
-            push_wrapped_prefixed_text(&mut lines, "    ", url, width);
+            if let Some(seconds) = app.claude_code_oauth_elapsed_seconds() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Waiting for callback ({seconds}s)."),
+                    muted(),
+                )));
+            }
+            if let Some(error) = app.claude_code_oauth_open_error() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Could not open browser automatically: {error}"),
+                    failed(),
+                )));
+            } else {
+                lines.push(Line::from("  Browser sign-in opened."));
+            }
+            if let Some(url) = app.claude_code_oauth_url() {
+                lines.push(Line::from(""));
+                lines.push(Line::from("  OAuth link:"));
+                push_wrapped_prefixed_text(&mut lines, "    ", url, width);
+            }
         }
         lines.extend([
             Line::from(""),
-            selected("Open browser again", 0, app.selected_row),
+            selected(
+                if result.account == ACCOUNT_CODEX {
+                    "Open sign-in page"
+                } else {
+                    "Open browser again"
+                },
+                0,
+                app.selected_row,
+            ),
             selected("Back", 1, app.selected_row),
         ]);
     } else {
