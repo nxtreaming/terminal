@@ -4268,8 +4268,8 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("inspect cart"));
-        assert!(screen.contains(": browser"));
-        assert!(!screen.contains(": answer"));
+        assert!(screen.contains("• browser"));
+        assert!(!screen.contains("• answer"));
         assert!(screen.contains("source https://example.com/cart"));
         assert!(screen.contains("Your cart has 14 items."));
         assert!(screen.contains("Example item (https://example.com/item)"));
@@ -4299,8 +4299,8 @@ mod redesign_tests {
         app.selected_session_id = Some(running_session.id);
         let running_screen = render_dump(&mut app)?;
         assert!(running_screen.contains("> run near the top"));
-        assert!(running_screen.contains(": browser"));
-        assert!(!running_screen.contains(": thought"));
+        assert!(running_screen.contains("• browser"));
+        assert!(!running_screen.contains("• thought"));
         let running_composer_row = row_containing(&running_screen, "Type to steer the agent...");
         assert!(!running_screen.contains("Processing browser task"));
         assert!(!running_screen.contains("AI ENGINE"));
@@ -4340,8 +4340,8 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let completed_screen = render_dump(&mut app)?;
         assert!(completed_screen.contains("inspect top alignment"));
-        assert!(!completed_screen.contains(": answer"));
-        assert!(!completed_screen.contains(": done"));
+        assert!(!completed_screen.contains("• answer"));
+        assert!(!completed_screen.contains("• done"));
         // Footer status bar surfaces the active model and a context-fill bar.
         assert!(completed_screen.contains("24.5k/60k"));
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
@@ -4395,9 +4395,9 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("whats happening"));
-        assert!(screen.contains(": subagent repo-explorer started"));
-        assert!(screen.contains(": subagent repo-explorer finished"));
-        assert!(!screen.contains(": answer"));
+        assert!(screen.contains("• subagent repo-explorer started"));
+        assert!(screen.contains("• subagent repo-explorer finished"));
+        assert!(!screen.contains("• answer"));
         assert!(!screen.contains("Purpose: Rust-first terminal workbench"));
         assert!(!screen.contains("crates/browser-use-tui"));
         assert!(!screen.contains("helper finished: Repository summary"));
@@ -5341,8 +5341,8 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(!screen.contains(": thinking"));
-        assert!(!screen.contains(": thought"));
+        assert!(!screen.contains("• thinking"));
+        assert!(!screen.contains("• thought"));
         assert!(!screen.contains("waiting for GPT-5.5"));
         Ok(())
     }
@@ -5380,11 +5380,11 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(!screen.contains(": thinking"));
-        assert!(screen.contains(": thought inspecting context"));
+        assert!(!screen.contains("• thinking"));
+        assert!(screen.contains("• thought inspecting context"));
         assert!(screen.contains("Checking the repository structure."));
         assert!(!screen.contains("Checking \n"));
-        assert!(!screen.contains(": answer draft"));
+        assert!(!screen.contains("• answer draft"));
         assert!(screen.contains("This is the answer draft."));
         Ok(())
     }
@@ -5450,7 +5450,7 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(!screen.contains(": answer draft"));
+        assert!(!screen.contains("• answer draft"));
         assert!(screen.contains("Streaming draft answer"));
         assert!(!screen.contains("Streaming \n"));
         Ok(())
@@ -5554,10 +5554,10 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": note"));
+        assert!(screen.contains("• note"));
         assert!(screen.contains("note: Need more targeted."));
         assert!(screen.contains("Final answer from session.done."));
-        assert!(!screen.contains(": answer draft"));
+        assert!(!screen.contains("• answer draft"));
         Ok(())
     }
 
@@ -5803,7 +5803,7 @@ mod redesign_tests {
         assert!(text.contains("repo-explorer started"));
         assert!(!text.contains("waiting for GPT-5.5"));
         assert!(!text.contains("start repo-explorer helper"));
-        assert!(!text.contains(": answer draft"));
+        assert!(!text.contains("• answer draft"));
         assert!(!text.contains("Live draft chunk"));
         Ok(())
     }
@@ -5934,7 +5934,7 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": subagent repo-explorer started"));
+        assert!(screen.contains("• subagent repo-explorer started"));
         assert!(!screen.contains("working"));
         assert!(!screen.contains("read /repo/README.md"));
         assert!(!screen.contains("writing Mapping the main crates."));
@@ -6043,7 +6043,7 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": subagent repo-explorer started"));
+        assert!(screen.contains("• subagent repo-explorer started"));
         assert!(!screen.contains("read /repo/file-1.rs"));
         assert!(!screen.contains("read /repo/file-12.rs"));
         assert!(!screen.contains("waiting for gpt-5.5"));
@@ -6164,13 +6164,12 @@ mod redesign_tests {
         let terminal_text =
             lines_plain_text(&transcript::all_terminal_scrollback_lines(&model, 120));
 
-        assert!(text.contains(": explored"));
-        assert_eq!(text.matches(": explored").count(), 1, "{text}");
-        assert!(text.contains("read README.md"));
-        assert!(text.contains("read Cargo.toml"));
+        assert!(text.contains("• explored"));
+        assert_eq!(text.matches("• explored").count(), 1, "{text}");
+        assert!(text.contains("read README.md, Cargo.toml"));
         assert!(text.contains("list "));
         assert!(text.contains("search \"renderer\" (7 matches)"));
-        assert!(text.contains(": edit"));
+        assert!(text.contains("• edit"));
         assert!(text.contains("changed README.md"));
         assert!(text.contains("Repository inspected."));
         assert!(!text.contains("read_file requested"));
@@ -6230,7 +6229,7 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": subagent repo_explorer started"));
+        assert!(screen.contains("• subagent repo_explorer started"));
         assert!(!screen.contains("waiting on repo_explorer"));
         Ok(())
     }
@@ -6732,7 +6731,7 @@ mod redesign_tests {
             transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
         let prompt_text = lines_plain_text(&prompt_emission.lines);
         assert!(prompt_text.contains("> can you tell me about this repo?"));
-        assert!(!prompt_text.contains(": note"));
+        assert!(!prompt_text.contains("• note"));
 
         app.store.append_event(
             &session.id,
@@ -6761,7 +6760,7 @@ mod redesign_tests {
         );
         let note_text = lines_plain_text(&note_emission.lines);
         assert!(!note_text.contains("> can you tell me about this repo?"));
-        assert!(note_text.starts_with(": note"));
+        assert!(note_text.starts_with("• note"));
         assert!(note_text.contains("note: Yoooo! What can I help you with?"));
         let replay_emission =
             transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
@@ -6773,9 +6772,15 @@ mod redesign_tests {
             .expect("replay should contain prompt");
         let note_idx = replay_lines
             .iter()
-            .position(|line| line.contains(": note"))
+            .position(|line| line.contains("• note"))
             .expect("replay should contain note");
-        assert_eq!(note_idx, prompt_idx + 1, "{replay_text}");
+        assert!(note_idx > prompt_idx, "{replay_text}");
+        assert!(
+            replay_lines[prompt_idx + 1..note_idx]
+                .iter()
+                .all(|line| line.trim().is_empty()),
+            "{replay_text}"
+        );
 
         app.args.width = 120;
         app.args.height = 28;
@@ -6938,7 +6943,7 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
-        assert!(!screen.contains(": answer"));
+        assert!(!screen.contains("• answer"));
         assert!(screen.contains("Cargo.toml"));
         Ok(())
     }

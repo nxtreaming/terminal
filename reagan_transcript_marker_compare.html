@@ -1,0 +1,527 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>Transcript Marker Compare</title>
+    <link rel="icon" href="data:," />
+    <style>
+      :root {
+        color-scheme: dark;
+        --bg: #111111;
+        --panel: #171414;
+        --panel-2: #201c1d;
+        --border: #312c2e;
+        --text: #cfd4ee;
+        --muted: #9a9aa0;
+        --dim: #707176;
+        --green: #b7f7ab;
+        --blue: #9db8ff;
+        --peach: #f0ba7e;
+        --cyan: #9ed9df;
+        --select: #33324b;
+        --good: #b7f7ab;
+        --warn: #f0ba7e;
+        font-family:
+          Inter, ui-sans-serif, system-ui, -apple-system, BlinkMacSystemFont,
+          "Segoe UI", sans-serif;
+        background: var(--bg);
+        color: var(--text);
+      }
+
+      * {
+        box-sizing: border-box;
+      }
+
+      body {
+        margin: 0;
+        min-height: 100vh;
+        background:
+          radial-gradient(circle at 16% -10%, rgba(157, 184, 255, 0.14), transparent 30rem),
+          linear-gradient(180deg, #171415 0%, #0f0f10 100%);
+      }
+
+      main {
+        width: min(1500px, calc(100vw - 40px));
+        margin: 0 auto;
+        padding: 34px 0 48px;
+      }
+
+      header {
+        display: flex;
+        align-items: end;
+        justify-content: space-between;
+        gap: 24px;
+        margin-bottom: 22px;
+      }
+
+      h1 {
+        margin: 0 0 8px;
+        font-size: 28px;
+        font-weight: 680;
+        letter-spacing: 0;
+      }
+
+      .intro {
+        max-width: 780px;
+        margin: 0;
+        color: var(--muted);
+        line-height: 1.55;
+      }
+
+      .recommendation {
+        flex: 0 0 360px;
+        border: 1px solid rgba(183, 247, 171, 0.24);
+        border-radius: 8px;
+        padding: 13px 14px;
+        background: rgba(183, 247, 171, 0.06);
+        color: var(--text);
+        font-size: 13px;
+        line-height: 1.45;
+      }
+
+      .recommendation strong {
+        color: var(--good);
+      }
+
+      .grid {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .card {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        overflow: hidden;
+        background: var(--panel);
+        box-shadow:
+          0 18px 50px rgba(0, 0, 0, 0.26),
+          inset 0 1px rgba(255, 255, 255, 0.03);
+      }
+
+      .card.recommended {
+        border-color: rgba(183, 247, 171, 0.42);
+      }
+
+      .card-header {
+        display: flex;
+        align-items: start;
+        justify-content: space-between;
+        gap: 12px;
+        min-height: 102px;
+        padding: 14px 15px;
+        background: var(--panel-2);
+        border-bottom: 1px solid var(--border);
+      }
+
+      .name {
+        margin: 0 0 4px;
+        font-size: 15px;
+        font-weight: 680;
+      }
+
+      .note {
+        margin: 0;
+        color: var(--muted);
+        font-size: 12px;
+        line-height: 1.45;
+      }
+
+      .score {
+        flex: 0 0 auto;
+        border: 1px solid rgba(255, 255, 255, 0.12);
+        border-radius: 999px;
+        padding: 4px 8px;
+        color: var(--muted);
+        font-size: 11px;
+        white-space: nowrap;
+      }
+
+      .recommended .score {
+        color: var(--good);
+        border-color: rgba(183, 247, 171, 0.34);
+        background: rgba(183, 247, 171, 0.08);
+      }
+
+      .terminal {
+        min-height: 395px;
+        padding: 16px 16px 18px;
+        background: #120f10;
+        font-family:
+          "SFMono-Regular", "SF Mono", Consolas, "Liberation Mono", Menlo,
+          monospace;
+        font-size: 14px;
+        line-height: 1.36;
+        overflow: hidden;
+      }
+
+      .line {
+        min-height: 19px;
+        white-space: pre;
+      }
+
+      .selected {
+        background: var(--select);
+      }
+
+      .prompt {
+        color: var(--blue);
+      }
+
+      .prompt-text {
+        color: var(--text);
+      }
+
+      .marker {
+        color: var(--dim);
+      }
+
+      .marker.dot {
+        color: #898a91;
+      }
+
+      .marker.rail {
+        color: #565860;
+      }
+
+      .group {
+        color: var(--green);
+        font-weight: 700;
+      }
+
+      .action-list {
+        color: var(--cyan);
+        font-weight: 700;
+      }
+
+      .action-run {
+        color: var(--green);
+        font-weight: 700;
+      }
+
+      .action-read {
+        color: var(--blue);
+        font-weight: 700;
+      }
+
+      .path {
+        color: var(--peach);
+      }
+
+      .muted {
+        color: var(--muted);
+      }
+
+      .footer {
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 10px;
+        padding: 12px 15px 14px;
+        border-top: 1px solid var(--border);
+        background: #151213;
+      }
+
+      .metric {
+        min-width: 0;
+      }
+
+      .metric-label {
+        display: block;
+        color: var(--muted);
+        font-size: 10px;
+        margin-bottom: 3px;
+      }
+
+      .metric-value {
+        display: block;
+        color: var(--text);
+        font-size: 12px;
+      }
+
+      .pairings {
+        margin-top: 22px;
+        display: grid;
+        grid-template-columns: repeat(3, minmax(0, 1fr));
+        gap: 16px;
+      }
+
+      .pairing {
+        border: 1px solid var(--border);
+        border-radius: 8px;
+        padding: 15px;
+        background: rgba(23, 20, 20, 0.82);
+      }
+
+      .pairing h2 {
+        margin: 0 0 8px;
+        font-size: 15px;
+      }
+
+      .pairing p {
+        margin: 0;
+        color: var(--muted);
+        font-size: 13px;
+        line-height: 1.5;
+      }
+
+      @media (max-width: 1180px) {
+        header {
+          display: block;
+        }
+
+        .recommendation {
+          margin-top: 16px;
+          max-width: 780px;
+        }
+
+        .grid,
+        .pairings {
+          grid-template-columns: repeat(2, minmax(0, 1fr));
+        }
+      }
+
+      @media (max-width: 760px) {
+        main {
+          width: min(100vw - 24px, 700px);
+          padding-top: 24px;
+        }
+
+        .grid,
+        .pairings {
+          grid-template-columns: 1fr;
+        }
+      }
+    </style>
+  </head>
+  <body>
+    <main>
+      <header>
+        <div>
+          <h1>Transcript Marker Compare</h1>
+          <p class="intro">
+            Same subagent transcript, different group-prefix markers. The goal is to keep hierarchy visible without making every activity row feel like punctuation.
+          </p>
+        </div>
+        <div class="recommendation">
+          <strong>Recommendation:</strong> use the middle dot. It is quieter than the colon, still aligns the group labels, and does not imply a tree structure the transcript does not really have.
+        </div>
+      </header>
+
+      <section class="grid">
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <p class="name">Current colon</p>
+              <p class="note">Readable, but visually reads like repeated syntax. It competes with commands and paths.</p>
+            </div>
+            <span class="score">baseline</span>
+          </div>
+          <div class="terminal">
+            <div class="line selected"><span class="prompt">&gt; </span><span class="prompt-text">can you tell me about this repo?</span></div>
+            <div class="line"><span class="marker">: </span><span class="group">subagent repo_explorer started</span></div>
+            <div class="line"><span class="marker">: </span><span class="group">explored</span></div>
+            <div class="line">  <span class="action-list">list</span> . <span class="muted">(200 items)</span></div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="marker">: </span><span class="action-run">run</span></div>
+            <div class="line">  pwd &amp;&amp; find . -maxdepth 2 -type f | sort | head -20</div>
+            <div class="line">  0</div>
+            <div class="line"><span class="marker">: </span><span class="action-run">run</span></div>
+            <div class="line">  <span class="path">/Users/reagan/.superset/projects/browser-use-terminal</span></div>
+            <div class="line">  .env.example</div>
+            <div class="line">  ... +53 lines</div>
+            <div class="line"><span class="marker">: </span><span class="group">explored</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Taskfile.yml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Cargo.toml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">README.md</span></div>
+          </div>
+          <div class="footer">
+            <span class="metric"><span class="metric-label">Noise</span><span class="metric-value">High</span></span>
+            <span class="metric"><span class="metric-label">Meaning</span><span class="metric-value">Low</span></span>
+            <span class="metric"><span class="metric-label">Risk</span><span class="metric-value">Low</span></span>
+          </div>
+        </article>
+
+        <article class="card recommended">
+          <div class="card-header">
+            <div>
+              <p class="name">Middle dot</p>
+              <p class="note">Keeps the same rhythm and alignment, but feels like a quiet bullet instead of syntax.</p>
+            </div>
+            <span class="score">best default</span>
+          </div>
+          <div class="terminal">
+            <div class="line selected"><span class="prompt">&gt; </span><span class="prompt-text">can you tell me about this repo?</span></div>
+            <div class="line"><span class="marker dot">&middot; </span><span class="group">subagent repo_explorer started</span></div>
+            <div class="line"><span class="marker dot">&middot; </span><span class="group">explored</span></div>
+            <div class="line">  <span class="action-list">list</span> . <span class="muted">(200 items)</span></div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="marker dot">&middot; </span><span class="action-run">run</span></div>
+            <div class="line">  pwd &amp;&amp; find . -maxdepth 2 -type f | sort | head -20</div>
+            <div class="line">  0</div>
+            <div class="line"><span class="marker dot">&middot; </span><span class="action-run">run</span></div>
+            <div class="line">  <span class="path">/Users/reagan/.superset/projects/browser-use-terminal</span></div>
+            <div class="line">  .env.example</div>
+            <div class="line">  ... +53 lines</div>
+            <div class="line"><span class="marker dot">&middot; </span><span class="group">explored</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Taskfile.yml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Cargo.toml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">README.md</span></div>
+          </div>
+          <div class="footer">
+            <span class="metric"><span class="metric-label">Noise</span><span class="metric-value">Low</span></span>
+            <span class="metric"><span class="metric-label">Meaning</span><span class="metric-value">Good</span></span>
+            <span class="metric"><span class="metric-label">Risk</span><span class="metric-value">Low</span></span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <p class="name">Round bullet</p>
+              <p class="note">Cleaner than colon, but visually heavier. It starts to look like a list inside a list.</p>
+            </div>
+            <span class="score">usable</span>
+          </div>
+          <div class="terminal">
+            <div class="line selected"><span class="prompt">&gt; </span><span class="prompt-text">can you tell me about this repo?</span></div>
+            <div class="line"><span class="marker">&bull; </span><span class="group">subagent repo_explorer started</span></div>
+            <div class="line"><span class="marker">&bull; </span><span class="group">explored</span></div>
+            <div class="line">  <span class="action-list">list</span> . <span class="muted">(200 items)</span></div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="marker">&bull; </span><span class="action-run">run</span></div>
+            <div class="line">  pwd &amp;&amp; find . -maxdepth 2 -type f | sort | head -20</div>
+            <div class="line">  0</div>
+            <div class="line"><span class="marker">&bull; </span><span class="action-run">run</span></div>
+            <div class="line">  <span class="path">/Users/reagan/.superset/projects/browser-use-terminal</span></div>
+            <div class="line">  .env.example</div>
+            <div class="line">  ... +53 lines</div>
+            <div class="line"><span class="marker">&bull; </span><span class="group">explored</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Taskfile.yml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Cargo.toml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">README.md</span></div>
+          </div>
+          <div class="footer">
+            <span class="metric"><span class="metric-label">Noise</span><span class="metric-value">Medium</span></span>
+            <span class="metric"><span class="metric-label">Meaning</span><span class="metric-value">Good</span></span>
+            <span class="metric"><span class="metric-label">Risk</span><span class="metric-value">Low</span></span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <p class="name">Chevron</p>
+              <p class="note">Active and directional, but too close to the user prompt glyph. It can blur roles.</p>
+            </div>
+            <span class="score">too active</span>
+          </div>
+          <div class="terminal">
+            <div class="line selected"><span class="prompt">&gt; </span><span class="prompt-text">can you tell me about this repo?</span></div>
+            <div class="line"><span class="marker">&#8250; </span><span class="group">subagent repo_explorer started</span></div>
+            <div class="line"><span class="marker">&#8250; </span><span class="group">explored</span></div>
+            <div class="line">  <span class="action-list">list</span> . <span class="muted">(200 items)</span></div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="marker">&#8250; </span><span class="action-run">run</span></div>
+            <div class="line">  pwd &amp;&amp; find . -maxdepth 2 -type f | sort | head -20</div>
+            <div class="line">  0</div>
+            <div class="line"><span class="marker">&#8250; </span><span class="action-run">run</span></div>
+            <div class="line">  <span class="path">/Users/reagan/.superset/projects/browser-use-terminal</span></div>
+            <div class="line">  .env.example</div>
+            <div class="line">  ... +53 lines</div>
+            <div class="line"><span class="marker">&#8250; </span><span class="group">explored</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Taskfile.yml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Cargo.toml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">README.md</span></div>
+          </div>
+          <div class="footer">
+            <span class="metric"><span class="metric-label">Noise</span><span class="metric-value">Medium</span></span>
+            <span class="metric"><span class="metric-label">Meaning</span><span class="metric-value">Wrong</span></span>
+            <span class="metric"><span class="metric-label">Risk</span><span class="metric-value">Medium</span></span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <p class="name">Vertical rail</p>
+              <p class="note">Best hierarchy, but it implies a persistent tree. It may overstate grouping.</p>
+            </div>
+            <span class="score">structured</span>
+          </div>
+          <div class="terminal">
+            <div class="line selected"><span class="prompt">&gt; </span><span class="prompt-text">can you tell me about this repo?</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="group">subagent repo_explorer started</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="group">explored</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span> <span class="action-list">list</span> . <span class="muted">(200 items)</span></div>
+            <div class="line"><span class="marker rail">&#9474;</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="action-run">run</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span>pwd &amp;&amp; find . -maxdepth 2 -type f | sort | head -20</div>
+            <div class="line"><span class="marker rail">&#9474; </span>0</div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="action-run">run</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="path">/Users/reagan/.superset/projects/browser-use-terminal</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span>.env.example</div>
+            <div class="line"><span class="marker rail">&#9474; </span>... +53 lines</div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="group">explored</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="action-read">read</span> <span class="path">Taskfile.yml</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="action-read">read</span> <span class="path">Cargo.toml</span></div>
+            <div class="line"><span class="marker rail">&#9474; </span><span class="action-read">read</span> <span class="path">README.md</span></div>
+          </div>
+          <div class="footer">
+            <span class="metric"><span class="metric-label">Noise</span><span class="metric-value">Medium</span></span>
+            <span class="metric"><span class="metric-label">Meaning</span><span class="metric-value">High</span></span>
+            <span class="metric"><span class="metric-label">Risk</span><span class="metric-value">Medium</span></span>
+          </div>
+        </article>
+
+        <article class="card">
+          <div class="card-header">
+            <div>
+              <p class="name">No marker</p>
+              <p class="note">Quietest, but status rows and output rows start to merge. Color carries too much load.</p>
+            </div>
+            <span class="score">too flat</span>
+          </div>
+          <div class="terminal">
+            <div class="line selected"><span class="prompt">&gt; </span><span class="prompt-text">can you tell me about this repo?</span></div>
+            <div class="line"><span class="group">subagent repo_explorer started</span></div>
+            <div class="line"><span class="group">explored</span></div>
+            <div class="line">  <span class="action-list">list</span> . <span class="muted">(200 items)</span></div>
+            <div class="line">&nbsp;</div>
+            <div class="line"><span class="action-run">run</span></div>
+            <div class="line">  pwd &amp;&amp; find . -maxdepth 2 -type f | sort | head -20</div>
+            <div class="line">  0</div>
+            <div class="line"><span class="action-run">run</span></div>
+            <div class="line">  <span class="path">/Users/reagan/.superset/projects/browser-use-terminal</span></div>
+            <div class="line">  .env.example</div>
+            <div class="line">  ... +53 lines</div>
+            <div class="line"><span class="group">explored</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Taskfile.yml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">Cargo.toml</span></div>
+            <div class="line">  <span class="action-read">read</span> <span class="path">README.md</span></div>
+          </div>
+          <div class="footer">
+            <span class="metric"><span class="metric-label">Noise</span><span class="metric-value">Lowest</span></span>
+            <span class="metric"><span class="metric-label">Meaning</span><span class="metric-value">Weak</span></span>
+            <span class="metric"><span class="metric-label">Risk</span><span class="metric-value">Medium</span></span>
+          </div>
+        </article>
+      </section>
+
+      <section class="pairings">
+        <div class="pairing">
+          <h2>Best default: middle dot</h2>
+          <p>It is a one-character swap from the colon, preserves alignment, and reads as a quiet event marker. This is the safest implementation path.</p>
+        </div>
+        <div class="pairing">
+          <h2>Best hierarchy: vertical rail</h2>
+          <p>Use this only if subagent output becomes a true nested thread. It looks intentional, but it also makes the transcript feel more like a log tree.</p>
+        </div>
+        <div class="pairing">
+          <h2>Avoid: chevron</h2>
+          <p>The chevron fights the user prompt's greater-than marker and makes activity rows feel interactive or prompt-like when they are not.</p>
+        </div>
+      </section>
+    </main>
+  </body>
+</html>
