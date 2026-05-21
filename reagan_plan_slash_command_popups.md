@@ -35,10 +35,11 @@ Fullscreen surfaces stay fullscreen: `Setup`.
 
 - Popup is a centered floating rectangle with a 1-cell border.
 - Dimensions are responsive:
-  - `width  = clamp(popup_content_width + 6, 40, area.width.saturating_sub(8))`
-    falling back to `area.width` if terminal narrower than 40.
-  - `height = clamp(line_count + 6, 10, area.height.saturating_sub(4))`
-    falling back to `area.height` if terminal shorter than 10.
+  - `width = area.width` when the terminal is 40 columns or narrower; otherwise
+    use `area.width.saturating_sub(8).min(84).max(40)`.
+  - `height = area.height` when the terminal is 10 rows or shorter; otherwise
+    clamp desired content height to `10..=26`, then cap to the terminal margin
+    and re-raise to `min(10, area.height)`.
 - Position: centered horizontally and vertically.
 - Body uses the existing `surface_header_lines` + `surface_lines` + `surface_footer`
   so all picker logic stays untouched.
