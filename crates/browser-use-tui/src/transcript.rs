@@ -516,71 +516,29 @@ fn committed_node_for_event(
                 text: "Progress is saved in history.".to_string(),
             },
         }),
-        // Child-agent lifecycle is represented by the active child cell while
-        // it is running and by agent.completed once it has a result. Emitting
-        // agent.spawned separately makes the transcript look like duplicate
-        // subagent blocks.
-        "agent.spawned" => None,
-        "agent.wait.started" => None,
-        "agent.wait.finished" => {
-            let timed_out = event
-                .payload
-                .get("timed_out")
-                .and_then(serde_json::Value::as_bool)
-                .unwrap_or(false);
-            timed_out.then(|| {
-                timeline_node(
-                    event,
-                    "subagent",
-                    vec!["wait timed out".to_string()],
-                    NodeStyle::Muted,
-                )
-            })
-        }
-        "agent.completed" => {
-            let child_id = event
-                .payload
-                .get("child_session_id")
-                .and_then(serde_json::Value::as_str);
-            let label = child_id
-                .map(|id| helper_label_for_child(app, &event.session_id, id))
-                .unwrap_or_else(|| "subagent".to_string());
-            let group = format!("subagent {label}");
-            let mut lines = child_id
-                .map(|id| completed_child_activity_lines(app, state, id, 4))
-                .unwrap_or_default();
-            lines.push("finished".to_string());
-            if let Some(result) = event
-                .payload
-                .get("payload")
-                .and_then(|payload| payload.get("result"))
-                .and_then(serde_json::Value::as_str)
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-            {
-                lines.extend(markdown_preview_lines(result, 3));
-            }
-            Some(timeline_node(event, &group, lines, NodeStyle::Normal))
-        }
-        "agent.failed" => {
-            let error = event
-                .payload
-                .get("payload")
-                .and_then(|payload| payload.get("error"))
-                .and_then(serde_json::Value::as_str)
-                .unwrap_or("subagent failed")
-                .to_string();
-            Some(timeline_node(
-                event,
-                "error",
-                vec![error],
-                NodeStyle::Failed,
-            ))
-        }
-        "agent.cancelled" => Some(timeline_node(
+        "agent.spawned" => Some(subagent_lifecycle_node(
+            app,
             event,
-            "subagent",
-            vec!["stopped".to_string()],
+            "started",
+            NodeStyle::Normal,
+        )),
+        "agent.wait.started" | "agent.wait.finished" => None,
+        "agent.completed" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "finished",
+            NodeStyle::Normal,
+        )),
+        "agent.failed" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "failed",
+            NodeStyle::Failed,
+        )),
+        "agent.cancelled" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "stopped",
             NodeStyle::Muted,
         )),
         "model.tool_call" | "tool.started" | "tool.finished" => None,
@@ -973,31 +931,13 @@ fn active_node_for_session(
         return Some(pending_followup);
     }
 
-    if let Some(child) = active_child_session(app, &root.id) {
-        let label = helper_label_for_session(app, &child.id);
-        let group = format!("subagent {label}");
-        let mut lines = vec!["working".to_string()];
-        if let Some(wait_event) = live_events
-            .iter()
-            .rev()
-            .find(|event| event.event_type == "agent.wait.started")
-        {
-            lines.push(wait_agent_started_label(&wait_event.payload));
-        }
-        let recent = recent_child_activity_lines(app, state, &child.id, ACTIVE_LIVE_LINE_LIMIT);
-        if recent.is_empty() {
-            if lines.len() == 1 {
-                lines.push("waiting for activity".to_string());
-            }
-        } else {
-            lines.extend(recent);
-        }
+    if has_active_child_session(app, &root.id) {
         return Some(active_status_node(
             root,
             events,
-            &group,
-            lines,
-            NodeStyle::Normal,
+            "status",
+            vec![ACTIVE_FALLBACK_STATUS.to_string()],
+            NodeStyle::Muted,
         ));
     }
 
@@ -1019,10 +959,8 @@ fn active_node_for_session(
 
     let suppress_model_wait = live_streaming_text.is_some() && live_thinking_text.is_none();
     if let Some(event) = live_events.iter().rev().find(|event| {
-        matches!(
-            event.event_type.as_str(),
-            "model.turn.retry" | "agent.wait.started"
-        ) && !(suppress_model_wait && matches!(event.event_type.as_str(), "model.turn.retry"))
+        matches!(event.event_type.as_str(), "model.turn.retry")
+            && !(suppress_model_wait && matches!(event.event_type.as_str(), "model.turn.retry"))
     }) {
         if let Some(node) = active_node_for_event(root, events, event) {
             active_nodes.push(node);
@@ -1173,8 +1111,9 @@ fn is_live_output_event(event: &EventRecord) -> bool {
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| !text.trim().is_empty()),
-        "agent.wait.started" | "command.waiting" | "tool.started" | "browser.page"
-        | "browser.state" | "plan.updated" => true,
+        "command.waiting" | "tool.started" | "browser.page" | "browser.state" | "plan.updated" => {
+            true
+        }
         _ => false,
     }
 }
@@ -1187,7 +1126,6 @@ fn pending_followup_status(app: &App, events: &[EventRecord], after_seq: i64) ->
         .find_map(|event| match event.event_type.as_str() {
             "model.turn.request" => Some("thinking".to_string()),
             "model.turn.retry" => Some("retrying model request".to_string()),
-            "agent.wait.started" => Some("waiting for subagent".to_string()),
             "command.waiting" => Some("running command".to_string()),
             "tool.started" => payload_string(event, "name")
                 .map(|name| format!("running {name}"))
@@ -1231,13 +1169,7 @@ fn active_node_for_event(
             vec!["retrying model request".to_string()],
             NodeStyle::Muted,
         )),
-        "agent.wait.started" => Some(active_status_node(
-            root,
-            events,
-            "subagent",
-            vec![wait_agent_started_label(&event.payload)],
-            NodeStyle::Muted,
-        )),
+        "agent.wait.started" => None,
         "command.waiting" => Some(active_status_node(
             root,
             events,
@@ -1927,36 +1859,6 @@ fn preview_lines(text: &str, limit: usize) -> Vec<String> {
     out
 }
 
-fn markdown_preview_lines(markdown: &str, limit: usize) -> Vec<String> {
-    let rendered = render_markdown_lines(markdown.trim_end(), 100);
-    let mut out = rendered
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .map(|line| line.trim_end().to_string())
-        .filter(|line| !line.is_empty())
-        .take(limit)
-        .collect::<Vec<_>>();
-    let total = rendered
-        .iter()
-        .map(|line| {
-            line.spans
-                .iter()
-                .map(|span| span.content.as_ref())
-                .collect::<String>()
-        })
-        .filter(|line| !line.trim().is_empty())
-        .count();
-    if total > out.len() {
-        out.push(format!("... +{} lines", total.saturating_sub(out.len())));
-    }
-    out
-}
-
 fn friendly_error_message(error: &str) -> String {
     let error = error.trim();
     if error.is_empty() {
@@ -2211,200 +2113,73 @@ fn is_subagent_management_tool(name: &str) -> bool {
     )
 }
 
-fn wait_agent_started_label(payload: &serde_json::Value) -> String {
-    if let Some(target) = payload
-        .get("target")
-        .and_then(serde_json::Value::as_str)
-        .map(short_agent_label)
-    {
-        return format!("waiting on {target}");
-    }
-    if let Some(targets) = payload.get("targets").and_then(serde_json::Value::as_array) {
-        return match targets.len() {
-            0 => "waiting on subagents".to_string(),
-            1 => {
-                let target = targets
-                    .first()
-                    .and_then(|target| {
-                        target
-                            .get("nickname")
-                            .and_then(serde_json::Value::as_str)
-                            .or_else(|| target.get("task_name").and_then(serde_json::Value::as_str))
-                    })
-                    .map(short_agent_label)
-                    .unwrap_or_else(|| "subagent".to_string());
-                format!("waiting on {target}")
-            }
-            count => format!("waiting on {count} subagents"),
-        };
-    }
-    "waiting on subagents".to_string()
+fn subagent_lifecycle_node(
+    app: &App,
+    event: &EventRecord,
+    status: &str,
+    style: NodeStyle,
+) -> TranscriptNode {
+    let group = subagent_label_for_event(app, event)
+        .map(|label| format!("subagent {label} {status}"))
+        .unwrap_or_else(|| format!("subagent {status}"));
+    timeline_node(event, &group, Vec::new(), style)
 }
 
-fn short_agent_label(value: &str) -> String {
-    value
+fn subagent_label_for_event(app: &App, event: &EventRecord) -> Option<String> {
+    if let Some(child_id) = event
+        .payload
+        .get("child_session_id")
+        .and_then(serde_json::Value::as_str)
+        .or_else(|| {
+            event
+                .payload
+                .get("payload")
+                .and_then(|payload| payload.get("child_session_id"))
+                .and_then(serde_json::Value::as_str)
+        })
+    {
+        if let Some(label) =
+            normalize_subagent_label(&helper_label_for_child(app, &event.session_id, child_id))
+        {
+            return Some(label);
+        }
+    }
+
+    ["nickname", "role", "task_name", "agent_path"]
+        .into_iter()
+        .find_map(|key| {
+            event
+                .payload
+                .get(key)
+                .and_then(serde_json::Value::as_str)
+                .and_then(normalize_subagent_label)
+                .or_else(|| {
+                    event
+                        .payload
+                        .get("payload")
+                        .and_then(|payload| payload.get(key))
+                        .and_then(serde_json::Value::as_str)
+                        .and_then(normalize_subagent_label)
+                })
+        })
+}
+
+fn normalize_subagent_label(value: &str) -> Option<String> {
+    let label = value
         .trim()
         .trim_matches('/')
         .rsplit('/')
         .next()
-        .filter(|segment| !segment.is_empty() && *segment != "root")
         .unwrap_or(value)
-        .to_string()
+        .trim();
+    (!label.is_empty() && label != "root" && label != "subagent").then(|| label.to_string())
 }
 
-fn active_child_session<'a>(app: &'a App, root_id: &str) -> Option<&'a SessionMeta> {
+fn has_active_child_session(app: &App, root_id: &str) -> bool {
     app.state_cache
         .sessions
         .iter()
-        .filter(|session| session.parent_id.as_deref() == Some(root_id))
-        .find(|session| session.status.is_active())
-}
-
-fn completed_child_activity_lines(
-    app: &App,
-    state: &WorkbenchState,
-    child_id: &str,
-    limit: usize,
-) -> Vec<String> {
-    let child_events = app.cached_events_for_session(child_id);
-    if !child_session_has_terminal_event(child_events) {
-        return Vec::new();
-    }
-
-    let mut lines = Vec::new();
-    for event in child_events.iter().rev() {
-        if matches!(
-            event.event_type.as_str(),
-            "session.input"
-                | "session.followup"
-                | "session.done"
-                | "session.failed"
-                | "session.cancelled"
-                | "model.thinking_delta"
-                | "model.stream_delta"
-        ) {
-            continue;
-        }
-        if let Some(line) = child_activity_line(event, state) {
-            lines.push(line);
-        }
-        if lines.len() >= limit {
-            break;
-        }
-    }
-    lines.reverse();
-    lines
-}
-
-fn child_session_has_terminal_event(events: &[EventRecord]) -> bool {
-    events.iter().any(|event| {
-        matches!(
-            event.event_type.as_str(),
-            "session.done" | "session.failed" | "session.cancelled"
-        )
-    })
-}
-
-fn recent_child_activity_lines(
-    app: &App,
-    state: &WorkbenchState,
-    child_id: &str,
-    limit: usize,
-) -> Vec<String> {
-    let mut lines = Vec::new();
-    for event in app.cached_events_for_session(child_id).iter().rev() {
-        if let Some(line) = child_activity_line(event, state) {
-            lines.push(line);
-        }
-        if lines.len() >= limit {
-            break;
-        }
-    }
-    lines.reverse();
-    lines
-}
-
-fn child_activity_line(event: &EventRecord, state: &WorkbenchState) -> Option<String> {
-    match event.event_type.as_str() {
-        "session.input" => payload_string(event, "text")
-            .map(|text| format!("task {}", truncate_text(text.trim(), 96))),
-        "session.followup" => payload_string(event, "text")
-            .map(|text| format!("follow-up {}", truncate_text(text.trim(), 96))),
-        "file.read" => {
-            payload_string(event, "path").map(|path| format!("read {}", display_path(&path, state)))
-        }
-        "file.list" => {
-            let path = payload_string(event, "path").unwrap_or_else(|| ".".to_string());
-            Some(format!("list {}", display_path(&path, state)))
-        }
-        "file.search" => {
-            let query = payload_string(event, "query").unwrap_or_else(|| "files".to_string());
-            let suffix = event
-                .payload
-                .get("matches")
-                .and_then(serde_json::Value::as_u64)
-                .map(|matches| format!(" ({matches} matches)"))
-                .unwrap_or_default();
-            Some(format!("search {query:?}{suffix}"))
-        }
-        "command.started" => {
-            payload_string(event, "cmd").map(|cmd| format!("run {}", truncate_text(cmd.trim(), 96)))
-        }
-        "command.finished" => event
-            .payload
-            .get("success")
-            .and_then(serde_json::Value::as_bool)
-            .and_then(|success| {
-                if success {
-                    None
-                } else {
-                    let code = event
-                        .payload
-                        .get("exit_code")
-                        .and_then(serde_json::Value::as_i64)
-                        .map(|code| code.to_string())
-                        .unwrap_or_else(|| "unknown".to_string());
-                    Some(format!("command failed with exit {code}"))
-                }
-            }),
-        "model.turn.request" => None,
-        "model.turn.retry" => Some("retrying model request".to_string()),
-        "model.thinking_delta" | "model.stream_delta" | "model.tool_call" | "tool.started" => None,
-        "tool.output" => {
-            let name = payload_string(event, "name").unwrap_or_else(|| "tool".to_string());
-            should_show_generic_tool_output_text(&name)
-                .then(|| payload_string(event, "text"))
-                .flatten()
-                .map(|text| truncate_text(text.trim(), 120))
-                .filter(|text| !text.is_empty())
-        }
-        "tool.failed" => {
-            let name = payload_string(event, "name").unwrap_or_else(|| "tool".to_string());
-            let error = payload_string(event, "error").unwrap_or_else(|| "tool failed".to_string());
-            Some(format!("{name} failed: {}", truncate_text(&error, 96)))
-        }
-        "tool.image" => Some(tool_image_label(event, state)),
-        "artifact.created" => event
-            .payload
-            .get("artifact")
-            .and_then(|artifact| artifact.get("path"))
-            .and_then(serde_json::Value::as_str)
-            .map(|path| format!("artifact {}", display_path(path, state))),
-        "plan.updated" => Some("updated plan".to_string()),
-        _ => None,
-    }
-}
-
-fn truncate_text(value: &str, max: usize) -> String {
-    if value.chars().count() <= max {
-        return value.to_string();
-    }
-    if max <= 3 {
-        return value.chars().take(max).collect();
-    }
-    let mut out = value.chars().take(max - 3).collect::<String>();
-    out.push_str("...");
-    out
+        .any(|session| session.parent_id.as_deref() == Some(root_id) && session.status.is_active())
 }
 
 fn plural(count: usize) -> &'static str {

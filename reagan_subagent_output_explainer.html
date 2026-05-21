@@ -1,0 +1,304 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Subagent Output Rendering</title>
+  <style>
+    :root {
+      --bg: #121210;
+      --panel: #191a17;
+      --panel-2: #20221e;
+      --line: #394034;
+      --text: #eceee8;
+      --muted: #8a9088;
+      --dim: #5c625a;
+      --accent: #89b4fa;
+      --green: #a6e3a1;
+      --orange: #fab387;
+      --purple: #cba6f7;
+      --red: #f38ba8;
+      --code: #cdd6f4;
+    }
+
+    * { box-sizing: border-box; }
+    body {
+      margin: 0;
+      background: var(--bg);
+      color: var(--text);
+      font: 15px/1.5 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+    }
+    main {
+      max-width: 1180px;
+      margin: 0 auto;
+      padding: 28px;
+    }
+    h1, h2, h3 {
+      margin: 0;
+      line-height: 1.15;
+      font-weight: 700;
+      letter-spacing: 0;
+    }
+    h1 { font-size: 30px; margin-bottom: 10px; }
+    h2 { font-size: 20px; margin: 34px 0 14px; color: var(--orange); }
+    h3 { font-size: 15px; margin-bottom: 10px; color: var(--green); }
+    p { margin: 0 0 12px; color: var(--muted); max-width: 980px; }
+    code {
+      color: var(--code);
+      background: #26283a;
+      padding: 1px 5px;
+      border-radius: 4px;
+    }
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(2, minmax(0, 1fr));
+      gap: 14px;
+    }
+    .card {
+      border: 1px solid var(--line);
+      background: var(--panel);
+      border-radius: 8px;
+      padding: 16px;
+    }
+    .flow {
+      display: grid;
+      grid-template-columns: 1fr 40px 1fr 40px 1fr;
+      gap: 10px;
+      align-items: stretch;
+      margin-top: 16px;
+    }
+    .box {
+      border: 1px solid var(--line);
+      background: var(--panel-2);
+      border-radius: 8px;
+      padding: 14px;
+      min-height: 126px;
+    }
+    .arrow {
+      align-self: center;
+      text-align: center;
+      color: var(--dim);
+      font-size: 26px;
+    }
+    .terminal {
+      border: 1px solid var(--line);
+      background: #0f100e;
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .term-title {
+      height: 30px;
+      display: flex;
+      align-items: center;
+      padding: 0 12px;
+      color: var(--muted);
+      border-bottom: 1px solid var(--line);
+      background: #151613;
+    }
+    .term-body {
+      height: 456px;
+      display: grid;
+      grid-template-rows: 1fr auto auto;
+      padding: 16px;
+      gap: 10px;
+    }
+    .native {
+      min-height: 0;
+      overflow: hidden;
+      border: 1px dashed #2f362d;
+      padding: 12px;
+      position: relative;
+    }
+    .active {
+      border: 1px solid #33412f;
+      background: #141812;
+      padding: 8px 10px;
+    }
+    .composer {
+      border: 1px solid var(--line);
+      border-radius: 6px;
+      min-height: 70px;
+      padding: 10px;
+      color: var(--muted);
+    }
+    .footer {
+      color: var(--muted);
+      display: flex;
+      gap: 22px;
+      padding-left: 2px;
+    }
+    .row { white-space: pre-wrap; }
+    .label { color: var(--purple); font-weight: 700; }
+    .ok { color: var(--green); }
+    .warn { color: var(--orange); }
+    .bad { color: var(--red); }
+    .muted { color: var(--muted); }
+    .dim { color: var(--dim); }
+    .callout {
+      border-left: 3px solid var(--orange);
+      background: #1c1b16;
+      padding: 12px 14px;
+      margin: 14px 0;
+      color: var(--text);
+    }
+    .split {
+      display: grid;
+      grid-template-columns: 1.15fr .85fr;
+      gap: 16px;
+      align-items: start;
+    }
+    .table {
+      display: grid;
+      grid-template-columns: 180px 1fr;
+      border: 1px solid var(--line);
+      border-radius: 8px;
+      overflow: hidden;
+    }
+    .table div {
+      padding: 10px 12px;
+      border-bottom: 1px solid #2c322a;
+    }
+    .table div:nth-child(odd) {
+      color: var(--green);
+      background: #181b16;
+      border-right: 1px solid #2c322a;
+    }
+    .table div:nth-last-child(-n+2) { border-bottom: 0; }
+    ul { margin: 10px 0 0; padding-left: 18px; color: var(--muted); }
+    li { margin: 6px 0; }
+    .mini-code {
+      border: 1px solid var(--line);
+      background: #10110f;
+      border-radius: 8px;
+      padding: 12px;
+      overflow-x: auto;
+      color: var(--code);
+      white-space: pre;
+    }
+    @media (max-width: 880px) {
+      main { padding: 18px; }
+      .grid, .split, .flow { grid-template-columns: 1fr; }
+      .arrow { transform: rotate(90deg); }
+      .table { grid-template-columns: 1fr; }
+      .table div:nth-child(odd) { border-right: 0; }
+    }
+  </style>
+</head>
+<body>
+<main>
+  <h1>Subagent Output Rendering</h1>
+  <p>This is the current TUI model in <code>crates/browser-use-tui/src/transcript.rs</code> and <code>render.rs</code>. Subagent output is not one raw stream. It is summarized twice: once for the parent workbench activity projection, and once for the parent transcript UI.</p>
+
+  <h2>1. Event Flow</h2>
+  <div class="flow">
+    <div class="box">
+      <h3>Parent session events</h3>
+      <div class="row"><span class="label">session.input</span> user prompt</div>
+      <div class="row"><span class="label">agent.spawned</span> child id + nickname</div>
+      <div class="row"><span class="label">agent.wait.started</span> optional waiting target</div>
+      <div class="row"><span class="label">agent.completed</span> short payload result</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="box">
+      <h3>Child session events</h3>
+      <div class="row"><span class="label">session.input</span> child task</div>
+      <div class="row"><span class="label">file.read</span> / <span class="label">file.list</span> / <span class="label">command.started</span></div>
+      <div class="row"><span class="label">model.stream_delta</span> child draft text</div>
+      <div class="row"><span class="label">session.done</span> full child result</div>
+    </div>
+    <div class="arrow">→</div>
+    <div class="box">
+      <h3>Parent visible transcript</h3>
+      <div class="row"><span class="ok">active:</span> live child activity summary</div>
+      <div class="row"><span class="ok">committed:</span> child recent actions + finished + short result</div>
+      <div class="row"><span class="bad">not shown:</span> full child prompt/result as parent output</div>
+    </div>
+  </div>
+
+  <h2>2. What Each Subagent Block Means</h2>
+  <div class="table">
+    <div><code>agent.spawned</code></div>
+    <div>Used to name the child, but intentionally not rendered as its own transcript row. The code comment says rendering it separately made duplicate subagent blocks.</div>
+    <div>Active child block</div>
+    <div>When a child session is active, <code>active_child_session()</code> returns it and the parent active viewport becomes <code>: subagent {nickname}</code>.</div>
+    <div><code>working</code></div>
+    <div>Always included as the first active line for a live child.</div>
+    <div><code>waiting on ...</code></div>
+    <div>Included only when the current parent turn has <code>agent.wait.started</code>. It comes from <code>wait_agent_started_label()</code>.</div>
+    <div>Recent child actions</div>
+    <div>Built from the child session events by <code>recent_child_activity_lines()</code>. Examples: <code>read README.md</code>, <code>list .</code>, <code>search "query"</code>, <code>run cargo test</code>, <code>artifact path</code>.</div>
+    <div>Child streaming text</div>
+    <div>Usually hidden in the TUI child summary. <code>child_activity_line()</code> returns <code>None</code> for <code>model.stream_delta</code> and <code>model.thinking_delta</code>. Protocol projection may mention streaming in generic activity, but the transcript UI does not show the raw draft.</div>
+    <div><code>agent.completed</code></div>
+    <div>Creates a committed <code>: subagent {nickname}</code> timeline node. It includes up to 4 recent child activity lines, then <code>finished</code>, then up to 3 preview lines from <code>payload.result</code>.</div>
+    <div>Full child result</div>
+    <div>Deliberately not replayed into the parent transcript. Tests assert strings from child <code>session.done</code> do not appear at top level unless the parent includes a short result in <code>agent.completed.payload.result</code>.</div>
+  </div>
+
+  <h2>3. Why It Can Appear In The Middle</h2>
+  <div class="split">
+    <div class="terminal">
+      <div class="term-title">Current native-scrollback active child layout</div>
+      <div class="term-body">
+        <div class="native">
+          <div class="row dim">native terminal scrollback above this frame...</div>
+          <div class="row dim">previous committed parent transcript lives here</div>
+          <div class="row dim">it is not redrawn by Ratatui on every frame</div>
+        </div>
+        <div class="active">
+          <div class="row"><span class="label">: subagent repo-explorer</span></div>
+          <div class="row">  working</div>
+          <div class="row">  read /repo/README.md</div>
+          <div class="row">  list crates</div>
+        </div>
+        <div class="composer">
+          <div class="row">&gt; Type to steer the agent...</div>
+        </div>
+        <div class="footer">GPT-5.5 · 42% context left</div>
+      </div>
+    </div>
+    <div>
+      <div class="callout">
+        In native scrollback mode, <code>render_main()</code> renders only the active viewport in the Ratatui body. The already-committed transcript is above it in native terminal scrollback.
+      </div>
+      <p>The layout then calls <code>main_layout_areas(..., attach_bottom_to_body = true)</code>. In this mode the body is placed at the top of the current Ratatui frame, the composer is placed directly under it, and the remaining blank space goes below the composer.</p>
+      <p>That was meant to keep the composer attached to active output. But visually, when the native scrollback above the frame is also visible in the terminal, the small active subagent block can look like it lands in the middle of the total viewport instead of growing from the bottom.</p>
+    </div>
+  </div>
+
+  <h2>4. The Two Rendering Paths</h2>
+  <div class="grid">
+    <div class="card">
+      <h3>Native scrollback active</h3>
+      <div class="mini-code">render_main()
+  body = active_viewport_lines_with_stream_skip(...)
+  attach_bottom_to_body = native_scrollback_active && !body.is_empty()
+  main_layout_areas(...)
+
+Result:
+  committed transcript = terminal scrollback
+  active subagent block = Ratatui body
+  composer = Ratatui bottom pane</div>
+    </div>
+    <div class="card">
+      <h3>Native scrollback inactive</h3>
+      <div class="mini-code">work_lines()
+  lines = all_scrollback_lines(model)
+  if running:
+    lines += active_viewport_lines(model)
+
+Result:
+  committed transcript + active block
+  are one Ratatui body list
+  then visible_main_body_lines crops it</div>
+    </div>
+  </div>
+
+  <h2>5. Diagnosis</h2>
+  <div class="callout">
+    The subagent content itself is a compact summary, not raw child output. The placement issue is layout-level: in native scrollback mode the active body is small, the composer attaches immediately below it, and the spacer sits below the composer. That can make the active subagent block feel centered or floating instead of bottom-aligned with the composer at the terminal bottom.
+  </div>
+  <p>If the desired convention is “output grows downward until the composer reaches the bottom, then old lines scroll upward,” the subagent active block should follow the same visual-space rule as other live output: active output plus composer should be bottom-docked when there is spare frame height, while committed output remains native scrollback.</p>
+</main>
+</body>
+</html>

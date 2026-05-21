@@ -4392,14 +4392,11 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("whats happening"));
-        assert!(screen.contains(": subagent repo-explorer"));
+        assert!(screen.contains(": subagent repo-explorer started"));
+        assert!(screen.contains(": subagent repo-explorer finished"));
         assert!(!screen.contains(": answer"));
-        assert!(screen.contains("Purpose: Rust-first terminal workbench"));
-        assert!(screen.contains("crates/browser-use-tui"));
-        assert!(screen.contains(": subagent repo-explorer"));
-        assert!(screen.contains("finished"));
-        assert!(!screen.contains("repo-explorer started"));
-        assert!(!screen.contains("repo-explorer finished"));
+        assert!(!screen.contains("Purpose: Rust-first terminal workbench"));
+        assert!(!screen.contains("crates/browser-use-tui"));
         assert!(!screen.contains("helper finished: Repository summary"));
         assert!(!screen.contains("**Purpose:**"));
         Ok(())
@@ -5800,7 +5797,7 @@ mod redesign_tests {
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("write as it streams"));
-        assert!(!text.contains("repo-explorer started"));
+        assert!(text.contains("repo-explorer started"));
         assert!(!text.contains("waiting for GPT-5.5"));
         assert!(!text.contains("start repo-explorer helper"));
         assert!(!text.contains(": answer draft"));
@@ -5880,7 +5877,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn child_agent_progress_is_summarized_in_parent_live_view() -> Result<()> {
+    fn child_agent_progress_commits_only_lifecycle_rows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5934,11 +5931,9 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": subagent"));
-        assert!(screen.contains("repo-explorer"));
-        assert!(screen.contains(": subagent repo-explorer"));
-        assert!(screen.contains("working"));
-        assert!(screen.contains("read /repo/README.md"));
+        assert!(screen.contains(": subagent repo-explorer started"));
+        assert!(!screen.contains("working"));
+        assert!(!screen.contains("read /repo/README.md"));
         assert!(!screen.contains("writing Mapping the main crates."));
         assert!(!screen.contains("Mapping the main crates."));
         assert!(!screen.contains("spawn_agent requested"));
@@ -5948,7 +5943,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn transcript_active_child_owns_live_view() -> Result<()> {
+    fn active_child_keeps_live_view_empty() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -6000,9 +5995,7 @@ mod redesign_tests {
         let model = transcript::transcript_model(&app, &state).expect("model");
         let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
 
-        assert!(text.contains(": subagent repo-explorer"));
-        assert!(text.contains("working"));
-        assert!(text.contains("read /repo/README.md"));
+        assert!(text.is_empty(), "{text}");
         assert!(!text.contains("writing Mapping the main crates."));
         assert!(!text.contains("Mapping the main crates."));
         assert!(!text.contains("spawn_agent requested"));
@@ -6011,7 +6004,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn active_child_progress_uses_available_viewport_before_summarizing() -> Result<()> {
+    fn active_child_progress_stays_out_of_parent_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -6047,8 +6040,9 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("read /repo/file-1.rs"));
-        assert!(screen.contains("read /repo/file-12.rs"));
+        assert!(screen.contains(": subagent repo-explorer started"));
+        assert!(!screen.contains("read /repo/file-1.rs"));
+        assert!(!screen.contains("read /repo/file-12.rs"));
         assert!(!screen.contains("waiting for gpt-5.5"));
         Ok(())
     }
@@ -6190,7 +6184,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn parent_live_view_shows_subagent_wait_target() -> Result<()> {
+    fn parent_live_view_hides_subagent_wait_target() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -6233,8 +6227,8 @@ mod redesign_tests {
         app.selected_session_id = Some(parent.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains(": subagent"));
-        assert!(screen.contains("waiting on repo_explorer"));
+        assert!(screen.contains(": subagent repo_explorer started"));
+        assert!(!screen.contains("waiting on repo_explorer"));
         Ok(())
     }
 
@@ -6291,12 +6285,10 @@ mod redesign_tests {
         let text = lines_plain_text(&lines);
 
         assert!(text.contains("explain this repo"));
-        assert!(!text.contains("repo-explorer started"));
-        assert!(text.contains("subagent repo-explorer"));
-        assert!(text.contains("read /repo/README.md"));
-        assert!(text.contains("finished"));
-        assert!(!text.contains("subagent finished"));
-        assert!(text.contains("Short helper summary"));
+        assert!(text.contains("subagent repo-explorer started"));
+        assert!(text.contains("subagent repo-explorer finished"));
+        assert!(!text.contains("read /repo/README.md"));
+        assert!(!text.contains("Short helper summary"));
         assert!(!text.contains("read every repo file"));
         assert!(!text.contains("CHILD FULL DETAILS SHOULD NOT BE TOP LEVEL"));
         Ok(())
@@ -6908,10 +6900,9 @@ mod redesign_tests {
         let model = transcript::transcript_model(&app, &state).expect("model");
         let text = lines_plain_text(&transcript::all_scrollback_lines(&model, 100));
 
-        assert!(text.contains("subagent repo-explorer"));
-        assert!(text.contains("finished"));
-        assert!(!text.contains("repo-explorer started"));
-        assert!(text.contains("Repository inspected read-only."));
+        assert!(text.contains("subagent repo-explorer started"));
+        assert!(text.contains("subagent repo-explorer finished"));
+        assert!(!text.contains("Repository inspected read-only."));
         assert!(text.contains("This repo is a Rust terminal workbench."));
         assert!(!text.contains("SECRET_CHILD_ONLY.md"));
         Ok(())
