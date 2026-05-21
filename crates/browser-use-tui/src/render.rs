@@ -2112,7 +2112,7 @@ fn append_task_section(lines: &mut Vec<Line<'static>>, state: &WorkbenchState) {
 
 fn event_marker_line(title: &str) -> Line<'static> {
     Line::from(vec![
-        Span::styled(": ", event_marker_style(title)),
+        Span::styled("• ", event_marker_style(title)),
         Span::styled(title.to_string(), event_marker_style(title)),
     ])
 }

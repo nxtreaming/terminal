@@ -554,7 +554,7 @@ def smoke_tall_terminal_keeps_running_controls_attached_to_content(binary: Path)
         )
         assert_not_contains(
             full,
-            ": answer draft",
+            "• answer draft",
             "streaming chunks should stay in the live viewport, not permanent scrollback",
         )
     finally:
@@ -898,7 +898,7 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "model.turn.response",
             {"tool_call_count": 1, "turn_idx": 1},
         )
-        wait_for(session, ": note", "prompt-only-followup-note")
+        wait_for(session, "• note", "prompt-only-followup-note")
         note_visible = capture_after_idle(
             session,
             "prompt-only-followup-note-visible",
@@ -907,7 +907,7 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         assert_line_directly_followed_by(
             note_visible,
             "> yo",
-            ": note",
+            "• note",
             "note commit should not inject a blank line after the submitted prompt",
         )
         assert_count(

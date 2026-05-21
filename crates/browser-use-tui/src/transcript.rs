@@ -13,6 +13,8 @@ use crate::theme::{
 
 use super::App;
 
+const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
+const GROUP_VALUE_LAST_PREFIX: &str = "  └ ";
 const ACTIVE_LIVE_LINE_LIMIT: usize = 48;
 const ACTIVE_FALLBACK_STATUS: &str = "running browser task";
 
@@ -162,14 +164,30 @@ impl TranscriptNode {
             }
             TranscriptKind::Timeline { group, lines, .. }
             | TranscriptKind::ActiveStatus { group, lines, .. } => {
-                let mut out = vec![format!(": {group}")];
-                out.extend(lines.iter().cloned());
+                let mut out = vec![format!("• {group}")];
+                let last_idx = lines.len().saturating_sub(1);
+                out.extend(lines.iter().enumerate().map(|(idx, line)| {
+                    let prefix = if idx == last_idx {
+                        GROUP_VALUE_LAST_PREFIX
+                    } else {
+                        GROUP_VALUE_RAIL_PREFIX
+                    };
+                    format!("{prefix}{line}")
+                }));
                 out
             }
             TranscriptKind::Error { text } => {
-                vec![": error".to_string(), friendly_error_message(text)]
+                vec![
+                    "• error".to_string(),
+                    format!("{GROUP_VALUE_LAST_PREFIX}{}", friendly_error_message(text)),
+                ]
             }
-            TranscriptKind::Cancelled { text } => vec![format!(": stopped"), text.clone()],
+            TranscriptKind::Cancelled { text } => {
+                vec![
+                    "• stopped".to_string(),
+                    format!("{GROUP_VALUE_LAST_PREFIX}{text}"),
+                ]
+            }
         }
     }
 
@@ -800,6 +818,7 @@ fn merge_timeline_node(last: &mut TranscriptNode, next: &TranscriptNode) -> bool
                 *lines = next_lines.clone();
             } else {
                 lines.extend(next_lines.clone());
+                compact_repeated_read_lines(lines);
             }
             last.id = next.id.clone();
             last.seq = next.seq;
@@ -808,6 +827,38 @@ fn merge_timeline_node(last: &mut TranscriptNode, next: &TranscriptNode) -> bool
         }
         _ => false,
     }
+}
+
+fn compact_repeated_read_lines(lines: &mut Vec<String>) {
+    let mut compacted = Vec::with_capacity(lines.len());
+    let mut reads = Vec::new();
+
+    for line in lines.drain(..) {
+        if let Some(path) = read_line_path(&line) {
+            reads.push(path.to_string());
+        } else {
+            flush_read_lines(&mut compacted, &mut reads);
+            compacted.push(line);
+        }
+    }
+    flush_read_lines(&mut compacted, &mut reads);
+
+    *lines = compacted;
+}
+
+fn read_line_path(line: &str) -> Option<&str> {
+    line.strip_prefix("read ")
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+}
+
+fn flush_read_lines(out: &mut Vec<String>, reads: &mut Vec<String>) {
+    match reads.len() {
+        0 => {}
+        1 => out.push(format!("read {}", reads[0])),
+        _ => out.push(format!("read {}", reads.join(", "))),
+    }
+    reads.clear();
 }
 
 fn model_turn_response_node(app: &App, event: &EventRecord) -> Option<TranscriptNode> {
@@ -1509,17 +1560,30 @@ fn grouped_lines(
 ) -> Vec<Line<'static>> {
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
-        Span::styled(": ", dim()),
+        Span::styled("• ", dim()),
         Span::styled(group.to_string(), group_style(style)),
     ]));
     let value_style = body_style(style);
-    let content_width = width.saturating_sub(2).max(1);
-    for value in values {
-        for (_, wrapped) in wrap_plain(value, content_width) {
-            let mut spans = vec![Span::raw("  ")];
-            spans.extend(styled_value_spans(group, &wrapped, value_style));
-            lines.push(Line::from(spans));
-        }
+    let prefix_width = display_width(GROUP_VALUE_LAST_PREFIX) as u16;
+    let content_width = width.saturating_sub(prefix_width).max(1);
+    let value_rows = values
+        .iter()
+        .flat_map(|value| {
+            wrap_plain(value, content_width)
+                .into_iter()
+                .map(|(_, row)| row)
+        })
+        .collect::<Vec<_>>();
+    let last_idx = value_rows.len().saturating_sub(1);
+    for (idx, wrapped) in value_rows.into_iter().enumerate() {
+        let prefix = if idx == last_idx {
+            GROUP_VALUE_LAST_PREFIX
+        } else {
+            GROUP_VALUE_RAIL_PREFIX
+        };
+        let mut spans = vec![Span::styled(prefix.to_string(), dim())];
+        spans.extend(styled_value_spans(group, &wrapped, value_style));
+        lines.push(Line::from(spans));
     }
     lines
 }
@@ -2285,6 +2349,72 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "First answer.");
         assert_eq!(line_text(&lines[1]), "");
         assert_eq!(line_text(&lines[2]), "> which chrome profiles do i have");
+    }
+
+    #[test]
+    fn merging_timeline_nodes_compacts_consecutive_reads() {
+        let mut last = TranscriptNode {
+            id: "first".to_string(),
+            seq: 1,
+            revision: 1,
+            kind: TranscriptKind::Timeline {
+                group: "explored".to_string(),
+                lines: vec!["read README.md".to_string()],
+                style: NodeStyle::Normal,
+            },
+        };
+        let next = TranscriptNode {
+            id: "second".to_string(),
+            seq: 2,
+            revision: 2,
+            kind: TranscriptKind::Timeline {
+                group: "explored".to_string(),
+                lines: vec![
+                    "read Cargo.toml".to_string(),
+                    "list . (10 items)".to_string(),
+                    "read Taskfile.yml".to_string(),
+                ],
+                style: NodeStyle::Normal,
+            },
+        };
+
+        assert!(merge_timeline_node(&mut last, &next));
+        let TranscriptKind::Timeline { lines, .. } = &last.kind else {
+            panic!("expected timeline node");
+        };
+        assert_eq!(
+            lines,
+            &[
+                "read README.md, Cargo.toml".to_string(),
+                "list . (10 items)".to_string(),
+                "read Taskfile.yml".to_string(),
+            ]
+        );
+    }
+
+    #[test]
+    fn grouped_timeline_values_are_visually_nested_under_header() {
+        let node = TranscriptNode {
+            id: "test".to_string(),
+            seq: 1,
+            revision: 1,
+            kind: TranscriptKind::Timeline {
+                group: "explored".to_string(),
+                lines: vec![
+                    "read Taskfile.yml Cargo.toml README.md".to_string(),
+                    "list . (200 items)".to_string(),
+                ],
+                style: NodeStyle::Normal,
+            },
+        };
+
+        let lines = node.display_lines(24, DisplayMode::Scrollback);
+        assert_eq!(line_text(&lines[0]), "• explored");
+        assert!(line_text(&lines[1]).starts_with(GROUP_VALUE_RAIL_PREFIX));
+        assert!(line_text(&lines[1]).contains("read"));
+        assert!(line_text(&lines[2]).starts_with(GROUP_VALUE_RAIL_PREFIX));
+        assert!(line_text(&lines[3]).starts_with(GROUP_VALUE_LAST_PREFIX));
+        assert!(line_text(&lines[3]).contains("list"));
     }
 
     #[test]
