@@ -28,6 +28,7 @@ pub(crate) enum DisplayMode {
 pub(crate) struct TranscriptModel {
     pub(crate) session_id: String,
     pub(crate) committed: Vec<TranscriptNode>,
+    terminal_committed: Vec<TranscriptNode>,
     pub(crate) active: Option<TranscriptNode>,
     pub(crate) last_event_seq: i64,
     pub(crate) revision: u64,
@@ -271,9 +272,11 @@ pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<Tran
     let events = app.cached_events_for_session(&session.id);
     let last_event_seq = events.last().map(|event| event.seq).unwrap_or_default();
     let mut committed = Vec::new();
+    let mut terminal_committed = Vec::new();
 
     for event in events {
         if let Some(node) = committed_node_for_event(app, state, session, event) {
+            terminal_committed.push(node.clone());
             push_committed_node(&mut committed, node);
         }
     }
@@ -288,6 +291,7 @@ pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<Tran
     Some(TranscriptModel {
         session_id: session.id.clone(),
         committed,
+        terminal_committed,
         active,
         last_event_seq,
         revision,
@@ -316,17 +320,25 @@ pub(crate) fn terminal_scrollback_emission_since(
     model: &TranscriptModel,
     after_seq: i64,
     width: u16,
-    _defer_pending_prompt: bool,
+    defer_open_tail: bool,
 ) -> TerminalScrollbackEmission {
-    let nodes = model
-        .committed
+    let mut nodes = Vec::new();
+    let mut last_seq = after_seq;
+    for node in model
+        .terminal_committed
         .iter()
         .filter(|node| node.seq() > after_seq)
         .filter(|node| !node.is_terminal_scrollback_transient())
-        .collect::<Vec<_>>();
-    let last_seq = nodes.last().map(|node| node.seq()).unwrap_or(after_seq);
+    {
+        last_seq = node.seq();
+        push_committed_node(&mut nodes, node.clone());
+    }
+    if defer_open_tail && nodes.last().is_some_and(is_open_timeline_node) {
+        nodes.pop();
+        last_seq = nodes.last().map(TranscriptNode::seq).unwrap_or(after_seq);
+    }
     TerminalScrollbackEmission {
-        lines: cells_to_lines(nodes.iter().copied(), width, DisplayMode::Scrollback),
+        lines: cells_to_lines(nodes.iter(), width, DisplayMode::Scrollback),
         last_seq,
     }
 }
@@ -766,8 +778,8 @@ fn committed_node_for_event(
                 .unwrap_or_else(|| "failed to write to command".to_string())],
             NodeStyle::Failed,
         )),
-        "model.turn.response" => model_turn_response_node(app, event),
         "model.turn.request"
+        | "model.turn.response"
         | "model.thinking_delta"
         | "model.turn.retry"
         | "model.stream_delta"
@@ -861,27 +873,6 @@ fn flush_read_lines(out: &mut Vec<String>, reads: &mut Vec<String>) {
     reads.clear();
 }
 
-fn model_turn_response_node(app: &App, event: &EventRecord) -> Option<TranscriptNode> {
-    if model_response_tool_call_count(event) == 0 {
-        return None;
-    }
-    let text = model_stream_text_for_response(app, event)?;
-    let mut lines = Vec::new();
-    for (idx, raw_line) in text
-        .lines()
-        .map(str::trim)
-        .filter(|line| !line.is_empty())
-        .enumerate()
-    {
-        if idx == 0 {
-            lines.push(format!("note: {raw_line}"));
-        } else {
-            lines.push(raw_line.to_string());
-        }
-    }
-    (!lines.is_empty()).then(|| timeline_node(event, "note", lines, NodeStyle::Muted))
-}
-
 fn thinking_delta_label(event: &EventRecord) -> Option<&str> {
     event
         .payload
@@ -905,70 +896,6 @@ fn model_response_tool_call_count(event: &EventRecord) -> u64 {
         .get("tool_call_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
-}
-
-fn model_stream_text_for_response(app: &App, response_event: &EventRecord) -> Option<String> {
-    let turn_idx = event_turn_idx(response_event)?;
-    let request_seq = app
-        .cached_events_for_session(&response_event.session_id)
-        .iter()
-        .rev()
-        .find(|event| {
-            event.seq < response_event.seq
-                && event.event_type == "model.turn.request"
-                && event_turn_idx(event) == Some(turn_idx)
-        })
-        .map(|event| event.seq)?;
-    let mut text = String::new();
-    for event in app.cached_events_for_session(&response_event.session_id) {
-        if event.seq <= request_seq {
-            continue;
-        }
-        if event.seq > response_event.seq {
-            break;
-        }
-        if event.event_type != "model.stream_delta" || event_turn_idx(event) != Some(turn_idx) {
-            continue;
-        }
-        if let Some(delta) = event_text_payload(event) {
-            append_live_delta_text(&mut text, delta);
-        }
-    }
-    let text = text.trim_end().to_string();
-    (!text.trim().is_empty()).then_some(text)
-}
-
-fn event_turn_idx(event: &EventRecord) -> Option<i64> {
-    event
-        .payload
-        .get("turn_idx")
-        .and_then(serde_json::Value::as_i64)
-}
-
-fn event_text_payload(event: &EventRecord) -> Option<&str> {
-    event
-        .payload
-        .get("text")
-        .and_then(serde_json::Value::as_str)
-        .filter(|text| !text.trim().is_empty())
-}
-
-fn append_live_delta_text(current: &mut String, incoming: &str) {
-    if current.is_empty() {
-        current.push_str(incoming);
-        return;
-    }
-    if incoming == current || incoming.trim() == current.trim() {
-        return;
-    }
-    if let Some(suffix) = incoming.strip_prefix(current.as_str()) {
-        current.push_str(suffix);
-        return;
-    }
-    if incoming.chars().count() >= 24 && current.ends_with(incoming) {
-        return;
-    }
-    current.push_str(incoming);
 }
 
 fn active_node_for_session(
@@ -1046,6 +973,12 @@ fn active_node_for_session(
         });
     }
 
+    if app.native_scrollback_is_active() && live_streaming_text.is_none() {
+        if let Some(node) = active_timeline_tail_node(app, state, root, live_events) {
+            active_nodes.push(node);
+        }
+    }
+
     if !active_nodes.is_empty() {
         let seq = events.last().map(|event| event.seq).unwrap_or_default();
         return Some(TranscriptNode {
@@ -1074,6 +1007,49 @@ fn active_node_for_session(
         vec![ACTIVE_FALLBACK_STATUS.to_string()],
         NodeStyle::Muted,
     ))
+}
+
+fn active_timeline_tail_node(
+    app: &App,
+    state: &WorkbenchState,
+    root: &SessionMeta,
+    live_events: &[EventRecord],
+) -> Option<TranscriptNode> {
+    let nodes = live_events
+        .iter()
+        .filter_map(|event| committed_node_for_event(app, state, root, event))
+        .filter(|node| !node.is_terminal_scrollback_transient())
+        .collect::<Vec<_>>();
+    let last = nodes.last()?;
+    let key = timeline_merge_key(last)?;
+    if !is_open_timeline_node(last) {
+        return None;
+    }
+
+    let mut start = nodes.len().saturating_sub(1);
+    while start > 0 && timeline_merge_key(&nodes[start - 1]) == Some(key) {
+        start -= 1;
+    }
+
+    let mut tail = Vec::new();
+    for node in nodes[start..].iter().cloned() {
+        push_committed_node(&mut tail, node);
+    }
+    tail.into_iter().next()
+}
+
+fn is_open_timeline_node(node: &TranscriptNode) -> bool {
+    matches!(
+        &node.kind,
+        TranscriptKind::Timeline { style, .. } if *style != NodeStyle::Failed
+    )
+}
+
+fn timeline_merge_key(node: &TranscriptNode) -> Option<(&str, NodeStyle)> {
+    match &node.kind {
+        TranscriptKind::Timeline { group, style, .. } => Some((group.as_str(), *style)),
+        _ => None,
+    }
 }
 
 fn pending_followup_active_node(
@@ -1561,7 +1537,7 @@ fn grouped_lines(
     let mut lines = Vec::new();
     lines.push(Line::from(vec![
         Span::styled("• ", dim()),
-        Span::styled(group.to_string(), group_style(style)),
+        Span::styled(group.to_string(), group_label_style(group, style)),
     ]));
     let value_style = body_style(style);
     let prefix_width = display_width(GROUP_VALUE_LAST_PREFIX) as u16;
@@ -1671,6 +1647,17 @@ fn activity_action_style(action: &str) -> Style {
         "artifact" | "task" | "follow-up" => activity_task(),
         "working" | "waiting" => thought(),
         _ => group_style(NodeStyle::Normal),
+    }
+}
+
+fn group_label_style(group: &str, style: NodeStyle) -> Style {
+    match group.split_whitespace().next() {
+        Some("subagent") => thought(),
+        Some("run") => activity_run(),
+        Some("explored") => activity_group(),
+        Some("browser") => activity_search(),
+        Some("edit") | Some("plan") | Some("context") => activity_task(),
+        _ => group_style(style),
     }
 }
 
@@ -2393,6 +2380,73 @@ mod tests {
     }
 
     #[test]
+    fn terminal_scrollback_emits_only_new_timeline_delta() {
+        let raw_nodes = vec![
+            TranscriptNode {
+                id: "first".to_string(),
+                seq: 1,
+                revision: 1,
+                kind: TranscriptKind::Timeline {
+                    group: "explored".to_string(),
+                    lines: vec!["read README.md".to_string()],
+                    style: NodeStyle::Normal,
+                },
+            },
+            TranscriptNode {
+                id: "second".to_string(),
+                seq: 2,
+                revision: 2,
+                kind: TranscriptKind::Timeline {
+                    group: "explored".to_string(),
+                    lines: vec!["read Cargo.toml".to_string()],
+                    style: NodeStyle::Normal,
+                },
+            },
+            TranscriptNode {
+                id: "third".to_string(),
+                seq: 3,
+                revision: 3,
+                kind: TranscriptKind::Timeline {
+                    group: "explored".to_string(),
+                    lines: vec!["read Taskfile.yml".to_string()],
+                    style: NodeStyle::Normal,
+                },
+            },
+        ];
+        let mut committed = Vec::new();
+        for node in raw_nodes.clone() {
+            push_committed_node(&mut committed, node);
+        }
+        let model = TranscriptModel {
+            session_id: "session".to_string(),
+            committed,
+            terminal_committed: raw_nodes,
+            active: None,
+            last_event_seq: 3,
+            revision: 3,
+        };
+
+        let full = terminal_scrollback_emission_since(&model, 0, 120, false);
+        let full_text = full
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(full_text.contains("read README.md, Cargo.toml, Taskfile.yml"));
+
+        let delta = terminal_scrollback_emission_since(&model, 1, 120, false);
+        let delta_text = delta
+            .lines
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(delta_text.contains("read Cargo.toml, Taskfile.yml"));
+        assert!(!delta_text.contains("README.md"), "{delta_text}");
+    }
+
+    #[test]
     fn grouped_timeline_values_are_visually_nested_under_header() {
         let node = TranscriptNode {
             id: "test".to_string(),
@@ -2541,5 +2595,27 @@ mod tests {
         assert_ne!(activity_list(), activity_search());
         assert_ne!(activity_list(), activity_task());
         assert_ne!(activity_search(), activity_task());
+    }
+
+    #[test]
+    fn timeline_group_labels_use_domain_styles() {
+        assert_eq!(
+            group_label_style("subagent repo_explorer started", NodeStyle::Normal),
+            thought()
+        );
+        assert_eq!(group_label_style("run", NodeStyle::Normal), activity_run());
+        assert_eq!(group_label_style("run", NodeStyle::Muted), activity_run());
+        assert_eq!(
+            group_label_style("explored", NodeStyle::Normal),
+            activity_group()
+        );
+        assert_ne!(
+            group_label_style("subagent repo_explorer started", NodeStyle::Normal),
+            group_label_style("explored", NodeStyle::Normal)
+        );
+        assert_ne!(
+            group_label_style("run", NodeStyle::Normal),
+            group_label_style("explored", NodeStyle::Normal)
+        );
     }
 }

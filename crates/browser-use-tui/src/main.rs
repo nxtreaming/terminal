@@ -5507,7 +5507,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn pre_tool_streaming_text_renders_as_model_note_not_answer() -> Result<()> {
+    fn pre_tool_streaming_text_is_hidden_after_tool_call_response() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5554,15 +5554,15 @@ mod redesign_tests {
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("• note"));
-        assert!(screen.contains("note: Need more targeted."));
+        assert!(!screen.contains("• note"));
+        assert!(!screen.contains("Need more targeted."));
         assert!(screen.contains("Final answer from session.done."));
         assert!(!screen.contains("• answer draft"));
         Ok(())
     }
 
     #[test]
-    fn tool_call_note_does_not_reuse_text_from_prior_turn() -> Result<()> {
+    fn tool_call_response_does_not_render_prior_turn_text() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5615,6 +5615,7 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Done."));
+        assert!(!screen.contains("• note"));
         assert!(
             !screen.contains("Old answer should not become a note."),
             "{screen}"
@@ -6700,7 +6701,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn tool_call_stream_note_does_not_duplicate_active_text() -> Result<()> {
+    fn tool_call_response_hides_committed_stream_text() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -6760,27 +6761,20 @@ mod redesign_tests {
         );
         let note_text = lines_plain_text(&note_emission.lines);
         assert!(!note_text.contains("> can you tell me about this repo?"));
-        assert!(note_text.starts_with("• note"));
-        assert!(note_text.contains("note: Yoooo! What can I help you with?"));
+        assert!(!note_text.contains("• note"));
+        assert!(!note_text.contains("Yoooo! What can I help you with?"));
         let replay_emission =
             transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
         let replay_text = lines_plain_text(&replay_emission.lines);
         let replay_lines = replay_text.lines().collect::<Vec<_>>();
-        let prompt_idx = replay_lines
-            .iter()
-            .position(|line| line.contains("> can you tell me about this repo?"))
-            .expect("replay should contain prompt");
-        let note_idx = replay_lines
-            .iter()
-            .position(|line| line.contains("• note"))
-            .expect("replay should contain note");
-        assert!(note_idx > prompt_idx, "{replay_text}");
         assert!(
-            replay_lines[prompt_idx + 1..note_idx]
+            replay_lines
                 .iter()
-                .all(|line| line.trim().is_empty()),
+                .any(|line| line.contains("> can you tell me about this repo?")),
             "{replay_text}"
         );
+        assert!(!replay_text.contains("• note"));
+        assert!(!replay_text.contains("Yoooo! What can I help you with?"));
 
         app.args.width = 120;
         app.args.height = 28;
@@ -6790,6 +6784,106 @@ mod redesign_tests {
             0,
             "stream text committed as a note should not be duplicated in the active viewport\n{active_screen}"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn native_activity_tail_grows_in_active_view_until_next_block() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "greet me"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Hello! How can I help you today?"}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let done_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), done_seq);
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "inspect repo".to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "README.md"}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let prompt_emission =
+            transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
+        let prompt_text = lines_plain_text(&prompt_emission.lines);
+        assert!(prompt_text.contains("> inspect repo"));
+        assert!(!prompt_text.contains("README.md"), "{prompt_text}");
+        let active_text =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(active_text.contains("• explored"), "{active_text}");
+        assert!(active_text.contains("read README.md"), "{active_text}");
+
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "Cargo.toml"}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let deferred = transcript::terminal_scrollback_emission_since(
+            &model,
+            prompt_emission.last_seq,
+            120,
+            true,
+        );
+        assert!(
+            lines_plain_text(&deferred.lines).trim().is_empty(),
+            "{}",
+            lines_plain_text(&deferred.lines)
+        );
+        let active_text =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(
+            active_text.contains("read README.md, Cargo.toml"),
+            "{active_text}"
+        );
+
+        app.store.append_event(
+            &session.id,
+            "command.started",
+            serde_json::json!({"cmd": "git status --short"}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let flushed = transcript::terminal_scrollback_emission_since(
+            &model,
+            prompt_emission.last_seq,
+            120,
+            true,
+        );
+        let flushed_text = lines_plain_text(&flushed.lines);
+        assert!(
+            flushed_text.contains("read README.md, Cargo.toml"),
+            "{flushed_text}"
+        );
+        assert!(
+            !flushed_text.contains("git status --short"),
+            "{flushed_text}"
+        );
+        let active_text =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(active_text.contains("git status --short"), "{active_text}");
+        assert!(!active_text.contains("README.md"), "{active_text}");
         Ok(())
     }
 

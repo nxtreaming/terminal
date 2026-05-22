@@ -898,23 +898,28 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "model.turn.response",
             {"tool_call_count": 1, "turn_idx": 1},
         )
-        wait_for(session, "• note", "prompt-only-followup-note")
-        note_visible = capture_after_idle(
+        append_store_event(
+            state_dir,
+            session_id,
+            "file.read",
+            {"path": "README.md"},
+        )
+        wait_for(session, "read README.md", "prompt-only-followup-tool-output")
+        response_visible = capture_after_idle(
             session,
-            "prompt-only-followup-note-visible",
+            "prompt-only-followup-tool-output-visible",
             visible_only=True,
         )
-        assert_line_directly_followed_by(
-            note_visible,
-            "> yo",
+        assert_not_contains(
+            response_visible,
             "• note",
-            "note commit should not inject a blank line after the submitted prompt",
+            "model turn responses with tool calls should not render note rows",
         )
         assert_count(
-            note_visible,
+            response_visible,
             "streaming now",
-            1,
-            "streaming text committed as a note should not remain duplicated in active viewport",
+            0,
+            "streaming text hidden by a tool-call response should not remain duplicated in active viewport",
         )
     finally:
         tmux("kill-session", "-t", session, check=False)
