@@ -13,7 +13,7 @@ This is the launch gate for making this repo public and posting about it. The go
 - [ ] Run the public install command against the real release from a clean machine or clean user account:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/browser-use/terminal/main/scripts/install/install.sh | sh
+curl -fsSL https://browser-use.com/terminal/install.sh | sh
 browser-use
 ```
 
@@ -48,7 +48,7 @@ browser-use-terminal update
 - [ ] Add a 60-second quickstart:
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/browser-use/terminal/main/scripts/install/install.sh | sh
+curl -fsSL https://browser-use.com/terminal/install.sh | sh
 browser-use
 ```
 

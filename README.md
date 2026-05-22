@@ -9,7 +9,7 @@ Automate the boring stuff in the browser.
 Browser Use Terminal is a Rust TUI for browser agents. It can use your real browser session, headless Chromium, or Browser Use cloud to get web work done from the terminal.
 
 ```bash
-curl -fsSL https://raw.githubusercontent.com/browser-use/terminal/main/scripts/install/install.sh | sh
+curl -fsSL https://browser-use.com/terminal/install.sh | sh
 browser
 ```
 
