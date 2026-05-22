@@ -632,10 +632,23 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         )?;
     }
     let result = (|| -> Result<String> {
+        let mut python_env = options.python_env.clone();
+        if !python_env
+            .iter()
+            .any(|(key, _)| key == "BH_AGENT_WORKSPACE")
+        {
+            python_env.push((
+                "BH_AGENT_WORKSPACE".to_string(),
+                store
+                    .state_dir()
+                    .join("agent-workspace")
+                    .display()
+                    .to_string(),
+            ));
+        }
         let mut worker = PythonWorker::start_with_browser_mode_and_env(
             options.browser_mode.as_deref(),
-            options
-                .python_env
+            python_env
                 .iter()
                 .map(|(key, value)| (key.as_str(), value.as_str())),
         )?;

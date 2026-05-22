@@ -92,6 +92,9 @@ impl PythonWorker {
     {
         let cwd = std::env::current_dir()?;
         let mut paths = Vec::new();
+        if let Some(path) = installed_python_path() {
+            paths.push(path);
+        }
         let repo_root = Path::new(env!("CARGO_MANIFEST_DIR"))
             .parent()
             .and_then(Path::parent)
@@ -110,10 +113,6 @@ impl PythonWorker {
         }
         if let Some(path) = std::env::var_os("BROWSER_HARNESS_SRC") {
             paths.push(path.into());
-        }
-        let local_harness = Path::new("/Users/greg/Developer/browser-harness/src");
-        if local_harness.exists() {
-            paths.push(local_harness.to_path_buf());
         }
         if let Some(path) = std::env::var_os("PYTHONPATH") {
             paths.extend(std::env::split_paths(&path));
@@ -411,6 +410,17 @@ impl PythonWorker {
             return Ok(value.get("data").cloned());
         }
     }
+}
+
+fn installed_python_path() -> Option<PathBuf> {
+    let exe = std::env::current_exe().ok()?;
+    let exe_dir = exe.parent()?;
+    let release_python = exe_dir.parent()?.join("python");
+    if release_python.exists() {
+        return Some(release_python);
+    }
+    let sibling_python = exe_dir.join("python");
+    sibling_python.exists().then_some(sibling_python)
 }
 
 fn spawn_python_worker(

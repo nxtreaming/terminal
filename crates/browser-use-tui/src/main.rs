@@ -28,7 +28,7 @@ use browser_use_providers::{
     ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH,
     CLAUDE_CODE_CALLBACK_PORT,
 };
-use browser_use_store::{Store, StoreNotification, StoreNotifier};
+use browser_use_store::{resolve_state_dir, Store, StoreNotification, StoreNotifier};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
@@ -74,7 +74,7 @@ use settings::{
     browser_use_cloud_env_key_present, is_claude_code_account, provider_model_for_display,
     AgentBackend, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI,
     ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_SETTING, MODEL_CHOICES,
+    BROWSER_USE_CLOUD_API_KEY_SETTING, MODEL_CHOICES, VISIBLE_MODEL_CHOICES,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -87,8 +87,9 @@ const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
+#[command(version)]
 struct Args {
-    #[arg(long, default_value = ".browser-use-terminal")]
+    #[arg(long, default_value = "~/.browser-use-terminal")]
     state_dir: PathBuf,
     #[arg(long, default_value = "GPT-5.5")]
     model: String,
@@ -271,6 +272,7 @@ enum AppCommand {
     SignIn,
     ConfigureTelemetry,
     ChangeBrowser,
+    Update,
     SaveAccount(String),
     SaveModel(usize),
     SaveBrowser(usize),
@@ -675,7 +677,8 @@ impl NativeHistoryState {
 }
 
 impl App {
-    fn new(args: Args) -> Result<Self> {
+    fn new(mut args: Args) -> Result<Self> {
+        args.state_dir = resolve_state_dir(&args.state_dir);
         let (store_tx, store_rx) = mpsc::channel();
         let store = Store::open_with_notifier(&args.state_dir, store_tx)?;
         seed_demo_if_requested(&store, args.seed_demo.as_deref())?;
@@ -1035,6 +1038,7 @@ impl App {
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
+            AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
             AppCommand::SaveModel(index) => self.save_model(index)?,
             AppCommand::SaveBrowser(index) => self.save_browser(index)?,
@@ -1439,7 +1443,14 @@ impl App {
                 _ => self.cancel_secret_entry(),
             },
             Surface::Model => {
-                self.dispatch(AppCommand::SaveModel(self.selected_row))?;
+                let model_index = VISIBLE_MODEL_CHOICES
+                    .get(
+                        self.selected_row
+                            .min(VISIBLE_MODEL_CHOICES.len().saturating_sub(1)),
+                    )
+                    .copied()
+                    .unwrap_or(0);
+                self.dispatch(AppCommand::SaveModel(model_index))?;
             }
             Surface::Browser => match self.selected_row.min(2) {
                 0 => self.dispatch(AppCommand::OpenBrowser)?,
@@ -1655,6 +1666,20 @@ impl App {
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
             PaletteAction::ConfigureLaminar => self.dispatch(AppCommand::ConfigureTelemetry)?,
+            PaletteAction::Update => self.dispatch(AppCommand::Update)?,
+        }
+        Ok(())
+    }
+
+    fn run_update(&mut self) -> Result<()> {
+        self.status_notice = Some("Checking for browser-use terminal updates...".to_string());
+        match run_update_installer() {
+            Ok(message) => {
+                self.status_notice = Some(message);
+            }
+            Err(error) => {
+                self.status_notice = Some(format!("Update failed: {error:#}"));
+            }
         }
         Ok(())
     }
@@ -2041,7 +2066,7 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
-            Surface::Model => MODEL_CHOICES.len(),
+            Surface::Model => VISIBLE_MODEL_CHOICES.len(),
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::History => self.workbench_state()?.history.len(),
@@ -2427,6 +2452,81 @@ fn auth_secret_label(account: &str) -> &'static str {
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "credential",
     }
+}
+
+#[cfg(not(test))]
+fn run_update_installer() -> Result<String> {
+    let source = std::env::var("BUT_INSTALL_SCRIPT")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .or_else(|| local_install_script_path().map(|path| path.display().to_string()));
+
+    let output = if let Some(source) = source {
+        if source.starts_with("https://") || source.starts_with("http://") {
+            run_remote_install_script(&source)?
+        } else {
+            std::process::Command::new("sh")
+                .arg(&source)
+                .arg("--no-launch")
+                .output()
+                .with_context(|| format!("run installer script {source}"))?
+        }
+    } else {
+        let repo = std::env::var("BUT_RELEASE_REPO")
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .unwrap_or_else(|| "browser-use/terminal".to_string());
+        let url =
+            format!("https://raw.githubusercontent.com/{repo}/main/scripts/install/install.sh");
+        run_remote_install_script(&url)?
+    };
+
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        let stdout = String::from_utf8_lossy(&output.stdout);
+        let detail = stderr.trim();
+        if !detail.is_empty() {
+            anyhow::bail!("{detail}");
+        }
+        anyhow::bail!("{}", stdout.trim());
+    }
+
+    Ok("Update installed. Restart browser-use terminal to use the latest release.".to_string())
+}
+
+#[cfg(test)]
+fn run_update_installer() -> Result<String> {
+    Ok("Update command is available.".to_string())
+}
+
+#[cfg(not(test))]
+fn local_install_script_path() -> Option<PathBuf> {
+    Path::new(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(|root| root.join("scripts/install/install.sh"))
+        .filter(|path| path.is_file())
+}
+
+#[cfg(not(test))]
+fn run_remote_install_script(url: &str) -> Result<std::process::Output> {
+    let script = r#"
+if command -v curl >/dev/null 2>&1; then
+  curl -fsSL "$1"
+elif command -v wget >/dev/null 2>&1; then
+  wget -q -O - "$1"
+else
+  echo "curl or wget is required to update browser-use terminal." >&2
+  exit 1
+fi | sh -s -- --no-launch
+"#;
+    std::process::Command::new("sh")
+        .arg("-c")
+        .arg(script)
+        .arg("browser-use-terminal-update")
+        .arg(url)
+        .output()
+        .with_context(|| format!("download and run installer script {url}"))
 }
 
 #[cfg(not(test))]
@@ -3997,7 +4097,7 @@ mod redesign_tests {
         assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("CHOOSE PROVIDER"));
         assert!(screen.contains("Codex login"));
-        assert!(screen.contains("Claude Code subscription"));
+        assert!(!screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
         assert!(screen.contains("click me!"));
         assert!(!screen.contains("click logo"));
@@ -4188,6 +4288,10 @@ mod redesign_tests {
             app.model_configured = true;
             app.store.set_setting("setup.complete", "1")?;
             app.open_surface(Surface::BrowserSelect);
+            app.selected_row = BROWSER_CHOICES
+                .iter()
+                .position(|browser| *browser == BROWSER_USE_CLOUD)
+                .context("cloud browser choice")?;
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
@@ -4217,7 +4321,7 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         app.open_surface(Surface::Account);
-        app.selected_row = 4;
+        app.selected_row = 3;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ApiKey);
         for ch in "sk-or-v1-test".chars() {
@@ -4247,7 +4351,7 @@ mod redesign_tests {
             let temp = tempfile::tempdir()?;
             let mut app = App::new(args(&temp))?;
             app.open_surface(Surface::Model);
-            app.selected_row = 7;
+            app.selected_row = 5;
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.model, "Kimi K2.5");
             assert_eq!(app.account, "OpenRouter API key");
@@ -4513,7 +4617,7 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         app.open_surface(Surface::Account);
-        app.selected_row = 4;
+        app.selected_row = 3;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ApiKey);
         for ch in "sk-or-v1-test".chars() {
@@ -4729,37 +4833,37 @@ mod redesign_tests {
         app.selected_row = 1;
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Claude Code subscription"));
+        assert!(!screen.contains("Claude Code subscription"));
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
 
-        assert_eq!(app.surface, Surface::SetupConfirm);
-        assert_eq!(
-            app.setup_pending_account.as_deref(),
-            Some(settings::ACCOUNT_CLAUDE_CODE)
-        );
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Use Claude Code subscription?"));
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-
-        assert_eq!(app.surface, Surface::SetupResult);
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Waiting for Claude Code OAuth sign-in."));
-        assert!(screen.contains("OAuth link:"));
-        assert!(!screen.contains("Run this in"));
-
-        app.open_surface(Surface::Setup);
-        app.selected_row = 2;
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
         assert_eq!(
             app.setup_pending_account.as_deref(),
             Some(settings::ACCOUNT_OPENAI)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Use OpenAI API key?"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENAI)
+        );
+
+        app.open_surface(Surface::Setup);
+        app.selected_row = 3;
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::SetupConfirm);
+        assert_eq!(
+            app.setup_pending_account.as_deref(),
+            Some(settings::ACCOUNT_OPENROUTER)
         );
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ApiKey);
         assert_eq!(
             app.api_key_account.as_deref(),
-            Some(settings::ACCOUNT_OPENAI)
+            Some(settings::ACCOUNT_OPENROUTER)
         );
         Ok(())
     }
@@ -4868,101 +4972,52 @@ mod redesign_tests {
     }
 
     #[test]
-    fn onboarding_claude_code_oauth_uses_default_model_without_model_modal() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let mut app = App::new(args(&temp))?;
-        app.selected_row = 1;
+    fn model_selector_hides_claude_code_and_routes_anthropic_to_api_key() -> Result<()> {
+        let saved_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
+        let saved_llm_browser = std::env::var("LLM_BROWSER_ANTHROPIC_API_KEY").ok();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("LLM_BROWSER_ANTHROPIC_API_KEY");
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            app.open_surface(Surface::Model);
+            app.selected_row = 3;
 
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::SetupConfirm);
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::SetupResult);
-        assert_eq!(
-            app.setup_result.as_ref().map(|result| &result.kind),
-            Some(&SetupResultKind::Pending)
-        );
+            let screen = render_dump(&mut app)?;
+            assert!(!screen.contains("Claude Code sub"));
+            assert!(!screen.contains("Claude Code subscription"));
+            assert!(!screen.contains("https://claude.ai/oauth/authorize?"));
 
-        let tx = app
-            .claude_code_oauth
-            .as_ref()
-            .and_then(|flow| flow.event_tx_guard.as_ref())
-            .expect("test OAuth sender")
-            .clone();
-        tx.send(ClaudeCodeOAuthEvent {
-            account: settings::ACCOUNT_CLAUDE_CODE.to_string(),
-            result: Ok(ClaudeCodeOAuthCredential {
-                access_token: "sk-ant-oat-onboarding".to_string(),
-                refresh_token: "refresh-onboarding".to_string(),
-                expires_ms: 5678,
-            }),
-        })
-        .expect("send test OAuth result");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.pending_model_after_auth, Some(5));
+            assert_eq!(
+                app.api_key_account.as_deref(),
+                Some(settings::ACCOUNT_ANTHROPIC)
+            );
 
-        assert!(app.drain_oauth_notifications()?);
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Connected to Claude Code."));
-        assert!(screen.contains("A default model will be selected automatically."));
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::Main);
-        assert!(app.setup_complete);
-        assert_eq!(app.account, settings::ACCOUNT_CLAUDE_CODE);
-        assert_eq!(app.model, "Claude Sonnet 4.6");
-        assert_eq!(app.provider_model, "claude-sonnet-4-6");
-        Ok(())
-    }
-
-    #[test]
-    fn model_selector_claude_code_uses_oauth_and_keeps_selected_model() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let mut app = ready_app(&temp)?;
-        app.open_surface(Surface::Model);
-        app.selected_row = 2;
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::SetupResult);
-        assert_eq!(app.pending_model_after_auth, Some(2));
-        assert_eq!(
-            app.setup_result.as_ref().map(|result| &result.kind),
-            Some(&SetupResultKind::Pending)
-        );
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("OAuth link:"));
-        assert!(screen.contains("https://claude.ai/oauth/authorize?"));
-
-        let tx = app
-            .claude_code_oauth
-            .as_ref()
-            .and_then(|flow| flow.event_tx_guard.as_ref())
-            .expect("test OAuth sender")
-            .clone();
-        tx.send(ClaudeCodeOAuthEvent {
-            account: settings::ACCOUNT_CLAUDE_CODE.to_string(),
-            result: Ok(ClaudeCodeOAuthCredential {
-                access_token: "sk-ant-oat-model".to_string(),
-                refresh_token: "refresh-model".to_string(),
-                expires_ms: 9012,
-            }),
-        })
-        .expect("send test OAuth result");
-
-        assert!(app.drain_oauth_notifications()?);
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Continue applies the selected model."));
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::Main);
-        assert_eq!(app.account, settings::ACCOUNT_CLAUDE_CODE);
-        assert_eq!(app.model, "Claude Opus 4.7");
-        assert_eq!(app.provider_model, "claude-opus-4-7");
-        Ok(())
+            app.handle_paste("sk-ant-test");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::Main);
+            assert_eq!(app.account, settings::ACCOUNT_ANTHROPIC);
+            assert_eq!(app.model, "Claude Opus 4.7");
+            assert_eq!(app.provider_model, "claude-opus-4-7");
+            Ok(())
+        })();
+        if let Some(value) = saved_anthropic {
+            std::env::set_var("ANTHROPIC_API_KEY", value);
+        }
+        if let Some(value) = saved_llm_browser {
+            std::env::set_var("LLM_BROWSER_ANTHROPIC_API_KEY", value);
+        }
+        result
     }
 
     #[test]
     fn setup_api_key_flow_keeps_key_entry_in_modal_then_confirms_saved() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
-        app.selected_row = 2;
+        app.selected_row = 1;
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
@@ -5028,7 +5083,7 @@ mod redesign_tests {
             app.open_surface(surface);
             let count = match surface {
                 Surface::Setup | Surface::Account => ACCOUNT_CHOICES.len(),
-                Surface::Model => MODEL_CHOICES.len(),
+                Surface::Model => VISIBLE_MODEL_CHOICES.len(),
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
                 _ => unreachable!(),
             };
@@ -5106,16 +5161,16 @@ mod redesign_tests {
 
         // The model picker wraps the same way.
         app.open_surface(Surface::Model);
-        for _ in 0..MODEL_CHOICES.len() - 1 {
+        for _ in 0..VISIBLE_MODEL_CHOICES.len() - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
+        assert_eq!(app.selected_row, VISIBLE_MODEL_CHOICES.len() - 1);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("DeepSeek V4 Pro"));
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.selected_row, 0);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-        assert_eq!(app.selected_row, MODEL_CHOICES.len() - 1);
+        assert_eq!(app.selected_row, VISIBLE_MODEL_CHOICES.len() - 1);
         Ok(())
     }
 
@@ -5863,11 +5918,11 @@ mod redesign_tests {
     fn file_native_links_use_the_full_url_for_each_visible_fragment() {
         let lines = vec![
             Line::from(ratatui::text::Span::styled(
-                "file:///home/alex/projects/browser-use/experiments/llm-",
+                "file:///tmp/browser-use-terminal/.browser-use-terminal/",
                 theme::link(),
             )),
             Line::from(ratatui::text::Span::styled(
-                "browser/.browser-use-terminal/artifacts/session/result.json",
+                "artifacts/session/result.json",
                 theme::link(),
             )),
         ];
@@ -5876,7 +5931,7 @@ mod redesign_tests {
         assert_eq!(hyperlinks.len(), 2);
         assert_eq!(
             hyperlinks[0].target,
-            "file:///home/alex/projects/browser-use/experiments/llm-browser/.browser-use-terminal/artifacts/session/result.json"
+            "file:///tmp/browser-use-terminal/.browser-use-terminal/artifacts/session/result.json"
         );
         assert_eq!(hyperlinks[1].target, hyperlinks[0].target);
     }

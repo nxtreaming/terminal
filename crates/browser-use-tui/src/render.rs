@@ -12,7 +12,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use crate::palette;
 use crate::settings::{
     is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES, VISIBLE_MODEL_CHOICES,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -710,11 +710,10 @@ fn command_palette_popup_rect(area: Rect) -> Option<Rect> {
     const V_MARGIN: u16 = 2;
 
     // The popup size is fixed at the full command count so the box never
-    // resizes as the user filters — empty slots stay blank below the rows.
+    // resizes as the user filters. Keep the initial height compact; commands
+    // beyond this row count are still reachable by filtering or arrow-key wrap.
     // Chrome: border(2) + input row(1) + blank(1) + footer(1) = 5.
-    let desired_h = (palette::max_item_count() as u16)
-        .saturating_add(5)
-        .max(MIN_H);
+    let desired_h = (palette::max_item_count() as u16).min(6).saturating_add(5);
 
     let popup_w = if area.width <= MIN_W {
         area.width
@@ -1808,25 +1807,35 @@ fn model_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(Line::from(""));
     }
     lines.push(Line::from(Span::styled("recommended", muted())));
-    for idx in 0..=2 {
-        lines.push(model_row(idx, app));
+    let mut row_idx = 0;
+    for &idx in VISIBLE_MODEL_CHOICES.iter().filter(|&&idx| idx == 0) {
+        lines.push(model_row(idx, row_idx, app));
+        row_idx += 1;
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("bring your own key", muted())));
-    for idx in 3..=5 {
-        lines.push(model_row(idx, app));
+    for &idx in VISIBLE_MODEL_CHOICES
+        .iter()
+        .filter(|&&idx| (3..=5).contains(&idx))
+    {
+        lines.push(model_row(idx, row_idx, app));
+        row_idx += 1;
     }
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("openrouter", muted())));
-    for idx in 6..=8 {
-        lines.push(model_row(idx, app));
+    for &idx in VISIBLE_MODEL_CHOICES
+        .iter()
+        .filter(|&&idx| (6..=8).contains(&idx))
+    {
+        lines.push(model_row(idx, row_idx, app));
+        row_idx += 1;
     }
     lines
 }
 
-fn model_row(idx: usize, app: &App) -> Line<'static> {
+fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
     let choice = MODEL_CHOICES[idx];
-    let is_selected = idx == app.selected_row;
+    let is_selected = row_idx == app.selected_row;
     let current =
         app.model_configured && app.model == choice.display && app.account == choice.account;
     let name_style = if is_selected { bold() } else { text_style() };
@@ -1883,8 +1892,8 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
         "remote browser with live view"
     };
     let descriptions = [
-        cloud_description,
         "attach to already-open browser",
+        cloud_description,
         "Rust-owned background browser",
     ];
     for (idx, browser) in BROWSER_CHOICES.iter().enumerate() {
@@ -1934,23 +1943,30 @@ fn work_lines(
     width: u16,
     product_state: ProductState,
 ) -> Vec<Line<'static>> {
-    let mut out = transcript::transcript_model(app, state)
-        .map(|model| {
-            let mut lines = transcript::all_scrollback_lines(&model, width);
-            if matches!(product_state, ProductState::Running) {
-                let active = transcript::active_viewport_lines(Some(&model), width, u16::MAX);
-                if !active.is_empty() {
-                    if !lines.is_empty() {
-                        for _ in 0..transcript::gap_before_active(&model) {
-                            lines.push(Line::from(""));
+    let mut out = Vec::new();
+    if let Some(notice) = app.status_notice.as_ref() {
+        out.push(Line::from(Span::styled(notice.clone(), muted())));
+        out.push(Line::from(""));
+    }
+    out.extend(
+        transcript::transcript_model(app, state)
+            .map(|model| {
+                let mut lines = transcript::all_scrollback_lines(&model, width);
+                if matches!(product_state, ProductState::Running) {
+                    let active = transcript::active_viewport_lines(Some(&model), width, u16::MAX);
+                    if !active.is_empty() {
+                        if !lines.is_empty() {
+                            for _ in 0..transcript::gap_before_active(&model) {
+                                lines.push(Line::from(""));
+                            }
                         }
+                        lines.extend(active);
                     }
-                    lines.extend(active);
                 }
-            }
-            lines
-        })
-        .unwrap_or_default();
+                lines
+            })
+            .unwrap_or_default(),
+    );
     if out.is_empty() {
         append_task_section(&mut out, state);
     }

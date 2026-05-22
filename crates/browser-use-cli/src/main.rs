@@ -1,4 +1,5 @@
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::fs;
 use std::io::{self, Read, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -26,7 +27,7 @@ use browser_use_providers::{
     CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
-use browser_use_store::{now_ms, Store};
+use browser_use_store::{now_ms, resolve_state_dir, Store};
 use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::Value;
@@ -34,8 +35,9 @@ use serde_json::Value;
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
 #[command(about = "Rust browser-use task control")]
+#[command(version)]
 struct Args {
-    #[arg(long, default_value = ".browser-use-terminal")]
+    #[arg(long, default_value = "~/.browser-use-terminal")]
     state_dir: PathBuf,
     #[command(subcommand)]
     command: Command,
@@ -173,6 +175,14 @@ enum Command {
     },
     WaitAgent {
         target_id: String,
+    },
+    Update {
+        #[arg(long, default_value = "latest")]
+        release: String,
+        #[arg(long)]
+        check: bool,
+        #[arg(long)]
+        install_script: Option<String>,
     },
     DatasetList,
     DatasetSample {
@@ -443,7 +453,8 @@ struct DatasetTaskPaths {
 fn main() -> Result<()> {
     install_process_crypto_provider();
     load_dotenv()?;
-    let args = Args::parse();
+    let mut args = Args::parse();
+    args.state_dir = resolve_state_dir(&args.state_dir);
     let store = Store::open(&args.state_dir)?;
     match args.command {
         Command::Start { text } => start(&store, text),
@@ -494,6 +505,11 @@ fn main() -> Result<()> {
             trigger_turn,
         } => send_agent_message(&store, &author_id, &target_id, &message, trigger_turn),
         Command::WaitAgent { target_id } => wait_agent(&store, &target_id),
+        Command::Update {
+            release,
+            check,
+            install_script,
+        } => update(release, check, install_script),
         Command::DatasetList => dataset_list(),
         Command::DatasetSample {
             dataset,
@@ -707,6 +723,127 @@ fn unquote_env_value(value: &str) -> String {
     }
 }
 
+const DEFAULT_RELEASE_REPO: &str = "browser-use/terminal";
+const INSTALL_SCRIPT_BRANCH: &str = "main";
+
+fn update(release: String, check: bool, install_script: Option<String>) -> Result<()> {
+    if check {
+        let latest = if release == "latest" {
+            latest_release_version()?
+        } else {
+            normalize_release_version(&release)
+        };
+        let current = env!("CARGO_PKG_VERSION");
+        if latest == current {
+            println!("browser-use terminal is up to date ({current}).");
+        } else {
+            println!("browser-use terminal update available: {current} -> {latest}");
+            println!("Run `browser-use-terminal update` to install it.");
+        }
+        return Ok(());
+    }
+
+    let script = resolve_install_script(install_script)?;
+    let status = std::process::Command::new("sh")
+        .arg(&script)
+        .arg("--release")
+        .arg(&release)
+        .arg("--no-launch")
+        .status()
+        .with_context(|| format!("run installer script {}", script.display()))?;
+    if !status.success() {
+        bail!("installer exited with status {status}");
+    }
+    Ok(())
+}
+
+fn latest_release_version() -> Result<String> {
+    let repo = release_repo();
+    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build GitHub release client")?;
+    let payload: Value = client
+        .get(url)
+        .header("User-Agent", "browser-use-terminal-updater")
+        .send()
+        .context("fetch latest GitHub release")?
+        .error_for_status()
+        .context("latest GitHub release returned an error")?
+        .json()
+        .context("parse latest GitHub release")?;
+    let tag = payload
+        .get("tag_name")
+        .and_then(Value::as_str)
+        .context("latest GitHub release missing tag_name")?;
+    Ok(normalize_release_version(tag))
+}
+
+fn normalize_release_version(raw: &str) -> String {
+    raw.trim()
+        .strip_prefix("browser-use-terminal-v")
+        .or_else(|| raw.trim().strip_prefix('v'))
+        .unwrap_or(raw.trim())
+        .to_string()
+}
+
+fn release_repo() -> String {
+    std::env::var("BUT_RELEASE_REPO")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DEFAULT_RELEASE_REPO.to_string())
+}
+
+fn resolve_install_script(explicit: Option<String>) -> Result<PathBuf> {
+    let source = explicit
+        .or_else(|| std::env::var("BUT_INSTALL_SCRIPT").ok())
+        .filter(|value| !value.trim().is_empty());
+    match source {
+        Some(source) if source.starts_with("https://") || source.starts_with("http://") => {
+            download_install_script(&source)
+        }
+        Some(source) => Ok(PathBuf::from(source)),
+        None => {
+            let local_script = Path::new(env!("CARGO_MANIFEST_DIR"))
+                .parent()
+                .and_then(Path::parent)
+                .map(|root| root.join("scripts/install/install.sh"))
+                .filter(|path| path.is_file());
+            if let Some(path) = local_script {
+                return Ok(path);
+            }
+            let repo = release_repo();
+            let url = format!(
+                "https://raw.githubusercontent.com/{repo}/{INSTALL_SCRIPT_BRANCH}/scripts/install/install.sh"
+            );
+            download_install_script(&url)
+        }
+    }
+}
+
+fn download_install_script(url: &str) -> Result<PathBuf> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(Duration::from_secs(10))
+        .build()
+        .context("build installer download client")?;
+    let script = client
+        .get(url)
+        .header("User-Agent", "browser-use-terminal-updater")
+        .send()
+        .with_context(|| format!("download installer script from {url}"))?
+        .error_for_status()
+        .with_context(|| format!("installer script request failed for {url}"))?
+        .text()
+        .with_context(|| format!("read installer script from {url}"))?;
+    let path = std::env::temp_dir().join(format!(
+        "browser-use-terminal-update-{}-install.sh",
+        std::process::id()
+    ));
+    fs::write(&path, script).context("write temporary installer script")?;
+    Ok(path)
+}
+
 fn sessions(store: &Store, command: SessionsCommand) -> Result<()> {
     match command {
         SessionsCommand::List => history(store),
@@ -754,7 +891,7 @@ fn cli_browser_mode() -> String {
     std::env::var("LLM_BROWSER_BROWSER_MODE")
         .ok()
         .filter(|mode| !mode.trim().is_empty())
-        .unwrap_or_else(|| "headless".to_string())
+        .unwrap_or_else(|| "local".to_string())
 }
 
 fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
@@ -949,7 +1086,15 @@ fn python(store: &Store, task_id: &str, code: String) -> Result<()> {
             "arguments": { "code": code.clone() },
         }),
     )?;
-    let mut worker = PythonWorker::start()?;
+    let browser_mode = cli_browser_mode();
+    let agent_workspace = store
+        .state_dir()
+        .join("agent-workspace")
+        .display()
+        .to_string();
+    let worker_env = [("BH_AGENT_WORKSPACE", agent_workspace.as_str())];
+    let mut worker =
+        PythonWorker::start_with_browser_mode_and_env(Some(&browser_mode), worker_env)?;
     let mut stream_error = None;
     let response =
         worker.run_with_events(task_id, &task.cwd, &task.artifact_root, &code, |event| {

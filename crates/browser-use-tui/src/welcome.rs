@@ -352,16 +352,16 @@ mod tests {
 
     #[test]
     fn cwd_shortening_only_applies_to_real_home_children() {
-        let home = Path::new("/home/alex");
+        let home = Path::new("/tmp/browser-use-home");
 
         assert_eq!(
-            shorten_cwd(Path::new("/home/alex/project"), Some(home)),
+            shorten_cwd(Path::new("/tmp/browser-use-home/project"), Some(home)),
             "~/project"
         );
         assert_eq!(shorten_cwd(home, Some(home)), "~");
         assert_eq!(
-            shorten_cwd(Path::new("/home/alexandra/project"), Some(home)),
-            "/home/alexandra/project"
+            shorten_cwd(Path::new("/tmp/browser-use-home-other/project"), Some(home)),
+            "/tmp/browser-use-home-other/project"
         );
     }
 }

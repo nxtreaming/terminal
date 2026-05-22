@@ -7,7 +7,6 @@ __pycache__/
 .mypy_cache/
 .ruff_cache/
 .venv/
-.llm-browser/
 .browser-use/
 .browser-use-terminal/
 artifacts/

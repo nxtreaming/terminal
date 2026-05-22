@@ -240,10 +240,12 @@ pub fn run_browser_script(
         run_bridge(listener, bridge_session_id, bridge_stop, bridge_error_sink)
     });
 
+    let agent_workspace_dir = agent_workspace_dir_for(artifact_dir.as_ref());
     let prelude = browser_script_prelude(
         bridge_addr.port(),
         cwd.as_ref(),
         artifact_dir.as_ref(),
+        &agent_workspace_dir,
         code,
     )?;
     let mut child = Command::new("python3")
@@ -273,11 +275,16 @@ pub fn run_browser_script(
         .wait_with_output()
         .context("wait for browser_script python3")?;
     stop.store(true, Ordering::SeqCst);
-    let _ = bridge.join();
-    let bridge_errors = bridge_errors
+    let bridge_joined = join_bridge_with_timeout(bridge, Duration::from_secs(5));
+    let mut bridge_errors = bridge_errors
         .lock()
         .expect("browser_script bridge error registry poisoned")
         .clone();
+    if !bridge_joined {
+        bridge_errors.push(
+            "browser_script bridge did not stop within 5 seconds after child exit".to_string(),
+        );
+    }
 
     if timed_out {
         return Ok(BrowserScriptOutput {
@@ -334,6 +341,53 @@ pub fn run_browser_script(
         response.error = Some(stderr);
     }
     Ok(response)
+}
+
+fn join_bridge_with_timeout(bridge: thread::JoinHandle<()>, timeout: Duration) -> bool {
+    let (tx, rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        let _ = bridge.join();
+        let _ = tx.send(());
+    });
+    rx.recv_timeout(timeout).is_ok()
+}
+
+fn agent_workspace_dir_for(artifact_dir: &Path) -> PathBuf {
+    if let Some(path) = std::env::var_os("BH_AGENT_WORKSPACE")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+    {
+        return path;
+    }
+    if artifact_dir.file_name().and_then(|name| name.to_str()) == Some("artifacts") {
+        if let Some(state_dir) = artifact_dir.parent() {
+            return state_dir.join("agent-workspace");
+        }
+    }
+    if artifact_dir
+        .parent()
+        .and_then(|parent| parent.file_name())
+        .and_then(|name| name.to_str())
+        == Some("artifacts")
+    {
+        if let Some(state_dir) = artifact_dir.parent().and_then(Path::parent) {
+            return state_dir.join("agent-workspace");
+        }
+    }
+    home_dir()
+        .map(|home| home.join(".browser-use-terminal").join("agent-workspace"))
+        .unwrap_or_else(|| PathBuf::from(".browser-use-terminal").join("agent-workspace"))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
 }
 
 pub fn cleanup_session(session_id: &str) -> usize {
@@ -1280,9 +1334,16 @@ impl CdpConnection {
 }
 
 fn set_cdp_socket_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
-    if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
-        let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
-        let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
+    match socket.get_mut() {
+        MaybeTlsStream::Plain(stream) => {
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
+        }
+        MaybeTlsStream::Rustls(stream) => {
+            let _ = stream.sock.set_read_timeout(Some(Duration::from_secs(20)));
+            let _ = stream.sock.set_write_timeout(Some(Duration::from_secs(20)));
+        }
+        _ => {}
     }
 }
 
@@ -2631,22 +2692,37 @@ fn handle_bridge_stream(mut stream: TcpStream, session_id: &str) -> Result<()> {
 }
 
 fn bridge_request(session_id: &str, request: &Value) -> Result<Value> {
-    let kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
-    let mut sessions = sessions()
-        .lock()
-        .expect("browser session registry poisoned");
-    let session = sessions
-        .get_mut(session_id)
-        .ok_or_else(|| anyhow!("browser is not connected; run `browser connect ...` first"))?;
-    match kind {
-        #[cfg(test)]
-        "test_large_response" => {
+    #[cfg(test)]
+    {
+        let kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
+        if kind == "test_large_response" {
             let bytes = request
                 .get("bytes")
                 .and_then(Value::as_u64)
                 .unwrap_or(1_000_000) as usize;
-            Ok(json!({ "blob": "x".repeat(bytes) }))
+            return Ok(json!({ "blob": "x".repeat(bytes) }));
         }
+    }
+
+    let mut session = {
+        let mut sessions = sessions()
+            .lock()
+            .expect("browser session registry poisoned");
+        sessions.remove(session_id).ok_or_else(|| {
+            anyhow!("browser is not connected or is busy; run `browser status --json`")
+        })?
+    };
+    let result = bridge_request_with_session(&mut session, request);
+    sessions()
+        .lock()
+        .expect("browser session registry poisoned")
+        .insert(session_id.to_string(), session);
+    result
+}
+
+fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) -> Result<Value> {
+    let kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
+    match kind {
         "cdp" => {
             let method = request
                 .get("method")
@@ -2707,6 +2783,7 @@ fn browser_script_prelude(
     bridge_port: u16,
     cwd: &Path,
     artifact_dir: &Path,
+    agent_workspace_dir: &Path,
     user_code: &str,
 ) -> Result<String> {
     let encoded_code = general_purpose::STANDARD.encode(user_code.as_bytes());
@@ -2718,6 +2795,7 @@ import base64, contextlib, io, json, os, pathlib, shutil, socket, sys, time, tra
 BRIDGE_PORT = {bridge_port}
 CWD = pathlib.Path({cwd:?}).expanduser().resolve()
 ARTIFACT_DIR = pathlib.Path({artifact_dir:?}).expanduser().resolve()
+AGENT_WORKSPACE_DIR = pathlib.Path({agent_workspace_dir:?}).expanduser().resolve()
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR = CWD
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
@@ -2845,7 +2923,11 @@ def session_metadata():
     }}
 
 def agent_workspace():
-    path = CWD / ".browser-use" / "agent-workspace"
+    configured = os.environ.get("BH_AGENT_WORKSPACE")
+    if configured:
+        path = pathlib.Path(configured).expanduser()
+    else:
+        path = AGENT_WORKSPACE_DIR
     path.mkdir(parents=True, exist_ok=True)
     return str(path)
 
@@ -3173,6 +3255,25 @@ print(session_metadata()["outputs_dir"])
                 "artifact path should be absolute: {artifact}"
             );
         }
+    }
+
+    #[test]
+    fn browser_script_timeout_returns_tool_failure() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-timeout",
+            temp.path(),
+            temp.path().join("artifacts"),
+            "import time\ntime.sleep(5)",
+            1,
+        )
+        .unwrap();
+
+        assert!(!output.ok);
+        assert!(output
+            .error
+            .as_deref()
+            .is_some_and(|error| error.contains("browser_script timed out after 1 seconds")));
     }
 
     #[test]

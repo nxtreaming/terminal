@@ -296,8 +296,9 @@ def test_worker_page_info_fallback_reads_target_url_and_title(
     assert response["data"]["fallback"] == "cdp"
 
 
-def test_worker_autoloads_agent_workspace_helpers(tmp_path: Path) -> None:
-    workspace = tmp_path / ".browser-use" / "agent-workspace"
+def test_worker_autoloads_agent_workspace_helpers(tmp_path: Path, monkeypatch) -> None:
+    workspace = tmp_path / ".browser-use-terminal" / "agent-workspace"
+    monkeypatch.setenv("BH_AGENT_WORKSPACE", str(workspace))
     workspace.mkdir(parents=True)
     (workspace / "agent_helpers.py").write_text(
         "def helper_value():\n    return 42\n",

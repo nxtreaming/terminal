@@ -238,9 +238,11 @@ def _annotate_error(msg: str) -> str:
 
 
 def _agent_workspace_path(cwd: Path) -> Path:
-    if _explicit_agent_workspace:
-        return Path(_explicit_agent_workspace).expanduser()
-    return (cwd / ".browser-use" / "agent-workspace").expanduser()
+    explicit_agent_workspace = os.environ.get("BH_AGENT_WORKSPACE") or _explicit_agent_workspace
+    if explicit_agent_workspace:
+        return Path(explicit_agent_workspace).expanduser()
+    home = Path(os.environ.get("BUT_HOME") or Path.home() / ".browser-use-terminal")
+    return (home / "agent-workspace").expanduser()
 
 
 def _outputs_dir_path(cwd: Path) -> Path:

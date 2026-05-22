@@ -23,7 +23,7 @@ tasks:
       - |
         set -eu
 
-        state_dir="${STATE_DIR:-.browser-use-terminal}"
+        state_dir="${STATE_DIR:-$HOME/.browser-use-terminal}"
         cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set setup.complete 0 >/dev/null
         cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set browser "Local Chrome" >/dev/null
 
@@ -34,13 +34,13 @@ tasks:
   auth:clear:
     aliases:
       - clear-auth
-    desc: Clear project-local stored auth and reset the TUI onboarding state
+    desc: Clear stored auth and reset the TUI onboarding state
     silent: true
     cmds:
       - |
         set -eu
 
-        state_dir="${STATE_DIR:-.browser-use-terminal}"
+        state_dir="${STATE_DIR:-$HOME/.browser-use-terminal}"
         backup_root="${BACKUP_ROOT:-/tmp}"
         timestamp="$(date +%Y%m%d-%H%M%S)"
         backup_dir="$backup_root/but-onboarding-reset-$timestamp"
@@ -89,7 +89,7 @@ tasks:
   auth:status:
     aliases:
       - auth-status
-    desc: Show provider auth status for the project-local TUI state
+    desc: Show provider auth status for the TUI state
     silent: true
     cmds:
-      - cargo run -q -p browser-use-cli -- --state-dir "${STATE_DIR:-.browser-use-terminal}" auth status
+      - cargo run -q -p browser-use-cli -- --state-dir "${STATE_DIR:-$HOME/.browser-use-terminal}" auth status

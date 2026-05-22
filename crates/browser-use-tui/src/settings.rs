@@ -64,9 +64,8 @@ pub(crate) const ACCOUNT_OPENAI: &str = "OpenAI API key";
 pub(crate) const ACCOUNT_ANTHROPIC: &str = "Anthropic API key";
 pub(crate) const ACCOUNT_OPENROUTER: &str = "OpenRouter API key";
 
-pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
+pub(crate) const ACCOUNT_CHOICES: [&str; 4] = [
     ACCOUNT_CODEX,
-    ACCOUNT_CLAUDE_CODE,
     ACCOUNT_OPENAI,
     ACCOUNT_ANTHROPIC,
     ACCOUNT_OPENROUTER,
@@ -77,7 +76,7 @@ pub(crate) const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_clo
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
 pub(crate) const BROWSER_LOCAL_CHROME: &str = "Local Chrome";
 pub(crate) const BROWSER_CHOICES: [&str; 3] =
-    [BROWSER_USE_CLOUD, BROWSER_LOCAL_CHROME, "Headless Chromium"];
+    [BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, "Headless Chromium"];
 
 pub(crate) fn browser_use_cloud_env_key_present() -> bool {
     std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).is_ok_and(|value| !value.trim().is_empty())
@@ -143,6 +142,8 @@ pub(crate) const MODEL_CHOICES: [ModelChoice; 9] = [
         provider_model: "deepseek/deepseek-v4-pro",
     },
 ];
+
+pub(crate) const VISIBLE_MODEL_CHOICES: [usize; 7] = [0, 3, 4, 5, 6, 7, 8];
 
 pub(crate) fn provider_model_for_display(display: &str) -> &str {
     MODEL_CHOICES

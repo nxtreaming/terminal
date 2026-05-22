@@ -6,6 +6,7 @@ pub(crate) enum PaletteAction {
     ChooseModel,
     Authenticate,
     ConfigureLaminar,
+    Update,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -15,7 +16,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const ITEMS: [PaletteItem; 6] = [
+const ITEMS: [PaletteItem; 7] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -45,6 +46,11 @@ const ITEMS: [PaletteItem; 6] = [
         command: "/laminar",
         description: "configure Laminar telemetry",
         action: PaletteAction::ConfigureLaminar,
+    },
+    PaletteItem {
+        command: "/update",
+        description: "install the latest release",
+        action: PaletteAction::Update,
     },
 ];
 

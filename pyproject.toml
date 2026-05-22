@@ -24,7 +24,6 @@ dependencies = [
 browser-use-terminal = "llm_browser_worker.rust_cli:main"
 but = "llm_browser_worker.rust_cli:tui_main"
 browser-use-terminal-ui = "llm_browser_worker.rust_cli:tui_main"
-llm-browser = "llm_browser_worker.rust_cli:main"
 
 [tool.setuptools.packages.find]
 where = ["python"]

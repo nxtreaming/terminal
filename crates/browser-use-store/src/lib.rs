@@ -30,6 +30,36 @@ pub struct Store {
     notifier: Option<StoreNotifier>,
 }
 
+pub fn default_state_dir() -> PathBuf {
+    home_dir()
+        .map(|home| home.join(".browser-use-terminal"))
+        .unwrap_or_else(|| PathBuf::from(".browser-use-terminal"))
+}
+
+pub fn resolve_state_dir(path: impl AsRef<Path>) -> PathBuf {
+    let path = path.as_ref();
+    if path == Path::new("~/.browser-use-terminal") {
+        return default_state_dir();
+    }
+    if let Ok(rest) = path.strip_prefix("~") {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    path.to_path_buf()
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum StoreNotification {
     SessionsChanged,
@@ -87,7 +117,7 @@ impl Store {
         state_dir: impl AsRef<Path>,
         notifier: Option<StoreNotifier>,
     ) -> Result<Self> {
-        let state_dir = state_dir.as_ref().to_path_buf();
+        let state_dir = resolve_state_dir(state_dir);
         std::fs::create_dir_all(&state_dir)
             .with_context(|| format!("create state dir {}", state_dir.display()))?;
         std::fs::create_dir_all(state_dir.join("artifacts")).with_context(|| {
