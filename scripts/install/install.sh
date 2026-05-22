@@ -124,55 +124,25 @@ release_url_for_asset() {
   asset="$1"
   resolved_version="$2"
 
-  printf 'https://github.com/%s/releases/download/%s/%s\n' "$REPO" "$(release_tag "$resolved_version")" "$asset"
-}
-
-release_metadata_url() {
-  resolved_version="$1"
-
-  printf 'https://api.github.com/repos/%s/releases/tags/%s\n' "$REPO" "$(release_tag "$resolved_version")"
+  if [ "$resolved_version" = "latest" ]; then
+    printf 'https://github.com/%s/releases/latest/download/%s\n' "$REPO" "$asset"
+  else
+    printf 'https://github.com/%s/releases/download/%s/%s\n' "$REPO" "$(release_tag "$resolved_version")" "$asset"
+  fi
 }
 
 release_asset_digest() {
   asset="$1"
   resolved_version="$2"
-  release_json="$(download_text "$(release_metadata_url "$resolved_version")")"
-
-  digest="$(printf '%s\n' "$release_json" | awk -v asset="$asset" '
-    {
-      if ($0 ~ "\"name\":[[:space:]]*\"" asset "\"") {
-        in_asset = 1
-        asset_depth = depth
-      }
-
-      if (in_asset && /"digest":[[:space:]]*"[^"]+"/) {
-        sub(/^.*"digest":[[:space:]]*"/, "")
-        sub(/".*$/, "")
-        digest = $0
-      }
-
-      line = $0
-      opens = gsub(/\{/, "{", line)
-      closes = gsub(/\}/, "}", line)
-      depth += opens - closes
-
-      if (in_asset && depth < asset_depth) {
-        in_asset = 0
-      }
-    }
-    END {
-      if (digest != "") {
-        print digest
-      }
-    }
-  ')"
+  checksum="$(download_text "$(release_url_for_asset "$asset.sha256" "$resolved_version")")"
+  digest="$(printf '%s\n' "$checksum" | awk 'NR == 1 { print $1 }')"
 
   case "$digest" in
-    sha256:????????????????????????????????????????????????????????????????)
-      printf '%s\n' "${digest#sha256:}"
+    ????????????????????????????????????????????????????????????????)
+      printf '%s\n' "$digest"
       ;;
     *)
-      echo "Could not find SHA-256 digest for release asset $asset." >&2
+      echo "Could not read SHA-256 digest for release asset $asset." >&2
       exit 1
       ;;
   esac
@@ -228,8 +198,14 @@ resolve_version() {
     return
   fi
 
-  release_json="$(download_text "https://api.github.com/repos/$REPO/releases/latest")"
-  resolved="$(printf '%s\n' "$release_json" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  if command -v curl >/dev/null 2>&1; then
+    final_url="$(curl -fsSLI -o /dev/null -w '%{url_effective}' "https://github.com/$REPO/releases/latest")"
+    resolved="${final_url##*/releases/tag/}"
+    resolved="${resolved%%[?#]*}"
+  else
+    release_json="$(download_text "https://api.github.com/repos/$REPO/releases/latest")"
+    resolved="$(printf '%s\n' "$release_json" | sed -n 's/.*"tag_name":[[:space:]]*"\([^"]*\)".*/\1/p' | head -n 1)"
+  fi
   resolved="$(normalize_version "$resolved")"
 
   if [ -z "$resolved" ] || [ "$resolved" = "latest" ]; then

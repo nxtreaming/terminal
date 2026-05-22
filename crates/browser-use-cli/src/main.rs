@@ -842,24 +842,33 @@ fn update(
 
 fn latest_release_version() -> Result<String> {
     let repo = release_repo();
-    let url = format!("https://api.github.com/repos/{repo}/releases/latest");
+    let url = format!("https://github.com/{repo}/releases/latest");
     let client = reqwest::blocking::Client::builder()
         .timeout(Duration::from_secs(10))
         .build()
         .context("build GitHub release client")?;
-    let payload: Value = client
+    let response = client
         .get(url)
         .header("User-Agent", "browser-use-terminal-updater")
         .send()
         .context("fetch latest GitHub release")?
         .error_for_status()
-        .context("latest GitHub release returned an error")?
-        .json()
-        .context("parse latest GitHub release")?;
-    let tag = payload
-        .get("tag_name")
-        .and_then(Value::as_str)
-        .context("latest GitHub release missing tag_name")?;
+        .context("latest GitHub release returned an error")?;
+    let final_url = response.url().clone();
+    let segments = final_url
+        .path_segments()
+        .context("latest GitHub release URL has no path")?
+        .collect::<Vec<_>>();
+    let tag = segments
+        .windows(3)
+        .find_map(|window| {
+            if window[0] == "releases" && window[1] == "tag" {
+                Some(window[2])
+            } else {
+                None
+            }
+        })
+        .context("latest GitHub release redirect missing tag")?;
     Ok(normalize_release_version(tag))
 }
 
