@@ -739,10 +739,10 @@ update_visible_commands() {
 }
 
 verify_visible_command() {
-  "$BIN_DIR/but" --version >/dev/null
-  "$BIN_DIR/browser" --version >/dev/null
-  "$BIN_DIR/browser-use" --version >/dev/null
-  "$BIN_DIR/browser-use-terminal" --version >/dev/null
+  BUT_AUTO_UPDATE=0 "$BIN_DIR/but" --version >/dev/null
+  BUT_AUTO_UPDATE=0 "$BIN_DIR/browser" --version >/dev/null
+  BUT_AUTO_UPDATE=0 "$BIN_DIR/browser-use" --version >/dev/null
+  BUT_AUTO_UPDATE=0 "$BIN_DIR/browser-use-terminal" --version >/dev/null
 }
 
 parse_args "$@"

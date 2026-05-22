@@ -26,6 +26,17 @@ assert_contains() {
   fi
 }
 
+assert_not_contains() {
+  local needle="$1"
+  local haystack="$2"
+  local label="$3"
+
+  if [[ "$haystack" == *"$needle"* ]]; then
+    printf 'FAIL: %s\nunexpected: %s\noutput:\n%s\n' "$label" "$needle" "$haystack" >&2
+    exit 1
+  fi
+}
+
 tmp="$(mktemp -d)"
 trap 'rm -rf "$tmp"' EXIT
 
@@ -68,6 +79,11 @@ chmod +x "$CURRENT_LINK/bin/but" "$CURRENT_LINK/bin/browser-use-terminal"
 
 update_visible_commands
 
+: >"$tmp/update.log"
+verify_visible_command
+assert_not_contains "update --release latest" "$(cat "$tmp/update.log")" "installer verification skips auto-update"
+
+: >"$tmp/update.log"
 out="$(BUT_AUTO_UPDATE_INTERVAL_SECS=0 "$BIN_DIR/browser")"
 assert_eq "but " "$out" "browser launches TUI after auto-update"
 assert_contains "cli update --release latest" "$(cat "$tmp/update.log")" "browser auto-runs update"
