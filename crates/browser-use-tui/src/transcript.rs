@@ -6,16 +6,15 @@ use unicode_width::UnicodeWidthChar;
 
 use crate::markdown::render_markdown_lines;
 use crate::theme::{
-    activity_group, activity_list, activity_read, activity_run, activity_search, activity_task,
-    dim, failed, link, muted, path_reference, text_style, thought, user_prompt_accent,
-    user_prompt_muted, user_prompt_text,
+    accent, activity_group, activity_list, activity_read, activity_run, activity_search,
+    activity_task, dim, failed, link, muted, path_reference, text_style, thought,
+    user_prompt_accent, user_prompt_muted, user_prompt_text,
 };
 
 use super::App;
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
 const GROUP_VALUE_LAST_PREFIX: &str = "  └ ";
-const ACTIVE_LIVE_LINE_LIMIT: usize = 48;
 const ACTIVE_FALLBACK_STATUS: &str = "running browser task";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -32,6 +31,7 @@ pub(crate) struct TranscriptModel {
     pub(crate) active: Option<TranscriptNode>,
     pub(crate) last_event_seq: i64,
     pub(crate) revision: u64,
+    live_phase: usize,
 }
 
 pub(crate) struct TerminalScrollbackEmission {
@@ -58,6 +58,7 @@ enum TranscriptKind {
     },
     PendingStatus {
         status: String,
+        detail: Option<String>,
     },
     Assistant {
         markdown: String,
@@ -110,7 +111,9 @@ impl TranscriptNode {
         match &self.kind {
             TranscriptKind::Stack { nodes } => cells_to_lines(nodes.iter(), width, mode),
             TranscriptKind::Prompt { text, followup } => prompt_lines(text, *followup, width),
-            TranscriptKind::PendingStatus { status } => pending_status_lines(status),
+            TranscriptKind::PendingStatus { status, detail } => {
+                pending_status_lines(status, detail.as_deref(), ShimmerMode::Static)
+            }
             TranscriptKind::Assistant { markdown, source } => {
                 let mut lines = markdown_cell_lines(markdown, width, mode);
                 if let Some(source) = source.as_deref() {
@@ -152,7 +155,9 @@ impl TranscriptNode {
                 nodes.iter().flat_map(|node| node.plain_lines()).collect()
             }
             TranscriptKind::Prompt { text, .. } => prefixed_plain("> ", text),
-            TranscriptKind::PendingStatus { status } => vec![status.clone()],
+            TranscriptKind::PendingStatus { status, detail } => {
+                vec![pending_status_text(status, detail.as_deref())]
+            }
             TranscriptKind::Assistant { markdown, source } => {
                 let mut out = markdown.lines().map(str::to_string).collect::<Vec<_>>();
                 if let Some(source) = source.as_ref() {
@@ -220,35 +225,87 @@ impl TranscriptNode {
         }
     }
 
-    fn is_pending_followup_indicator(&self) -> bool {
-        matches!(self.kind, TranscriptKind::PendingStatus { .. })
+    fn has_shimmering_live_status(&self) -> bool {
+        match &self.kind {
+            TranscriptKind::PendingStatus { .. } => true,
+            TranscriptKind::Stack { nodes } => {
+                nodes.iter().any(TranscriptNode::has_shimmering_live_status)
+            }
+            _ => false,
+        }
     }
 
     fn is_prompt(&self) -> bool {
         matches!(self.kind, TranscriptKind::Prompt { .. })
     }
 
-    fn display_lines_with_stream_skip(
+    fn active_display_lines(
         &self,
         width: u16,
-        mode: DisplayMode,
-        stream_skip_lines: &mut usize,
+        shimmer_phase: usize,
+        stream_skip_lines: Option<&mut usize>,
+        allow_empty_stream: bool,
     ) -> Vec<Line<'static>> {
         let width = width.max(1);
         match &self.kind {
             TranscriptKind::Stack { nodes } => {
-                cells_to_lines_with_stream_skip(nodes.iter(), width, mode, stream_skip_lines)
+                let mut out = Vec::new();
+                let mut previous_kind = None;
+                let mut stream_skip_lines = stream_skip_lines;
+                for (idx, node) in nodes.iter().enumerate() {
+                    let _ = (node.id(), node.revision());
+                    let child_allow_empty_stream =
+                        matches!(node.kind, TranscriptKind::StreamingAssistant { .. })
+                            && nodes[idx + 1..].iter().any(|node| {
+                                matches!(node.kind, TranscriptKind::PendingStatus { .. })
+                            });
+                    let child_lines = node.active_display_lines(
+                        width,
+                        shimmer_phase,
+                        stream_skip_lines.as_deref_mut(),
+                        child_allow_empty_stream,
+                    );
+                    if child_lines.is_empty() {
+                        continue;
+                    }
+                    if !out.is_empty() {
+                        let gap = previous_kind
+                            .map(|previous| gap_lines_between(previous, &node.kind))
+                            .unwrap_or(0);
+                        out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
+                    }
+                    out.extend(child_lines);
+                    previous_kind = Some(&node.kind);
+                }
+                out
             }
+            TranscriptKind::PendingStatus { status, detail } => pending_status_lines(
+                status,
+                detail.as_deref(),
+                ShimmerMode::AnimatedAt(shimmer_phase),
+            ),
+            TranscriptKind::ActiveStatus {
+                group,
+                lines,
+                style,
+            } => grouped_lines(group, lines, *style, width),
             TranscriptKind::StreamingAssistant { markdown } => {
-                let mut lines = markdown_cell_lines(markdown, width, mode);
-                let skip = (*stream_skip_lines).min(lines.len().saturating_sub(1));
-                *stream_skip_lines = (*stream_skip_lines).saturating_sub(skip);
-                if skip > 0 {
-                    lines = lines.into_iter().skip(skip).collect();
+                let mut lines = markdown_cell_lines(markdown, width, DisplayMode::Active);
+                if let Some(stream_skip_lines) = stream_skip_lines {
+                    let max_skip = if allow_empty_stream {
+                        lines.len()
+                    } else {
+                        lines.len().saturating_sub(1)
+                    };
+                    let skip = (*stream_skip_lines).min(max_skip);
+                    *stream_skip_lines = (*stream_skip_lines).saturating_sub(skip);
+                    if skip > 0 {
+                        lines = lines.into_iter().skip(skip).collect();
+                    }
                 }
                 lines
             }
-            _ => self.display_lines(width, mode),
+            _ => self.display_lines(width, DisplayMode::Active),
         }
     }
 
@@ -295,6 +352,7 @@ pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<Tran
         active,
         last_event_seq,
         revision,
+        live_phase: app.live_spinner_frame,
     })
 }
 
@@ -354,7 +412,12 @@ pub(crate) fn active_viewport_lines(
     if active.is_active_viewport_placeholder() {
         return Vec::new();
     }
-    let mut lines = active.display_lines(width, DisplayMode::Active);
+    let mut lines = active.active_display_lines(
+        width,
+        model.map(|model| model.live_phase).unwrap_or(0),
+        None,
+        false,
+    );
     if lines.len() > height as usize {
         let start = lines.len().saturating_sub(height as usize);
         lines = lines.into_iter().skip(start).collect();
@@ -375,7 +438,12 @@ pub(crate) fn active_viewport_lines_with_stream_skip(
         return Vec::new();
     }
     let mut skip = stream_skip_lines;
-    let mut lines = active.display_lines_with_stream_skip(width, DisplayMode::Active, &mut skip);
+    let mut lines = active.active_display_lines(
+        width,
+        model.map(|model| model.live_phase).unwrap_or(0),
+        Some(&mut skip),
+        false,
+    );
     if lines.len() > height as usize {
         let start = lines.len().saturating_sub(height as usize);
         lines = lines.into_iter().skip(start).collect();
@@ -400,10 +468,10 @@ pub(crate) fn active_viewport_has_live_content(model: Option<&TranscriptModel>) 
         .is_some_and(|active| !active.is_active_viewport_placeholder())
 }
 
-pub(crate) fn has_pending_followup_indicator(model: Option<&TranscriptModel>) -> bool {
+pub(crate) fn has_shimmering_live_status(model: Option<&TranscriptModel>) -> bool {
     model
         .and_then(|model| model.active.as_ref())
-        .is_some_and(TranscriptNode::is_pending_followup_indicator)
+        .is_some_and(TranscriptNode::has_shimmering_live_status)
 }
 
 pub(crate) fn model_plain_text(model: &TranscriptModel) -> String {
@@ -440,28 +508,6 @@ fn cells_to_lines<'a>(
             out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
         }
         out.extend(node.display_lines(width, mode));
-        previous_kind = Some(&node.kind);
-    }
-    out
-}
-
-fn cells_to_lines_with_stream_skip<'a>(
-    nodes: impl Iterator<Item = &'a TranscriptNode>,
-    width: u16,
-    mode: DisplayMode,
-    stream_skip_lines: &mut usize,
-) -> Vec<Line<'static>> {
-    let mut out = Vec::new();
-    let mut previous_kind = None;
-    for node in nodes {
-        let _ = (node.id(), node.revision());
-        if !out.is_empty() {
-            let gap = previous_kind
-                .map(|previous| gap_lines_between(previous, &node.kind))
-                .unwrap_or(0);
-            out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
-        }
-        out.extend(node.display_lines_with_stream_skip(width, mode, stream_skip_lines));
         previous_kind = Some(&node.kind);
     }
     out
@@ -873,23 +919,6 @@ fn flush_read_lines(out: &mut Vec<String>, reads: &mut Vec<String>) {
     reads.clear();
 }
 
-fn thinking_delta_label(event: &EventRecord) -> Option<&str> {
-    event
-        .payload
-        .get("label")
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|label| !label.is_empty())
-}
-
-fn latest_thinking_label(events: &[EventRecord]) -> Option<&str> {
-    events
-        .iter()
-        .rev()
-        .find(|event| event.event_type == "model.thinking_delta")
-        .and_then(thinking_delta_label)
-}
-
 fn model_response_tool_call_count(event: &EventRecord) -> u64 {
     event
         .payload
@@ -910,16 +939,7 @@ fn active_node_for_session(
         return Some(pending_followup);
     }
 
-    if has_active_child_session(app, &root.id) {
-        return Some(active_status_node(
-            root,
-            events,
-            "status",
-            vec![ACTIVE_FALLBACK_STATUS.to_string()],
-            NodeStyle::Muted,
-        ));
-    }
-
+    let active_child_count = active_child_session_count(app, &root.id);
     let live_thinking_text = state
         .transcript
         .last()
@@ -935,29 +955,7 @@ fn active_node_for_session(
         .filter(|_| !live_stream_has_committed_successor(live_events));
 
     let mut active_nodes = Vec::new();
-
-    let suppress_model_wait = live_streaming_text.is_some() && live_thinking_text.is_none();
-    if let Some(event) = live_events.iter().rev().find(|event| {
-        matches!(event.event_type.as_str(), "model.turn.retry")
-            && !(suppress_model_wait && matches!(event.event_type.as_str(), "model.turn.retry"))
-    }) {
-        if let Some(node) = active_node_for_event(root, events, event) {
-            active_nodes.push(node);
-        }
-    }
-
-    if let Some(text) = live_thinking_text {
-        let label = latest_thinking_label(events);
-        active_nodes.push(active_status_node(
-            root,
-            events,
-            &label
-                .map(|label| format!("thought {label}"))
-                .unwrap_or_else(|| "thought".to_string()),
-            preview_lines(text, ACTIVE_LIVE_LINE_LIMIT),
-            NodeStyle::Thought,
-        ));
-    }
+    let live_status = live_status_for_session(active_child_count, live_thinking_text, live_events);
 
     if let Some(text) = live_streaming_text {
         active_nodes.push(TranscriptNode {
@@ -979,6 +977,31 @@ fn active_node_for_session(
         }
     }
 
+    if !app.native_scrollback_is_active() && live_streaming_text.is_none() {
+        if let Some(event) = live_events.iter().rev().find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "command.waiting"
+                    | "tool.started"
+                    | "browser.page"
+                    | "browser.state"
+                    | "plan.updated"
+            )
+        }) {
+            if let Some(node) = active_node_for_event(root, events, event) {
+                active_nodes.push(node);
+            }
+        }
+    }
+    if live_streaming_text.is_none() {
+        active_nodes.push(pending_status_node(
+            root,
+            events,
+            live_status,
+            active_subagent_summary(active_child_count).as_deref(),
+        ));
+    }
+
     if !active_nodes.is_empty() {
         let seq = events.last().map(|event| event.seq).unwrap_or_default();
         return Some(TranscriptNode {
@@ -991,22 +1014,60 @@ fn active_node_for_session(
         });
     }
 
-    if let Some(event) = live_events.iter().rev().find(|event| {
-        matches!(
-            event.event_type.as_str(),
-            "command.waiting" | "tool.started" | "browser.page" | "browser.state" | "plan.updated"
-        )
-    }) {
-        return active_node_for_event(root, events, event);
-    }
-
-    Some(active_status_node(
+    Some(pending_status_node(
         root,
         events,
-        "status",
-        vec![ACTIVE_FALLBACK_STATUS.to_string()],
-        NodeStyle::Muted,
+        live_status,
+        active_subagent_summary(active_child_count).as_deref(),
     ))
+}
+
+fn live_status_for_session(
+    active_child_count: usize,
+    live_thinking_text: Option<&str>,
+    live_events: &[EventRecord],
+) -> &'static str {
+    if active_child_count > 0 {
+        return "Working...";
+    }
+    if live_events
+        .iter()
+        .rev()
+        .any(|event| event.event_type == "model.turn.retry")
+    {
+        return "Retrying...";
+    }
+    if live_thinking_text.is_some()
+        || live_events
+            .iter()
+            .rev()
+            .any(|event| event.event_type == "model.turn.request")
+    {
+        return "Thinking...";
+    }
+    "Working..."
+}
+
+fn active_child_session_count(app: &App, root_id: &str) -> usize {
+    app.state_cache
+        .sessions
+        .iter()
+        .filter(|session| {
+            session.parent_id.as_deref() == Some(root_id) && session.status.is_active()
+        })
+        .count()
+}
+
+fn active_subagent_summary(active_child_count: usize) -> Option<String> {
+    if active_child_count == 0 {
+        return None;
+    }
+    let noun = if active_child_count == 1 {
+        "subagent"
+    } else {
+        "subagents"
+    };
+    Some(format!("({active_child_count} {noun} running)"))
 }
 
 fn active_timeline_tail_node(
@@ -1086,12 +1147,15 @@ fn pending_followup_active_node(
     if has_live_output_after {
         return None;
     }
-    let status = pending_followup_status(app, events, latest_followup.seq);
+    let status = pending_followup_status(events, latest_followup.seq);
     Some(TranscriptNode {
         id: format!("{}:active-followup:{}", root.id, latest_followup.seq),
         seq: latest_followup.seq,
         revision: latest_followup.seq.max(0) as u64,
-        kind: TranscriptKind::PendingStatus { status },
+        kind: TranscriptKind::PendingStatus {
+            status,
+            detail: None,
+        },
     })
 }
 
@@ -1146,8 +1210,8 @@ fn is_live_output_event(event: &EventRecord) -> bool {
     }
 }
 
-fn pending_followup_status(app: &App, events: &[EventRecord], after_seq: i64) -> String {
-    let label = events
+fn pending_followup_status(events: &[EventRecord], after_seq: i64) -> String {
+    events
         .iter()
         .filter(|event| event.seq > after_seq)
         .rev()
@@ -1160,13 +1224,7 @@ fn pending_followup_status(app: &App, events: &[EventRecord], after_seq: i64) ->
                 .or_else(|| Some("running tool".to_string())),
             _ => None,
         })
-        .unwrap_or_else(|| "sending".to_string());
-    format!("{} {label}", live_spinner_frame(app.live_spinner_frame))
-}
-
-fn live_spinner_frame(frame: usize) -> &'static str {
-    const FRAMES: [&str; 4] = ["-", "\\", "|", "/"];
-    FRAMES[frame % FRAMES.len()]
+        .unwrap_or_else(|| "sending".to_string())
 }
 
 fn current_turn_events(events: &[EventRecord]) -> &[EventRecord] {
@@ -1257,6 +1315,24 @@ fn active_status_node(
             group: group.to_string(),
             lines,
             style,
+        },
+    }
+}
+
+fn pending_status_node(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    status: &str,
+    detail: Option<&str>,
+) -> TranscriptNode {
+    let seq = events.last().map(|event| event.seq).unwrap_or_default();
+    TranscriptNode {
+        id: format!("{}:active-status", root.id),
+        seq,
+        revision: seq.max(0) as u64,
+        kind: TranscriptKind::PendingStatus {
+            status: status.to_string(),
+            detail: detail.map(str::to_string),
         },
     }
 }
@@ -1412,11 +1488,71 @@ fn prompt_lines(text: &str, followup: bool, width: u16) -> Vec<Line<'static>> {
     prompt_lines_with_status(text, followup, width, None)
 }
 
-fn pending_status_lines(status: &str) -> Vec<Line<'static>> {
-    vec![Line::from(vec![
-        Span::styled("  ".to_string(), user_prompt_accent()),
-        Span::styled(status.to_string(), user_prompt_muted()),
-    ])]
+#[derive(Clone, Copy)]
+enum ShimmerMode {
+    Static,
+    AnimatedAt(usize),
+}
+
+fn pending_status_lines(
+    status: &str,
+    detail: Option<&str>,
+    shimmer: ShimmerMode,
+) -> Vec<Line<'static>> {
+    let mut spans = vec![Span::styled("• ".to_string(), dim())];
+    spans.extend(match shimmer {
+        ShimmerMode::Static => vec![Span::styled(status.to_string(), muted())],
+        ShimmerMode::AnimatedAt(phase) => shimmer_spans(status, phase, muted()),
+    });
+    if let Some(detail) = detail.filter(|detail| !detail.trim().is_empty()) {
+        spans.push(Span::styled("  ".to_string(), dim()));
+        spans.push(Span::styled(detail.to_string(), muted()));
+    }
+    vec![Line::from(spans)]
+}
+
+fn pending_status_text(status: &str, detail: Option<&str>) -> String {
+    match detail.filter(|detail| !detail.trim().is_empty()) {
+        Some(detail) => format!("• {status}  {detail}"),
+        None => format!("• {status}"),
+    }
+}
+
+fn shimmer_spans(text: &str, phase: usize, base: Style) -> Vec<Span<'static>> {
+    if text.is_empty() {
+        return Vec::new();
+    }
+    let chars = text.chars().collect::<Vec<_>>();
+    let center = (phase % chars.len().max(1)) as isize;
+    let mut spans = Vec::new();
+    let mut pending = String::new();
+    let mut pending_style = base;
+    let mut have_pending = false;
+
+    for (idx, ch) in chars.into_iter().enumerate() {
+        let distance = (idx as isize - center).unsigned_abs();
+        let style = if distance <= 1 {
+            accent()
+        } else if distance <= 3 {
+            text_style()
+        } else {
+            base
+        };
+        if have_pending && style == pending_style {
+            pending.push(ch);
+        } else {
+            if have_pending {
+                spans.push(Span::styled(std::mem::take(&mut pending), pending_style));
+            }
+            pending.push(ch);
+            pending_style = style;
+            have_pending = true;
+        }
+    }
+    if have_pending {
+        spans.push(Span::styled(pending, pending_style));
+    }
+    spans
 }
 
 fn prompt_lines_with_status(
@@ -2230,13 +2366,6 @@ fn normalize_subagent_label(value: &str) -> Option<String> {
     (!label.is_empty() && label != "root" && label != "subagent").then(|| label.to_string())
 }
 
-fn has_active_child_session(app: &App, root_id: &str) -> bool {
-    app.state_cache
-        .sessions
-        .iter()
-        .any(|session| session.parent_id.as_deref() == Some(root_id) && session.status.is_active())
-}
-
 fn plural(count: usize) -> &'static str {
     if count == 1 {
         ""
@@ -2424,6 +2553,7 @@ mod tests {
             active: None,
             last_event_seq: 3,
             revision: 3,
+            live_phase: 0,
         };
 
         let full = terminal_scrollback_emission_since(&model, 0, 120, false);

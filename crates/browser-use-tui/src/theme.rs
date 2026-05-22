@@ -210,7 +210,7 @@ pub(crate) fn status_style(status: &str) -> Style {
     match status {
         "done" => done(),
         "failed" => failed(),
-        "running" | "created" => running(),
+        "running" | "created" | "starting" => running(),
         _ => muted(),
     }
 }

@@ -162,8 +162,8 @@ fn render_main(
     } else {
         app.surface
     };
-    let bottom_h = main_bottom_height_for(app, state, layout_surface, area, product_state);
     let body_width = content_width(area.width);
+    let bottom_h = main_bottom_height_for(app, state, layout_surface, area, product_state);
     let modal_overlay_active = app.surface.is_popup() && !app.native_scrollback_is_active();
     let native_scrollback_active = app.native_scrollback_is_active() && !modal_overlay_active;
     let show_footer = layout_surface.is_bottom_pane()

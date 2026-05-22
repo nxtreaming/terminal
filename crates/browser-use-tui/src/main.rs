@@ -2152,7 +2152,7 @@ impl App {
         }
         let state = self.refresh_cached_projection().clone();
         let model = transcript::transcript_model(self, &state);
-        transcript::has_pending_followup_indicator(model.as_ref())
+        transcript::has_shimmering_live_status(model.as_ref())
     }
 
     fn tick_live_spinner(&mut self) {
@@ -5348,7 +5348,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn provider_thinking_deltas_render_as_thought_not_status() -> Result<()> {
+    fn provider_thinking_deltas_do_not_replace_streaming_text() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5381,8 +5381,8 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(!screen.contains("• thinking"));
-        assert!(screen.contains("• thought inspecting context"));
-        assert!(screen.contains("Checking the repository structure."));
+        assert!(!screen.contains("• thought inspecting context"));
+        assert!(!screen.contains("Checking the repository structure."));
         assert!(!screen.contains("Checking \n"));
         assert!(!screen.contains("• answer draft"));
         assert!(screen.contains("This is the answer draft."));
@@ -5390,7 +5390,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn live_thinking_uses_available_viewport_before_summarizing() -> Result<()> {
+    fn live_thinking_renders_compact_shimmer_status() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5415,10 +5415,22 @@ mod redesign_tests {
         )?;
         app.selected_session_id = Some(session.id);
 
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("thinking line 1"));
-        assert!(screen.contains("thinking line 12"));
-        assert!(!screen.contains("... +"));
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let lines = transcript::active_viewport_lines(Some(&model), 100, 20);
+        let text = lines_plain_text(&lines);
+
+        assert!(text.contains("Thinking..."), "{text}");
+        assert!(!text.contains("thinking line 1"), "{text}");
+        assert!(!text.contains("thinking line 12"), "{text}");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style == theme::accent()),
+            "live thinking status should include a moving shimmer highlight"
+        );
         Ok(())
     }
 
@@ -5936,18 +5948,20 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("• subagent repo-explorer started"));
-        assert!(!screen.contains("working"));
+        assert!(!screen.contains("subagents  repo-explorer starting"));
         assert!(!screen.contains("read /repo/README.md"));
         assert!(!screen.contains("writing Mapping the main crates."));
         assert!(!screen.contains("Mapping the main crates."));
         assert!(!screen.contains("spawn_agent requested"));
         assert!(!screen.contains("spawn_agent started"));
+        assert!(screen.contains("Working..."));
+        assert!(screen.contains("(1 subagent running)"));
         assert!(!screen.contains("parent is waiting"));
         Ok(())
     }
 
     #[test]
-    fn active_child_keeps_live_view_empty() -> Result<()> {
+    fn active_child_keeps_child_progress_out_but_keeps_parent_live_view() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -5997,13 +6011,22 @@ mod redesign_tests {
         app.drain_store_notifications()?;
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
-        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+        let lines = transcript::active_viewport_lines(Some(&model), 100, 20);
+        let text = lines_plain_text(&lines);
 
-        assert!(text.is_empty(), "{text}");
+        assert!(text.contains("Working..."), "{text}");
+        assert!(text.contains("(1 subagent running)"), "{text}");
+        assert!(!text.contains("parent is waiting"), "{text}");
+        assert!(
+            lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .any(|span| span.style == theme::accent()),
+            "parent live status should include a moving shimmer highlight"
+        );
         assert!(!text.contains("writing Mapping the main crates."));
         assert!(!text.contains("Mapping the main crates."));
         assert!(!text.contains("spawn_agent requested"));
-        assert!(!text.contains("parent is waiting"));
         Ok(())
     }
 
@@ -6045,6 +6068,7 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("• subagent repo-explorer started"));
+        assert!(!screen.contains("subagents  repo-explorer starting"));
         assert!(!screen.contains("read /repo/file-1.rs"));
         assert!(!screen.contains("read /repo/file-12.rs"));
         assert!(!screen.contains("waiting for gpt-5.5"));
@@ -6490,7 +6514,7 @@ mod redesign_tests {
             Some(SessionStatus::Running)
         );
         let prompt_only = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
-        assert_eq!(prompt_only, docked);
+        assert_eq!(prompt_only, docked.saturating_add(1));
         let native_prompt = lines_plain_text(&native_scrollback_lines(&mut app, 120)?);
         assert!(native_prompt.contains("> yo"));
         let prompt_only_screen = render_dump(&mut app)?;
@@ -6501,7 +6525,7 @@ mod redesign_tests {
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         assert!(transcript::active_viewport_has_live_content(Some(&model)));
-        assert_eq!(prompt_only, docked);
+        assert_eq!(prompt_only, docked.saturating_add(1));
 
         app.store.append_event(
             &session.id,
@@ -6526,6 +6550,7 @@ mod redesign_tests {
         let streaming_screen = render_dump(&mut app)?;
         assert!(streaming_screen.contains("streaming now"));
         assert!(!streaming_screen.contains("thinking"));
+        assert!(!streaming_screen.contains("Working..."));
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         let emission = transcript::terminal_scrollback_emission_since(&model, last_seq, 120, true);
@@ -6569,7 +6594,7 @@ mod redesign_tests {
         app.drain_store_notifications()?;
 
         let measured = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
-        assert_eq!(measured, docked);
+        assert_eq!(measured, docked.saturating_add(1));
         app.args.width = 80;
         app.args.height = measured;
         let native_prompt = lines_plain_text(&native_scrollback_lines(&mut app, 80)?);
@@ -6696,6 +6721,7 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("live output line 24"));
         assert!(!screen.contains("live output line 01"));
+        assert!(!screen.contains("Working..."));
         assert!(screen.contains("Type to steer the agent"));
         Ok(())
     }

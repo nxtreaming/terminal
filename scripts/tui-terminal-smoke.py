@@ -269,6 +269,72 @@ def append_store_event(state_dir: Path, session_id: str, event_type: str, payloa
         conn.execute("UPDATE sessions SET updated_ms = ? WHERE id = ?", (now_ms, session_id))
 
 
+def create_live_subagent(
+    state_dir: Path,
+    parent_id: str,
+    *,
+    nickname: str = "repo-explorer",
+    status: str = "running",
+) -> str:
+    child_id = uuid.uuid4().hex[:12]
+    now_ms = int(time.time() * 1000)
+    artifact_root = state_dir / "artifacts" / child_id
+    artifact_root.mkdir(parents=True, exist_ok=True)
+    cwd = str(ROOT)
+
+    def event_row(session_id: str, event_type: str, payload: dict[str, object]) -> tuple[str, str, int, str, str]:
+        return (uuid.uuid4().hex, session_id, now_ms, event_type, json.dumps(payload))
+
+    with sqlite3.connect(state_dir / "state.db") as conn:
+        conn.execute(
+            """
+            INSERT INTO sessions(
+                id, parent_id, cwd, artifact_root, status,
+                created_ms, updated_ms, agent_path, agent_nickname, agent_role
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                child_id,
+                parent_id,
+                cwd,
+                str(artifact_root),
+                status,
+                now_ms,
+                now_ms,
+                f"/root/{nickname}",
+                nickname,
+                "explorer",
+            ),
+        )
+        conn.execute(
+            """
+            INSERT INTO agent_edges(parent_session_id, child_session_id, status, created_ms, updated_ms)
+            VALUES (?, ?, ?, ?, ?)
+            """,
+            (parent_id, child_id, status, now_ms, now_ms),
+        )
+        conn.executemany(
+            "INSERT INTO events(id, session_id, ts_ms, type, payload_json) VALUES (?, ?, ?, ?, ?)",
+            [
+                event_row(child_id, "session.created", {}),
+                event_row(child_id, "agent.context", {"nickname": nickname, "role": "explorer"}),
+                event_row(child_id, "file.read", {"path": "/repo/README.md"}),
+                event_row(
+                    parent_id,
+                    "agent.spawned",
+                    {
+                        "child_session_id": child_id,
+                        "nickname": nickname,
+                        "role": "explorer",
+                    },
+                ),
+                event_row(parent_id, "model.thinking_delta", {"text": "parent is waiting"}),
+            ],
+        )
+        conn.execute("UPDATE sessions SET updated_ms = ? WHERE id IN (?, ?)", (now_ms, parent_id, child_id))
+    return child_id
+
+
 def assert_no_legacy_dashboard_chrome(text: str, context: str) -> None:
     assert_not_contains(text, "[box] Active objective", context)
     assert_not_contains(text, "[box] Task complete", context)
@@ -448,6 +514,37 @@ def smoke_interactive_terminal(binary: Path) -> None:
         assert_contains(resized_burst, "Current browser", "resize burst should keep the live app visible")
         assert_count(resized_burst, "Current browser", 1, "resize burst should redraw in place")
         assert_not_contains(resized_burst, "^[[", "resize burst should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_live_subagent_status_bar(binary: Path) -> None:
+    session = f"but-smoke-subagent-status-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-subagent-status-"))
+    try:
+        start_session(session, binary, state_dir)
+        parent_id = latest_session_id(state_dir)
+        append_store_event(
+            state_dir,
+            parent_id,
+            "model.turn.response",
+            {"tool_call_count": 1},
+        )
+        create_live_subagent(state_dir, parent_id, status="running")
+        visible = wait_for(session, "(1 subagent running)", "subagent-status-bar")
+        assert_contains(visible, "Working...", "parent live status should remain compact and visible")
+        assert_contains(visible, "(1 subagent running)", "subagent count should share the live status row")
+        assert_not_contains(visible, "subagents  repo-explorer running", "subagent details should not render as a separate bar")
+        assert_not_contains(visible, "parent is waiting", "raw parent thinking should stay out of the live status")
+        assert_not_contains(visible, "read /repo/README.md", "child details should not leak into parent view")
+        assert_line_directly_followed_by(
+            visible,
+            "Working...",
+            "╭",
+            "combined live status should sit directly above composer",
+        )
+        assert_no_ansi(visible, "subagent status capture should be plain terminal text")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -880,12 +977,17 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         assert_contains(
             streaming_visible,
             "streaming now",
-            "streaming follow-up should replace the pending indicator with live output",
+            "streaming follow-up should keep live output visible",
+        )
+        assert_not_contains(
+            streaming_visible,
+            "Working...",
+            "streaming follow-up should not show a redundant live heartbeat",
         )
         assert_not_contains(
             streaming_visible,
             "thinking",
-            "streaming follow-up should no longer show the prompt-only thinking indicator",
+            "streaming follow-up should replace the prompt-only thinking indicator",
         )
         assert_not_contains(
             streaming_visible,
@@ -1213,6 +1315,7 @@ def main() -> int:
 
     binary = ROOT / "target" / "debug" / "but" if args.skip_build else build_binary()
     smoke_interactive_terminal(binary)
+    smoke_live_subagent_status_bar(binary)
     smoke_ready_resize_does_not_leave_stale_frames(binary)
     smoke_history_selection_emits_native_transcript(binary)
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
