@@ -1,8 +1,8 @@
-# Browser Use Terminal
-
 <p align="center">
   <img src="static/browser-use-terminal-banner.png" alt="Browser Use Terminal" />
 </p>
+
+# Browser Use Terminal
 
 Automate the boring stuff in the browser.
 
@@ -10,7 +10,7 @@ Browser Use Terminal is a Rust TUI for browser agents. It can use your real brow
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/browser-use/terminal/main/scripts/install/install.sh | sh
-browser-use
+browser
 ```
 
 <p align="center">
@@ -44,7 +44,7 @@ Find the cancellation policy for my current hotel reservation.
 Launch the app:
 
 ```bash
-browser-use
+browser
 ```
 
 Use slash commands inside the TUI:
@@ -59,9 +59,9 @@ Use slash commands inside the TUI:
 Useful shell commands:
 
 ```bash
-browser-use-terminal auth status
-browser-use-terminal config show
-browser-use-terminal diagnostics
+browser auth status
+browser config show
+browser diagnostics
 ```
 
 ## Development
