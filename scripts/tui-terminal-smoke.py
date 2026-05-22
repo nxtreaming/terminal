@@ -40,6 +40,12 @@ def run(cmd: list[str], *, check: bool = True, text: str | None = None) -> subpr
     )
 
 
+def binary_version_label(binary: Path) -> str:
+    output = run([str(binary), "--version"]).stdout.strip()
+    version = output.rsplit(" ", 1)[-1]
+    return f"v{version}"
+
+
 def tmux(*args: str, check: bool = True) -> str:
     return run(["tmux", *args], check=check).stdout
 
@@ -554,6 +560,7 @@ def smoke_live_subagent_status_bar(binary: Path) -> None:
 def smoke_ready_resize_does_not_leave_stale_frames(binary: Path) -> None:
     session = f"but-smoke-ready-resize-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-ready-resize-"))
+    expected_version = binary_version_label(binary)
     try:
         start_session(
             session,
@@ -570,7 +577,7 @@ def smoke_ready_resize_does_not_leave_stale_frames(binary: Path) -> None:
         for name, text in [("visible", visible), ("scrollback", full)]:
             assert_contains(text, "Tell the browser what to do...", f"ready resize {name} should keep composer visible")
             assert_count(text, "Browser Use", 1, f"ready resize {name} should keep one header")
-            assert_count(text, "v0.1.0", 1, f"ready resize {name} should keep one version")
+            assert_count(text, expected_version, 1, f"ready resize {name} should keep one version")
             assert_count(text, "press / for shortcuts", 1, f"ready resize {name} should keep one shortcut hint")
             assert_not_contains(text, "^[[", f"ready resize {name} should not leak escape sequences")
     finally:

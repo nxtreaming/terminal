@@ -4599,7 +4599,7 @@ mod redesign_tests {
         let ready_screen = render_dump(&mut app)?;
         // Current welcome screen: centered logo plus the shortcut hint.
         assert!(ready_screen.contains("Browser Use"));
-        assert!(ready_screen.contains("v0.1.0"));
+        assert!(ready_screen.contains(concat!("v", env!("CARGO_PKG_VERSION"))));
         assert!(ready_screen.contains("press / for shortcuts"));
         // Fused composer carries model metadata in the status row.
         assert!(ready_screen.contains("GPT-5.5"));
