@@ -1665,7 +1665,6 @@ impl App {
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
-            PaletteAction::ConfigureLaminar => self.dispatch(AppCommand::ConfigureTelemetry)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
         }
         Ok(())
@@ -3067,7 +3066,7 @@ fn run_terminal(mut app: App) -> Result<()> {
 struct TerminalDriver {
     terminal: Terminal<CrosstermBackend<io::Stdout>>,
     mouse_capture_enabled: bool,
-    manual_modal_overlay_visible: bool,
+    manual_modal_overlay_rect: Option<Rect>,
 }
 
 impl TerminalDriver {
@@ -3075,7 +3074,7 @@ impl TerminalDriver {
         Ok(Self {
             terminal: new_inline_terminal(height)?,
             mouse_capture_enabled: false,
-            manual_modal_overlay_visible: false,
+            manual_modal_overlay_rect: None,
         })
     }
 
@@ -3087,33 +3086,40 @@ impl TerminalDriver {
         reset_terminal_screen(self.terminal.backend_mut(), ClearType::Purge)?;
         self.terminal = new_inline_terminal(desired_height)?;
         app.native_history.reset();
-        self.manual_modal_overlay_visible = false;
+        self.manual_modal_overlay_rect = None;
         Ok(desired_height)
     }
 
     fn settle_resize(&mut self, app: &mut App) -> Result<()> {
         reset_inline_terminal_after_resize(&mut self.terminal)?;
         app.native_history.reset();
-        self.manual_modal_overlay_visible = false;
+        self.manual_modal_overlay_rect = None;
         Ok(())
     }
 
     fn draw(&mut self, app: &mut App) -> Result<()> {
         let manual_overlay_active = should_draw_manual_modal_overlay(app);
-        let overlay_state = if manual_overlay_active {
-            Some(app.workbench_state()?)
+        let manual_overlay = if manual_overlay_active {
+            let state = app.workbench_state()?;
+            manual_modal_overlay(app, &state)
         } else {
             None
         };
-        if self.manual_modal_overlay_visible && !manual_overlay_active {
+        let manual_overlay_rect = manual_overlay.as_ref().map(|overlay| overlay.rect);
+        if let Some(previous_rect) = self.manual_modal_overlay_rect {
+            if manual_overlay_rect != Some(previous_rect) {
+                clear_manual_modal_overlay_rect(self.terminal.backend_mut(), previous_rect)?;
+            }
+        }
+        if self.manual_modal_overlay_rect.is_some() && !manual_overlay_active {
             app.native_history.reset_with_clear();
         }
         maybe_emit_native_transcript(&mut self.terminal, app)?;
         self.terminal.draw(|frame| render(frame, app))?;
-        if let Some(state) = overlay_state.as_ref() {
-            draw_manual_modal_overlay(self.terminal.backend_mut(), app, state)?;
+        if let Some(overlay) = manual_overlay.as_ref() {
+            draw_manual_modal_overlay(self.terminal.backend_mut(), overlay)?;
         }
-        self.manual_modal_overlay_visible = manual_overlay_active;
+        self.manual_modal_overlay_rect = manual_overlay_rect;
         self.sync_mouse_capture(app)?;
         Ok(())
     }
@@ -3210,20 +3216,51 @@ fn should_draw_manual_modal_overlay(app: &App) -> bool {
     (app.is_slash_palette_active() || app.surface.is_popup()) && app.native_scrollback_is_active()
 }
 
-fn draw_manual_modal_overlay(
-    target: &mut CrosstermBackend<io::Stdout>,
-    app: &App,
-    state: &WorkbenchState,
-) -> Result<()> {
+fn manual_modal_overlay(app: &App, state: &WorkbenchState) -> Option<render::ModalOverlay> {
     let (term_w, term_h) = crossterm::terminal::size().unwrap_or((app.args.width, app.args.height));
     if term_w == 0 || term_h == 0 {
-        return Ok(());
+        return None;
     }
     let area = Rect::new(0, 0, term_w, term_h);
-    let Some(overlay) = render::active_modal_overlay(app, state, area) else {
-        return Ok(());
-    };
+    render::active_modal_overlay(app, state, area)
+}
 
+fn clear_manual_modal_overlay_rect(
+    target: &mut CrosstermBackend<io::Stdout>,
+    rect: Rect,
+) -> Result<()> {
+    let (term_w, term_h) = crossterm::terminal::size().unwrap_or((rect.width, rect.height));
+    queue!(
+        target,
+        ResetColor,
+        SetAttribute(Attribute::Reset),
+        SetForegroundColor(CrosstermColor::Reset),
+        SetBackgroundColor(CrosstermColor::Reset)
+    )?;
+    for y in 0..rect.height {
+        let row = rect.y.saturating_add(y);
+        if row >= term_h {
+            break;
+        }
+        for x in 0..rect.width {
+            let col = rect.x.saturating_add(x);
+            if col >= term_w {
+                break;
+            }
+            queue!(target, MoveTo(col, row), Print(" "))?;
+        }
+    }
+    queue!(target, ResetColor, SetAttribute(Attribute::Reset))?;
+    target.flush()?;
+    Ok(())
+}
+
+fn draw_manual_modal_overlay(
+    target: &mut CrosstermBackend<io::Stdout>,
+    overlay: &render::ModalOverlay,
+) -> Result<()> {
+    let (term_w, term_h) =
+        crossterm::terminal::size().unwrap_or((overlay.rect.width, overlay.rect.height));
     for y in 0..overlay.rect.height {
         let row = overlay.rect.y.saturating_add(y);
         if row >= term_h {
@@ -4543,7 +4580,7 @@ mod redesign_tests {
         assert!(screen.contains("/browser"));
         assert!(screen.contains("/model"));
         assert!(screen.contains("/auth"));
-        assert!(screen.contains("/laminar"));
+        assert!(!screen.contains("/laminar"));
         assert!(screen.contains("start a new task"));
         assert!(screen.contains("change browser backend"));
         assert!(!screen.contains("filter actions"));

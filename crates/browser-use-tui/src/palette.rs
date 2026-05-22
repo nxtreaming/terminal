@@ -5,7 +5,6 @@ pub(crate) enum PaletteAction {
     ChangeBrowser,
     ChooseModel,
     Authenticate,
-    ConfigureLaminar,
     Update,
 }
 
@@ -16,7 +15,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const ITEMS: [PaletteItem; 7] = [
+const ITEMS: [PaletteItem; 6] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -41,11 +40,6 @@ const ITEMS: [PaletteItem; 7] = [
         command: "/auth",
         description: "sign in to a provider",
         action: PaletteAction::Authenticate,
-    },
-    PaletteItem {
-        command: "/laminar",
-        description: "configure Laminar telemetry",
-        action: PaletteAction::ConfigureLaminar,
     },
     PaletteItem {
         command: "/update",

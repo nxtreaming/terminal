@@ -6,7 +6,7 @@
 
 Automate the boring stuff in the browser.
 
-Browser Use Terminal is a Rust TUI for browser agents. It can use your real browser session, headless Chromium, or Browser Use cloud to get web work done from the terminal.
+Browser Use Terminal is a Rust TUI for browser agents. It combines a new LLM harness, Browser Harness-style CDP control, real Chrome sessions, and a terminal UI you can actually steer.
 
 ```bash
 curl -fsSL https://browser-use.com/terminal/install.sh | sh
@@ -20,10 +20,43 @@ browser
 ## What It Does
 
 - runs browser tasks from a terminal UI
-- works with logged-in local Chrome
-- supports headless and cloud browsers
-- lets you watch, steer, stop, and resume tasks
-- keeps local history and artifacts
+- works with your logged-in Chrome when the task needs real account state
+- supports headless Chromium and Browser Use cloud for clean or remote runs
+- lets you watch, steer, stop, retry, and resume tasks
+- keeps local history, screenshots, artifacts, and follow-ups
+- uses a new LLM harness built to be 2x cheaper and 2x faster than Browser Harness
+
+## How It Works
+
+```text
+┌─────────────────────────────────────────────────────────────┐
+│                         browser                             │
+├─────────────────────────────────────────────────────────────┤
+│  terminal UI                                                │
+│  custom Ratatui renderer, native scrollback, keyboard UX     │
+├─────────────────────────────────────────────────────────────┤
+│  Rust LLM harness                                           │
+│  provider loop, tools, subagents, compaction, cancellation   │
+├─────────────────────────────────────────────────────────────┤
+│  event store                                                │
+│  SQLite history, artifacts, screenshots, follow-ups, traces  │
+├─────────────────────────────────────────────────────────────┤
+│  browser runtime                                            │
+│  connect, profiles, doctor, recovery, ownership             │
+├─────────────────────────────────────────────────────────────┤
+│  browser interaction                                        │
+│  direct CDP, page JS, screenshots, files, helper workspace   │
+├─────────────────────────────────────────────────────────────┤
+│  Chrome                                                     │
+│  real logged-in Chrome, headless Chromium, or cloud browser  │
+└─────────────────────────────────────────────────────────────┘
+```
+
+The harness is built from scratch around browser work. The model gets a CDP-first action space instead of a narrow framework API, while Rust keeps the durable state: task history, tool calls, artifacts, browser status, cancellation, follow-ups, and subagents.
+
+The TUI is not a log dump. It has a custom Ratatui renderer that keeps completed output in native terminal scrollback, renders only live state in the active viewport, and drives real keyboard flows for history, browser controls, model/auth setup, steering, stopping, and retrying.
+
+Browser state is explicit: connect, profile, doctor, recover, stop. No mystery browser session hiding behind the agent loop.
 
 ## Try It
 
