@@ -73,6 +73,11 @@ enum Command {
         #[arg(long, default_value = "openai/gpt-5.5")]
         model: String,
     },
+    RunDeepseek {
+        text: String,
+        #[arg(long, default_value = "deepseek-v4-pro")]
+        model: String,
+    },
     RunOpenaiSession {
         task_id: String,
         #[arg(long, default_value = "gpt-5.5")]
@@ -91,6 +96,11 @@ enum Command {
     RunOpenrouterSession {
         task_id: String,
         #[arg(long, default_value = "openai/gpt-5.5")]
+        model: String,
+    },
+    RunDeepseekSession {
+        task_id: String,
+        #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
     },
     Followup {
@@ -405,6 +415,7 @@ enum AuthAccount {
     Openai,
     Anthropic,
     Openrouter,
+    Deepseek,
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -468,6 +479,7 @@ fn main() -> Result<()> {
         Command::RunCodex { text, model } => run_codex(&store, text, model),
         Command::RunAnthropic { text, model } => run_anthropic(&store, text, model),
         Command::RunOpenrouter { text, model } => run_openrouter(&store, text, model),
+        Command::RunDeepseek { text, model } => run_deepseek(&store, text, model),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(&store, &task_id, model),
         Command::RunCodexSession { task_id, model } => run_codex_session(&store, &task_id, model),
         Command::RunAnthropicSession { task_id, model } => {
@@ -475,6 +487,9 @@ fn main() -> Result<()> {
         }
         Command::RunOpenrouterSession { task_id, model } => {
             run_openrouter_session(&store, &task_id, model)
+        }
+        Command::RunDeepseekSession { task_id, model } => {
+            run_deepseek_session(&store, &task_id, model)
         }
         Command::Followup { task_id, text } => followup(&store, &task_id, text),
         Command::Finish { task_id, result } => finish(&store, &task_id, result),
@@ -698,10 +713,12 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunCodex { .. } => "run_codex",
         Command::RunAnthropic { .. } => "run_anthropic",
         Command::RunOpenrouter { .. } => "run_openrouter",
+        Command::RunDeepseek { .. } => "run_deepseek",
         Command::RunOpenaiSession { .. } => "run_openai_session",
         Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
+        Command::RunDeepseekSession { .. } => "run_deepseek_session",
         Command::Followup { .. } => "followup",
         Command::Finish { .. } => "finish",
         Command::Fail { .. } => "fail",
@@ -1031,6 +1048,14 @@ fn run_openrouter(store: &Store, text: String, model: String) -> Result<()> {
     Ok(())
 }
 
+fn run_deepseek(store: &Store, text: String, model: String) -> Result<()> {
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(cli_agent_options());
+    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
+    println!("{session_id}");
+    Ok(())
+}
+
 fn run_openai_session(store: &Store, task_id: &str, model: String) -> Result<()> {
     ensure_task_exists(store, task_id)?;
     let config =
@@ -1062,6 +1087,15 @@ fn run_openrouter_session(store: &Store, task_id: &str, model: String) -> Result
     ensure_task_exists(store, task_id)?;
     let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model)
         .with_options(cli_agent_options());
+    let session_id = run_existing_session_from_config(store, task_id, config)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn run_deepseek_session(store: &Store, task_id: &str, model: String) -> Result<()> {
+    ensure_task_exists(store, task_id)?;
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(cli_agent_options());
     let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
@@ -1334,6 +1368,12 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
                 "auth.openrouter.api_key",
                 &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
             )?;
+            print_api_key_status(
+                store,
+                "DeepSeek API key",
+                "auth.deepseek.api_key",
+                &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+            )?;
             print_claude_code_status(store)?;
             Ok(())
         }
@@ -1405,7 +1445,10 @@ fn auth_login(
             println!("{}: connected (stored)", auth_account_label(account));
             Ok(())
         }
-        AuthAccount::Openai | AuthAccount::Anthropic | AuthAccount::Openrouter => {
+        AuthAccount::Openai
+        | AuthAccount::Anthropic
+        | AuthAccount::Openrouter
+        | AuthAccount::Deepseek => {
             let api_key =
                 read_required_secret(api_key, &format!("{} API key", auth_account_label(account)))?;
             let key = api_key_setting(account).context("account does not use an API key")?;
@@ -1423,7 +1466,9 @@ fn auth_login(
                         .context("auth login codex requires --account-id with --access-token")?,
                 }
             } else {
-                load_codex_auth().context("load external Codex auth for login")?
+                anyhow::bail!(
+                    "auth login codex requires --access-token with --account-id; use auth import-codex to copy an external Codex login"
+                );
             };
             store_codex_auth(store, &auth)?;
             store.set_setting("account", "Codex login")?;
@@ -1446,7 +1491,10 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
             store.delete_setting("auth.codex.access_token")?;
             store.delete_setting("auth.codex.account_id")?;
         }
-        AuthAccount::Openai | AuthAccount::Anthropic | AuthAccount::Openrouter => {
+        AuthAccount::Openai
+        | AuthAccount::Anthropic
+        | AuthAccount::Openrouter
+        | AuthAccount::Deepseek => {
             if let Some(key) = api_key_setting(account) {
                 store.delete_setting(key)?;
             }
@@ -1688,12 +1736,13 @@ fn print_codex_status(store: &Store) -> Result<()> {
         );
         return Ok(());
     }
-    match load_codex_auth() {
-        Ok(auth) => println!(
-            "Codex login: connected account {} (external)",
+    if let Some(auth) = codex_auth_from_explicit_env() {
+        println!(
+            "Codex login: connected account {} (environment)",
             auth.account_id
-        ),
-        Err(error) => println!("Codex login: not connected ({error})"),
+        );
+    } else {
+        print_auth_line("Codex login", false);
     }
     Ok(())
 }
@@ -1775,6 +1824,24 @@ fn stored_codex_auth(store: &Store) -> Result<Option<CodexAuth>> {
     }))
 }
 
+fn codex_auth_from_explicit_env() -> Option<CodexAuth> {
+    if let Ok(path) = std::env::var("LLM_BROWSER_CODEX_AUTH_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return load_codex_auth_file(path).ok();
+        }
+    }
+    let access_token = std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").ok()?;
+    let account_id = std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").ok()?;
+    if access_token.trim().is_empty() || account_id.trim().is_empty() {
+        return None;
+    }
+    Some(CodexAuth {
+        access_token,
+        account_id,
+    })
+}
+
 fn stored_or_env(store: &Store, setting_key: &str, env_names: &[&str]) -> Result<Option<String>> {
     if let Some(value) = store.get_setting(setting_key)? {
         if !value.trim().is_empty() {
@@ -1815,10 +1882,9 @@ fn openai_provider(store: &Store, model: String) -> Result<OpenAIResponsesProvid
 }
 
 fn codex_provider(store: &Store, model: String) -> Result<CodexResponsesProvider> {
-    let auth = match stored_codex_auth(store)? {
-        Some(auth) => auth,
-        None => load_codex_auth()?,
-    };
+    let auth = stored_codex_auth(store)?
+        .or_else(codex_auth_from_explicit_env)
+        .context("Codex login is missing; run `auth import-codex`, `auth login codex --access-token ... --account-id ...`, or set LLM_BROWSER_CODEX_ACCESS_TOKEN and LLM_BROWSER_CODEX_ACCOUNT_ID")?;
     let base_url = setting_or_env_or_default(
         store,
         "auth.codex.base_url",
@@ -1925,6 +1991,7 @@ fn api_key_setting(account: AuthAccount) -> Option<&'static str> {
         AuthAccount::Openai => Some("auth.openai.api_key"),
         AuthAccount::Anthropic => Some("auth.anthropic.api_key"),
         AuthAccount::Openrouter => Some("auth.openrouter.api_key"),
+        AuthAccount::Deepseek => Some("auth.deepseek.api_key"),
         AuthAccount::BrowserUseCloud => Some(BROWSER_USE_CLOUD_API_KEY_SETTING),
         AuthAccount::Codex | AuthAccount::ClaudeCode => None,
     }
@@ -1938,6 +2005,7 @@ fn auth_account_label(account: AuthAccount) -> &'static str {
         AuthAccount::Openai => "OpenAI API key",
         AuthAccount::Anthropic => "Anthropic API key",
         AuthAccount::Openrouter => "OpenRouter API key",
+        AuthAccount::Deepseek => "DeepSeek API key",
     }
 }
 

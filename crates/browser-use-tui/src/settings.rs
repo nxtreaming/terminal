@@ -7,6 +7,7 @@ pub(crate) enum AgentBackend {
     Openai,
     Anthropic,
     Openrouter,
+    Deepseek,
     Fake,
     None,
 }
@@ -18,6 +19,7 @@ impl AgentBackend {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
             Self::Openrouter => "openrouter",
+            Self::Deepseek => "deepseek",
             Self::Fake => "fake",
             Self::None => "none",
         }
@@ -29,6 +31,7 @@ impl AgentBackend {
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
             "openrouter" => Some(Self::Openrouter),
+            "deepseek" => Some(Self::Deepseek),
             "fake" => Some(Self::Fake),
             "none" => Some(Self::None),
             _ => None,
@@ -43,6 +46,7 @@ impl From<AgentBackend> for ProviderBackend {
             AgentBackend::Openai => Self::Openai,
             AgentBackend::Anthropic => Self::Anthropic,
             AgentBackend::Openrouter => Self::Openrouter,
+            AgentBackend::Deepseek => Self::Deepseek,
             AgentBackend::Fake => Self::Fake,
             AgentBackend::None => Self::None,
         }
@@ -63,12 +67,14 @@ pub(crate) const ACCOUNT_CLAUDE_CODE_LEGACY: &str = "Claude Code login";
 pub(crate) const ACCOUNT_OPENAI: &str = "OpenAI API key";
 pub(crate) const ACCOUNT_ANTHROPIC: &str = "Anthropic API key";
 pub(crate) const ACCOUNT_OPENROUTER: &str = "OpenRouter API key";
+pub(crate) const ACCOUNT_DEEPSEEK: &str = "DeepSeek API key";
 
-pub(crate) const ACCOUNT_CHOICES: [&str; 4] = [
+pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
     ACCOUNT_CODEX,
     ACCOUNT_OPENAI,
     ACCOUNT_ANTHROPIC,
     ACCOUNT_OPENROUTER,
+    ACCOUNT_DEEPSEEK,
 ];
 
 pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use cloud";
@@ -86,7 +92,7 @@ pub(crate) fn is_claude_code_account(account: &str) -> bool {
     account == ACCOUNT_CLAUDE_CODE || account == ACCOUNT_CLAUDE_CODE_LEGACY
 }
 
-pub(crate) const MODEL_CHOICES: [ModelChoice; 9] = [
+pub(crate) const MODEL_CHOICES: [ModelChoice; 10] = [
     ModelChoice {
         display: "GPT-5.5",
         account: ACCOUNT_CODEX,
@@ -141,9 +147,15 @@ pub(crate) const MODEL_CHOICES: [ModelChoice; 9] = [
         backend: AgentBackend::Openrouter,
         provider_model: "deepseek/deepseek-v4-pro",
     },
+    ModelChoice {
+        display: "DeepSeek V4 Pro",
+        account: ACCOUNT_DEEPSEEK,
+        backend: AgentBackend::Deepseek,
+        provider_model: "deepseek-v4-pro",
+    },
 ];
 
-pub(crate) const VISIBLE_MODEL_CHOICES: [usize; 7] = [0, 3, 4, 5, 6, 7, 8];
+pub(crate) const VISIBLE_MODEL_CHOICES: [usize; 8] = [0, 3, 4, 5, 6, 7, 8, 9];
 
 pub(crate) fn provider_model_for_display(display: &str) -> &str {
     MODEL_CHOICES

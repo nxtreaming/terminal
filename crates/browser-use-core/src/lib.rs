@@ -14,10 +14,10 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{
     failure_from_events, result_from_events, sanitized_agent_context_from_events, EventRecord,
-    ModelEvent, SessionMeta, SessionStatus, ToolCall, ToolSpec,
+    ModelEvent, SessionMeta, ToolCall, ToolSpec,
 };
 use browser_use_providers::{
-    load_codex_auth, refresh_claude_code_oauth, AnthropicMessagesProvider,
+    load_codex_auth_file, refresh_claude_code_oauth, AnthropicMessagesProvider,
     ClaudeCodeOAuthCredential, CodexAuth, CodexResponsesProvider, FakeProvider, ModelProvider,
     OpenAICompatibleChatProvider, OpenAIResponsesProvider, ProviderTurn, ScriptedProvider,
 };
@@ -58,6 +58,7 @@ pub enum ProviderBackend {
     Openai,
     Anthropic,
     Openrouter,
+    Deepseek,
     Fake,
     None,
 }
@@ -324,6 +325,10 @@ pub fn run_existing_session_from_config(
             let provider = openrouter_provider(store, config.model)?;
             run_existing_session_with_provider(store, &provider, session_id, config.options)
         }
+        ProviderBackend::Deepseek => {
+            let provider = deepseek_provider(store, config.model)?;
+            run_existing_session_with_provider(store, &provider, session_id, config.options)
+        }
         ProviderBackend::Fake => {
             let provider = FakeProvider::with_text(
                 config
@@ -343,6 +348,7 @@ fn provider_backend_kind(backend: ProviderBackend) -> &'static str {
         ProviderBackend::Openai => "openai",
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
+        ProviderBackend::Deepseek => "deepseek",
         ProviderBackend::Fake => "fake",
         ProviderBackend::None => "none",
     }
@@ -442,10 +448,9 @@ fn openai_provider(store: &Store, model: String) -> Result<OpenAIResponsesProvid
 }
 
 fn codex_provider(store: &Store, model: String) -> Result<CodexResponsesProvider> {
-    let auth = match stored_codex_auth(store)? {
-        Some(auth) => auth,
-        None => load_codex_auth()?,
-    };
+    let auth = stored_codex_auth(store)?
+        .or_else(codex_auth_from_explicit_env)
+        .context("Codex login is missing; sign in from the TUI or set LLM_BROWSER_CODEX_ACCESS_TOKEN and LLM_BROWSER_CODEX_ACCOUNT_ID")?;
     let base_url = setting_or_env_or_default(
         store,
         "auth.codex.base_url",
@@ -453,6 +458,24 @@ fn codex_provider(store: &Store, model: String) -> Result<CodexResponsesProvider
         "https://chatgpt.com/backend-api",
     )?;
     Ok(CodexResponsesProvider::with_base_url(auth, model, base_url))
+}
+
+fn codex_auth_from_explicit_env() -> Option<CodexAuth> {
+    if let Ok(path) = std::env::var("LLM_BROWSER_CODEX_AUTH_FILE") {
+        let path = path.trim();
+        if !path.is_empty() {
+            return load_codex_auth_file(path).ok();
+        }
+    }
+    let access_token = std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").ok()?;
+    let account_id = std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").ok()?;
+    if access_token.trim().is_empty() || account_id.trim().is_empty() {
+        return None;
+    }
+    Some(CodexAuth {
+        access_token,
+        account_id,
+    })
 }
 
 fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesProvider> {
@@ -566,6 +589,24 @@ fn openrouter_provider(store: &Store, model: String) -> Result<OpenAICompatibleC
         "https://openrouter.ai/api/v1",
     )?;
     Ok(OpenAICompatibleChatProvider::with_base_url(
+        api_key, model, base_url,
+    ))
+}
+
+fn deepseek_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
+    let api_key = stored_or_env(
+        store,
+        "auth.deepseek.api_key",
+        &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+    )?
+    .context("run `auth login deepseek --api-key ...` or set DEEPSEEK_API_KEY")?;
+    let base_url = setting_or_env_or_default(
+        store,
+        "auth.deepseek.base_url",
+        &["LLM_BROWSER_DEEPSEEK_BASE_URL"],
+        "https://api.deepseek.com",
+    )?;
+    Ok(OpenAICompatibleChatProvider::deepseek(
         api_key, model, base_url,
     ))
 }
@@ -754,6 +795,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             }),
         )?;
     }
+    let cancel_after_seq = latest_session_message_seq(store, &session.id)?;
     let result = (|| -> Result<String> {
         let mut python_env = options.python_env.clone();
         if !python_env
@@ -791,10 +833,9 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             )?;
 
             let mut deadline_warning_emitted = false;
-            let mut last_external_session_message_seq =
-                latest_session_message_seq(store, &session.id)?;
-            for turn_idx in 0..options.max_turns {
-                ensure_not_cancelled(store, &session.id)?;
+            let mut last_external_session_message_seq = cancel_after_seq;
+            'turns: for turn_idx in 0..options.max_turns {
+                ensure_not_cancelled(store, &session.id, cancel_after_seq)?;
                 append_new_external_session_messages(
                     store,
                     &session.id,
@@ -822,6 +863,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     }));
                 }
                 let mut assistant_text = String::new();
+                let mut assistant_reasoning_content = String::new();
                 let mut tool_calls = Vec::new();
                 let step_span = telemetry.start_step_span(
                     &agent_span,
@@ -850,6 +892,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         tools: turn_tools.clone(),
                     },
                     turn_idx,
+                    cancel_after_seq,
                 ) {
                     Ok(events) => {
                         telemetry.record_model_events(
@@ -892,6 +935,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                     tools: turn_tools,
                                 },
                                 turn_idx,
+                                cancel_after_seq,
                             ) {
                                 Ok(events) => {
                                     telemetry.record_model_events(
@@ -929,7 +973,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 assistant_text.push_str(&delta);
                             }
                         }
-                        ModelEvent::ThinkingDelta { .. } => {}
+                        ModelEvent::ThinkingDelta { text, .. } => {
+                            if let Some(delta) =
+                                assistant_delta_to_append(&assistant_reasoning_content, &text)
+                            {
+                                assistant_reasoning_content.push_str(&delta);
+                            }
+                        }
                         ModelEvent::Usage { usage } => {
                             store.append_event(
                                 &session.id,
@@ -948,14 +998,19 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         ModelEvent::Done => {}
                     }
                 }
-                ensure_not_cancelled(store, &session.id)?;
+                ensure_not_cancelled(store, &session.id, cancel_after_seq)?;
 
                 if !assistant_text.is_empty() || !tool_calls.is_empty() {
-                    messages.push(serde_json::json!({
+                    let mut assistant_message = serde_json::json!({
                         "role": "assistant",
                         "content": assistant_text,
                         "tool_calls": tool_calls.iter().map(tool_call_message).collect::<Vec<_>>(),
-                    }));
+                    });
+                    if !tool_calls.is_empty() && !assistant_reasoning_content.is_empty() {
+                        assistant_message["reasoning_content"] =
+                            serde_json::json!(assistant_reasoning_content);
+                    }
+                    messages.push(assistant_message);
                 }
                 maybe_compact_messages(
                     store,
@@ -965,6 +1020,23 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 )?;
 
                 if tool_calls.is_empty() {
+                    if append_new_external_session_messages(
+                        store,
+                        &session.id,
+                        &mut messages,
+                        &mut last_external_session_message_seq,
+                    )? > 0
+                    {
+                        normalize_provider_messages(&mut messages);
+                        maybe_compact_messages(
+                            store,
+                            &session.id,
+                            &mut messages,
+                            options.max_context_chars,
+                        )?;
+                        step_span.set_ok();
+                        continue;
+                    }
                     if !assistant_text.trim().is_empty() {
                         let requested_result = assistant_text.trim_end();
                         if let Some(error) = guard_or_close_active_descendants(
@@ -1016,6 +1088,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &telemetry,
                     &step_span,
                     turn_idx,
+                    cancel_after_seq,
                 )? {
                     messages.extend(outcome.messages);
                     maybe_compact_messages(
@@ -1025,6 +1098,28 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         options.max_context_chars,
                     )?;
                     if outcome.finished {
+                        if append_new_external_session_messages(
+                            store,
+                            &session.id,
+                            &mut messages,
+                            &mut last_external_session_message_seq,
+                        )? > 0
+                        {
+                            store.append_event(
+                                &session.id,
+                                "session.status",
+                                serde_json::json!({ "status": "running" }),
+                            )?;
+                            normalize_provider_messages(&mut messages);
+                            maybe_compact_messages(
+                                store,
+                                &session.id,
+                                &mut messages,
+                                options.max_context_chars,
+                            )?;
+                            step_span.set_ok();
+                            continue 'turns;
+                        }
                         step_span.set_ok();
                         return Ok(session.id.clone());
                     }
@@ -1053,7 +1148,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         }
         run_result
     })();
-    let cancelled = is_cancelled(store, &session.id)?;
+    let cancelled = is_cancelled(store, &session.id, cancel_after_seq)?;
     let final_events = store.events_for_session(&session.id).unwrap_or_default();
     if cancelled {
         telemetry.record_agent_output(&agent_span, "cancelled");
@@ -1061,7 +1156,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         let output = failure_from_events(&final_events).unwrap_or_else(|| format!("{error:#}"));
         telemetry.record_agent_output(&agent_span, &output);
         agent_span.record_error(error.as_ref());
-        if !cancelled && !has_terminal_session_event(store, &session.id)? {
+        if !cancelled && !has_terminal_session_event(store, &session.id, cancel_after_seq)? {
             store.append_event(
                 &session.id,
                 "session.failed",
@@ -1119,15 +1214,18 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
     provider: &P,
     turn: ProviderTurn,
     turn_idx: usize,
+    cancel_after_seq: i64,
 ) -> Result<Vec<ModelEvent>> {
     record_model_turn_request(store, session_id, provider, turn_idx, &turn)?;
     let max_retries = provider_retry_budget(provider.provider_name());
     let mut attempt = 0_usize;
     loop {
+        ensure_not_cancelled(store, session_id, cancel_after_seq)?;
         let mut events = Vec::new();
         let mut streamed_text = String::new();
         let mut streamed_thinking_text = String::new();
         match provider.stream_turn(turn.clone(), &mut |event| {
+            ensure_not_cancelled(store, session_id, cancel_after_seq)?;
             match &event {
                 ModelEvent::TextDelta { text } => {
                     if let Some(delta) = assistant_delta_to_append(&streamed_text, text) {
@@ -1167,6 +1265,9 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
             }
             Err(error) => {
                 let error_chain = format!("{error:#}");
+                if error_chain.contains("agent cancelled") {
+                    return Err(error);
+                }
                 let transient = is_transient_provider_error(&error_chain);
                 store.append_event(
                     session_id,
@@ -1198,10 +1299,25 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                         "error": error_chain,
                     }),
                 )?;
-                thread::sleep(delay);
+                sleep_with_cancel(store, session_id, cancel_after_seq, delay)?;
             }
         }
     }
+}
+
+fn sleep_with_cancel(
+    store: &Store,
+    session_id: &str,
+    cancel_after_seq: i64,
+    delay: Duration,
+) -> Result<()> {
+    let started_at = Instant::now();
+    while started_at.elapsed() < delay {
+        ensure_not_cancelled(store, session_id, cancel_after_seq)?;
+        let remaining = delay.saturating_sub(started_at.elapsed());
+        thread::sleep(remaining.min(Duration::from_millis(50)));
+    }
+    ensure_not_cancelled(store, session_id, cancel_after_seq)
 }
 
 fn record_model_stream_delta<P: ModelProvider>(
@@ -1444,26 +1560,31 @@ fn assistant_delta_to_append(current: &str, incoming: &str) -> Option<String> {
     Some(incoming.to_string())
 }
 
-fn ensure_not_cancelled(store: &Store, session_id: &str) -> Result<()> {
-    if is_cancelled(store, session_id)? {
+fn ensure_not_cancelled(store: &Store, session_id: &str, after_seq: i64) -> Result<()> {
+    if is_cancelled(store, session_id, after_seq)? {
         bail!("agent cancelled");
     }
     Ok(())
 }
 
-fn has_terminal_session_event(store: &Store, session_id: &str) -> Result<bool> {
+fn has_terminal_session_event(store: &Store, session_id: &str, after_seq: i64) -> Result<bool> {
     Ok(store.events_for_session(session_id)?.iter().any(|event| {
-        matches!(
-            event.event_type.as_str(),
-            "session.done" | "session.failed" | "session.cancelled"
-        )
+        event.seq > after_seq
+            && matches!(
+                event.event_type.as_str(),
+                "session.done" | "session.failed" | "session.cancelled"
+            )
     }))
 }
 
-fn is_cancelled(store: &Store, session_id: &str) -> Result<bool> {
-    Ok(store
-        .load_session(session_id)?
-        .is_some_and(|session| session.status == SessionStatus::Cancelled))
+fn is_cancelled(store: &Store, session_id: &str, after_seq: i64) -> Result<bool> {
+    Ok(store.events_for_session(session_id)?.iter().any(|event| {
+        event.seq > after_seq
+            && matches!(
+                event.event_type.as_str(),
+                "session.cancel_requested" | "session.cancelled"
+            )
+    }))
 }
 
 fn maybe_emit_deadline_warning(
@@ -1893,7 +2014,7 @@ fn append_new_external_session_messages(
     session_id: &str,
     messages: &mut Vec<Value>,
     last_seq: &mut i64,
-) -> Result<()> {
+) -> Result<usize> {
     let mut events = store
         .events_for_session(session_id)?
         .into_iter()
@@ -1906,6 +2027,7 @@ fn append_new_external_session_messages(
         })
         .collect::<Vec<_>>();
     events.sort_by_key(|event| event.seq);
+    let mut appended = 0;
     for event in events {
         *last_seq = (*last_seq).max(event.seq);
         let Some(text) = event
@@ -1921,13 +2043,15 @@ fn append_new_external_session_messages(
             "role": "user",
             "content": text,
         }));
+        appended += 1;
     }
-    Ok(())
+    Ok(appended)
 }
 
 fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -> Vec<Value> {
     let mut messages = Vec::new();
     let mut assistant_text = String::new();
+    let mut assistant_reasoning_content = String::new();
     let mut assistant_tool_calls = Vec::<Value>::new();
     let mut tool_names = HashMap::<String, String>::new();
     let mut emitted_tool_messages = HashSet::<String>::new();
@@ -1935,16 +2059,30 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
     fn flush_assistant(
         messages: &mut Vec<Value>,
         assistant_text: &mut String,
+        assistant_reasoning_content: &mut String,
         assistant_tool_calls: &mut Vec<Value>,
     ) {
         if assistant_text.is_empty() && assistant_tool_calls.is_empty() {
+            assistant_reasoning_content.clear();
             return;
         }
-        messages.push(serde_json::json!({
+        let mut assistant_message = serde_json::json!({
             "role": "assistant",
             "content": std::mem::take(assistant_text),
             "tool_calls": std::mem::take(assistant_tool_calls),
-        }));
+        });
+        if assistant_message
+            .get("tool_calls")
+            .and_then(Value::as_array)
+            .is_some_and(|calls| !calls.is_empty())
+            && !assistant_reasoning_content.is_empty()
+        {
+            assistant_message["reasoning_content"] =
+                serde_json::json!(std::mem::take(assistant_reasoning_content));
+        } else {
+            assistant_reasoning_content.clear();
+        }
+        messages.push(assistant_message);
     }
 
     for event in events {
@@ -1953,6 +2091,7 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                 flush_assistant(
                     &mut messages,
                     &mut assistant_text,
+                    &mut assistant_reasoning_content,
                     &mut assistant_tool_calls,
                 );
                 let mut sections = Vec::new();
@@ -1999,6 +2138,7 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                 flush_assistant(
                     &mut messages,
                     &mut assistant_text,
+                    &mut assistant_reasoning_content,
                     &mut assistant_tool_calls,
                 );
                 if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
@@ -2011,6 +2151,11 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
             "model.delta" => {
                 if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
                     assistant_text.push_str(text);
+                }
+            }
+            "model.thinking_delta" => {
+                if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
+                    assistant_reasoning_content.push_str(text);
                 }
             }
             "model.tool_call" => {
@@ -2026,6 +2171,7 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                 flush_assistant(
                     &mut messages,
                     &mut assistant_text,
+                    &mut assistant_reasoning_content,
                     &mut assistant_tool_calls,
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
@@ -2037,6 +2183,7 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                 flush_assistant(
                     &mut messages,
                     &mut assistant_text,
+                    &mut assistant_reasoning_content,
                     &mut assistant_tool_calls,
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
@@ -2065,6 +2212,7 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                 flush_assistant(
                     &mut messages,
                     &mut assistant_text,
+                    &mut assistant_reasoning_content,
                     &mut assistant_tool_calls,
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
@@ -2091,6 +2239,7 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
     flush_assistant(
         &mut messages,
         &mut assistant_text,
+        &mut assistant_reasoning_content,
         &mut assistant_tool_calls,
     );
     normalize_provider_messages(&mut messages);
@@ -2436,12 +2585,13 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
+    cancel_after_seq: i64,
 ) -> Result<Vec<ToolDispatchOutcome>> {
     let registry = ToolRegistry::browser_agent();
     let mut outcomes = Vec::new();
     let mut index = 0;
     while index < tool_calls.len() {
-        ensure_not_cancelled(store, &session.id)?;
+        ensure_not_cancelled(store, &session.id, cancel_after_seq)?;
         if tool_call_supports_parallel(&registry, &tool_calls[index]) {
             let batch_start = index;
             index += 1;
@@ -3512,7 +3662,13 @@ fn dispatch_done_tool(
     store.append_event(&session.id, "session.done", done_payload)?;
     Ok(ToolDispatchOutcome {
         finished: true,
-        messages: Vec::new(),
+        messages: vec![tool_text_message(
+            store,
+            session,
+            call,
+            "done",
+            "done recorded the final result.",
+        )?],
     })
 }
 
@@ -5282,6 +5438,7 @@ fn record_tool_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use browser_use_protocol::SessionStatus;
 
     fn event(event_type: &str, payload: Value) -> EventRecord {
         EventRecord {
@@ -5530,6 +5687,56 @@ mod tests {
     }
 
     #[test]
+    fn provider_messages_preserve_reasoning_for_tool_call_turns() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Need page state. "}),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.thinking_delta",
+            serde_json::json!({"text": "Call python."}),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "call_py",
+                "name": "python",
+                "arguments": {"code": "print('ok')"},
+            }),
+        )?;
+        store.append_event(
+            &session.id,
+            "tool.finished",
+            serde_json::json!({
+                "name": "python",
+                "tool_call_id": "call_py",
+            }),
+        )?;
+
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_py");
+        assert_eq!(
+            messages[1]["reasoning_content"],
+            "Need page state. Call python."
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        Ok(())
+    }
+
+    #[test]
     fn provider_done_tool_finishes_session() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -5731,6 +5938,162 @@ mod tests {
             Ok(vec![
                 ModelEvent::TextDelta {
                     text: "this should not become the final answer".to_string(),
+                },
+                ModelEvent::Done,
+            ])
+        }
+    }
+
+    #[test]
+    fn provider_loop_consumes_followup_before_plain_text_finish() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial task"}),
+        )?;
+        let provider = FollowupBeforeFinalProvider {
+            state_dir: temp.path().to_path_buf(),
+            session_id: session.id.clone(),
+            turns: std::sync::Mutex::new(0),
+        };
+
+        run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let done_results = events
+            .iter()
+            .filter(|event| event.event_type == "session.done")
+            .filter_map(|event| event.payload.get("result").and_then(Value::as_str))
+            .collect::<Vec<_>>();
+        assert_eq!(done_results, vec!["new final"]);
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.followup" && event.payload["text"] == "steer now"
+        }));
+        Ok(())
+    }
+
+    struct FollowupBeforeFinalProvider {
+        state_dir: std::path::PathBuf,
+        session_id: String,
+        turns: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for FollowupBeforeFinalProvider {
+        fn provider_name(&self) -> &'static str {
+            "followup-before-final"
+        }
+
+        fn model_name(&self) -> &str {
+            "followup-before-final"
+        }
+
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut turns = self.turns.lock().expect("turn lock");
+            if *turns == 0 {
+                *turns += 1;
+                Store::open(&self.state_dir)?.append_event(
+                    &self.session_id,
+                    "session.followup",
+                    serde_json::json!({"text": "steer now"}),
+                )?;
+                return Ok(vec![
+                    ModelEvent::TextDelta {
+                        text: "old final".to_string(),
+                    },
+                    ModelEvent::Done,
+                ]);
+            }
+            *turns += 1;
+            let latest_user = turn
+                .messages
+                .iter()
+                .rev()
+                .find(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+                .map(message_content_text);
+            assert_eq!(latest_user.as_deref(), Some("steer now"));
+            Ok(vec![
+                ModelEvent::TextDelta {
+                    text: "new final".to_string(),
+                },
+                ModelEvent::Done,
+            ])
+        }
+    }
+
+    #[test]
+    fn cancelled_run_stays_cancelled_after_later_followup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "cancel then continue"}),
+        )?;
+        let provider = CancelThenFollowupProvider {
+            state_dir: temp.path().to_path_buf(),
+            session_id: session.id.clone(),
+        };
+
+        let result = run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        );
+
+        assert!(result.is_err());
+        let session = store.load_session(&session.id)?.context("session")?;
+        assert_eq!(session.status, SessionStatus::Running);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.cancelled"));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.followup"));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.done"));
+        let runs = store.runs_for_session(&session.id)?;
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].status, "cancelled");
+        Ok(())
+    }
+
+    struct CancelThenFollowupProvider {
+        state_dir: std::path::PathBuf,
+        session_id: String,
+    }
+
+    impl ModelProvider for CancelThenFollowupProvider {
+        fn provider_name(&self) -> &'static str {
+            "cancel-then-followup"
+        }
+
+        fn model_name(&self) -> &str {
+            "cancel-then-followup"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let store = Store::open(&self.state_dir)?;
+            store.request_cancel(&self.session_id, "test cancel")?;
+            store.append_event(
+                &self.session_id,
+                "session.followup",
+                serde_json::json!({"text": "new task"}),
+            )?;
+            Ok(vec![
+                ModelEvent::TextDelta {
+                    text: "old final should not land".to_string(),
                 },
                 ModelEvent::Done,
             ])

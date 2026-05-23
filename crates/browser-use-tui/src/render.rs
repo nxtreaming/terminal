@@ -11,8 +11,9 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES, VISIBLE_MODEL_CHOICES,
+    is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK,
+    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES,
+    VISIBLE_MODEL_CHOICES,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -684,7 +685,7 @@ fn render_surface_popup_box(
 }
 
 pub(crate) fn command_palette_overlay(app: &App, area: Rect) -> Option<ModalOverlay> {
-    let rect = command_palette_popup_rect(area)?;
+    let rect = command_palette_popup_rect(app, area)?;
     let local_rect = Rect::new(0, 0, rect.width, rect.height);
     let mut buffer = Buffer::empty(local_rect);
     let local_cursor = render_command_palette_box(&mut buffer, local_rect, app)?;
@@ -699,7 +700,7 @@ pub(crate) fn command_palette_overlay(app: &App, area: Rect) -> Option<ModalOver
     })
 }
 
-fn command_palette_popup_rect(area: Rect) -> Option<Rect> {
+fn command_palette_popup_rect(app: &App, area: Rect) -> Option<Rect> {
     if area.width == 0 || area.height == 0 {
         return None;
     }
@@ -709,11 +710,16 @@ fn command_palette_popup_rect(area: Rect) -> Option<Rect> {
     const H_MARGIN: u16 = 4;
     const V_MARGIN: u16 = 2;
 
-    // The popup size is fixed at the full command count so the box never
-    // resizes as the user filters. Keep the initial height compact; commands
-    // beyond this row count are still reachable by filtering or arrow-key wrap.
+    // The popup size is fixed so the box never resizes as the user filters.
+    // Completed native scrollback keeps one row shorter so the underlying
+    // transcript remains visibly anchored while the palette layers over it.
     // Chrome: border(2) + input row(1) + blank(1) + footer(1) = 5.
-    let desired_h = (palette::max_item_count() as u16).min(6).saturating_add(5);
+    let item_rows = if app.native_scrollback_is_active() {
+        (palette::max_item_count() as u16).min(6)
+    } else {
+        palette::max_item_count() as u16
+    };
+    let desired_h = item_rows.saturating_add(5);
 
     let popup_w = if area.width <= MIN_W {
         area.width
@@ -1830,6 +1836,12 @@ fn model_lines(app: &App) -> Vec<Line<'static>> {
         lines.push(model_row(idx, row_idx, app));
         row_idx += 1;
     }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("deepseek", muted())));
+    for &idx in VISIBLE_MODEL_CHOICES.iter().filter(|&&idx| idx == 9) {
+        lines.push(model_row(idx, row_idx, app));
+        row_idx += 1;
+    }
     lines
 }
 
@@ -2332,6 +2344,7 @@ fn auth_secret_label(account: &str) -> &'static str {
     match account {
         ACCOUNT_OPENAI => "OpenAI API key",
         ACCOUNT_OPENROUTER => "OpenRouter API key",
+        ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
         BROWSER_USE_CLOUD => "Browser Use cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
@@ -2343,6 +2356,8 @@ fn failure_actions(error: &str) -> (&'static str, &'static str) {
     let lower = error.to_ascii_lowercase();
     if lower.contains("openrouter") {
         ("Authenticate with OpenRouter", "Choose a different model")
+    } else if lower.contains("deepseek") {
+        ("Authenticate with DeepSeek", "Choose a different model")
     } else if lower.contains("openai") {
         ("Authenticate with OpenAI", "Choose a different model")
     } else if lower.contains("anthropic") || lower.contains("claude") {
