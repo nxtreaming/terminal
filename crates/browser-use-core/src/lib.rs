@@ -13838,7 +13838,7 @@ fn is_local_agent_id(value: &str) -> bool {
     value.len() == 12 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
-fn final_statuses_for_v1_wait(
+pub fn final_statuses_for_v1_wait(
     store: &Store,
     targets: &[&str],
 ) -> Result<serde_json::Map<String, Value>> {
