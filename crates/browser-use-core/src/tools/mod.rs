@@ -1,5 +1,7 @@
+use bm25::{Document, Language, SearchEngineBuilder};
 use browser_use_protocol::{FreeformToolFormat, ToolSpec};
 use serde_json::Value;
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 pub(crate) mod command;
@@ -52,12 +54,22 @@ pub(crate) enum ToolHandlerKind {
     ListAgents,
     CloseAgent,
     CloseAgentV1,
+    ToolSearch,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum ToolExposure {
+    Direct,
+    Deferred,
+    DirectModelOnly,
+    Hidden,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct RegisteredTool {
     spec: ToolSpec,
     handler: ToolHandlerKind,
+    exposure: ToolExposure,
 }
 
 #[derive(Clone, Debug, Default)]
@@ -76,6 +88,7 @@ pub(crate) struct MultiAgentToolSpecConfig {
     pub(crate) usage_hint_text: Option<String>,
     pub(crate) max_concurrent_threads_per_session: usize,
     pub(crate) tool_namespace: Option<String>,
+    pub(crate) non_code_mode_only: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +109,7 @@ impl Default for MultiAgentToolSpecConfig {
             usage_hint_text: None,
             max_concurrent_threads_per_session: 4,
             tool_namespace: None,
+            non_code_mode_only: false,
         }
     }
 }
@@ -103,6 +117,16 @@ impl Default for MultiAgentToolSpecConfig {
 const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
 const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
 const MULTI_AGENT_V2_NAMESPACE_DESCRIPTION: &str = "Tools for spawning and managing sub-agents.";
+const TOOL_SEARCH_TOOL_NAME: &str = "tool_search";
+const TOOL_SEARCH_DEFAULT_LIMIT: usize = 8;
+const TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT: &str = "Multi-agent tools";
+const TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT: &str = "Spawn and manage sub-agents.";
+
+#[derive(Clone, Debug)]
+struct ToolSearchEntry {
+    search_text: String,
+    spec: ToolSpec,
+}
 
 impl ToolRegistry {
     pub(crate) fn browser_agent() -> Self {
@@ -168,23 +192,50 @@ impl ToolRegistry {
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
         match multi_agent_config.family {
             MultiAgentToolFamily::V1 => {
-                registry.register(
+                registry.register_with_exposure(
                     spawn_agent_v1_tool_spec(
                         &agent_type_description,
                         &multi_agent_config,
                         &model_overrides_description,
                     ),
                     ToolHandlerKind::SpawnAgentV1,
+                    ToolExposure::Deferred,
                 );
-                registry.register(send_input_v1_tool_spec(), ToolHandlerKind::SendInputV1);
-                registry.register(resume_agent_v1_tool_spec(), ToolHandlerKind::ResumeAgentV1);
-                registry.register(
+                registry.register_with_exposure(
+                    send_input_v1_tool_spec(),
+                    ToolHandlerKind::SendInputV1,
+                    ToolExposure::Deferred,
+                );
+                registry.register_with_exposure(
+                    resume_agent_v1_tool_spec(),
+                    ToolHandlerKind::ResumeAgentV1,
+                    ToolExposure::Deferred,
+                );
+                registry.register_with_exposure(
                     wait_agent_v1_tool_spec(&multi_agent_config),
                     ToolHandlerKind::WaitAgentV1,
+                    ToolExposure::Deferred,
                 );
-                registry.register(close_agent_v1_tool_spec(), ToolHandlerKind::CloseAgentV1);
+                registry.register_with_exposure(
+                    close_agent_v1_tool_spec(),
+                    ToolHandlerKind::CloseAgentV1,
+                    ToolExposure::Deferred,
+                );
+                registry.register_with_exposure(
+                    tool_search_tool_spec(&[(
+                        TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
+                        Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
+                    )]),
+                    ToolHandlerKind::ToolSearch,
+                    ToolExposure::Hidden,
+                );
             }
             MultiAgentToolFamily::V2 => {
+                let exposure = if multi_agent_config.non_code_mode_only {
+                    ToolExposure::DirectModelOnly
+                } else {
+                    ToolExposure::Direct
+                };
                 registry.register(
                     spawn_agent_tool_spec(
                         &agent_type_description,
@@ -213,17 +264,82 @@ impl ToolRegistry {
                     close_agent_tool_spec(&multi_agent_config),
                     ToolHandlerKind::CloseAgent,
                 );
+                if exposure == ToolExposure::DirectModelOnly {
+                    for tool in &mut registry.tools {
+                        if matches!(
+                            tool.handler,
+                            ToolHandlerKind::SpawnAgent
+                                | ToolHandlerKind::WaitAgent
+                                | ToolHandlerKind::SendMessage
+                                | ToolHandlerKind::FollowupTask
+                                | ToolHandlerKind::ListAgents
+                                | ToolHandlerKind::CloseAgent
+                        ) {
+                            tool.exposure = exposure;
+                        }
+                    }
+                }
             }
         }
         registry
     }
 
     pub(crate) fn register(&mut self, spec: ToolSpec, handler: ToolHandlerKind) {
-        self.tools.push(RegisteredTool { spec, handler });
+        self.register_with_exposure(spec, handler, ToolExposure::Direct);
     }
 
+    pub(crate) fn register_with_exposure(
+        &mut self,
+        spec: ToolSpec,
+        handler: ToolHandlerKind,
+        exposure: ToolExposure,
+    ) {
+        self.tools.push(RegisteredTool {
+            spec,
+            handler,
+            exposure,
+        });
+    }
+
+    #[cfg(test)]
     pub(crate) fn specs(&self) -> Vec<ToolSpec> {
-        self.tools.iter().map(|tool| tool.spec.clone()).collect()
+        self.tools
+            .iter()
+            .filter(|tool| tool.exposure != ToolExposure::Hidden)
+            .map(|tool| tool.spec.clone())
+            .collect()
+    }
+
+    pub(crate) fn specs_for_model(
+        &self,
+        tool_search_supported: bool,
+        namespace_tools_supported: bool,
+    ) -> Vec<ToolSpec> {
+        let use_tool_search =
+            tool_search_supported && namespace_tools_supported && self.has_deferred_tools();
+        let mut specs = self
+            .tools
+            .iter()
+            .filter(|tool| match tool.exposure {
+                ToolExposure::Hidden => false,
+                ToolExposure::Deferred => !use_tool_search,
+                ToolExposure::Direct | ToolExposure::DirectModelOnly => true,
+            })
+            .map(|tool| tool.spec.clone())
+            .collect::<Vec<_>>();
+        if use_tool_search {
+            specs.push(tool_search_tool_spec(&[(
+                TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
+                Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
+            )]));
+        }
+        specs
+    }
+
+    fn has_deferred_tools(&self) -> bool {
+        self.tools
+            .iter()
+            .any(|tool| tool.exposure == ToolExposure::Deferred)
     }
 
     pub(crate) fn handler_for(&self, name: &str) -> Option<ToolHandlerKind> {
@@ -249,6 +365,199 @@ impl ToolRegistry {
             None => self.handler_for(name),
         }
     }
+
+    pub(crate) fn search_deferred_tools(&self, query: &str, limit: usize) -> Vec<Value> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 {
+            return Vec::new();
+        }
+        let entries = self.deferred_tool_search_entries();
+        if entries.is_empty() {
+            return Vec::new();
+        }
+        let documents = entries
+            .iter()
+            .enumerate()
+            .map(|(idx, entry)| Document::new(idx, entry.search_text.clone()))
+            .collect::<Vec<_>>();
+        let search_engine =
+            SearchEngineBuilder::<usize>::with_documents(Language::English, documents).build();
+        let matches = search_engine
+            .search(query, limit)
+            .into_iter()
+            .filter_map(|result| entries.get(result.document.id));
+        coalesce_loadable_tool_specs(matches.map(|entry| deferred_tool_json(&entry.spec)))
+    }
+
+    fn deferred_tool_search_entries(&self) -> Vec<ToolSearchEntry> {
+        self.tools
+            .iter()
+            .filter(|tool| tool.exposure == ToolExposure::Deferred)
+            .map(|tool| ToolSearchEntry {
+                search_text: multi_agent_v1_tool_search_text(tool.handler)
+                    .unwrap_or_else(|| tool.spec.name.as_str())
+                    .to_string(),
+                spec: tool.spec.clone(),
+            })
+            .collect()
+    }
+}
+
+fn multi_agent_v1_tool_search_text(handler: ToolHandlerKind) -> Option<&'static str> {
+    match handler {
+        ToolHandlerKind::SpawnAgentV1 => Some(
+            "spawn_agent spawn agent subagent sub-agent delegate delegation parallel work worker explorer no-apps fork model reasoning",
+        ),
+        ToolHandlerKind::SendInputV1 => Some(
+            "send_input send message existing agent subagent follow up interrupt redirect queue target",
+        ),
+        ToolHandlerKind::ResumeAgentV1 => {
+            Some("resume_agent resume reopen closed agent subagent thread id target")
+        }
+        ToolHandlerKind::WaitAgentV1 => {
+            Some("wait_agent wait agent subagent status final result complete timeout targets")
+        }
+        ToolHandlerKind::CloseAgentV1 => {
+            Some("close_agent close shutdown stop agent subagent thread status target")
+        }
+        _ => None,
+    }
+}
+
+fn tool_search_tool_spec(searchable_sources: &[(&str, Option<&str>)]) -> ToolSpec {
+    let mut source_descriptions = BTreeMap::<String, Option<String>>::new();
+    for (name, description) in searchable_sources {
+        source_descriptions
+            .entry((*name).to_string())
+            .and_modify(|existing| {
+                if existing.is_none() {
+                    *existing = description.map(str::to_string);
+                }
+            })
+            .or_insert_with(|| description.map(str::to_string));
+    }
+    let source_descriptions = if source_descriptions.is_empty() {
+        "None currently enabled.".to_string()
+    } else {
+        source_descriptions
+            .into_iter()
+            .map(|(name, description)| match description {
+                Some(description) => format!("- {name}: {description}"),
+                None => format!("- {name}"),
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    };
+    ToolSpec {
+        name: TOOL_SEARCH_TOOL_NAME.to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: format!(
+            "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{source_descriptions}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`{TOOL_SEARCH_TOOL_NAME}`) to search for the required tools. For MCP tool discovery, always use `{TOOL_SEARCH_TOOL_NAME}` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
+        ),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "query": {
+                    "type": "string",
+                    "description": "Search query for deferred tools.",
+                },
+                "limit": {
+                    "type": "number",
+                    "description": format!(
+                        "Maximum number of tools to return (defaults to {TOOL_SEARCH_DEFAULT_LIMIT})."
+                    ),
+                },
+            },
+            "required": ["query"],
+            "additionalProperties": false,
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn deferred_tool_json(spec: &ToolSpec) -> Value {
+    let function_tool = if let Some(format) = &spec.freeform {
+        serde_json::json!({
+            "type": "custom",
+            "name": spec.name.clone(),
+            "description": spec.description.clone(),
+            "defer_loading": true,
+            "format": {
+                "type": format.kind.clone(),
+                "syntax": format.syntax.clone(),
+                "definition": format.definition.clone(),
+            },
+        })
+    } else {
+        serde_json::json!({
+            "type": "function",
+            "name": spec.name.clone(),
+            "description": spec.description.clone(),
+            "strict": false,
+            "defer_loading": true,
+            "parameters": spec.input_schema.clone(),
+        })
+    };
+    if let Some(namespace) = spec.namespace.as_deref() {
+        serde_json::json!({
+            "type": "namespace",
+            "name": namespace,
+            "description": spec
+                .namespace_description
+                .clone()
+                .unwrap_or_else(|| format!("Tools in the {namespace} namespace.")),
+            "tools": [function_tool],
+        })
+    } else {
+        function_tool
+    }
+}
+
+fn coalesce_loadable_tool_specs(specs: impl IntoIterator<Item = Value>) -> Vec<Value> {
+    let mut output = Vec::<Value>::new();
+    let mut namespace_indices = BTreeMap::<String, usize>::new();
+    for spec in specs {
+        let Some(namespace) = spec
+            .get("name")
+            .and_then(Value::as_str)
+            .filter(|_| spec.get("type").and_then(Value::as_str) == Some("namespace"))
+            .map(str::to_string)
+        else {
+            output.push(spec);
+            continue;
+        };
+        if let Some(index) = namespace_indices.get(&namespace).copied() {
+            let new_tools = spec
+                .get("tools")
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default();
+            if let Some(tools) = output[index].get_mut("tools").and_then(Value::as_array_mut) {
+                tools.extend(new_tools);
+            }
+            continue;
+        }
+        namespace_indices.insert(namespace, output.len());
+        output.push(spec);
+    }
+    for spec in &mut output {
+        if let Some(tools) = spec.get_mut("tools").and_then(Value::as_array_mut) {
+            tools.sort_by(|left, right| {
+                left.get("name")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .cmp(
+                        right
+                            .get("name")
+                            .and_then(Value::as_str)
+                            .unwrap_or_default(),
+                    )
+            });
+        }
+    }
+    output
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1663,6 +1972,42 @@ mod tests {
         let close_properties = close.input_schema["properties"].as_object().unwrap();
         assert!(close_properties.contains_key("target"));
         assert!(!close_properties.contains_key("reason"));
+    }
+
+    #[test]
+    fn v1_multi_agent_tools_defer_behind_tool_search_when_supported_like_codex() {
+        let registry =
+            ToolRegistry::browser_agent_with_agent_type_description_and_model_description_and_multi_agent_config(
+                default_spawn_agent_type_description(),
+                MultiAgentToolSpecConfig {
+                    family: MultiAgentToolFamily::V1,
+                    ..MultiAgentToolSpecConfig::default()
+                },
+                false,
+                browser_use_providers::spawn_agent_model_overrides_description(),
+            );
+
+        let direct_specs = registry.specs_for_model(true, true);
+        assert!(direct_specs.iter().any(|spec| spec.name == "tool_search"));
+        assert!(!direct_specs.iter().any(|spec| {
+            spec.namespace.as_deref() == Some("multi_agent_v1") && spec.name == "spawn_agent"
+        }));
+
+        let fallback_specs = registry.specs_for_model(false, true);
+        assert!(!fallback_specs.iter().any(|spec| spec.name == "tool_search"));
+        assert!(fallback_specs.iter().any(|spec| {
+            spec.namespace.as_deref() == Some("multi_agent_v1") && spec.name == "spawn_agent"
+        }));
+
+        let loaded = registry.search_deferred_tools("spawn subagent", 8);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0]["type"], "namespace");
+        assert_eq!(loaded[0]["name"], "multi_agent_v1");
+        assert!(loaded[0]["tools"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|tool| { tool["name"] == "spawn_agent" && tool["defer_loading"] == true }));
     }
 
     #[test]

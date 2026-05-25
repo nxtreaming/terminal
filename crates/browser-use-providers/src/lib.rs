@@ -573,6 +573,7 @@ struct StaticModelRequestInfo {
     default_verbosity: Option<&'static str>,
     supported_service_tiers: &'static [&'static str],
     supports_parallel_tool_calls: bool,
+    supports_search_tool: bool,
     supports_image_input: bool,
     supports_image_detail_original: bool,
     truncation_policy: ModelTruncationPolicyInfo,
@@ -589,6 +590,7 @@ impl StaticModelRequestInfo {
             default_verbosity: None,
             supported_service_tiers: &[],
             supports_parallel_tool_calls: false,
+            supports_search_tool: false,
             supports_image_input: true,
             supports_image_detail_original: false,
             truncation_policy: default_model_truncation_policy(),
@@ -606,6 +608,7 @@ pub struct ModelRequestInfo {
     pub default_verbosity: Option<String>,
     pub supported_service_tiers: Vec<String>,
     pub supports_parallel_tool_calls: bool,
+    pub supports_search_tool: bool,
     pub supports_image_input: bool,
     pub supports_image_detail_original: bool,
     pub context_window: Option<i64>,
@@ -681,6 +684,7 @@ impl From<StaticModelRequestInfo> for ModelRequestInfo {
                 .map(|value| (*value).to_string())
                 .collect(),
             supports_parallel_tool_calls: info.supports_parallel_tool_calls,
+            supports_search_tool: info.supports_search_tool,
             supports_image_input: info.supports_image_input,
             supports_image_detail_original: info.supports_image_detail_original,
             context_window: Some(272_000),
@@ -744,6 +748,8 @@ pub struct ModelCatalogEntryInfo {
     pub default_verbosity: Option<String>,
     #[serde(default)]
     pub supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    pub supports_search_tool: bool,
     #[serde(default)]
     pub supports_image_detail_original: bool,
     #[serde(default = "default_input_modalities")]
@@ -880,6 +886,7 @@ impl ModelCatalogEntryInfo {
                 .map(|tier| tier.id.clone())
                 .collect(),
             supports_parallel_tool_calls: self.supports_parallel_tool_calls,
+            supports_search_tool: self.supports_search_tool,
             supports_image_input: self
                 .input_modalities
                 .iter()
@@ -1020,6 +1027,7 @@ fn amazon_bedrock_gpt_5_4_catalog_entry(priority: i32) -> ModelCatalogEntryInfo 
         support_verbosity: true,
         default_verbosity: Some("medium".to_string()),
         supports_parallel_tool_calls: true,
+        supports_search_tool: true,
         supports_image_detail_original: true,
         input_modalities: vec!["text".to_string(), "image".to_string()],
         context_window: Some(272_000),
@@ -1062,6 +1070,7 @@ fn amazon_bedrock_oss_catalog_entry(
         support_verbosity: false,
         default_verbosity: None,
         supports_parallel_tool_calls: true,
+        supports_search_tool: false,
         supports_image_detail_original: false,
         input_modalities: vec!["text".to_string()],
         context_window: Some(128_000),
@@ -4637,7 +4646,7 @@ fn maybe_push_codex_output_item(
     }
     if matches!(
         item.get("type").and_then(Value::as_str),
-        Some("function_call") | Some("custom_tool_call")
+        Some("function_call") | Some("custom_tool_call") | Some("tool_search_call")
     ) {
         let call_id = item
             .get("call_id")
@@ -4961,6 +4970,15 @@ fn tool_specs_to_responses_tools(tools: &[ToolSpec]) -> Vec<Value> {
     let mut output = Vec::new();
     let mut namespace_indices = HashMap::<String, usize>::new();
     for tool in tools {
+        if tool.name == "tool_search" && tool.namespace.is_none() && tool.freeform.is_none() {
+            output.push(json!({
+                "type": "tool_search",
+                "execution": "client",
+                "description": tool.description,
+                "parameters": tool.input_schema,
+            }));
+            continue;
+        }
         let function_tool = if let Some(format) = &tool.freeform {
             json!({
                 "type": "custom",
@@ -6219,6 +6237,21 @@ fn parse_response_output_item(item: &Value, events: &mut Vec<ModelEvent>) -> Res
                 },
             });
         }
+        Some("tool_search_call") => {
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .context("tool_search_call missing call_id")?;
+            events.push(ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: call_id.to_string(),
+                    name: "tool_search".to_string(),
+                    namespace: None,
+                    arguments: item.get("arguments").cloned().unwrap_or_else(|| json!({})),
+                },
+            });
+        }
         _ => {}
     }
     Ok(())
@@ -6886,6 +6919,43 @@ mod tests {
     }
 
     #[test]
+    fn responses_tools_encode_tool_search_like_codex() {
+        let tools = tool_specs_to_responses_tools(&[ToolSpec {
+            name: "tool_search".to_string(),
+            namespace: None,
+            namespace_description: None,
+            description: "Search deferred tools.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                },
+                "required": ["query"],
+                "additionalProperties": false,
+            }),
+            output_schema: None,
+            freeform: None,
+        }]);
+
+        assert_eq!(
+            tools[0],
+            json!({
+                "type": "tool_search",
+                "execution": "client",
+                "description": "Search deferred tools.",
+                "parameters": {
+                    "type": "object",
+                    "properties": {
+                        "query": {"type": "string"}
+                    },
+                    "required": ["query"],
+                    "additionalProperties": false,
+                },
+            })
+        );
+    }
+
+    #[test]
     fn responses_tools_coalesce_namespaced_function_tools_like_codex() {
         let tools = tool_specs_to_responses_tools(&[
             ToolSpec {
@@ -7344,6 +7414,40 @@ mod tests {
             end_turn: Some(false),
         }));
         assert!(events.contains(&ModelEvent::Done));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_output_item_parses_tool_search_call_like_codex() -> Result<()> {
+        let mut events = Vec::new();
+        parse_response_output_item(
+            &json!({
+                "type": "tool_search_call",
+                "call_id": "search_1",
+                "status": "completed",
+                "execution": "client",
+                "arguments": {
+                    "query": "spawn subagent",
+                    "limit": 3
+                }
+            }),
+            &mut events,
+        )?;
+
+        assert_eq!(
+            events,
+            vec![ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: "search_1".to_string(),
+                    name: "tool_search".to_string(),
+                    namespace: None,
+                    arguments: json!({
+                        "query": "spawn subagent",
+                        "limit": 3
+                    }),
+                },
+            }]
+        );
         Ok(())
     }
 
@@ -8811,6 +8915,7 @@ mod tests {
                     "support_verbosity": true,
                     "default_verbosity": "high",
                     "supports_parallel_tool_calls": true,
+                    "supports_search_tool": true,
                     "supports_image_detail_original": true,
                     "context_window": 1000,
                     "max_context_window": 2000,
@@ -8834,6 +8939,7 @@ mod tests {
         assert_eq!(info.default_reasoning_effort.as_deref(), Some("high"));
         assert_eq!(info.default_verbosity.as_deref(), Some("high"));
         assert!(info.supports_parallel_tool_calls);
+        assert!(info.supports_search_tool);
         assert!(info.supports_image_detail_original);
         assert_eq!(info.resolved_context_window(), Some(1000));
         assert_eq!(info.auto_compact_token_limit(), Some(800));
@@ -8842,6 +8948,7 @@ mod tests {
         let hidden = model_request_info_for_catalog("catalog-hidden", Some(&catalog));
         assert!(!hidden.supports_image_input);
         assert!(!hidden.supports_parallel_tool_calls);
+        assert!(!hidden.supports_search_tool);
         assert_eq!(hidden.tool_output_token_budget(), 2500);
 
         let description = spawn_agent_model_overrides_description_for_catalog(&catalog, true);

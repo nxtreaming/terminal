@@ -164,28 +164,30 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch closed the represented MultiAgentV2 namespace exposure cluster
-in G-033.
+The latest batch closed the represented MultiAgentV1 typed-input and deferred
+tool-discovery cluster in G-033.
 
-- `ToolSpec` and `ToolCall` now carry optional namespace metadata, so the model
-  and runtime can represent Codex's Responses namespace tools instead of only
-  flat function names.
-- Configured `[features.multi_agent_v2].tool_namespace` now wraps the six v2
-  tools in the configured namespace when the provider supports namespace tools.
-- Plain runtime lookup is removed for namespaced v2 tools, matching Codex's
-  registered-name behavior when `tool_namespace = "agents"`.
-- Providers that do not support namespace tools, including Bedrock and
-  chat/Anthropic fallbacks, keep the flat v2 tool surface like Codex.
-- Responses request serialization now coalesces same-namespace function tools
-  into one `type = "namespace"` tool object with Codex-sorted child functions,
-  and Responses tool-call parsing preserves the returned namespace.
-- Response-history replay now keeps namespaces on persisted raw response items,
-  response-item checkpoints, and normalized assistant tool calls, so later turns
-  do not lose `agents.spawn_agent` context after a namespaced call.
-- Remaining multi-agent gaps are v1 multi-agent tools, non-code-mode-only
-  routing, CLI legacy spawn parity, exact app-server collaboration events, and
-  deeper typed rollout/input-queue persistence beyond this event-store
-  adaptation.
+- The model catalog now carries Codex's `supports_search_tool` capability into
+  request planning, and default `multi_agent_v1` tools defer behind `tool_search`
+  when the selected model and provider support search plus namespace tools.
+- `tool_search` serializes with Codex's Responses wire shape, `tool_search_call`
+  parses into a dispatchable local tool call, and the dispatcher returns
+  `tool_search_output` raw response items containing loadable namespace/function
+  specs marked `defer_loading: true`.
+- V1 `spawn_agent` and `send_input` now enforce Codex's `message` versus
+  `items` validation: both, neither, empty message, and empty items are rejected
+  with Codex-shaped model-facing errors.
+- V1 typed `items` no longer collapse to preview text. Text, remote image, local
+  image, skill, and mention inputs persist with the session event, replay into
+  provider messages as typed content parts where possible, and keep deterministic
+  preview text for local product surfaces.
+- V1 `send_input` now writes typed follow-up events directly to the target
+  session instead of going through the string-only inter-agent mailbox.
+- Remaining multi-agent gaps are full skill/mention/plugin/app context
+  injection, CLI legacy spawn/resume/wait parity, exact app-server
+  collaboration events, v1 reference/resume/close tree persistence nuances,
+  code-mode-only/direct-model-only runtime separation, and deeper typed
+  rollout/input-queue persistence beyond this event-store adaptation.
 - Remaining large non-multi-agent gaps are websocket transport/fallback/
   `response.processed`, richer effective-config provenance and doctor/status
   displays, full app-server thread-config protocol surfaces beyond the
@@ -952,13 +954,22 @@ The biggest remaining categories are:
   surface, while the default surface is the namespaced legacy
   `multi_agent_v1` family. The v1 wrappers cover `spawn_agent`, `send_input`,
   `resume_agent`, `wait_agent`, and `close_agent` with Codex-shaped schemas and
-  output payloads, adapting to the local session store.
-- Full multi-agent parity: typed v1 `items` persistence, exact tool-search
-  deferral/direct-model-only exposure metadata, CLI legacy spawn parity,
-  arbitrary role config keys such as sandbox/skills/tools, exact non-file
-  config layer semantics, exact app-server collaboration/input-queue event
-  bridge semantics, and deeper typed rollout persistence beyond the local
-  event-store mailbox adaptation.
+  output payloads, adapting to the local session store. The latest slice also
+  preserves typed v1 `items` for child context: Codex-style `message`/`items`
+  validation is enforced, text/image/local_image/skill/mention inputs persist
+  alongside preview text on `session.input` and `session.followup`, provider
+  replay uses typed content parts, and v1 `send_input` bypasses the string-only
+  mailbox for model-visible input. Local now also parses model
+  `supports_search_tool`, exposes Codex-shaped `tool_search`, parses
+  `tool_search_call`, and defers default `multi_agent_v1` tools behind BM25
+  discovery when the selected model and provider support search plus namespace
+  tools.
+- Full multi-agent parity: full skill/mention/plugin/app context injection,
+  CLI legacy spawn/resume/wait parity, arbitrary role config keys such as
+  sandbox/skills/tools, exact non-file config layer semantics, exact app-server
+  collaboration/input-queue event bridge semantics, v1 reference/resume/close
+  tree persistence nuances, code-mode-only/direct-model-only runtime separation,
+  and deeper typed rollout persistence beyond the local event-store adaptation.
 - Codex turn lifecycle parity: fully typed `TurnComplete`/`TurnAborted` events,
   websocket-only previous-response transport placement, `response.processed`
   ack and sticky fallback, TTFT/duration/app-server notification exactness,
