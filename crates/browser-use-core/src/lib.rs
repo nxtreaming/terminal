@@ -68,6 +68,7 @@ const MULTI_AGENT_USAGE_HINT_CONTEXT_MESSAGE_NAME: &str = "multi_agent_usage_hin
 const MODEL_SWITCH_CONTEXT_MESSAGE_NAME: &str = "model_switch_context";
 const PERSONALITY_CONTEXT_MESSAGE_NAME: &str = "personality_context";
 const COLLABORATION_CONTEXT_MESSAGE_NAME: &str = "collaboration_context";
+const MENTION_CONTEXT_MESSAGE_NAME: &str = "typed_mention_context";
 const COLLABORATION_CONTEXT_EVENT: &str = "model.collaboration_context";
 const SESSION_COLLABORATION_MODE_EVENT: &str = "session.collaboration_mode";
 const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
@@ -6205,6 +6206,7 @@ fn is_contextual_provider_message(message: &Value) -> bool {
             | Some(MODEL_SWITCH_CONTEXT_MESSAGE_NAME)
             | Some(PERSONALITY_CONTEXT_MESSAGE_NAME)
             | Some(COLLABORATION_CONTEXT_MESSAGE_NAME)
+            | Some(MENTION_CONTEXT_MESSAGE_NAME)
     )
 }
 
@@ -7364,6 +7366,7 @@ fn task_text_from_provider_messages(messages: &[Value]) -> Option<String> {
             && !is_turn_aborted_message(message)
             && !is_compaction_summary_message(message)
             && !is_skill_context_message(message)
+            && !is_mention_context_message(message)
             && !is_subagent_notification_context_message(message))
         .then(|| message_content_text(message))
         .filter(|text| !text.trim().is_empty())
@@ -7409,6 +7412,7 @@ fn session_event_user_content(payload: &Value) -> Option<Value> {
 
 fn session_event_user_messages(payload: &Value) -> Vec<Value> {
     let mut messages = Vec::new();
+    messages.extend(mention_context_messages_from_payload(payload));
     if let Some(content) = session_event_user_content(payload) {
         messages.push(serde_json::json!({
             "role": "user",
@@ -7417,6 +7421,66 @@ fn session_event_user_messages(payload: &Value) -> Vec<Value> {
     }
     messages.extend(skill_context_messages_from_payload(payload));
     messages
+}
+
+fn mention_context_messages_from_payload(payload: &Value) -> Vec<Value> {
+    payload
+        .get("mention_context_messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| is_mention_context_message(message))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn app_connector_ids_from_items(items: &[Value]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut connectors = Vec::new();
+    for item in items {
+        let Some(path) = item.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(connector_id) = path.strip_prefix("app://") else {
+            continue;
+        };
+        let connector_id = connector_id.trim();
+        if connector_id.is_empty() || !seen.insert(connector_id.to_string()) {
+            continue;
+        }
+        connectors.push(connector_id.to_string());
+    }
+    connectors
+}
+
+fn plugin_mentions_from_items(items: &[Value]) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut mentions = Vec::new();
+    for item in items {
+        let Some(path) = item.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(plugin_id) = path.strip_prefix("plugin://") else {
+            continue;
+        };
+        let plugin_id = plugin_id.trim();
+        if plugin_id.is_empty() || !seen.insert(path.to_string()) {
+            continue;
+        }
+        mentions.push(serde_json::json!({
+            "name": item.get("name").and_then(Value::as_str).unwrap_or_default(),
+            "path": path,
+            "plugin": plugin_id,
+        }));
+    }
+    mentions
+}
+
+fn unique_non_empty_array<T>(values: Vec<T>) -> Option<Vec<T>> {
+    (!values.is_empty()).then_some(values)
 }
 
 fn skill_context_messages_from_payload(payload: &Value) -> Vec<Value> {
@@ -7484,6 +7548,11 @@ fn is_skill_context_message(message: &Value) -> bool {
         && message_content_text(message)
             .trim_start()
             .starts_with("<skill>")
+}
+
+fn is_mention_context_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("developer")
+        && message.get("name").and_then(Value::as_str) == Some(MENTION_CONTEXT_MESSAGE_NAME)
 }
 
 fn is_subagent_notification_context_message(message: &Value) -> bool {
@@ -11990,6 +12059,7 @@ fn close_direct_active_child_subtrees(store: &Store, session_id: &str) -> Result
             .is_some_and(|session| session.status.is_active());
         if child_is_active || !subtree_active.is_empty() {
             store.close_child_agent(&agent.child_session_id, "parent finished task")?;
+            tools::command::cleanup_session_commands(&agent.child_session_id);
             store.append_event(
                 session_id,
                 "agent.cancelled",
@@ -12673,6 +12743,9 @@ struct CollabInput {
     content: Value,
     items: Option<Vec<Value>>,
     skill_context_messages: Option<Vec<Value>>,
+    mention_context_messages: Option<Vec<Value>>,
+    app_connector_ids: Option<Vec<String>>,
+    plugin_mentions: Option<Vec<Value>>,
 }
 
 fn spawn_agent_message_from_call(call: &ToolCall, legacy_v1: bool) -> String {
@@ -12717,6 +12790,9 @@ fn parse_collab_input(
                 content: Value::String(message.to_string()),
                 items: None,
                 skill_context_messages: None,
+                mention_context_messages: None,
+                app_connector_ids: None,
+                plugin_mentions: None,
             })
         }
         (None, Some(items)) => collab_input_from_items(items),
@@ -12730,17 +12806,49 @@ fn collab_input_from_items(items: &Value) -> Result<CollabInput, String> {
     if items.is_empty() {
         return Err("Items can't be empty".to_string());
     }
-    let preview = items
+    let item_values = items.clone();
+    let preview = collab_items_preview(&item_values);
+    Ok(collab_input_from_item_values(preview, item_values))
+}
+
+pub fn typed_user_input_payload_from_text(text: &str) -> Value {
+    collab_input_event_payload(&typed_collab_input_from_text(text))
+}
+
+pub fn typed_user_input_payload_from_items(items: &Value) -> Result<Value, String> {
+    collab_input_from_items(items).map(|input| collab_input_event_payload(&input))
+}
+
+fn typed_collab_input_from_text(text: &str) -> CollabInput {
+    if let Some(items) = collab_items_from_linked_mentions(text) {
+        return collab_input_from_item_values(text.to_string(), items);
+    }
+    CollabInput {
+        preview: text.to_string(),
+        content: Value::String(text.to_string()),
+        items: None,
+        skill_context_messages: None,
+        mention_context_messages: None,
+        app_connector_ids: None,
+        plugin_mentions: None,
+    }
+}
+
+fn collab_items_preview(items: &[Value]) -> String {
+    items
         .iter()
         .map(collab_item_preview)
         .filter(|preview| !preview.is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+fn collab_input_from_item_values(preview: String, item_values: Vec<Value>) -> CollabInput {
     let mut parts = Vec::new();
-    for item in items {
+    for item in &item_values {
         collab_item_content_parts(item, &mut parts);
     }
-    let fallback_preview = items
+    let fallback_preview = item_values
         .iter()
         .filter(|item| collab_item_allows_preview_fallback(item))
         .map(collab_item_preview)
@@ -12753,18 +12861,22 @@ fn collab_input_from_items(items: &Value) -> Result<CollabInput, String> {
             "text": fallback_preview,
         }));
     }
-    let item_values = items.clone();
     let skill_context_messages = if collab_items_include_skill(&item_values) {
-        Some(skill_context_messages_from_items(&item_values))
+        unique_non_empty_array(skill_context_messages_from_items(&item_values))
     } else {
         None
     };
-    Ok(CollabInput {
+    let app_connector_ids = unique_non_empty_array(app_connector_ids_from_items(&item_values));
+    let plugin_mentions = unique_non_empty_array(plugin_mentions_from_items(&item_values));
+    CollabInput {
         preview,
         content: Value::Array(parts),
         items: Some(item_values),
         skill_context_messages,
-    })
+        mention_context_messages: None,
+        app_connector_ids,
+        plugin_mentions,
+    }
 }
 
 fn collab_input_event_payload(input: &CollabInput) -> Value {
@@ -12778,6 +12890,21 @@ fn collab_input_event_payload(input: &CollabInput) -> Value {
     if let Some(messages) = input.skill_context_messages.as_ref() {
         payload["skill_context_messages"] = Value::Array(messages.clone());
     }
+    if let Some(messages) = input.mention_context_messages.as_ref() {
+        payload["mention_context_messages"] = Value::Array(messages.clone());
+    }
+    if let Some(connector_ids) = input.app_connector_ids.as_ref() {
+        payload["app_connector_ids"] = Value::Array(
+            connector_ids
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(mentions) = input.plugin_mentions.as_ref() {
+        payload["plugin_mentions"] = Value::Array(mentions.clone());
+    }
     payload
 }
 
@@ -12785,6 +12912,113 @@ fn collab_items_include_skill(items: &[Value]) -> bool {
     items
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("skill"))
+}
+
+fn collab_items_from_linked_mentions(text: &str) -> Option<Vec<Value>> {
+    let mut items = Vec::new();
+    let mut search_from = 0;
+    let mut last_emit = 0;
+    let mut found = false;
+
+    while let Some(open_rel) = text[search_from..].find('[') {
+        let open = search_from + open_rel;
+        let Some(close_rel) = text[open + 1..].find(']') else {
+            break;
+        };
+        let close = open + 1 + close_rel;
+        if !text[close + 1..].starts_with('(') {
+            search_from = open + 1;
+            continue;
+        }
+        let target_start = close + 2;
+        let Some(target_rel) = text[target_start..].find(')') else {
+            break;
+        };
+        let target_end = target_start + target_rel;
+        let label = &text[open + 1..close];
+        let target = &text[target_start..target_end];
+        let Some(item) = collab_item_from_linked_target(label, target) else {
+            search_from = open + 1;
+            continue;
+        };
+        push_collab_text_item(&mut items, &text[last_emit..open]);
+        items.push(item);
+        found = true;
+        last_emit = target_end + 1;
+        search_from = last_emit;
+    }
+
+    if !found {
+        return None;
+    }
+    push_collab_text_item(&mut items, &text[last_emit..]);
+    Some(items)
+}
+
+fn collab_item_from_linked_target(label: &str, target: &str) -> Option<Value> {
+    let target = target.trim();
+    let display_name = linked_target_display_name(label, target);
+    if target.starts_with("app://") || target.starts_with("plugin://") {
+        return Some(serde_json::json!({
+            "type": "mention",
+            "name": display_name,
+            "path": target,
+        }));
+    }
+    let Some(skill_path) = target.strip_prefix("skill://") else {
+        return None;
+    };
+    let skill_path = skill_path.trim();
+    if skill_path.is_empty()
+        || !Path::new(skill_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "SKILL.md")
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": "skill",
+        "name": display_name,
+        "path": skill_path,
+    }))
+}
+
+fn linked_target_display_name(label: &str, target: &str) -> String {
+    let label = label
+        .trim()
+        .trim_start_matches(['$', '@'])
+        .trim()
+        .to_string();
+    if !label.is_empty() {
+        return label;
+    }
+    if let Some(connector_id) = target.strip_prefix("app://") {
+        return connector_id.to_string();
+    }
+    if let Some(plugin_id) = target.strip_prefix("plugin://") {
+        return plugin_id.to_string();
+    }
+    target
+        .strip_prefix("skill://")
+        .and_then(|path| {
+            Path::new(path)
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn push_collab_text_item(items: &mut Vec<Value>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    items.push(serde_json::json!({
+        "type": "text",
+        "text": text,
+    }));
 }
 
 fn collab_item_preview(item: &Value) -> String {
@@ -13547,6 +13781,10 @@ pub fn collect_agent_tree(store: &Store, parent_session_id: &str) -> Result<Vec<
     let mut out = Vec::new();
     collect_agent_tree_into(store, parent_session_id, &mut out)?;
     Ok(out)
+}
+
+pub fn cleanup_unified_exec_commands_for_session(session_id: &str) -> usize {
+    tools::command::cleanup_session_commands(session_id)
 }
 
 fn collect_agent_tree_into(
@@ -14395,6 +14633,7 @@ fn dispatch_close_agent_tool(
         .with_context(|| format!("unknown child session id: {child_session_id}"))?;
     let previous_status = local_agent_status_value(store, &child, target_agent.summary.as_ref())?;
     store.close_child_agent(&child_session_id, "closed by parent agent")?;
+    tools::command::cleanup_session_commands(&child_session_id);
     store.append_event(
         &session.id,
         "agent.cancelled",
@@ -14481,6 +14720,7 @@ fn dispatch_close_agent_v1_tool(
     )?;
     let previous_status = local_agent_status_value(store, &child, agent_summary.as_ref())?;
     store.close_child_agent(child_session_id, "closed by parent agent")?;
+    tools::command::cleanup_session_commands(child_session_id);
     store.append_event(
         &session.id,
         "agent.cancelled",
@@ -26115,6 +26355,15 @@ description = "Missing developer instructions"
         assert!(mention_input.content.as_array().is_some_and(Vec::is_empty));
         let mention_payload = collab_input_event_payload(&mention_input);
         assert!(mention_payload.get("skill_context_messages").is_none());
+        assert!(mention_payload.get("mention_context_messages").is_none());
+        assert_eq!(mention_payload["app_connector_ids"], json!(["calendar"]));
+        assert_eq!(
+            mention_payload["plugin_mentions"][0]["path"],
+            "plugin://notes@example"
+        );
+        assert!(mention_payload["plugin_mentions"]
+            .as_array()
+            .is_some_and(|mentions| mentions.len() == 1));
         assert_eq!(mention_payload["items"][0]["path"], "app://calendar");
         assert_eq!(
             mention_payload["items"][1]["path"],
@@ -26215,6 +26464,8 @@ description = "Missing developer instructions"
         assert!(input.payload["skill_context_messages"]
             .as_array()
             .is_some_and(|messages| messages.len() == 1));
+        assert!(input.payload.get("mention_context_messages").is_none());
+        assert_eq!(input.payload["app_connector_ids"], json!(["calendar"]));
         std::fs::write(&skill_path, "This later rewrite should not replay.")?;
 
         let messages = provider_messages_from_events(&child_events);
@@ -26235,6 +26486,7 @@ description = "Missing developer instructions"
                 && message_content_text(message).contains("<skill>\n<name>Docs</name>")
                 && message_content_text(message).contains("Use the internal docs workflow.")
         }));
+        assert!(!messages.iter().any(is_mention_context_message));
         assert!(!messages.iter().any(|message| message_content_text(message)
             .contains("This later rewrite should not replay.")));
         let model_text = messages
@@ -26272,7 +26524,8 @@ description = "Missing developer instructions"
                 "items": [
                     {"type": "text", "text": "look at this"},
                     {"type": "image", "image_url": "data:image/png;base64,abc"},
-                    {"type": "skill", "name": "Review", "path": skill_path.display().to_string()}
+                    {"type": "skill", "name": "Review", "path": skill_path.display().to_string()},
+                    {"type": "mention", "name": "Notes", "path": "plugin://notes@example"}
                 ]
             }),
         };
@@ -26301,6 +26554,11 @@ description = "Missing developer instructions"
         assert!(followup.payload["skill_context_messages"]
             .as_array()
             .is_some_and(|messages| messages.len() == 1));
+        assert!(followup.payload.get("mention_context_messages").is_none());
+        assert_eq!(
+            followup.payload["plugin_mentions"][0]["path"],
+            "plugin://notes@example"
+        );
         std::fs::remove_file(&skill_path)?;
         let messages = provider_messages_from_events(&child_events);
         assert!(messages.iter().any(|message| {
@@ -26315,6 +26573,91 @@ description = "Missing developer instructions"
                 && message_content_text(message).contains("<skill>\n<name>Review</name>")
                 && message_content_text(message).contains("Always check the review checklist.")
         }));
+        assert!(!messages.iter().any(is_mention_context_message));
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!model_text.contains("[mention:$Notes]"));
+        assert!(!model_text.contains("plugin://notes@example"));
+        Ok(())
+    }
+
+    #[test]
+    fn top_level_text_linked_skill_and_mentions_materialize_typed_payload_like_codex() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let skill_path = temp.path().join("skills").join("Docs").join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().context("skill parent")?)?;
+        std::fs::write(&skill_path, "Use docs for this task.")?;
+        let text = format!(
+            "use [$Docs](skill://{}) with [$Calendar](app://calendar) and [@Notes](plugin://notes@example)",
+            skill_path.display()
+        );
+        let payload = typed_user_input_payload_from_text(&text);
+        assert_eq!(payload["text"], text);
+        assert!(payload["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "skill")));
+        assert_eq!(payload["app_connector_ids"], json!(["calendar"]));
+        assert_eq!(payload["plugin_mentions"][0]["plugin"], "notes@example");
+        assert!(payload["skill_context_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() == 1));
+        let messages = session_event_user_messages(&payload);
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_content_text(message).contains("Use docs for this task.")
+        }));
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(model_text.contains("use "));
+        assert!(!model_text.contains("skill://"));
+        assert!(!model_text.contains("[@Notes]"));
+        assert!(!model_text.contains("app://calendar"));
+        assert!(!model_text.contains("plugin://notes@example"));
+        Ok(())
+    }
+
+    #[test]
+    fn materialized_plugin_context_replays_as_developer_context_without_inventory_lookup(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let mut payload =
+            typed_user_input_payload_from_text("use [@Notes](plugin://notes@example) here");
+        payload["mention_context_messages"] = json!([{
+            "role": "developer",
+            "name": MENTION_CONTEXT_MESSAGE_NAME,
+            "content": [{
+                "type": "input_text",
+                "text": "<plugin_mention>\nresolved plugin capabilities\n</plugin_mention>",
+            }],
+        }]);
+        store.append_event(&session.id, "session.input", payload)?;
+
+        let events = store.events_for_session(&session.id)?;
+        let messages = provider_messages_from_events(&events);
+        assert!(messages.iter().any(|message| {
+            is_mention_context_message(message)
+                && message_content_text(message).contains("resolved plugin capabilities")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_content_text(message).contains("use ")
+        }));
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!model_text.contains("[@Notes]"));
+        assert!(!model_text.contains("plugin://notes@example"));
         Ok(())
     }
 

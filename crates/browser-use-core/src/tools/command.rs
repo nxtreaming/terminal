@@ -397,20 +397,14 @@ pub(crate) fn exec_command_with_budget(
         let text = managed.read_recent_output();
         let aggregated_output = managed.read_transcript_output();
         emit_command_output(store, &session.id, process_id, &text)?;
-        store.append_event(
+        emit_command_finished(
+            store,
             &session.id,
-            "command.finished",
-            json!({
-                "tool_call_id": call.id,
-                "session_id": process_id,
-                "exit_code": status.exit_code,
-                "success": status.success,
-                "duration_ms": managed.started_at.elapsed().as_millis() as u64,
-                "stdout": aggregated_output,
-                "stderr": "",
-                "aggregated_output": aggregated_output,
-                "timed_out": false,
-            }),
+            process_id,
+            &call.id,
+            &status,
+            managed.started_at.elapsed(),
+            &aggregated_output,
         )?;
         let payload = CommandOutputPayload {
             chunk_id: generate_chunk_id(),
@@ -543,25 +537,13 @@ pub(crate) fn write_stdin_with_budget(
             .insert(process_id, command);
         bail!(STDIN_CLOSED_MESSAGE);
     }
-    let write_error = if !chars.is_empty() {
+    let pending_write_error = if !chars.is_empty() {
         match command.process.write_all(chars.as_bytes()) {
             Ok(()) => {
                 thread::sleep(Duration::from_millis(WRITE_STDIN_REACTION_SETTLE_MS));
                 None
             }
-            Err(error) => {
-                let message = format!("{error:#}");
-                store.append_event(
-                    &session.id,
-                    "command.write_error",
-                    json!({
-                        "tool_call_id": call.id,
-                        "session_id": process_id,
-                        "error": message,
-                    }),
-                )?;
-                Some(message)
-            }
+            Err(error) => Some(format!("{error:#}")),
         }
     } else {
         None
@@ -575,10 +557,26 @@ pub(crate) fn write_stdin_with_budget(
     emit_command_output(store, &session.id, process_id, &text)?;
 
     let running = status.is_none();
+    let write_error = if running {
+        if let Some(message) = pending_write_error.as_ref() {
+            store.append_event(
+                &session.id,
+                "command.write_error",
+                json!({
+                    "tool_call_id": call.id,
+                    "session_id": process_id,
+                    "error": message,
+                }),
+            )?;
+        }
+        pending_write_error.as_deref()
+    } else {
+        None
+    };
     let tty_allocated = command.process.tty_allocated();
     let payload = CommandOutputPayload {
         chunk_id: generate_chunk_id(),
-        session_id: Some(process_id),
+        session_id: running.then_some(process_id),
         running,
         output: &text,
         max_chars,
@@ -586,27 +584,21 @@ pub(crate) fn write_stdin_with_budget(
         duration: command.started_at.elapsed(),
         tty_requested: tty_allocated,
         tty_allocated,
-        write_error: write_error.as_deref(),
+        write_error,
     };
     let content = command_output(&payload);
     let model_text = command_model_text(&payload);
     if let Some(status) = status {
         if !command.background_finished {
             let aggregated_output = command.read_transcript_output();
-            store.append_event(
+            emit_command_finished(
+                store,
                 &session.id,
-                "command.finished",
-                json!({
-                    "tool_call_id": command.tool_call_id,
-                    "session_id": process_id,
-                    "exit_code": status.exit_code,
-                    "success": status.success,
-                    "duration_ms": command.started_at.elapsed().as_millis() as u64,
-                    "stdout": aggregated_output,
-                    "stderr": "",
-                    "aggregated_output": aggregated_output,
-                    "timed_out": false,
-                }),
+                process_id,
+                &command.tool_call_id,
+                &status,
+                command.started_at.elapsed(),
+                &aggregated_output,
             )?;
         }
     } else {
@@ -740,6 +732,7 @@ fn spawn_background_completion_watcher(
                 Err(_) => return,
             };
             finish_readers(command);
+            let recent_output = command.read_recent_output();
             let aggregated_output = command.read_transcript_output();
             command.background_finished = true;
             Some((
@@ -747,25 +740,29 @@ fn spawn_background_completion_watcher(
                 command.tool_call_id.clone(),
                 status,
                 command.started_at.elapsed(),
+                recent_output,
                 aggregated_output,
             ))
         };
-        if let Some((session_id, tool_call_id, status, duration, aggregated_output)) = event {
+        if let Some((
+            session_id,
+            tool_call_id,
+            status,
+            duration,
+            recent_output,
+            aggregated_output,
+        )) = event
+        {
             if let Ok(store) = Store::open_with_optional_notifier(&state_dir, notifier.clone()) {
-                let _ = store.append_event(
+                let _ = emit_command_output(&store, &session_id, process_id, &recent_output);
+                let _ = emit_command_finished(
+                    &store,
                     &session_id,
-                    "command.finished",
-                    json!({
-                        "tool_call_id": tool_call_id,
-                        "session_id": process_id,
-                        "exit_code": status.exit_code,
-                        "success": status.success,
-                        "duration_ms": duration.as_millis() as u64,
-                        "stdout": aggregated_output,
-                        "stderr": "",
-                        "aggregated_output": aggregated_output,
-                        "timed_out": false,
-                    }),
+                    process_id,
+                    &tool_call_id,
+                    &status,
+                    duration,
+                    &aggregated_output,
                 );
             }
         }
@@ -1142,6 +1139,33 @@ fn emit_command_output(store: &Store, session_id: &str, process_id: i64, text: &
             "session_id": process_id,
             "stream": "combined",
             "text": text,
+        }),
+    )?;
+    Ok(())
+}
+
+fn emit_command_finished(
+    store: &Store,
+    session_id: &str,
+    process_id: i64,
+    tool_call_id: &str,
+    status: &ProcessExit,
+    duration: Duration,
+    aggregated_output: &str,
+) -> Result<()> {
+    store.append_event(
+        session_id,
+        "command.finished",
+        json!({
+            "tool_call_id": tool_call_id,
+            "session_id": process_id,
+            "exit_code": status.exit_code,
+            "success": status.success,
+            "duration_ms": duration.as_millis() as u64,
+            "stdout": aggregated_output,
+            "stderr": "",
+            "aggregated_output": aggregated_output,
+            "timed_out": false,
         }),
     )?;
     Ok(())
@@ -2337,6 +2361,18 @@ mod tests {
         }
 
         let before_poll_events = store.events_for_session(&session.id).expect("events");
+        let trailing_output = before_poll_events
+            .iter()
+            .find(|event| {
+                event.event_type == "command.output"
+                    && event.payload["session_id"] == json!(process_id)
+                    && event
+                        .payload
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| text.contains("done"))
+            })
+            .expect("trailing background command.output");
         let finished_events_before_poll = before_poll_events
             .iter()
             .filter(|event| {
@@ -2358,6 +2394,7 @@ mod tests {
         );
         assert_eq!(finished_events_before_poll[0].payload["stderr"], "");
         assert_eq!(finished_events_before_poll[0].payload["timed_out"], false);
+        assert!(trailing_output.seq < finished_events_before_poll[0].seq);
 
         let polled = write_stdin(
             &store,
@@ -2371,10 +2408,7 @@ mod tests {
         )
         .expect("poll");
         assert_eq!(polled.content["running"], false);
-        assert!(polled.content["output"]
-            .as_str()
-            .expect("output")
-            .contains("done"));
+        assert_eq!(polled.content["session_id"], Value::Null);
 
         let after_poll_events = store.events_for_session(&session.id).expect("events");
         let finished_after_poll = after_poll_events
@@ -2582,6 +2616,143 @@ mod tests {
             .expect("output")
             .contains("settled"));
         stop_for_test(process_id);
+    }
+
+    #[test]
+    fn write_stdin_finished_process_omits_session_id_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let started = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_finishes_before_poll".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(1.0); print('done', flush=True)\"",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )
+        .expect("exec");
+        let process_id = started.content["session_id"].as_i64().expect("session id");
+        thread::sleep(Duration::from_millis(1300));
+
+        let polled = write_stdin(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_poll_finished_no_session".to_string(),
+                name: "write_stdin".to_string(),
+                namespace: None,
+                arguments: json!({"session_id": process_id, "chars": "", "yield_time_ms": 5000}),
+            },
+        )
+        .expect("poll");
+
+        assert_eq!(polled.content["running"], false);
+        assert_eq!(polled.content["session_id"], Value::Null);
+        assert!(!polled
+            .model_text
+            .contains(&format!("Process running with session ID {process_id}")));
+    }
+
+    #[test]
+    fn write_stdin_after_process_exit_returns_completion_without_stale_write_error() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let started = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_tty_exits_before_write".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(1.0); print('done', flush=True)\"",
+                    "tty": true,
+                    "yield_time_ms": 50,
+                }),
+            },
+        )
+        .expect("exec");
+        let process_id = started.content["session_id"].as_i64().expect("session id");
+        thread::sleep(Duration::from_millis(1300));
+
+        let written = write_stdin(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_write_after_exit".to_string(),
+                name: "write_stdin".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "session_id": process_id,
+                    "chars": "late\n",
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("write after exit");
+
+        assert_eq!(written.content["running"], false);
+        assert_eq!(written.content["session_id"], Value::Null);
+        assert_eq!(written.content["metadata"]["write_error"], Value::Null);
+        assert!(!written.model_text.contains("Write error:"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events.iter().any(|event| {
+            event.event_type == "command.write_error"
+                && event.payload["tool_call_id"] == json!("call_write_after_exit")
+        }));
+    }
+
+    #[test]
+    fn cleanup_session_commands_kills_explicit_session_without_touching_others() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let other_cwd = tmp.path().join("other");
+        std::fs::create_dir_all(&other_cwd).expect("other cwd");
+        let other = store
+            .create_session(None, other_cwd)
+            .expect("other session");
+        let first = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_cleanup_first".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import time; print('first', flush=True); time.sleep(5)\"",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )
+        .expect("first");
+        let second = exec_command(
+            &store,
+            &other,
+            &ToolCall {
+                id: "call_cleanup_second".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import time; print('second', flush=True); time.sleep(5)\"",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )
+        .expect("second");
+        let first_id = first.content["session_id"].as_i64().expect("first id");
+        let second_id = second.content["session_id"].as_i64().expect("second id");
+
+        assert_eq!(cleanup_session_commands(&session.id), 1);
+        let commands = commands().lock().expect("command registry poisoned");
+        assert!(!commands.contains_key(&first_id));
+        assert!(commands.contains_key(&second_id));
+        drop(commands);
+        stop_for_test(second_id);
     }
 
     #[test]

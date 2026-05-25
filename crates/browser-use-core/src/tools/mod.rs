@@ -1476,6 +1476,11 @@ fn collab_input_items_schema() -> Value {
                     "type": "string",
                     "description": "Image URL when type is image."
                 },
+                "detail": {
+                    "type": "string",
+                    "description": "Image detail level when type is image or local_image.",
+                    "enum": ["auto", "low", "high"]
+                },
                 "path": {
                     "type": "string",
                     "description": "Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
@@ -1813,6 +1818,16 @@ mod tests {
         assert_eq!(
             with_original.output_schema.as_ref().unwrap()["required"],
             serde_json::json!(["image_url", "detail"])
+        );
+    }
+
+    #[test]
+    fn v1_structured_input_schema_exposes_image_detail_like_codex() {
+        let schema = collab_input_items_schema();
+
+        assert_eq!(
+            schema["items"]["properties"]["detail"]["enum"],
+            serde_json::json!(["auto", "low", "high"])
         );
     }
 

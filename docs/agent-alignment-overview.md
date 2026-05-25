@@ -181,9 +181,43 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch closed two model-visible parity slices: G-032 typed runtime
-instruction overrides and the next G-028 unified-exec response/shell fidelity
-cluster.
+The latest batch intentionally took a larger step and closed two separate
+agent-quality clusters: G-033 typed input production/replay across top-level
+CLI/TUI/multi-agent paths, and the next G-028 unified-exec completion/drain
+contract.
+
+- Core now owns reusable typed user-input payload builders. Top-level text can
+  materialize explicit linked references such as `[$Calendar](app://calendar)`,
+  `[@Notes](plugin://notes@example)`, and `[$Docs](skill:///.../SKILL.md)`.
+- CLI `start`, CLI `followup`, CLI `spawn-agent` child input, TUI start, and
+  TUI follow-up now use the same typed payload builder instead of plain
+  `{"text": ...}` events.
+- `skill` references still materialize stable `<skill>` context at event
+  creation time. `app://` and `plugin://` references are persisted as sidecars
+  (`app_connector_ids` and `plugin_mentions`) and are not replayed as ordinary
+  prompt text. Plugin developer context is replayed only when already
+  materialized in the event payload, avoiding invented plugin capabilities.
+- The v1 structured input schema now exposes the `detail` field that the
+  runtime already honored for `image` and `local_image` items.
+- Unified exec now uses one shared `command.finished` emitter for immediate,
+  polled, and background completion paths. Background exit watchers emit unread
+  trailing `command.output` before `command.finished`, completed
+  `write_stdin` responses return `session_id: null`, write-after-exit does not
+  surface stale write errors, and explicit child-agent close paths clean up
+  that child's background commands without restoring normal-turn cleanup.
+- Focused tests cover typed top-level links, materialized plugin context replay,
+  v1 typed input, CLI/TUI typed payload production, v1 image-detail schema,
+  command completion/session-id/write-after-exit cleanup behavior, close-agent
+  command cleanup, and the full command module.
+- Full terminal verification passed through `scripts/verify-terminal-ui.sh`,
+  including Rust/Python suites, deterministic dumps, real tmux terminal smoke,
+  and artifact inspection under `/tmp/but-design-loop`.
+- Read-only subagent audits kept the next high-impact G-032 cluster open:
+  Codex-style effective config/thread-config layering and
+  `include_permissions_instructions` gating.
+
+The previous batch closed two model-visible parity slices: G-032 typed runtime
+instruction overrides and a G-028 unified-exec response/shell fidelity cluster.
 
 - `AgentRunOptions` now has typed `base_instructions` and
   `developer_instructions` overrides. Runtime base instructions beat config

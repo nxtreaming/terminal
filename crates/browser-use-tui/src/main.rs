@@ -17,8 +17,8 @@ use anyhow::{Context, Result};
 use browser_use_core::{
     configured_model_for_cwd_with_options, configured_model_provider_id_for_cwd_with_options,
     default_model_for_cwd_with_options, install_process_crypto_provider,
-    model_catalog_for_cwd_with_options, parse_config_overrides, product_analytics, AgentRunOptions,
-    CollaborationModeKind, ConfigOverrides,
+    model_catalog_for_cwd_with_options, parse_config_overrides, product_analytics,
+    typed_user_input_payload_from_text, AgentRunOptions, CollaborationModeKind, ConfigOverrides,
 };
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
@@ -2251,7 +2251,7 @@ impl App {
                 self.store.append_event(
                     &session.id,
                     "session.input",
-                    serde_json::json!({ "text": text }),
+                    typed_user_input_payload_from_text(&text),
                 )?;
                 self.selected_session_id = Some(session.id.clone());
                 self.native_history.reset_with_clear();
@@ -2271,7 +2271,7 @@ impl App {
                 self.store.append_event(
                     &session_id,
                     "session.followup",
-                    serde_json::json!({ "text": text }),
+                    typed_user_input_payload_from_text(&text),
                 )?;
                 if !active {
                     self.start_agent_for_session(session_id)?;
@@ -5859,6 +5859,79 @@ mod redesign_tests {
         assert_eq!(app.composer.input(), "/plan revise this");
         assert!(app.status_notice.as_deref().is_some_and(|notice| notice
             .contains("Collaboration mode can change after the running turn finishes")));
+        Ok(())
+    }
+
+    #[test]
+    fn tui_start_task_persists_typed_input_payload_for_linked_mentions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.dispatch(AppCommand::StartTask(
+            "check [$Calendar](app://calendar)".to_string(),
+        ))?;
+
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session")?;
+        let input = app
+            .store
+            .events_for_session(&session_id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert_eq!(
+            input.payload["app_connector_ids"],
+            serde_json::json!(["calendar"])
+        );
+        assert!(!input.payload["content"]
+            .as_array()
+            .context("input content")?
+            .iter()
+            .any(|part| part["text"].as_str().unwrap_or_default().contains("app://")));
+        Ok(())
+    }
+
+    #[test]
+    fn tui_followup_persists_typed_input_payload_for_linked_mentions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "existing turn"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "then use [@Notes](plugin://notes@example)".to_string(),
+        })?;
+
+        let followup = app
+            .store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.followup")
+            .context("session.followup")?;
+        assert_eq!(
+            followup.payload["plugin_mentions"][0]["path"],
+            "plugin://notes@example"
+        );
+        assert!(!followup.payload["content"]
+            .as_array()
+            .context("followup content")?
+            .iter()
+            .any(|part| part["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("plugin://")));
         Ok(())
     }
 
