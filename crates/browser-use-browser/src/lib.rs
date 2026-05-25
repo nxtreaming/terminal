@@ -3861,6 +3861,41 @@ print("bs4 available", bs4.__version__)
     }
 
     #[test]
+    fn browser_script_fill_input_builds_valid_helper_js() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-fill-input-js",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+seen = []
+
+def js(expression, *args, **kwargs):
+    seen.append(expression)
+    return True
+
+def cdp(*args, **kwargs):
+    return {}
+
+def press_key(key):
+    seen.append(("key", key))
+    return True
+
+fill_input("input", "ab")
+assert any("return true;})()" in item for item in seen if isinstance(item, str)), seen
+assert not any("return true;}})()" in item for item in seen if isinstance(item, str)), seen
+assert any("change" in item and "})();" in item for item in seen if isinstance(item, str)), seen
+print("fill_input js ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("fill_input js ok"));
+    }
+
+    #[test]
     fn browser_script_http_get_matches_proxy_gzip_and_binary_contracts() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

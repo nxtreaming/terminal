@@ -627,7 +627,7 @@ def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
         raise RuntimeError(f"fill_input: element not found: {selector!r}")
     focused = js(
         f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-        "if(!e)return false;e.focus();return true;}})()"
+        "if(!e)return false;e.focus();return true;})()"
     )
     if not focused:
         raise RuntimeError(f"fill_input: element not found: {selector!r}")
@@ -649,7 +649,7 @@ def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
         f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
         "if(!e)return;"
         "e.dispatchEvent(new Event('input',{bubbles:true}));"
-        "e.dispatchEvent(new Event('change',{bubbles:true}));}})();"
+        "e.dispatchEvent(new Event('change',{bubbles:true}));})();"
     )
     return True
 
