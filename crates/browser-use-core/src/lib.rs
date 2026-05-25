@@ -2904,6 +2904,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             }
                         }
                         ModelEvent::ThinkingDelta { .. } => {}
+                        ModelEvent::CustomToolCallInputDelta { .. } => {}
                         ModelEvent::Usage { usage } => {
                             store.append_event(
                                 &session.id,
@@ -3290,6 +3291,8 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
         let mut events = Vec::new();
         let mut streamed_text = String::new();
         let mut streamed_thinking_text = String::new();
+        let mut custom_tool_input_buffers = HashMap::<String, String>::new();
+        let mut custom_tool_progress_snapshots = HashMap::<String, String>::new();
         match provider.stream_turn(turn.clone(), &mut |event| {
             match &event {
                 ModelEvent::TextDelta { text } => {
@@ -3323,6 +3326,33 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                             label.as_deref(),
                         )?;
                         streamed_thinking_text.push_str(&delta);
+                    }
+                }
+                ModelEvent::CustomToolCallInputDelta {
+                    call_id,
+                    name,
+                    delta,
+                } => {
+                    if name == "apply_patch" {
+                        let buffer = custom_tool_input_buffers
+                            .entry(call_id.clone())
+                            .or_default();
+                        buffer.push_str(delta);
+                        let changes = patch_progress_changes_from_text(buffer);
+                        if !changes.is_empty() {
+                            let snapshot = serde_json::to_string(&changes)?;
+                            if custom_tool_progress_snapshots.get(call_id) != Some(&snapshot) {
+                                custom_tool_progress_snapshots.insert(call_id.clone(), snapshot);
+                                store.append_event(
+                                    session_id,
+                                    "patch.updated",
+                                    serde_json::json!({
+                                        "tool_call_id": call_id,
+                                        "changes": changes,
+                                    }),
+                                )?;
+                            }
+                        }
                     }
                 }
                 ModelEvent::ToolCall { .. }
@@ -3703,6 +3733,38 @@ fn record_full_model_io() -> bool {
             )
         })
         .unwrap_or(false)
+}
+
+fn patch_progress_changes_from_text(input: &str) -> Vec<Value> {
+    let mut changes = Vec::<Value>::new();
+    for line in input.lines() {
+        let trimmed = line.trim();
+        if let Some(path) = trimmed.strip_prefix("*** Add File: ") {
+            changes.push(serde_json::json!({
+                "path": path.trim(),
+                "kind": "added",
+                "move_path": Value::Null,
+            }));
+        } else if let Some(path) = trimmed.strip_prefix("*** Delete File: ") {
+            changes.push(serde_json::json!({
+                "path": path.trim(),
+                "kind": "deleted",
+                "move_path": Value::Null,
+            }));
+        } else if let Some(path) = trimmed.strip_prefix("*** Update File: ") {
+            changes.push(serde_json::json!({
+                "path": path.trim(),
+                "kind": "modified",
+                "move_path": Value::Null,
+            }));
+        } else if let Some(move_path) = trimmed.strip_prefix("*** Move to: ") {
+            if let Some(change) = changes.last_mut() {
+                change["kind"] = Value::String("moved".to_string());
+                change["move_path"] = Value::String(move_path.trim().to_string());
+            }
+        }
+    }
+    changes
 }
 
 fn value_fingerprint(value: &Value) -> Result<String> {
@@ -23034,6 +23096,95 @@ command = "print-token"
             };
             *step += 1;
             Ok(events)
+        }
+    }
+
+    #[test]
+    fn streamed_apply_patch_custom_input_deltas_emit_progress_only() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = StreamingPatchProgressProvider::default();
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "stream a patch",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("streamed.txt"))?,
+            "hello\n"
+        );
+        let events = store.events_for_session(&session_id)?;
+        let updated = events
+            .iter()
+            .find(|event| event.event_type == "patch.updated")
+            .context("patch updated event")?;
+        assert_eq!(updated.payload["tool_call_id"], "patch_stream");
+        assert_eq!(updated.payload["changes"][0]["path"], "streamed.txt");
+        assert_eq!(updated.payload["changes"][0]["kind"], "added");
+        assert!(events.iter().any(|event| {
+            event.event_type == "patch.finished"
+                && event.payload["tool_call_id"] == "patch_stream"
+                && event.payload["status"] == "completed"
+        }));
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct StreamingPatchProgressProvider {
+        step: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for StreamingPatchProgressProvider {
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            Ok(vec![ModelEvent::Done])
+        }
+
+        fn stream_turn(
+            &self,
+            turn: ProviderTurn,
+            on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+        ) -> Result<()> {
+            let mut step = self.step.lock().expect("step lock");
+            if *step == 0 {
+                let patch = "*** Begin Patch\n*** Add File: streamed.txt\n+hello\n*** End Patch";
+                on_event(ModelEvent::CustomToolCallInputDelta {
+                    call_id: "patch_stream".to_string(),
+                    name: "apply_patch".to_string(),
+                    delta: "*** Begin Patch\n*** Add File: streamed.txt\n".to_string(),
+                })?;
+                on_event(ModelEvent::CustomToolCallInputDelta {
+                    call_id: "patch_stream".to_string(),
+                    name: "apply_patch".to_string(),
+                    delta: "+hello\n*** End Patch".to_string(),
+                })?;
+                on_event(ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "patch_stream".to_string(),
+                        name: "apply_patch".to_string(),
+                        namespace: None,
+                        arguments: Value::String(patch.to_string()),
+                    },
+                })?;
+                on_event(ModelEvent::Done)?;
+            } else {
+                let content =
+                    latest_tool_content(&turn, "apply_patch").context("apply_patch output")?;
+                assert!(content.contains("Success. Updated the following files:"));
+                on_event(ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_streamed_patch".to_string(),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({"result": "streamed patch complete"}),
+                    },
+                })?;
+                on_event(ModelEvent::Done)?;
+            }
+            *step += 1;
+            Ok(())
         }
     }
 

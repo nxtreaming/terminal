@@ -1,4 +1,6 @@
+use std::error::Error as StdError;
 use std::ffi::OsStr;
+use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
@@ -331,9 +333,45 @@ pub(crate) fn apply_patch_tool(
             }),
         )?;
         let cwd = PathBuf::from(&session.cwd);
-        let ops = parse_patch(patch)?;
-        verify_patch_operations(&cwd, &ops)?;
-        let changes = apply_patch_operations(&cwd, ops, |change| {
+        let ops = match parse_patch(patch) {
+            Ok(ops) => ops,
+            Err(error) => {
+                emit_patch_finished(
+                    store,
+                    session,
+                    call,
+                    PatchFinish {
+                        status: "failed",
+                        success: false,
+                        stdout: "",
+                        stderr: &error.to_string(),
+                        planned_changes: Vec::new(),
+                        committed_changes: &[],
+                        committed_delta_exact: true,
+                    },
+                )?;
+                return Err(error);
+            }
+        };
+        if let Err(error) = verify_patch_operations(&cwd, &ops) {
+            emit_patch_finished(
+                store,
+                session,
+                call,
+                PatchFinish {
+                    status: "failed",
+                    success: false,
+                    stdout: "",
+                    stderr: &error.to_string(),
+                    planned_changes: planned_patch_changes_payload(&ops),
+                    committed_changes: &[],
+                    committed_delta_exact: true,
+                },
+            )?;
+            return Err(error);
+        }
+        let planned_changes = planned_patch_changes_payload(&ops);
+        let changes = match apply_patch_operations(&cwd, ops, |change| {
             store.append_event(
                 &session.id,
                 "patch.file_changed",
@@ -345,15 +383,26 @@ pub(crate) fn apply_patch_tool(
                 }),
             )?;
             Ok(())
-        })?;
-        store.append_event(
-            &session.id,
-            "patch.finished",
-            json!({
-                "tool_call_id": call.id,
-                "changed_files": changes.len(),
-            }),
-        )?;
+        }) {
+            Ok(changes) => changes,
+            Err(error) => {
+                emit_patch_finished(
+                    store,
+                    session,
+                    call,
+                    PatchFinish {
+                        status: "failed",
+                        success: false,
+                        stdout: "",
+                        stderr: &error.source.to_string(),
+                        planned_changes,
+                        committed_changes: error.committed_changes(),
+                        committed_delta_exact: true,
+                    },
+                )?;
+                return Err(error.into());
+            }
+        };
         let mut lines = vec!["Success. Updated the following files:".to_string()];
         for change in &changes {
             let marker = match change.kind {
@@ -364,8 +413,23 @@ pub(crate) fn apply_patch_tool(
             let line = format!("{marker} {}", change.display_path.display());
             lines.push(line);
         }
+        let content = format!("{}\n", lines.join("\n"));
+        emit_patch_finished(
+            store,
+            session,
+            call,
+            PatchFinish {
+                status: "completed",
+                success: true,
+                stdout: &content,
+                stderr: "",
+                planned_changes,
+                committed_changes: &changes,
+                committed_delta_exact: true,
+            },
+        )?;
         Ok(FileToolResult {
-            content: Value::String(format!("{}\n", lines.join("\n"))),
+            content: Value::String(content),
         })
     })
 }
@@ -546,12 +610,92 @@ fn fallback_search(
     Ok(SearchResult { matches, truncated })
 }
 
-#[derive(Debug)]
+#[derive(Clone, Debug)]
 struct AppliedChange {
     path: PathBuf,
     display_path: PathBuf,
     kind: &'static str,
     move_path: Option<PathBuf>,
+}
+
+#[derive(Debug)]
+struct PatchApplyError {
+    source: anyhow::Error,
+    committed_changes: Vec<AppliedChange>,
+}
+
+impl PatchApplyError {
+    fn new(source: anyhow::Error, committed_changes: Vec<AppliedChange>) -> Self {
+        Self {
+            source,
+            committed_changes,
+        }
+    }
+
+    fn committed_changes(&self) -> &[AppliedChange] {
+        &self.committed_changes
+    }
+}
+
+impl fmt::Display for PatchApplyError {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        write!(f, "{:#}", self.source)?;
+        if !self.committed_changes.is_empty() {
+            let files = self
+                .committed_changes
+                .iter()
+                .map(|change| change.display_path.display().to_string())
+                .collect::<Vec<_>>()
+                .join(", ");
+            write!(
+                f,
+                " ({} file(s) were already updated before the failure: {files})",
+                self.committed_changes.len()
+            )?;
+        }
+        Ok(())
+    }
+}
+
+impl StdError for PatchApplyError {
+    fn source(&self) -> Option<&(dyn StdError + 'static)> {
+        Some(self.source.as_ref())
+    }
+}
+
+struct PatchFinish<'a> {
+    status: &'static str,
+    success: bool,
+    stdout: &'a str,
+    stderr: &'a str,
+    planned_changes: Vec<Value>,
+    committed_changes: &'a [AppliedChange],
+    committed_delta_exact: bool,
+}
+
+fn emit_patch_finished(
+    store: &Store,
+    session: &SessionMeta,
+    call: &ToolCall,
+    finish: PatchFinish<'_>,
+) -> Result<()> {
+    store.append_event(
+        &session.id,
+        "patch.finished",
+        json!({
+            "tool_call_id": call.id,
+            "status": finish.status,
+            "success": finish.success,
+            "stdout": finish.stdout,
+            "stderr": finish.stderr,
+            "changed_files": finish.committed_changes.len(),
+            "changes": finish.planned_changes,
+            "committed_changes": applied_changes_payload(finish.committed_changes),
+            "committed_files": applied_changes_payload(finish.committed_changes),
+            "committed_delta_exact": finish.committed_delta_exact,
+        }),
+    )?;
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -747,17 +891,60 @@ fn apply_patch_operations(
     cwd: &Path,
     ops: Vec<PatchOperation>,
     mut on_change: impl FnMut(&AppliedChange) -> Result<()>,
-) -> Result<Vec<AppliedChange>> {
+) -> std::result::Result<Vec<AppliedChange>, PatchApplyError> {
     if ops.is_empty() {
-        bail!("No files were modified.");
+        return Err(PatchApplyError::new(
+            anyhow::anyhow!("No files were modified."),
+            Vec::new(),
+        ));
     }
     let mut changes = Vec::new();
     for op in ops {
-        let change = apply_patch_operation(cwd, op)?;
-        on_change(&change)?;
+        let change = apply_patch_operation(cwd, op)
+            .map_err(|error| PatchApplyError::new(error, changes.clone()))?;
         changes.push(change);
+        on_change(changes.last().expect("just pushed change"))
+            .map_err(|error| PatchApplyError::new(error, changes.clone()))?;
     }
     Ok(changes)
+}
+
+fn applied_changes_payload(changes: &[AppliedChange]) -> Vec<Value> {
+    changes
+        .iter()
+        .map(|change| {
+            json!({
+                "path": change.path.display().to_string(),
+                "display_path": change.display_path.display().to_string(),
+                "kind": change.kind,
+                "move_path": change.move_path.as_ref().map(|path| path.display().to_string()),
+            })
+        })
+        .collect()
+}
+
+fn planned_patch_changes_payload(ops: &[PatchOperation]) -> Vec<Value> {
+    ops.iter()
+        .map(|op| match op {
+            PatchOperation::Add { path, .. } => json!({
+                "path": path,
+                "kind": "added",
+                "move_path": Value::Null,
+            }),
+            PatchOperation::Delete { path } => json!({
+                "path": path,
+                "kind": "deleted",
+                "move_path": Value::Null,
+            }),
+            PatchOperation::Update {
+                path, move_path, ..
+            } => json!({
+                "path": path,
+                "kind": if move_path.is_some() { "moved" } else { "modified" },
+                "move_path": move_path,
+            }),
+        })
+        .collect()
 }
 
 fn verify_patch_operations(cwd: &Path, ops: &[PatchOperation]) -> Result<()> {
@@ -1295,6 +1482,21 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "patch.file_changed"));
+        let finished = events
+            .iter()
+            .find(|event| event.event_type == "patch.finished")
+            .expect("patch finished");
+        assert_eq!(finished.payload["status"], "completed");
+        assert_eq!(finished.payload["success"], true);
+        assert_eq!(finished.payload["changed_files"], 4);
+        assert_eq!(
+            finished.payload["committed_changes"]
+                .as_array()
+                .expect("committed changes")
+                .len(),
+            4
+        );
+        assert_eq!(finished.payload["committed_delta_exact"], true);
     }
 
     #[test]
@@ -1340,6 +1542,77 @@ mod tests {
         assert!(!events
             .iter()
             .any(|event| event.event_type == "patch.file_changed"));
+        let finished = events
+            .iter()
+            .find(|event| event.event_type == "patch.finished")
+            .expect("patch finished");
+        assert_eq!(finished.payload["status"], "failed");
+        assert_eq!(finished.payload["success"], false);
+        assert_eq!(finished.payload["changed_files"], 0);
+        assert_eq!(
+            finished.payload["changes"]
+                .as_array()
+                .expect("planned changes")
+                .len(),
+            2
+        );
+    }
+
+    #[test]
+    fn apply_patch_reports_committed_prefix_after_runtime_failure_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::write(cwd.join("not_a_dir"), "blocking parent\n").expect("write parent file");
+        let patch = r#"*** Begin Patch
+*** Add File: created.txt
++created
+*** Add File: not_a_dir/child.txt
++child
+*** End Patch"#;
+
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_partial_failure".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        );
+
+        let error = result.expect_err("patch should fail after first committed change");
+        assert!(
+            error.to_string().contains("already updated before the failure"),
+            "partial committed files should be model-visible through the recovered error: {error:#}"
+        );
+        assert_eq!(
+            fs::read_to_string(cwd.join("created.txt")).expect("created file"),
+            "created\n"
+        );
+        let events = store.events_for_session(&session.id).expect("events");
+        let file_changes = events
+            .iter()
+            .filter(|event| event.event_type == "patch.file_changed")
+            .collect::<Vec<_>>();
+        assert_eq!(file_changes.len(), 1);
+        assert_eq!(
+            file_changes[0].payload["path"],
+            json!(cwd.join("created.txt").display().to_string())
+        );
+        let finished = events
+            .iter()
+            .find(|event| event.event_type == "patch.finished")
+            .expect("patch finished");
+        assert_eq!(finished.payload["status"], "failed");
+        assert_eq!(finished.payload["success"], false);
+        assert_eq!(finished.payload["changed_files"], 1);
+        assert_eq!(
+            finished.payload["committed_changes"][0]["display_path"],
+            "created.txt"
+        );
+        assert_eq!(finished.payload["committed_delta_exact"], true);
     }
 
     #[test]

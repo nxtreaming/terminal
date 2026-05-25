@@ -1,5 +1,5 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::{BufRead, BufReader, Write};
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, ChildStdin, Command, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
@@ -50,6 +50,7 @@ struct ManagedCommand {
     tool_call_id: String,
     process: ManagedProcess,
     output: Arc<Mutex<HeadTailBuffer>>,
+    transcript: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
     last_used: Instant,
     background_finished: bool,
@@ -117,7 +118,6 @@ impl HeadTailBuffer {
         self.omitted_bytes
     }
 
-    #[cfg(test)]
     fn to_bytes(&self) -> Vec<u8> {
         let mut out = Vec::with_capacity(self.retained_bytes());
         for chunk in &self.head {
@@ -293,6 +293,7 @@ pub(crate) fn exec_command_with_budget(
     )?;
 
     let output = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
     let (process, readers, tty_allocated) = spawn_process(
         &shell,
         login,
@@ -300,6 +301,7 @@ pub(crate) fn exec_command_with_budget(
         &workdir,
         tty_requested,
         output.clone(),
+        transcript.clone(),
         &session.id,
     )?;
     store.append_event(
@@ -320,6 +322,7 @@ pub(crate) fn exec_command_with_budget(
         tool_call_id: call.id.clone(),
         process,
         output,
+        transcript,
         started_at: Instant::now(),
         last_used: Instant::now(),
         background_finished: false,
@@ -330,6 +333,7 @@ pub(crate) fn exec_command_with_budget(
     if let Some(status) = managed.process.try_wait()? {
         finish_readers(&mut managed);
         let text = managed.read_recent_output();
+        let aggregated_output = managed.read_transcript_output();
         emit_command_output(store, &session.id, process_id, &text)?;
         store.append_event(
             &session.id,
@@ -340,6 +344,10 @@ pub(crate) fn exec_command_with_budget(
                 "exit_code": status.exit_code,
                 "success": status.success,
                 "duration_ms": managed.started_at.elapsed().as_millis() as u64,
+                "stdout": aggregated_output,
+                "stderr": "",
+                "aggregated_output": aggregated_output,
+                "timed_out": false,
             }),
         )?;
         let payload = CommandOutputPayload {
@@ -519,6 +527,7 @@ pub(crate) fn write_stdin_with_budget(
     let model_text = command_model_text(&payload);
     if let Some(status) = status {
         if !command.background_finished {
+            let aggregated_output = command.read_transcript_output();
             store.append_event(
                 &session.id,
                 "command.finished",
@@ -528,6 +537,10 @@ pub(crate) fn write_stdin_with_budget(
                     "exit_code": status.exit_code,
                     "success": status.success,
                     "duration_ms": command.started_at.elapsed().as_millis() as u64,
+                    "stdout": aggregated_output,
+                    "stderr": "",
+                    "aggregated_output": aggregated_output,
+                    "timed_out": false,
                 }),
             )?;
         }
@@ -662,15 +675,17 @@ fn spawn_background_completion_watcher(
                 Err(_) => return,
             };
             finish_readers(command);
+            let aggregated_output = command.read_transcript_output();
             command.background_finished = true;
             Some((
                 command.session_id.clone(),
                 command.tool_call_id.clone(),
                 status,
                 command.started_at.elapsed(),
+                aggregated_output,
             ))
         };
-        if let Some((session_id, tool_call_id, status, duration)) = event {
+        if let Some((session_id, tool_call_id, status, duration, aggregated_output)) = event {
             if let Ok(store) = Store::open_with_optional_notifier(&state_dir, notifier.clone()) {
                 let _ = store.append_event(
                     &session_id,
@@ -681,6 +696,10 @@ fn spawn_background_completion_watcher(
                         "exit_code": status.exit_code,
                         "success": status.success,
                         "duration_ms": duration.as_millis() as u64,
+                        "stdout": aggregated_output,
+                        "stderr": "",
+                        "aggregated_output": aggregated_output,
+                        "timed_out": false,
                     }),
                 );
             }
@@ -810,12 +829,13 @@ fn spawn_process(
     workdir: &Path,
     tty_requested: bool,
     output: Arc<Mutex<HeadTailBuffer>>,
+    transcript: Arc<Mutex<HeadTailBuffer>>,
     thread_id: &str,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     if tty_requested {
-        return spawn_pty_process(shell, login, cmd, workdir, output, thread_id);
+        return spawn_pty_process(shell, login, cmd, workdir, output, transcript, thread_id);
     }
-    spawn_pipe_process(shell, login, cmd, workdir, output, thread_id)
+    spawn_pipe_process(shell, login, cmd, workdir, output, transcript, thread_id)
 }
 
 fn spawn_pipe_process(
@@ -824,6 +844,7 @@ fn spawn_pipe_process(
     cmd: &str,
     workdir: &Path,
     output: Arc<Mutex<HeadTailBuffer>>,
+    transcript: Arc<Mutex<HeadTailBuffer>>,
     thread_id: &str,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     let mut command = Command::new(shell);
@@ -840,10 +861,10 @@ fn spawn_pipe_process(
     let stdin = child.stdin.take();
     let mut readers = Vec::new();
     if let Some(stdout) = child.stdout.take() {
-        readers.push(spawn_reader(stdout, output.clone()));
+        readers.push(spawn_reader(stdout, output.clone(), transcript.clone()));
     }
     if let Some(stderr) = child.stderr.take() {
-        readers.push(spawn_reader(stderr, output));
+        readers.push(spawn_reader(stderr, output, transcript));
     }
     Ok((ManagedProcess::Pipes { child, stdin }, readers, false))
 }
@@ -854,6 +875,7 @@ fn spawn_pty_process(
     cmd: &str,
     workdir: &Path,
     output: Arc<Mutex<HeadTailBuffer>>,
+    transcript: Arc<Mutex<HeadTailBuffer>>,
     thread_id: &str,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     let pty_system = native_pty_system();
@@ -876,7 +898,7 @@ fn spawn_pty_process(
             workdir.display()
         )
     })?;
-    let readers = vec![spawn_reader(reader, output)];
+    let readers = vec![spawn_reader(reader, output, transcript)];
     Ok((
         ManagedProcess::Pty {
             child,
@@ -962,22 +984,25 @@ impl ManagedProcess {
     }
 }
 
-fn spawn_reader<R>(reader: R, output: Arc<Mutex<HeadTailBuffer>>) -> JoinHandle<()>
+fn spawn_reader<R>(
+    mut reader: R,
+    output: Arc<Mutex<HeadTailBuffer>>,
+    transcript: Arc<Mutex<HeadTailBuffer>>,
+) -> JoinHandle<()>
 where
     R: std::io::Read + Send + 'static,
 {
     thread::spawn(move || {
-        let mut reader = BufReader::new(reader);
+        let mut buffer = [0u8; 8192];
         loop {
-            let mut bytes = Vec::new();
-            match reader.read_until(b'\n', &mut bytes) {
+            match reader.read(&mut buffer) {
                 Ok(0) => break,
-                Ok(_) => output
-                    .lock()
-                    .expect("command output poisoned")
-                    .push_chunk(bytes),
+                Ok(n) => push_command_output_chunk(&output, &transcript, buffer[..n].to_vec()),
+                Err(error) if error.kind() == std::io::ErrorKind::Interrupted => continue,
                 Err(error) => {
-                    output.lock().expect("command output poisoned").push_chunk(
+                    push_command_output_chunk(
+                        &output,
+                        &transcript,
                         format!("[command output read failed: {error}]\n").into_bytes(),
                     );
                     break;
@@ -985,6 +1010,21 @@ where
             }
         }
     })
+}
+
+fn push_command_output_chunk(
+    output: &Arc<Mutex<HeadTailBuffer>>,
+    transcript: &Arc<Mutex<HeadTailBuffer>>,
+    chunk: Vec<u8>,
+) {
+    output
+        .lock()
+        .expect("command output poisoned")
+        .push_chunk(chunk.clone());
+    transcript
+        .lock()
+        .expect("command transcript poisoned")
+        .push_chunk(chunk);
 }
 
 fn finish_readers(command: &mut ManagedCommand) {
@@ -997,6 +1037,11 @@ impl ManagedCommand {
     fn read_recent_output(&mut self) -> String {
         let mut output = self.output.lock().expect("command output poisoned");
         String::from_utf8_lossy(&output.drain_bytes()).to_string()
+    }
+
+    fn read_transcript_output(&self) -> String {
+        let transcript = self.transcript.lock().expect("command transcript poisoned");
+        String::from_utf8_lossy(&transcript.to_bytes()).to_string()
     }
 }
 
@@ -1078,6 +1123,9 @@ fn command_model_text(payload: &CommandOutputPayload<'_>) -> String {
         if let Some(session_id) = &payload.session_id {
             sections.push(format!("Process running with session ID {session_id}"));
         }
+    }
+    if let Some(error) = payload.write_error {
+        sections.push(format!("Write error: {error}"));
     }
     sections.push(format!(
         "Original token count: {}",
@@ -1870,14 +1918,27 @@ mod tests {
         }
 
         let before_poll_events = store.events_for_session(&session.id).expect("events");
-        let finished_before_poll = before_poll_events
+        let finished_events_before_poll = before_poll_events
             .iter()
             .filter(|event| {
                 event.event_type == "command.finished"
                     && event.payload["session_id"] == json!(process_id)
             })
-            .count();
-        assert_eq!(finished_before_poll, 1);
+            .collect::<Vec<_>>();
+        assert_eq!(finished_events_before_poll.len(), 1);
+        let transcript = finished_events_before_poll[0].payload["aggregated_output"]
+            .as_str()
+            .expect("aggregated output");
+        assert!(
+            transcript.contains("ready") && transcript.contains("done"),
+            "background finish should retain the whole Codex-style transcript: {transcript:?}"
+        );
+        assert_eq!(
+            finished_events_before_poll[0].payload["stdout"],
+            finished_events_before_poll[0].payload["aggregated_output"]
+        );
+        assert_eq!(finished_events_before_poll[0].payload["stderr"], "");
+        assert_eq!(finished_events_before_poll[0].payload["timed_out"], false);
 
         let polled = write_stdin(
             &store,
@@ -1944,6 +2005,59 @@ mod tests {
             .expect("output")
             .contains("pty-ok"));
         assert_eq!(result.content["metadata"]["tty_allocated"], true);
+    }
+
+    #[test]
+    fn exec_command_streams_partial_output_without_newline_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_partial_prompt".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import sys, time; sys.stdout.write('prompt> '); sys.stdout.flush(); time.sleep(1.0)\"",
+                    "yield_time_ms": 250,
+                }),
+            },
+        )
+        .expect("exec");
+
+        assert_eq!(result.content["running"], true);
+        assert_eq!(result.content["output"], "prompt> ");
+        assert!(result.model_text.ends_with("Output:\nprompt> "));
+    }
+
+    #[test]
+    fn exec_command_pty_streams_partial_output_without_newline_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_pty_partial_prompt".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import sys, time; sys.stdout.write('pty> '); sys.stdout.flush(); time.sleep(1.0)\"",
+                    "yield_time_ms": 250,
+                    "tty": true,
+                }),
+            },
+        )
+        .expect("exec");
+
+        assert_eq!(result.content["running"], true);
+        assert!(result.content["output"]
+            .as_str()
+            .expect("output")
+            .contains("pty> "));
+        assert!(result.model_text.contains("Output:\n"));
+        assert!(result.model_text.contains("pty> "));
     }
 
     #[test]
@@ -2029,6 +2143,27 @@ mod tests {
         assert!(text.contains("tokens truncated"));
         assert!(!text.contains("omitted"));
         assert!(!text.contains("chars truncated"));
+    }
+
+    #[test]
+    fn command_model_text_includes_write_errors_like_codex_recovery_context() {
+        let payload = CommandOutputPayload {
+            chunk_id: "chunk_write".to_string(),
+            session_id: Some(1000),
+            running: false,
+            output: "",
+            max_chars: 1000,
+            exit_code: Some(1),
+            duration: Duration::from_millis(12),
+            tty_requested: true,
+            tty_allocated: true,
+            write_error: Some("broken pipe"),
+        };
+
+        let text = command_model_text(&payload);
+
+        assert!(text.contains("Write error: broken pipe"));
+        assert!(text.contains("Process exited with code 1"));
     }
 
     #[test]

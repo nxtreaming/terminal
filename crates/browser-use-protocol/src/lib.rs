@@ -191,6 +191,11 @@ pub enum ModelEvent {
     ToolCall {
         call: ToolCall,
     },
+    CustomToolCallInputDelta {
+        call_id: String,
+        name: String,
+        delta: String,
+    },
     Usage {
         usage: ModelUsage,
     },

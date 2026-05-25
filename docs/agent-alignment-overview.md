@@ -71,9 +71,10 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 - Gap log: `docs/agent-gap-log.md`
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
-  has verified-write semantics for common Codex patch behavior plus the first
-  Codex-shaped writable-root and protected-metadata safety slice, and the shell
-  command path now has a first Codex-shaped safety slice for read-only
+  has verified-write semantics for common Codex patch behavior, streaming
+  progress/final lifecycle events, committed-prefix failure reporting, plus the
+  first Codex-shaped writable-root and protected-metadata safety slice, and the
+  shell command path now has a first Codex-shaped safety slice for read-only
   parallelization, destructive `rm -f`/`rm -rf` rejection before spawn, and
   Codex-shaped approval metadata, hidden additional-permission handling, and
   no-approval permission instructions. The read-only shell parser now rejects
@@ -91,7 +92,11 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   polls can wait in the 5s-300s background range, and oversized
   `max_output_tokens` requests are capped by this repo's effective tool-output
   token policy. Per-call command output is now collected through a Codex-style
-  1 MiB head/tail buffer instead of an unbounded vector.
+  1 MiB head/tail buffer instead of an unbounded vector, while a separate final
+  transcript buffer preserves whole-process completion output for background
+  `command.finished` events. Command readers now stream no-newline output
+  chunks, so prompts and progress text are visible before EOF, and stdin write
+  failures are included in model-visible recovery text.
   Compaction now preserves the canonical
   startup context instead of replacing it with only a summary. AGENTS discovery
   now reads Codex's project-doc config knobs from Codex-home `config.toml` and
@@ -164,72 +169,39 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch closed the represented MultiAgentV1 mention/skill ordinary
-user-content suppression slice and the CLI-created child-agent command breadth
-slice in G-033.
+The latest batch closed a high-impact G-028/G-029 tool-runtime parity slice:
+command output fidelity for interactive processes and Codex-shaped patch
+progress/final lifecycle reporting.
 
-- Structured `mention` items now match Codex's ordinary user-content behavior
-  for the represented v1 path: they stay in saved typed `items` and UI preview
-  text, but no longer replay as `[mention:$Name](app://...)` user text.
-- The generic typed-item fallback no longer leaks skill-only inputs as
-  `[skill:$Name](...)` user text. Skill-only turns now replay only through the
-  Codex-shaped `<skill>` contextual user message when a valid `SKILL.md` body
-  can be loaded.
-- Skill bodies are now materialized into the persisted `session.input` or
-  `session.followup` payload when the typed input is created, so replay uses
-  the same captured skill content even if the `SKILL.md` file later changes or
-  disappears.
-- Mixed typed turns keep text/images/local-image placeholders model-visible,
-  while `skill` and `mention` remain metadata/context sources rather than
-  ordinary prompt text.
-- Full `app://` connector selection and `plugin://` developer-instruction
-  injection remain open because this repo does not yet have Codex's plugin
-  capability registry, app connector inventory, or app-server selection path.
-- CLI-created child agents now use the parent session cwd, store the same
-  core-facing `agent.context` metadata for path/nickname/role/compact inherited
-  context, and append normal workspace context before the child input.
-- When a CLI-run or manually finished child reaches `done`, `failed`, or
-  `cancelled`, the parent now receives the same Codex-shaped
-  `<subagent_notification>` mailbox message and parent lifecycle event that
-  core-created children already send, so the next parent model turn can see
-  child completion instead of only a UI event.
-- CLI `spawn-agent --task-name` now uses the same task-name validation and
-  canonical path derivation as the core v2 tool, while still allowing legacy
-  `--path` for compatibility and rejecting ambiguous combinations.
-- CLI `send-agent-message` now resolves live agent paths relative to the author
-  like the core tool, rejects empty content, rejects `--trigger-turn` tasks aimed
-  at `/root`, and stores author/recipient path metadata on the `agent.message`
-  event.
-- CLI `wait-agent` now waits for mailbox delivery up to a timeout and records
-  wait start/finish events without dumping queued message bodies to stdout. It
-  also has an explicit `--target` status-wait mode that reuses the core v1
-  final-status reducer for id-targeted legacy waits.
-- CLI `list-agents` now reports the root plus live descendant tree with
-  Codex-shaped `agent_name`, `agent_status`, and `last_task_message` fields,
-  supports Codex-style `--path-prefix` filtering, and omits CLI-only session
-  metadata from the structured output.
-- CLI `close-agent` now rejects root/non-edge sessions, returns the previous
-  Codex-shaped local status, closes the child edge, cancels active descendants,
-  records the parent cancellation event, and can resolve relative or canonical
-  agent paths when given `--current-id`.
-- CLI `resume-agent` now reopens a closed/cancelled child by id, restores open
-  descendants through the same store path as core v1 `resume_agent`, and returns
-  the Codex-shaped local status payload.
-- A plugin/app mention audit found directly model-visible Codex behavior around
-  available-plugin/app developer context and explicit plugin mention hints, but
-  exact parity depends on plugin capability inventory, app connector inventory,
-  app MCP tool exposure, and plugin/app enablement checks that this terminal does
-  not currently own. The represented typed-input slice remains metadata-safe:
-  app/plugin mentions persist without leaking ordinary prompt text.
-- Remaining multi-agent gaps are app/plugin connector context injection, exact
-  app-server collaboration/input-queue events, exact product output shape for
-  non-modeled CLI/debug surfaces, full rollout persistence semantics, arbitrary
-  role config keys such as sandbox/skills/tools, and code-mode-only runtime
-  behavior if code mode is added.
-- Remaining large non-multi-agent gaps are websocket transport/fallback/
-  `response.processed`, richer effective-config provenance and doctor/status
-  displays, full app-server thread-config protocol surfaces beyond the
-  represented core event, and broader config-layer stack behavior.
+- Unified exec readers now stream partial chunks instead of waiting for newline
+  boundaries. Model-visible output can now include prompts such as `Password: `,
+  REPL prompts, progress text, and server startup lines before EOF or a newline.
+- Running commands keep a separate final transcript buffer in addition to the
+  per-poll drain buffer. Background `command.finished` events now include
+  `stdout`, `stderr`, `aggregated_output`, and `timed_out` without consuming
+  output that a later `write_stdin` poll should still return.
+- `write_stdin` failures are now included in the command result text, giving the
+  model Codex-like recovery context when a PTY or process has already exited.
+- Responses streaming now exposes `CustomToolCallInputDelta` events for custom
+  tools. `apply_patch` consumes those deltas only for progress and still executes
+  solely from the final custom-tool payload.
+- Streaming `apply_patch` input deltas now emit best-effort `patch.updated`
+  snapshots, so UI/state observers can see patch progress before the final tool
+  call arrives.
+- `apply_patch` now emits `patch.finished` for parse, verification, runtime
+  apply, and success paths. The payload includes status/success, stdout/stderr,
+  planned changes, committed changes, committed files, and a
+  `committed_delta_exact` flag.
+- Runtime patch failures after earlier files were written now report the
+  committed prefix in both the tool error text and the structured
+  `patch.finished` payload.
+- Remaining G-028 gaps are shell-mode breadth, pause-aware deadline extension,
+  parser breadth, code-mode JSON output if this harness adds code mode, and
+  exact cross-turn process persistence.
+- Remaining G-029 gaps are exact app-server v2 patch notification surfaces,
+  fuller Codex streaming parser/throttle behavior, and sandbox-dependent
+  hardlink/path protections. Approval logic stays intentionally out of scope for
+  this experiment.
 
 The previous batch closed the represented MultiAgentV1 skill/reference/resume
 cluster in G-033.
@@ -601,7 +573,8 @@ AGENTS.md parity.
   uses `response.custom_tool_call_input.delta` only for live patch-progress
   events; executable `apply_patch` input still comes from the final
   `response.output_item.done` custom tool call. Local now preserves that
-  payload rule and dedupes repeated custom tool calls if a local mock/provider
+  payload rule, emits progress-only `patch.updated` snapshots from streamed
+  deltas, and dedupes repeated custom tool calls if a local mock/provider
   response also includes the same call in `response.completed.output`.
 - Matched Codex's current `parallel_tool_calls` request default for bundled
   agent models. Local OpenAI/Codex Responses and OpenAI-compatible chat
@@ -873,14 +846,17 @@ The biggest remaining categories are:
   behavior for bundled model metadata, local-only file helpers are no longer
   model-visible, and legacy hidden spawn fields reject like Codex v2.
 - Unified exec internals: env defaults, default login behavior, explicit-shell
-  fallback, process id allocation/pruning, and background completion are now
-  partially aligned. Still open: shell-mode breadth, pause-aware waits, final
-  end-event transcript, dynamic truncation policy, code-mode JSON, and full
-  parser parity.
-- Patch semantics: live progress snapshots from streaming custom-tool deltas,
-  committed-delta reporting after runtime write/remove failures, structured
-  app-server patch lifecycle events, and sandbox-dependent hardlink/path
-  protections.
+  fallback, process id allocation/pruning, background completion, per-call
+  output buffering, final transcript events, no-newline partial output, and
+  stdin write-error model text are now partially aligned. Still open:
+  shell-mode breadth, pause-aware waits, full parser parity, code-mode JSON,
+  and exact cross-turn process persistence.
+- Patch semantics: contextual/parser semantics, preverification/runtime
+  sequencing, streaming custom-tool progress snapshots, success/failure
+  lifecycle events, and committed-delta reporting after runtime failures are
+  now partially aligned. Still open: exact app-server patch notification
+  surfaces, fuller streaming parser/throttle behavior, and sandbox-dependent
+  hardlink/path protections.
 - Collaboration and Plan mode: exact Default/Plan collaboration templates,
   config-gated injection, later-turn developer updates, Plan-mode `update_plan`
   rejection, local TUI/CLI mode controls, the `request_user_input` answer path,
@@ -937,18 +913,15 @@ The biggest remaining categories are:
   prefix-rule approvals, feature-enabled additional-permission normalization
   and approval, network denial handling, full tree-sitter parser parity beyond
   the tested Unix plain-command edge cases, Codex shell-mode breadth including
-  PowerShell/Windows heuristics, pause-aware wait deadline extension, dynamic
-  Codex's separate whole-process transcript buffer/final unified-exec end-event
-  surface, code-mode JSON if this terminal adds code-mode, and
-  exact prompt-vs-allow behavior for non-dangerous unmatched commands.
+  PowerShell/Windows heuristics, pause-aware wait deadline extension, code-mode
+  JSON if this terminal adds code-mode, exact cross-turn process persistence,
+  and exact prompt-vs-allow behavior for non-dangerous unmatched commands.
 - Full patch sandbox execution, protected-path approval prompts, and approval
   decision logic are intentionally out of scope for this experiment unless the
   product later needs them. Still open for patch quality: hardlink-escape
-  protection that depends on sandboxing, streaming patch-input progress events
-  from `response.custom_tool_call_input.delta`, committed-delta reporting for
-  runtime write/remove failures, and structured patch progress/end events.
-  Dirty-worktree ownership remains prompt-level in Codex rather than a runtime
-  patch guard.
+  protection that depends on sandboxing, exact app-server patch notification
+  surfaces, and fuller streaming parser/throttle behavior. Dirty-worktree
+  ownership remains prompt-level in Codex rather than a runtime patch guard.
 - A repeatable Codex-auth golden-task harness beyond the current subagent
   reference checks.
 - Exact Codex app-server `configWarning` and thread-response

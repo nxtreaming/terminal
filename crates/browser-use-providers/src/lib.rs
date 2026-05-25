@@ -4447,9 +4447,33 @@ fn flush_sse_event(
                 }
             }
         }
+        Some("response.output_item.added") => {
+            if let Some(item) = event.get("item") {
+                stream_state.remember_custom_tool_call_item(item);
+            }
+        }
+        Some("response.custom_tool_call_input.delta") => {
+            let item_id = event
+                .get("item_id")
+                .or_else(|| event.get("output_index").and_then(|_| event.get("item_id")))
+                .and_then(Value::as_str);
+            if let Some(item_id) = item_id {
+                if let Some((call_id, name)) = stream_state.custom_tool_call_for_item(item_id) {
+                    if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                        emit_codex_model_event(
+                            ModelEvent::CustomToolCallInputDelta {
+                                call_id: call_id.to_string(),
+                                name: name.to_string(),
+                                delta: delta.to_string(),
+                            },
+                            on_event,
+                            emitted_done,
+                        )?;
+                    }
+                }
+            }
+        }
         Some("response.created")
-        | Some("response.output_item.added")
-        | Some("response.custom_tool_call_input.delta")
         | Some("response.reasoning_summary_part.added")
         | Some("response.metadata") => {}
         Some("response.reasoning_text.delta") => {
@@ -4633,6 +4657,37 @@ struct CodexSseStreamState {
     seen_tool_calls: HashSet<String>,
     seen_output_items: HashSet<String>,
     last_server_model: Option<String>,
+    custom_tool_calls_by_item_id: HashMap<String, (String, String)>,
+}
+
+impl CodexSseStreamState {
+    fn remember_custom_tool_call_item(&mut self, item: &Value) {
+        if item.get("type").and_then(Value::as_str) != Some("custom_tool_call") {
+            return;
+        }
+        let Some(item_id) = item.get("id").and_then(Value::as_str) else {
+            return;
+        };
+        let call_id = item
+            .get("call_id")
+            .or_else(|| item.get("id"))
+            .and_then(Value::as_str)
+            .unwrap_or(item_id)
+            .to_string();
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or("custom_tool")
+            .to_string();
+        self.custom_tool_calls_by_item_id
+            .insert(item_id.to_string(), (call_id, name));
+    }
+
+    fn custom_tool_call_for_item(&self, item_id: &str) -> Option<(&str, &str)> {
+        self.custom_tool_calls_by_item_id
+            .get(item_id)
+            .map(|(call_id, name)| (call_id.as_str(), name.as_str()))
+    }
 }
 
 fn maybe_push_codex_output_item(
@@ -7740,6 +7795,10 @@ mod tests {
             .iter()
             .filter(|event| matches!(event, ModelEvent::ResponseOutputItem { .. }))
             .count();
+        let input_deltas = events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::CustomToolCallInputDelta { .. }))
+            .count();
         assert_eq!(
             tool_calls, 1,
             "custom tool call repeated in response.completed should be deduped"
@@ -7748,6 +7807,15 @@ mod tests {
             response_output_items, 1,
             "raw response item repeated in response.completed should be deduped"
         );
+        assert_eq!(
+            input_deltas, 2,
+            "custom input deltas should be exposed only as progress events"
+        );
+        assert!(events.contains(&ModelEvent::CustomToolCallInputDelta {
+            call_id: "call_patch".to_string(),
+            name: "apply_patch".to_string(),
+            delta: "live progress only".to_string(),
+        }));
         assert!(events.contains(&ModelEvent::ToolCall {
             call: ToolCall {
                 id: "call_patch".to_string(),
