@@ -10,20 +10,20 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
     append_workspace_context_event, canonical_agent_path_from_task_name, canonical_agent_reference,
-    cleanup_unified_exec_commands_for_session, collect_agent_tree,
+    cleanup_unified_exec_commands_for_agent_subtree, collect_agent_tree,
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
     display_agent_path_for_session, final_statuses_for_v1_wait, install_process_crypto_provider,
     last_task_message_for_agent, local_agent_status_value, model_catalog_for_cwd_with_options,
     parse_config_overrides, product_analytics, record_python_response_final_event,
     record_python_worker_event, resolve_agent_reference_in_tree, root_session_id,
     run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
-    run_fake_agent, typed_user_input_payload_from_text, update_parent_from_child_run,
+    run_fake_agent, typed_user_input_payload_from_text_for_cwd, update_parent_from_child_run,
     AgentRunOptions, CollaborationModeKind, ConfigOverrides, FakeAgentOptions, ProviderBackend,
-    ProviderRunConfig, RunConfigValueSource,
+    ProviderRunConfig, RunConfigValueSource, UnifiedExecShutdownCleanup,
 };
 use browser_use_protocol::{
-    browser_summary_from_events, failure_from_events, result_from_events,
-    sanitized_agent_context_from_events, task_from_events,
+    browser_summary_from_events, failure_from_events, sanitized_agent_context_from_events,
+    session_result_from_events, task_from_events,
 };
 use browser_use_providers::{
     claude_code_oauth_authorize_url, claude_code_oauth_pkce,
@@ -556,6 +556,7 @@ struct DatasetTaskPaths {
 
 fn main() -> Result<()> {
     install_process_crypto_provider();
+    let _unified_exec_cleanup = UnifiedExecShutdownCleanup::new();
     load_dotenv()?;
     let mut args = Args::parse();
     args.state_dir = resolve_state_dir(&args.state_dir);
@@ -1135,11 +1136,12 @@ fn sessions(store: &Store, command: SessionsCommand) -> Result<()> {
 }
 
 fn start(store: &Store, text: String) -> Result<()> {
-    let task = store.create_session(None, std::env::current_dir()?)?;
+    let cwd = std::env::current_dir()?;
+    let task = store.create_session(None, &cwd)?;
     store.append_event(
         &task.id,
         "session.input",
-        typed_user_input_payload_from_text(&text),
+        typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
     println!("{}", task.id);
     Ok(())
@@ -1474,11 +1476,11 @@ fn notify_parent_after_cli_child_run(
 }
 
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
-    ensure_task_exists(store, task_id)?;
+    let session = ensure_task_exists(store, task_id)?;
     store.append_event(
         task_id,
         "session.followup",
-        typed_user_input_payload_from_text(&text),
+        typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
     )?;
     println!("followup {task_id}");
     Ok(())
@@ -1499,6 +1501,7 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
 fn cancel(store: &Store, task_id: &str, reason: &str) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     store.request_cancel(task_id, reason)?;
+    cleanup_unified_exec_commands_for_agent_subtree(store, task_id)?;
     notify_parent_agent_done(store, &task)?;
     println!("cancelled {task_id}");
     Ok(())
@@ -1540,7 +1543,7 @@ fn show(store: &Store, task_id: &str) -> Result<()> {
     if let Some(url) = browser.url {
         println!("Browser: {url}");
     }
-    if let Some(result) = result_from_events(&events) {
+    if let Some(result) = session_result_from_events(&events) {
         println!();
         println!("Result");
         println!("{result}");
@@ -2525,7 +2528,7 @@ fn spawn_agent(
     store.append_event(
         &child.id,
         "session.input",
-        typed_user_input_payload_from_text(&message),
+        typed_user_input_payload_from_text_for_cwd(&message, &child.cwd)?,
     )?;
     store.append_event(
         parent_id,
@@ -2631,8 +2634,8 @@ fn close_agent(store: &Store, current_id: Option<&str>, target: &str, reason: &s
         .agent_summary_for_child(&child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
     let previous_status = local_agent_status_value(store, &child, Some(&summary))?;
+    cleanup_unified_exec_commands_for_agent_subtree(store, &child_id)?;
     store.close_child_agent(&child_id, reason)?;
-    cleanup_unified_exec_commands_for_session(&child_id);
     store.append_event(
         &summary.parent_session_id,
         "agent.cancelled",
@@ -3354,7 +3357,7 @@ fn dataset_attempt_result(
 ) -> Result<Value> {
     let session = ensure_task_exists(store, session_id)?;
     let events = store.events_for_session(session_id)?;
-    let final_result = result_from_events(&events);
+    let final_result = session_result_from_events(&events);
     let final_result_chars = final_result.as_deref().map(str::len).unwrap_or(0);
     let usage = usage_summary_from_events(&events);
     let session_failure = failure_from_events(&events);

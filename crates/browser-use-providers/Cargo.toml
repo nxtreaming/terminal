@@ -6,15 +6,10 @@ version.workspace = true
 
 [dependencies]
 anyhow.workspace = true
-aws-config = { version = "1", features = ["credentials-login"] }
-aws-credential-types = "1"
-aws-sigv4 = "1"
-aws-types = "1"
 base64.workspace = true
 browser-use-protocol = { path = "../browser-use-protocol" }
 bytes = "1"
 chrono.workspace = true
-http = "1"
 rand = "0.9.4"
 reqwest.workspace = true
 serde = { workspace = true, features = ["derive"] }

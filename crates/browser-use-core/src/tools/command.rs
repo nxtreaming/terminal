@@ -1,8 +1,9 @@
 use std::collections::{HashMap, VecDeque};
-use std::io::Write;
+use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Child as StdChild, ChildStdin, Command, Stdio};
+use std::process::{Child as StdChild, ChildStdin, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicI64, Ordering};
+use std::sync::mpsc;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
@@ -16,6 +17,7 @@ use tree_sitter::{Node, Parser, Tree};
 use tree_sitter_bash::LANGUAGE as BASH;
 
 const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
+const DEFAULT_SHELL_COMMAND_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_TIME_MS: u64 = 250;
 const MIN_YIELD_TIME_MS: u64 = 250;
 const MIN_EMPTY_POLL_YIELD_TIME_MS: u64 = 5_000;
@@ -26,6 +28,10 @@ const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
 const TOKEN_TO_CHAR_APPROX: usize = 4;
 const WRITE_STDIN_REACTION_SETTLE_MS: u64 = 100;
+const POST_EXIT_READER_DRAIN_TIMEOUT_MS: u64 = 50;
+const BACKGROUND_TRAILING_OUTPUT_GRACE_MS: u64 = 100;
+const SHELL_COMMAND_TIMEOUT_EXIT_CODE: i32 = 124;
+const SHELL_COMMAND_IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
 const STDIN_CLOSED_MESSAGE: &str =
     "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open";
 const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
@@ -393,10 +399,10 @@ pub(crate) fn exec_command_with_budget(
 
     wait_for_output(yield_time, || managed.process.try_wait())?;
     if let Some(status) = managed.process.try_wait()? {
-        finish_readers(&mut managed);
+        let _ = finish_readers_after_exit(&mut managed);
         let text = managed.read_recent_output();
         let aggregated_output = managed.read_transcript_output();
-        emit_command_output(store, &session.id, process_id, &text)?;
+        emit_command_output(store, &session.id, Some(process_id), &text)?;
         emit_command_finished(
             store,
             &session.id,
@@ -437,7 +443,7 @@ pub(crate) fn exec_command_with_budget(
     }
 
     let text = managed.read_recent_output();
-    emit_command_output(store, &session.id, process_id, &text)?;
+    emit_command_output(store, &session.id, Some(process_id), &text)?;
     store.append_event(
         &session.id,
         "command.waiting",
@@ -481,6 +487,230 @@ pub(crate) fn exec_command_with_budget(
         content,
         model_text,
     })
+}
+
+pub(crate) fn shell_command_with_budget(
+    store: &Store,
+    session: &SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+    allow_login_shell: bool,
+) -> Result<CommandToolResult> {
+    let raw_command = call
+        .arguments
+        .get("command")
+        .and_then(Value::as_str)
+        .unwrap_or("")
+        .trim();
+    if raw_command.is_empty() {
+        bail!("shell_command requires command");
+    }
+    if let Some(reason) = dangerous_command_rejection(raw_command) {
+        bail!("{reason}");
+    }
+    let login = match call.arguments.get("login").and_then(Value::as_bool) {
+        Some(true) if !allow_login_shell => {
+            bail!("login shell is disabled by config; omit `login` or set it to false.");
+        }
+        Some(login) => login,
+        None => allow_login_shell,
+    };
+    let timeout = shell_command_timeout(&call.arguments);
+    let max_chars = tool_output_token_budget
+        .min(DEFAULT_MAX_OUTPUT_TOKENS)
+        .saturating_mul(TOKEN_TO_CHAR_APPROX);
+    let workdir = resolve_workdir(
+        session,
+        call.arguments.get("workdir").and_then(Value::as_str),
+    )?;
+    let shell = default_user_shell();
+
+    store.append_event(
+        &session.id,
+        "tool.started",
+        json!({
+            "name": "shell_command",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "command.started",
+        json!({
+            "tool_call_id": call.id,
+            "session_id": Value::Null,
+            "cmd": raw_command,
+            "workdir": workdir,
+            "shell": shell.path_string(),
+            "shell_type": shell.name(),
+            "login": login,
+            "tty": false,
+        }),
+    )?;
+
+    let started_at = Instant::now();
+    let mut child = spawn_shell_command_process(&shell, login, raw_command, &workdir, &session.id)?;
+    let stdout = child.stdout.take().context("stdout pipe not available")?;
+    let stderr = child.stderr.take().context("stderr pipe not available")?;
+    let stdout_rx = spawn_capped_reader(stdout);
+    let stderr_rx = spawn_capped_reader(stderr);
+
+    let (status, timed_out) = wait_for_shell_command(&mut child, timeout)?;
+    let duration = started_at.elapsed();
+    let stdout = recv_capped_reader(stdout_rx);
+    let stderr = recv_capped_reader(stderr_rx);
+    let aggregated_output = aggregate_shell_output(&stdout, &stderr);
+    emit_command_output(store, &session.id, None, &aggregated_output)?;
+
+    let exit_code = if timed_out {
+        SHELL_COMMAND_TIMEOUT_EXIT_CODE
+    } else {
+        status.code().unwrap_or(-1)
+    };
+    let success = exit_code == 0 && !timed_out;
+    emit_shell_command_finished(
+        store,
+        &session.id,
+        &call.id,
+        exit_code,
+        success,
+        duration,
+        &stdout,
+        &stderr,
+        &aggregated_output,
+        timed_out,
+    )?;
+    let content = shell_command_output(exit_code, success, duration, &aggregated_output, timed_out);
+    let model_text = shell_command_model_text(
+        exit_code,
+        duration,
+        &aggregated_output,
+        timed_out,
+        max_chars,
+    );
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        json!({
+            "name": "shell_command",
+            "tool_call_id": call.id,
+            "output": content,
+        }),
+    )?;
+    Ok(CommandToolResult {
+        #[cfg(test)]
+        content,
+        model_text,
+    })
+}
+
+#[derive(Clone, Debug, Default)]
+struct CappedOutput {
+    bytes: Vec<u8>,
+}
+
+impl CappedOutput {
+    fn push(&mut self, chunk: &[u8]) {
+        if self.bytes.len() >= UNIFIED_EXEC_OUTPUT_MAX_BYTES {
+            return;
+        }
+        let remaining = UNIFIED_EXEC_OUTPUT_MAX_BYTES.saturating_sub(self.bytes.len());
+        self.bytes
+            .extend_from_slice(&chunk[..chunk.len().min(remaining)]);
+    }
+
+    fn text(&self) -> String {
+        String::from_utf8_lossy(&self.bytes).to_string()
+    }
+}
+
+fn spawn_shell_command_process(
+    shell: &ShellSpec,
+    login: bool,
+    command_text: &str,
+    workdir: &Path,
+    thread_id: &str,
+) -> Result<StdChild> {
+    let shell_path = shell.path_string();
+    let mut command = Command::new(&shell_path);
+    command
+        .args(shell.exec_args(command_text, login))
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped());
+    apply_unified_exec_env_to_command(&mut command, thread_id);
+    command.spawn().with_context(|| {
+        format!(
+            "spawn shell_command via shell {} in {}",
+            shell_path,
+            workdir.display()
+        )
+    })
+}
+
+fn spawn_capped_reader<R>(mut reader: R) -> mpsc::Receiver<CappedOutput>
+where
+    R: Read + Send + 'static,
+{
+    let (tx, rx) = mpsc::channel();
+    thread::spawn(move || {
+        let mut output = CappedOutput::default();
+        let mut buffer = [0u8; 8192];
+        loop {
+            match reader.read(&mut buffer) {
+                Ok(0) => break,
+                Ok(n) => output.push(&buffer[..n]),
+                Err(_) => break,
+            }
+        }
+        let _ = tx.send(output);
+    });
+    rx
+}
+
+fn recv_capped_reader(rx: mpsc::Receiver<CappedOutput>) -> String {
+    rx.recv_timeout(Duration::from_millis(SHELL_COMMAND_IO_DRAIN_TIMEOUT_MS))
+        .unwrap_or_default()
+        .text()
+}
+
+fn wait_for_shell_command(child: &mut StdChild, timeout: Duration) -> Result<(ExitStatus, bool)> {
+    let started = Instant::now();
+    loop {
+        if let Some(status) = child.try_wait()? {
+            return Ok((status, false));
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let status = child.wait()?;
+            return Ok((status, true));
+        }
+        thread::sleep(Duration::from_millis(25));
+    }
+}
+
+fn aggregate_shell_output(stdout: &str, stderr: &str) -> String {
+    let stdout_bytes = stdout.as_bytes();
+    let stderr_bytes = stderr.as_bytes();
+    let total_len = stdout_bytes.len().saturating_add(stderr_bytes.len());
+    let mut aggregated = Vec::with_capacity(total_len.min(UNIFIED_EXEC_OUTPUT_MAX_BYTES));
+    if total_len <= UNIFIED_EXEC_OUTPUT_MAX_BYTES {
+        aggregated.extend_from_slice(stdout_bytes);
+        aggregated.extend_from_slice(stderr_bytes);
+    } else {
+        let want_stdout = stdout_bytes.len().min(UNIFIED_EXEC_OUTPUT_MAX_BYTES / 3);
+        let stderr_take = stderr_bytes
+            .len()
+            .min(UNIFIED_EXEC_OUTPUT_MAX_BYTES.saturating_sub(want_stdout));
+        let remaining = UNIFIED_EXEC_OUTPUT_MAX_BYTES.saturating_sub(want_stdout + stderr_take);
+        let stdout_take =
+            want_stdout + remaining.min(stdout_bytes.len().saturating_sub(want_stdout));
+        aggregated.extend_from_slice(&stdout_bytes[..stdout_take]);
+        aggregated.extend_from_slice(&stderr_bytes[..stderr_take]);
+    }
+    String::from_utf8_lossy(&aggregated).to_string()
 }
 
 #[cfg(test)]
@@ -551,10 +781,10 @@ pub(crate) fn write_stdin_with_budget(
     wait_for_output(yield_time, || command.process.try_wait())?;
     let status = command.process.try_wait()?;
     if status.is_some() {
-        finish_readers(&mut command);
+        let _ = finish_readers_after_exit(&mut command);
     }
     let text = command.read_recent_output();
-    emit_command_output(store, &session.id, process_id, &text)?;
+    emit_command_output(store, &session.id, Some(process_id), &text)?;
 
     let running = status.is_none();
     let write_error = if running {
@@ -661,7 +891,7 @@ fn store_running_command(store: &Store, process_id: i64, managed: ManagedCommand
     if let Some(mut command) = pruned {
         let _ = command.process.kill();
         let _ = command.process.wait();
-        finish_readers(&mut command);
+        let _ = finish_readers_after_exit(&mut command);
         let _ = store.append_event(
             &command.session_id,
             "command.pruned",
@@ -718,7 +948,7 @@ fn spawn_background_completion_watcher(
 ) {
     thread::spawn(move || loop {
         thread::sleep(Duration::from_millis(100));
-        let event = {
+        let status = {
             let mut commands = commands().lock().expect("command registry poisoned");
             let Some(command) = commands.get_mut(&process_id) else {
                 return;
@@ -731,10 +961,24 @@ fn spawn_background_completion_watcher(
                 Ok(None) => continue,
                 Err(_) => return,
             };
-            finish_readers(command);
+            status
+        };
+        thread::sleep(Duration::from_millis(BACKGROUND_TRAILING_OUTPUT_GRACE_MS));
+        let event = {
+            let mut commands = commands().lock().expect("command registry poisoned");
+            let Some(command) = commands.get_mut(&process_id) else {
+                return;
+            };
+            if command.background_finished {
+                return;
+            }
+            let readers_finished = finish_readers_after_exit(command);
             let recent_output = command.read_recent_output();
             let aggregated_output = command.read_transcript_output();
             command.background_finished = true;
+            if !readers_finished {
+                command.detach_reader_buffers();
+            }
             Some((
                 command.session_id.clone(),
                 command.tool_call_id.clone(),
@@ -754,7 +998,7 @@ fn spawn_background_completion_watcher(
         )) = event
         {
             if let Ok(store) = Store::open_with_optional_notifier(&state_dir, notifier.clone()) {
-                let _ = emit_command_output(&store, &session_id, process_id, &recent_output);
+                let _ = emit_command_output(&store, &session_id, Some(process_id), &recent_output);
                 let _ = emit_command_finished(
                     &store,
                     &session_id,
@@ -842,14 +1086,21 @@ fn json_type_name(value: &Value) -> &'static str {
 
 #[allow(dead_code)]
 pub(crate) fn cleanup_session_commands(session_id: &str) -> usize {
+    cleanup_commands_matching(|command| command.session_id == session_id)
+}
+
+#[allow(dead_code)]
+pub(crate) fn cleanup_all_commands() -> usize {
+    cleanup_commands_matching(|_| true)
+}
+
+fn cleanup_commands_matching(predicate: impl Fn(&ManagedCommand) -> bool) -> usize {
     let mut pending = Vec::new();
     {
         let mut commands = commands().lock().expect("command registry poisoned");
         let process_ids = commands
             .iter()
-            .filter_map(|(process_id, command)| {
-                (command.session_id == session_id).then_some(*process_id)
-            })
+            .filter_map(|(process_id, command)| predicate(command).then_some(*process_id))
             .collect::<Vec<_>>();
         for process_id in process_ids {
             if let Some(command) = commands.remove(&process_id) {
@@ -862,14 +1113,25 @@ pub(crate) fn cleanup_session_commands(session_id: &str) -> usize {
     for mut command in pending {
         let _ = command.process.kill();
         let _ = command.process.wait();
-        finish_readers(&mut command);
+        let _ = finish_readers_after_exit(&mut command);
     }
     count
 }
 
+#[cfg(test)]
 pub(crate) fn exec_command_is_known_read_only(arguments: &Value) -> bool {
+    command_arguments_are_known_read_only(arguments, "cmd")
+}
+
+#[cfg(test)]
+pub(crate) fn shell_command_is_known_read_only(arguments: &Value) -> bool {
+    command_arguments_are_known_read_only(arguments, "command")
+}
+
+#[cfg(test)]
+fn command_arguments_are_known_read_only(arguments: &Value, command_key: &str) -> bool {
     let cmd = arguments
-        .get("cmd")
+        .get(command_key)
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
@@ -1096,10 +1358,31 @@ fn push_command_output_chunk(
         .push_chunk(chunk);
 }
 
-fn finish_readers(command: &mut ManagedCommand) {
-    for reader in command.readers.drain(..) {
-        let _ = reader.join();
+fn finish_readers_after_exit(command: &mut ManagedCommand) -> bool {
+    let timeout = Duration::from_millis(POST_EXIT_READER_DRAIN_TIMEOUT_MS);
+    let started = Instant::now();
+    let mut pending = Vec::new();
+    std::mem::swap(&mut pending, &mut command.readers);
+    while !pending.is_empty() {
+        let mut still_running = Vec::new();
+        for reader in pending.drain(..) {
+            if reader.is_finished() {
+                let _ = reader.join();
+            } else {
+                still_running.push(reader);
+            }
+        }
+        if still_running.is_empty() {
+            return true;
+        }
+        if started.elapsed() >= timeout {
+            return false;
+        }
+        let remaining = timeout.saturating_sub(started.elapsed());
+        thread::sleep(Duration::from_millis(5).min(remaining));
+        pending = still_running;
     }
+    true
 }
 
 impl ManagedCommand {
@@ -1111,6 +1394,11 @@ impl ManagedCommand {
     fn read_transcript_output(&self) -> String {
         let transcript = self.transcript.lock().expect("command transcript poisoned");
         String::from_utf8_lossy(&transcript.to_bytes()).to_string()
+    }
+
+    fn detach_reader_buffers(&mut self) {
+        self.output = Arc::new(Mutex::new(HeadTailBuffer::default()));
+        self.transcript = Arc::new(Mutex::new(HeadTailBuffer::default()));
     }
 }
 
@@ -1128,7 +1416,12 @@ fn wait_for_output(
     Ok(())
 }
 
-fn emit_command_output(store: &Store, session_id: &str, process_id: i64, text: &str) -> Result<()> {
+fn emit_command_output(
+    store: &Store,
+    session_id: &str,
+    process_id: Option<i64>,
+    text: &str,
+) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
@@ -1171,6 +1464,36 @@ fn emit_command_finished(
     Ok(())
 }
 
+fn emit_shell_command_finished(
+    store: &Store,
+    session_id: &str,
+    tool_call_id: &str,
+    exit_code: i32,
+    success: bool,
+    duration: Duration,
+    stdout: &str,
+    stderr: &str,
+    aggregated_output: &str,
+    timed_out: bool,
+) -> Result<()> {
+    store.append_event(
+        session_id,
+        "command.finished",
+        json!({
+            "tool_call_id": tool_call_id,
+            "session_id": Value::Null,
+            "exit_code": exit_code,
+            "success": success,
+            "duration_ms": duration.as_millis() as u64,
+            "stdout": stdout,
+            "stderr": stderr,
+            "aggregated_output": aggregated_output,
+            "timed_out": timed_out,
+        }),
+    )?;
+    Ok(())
+}
+
 struct CommandOutputPayload<'a> {
     chunk_id: String,
     session_id: Option<i64>,
@@ -1182,6 +1505,25 @@ struct CommandOutputPayload<'a> {
     tty_requested: bool,
     tty_allocated: bool,
     write_error: Option<&'a str>,
+}
+
+fn shell_command_output(
+    exit_code: i32,
+    success: bool,
+    duration: Duration,
+    output: &str,
+    timed_out: bool,
+) -> Value {
+    json!({
+        "running": false,
+        "output": output,
+        "metadata": {
+            "exit_code": exit_code,
+            "duration_ms": duration.as_millis() as u64,
+            "success": success,
+            "timed_out": timed_out,
+        }
+    })
 }
 
 fn command_output(payload: &CommandOutputPayload<'_>) -> Value {
@@ -1199,6 +1541,36 @@ fn command_output(payload: &CommandOutputPayload<'_>) -> Value {
             "write_error": payload.write_error,
         }
     })
+}
+
+fn shell_command_model_text(
+    exit_code: i32,
+    duration: Duration,
+    output: &str,
+    timed_out: bool,
+    max_chars: usize,
+) -> String {
+    let duration_seconds = ((duration.as_secs_f32()) * 10.0).round() / 10.0;
+    let content = if timed_out {
+        format!(
+            "command timed out after {} milliseconds\n{}",
+            duration.as_millis(),
+            output
+        )
+    } else {
+        output.to_string()
+    };
+    let max_tokens = max_chars / TOKEN_TO_CHAR_APPROX;
+    let (formatted_output, truncated) = truncate_for_model_text(&content, max_tokens);
+    let mut sections = Vec::new();
+    sections.push(format!("Exit code: {exit_code}"));
+    sections.push(format!("Wall time: {duration_seconds} seconds"));
+    if truncated {
+        sections.push(format!("Total output lines: {}", content.lines().count()));
+    }
+    sections.push("Output:".to_string());
+    sections.push(formatted_output);
+    sections.join("\n")
 }
 
 fn command_model_text(payload: &CommandOutputPayload<'_>) -> String {
@@ -1230,6 +1602,13 @@ fn command_model_text(payload: &CommandOutputPayload<'_>) -> String {
     sections.push("Output:".to_string());
     sections.push(output);
     sections.join("\n")
+}
+
+fn truncate_for_model_text(content: &str, max_tokens: usize) -> (String, bool) {
+    if content.len() <= max_tokens.saturating_mul(TOKEN_TO_CHAR_APPROX) {
+        return (content.to_string(), false);
+    }
+    (truncate_middle_with_token_budget(content, max_tokens), true)
 }
 
 fn generate_chunk_id() -> String {
@@ -1370,6 +1749,15 @@ fn yield_time(arguments: &Value, default_ms: u64) -> Duration {
         .and_then(Value::as_u64)
         .unwrap_or(default_ms)
         .clamp(MIN_YIELD_TIME_MS, MAX_YIELD_TIME_MS);
+    Duration::from_millis(millis)
+}
+
+fn shell_command_timeout(arguments: &Value) -> Duration {
+    let millis = arguments
+        .get("timeout_ms")
+        .or_else(|| arguments.get("timeout"))
+        .and_then(Value::as_u64)
+        .unwrap_or(DEFAULT_SHELL_COMMAND_TIMEOUT_MS);
     Duration::from_millis(millis)
 }
 
@@ -1828,6 +2216,7 @@ fn parse_raw_string(node: Node<'_>, src: &str) -> Option<String> {
         .map(str::to_owned)
 }
 
+#[cfg(test)]
 fn command_words_are_known_read_only(words: &[String]) -> bool {
     let Some(first) = words.first().map(String::as_str) else {
         return false;
@@ -1861,6 +2250,7 @@ fn command_words_might_be_dangerous(words: &[String]) -> bool {
     }
 }
 
+#[cfg(test)]
 fn base64_command_is_read_only(args: &[String]) -> bool {
     !args.iter().any(|arg| {
         matches!(arg.as_str(), "-o" | "--output")
@@ -1869,6 +2259,7 @@ fn base64_command_is_read_only(args: &[String]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn rg_command_is_read_only(args: &[String]) -> bool {
     !args.iter().any(|arg| {
         matches!(
@@ -1879,12 +2270,14 @@ fn rg_command_is_read_only(args: &[String]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn sed_command_is_read_only(words: &[String]) -> bool {
     words.len() <= 4
         && words.get(1).map(String::as_str) == Some("-n")
         && is_valid_sed_n_arg(words.get(2).map(String::as_str))
 }
 
+#[cfg(test)]
 fn git_command_is_read_only(words: &[String]) -> bool {
     let Some((subcommand_idx, subcommand)) =
         find_git_subcommand(words, &["status", "log", "diff", "show", "branch"])
@@ -1908,6 +2301,7 @@ fn git_command_is_read_only(words: &[String]) -> bool {
     }
 }
 
+#[cfg(test)]
 fn find_git_subcommand<'a>(words: &'a [String], subcommands: &[&str]) -> Option<(usize, &'a str)> {
     let first = words
         .first()
@@ -1942,6 +2336,7 @@ fn find_git_subcommand<'a>(words: &'a [String], subcommands: &[&str]) -> Option<
     None
 }
 
+#[cfg(test)]
 fn git_branch_is_read_only(args: &[String]) -> bool {
     if args.is_empty() {
         return true;
@@ -1960,12 +2355,14 @@ fn git_branch_is_read_only(args: &[String]) -> bool {
 }
 
 #[derive(Clone, Copy)]
+#[cfg(test)]
 enum GitOptionPattern {
     Exact(&'static str),
     ShortWithInlineValue(&'static str),
     Prefix(&'static str),
 }
 
+#[cfg(test)]
 impl GitOptionPattern {
     fn matches(self, arg: &str) -> bool {
         match self {
@@ -1978,6 +2375,7 @@ impl GitOptionPattern {
     }
 }
 
+#[cfg(test)]
 const UNSAFE_GIT_GLOBAL_OPTIONS: &[GitOptionPattern] = &[
     GitOptionPattern::Exact("-C"),
     GitOptionPattern::ShortWithInlineValue("-C"),
@@ -1999,6 +2397,7 @@ const UNSAFE_GIT_GLOBAL_OPTIONS: &[GitOptionPattern] = &[
     GitOptionPattern::Prefix("--work-tree="),
 ];
 
+#[cfg(test)]
 const UNSAFE_GIT_SUBCOMMAND_OPTIONS: &[GitOptionPattern] = &[
     GitOptionPattern::Exact("--output"),
     GitOptionPattern::Prefix("--output="),
@@ -2008,6 +2407,7 @@ const UNSAFE_GIT_SUBCOMMAND_OPTIONS: &[GitOptionPattern] = &[
     GitOptionPattern::Prefix("--exec="),
 ];
 
+#[cfg(test)]
 fn git_has_unsafe_global_option(global_args: &[String]) -> bool {
     global_args
         .iter()
@@ -2015,6 +2415,7 @@ fn git_has_unsafe_global_option(global_args: &[String]) -> bool {
         .any(|arg| git_matches_option_pattern(arg, UNSAFE_GIT_GLOBAL_OPTIONS))
 }
 
+#[cfg(test)]
 fn git_subcommand_args_are_read_only(args: &[String]) -> bool {
     !args
         .iter()
@@ -2022,10 +2423,12 @@ fn git_subcommand_args_are_read_only(args: &[String]) -> bool {
         .any(|arg| git_matches_option_pattern(arg, UNSAFE_GIT_SUBCOMMAND_OPTIONS))
 }
 
+#[cfg(test)]
 fn git_matches_option_pattern(arg: &str, patterns: &[GitOptionPattern]) -> bool {
     patterns.iter().any(|pattern| pattern.matches(arg))
 }
 
+#[cfg(test)]
 fn is_git_global_option_with_value(arg: &str) -> bool {
     matches!(
         arg,
@@ -2039,6 +2442,7 @@ fn is_git_global_option_with_value(arg: &str) -> bool {
     )
 }
 
+#[cfg(test)]
 fn is_git_global_option_with_inline_value(arg: &str) -> bool {
     matches!(
         arg,
@@ -2051,6 +2455,7 @@ fn is_git_global_option_with_inline_value(arg: &str) -> bool {
     ) || ((arg.starts_with("-C") || arg.starts_with("-c")) && arg.len() > 2)
 }
 
+#[cfg(test)]
 fn find_command_is_read_only(args: &[String]) -> bool {
     !args.iter().any(|arg| {
         matches!(
@@ -2060,6 +2465,7 @@ fn find_command_is_read_only(args: &[String]) -> bool {
     })
 }
 
+#[cfg(test)]
 fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
     let Some(arg) = arg else {
         return false;
@@ -2157,6 +2563,132 @@ mod tests {
         assert!(started.payload["shell"].as_str().is_some());
         assert!(started.payload["shell_type"].as_str().is_some());
         assert!(started.payload["session_id"].as_i64().is_some());
+    }
+
+    #[test]
+    fn shell_command_returns_codex_legacy_output_without_session() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = shell_command_with_budget(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_shell_completed".to_string(),
+                name: "shell_command".to_string(),
+                namespace: None,
+                arguments: json!({"command": "printf legacy", "timeout_ms": 5000}),
+            },
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            true,
+        )
+        .expect("shell command");
+
+        assert_eq!(result.content["running"], false);
+        assert_eq!(result.content["output"], "legacy");
+        assert!(result.model_text.starts_with("Exit code: 0\nWall time: "));
+        assert!(result.model_text.ends_with("Output:\nlegacy"));
+        assert!(!result
+            .model_text
+            .contains("Process running with session ID"));
+        assert!(!result.model_text.contains("Chunk ID:"));
+
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.started" && event.payload["name"] == "shell_command"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "tool.started" && event.payload["name"] == "exec_command"
+        }));
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "command.started")
+            .expect("command started event");
+        assert_eq!(started.payload["session_id"], Value::Null);
+        assert_eq!(started.payload["cmd"], "printf legacy");
+        assert_eq!(started.payload["login"], true);
+        assert_eq!(started.payload["tty"], false);
+        let finished = events
+            .iter()
+            .find(|event| event.event_type == "command.finished")
+            .expect("command finished event");
+        assert_eq!(finished.payload["session_id"], Value::Null);
+        assert_eq!(finished.payload["exit_code"], 0);
+        assert_eq!(finished.payload["timed_out"], false);
+        assert_eq!(finished.payload["aggregated_output"], "legacy");
+    }
+
+    #[test]
+    fn shell_command_timeout_is_hard_and_does_not_keep_session() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = shell_command_with_budget(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_shell_timeout".to_string(),
+                name: "shell_command".to_string(),
+                namespace: None,
+                arguments: json!({"command": "sleep 2", "timeout_ms": 50}),
+            },
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            true,
+        )
+        .expect("shell timeout");
+
+        assert_eq!(result.content["running"], false);
+        assert_eq!(
+            result.content["metadata"]["exit_code"],
+            SHELL_COMMAND_TIMEOUT_EXIT_CODE
+        );
+        assert_eq!(result.content["metadata"]["timed_out"], true);
+        assert!(result.model_text.starts_with(&format!(
+            "Exit code: {}\nWall time: ",
+            SHELL_COMMAND_TIMEOUT_EXIT_CODE
+        )));
+        assert!(result.model_text.contains("command timed out after"));
+        assert!(!result
+            .model_text
+            .contains("Process running with session ID"));
+
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.waiting"));
+        let finished = events
+            .iter()
+            .find(|event| event.event_type == "command.finished")
+            .expect("command finished event");
+        assert_eq!(finished.payload["session_id"], Value::Null);
+        assert_eq!(
+            finished.payload["exit_code"],
+            SHELL_COMMAND_TIMEOUT_EXIT_CODE
+        );
+        assert_eq!(finished.payload["timed_out"], true);
+    }
+
+    #[test]
+    fn shell_command_rejects_login_when_disabled_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let error = shell_command_with_budget(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_shell_login_disabled".to_string(),
+                name: "shell_command".to_string(),
+                namespace: None,
+                arguments: json!({"command": "printf nope", "login": true}),
+            },
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            false,
+        )
+        .expect_err("disabled login should be rejected");
+
+        assert!(format!("{error:#}").contains("login shell is disabled by config"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
     }
 
     #[test]
@@ -2419,6 +2951,127 @@ mod tests {
             })
             .count();
         assert_eq!(finished_after_poll, 1);
+    }
+
+    #[test]
+    fn background_finish_waits_for_trailing_output_grace_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let started = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_background_trailing_output".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import subprocess, sys, time; print('ready', flush=True); time.sleep(0.6); print('done', flush=True); subprocess.Popen(['python3','-u','-c','import time; time.sleep(0.05); print(\\\"tail\\\", flush=True)'], stdout=sys.stdout, stderr=sys.stderr)\"",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )
+        .expect("exec");
+        let process_id = started.content["session_id"].as_i64().expect("session id");
+        assert_eq!(started.content["running"], true);
+
+        let mut finished = None;
+        for _ in 0..40 {
+            let events = store.events_for_session(&session.id).expect("events");
+            finished = events.into_iter().find(|event| {
+                event.event_type == "command.finished"
+                    && event.payload["session_id"] == json!(process_id)
+            });
+            if finished.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let finished = finished.expect("background command.finished event");
+        let transcript = finished.payload["aggregated_output"]
+            .as_str()
+            .expect("aggregated output");
+        assert!(
+            transcript.contains("done") && transcript.contains("tail"),
+            "background finish should wait for trailing post-exit output: {transcript:?}"
+        );
+    }
+
+    #[test]
+    fn completed_exec_does_not_wait_for_background_descendant_pipe_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let started = Instant::now();
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_post_exit_drain".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import subprocess, sys; print('done', flush=True); subprocess.Popen(['sleep','2'], stdout=sys.stdout, stderr=sys.stderr)\"",
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("exec");
+
+        assert!(
+            started.elapsed() < Duration::from_millis(1000),
+            "post-exit reader drain should be capped instead of waiting for a background descendant"
+        );
+        assert_eq!(result.content["running"], false);
+        assert!(result.content["output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("done"));
+    }
+
+    #[test]
+    fn background_finish_does_not_wait_for_background_descendant_pipe_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let started = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_background_post_exit_drain".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import subprocess, sys, time; print('ready', flush=True); time.sleep(0.6); print('done', flush=True); subprocess.Popen(['sleep','2'], stdout=sys.stdout, stderr=sys.stderr)\"",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )
+        .expect("exec");
+        let process_id = started.content["session_id"].as_i64().expect("session id");
+        assert_eq!(started.content["running"], true);
+
+        let wait_started = Instant::now();
+        let mut finished = None;
+        for _ in 0..30 {
+            let events = store.events_for_session(&session.id).expect("events");
+            finished = events.into_iter().find(|event| {
+                event.event_type == "command.finished"
+                    && event.payload["session_id"] == json!(process_id)
+            });
+            if finished.is_some() {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let finished = finished.expect("background command.finished event");
+        assert!(
+            wait_started.elapsed() < Duration::from_millis(1500),
+            "background watcher should cap post-exit reader drain"
+        );
+        assert!(finished.payload["aggregated_output"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("done"));
     }
 
     #[test]
@@ -3399,6 +4052,9 @@ mod tests {
         assert!(exec_command_is_known_read_only(
             &json!({"cmd": "bash -lc 'git status --short && rg -n browser src | wc -l'"})
         ));
+        assert!(shell_command_is_known_read_only(
+            &json!({"command": "git status --short"})
+        ));
         assert!(!exec_command_is_known_read_only(
             &json!({"cmd": "git worktree list --porcelain"})
         ));
@@ -3519,7 +4175,7 @@ mod tests {
         {
             let _ = command.process.kill();
             let _ = command.process.wait();
-            finish_readers(&mut command);
+            let _ = finish_readers_after_exit(&mut command);
         }
     }
 }

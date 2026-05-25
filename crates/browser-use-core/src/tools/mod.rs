@@ -1,5 +1,6 @@
 use bm25::{Document, Language, SearchEngineBuilder};
 use browser_use_protocol::{FreeformToolFormat, ToolSpec};
+use browser_use_providers::ModelShellType;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -34,6 +35,7 @@ pub(crate) enum ToolHandlerKind {
     Browser,
     BrowserScript,
     Python,
+    ShellCommand,
     ExecCommand,
     WriteStdin,
     ApplyPatch,
@@ -72,9 +74,19 @@ pub(crate) struct RegisteredTool {
     exposure: ToolExposure,
 }
 
-#[derive(Clone, Debug, Default)]
+#[derive(Clone, Debug)]
 pub(crate) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
+    allow_login_shell: bool,
+}
+
+impl Default for ToolRegistry {
+    fn default() -> Self {
+        Self {
+            tools: Vec::new(),
+            allow_login_shell: true,
+        }
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -89,6 +101,7 @@ pub(crate) struct MultiAgentToolSpecConfig {
     pub(crate) max_concurrent_threads_per_session: usize,
     pub(crate) tool_namespace: Option<String>,
     pub(crate) non_code_mode_only: bool,
+    pub(crate) request_user_input_default_mode_enabled: bool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -96,6 +109,42 @@ pub(crate) enum MultiAgentToolFamily {
     Disabled,
     V1,
     V2,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) struct ShellToolSpecConfig {
+    pub(crate) shell_tool_enabled: bool,
+    pub(crate) unified_exec_enabled: bool,
+    pub(crate) model_shell_type: ModelShellType,
+    pub(crate) allow_login_shell: bool,
+}
+
+impl Default for ShellToolSpecConfig {
+    fn default() -> Self {
+        Self {
+            shell_tool_enabled: true,
+            unified_exec_enabled: !cfg!(windows),
+            model_shell_type: ModelShellType::ShellCommand,
+            allow_login_shell: true,
+        }
+    }
+}
+
+impl ShellToolSpecConfig {
+    fn resolved_shell_type(self) -> ModelShellType {
+        if !self.shell_tool_enabled {
+            return ModelShellType::Disabled;
+        }
+        if self.unified_exec_enabled {
+            return ModelShellType::UnifiedExec;
+        }
+        match self.model_shell_type {
+            ModelShellType::UnifiedExec | ModelShellType::Default | ModelShellType::Local => {
+                ModelShellType::ShellCommand
+            }
+            other => other,
+        }
+    }
 }
 
 impl Default for MultiAgentToolSpecConfig {
@@ -111,6 +160,7 @@ impl Default for MultiAgentToolSpecConfig {
             max_concurrent_threads_per_session: 4,
             tool_namespace: None,
             non_code_mode_only: false,
+            request_user_input_default_mode_enabled: false,
         }
     }
 }
@@ -130,6 +180,7 @@ struct ToolSearchEntry {
 }
 
 impl ToolRegistry {
+    #[cfg(test)]
     pub(crate) fn browser_agent() -> Self {
         Self::browser_agent_with_agent_type_description(
             default_spawn_agent_type_description(),
@@ -138,6 +189,7 @@ impl ToolRegistry {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn browser_agent_with_agent_type_description(
         agent_type_description: String,
         hide_spawn_agent_metadata: bool,
@@ -151,6 +203,7 @@ impl ToolRegistry {
         )
     }
 
+    #[cfg(test)]
     pub(crate) fn browser_agent_with_agent_type_description_and_model_description(
         agent_type_description: String,
         hide_spawn_agent_metadata: bool,
@@ -164,6 +217,7 @@ impl ToolRegistry {
         Self::browser_agent_with_agent_type_description_and_model_description_and_multi_agent_config(
             agent_type_description,
             config,
+            ShellToolSpecConfig::default(),
             can_request_original_image_detail,
             model_overrides_description,
         )
@@ -172,12 +226,33 @@ impl ToolRegistry {
     pub(crate) fn browser_agent_with_agent_type_description_and_model_description_and_multi_agent_config(
         agent_type_description: String,
         multi_agent_config: MultiAgentToolSpecConfig,
+        shell_config: ShellToolSpecConfig,
         can_request_original_image_detail: bool,
         model_overrides_description: String,
     ) -> Self {
         let mut registry = Self::default();
-        registry.register(exec_command_tool_spec(), ToolHandlerKind::ExecCommand);
-        registry.register(write_stdin_tool_spec(), ToolHandlerKind::WriteStdin);
+        registry.allow_login_shell = shell_config.allow_login_shell;
+        match shell_config.resolved_shell_type() {
+            ModelShellType::UnifiedExec => {
+                registry.register(
+                    exec_command_tool_spec(shell_config.allow_login_shell),
+                    ToolHandlerKind::ExecCommand,
+                );
+                registry.register(write_stdin_tool_spec(), ToolHandlerKind::WriteStdin);
+                registry.register_with_exposure(
+                    shell_command_tool_spec(shell_config.allow_login_shell),
+                    ToolHandlerKind::ShellCommand,
+                    ToolExposure::Hidden,
+                );
+            }
+            ModelShellType::Disabled => {}
+            ModelShellType::Default | ModelShellType::Local | ModelShellType::ShellCommand => {
+                registry.register(
+                    shell_command_tool_spec(shell_config.allow_login_shell),
+                    ToolHandlerKind::ShellCommand,
+                );
+            }
+        }
         registry.register(apply_patch_tool_spec(), ToolHandlerKind::ApplyPatch);
         registry.register(
             view_image_tool_spec(can_request_original_image_detail),
@@ -185,7 +260,9 @@ impl ToolRegistry {
         );
         registry.register(update_plan_tool_spec(), ToolHandlerKind::UpdatePlan);
         registry.register(
-            request_user_input_tool_spec(),
+            request_user_input_tool_spec(
+                multi_agent_config.request_user_input_default_mode_enabled,
+            ),
             ToolHandlerKind::RequestUserInput,
         );
         registry.register(browser_tool_spec(), ToolHandlerKind::Browser);
@@ -303,6 +380,10 @@ impl ToolRegistry {
         });
     }
 
+    pub(crate) fn allow_login_shell(&self) -> bool {
+        self.allow_login_shell
+    }
+
     #[cfg(test)]
     pub(crate) fn specs(&self) -> Vec<ToolSpec> {
         self.tools
@@ -366,6 +447,21 @@ impl ToolRegistry {
                 .map(|tool| tool.handler),
             None => self.handler_for(name),
         }
+    }
+
+    pub(crate) fn direct_handler_for_namespaced(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<ToolHandlerKind> {
+        self.tools
+            .iter()
+            .find(|tool| {
+                tool.exposure != ToolExposure::Hidden
+                    && tool.spec.name == name
+                    && tool.spec.namespace.as_deref() == namespace
+            })
+            .map(|tool| tool.handler)
     }
 
     pub(crate) fn search_deferred_tools(&self, query: &str, limit: usize) -> Vec<Value> {
@@ -594,6 +690,7 @@ pub(crate) fn spawn_agent_type_description_for_roles(
     )
 }
 
+#[cfg(test)]
 fn default_spawn_agent_type_description() -> String {
     spawn_agent_type_description_for_roles(std::iter::empty::<SpawnAgentRoleDescription>())
 }
@@ -918,7 +1015,52 @@ fn close_agent_output_schema() -> Value {
     })
 }
 
-fn exec_command_tool_spec() -> ToolSpec {
+fn exec_command_tool_spec(allow_login_shell: bool) -> ToolSpec {
+    let mut properties = serde_json::json!({
+        "cmd": {
+            "type": "string",
+            "description": "Shell command to execute."
+        },
+        "workdir": {
+            "type": "string",
+            "description": "Optional working directory to run the command in; defaults to the turn cwd."
+        },
+        "shell": {
+            "type": "string",
+            "description": "Shell binary to launch. Defaults to the user's default shell."
+        },
+        "tty": {
+            "type": "boolean",
+            "description": "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process."
+        },
+        "yield_time_ms": {
+            "type": "integer",
+            "description": "How long to wait (in milliseconds) for output before yielding."
+        },
+        "max_output_tokens": {
+            "type": "integer",
+            "description": "Maximum number of tokens to return. Excess output will be truncated."
+        },
+        "sandbox_permissions": {
+            "type": "string",
+            "description": "Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."
+        },
+        "justification": {
+            "type": "string",
+            "description": "Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'"
+        },
+        "prefix_rule": {
+            "type": "array",
+            "description": "Only specify when sandbox_permissions is `require_escalated`. Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future. Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"].",
+            "items": { "type": "string" }
+        }
+    });
+    if allow_login_shell {
+        properties["login"] = serde_json::json!({
+            "type": "boolean",
+            "description": "Whether to run the shell with -l/-i semantics. Defaults to true."
+        });
+    }
     ToolSpec {
         name: "exec_command".to_string(),
         namespace: None,
@@ -928,49 +1070,7 @@ fn exec_command_tool_spec() -> ToolSpec {
                 .to_string(),
         input_schema: serde_json::json!({
             "type": "object",
-            "properties": {
-                "cmd": {
-                    "type": "string",
-                    "description": "Shell command to execute."
-                },
-                "workdir": {
-                    "type": "string",
-                    "description": "Optional working directory to run the command in; defaults to the turn cwd."
-                },
-                "shell": {
-                    "type": "string",
-                    "description": "Shell binary to launch. Defaults to the user's default shell."
-                },
-                "tty": {
-                    "type": "boolean",
-                    "description": "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process."
-                },
-                "login": {
-                    "type": "boolean",
-                    "description": "Whether to run the shell with -l/-i semantics. Defaults to true."
-                },
-                "yield_time_ms": {
-                    "type": "integer",
-                    "description": "How long to wait (in milliseconds) for output before yielding."
-                },
-                "max_output_tokens": {
-                    "type": "integer",
-                    "description": "Maximum number of tokens to return. Excess output will be truncated."
-                },
-                "sandbox_permissions": {
-                    "type": "string",
-                    "description": "Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."
-                },
-                "justification": {
-                    "type": "string",
-                    "description": "Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'"
-                },
-                "prefix_rule": {
-                    "type": "array",
-                    "description": "Only specify when sandbox_permissions is `require_escalated`. Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future. Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"].",
-                    "items": { "type": "string" }
-                }
-            },
+            "properties": properties,
             "required": ["cmd"],
             "additionalProperties": false
         }),
@@ -1011,6 +1111,58 @@ fn write_stdin_tool_spec() -> ToolSpec {
             "additionalProperties": false
         }),
         output_schema: Some(unified_exec_output_schema()),
+        freeform: None,
+    }
+}
+
+fn shell_command_tool_spec(allow_login_shell: bool) -> ToolSpec {
+    let mut properties = serde_json::json!({
+        "command": {
+            "type": "string",
+            "description": "The shell script to execute in the user's default shell"
+        },
+        "workdir": {
+            "type": "string",
+            "description": "The working directory to execute the command in"
+        },
+        "timeout_ms": {
+            "type": "number",
+            "description": "The timeout for the command in milliseconds"
+        },
+        "sandbox_permissions": {
+            "type": "string",
+            "description": "Sandbox permissions for the command. Set to \"require_escalated\" to request running without sandbox restrictions; defaults to \"use_default\"."
+        },
+        "justification": {
+            "type": "string",
+            "description": "Only set if sandbox_permissions is \"require_escalated\". Request approval from the user to run this command outside the sandbox. Phrased as a simple question that summarizes the purpose of the command as it relates to the task at hand - e.g. 'Do you want to fetch and pull the latest version of this git branch?'"
+        },
+        "prefix_rule": {
+            "type": "array",
+            "description": "Only specify when sandbox_permissions is `require_escalated`. Suggest a prefix command pattern that will allow you to fulfill similar requests from the user in the future. Should be a short but reasonable prefix, e.g. [\"git\", \"pull\"] or [\"uv\", \"run\"] or [\"pytest\"].",
+            "items": { "type": "string" }
+        }
+    });
+    if allow_login_shell {
+        properties["login"] = serde_json::json!({
+            "type": "boolean",
+            "description": "Whether to run the shell with login shell semantics. Defaults to true."
+        });
+    }
+    ToolSpec {
+        name: "shell_command".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description:
+            "Runs a shell command and returns its output.\n- Always set the `workdir` param when using the shell_command function. Do not use `cd` unless absolutely necessary."
+                .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": properties,
+            "required": ["command"],
+            "additionalProperties": false
+        }),
+        output_schema: None,
         freeform: None,
     }
 }
@@ -1203,12 +1355,19 @@ fn update_plan_tool_spec() -> ToolSpec {
     }
 }
 
-fn request_user_input_tool_spec() -> ToolSpec {
+fn request_user_input_tool_spec(default_mode_enabled: bool) -> ToolSpec {
+    let mode_description = if default_mode_enabled {
+        "Default or Plan mode"
+    } else {
+        "Plan mode"
+    };
     ToolSpec {
         name: "request_user_input".to_string(),
         namespace: None,
         namespace_description: None,
-        description: "Request user input for one to three short questions and wait for the response. This tool is only available in Plan mode.".to_string(),
+        description: format!(
+            "Request user input for one to three short questions and wait for the response. This tool is only available in {mode_description}."
+        ),
         input_schema: serde_json::json!({
             "type": "object",
             "properties": {
@@ -2000,6 +2159,7 @@ mod tests {
                     family: MultiAgentToolFamily::V1,
                     ..MultiAgentToolSpecConfig::default()
                 },
+                ShellToolSpecConfig::default(),
                 false,
                 browser_use_providers::spawn_agent_model_overrides_description(),
             );
@@ -2172,7 +2332,7 @@ mod tests {
 
     #[test]
     fn exec_command_tool_spec_exposes_codex_approval_metadata() {
-        let spec = exec_command_tool_spec();
+        let spec = exec_command_tool_spec(true);
         assert_eq!(
             spec.description,
             "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
@@ -2199,7 +2359,17 @@ mod tests {
             .unwrap_or_default()
             .contains("Only specify when sandbox_permissions"));
         assert_eq!(properties["prefix_rule"]["items"]["type"], "string");
+        assert!(properties.get("login").is_some());
         assert!(properties.get("additional_permissions").is_none());
+    }
+
+    #[test]
+    fn shell_tool_specs_hide_login_when_login_shell_disabled_like_codex() {
+        let exec = exec_command_tool_spec(false);
+        assert!(exec.input_schema["properties"].get("login").is_none());
+
+        let shell = shell_command_tool_spec(false);
+        assert!(shell.input_schema["properties"].get("login").is_none());
     }
 
     #[test]
