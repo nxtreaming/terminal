@@ -101,7 +101,10 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   `write_stdin` calls like Codex, while read-only shell classification uses
   Codex's tree-sitter-bash word-only parser shape for nested `bash -lc` and
   `zsh -lc` sequences, safe command separators, quoted strings, and
-  concatenated literal words.
+  concatenated literal words. Exec spawning now also resolves Codex-shaped shell
+  types for Bash, Zsh, Sh, PowerShell, and Cmd, derives shell-specific argv,
+  emits Codex-style six-hex chunk ids, and gives non-empty `write_stdin` input
+  the same short reaction window before collecting output.
   Compaction now preserves the canonical
   startup context instead of replacing it with only a summary. AGENTS discovery
   now reads Codex's project-doc config knobs from Codex-home `config.toml` and
@@ -109,7 +112,11 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   managed-config and macOS managed-preferences precedence layers.
   Codex-style `developer_instructions` are now loaded from that same config
   stack and appended to the aggregated developer context alongside the
-  no-approval permissions instructions. Environment context now covers
+  no-approval permissions instructions. Typed runtime `AgentRunOptions`
+  `base_instructions` and `developer_instructions` now match Codex override
+  precedence by beating config layers for model-visible prompt context while
+  preserving the first persisted session base instructions for default resumes.
+  Environment context now covers
   Codex-shaped network, multiple-environment, active-subagent, and disable
   semantics for the runtime facts this harness has. Config-backed
   `instructions` and `model_instructions_file` now override provider base
@@ -174,7 +181,33 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch closed the next high-impact G-028 unified-exec slice:
+The latest batch closed two model-visible parity slices: G-032 typed runtime
+instruction overrides and the next G-028 unified-exec response/shell fidelity
+cluster.
+
+- `AgentRunOptions` now has typed `base_instructions` and
+  `developer_instructions` overrides. Runtime base instructions beat config
+  `instructions` and persisted session base for the current provider turn, but
+  only write the durable `session.base_instructions` event when the session has
+  no prior base, matching Codex's session-meta behavior.
+- Runtime developer instructions now beat user and managed config
+  `developer_instructions` in the initial developer context bundle.
+- Unified exec now has a local Codex-shaped shell substrate: detected
+  `ShellType` values for Bash, Zsh, PowerShell, Sh, and Cmd; Codex-style
+  fallback selection; `-lc`/`-c`, PowerShell `-NoProfile -Command`, and Cmd
+  `/c` argv derivation; and `command.started.shell_type` state for auditability.
+- `exec_command` and `write_stdin` model text now use Codex-style random
+  six-hex chunk ids instead of deterministic call-id-derived chunk names.
+- Non-empty `write_stdin` calls now sleep for the Codex 100 ms process reaction
+  window before polling output, reducing missed interactive responses.
+- Focused tests cover runtime base/developer override precedence, shell
+  detection and argv derivation, Codex chunk-id shape, command output
+  truncation, the PTY stdin reaction window, and the full command tool module.
+- Read-only follow-up audits kept the remaining high-level G-032 and G-033 gaps
+  open: full `ConfigLayerStack`/effective-config provenance and typed
+  plugin/app mention context still need larger product substrate work.
+
+The previous batch closed the high-impact G-028 unified-exec slice:
 Codex-style process lifetime across completed turns plus the represented
 tree-sitter shell parser path for safe read-only command classification.
 
@@ -200,8 +233,9 @@ tree-sitter shell parser path for safe read-only command classification.
   `response.processed`, sticky HTTP fallback, and full effective-config
   provenance remain open follow-up clusters rather than this turn's runtime
   slice.
-- Remaining G-028 gaps are shell-mode breadth including PowerShell/cmd and
-  optional zsh-fork behavior, pause-aware deadline extension, notification-based
+- Remaining G-028 gaps are optional zsh-fork behavior, deeper non-Unix shell
+  policy/parser semantics beyond argv derivation, pause-aware deadline extension,
+  notification-based
   output waiting/post-exit drain exactness, here-doc command-prefix metadata,
   code-mode JSON output if this harness adds code mode, and explicit
   shutdown/stop wiring for background command cleanup. Approval logic stays
@@ -858,9 +892,12 @@ The biggest remaining categories are:
   output buffering, final transcript events, no-newline partial output,
   stdin write-error model text, cross-turn background process lifetime, and the
   represented Unix tree-sitter shell parser path are now partially aligned.
-  Still open: shell-mode breadth, pause-aware waits, notification/post-exit
-  drain exactness, here-doc metadata, code-mode JSON, and explicit product stop
-  cleanup wiring.
+  Shell type/path resolution, shell-specific argv derivation, six-hex chunk ids,
+  and the non-empty stdin reaction window are now aligned for the represented
+  runtime. Still open: optional zsh-fork behavior, deeper non-Unix
+  policy/parser semantics beyond argv derivation, pause-aware waits,
+  notification/post-exit drain exactness, here-doc metadata, code-mode JSON, and
+  explicit product stop cleanup wiring.
 - Patch semantics: contextual/parser semantics, preverification/runtime
   sequencing, streaming custom-tool progress snapshots, success/failure
   lifecycle events, and committed-delta reporting after runtime failures are
@@ -898,8 +935,9 @@ The biggest remaining categories are:
 - Exact Codex instruction layering beyond the now-aligned no-approval
   permissions fragment, simple AGENTS plus environment startup context,
   config-backed `developer_instructions`, config-backed base instructions,
-  session-persisted base instructions, compaction reinjection, and
-  fallback-provider priority mapping. Still open: separate developer
+  typed runtime base/developer instruction overrides, session-persisted base
+  instructions, compaction reinjection, and fallback-provider priority mapping.
+  Still open: separate developer
   exceptions, apps/skills/plugins/collaboration/personality/realtime developer
   sections, precise later-turn permission/profile updates, token-accounting use
   of frozen session base instructions, and rollout/resume reference-context
@@ -922,8 +960,9 @@ The biggest remaining categories are:
 - Full runtime shell approval, sandbox, and execpolicy behavior: rule files,
   prefix-rule approvals, feature-enabled additional-permission normalization
   and approval, network denial handling, full tree-sitter parser parity beyond
-  the tested Unix plain-command edge cases, Codex shell-mode breadth including
-  PowerShell/Windows heuristics and optional zsh-fork behavior, pause-aware wait
+  the tested Unix plain-command edge cases, deeper non-Unix shell policy/parser
+  semantics beyond the now-aligned PowerShell/Cmd argv derivation, optional
+  zsh-fork behavior, pause-aware wait
   deadline extension, notification/post-exit drain exactness, here-doc metadata,
   code-mode JSON if this terminal adds code-mode, explicit product stop cleanup
   wiring, and exact prompt-vs-allow behavior for non-dangerous unmatched
@@ -967,7 +1006,7 @@ The biggest remaining categories are:
   `session.config_snapshot` now also carries a Codex-shaped provider object for
   default resumes, and Bedrock static catalog plus bearer-token and AWS SigV4
   Mantle execution are represented. Still open: full `ConfigLayerStack`,
-  thread/project layer behavior, harness/API `ConfigOverrides.base_instructions`,
+  thread/project layer behavior,
   full app-server provider/model snapshot protocol surfaces on resume/fork
   beyond the represented core event, richer Codex doctor/status-style config
   displays, unsupported-verbosity warning

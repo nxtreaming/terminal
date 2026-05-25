@@ -3320,6 +3320,8 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         environment_context_network: None,
         config_profile: None,
         config_overrides: Vec::new(),
+        base_instructions: None,
+        developer_instructions: None,
         model_provider_id: Some(config.provider.clone()),
         model_provider_id_source: RunConfigValueSource::Explicit,
         python_tool_timeout_seconds: config.python_timeout_seconds,

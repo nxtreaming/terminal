@@ -455,6 +455,8 @@ pub struct AgentRunOptions {
     pub environment_context_network: Option<EnvironmentNetworkContext>,
     pub config_profile: Option<String>,
     pub config_overrides: ConfigOverrides,
+    pub base_instructions: Option<String>,
+    pub developer_instructions: Option<String>,
     pub model_provider_id: Option<String>,
     pub model_provider_id_source: RunConfigValueSource,
     pub python_tool_timeout_seconds: u64,
@@ -479,6 +481,8 @@ impl Default for AgentRunOptions {
             environment_context_network: None,
             config_profile: None,
             config_overrides: Vec::new(),
+            base_instructions: None,
+            developer_instructions: None,
             model_provider_id: None,
             model_provider_id_source: RunConfigValueSource::Default,
             python_tool_timeout_seconds: 120,
@@ -529,6 +533,16 @@ impl AgentRunOptions {
 
     pub fn with_config_overrides(mut self, overrides: Vec<(String, toml::Value)>) -> Self {
         self.config_overrides = overrides;
+        self
+    }
+
+    pub fn with_base_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.base_instructions = Some(instructions.into());
+        self
+    }
+
+    pub fn with_developer_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.developer_instructions = Some(instructions.into());
         self
     }
 
@@ -741,9 +755,14 @@ pub fn append_workspace_context_event_with_options(
         None
     };
     let mut appended = false;
-    let config_developer_instructions = agents_context
-        .as_ref()
-        .and_then(|load| load.developer_instructions.as_deref())
+    let config_developer_instructions = options
+        .developer_instructions
+        .as_deref()
+        .or_else(|| {
+            agents_context
+                .as_ref()
+                .and_then(|load| load.developer_instructions.as_deref())
+        })
         .filter(|text| !text.is_empty())
         .map(str::to_string);
     let config_include_environment_context = agents_context
@@ -4177,6 +4196,18 @@ fn provider_base_instructions_for_session(
     )?;
     let events = store.events_for_session(&session.id)?;
     let persisted = session_base_instructions_from_events(&events);
+
+    if let Some(base_instructions) = options.base_instructions.clone() {
+        if persisted.is_none() {
+            append_session_base_instructions_event(
+                store,
+                &session.id,
+                &base_instructions,
+                "runtime_override",
+            )?;
+        }
+        return Ok(Some(base_instructions));
+    }
 
     if let Some(base_instructions) = config.base_instructions_override()? {
         if persisted.is_none() {
@@ -16015,6 +16046,65 @@ x-env = "CORP_HEADER"
     }
 
     #[test]
+    fn provider_turn_runtime_base_instructions_override_matches_codex_precedence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "instructions = \"config base should lose\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "capture runtime base instructions",
+                &project,
+                AgentRunOptions::default().with_base_instructions("runtime base"),
+            )?;
+            std::fs::write(codex_home.join("config.toml"), "")?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default().with_base_instructions("runtime base v2"),
+            )?;
+            Ok(session_id)
+        })?;
+
+        assert_eq!(
+            provider.captured_instructions(),
+            vec![
+                Some("runtime base".to_string()),
+                Some("runtime base".to_string()),
+                Some("runtime base v2".to_string()),
+            ]
+        );
+        let events = store.events_for_session(&session_id)?;
+        let base_events = events
+            .iter()
+            .filter(|event| event.event_type == SESSION_BASE_INSTRUCTIONS_EVENT)
+            .collect::<Vec<_>>();
+        assert_eq!(base_events.len(), 1);
+        assert_eq!(base_events[0].payload["source"], "runtime_override");
+        assert_eq!(
+            session_base_instructions_from_events(&events).as_deref(),
+            Some("runtime base")
+        );
+        Ok(())
+    }
+
+    #[test]
     fn provider_turn_injects_model_switch_context_once_before_resumed_user_message() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -20269,6 +20359,40 @@ command = "print-token"
     }
 
     #[test]
+    fn workspace_context_runtime_developer_instructions_override_config_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "developer_instructions = \"User config policy should lose.\"\n",
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            "developer_instructions = \"Managed policy should lose.\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options =
+            AgentRunOptions::default().with_developer_instructions("Runtime policy wins.");
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let developer_text = message_content_text(&messages[0]);
+
+        assert!(developer_text.contains("Runtime policy wins."));
+        assert!(!developer_text.contains("User config policy should lose."));
+        assert!(!developer_text.contains("Managed policy should lose."));
+        Ok(())
+    }
+
+    #[test]
     fn workspace_context_emits_agents_warnings_and_sources_outside_model_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -23027,10 +23151,13 @@ command = "print-token"
             } else {
                 let content = latest_tool_content(&turn, "exec_command")
                     .context("exec command tool response")?;
-                assert!(
-                    content.contains("Chunk ID: chunk_exec_1"),
-                    "exec output should use Codex-style chunk header: {content}"
-                );
+                let chunk_id = content
+                    .lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix("Chunk ID: "))
+                    .context("exec output should use Codex-style chunk header")?;
+                assert_eq!(chunk_id.len(), 6);
+                assert!(chunk_id.chars().all(|ch| ch.is_ascii_hexdigit()));
                 assert!(
                     content.contains("Wall time: "),
                     "exec output should include wall time: {content}"

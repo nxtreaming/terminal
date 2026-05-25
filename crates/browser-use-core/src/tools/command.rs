@@ -25,6 +25,7 @@ const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
 const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
 const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
 const TOKEN_TO_CHAR_APPROX: usize = 4;
+const WRITE_STDIN_REACTION_SETTLE_MS: u64 = 100;
 const STDIN_CLOSED_MESSAGE: &str =
     "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open";
 const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
@@ -39,6 +40,64 @@ const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
     ("GH_PAGER", "cat"),
     ("CODEX_CI", "1"),
 ];
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellType {
+    Zsh,
+    Bash,
+    PowerShell,
+    Sh,
+    Cmd,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ShellSpec {
+    shell_type: ShellType,
+    shell_path: PathBuf,
+}
+
+impl ShellSpec {
+    fn name(&self) -> &'static str {
+        match self.shell_type {
+            ShellType::Zsh => "zsh",
+            ShellType::Bash => "bash",
+            ShellType::PowerShell => "powershell",
+            ShellType::Sh => "sh",
+            ShellType::Cmd => "cmd",
+        }
+    }
+
+    fn path_string(&self) -> String {
+        self.shell_path.to_string_lossy().to_string()
+    }
+
+    fn derive_exec_argv(&self, command: &str, use_login_shell: bool) -> Vec<String> {
+        let shell_path = self.path_string();
+        match self.shell_type {
+            ShellType::Zsh | ShellType::Bash | ShellType::Sh => {
+                let flag = if use_login_shell { "-lc" } else { "-c" };
+                vec![shell_path, flag.to_string(), command.to_string()]
+            }
+            ShellType::PowerShell => {
+                let mut args = vec![shell_path];
+                if !use_login_shell {
+                    args.push("-NoProfile".to_string());
+                }
+                args.push("-Command".to_string());
+                args.push(command.to_string());
+                args
+            }
+            ShellType::Cmd => vec![shell_path, "/c".to_string(), command.to_string()],
+        }
+    }
+
+    fn exec_args(&self, command: &str, use_login_shell: bool) -> Vec<String> {
+        self.derive_exec_argv(command, use_login_shell)
+            .into_iter()
+            .skip(1)
+            .collect()
+    }
+}
 
 #[derive(Debug)]
 pub(crate) struct CommandToolResult {
@@ -271,7 +330,7 @@ pub(crate) fn exec_command_with_budget(
         .and_then(Value::as_str)
         .filter(|shell| !shell.trim().is_empty())
         .map(resolve_model_shell)
-        .unwrap_or_else(default_shell);
+        .unwrap_or_else(default_user_shell);
     let login = call
         .arguments
         .get("login")
@@ -314,7 +373,8 @@ pub(crate) fn exec_command_with_budget(
             "session_id": process_id,
             "cmd": cmd,
             "workdir": workdir,
-            "shell": shell,
+            "shell": shell.path_string(),
+            "shell_type": shell.name(),
             "login": login,
             "tty": tty_requested,
         }),
@@ -353,7 +413,7 @@ pub(crate) fn exec_command_with_budget(
             }),
         )?;
         let payload = CommandOutputPayload {
-            chunk_id: chunk_id_for_call(&call.id),
+            chunk_id: generate_chunk_id(),
             session_id: None,
             running: false,
             output: &text,
@@ -394,7 +454,7 @@ pub(crate) fn exec_command_with_budget(
         }),
     )?;
     let payload = CommandOutputPayload {
-        chunk_id: chunk_id_for_call(&call.id),
+        chunk_id: generate_chunk_id(),
         session_id: Some(process_id),
         running: true,
         output: &text,
@@ -485,7 +545,10 @@ pub(crate) fn write_stdin_with_budget(
     }
     let write_error = if !chars.is_empty() {
         match command.process.write_all(chars.as_bytes()) {
-            Ok(()) => None,
+            Ok(()) => {
+                thread::sleep(Duration::from_millis(WRITE_STDIN_REACTION_SETTLE_MS));
+                None
+            }
             Err(error) => {
                 let message = format!("{error:#}");
                 store.append_event(
@@ -514,7 +577,7 @@ pub(crate) fn write_stdin_with_budget(
     let running = status.is_none();
     let tty_allocated = command.process.tty_allocated();
     let payload = CommandOutputPayload {
-        chunk_id: chunk_id_for_call(&call.id),
+        chunk_id: generate_chunk_id(),
         session_id: Some(process_id),
         running,
         output: &text,
@@ -826,7 +889,7 @@ pub(crate) fn exec_command_is_known_read_only(arguments: &Value) -> bool {
 }
 
 fn spawn_process(
-    shell: &str,
+    shell: &ShellSpec,
     login: bool,
     cmd: &str,
     workdir: &Path,
@@ -842,7 +905,7 @@ fn spawn_process(
 }
 
 fn spawn_pipe_process(
-    shell: &str,
+    shell: &ShellSpec,
     login: bool,
     cmd: &str,
     workdir: &Path,
@@ -850,17 +913,22 @@ fn spawn_pipe_process(
     transcript: Arc<Mutex<HeadTailBuffer>>,
     thread_id: &str,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
-    let mut command = Command::new(shell);
+    let shell_path = shell.path_string();
+    let mut command = Command::new(&shell_path);
     command
-        .args(shell_args(shell, login, cmd))
+        .args(shell.exec_args(cmd, login))
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_unified_exec_env_to_command(&mut command, thread_id);
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("spawn command via shell {} in {}", shell, workdir.display()))?;
+    let mut child = command.spawn().with_context(|| {
+        format!(
+            "spawn command via shell {} in {}",
+            shell_path,
+            workdir.display()
+        )
+    })?;
     let stdin = child.stdin.take();
     let mut readers = Vec::new();
     if let Some(stdout) = child.stdout.take() {
@@ -873,7 +941,7 @@ fn spawn_pipe_process(
 }
 
 fn spawn_pty_process(
-    shell: &str,
+    shell: &ShellSpec,
     login: bool,
     cmd: &str,
     workdir: &Path,
@@ -890,14 +958,15 @@ fn spawn_pty_process(
     })?;
     let reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
-    let mut command = CommandBuilder::new(shell);
-    command.args(shell_args(shell, login, cmd));
+    let shell_path = shell.path_string();
+    let mut command = CommandBuilder::new(&shell_path);
+    command.args(shell.exec_args(cmd, login));
     command.cwd(workdir.as_os_str());
     apply_unified_exec_env_to_pty_command(&mut command, thread_id);
     let child = pair.slave.spawn_command(command).with_context(|| {
         format!(
             "spawn pty command via shell {} in {}",
-            shell,
+            shell_path,
             workdir.display()
         )
     })?;
@@ -1139,8 +1208,9 @@ fn command_model_text(payload: &CommandOutputPayload<'_>) -> String {
     sections.join("\n")
 }
 
-fn chunk_id_for_call(call_id: &str) -> String {
-    format!("chunk_{}", call_id.replace('-', "_"))
+fn generate_chunk_id() -> String {
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    format!("{:02x}{:02x}{:02x}", bytes[0], bytes[1], bytes[2])
 }
 
 fn approximate_token_count(text: &str) -> usize {
@@ -1293,62 +1363,259 @@ fn resolve_workdir(session: &SessionMeta, workdir: Option<&str>) -> Result<PathB
     Ok(resolved)
 }
 
-fn default_shell() -> String {
-    std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
+fn default_user_shell() -> ShellSpec {
+    let path_dirs = path_dirs_from_env();
+    let default_shell_path = std::env::var_os("SHELL").map(PathBuf::from);
+    default_user_shell_with_path_lookup(&path_dirs, default_shell_path)
 }
 
-fn resolve_model_shell(shell: &str) -> String {
-    let path = Path::new(shell.trim());
-    if path.is_file() {
-        return path.to_string_lossy().to_string();
+fn resolve_model_shell(shell: &str) -> ShellSpec {
+    let path_dirs = path_dirs_from_env();
+    let default_shell_path = std::env::var_os("SHELL").map(PathBuf::from);
+    resolve_model_shell_with_path_lookup(shell, &path_dirs, default_shell_path)
+}
+
+fn resolve_model_shell_with_path_lookup(
+    shell: &str,
+    path_dirs: &[PathBuf],
+    default_shell_path: Option<PathBuf>,
+) -> ShellSpec {
+    let path = PathBuf::from(shell.trim());
+    detect_shell_type(&path)
+        .and_then(|shell_type| get_shell(shell_type, Some(&path), path_dirs, default_shell_path))
+        .unwrap_or_else(ultimate_fallback_shell)
+}
+
+fn default_user_shell_with_path_lookup(
+    path_dirs: &[PathBuf],
+    default_shell_path: Option<PathBuf>,
+) -> ShellSpec {
+    if cfg!(windows) {
+        return get_shell(
+            ShellType::PowerShell,
+            None,
+            path_dirs,
+            default_shell_path.clone(),
+        )
+        .unwrap_or_else(ultimate_fallback_shell);
     }
-    match shell_name(path).as_deref() {
-        Some("bash") => first_available_shell("bash", &["/bin/bash"]),
-        Some("zsh") => first_available_shell("zsh", &["/bin/zsh"]),
-        Some("sh") => first_available_shell("sh", &["/bin/sh"]),
-        _ => ultimate_fallback_shell(),
+
+    let user_default_shell = default_shell_path
+        .as_ref()
+        .and_then(|shell| detect_shell_type(shell))
+        .and_then(|shell_type| get_shell(shell_type, None, path_dirs, default_shell_path.clone()));
+
+    let shell_with_fallback = if cfg!(target_os = "macos") {
+        user_default_shell
+            .or_else(|| get_shell(ShellType::Zsh, None, path_dirs, default_shell_path.clone()))
+            .or_else(|| get_shell(ShellType::Bash, None, path_dirs, default_shell_path.clone()))
+    } else {
+        user_default_shell
+            .or_else(|| get_shell(ShellType::Bash, None, path_dirs, default_shell_path.clone()))
+            .or_else(|| get_shell(ShellType::Zsh, None, path_dirs, default_shell_path.clone()))
+    };
+
+    shell_with_fallback.unwrap_or_else(ultimate_fallback_shell)
+}
+
+fn get_shell(
+    shell_type: ShellType,
+    provided_path: Option<&PathBuf>,
+    path_dirs: &[PathBuf],
+    default_shell_path: Option<PathBuf>,
+) -> Option<ShellSpec> {
+    match shell_type {
+        ShellType::Zsh => get_shell_from_candidates(
+            ShellType::Zsh,
+            provided_path,
+            "zsh",
+            &["/bin/zsh"],
+            path_dirs,
+            default_shell_path,
+        ),
+        ShellType::Bash => get_shell_from_candidates(
+            ShellType::Bash,
+            provided_path,
+            "bash",
+            &["/bin/bash"],
+            path_dirs,
+            default_shell_path,
+        ),
+        ShellType::PowerShell => get_shell_from_candidates(
+            ShellType::PowerShell,
+            provided_path,
+            "pwsh",
+            powershell_core_fallback_paths(),
+            path_dirs,
+            default_shell_path.clone(),
+        )
+        .or_else(|| {
+            get_shell_from_candidates(
+                ShellType::PowerShell,
+                provided_path,
+                "powershell",
+                powershell_legacy_fallback_paths(),
+                path_dirs,
+                default_shell_path,
+            )
+        }),
+        ShellType::Sh => get_shell_from_candidates(
+            ShellType::Sh,
+            provided_path,
+            "sh",
+            &["/bin/sh"],
+            path_dirs,
+            default_shell_path,
+        ),
+        ShellType::Cmd => get_shell_from_candidates(
+            ShellType::Cmd,
+            provided_path,
+            "cmd",
+            cmd_fallback_paths(),
+            path_dirs,
+            default_shell_path,
+        ),
     }
 }
 
-fn first_available_shell(binary_name: &str, fallback_paths: &[&str]) -> String {
-    if command_exists_on_path(binary_name) {
-        return binary_name.to_string();
+fn get_shell_from_candidates(
+    shell_type: ShellType,
+    provided_path: Option<&PathBuf>,
+    binary_name: &str,
+    fallback_paths: &[&str],
+    path_dirs: &[PathBuf],
+    default_shell_path: Option<PathBuf>,
+) -> Option<ShellSpec> {
+    if let Some(shell_path) = provided_path.and_then(|path| file_exists(path)) {
+        return Some(ShellSpec {
+            shell_type,
+            shell_path,
+        });
     }
+
+    if let Some(default_shell_path) = default_shell_path
+        .as_ref()
+        .filter(|path| detect_shell_type(path) == Some(shell_type))
+        .and_then(|path| file_exists(path))
+    {
+        return Some(ShellSpec {
+            shell_type,
+            shell_path: default_shell_path,
+        });
+    }
+
+    if let Some(shell_path) = find_on_path(binary_name, path_dirs) {
+        return Some(ShellSpec {
+            shell_type,
+            shell_path,
+        });
+    }
+
     fallback_paths
         .iter()
-        .find(|path| Path::new(path).is_file())
-        .copied()
-        .unwrap_or_else(|| fallback_paths.first().copied().unwrap_or("/bin/sh"))
-        .to_string()
+        .find_map(|path| file_exists(Path::new(path)))
+        .map(|shell_path| ShellSpec {
+            shell_type,
+            shell_path,
+        })
 }
 
-fn command_exists_on_path(binary_name: &str) -> bool {
-    let Some(path_var) = std::env::var_os("PATH") else {
+fn path_dirs_from_env() -> Vec<PathBuf> {
+    std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default()
+}
+
+fn file_exists(path: &Path) -> Option<PathBuf> {
+    std::fs::metadata(path)
+        .is_ok_and(|metadata| metadata.is_file())
+        .then(|| path.to_path_buf())
+}
+
+fn find_on_path(binary_name: &str, path_dirs: &[PathBuf]) -> Option<PathBuf> {
+    path_dirs
+        .iter()
+        .map(|dir| dir.join(binary_name))
+        .find(|path| path_is_executable_file(path))
+}
+
+fn path_is_executable_file(path: &Path) -> bool {
+    let Ok(metadata) = std::fs::metadata(path) else {
         return false;
     };
-    std::env::split_paths(&path_var).any(|dir| dir.join(binary_name).is_file())
+    if !metadata.is_file() {
+        return false;
+    }
+    path_is_executable_metadata(&metadata)
 }
 
-fn ultimate_fallback_shell() -> String {
+#[cfg(unix)]
+fn path_is_executable_metadata(metadata: &std::fs::Metadata) -> bool {
+    use std::os::unix::fs::PermissionsExt;
+
+    metadata.permissions().mode() & 0o111 != 0
+}
+
+#[cfg(not(unix))]
+fn path_is_executable_metadata(_metadata: &std::fs::Metadata) -> bool {
+    true
+}
+
+fn powershell_core_fallback_paths() -> &'static [&'static str] {
     if cfg!(windows) {
-        "cmd.exe".to_string()
+        &[r#"C:\Program Files\PowerShell\7\pwsh.exe"#]
     } else {
-        "/bin/sh".to_string()
+        &["/usr/local/bin/pwsh"]
     }
 }
 
-fn shell_name(path: &Path) -> Option<String> {
-    let name = path.file_name()?.to_str()?;
-    let name = name.strip_suffix(".exe").unwrap_or(name);
-    Some(name.to_ascii_lowercase())
+fn powershell_legacy_fallback_paths() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[r#"C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe"#]
+    } else {
+        &[]
+    }
 }
 
-fn shell_args(shell: &str, login: bool, cmd: &str) -> Vec<String> {
-    let name = shell_name(Path::new(shell)).unwrap_or_else(|| shell.to_ascii_lowercase());
-    if login && matches!(name.as_str(), "bash" | "zsh" | "sh") {
-        vec!["-lc".to_string(), cmd.to_string()]
+fn cmd_fallback_paths() -> &'static [&'static str] {
+    if cfg!(windows) {
+        &[r#"C:\Windows\System32\cmd.exe"#]
     } else {
-        vec!["-c".to_string(), cmd.to_string()]
+        &[]
+    }
+}
+
+fn ultimate_fallback_shell() -> ShellSpec {
+    if cfg!(windows) {
+        ShellSpec {
+            shell_type: ShellType::Cmd,
+            shell_path: PathBuf::from("cmd.exe"),
+        }
+    } else {
+        ShellSpec {
+            shell_type: ShellType::Sh,
+            shell_path: PathBuf::from("/bin/sh"),
+        }
+    }
+}
+
+fn detect_shell_type(shell_path: &Path) -> Option<ShellType> {
+    match shell_path.as_os_str().to_str() {
+        Some("zsh") => Some(ShellType::Zsh),
+        Some("sh") => Some(ShellType::Sh),
+        Some("cmd") => Some(ShellType::Cmd),
+        Some("bash") => Some(ShellType::Bash),
+        Some("pwsh") => Some(ShellType::PowerShell),
+        Some("powershell") => Some(ShellType::PowerShell),
+        _ => {
+            let shell_name = shell_path.file_stem()?;
+            let shell_name_path = Path::new(shell_name);
+            if shell_name_path == shell_path {
+                None
+            } else {
+                detect_shell_type(shell_name_path)
+            }
+        }
     }
 }
 
@@ -1810,6 +2077,27 @@ mod tests {
         (store, session)
     }
 
+    fn assert_codex_chunk_id(model_text: &str) {
+        let first_line = model_text.lines().next().expect("chunk id line");
+        let chunk_id = first_line
+            .strip_prefix("Chunk ID: ")
+            .expect("chunk id prefix");
+        assert_eq!(chunk_id.len(), 6);
+        assert!(chunk_id.chars().all(|ch| ch.is_ascii_hexdigit()));
+    }
+
+    #[cfg(unix)]
+    fn make_executable_for_test(path: &Path) {
+        use std::os::unix::fs::PermissionsExt;
+
+        let mut permissions = std::fs::metadata(path).expect("metadata").permissions();
+        permissions.set_mode(0o755);
+        std::fs::set_permissions(path, permissions).expect("chmod");
+    }
+
+    #[cfg(not(unix))]
+    fn make_executable_for_test(_path: &Path) {}
+
     #[test]
     fn exec_command_returns_completed_output() {
         let tmp = TempDir::new().expect("tmp");
@@ -1828,9 +2116,7 @@ mod tests {
 
         assert_eq!(result.content["running"], false);
         assert_eq!(result.content["output"], "hello");
-        assert!(result
-            .model_text
-            .contains("Chunk ID: chunk_call_exec_completed"));
+        assert_codex_chunk_id(&result.model_text);
         assert!(result.model_text.contains("Wall time: "));
         assert!(result.model_text.contains("Process exited with code 0"));
         assert!(result.model_text.contains("Original token count: "));
@@ -1844,7 +2130,114 @@ mod tests {
             .find(|event| event.event_type == "command.started")
             .expect("command started event");
         assert_eq!(started.payload["login"], true);
+        assert!(started.payload["shell"].as_str().is_some());
+        assert!(started.payload["shell_type"].as_str().is_some());
         assert!(started.payload["session_id"].as_i64().is_some());
+    }
+
+    #[test]
+    fn shell_detection_matches_codex_paths() {
+        assert_eq!(detect_shell_type(Path::new("zsh")), Some(ShellType::Zsh));
+        assert_eq!(detect_shell_type(Path::new("bash")), Some(ShellType::Bash));
+        assert_eq!(
+            detect_shell_type(Path::new("pwsh")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(Path::new("powershell.exe")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(
+            detect_shell_type(Path::new("/usr/local/bin/pwsh")),
+            Some(ShellType::PowerShell)
+        );
+        assert_eq!(detect_shell_type(Path::new("/bin/sh")), Some(ShellType::Sh));
+        assert_eq!(
+            detect_shell_type(Path::new("cmd.exe")),
+            Some(ShellType::Cmd)
+        );
+        assert_eq!(detect_shell_type(Path::new("fish")), None);
+    }
+
+    #[test]
+    fn shell_exec_argv_matches_codex_shell_types() {
+        let bash = ShellSpec {
+            shell_type: ShellType::Bash,
+            shell_path: PathBuf::from("/bin/bash"),
+        };
+        assert_eq!(
+            bash.derive_exec_argv("printf ok", true),
+            vec!["/bin/bash", "-lc", "printf ok"]
+        );
+        assert_eq!(
+            bash.derive_exec_argv("printf ok", false),
+            vec!["/bin/bash", "-c", "printf ok"]
+        );
+
+        let pwsh = ShellSpec {
+            shell_type: ShellType::PowerShell,
+            shell_path: PathBuf::from("pwsh"),
+        };
+        assert_eq!(
+            pwsh.derive_exec_argv("Write-Output ok", true),
+            vec!["pwsh", "-Command", "Write-Output ok"]
+        );
+        assert_eq!(
+            pwsh.derive_exec_argv("Write-Output ok", false),
+            vec!["pwsh", "-NoProfile", "-Command", "Write-Output ok"]
+        );
+
+        let cmd = ShellSpec {
+            shell_type: ShellType::Cmd,
+            shell_path: PathBuf::from("cmd"),
+        };
+        assert_eq!(
+            cmd.derive_exec_argv("echo ok", true),
+            vec!["cmd", "/c", "echo ok"]
+        );
+        assert_eq!(
+            cmd.derive_exec_argv("echo ok", false),
+            vec!["cmd", "/c", "echo ok"]
+        );
+    }
+
+    #[test]
+    fn model_shell_resolution_uses_codex_type_fallbacks() {
+        let tmp = TempDir::new().expect("tmp");
+        let bin = tmp.path().join("bin");
+        std::fs::create_dir_all(&bin).expect("bin");
+        for name in ["pwsh", "powershell", "cmd", "bash"] {
+            let path = bin.join(name);
+            std::fs::write(&path, "").expect("fake shell");
+            make_executable_for_test(&path);
+        }
+        let path_dirs = vec![bin.clone()];
+
+        assert_eq!(
+            resolve_model_shell_with_path_lookup("pwsh", &path_dirs, None),
+            ShellSpec {
+                shell_type: ShellType::PowerShell,
+                shell_path: bin.join("pwsh"),
+            }
+        );
+        assert_eq!(
+            resolve_model_shell_with_path_lookup("powershell", &path_dirs, None),
+            ShellSpec {
+                shell_type: ShellType::PowerShell,
+                shell_path: bin.join("pwsh"),
+            }
+        );
+        assert_eq!(
+            resolve_model_shell_with_path_lookup("cmd", &path_dirs, None),
+            ShellSpec {
+                shell_type: ShellType::Cmd,
+                shell_path: bin.join("cmd"),
+            }
+        );
+        assert_eq!(
+            resolve_model_shell_with_path_lookup("/definitely/missing/fish", &path_dirs, None),
+            ultimate_fallback_shell()
+        );
     }
 
     #[test]
@@ -1901,7 +2294,14 @@ mod tests {
             .iter()
             .find(|event| event.event_type == "command.started")
             .expect("command started event");
-        assert_eq!(started.payload["shell"], json!(ultimate_fallback_shell()));
+        assert_eq!(
+            started.payload["shell"],
+            json!(ultimate_fallback_shell().path_string())
+        );
+        assert_eq!(
+            started.payload["shell_type"],
+            json!(ultimate_fallback_shell().name())
+        );
     }
 
     #[test]
@@ -2133,6 +2533,54 @@ mod tests {
             .as_str()
             .expect("output")
             .contains("echo:hello"));
+        stop_for_test(process_id);
+    }
+
+    #[test]
+    fn write_stdin_non_empty_wait_includes_codex_reaction_window() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let started = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_settle".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import sys, time; print('ready', flush=True); sys.stdin.readline(); time.sleep(0.28); print('settled', flush=True); time.sleep(1.0)\"",
+                    "tty": true,
+                    "yield_time_ms": 100,
+                }),
+            },
+        )
+        .expect("exec");
+        let process_id = started.content["session_id"].as_i64().expect("session id");
+        assert!(started.content["output"]
+            .as_str()
+            .expect("output")
+            .contains("ready"));
+
+        let written = write_stdin(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_write_settle".to_string(),
+                name: "write_stdin".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "session_id": process_id,
+                    "chars": "go\n",
+                    "yield_time_ms": 250,
+                }),
+            },
+        )
+        .expect("write stdin");
+
+        assert!(written.content["output"]
+            .as_str()
+            .expect("output")
+            .contains("settled"));
         stop_for_test(process_id);
     }
 
