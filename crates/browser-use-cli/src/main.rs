@@ -3395,11 +3395,33 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),
     };
-    let run_error = runner
+    let mut run_error = runner
         .run_dataset_session(store, &session_id, agent_options)
         .err()
         .map(|error| format!("{error:#}"));
+    if let Err(error) = cleanup_dataset_browser_session(store, &session_id) {
+        let cleanup_error = format!("dataset browser cleanup failed: {error:#}");
+        if let Some(run_error) = run_error.as_mut() {
+            run_error.push_str("\n");
+            run_error.push_str(&cleanup_error);
+        } else {
+            run_error = Some(cleanup_error);
+        }
+    }
     dataset_attempt_result(store, case, &session_id, config, attempt, run_error)
+}
+
+fn cleanup_dataset_browser_session(store: &Store, session_id: &str) -> Result<usize> {
+    let removed_sessions = browser_use_browser::cleanup_session(session_id);
+    store.append_event(
+        session_id,
+        "browser.cleaned_up",
+        serde_json::json!({
+            "source": "dataset-run",
+            "removed_sessions": removed_sessions,
+        }),
+    )?;
+    Ok(removed_sessions)
 }
 
 fn dataset_attempt_result(
@@ -4420,6 +4442,30 @@ mod tests {
         let options = cli_agent_options(None, &[], CollaborationModeKind::Plan)?;
 
         assert_eq!(options.collaboration_mode, CollaborationModeKind::Plan);
+        Ok(())
+    }
+
+    #[test]
+    fn dataset_browser_cleanup_records_event_even_without_browser_state() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-browser-cleanup")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, &cwd)?;
+
+        let removed = cleanup_dataset_browser_session(&store, &session.id)?;
+
+        assert_eq!(removed, 0);
+        let events = store.events_for_session(&session.id)?;
+        let cleanup = events
+            .iter()
+            .find(|event| event.event_type == "browser.cleaned_up")
+            .context("browser.cleaned_up event")?;
+        assert_eq!(cleanup.payload["source"], "dataset-run");
+        assert_eq!(cleanup.payload["removed_sessions"], 0);
+
+        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
