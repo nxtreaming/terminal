@@ -250,7 +250,8 @@ pub fn run_browser_script(
         &domain_skill_roots,
         code,
     )?;
-    let mut child = Command::new("python3")
+    let mut command = browser_script_python_command();
+    let mut child = command
         .arg("-c")
         .arg(prelude)
         .current_dir(cwd.as_ref())
@@ -258,7 +259,7 @@ pub fn run_browser_script(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
-        .context("spawn browser_script python3")?;
+        .context("spawn browser_script python")?;
 
     let deadline = Instant::now() + Duration::from_secs(timeout_seconds.max(1));
     let mut timed_out = false;
@@ -275,7 +276,7 @@ pub fn run_browser_script(
     }
     let output = child
         .wait_with_output()
-        .context("wait for browser_script python3")?;
+        .context("wait for browser_script python")?;
     stop.store(true, Ordering::SeqCst);
     let bridge_joined = join_bridge_with_timeout(bridge, Duration::from_secs(5));
     let mut bridge_errors = bridge_errors
@@ -343,6 +344,75 @@ pub fn run_browser_script(
         response.error = Some(stderr);
     }
     Ok(response)
+}
+
+fn browser_script_python_command() -> Command {
+    if let Some(configured) = nonempty_os_var("LLM_BROWSER_BROWSER_SCRIPT_PYTHON") {
+        return Command::new(configured);
+    }
+    if let Some(venv) = nonempty_os_var("VIRTUAL_ENV") {
+        let candidate = venv_python_path(Path::new(&venv));
+        if candidate.is_file() {
+            return Command::new(candidate);
+        }
+    }
+    if let Some(repo_root) = repo_root_from_manifest() {
+        let candidate = venv_python_path(&repo_root.join(".venv"));
+        if candidate.is_file() {
+            return Command::new(candidate);
+        }
+        if repo_root.join("pyproject.toml").is_file() && command_exists("uv") {
+            let mut command = Command::new("uv");
+            command
+                .arg("run")
+                .arg("--project")
+                .arg(repo_root)
+                .arg("python");
+            return command;
+        }
+    }
+    Command::new("python3")
+}
+
+fn nonempty_os_var(name: &str) -> Option<std::ffi::OsString> {
+    std::env::var_os(name).filter(|value| !value.is_empty())
+}
+
+fn venv_python_path(venv: &Path) -> PathBuf {
+    #[cfg(windows)]
+    {
+        venv.join("Scripts").join("python.exe")
+    }
+    #[cfg(not(windows))]
+    {
+        venv.join("bin").join("python")
+    }
+}
+
+fn repo_root_from_manifest() -> Option<PathBuf> {
+    PathBuf::from(env!("CARGO_MANIFEST_DIR"))
+        .parent()
+        .and_then(Path::parent)
+        .map(Path::to_path_buf)
+}
+
+fn command_exists(name: &str) -> bool {
+    std::env::var_os("PATH").is_some_and(|paths| {
+        std::env::split_paths(&paths).any(|dir| {
+            let candidate = dir.join(name);
+            if candidate.is_file() {
+                return true;
+            }
+            #[cfg(windows)]
+            {
+                dir.join(format!("{name}.exe")).is_file()
+            }
+            #[cfg(not(windows))]
+            {
+                false
+            }
+        })
+    })
 }
 
 fn join_bridge_with_timeout(bridge: thread::JoinHandle<()>, timeout: Duration) -> bool {
@@ -3760,6 +3830,34 @@ print("time shadow ok")
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
         assert!(output.text.contains("time shadow ok"));
+    }
+
+    #[test]
+    fn browser_script_uses_project_python_environment_when_available() {
+        let Some(repo_root) = repo_root_from_manifest() else {
+            eprintln!("skipping project python environment test: missing repo root");
+            return;
+        };
+        if !repo_root.join(".venv").is_dir() && !command_exists("uv") {
+            eprintln!("skipping project python environment test: no .venv or uv");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-project-python-env",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+import bs4
+print("bs4 available", bs4.__version__)
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("bs4 available"));
     }
 
     #[test]
