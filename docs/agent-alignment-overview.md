@@ -62,6 +62,12 @@ using a subagent with Codex auth whenever the behavior can be exercised through
 Codex. That reference check is part of the acceptance gate, not optional
 research.
 
+Each loop that can affect provider transport, request shaping, tool runtime, or
+subagent behavior also runs a cheap Codex-auth health smoke: a direct root
+`run-codex` prompt and a spawned child `run-codex-session` reading a tiny local
+file. If the smoke fails, fixing that blocker takes priority over more parity
+work.
+
 The working rule is simple: if a difference can affect agent quality, it stays
 open until it is either fixed or deliberately rejected with evidence. If several
 related differences can be fixed in the same loop, fix all of them in that loop.
@@ -102,7 +108,10 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   `write_stdin` calls like Codex, while read-only shell classification uses
   Codex's tree-sitter-bash word-only parser shape for nested `bash -lc` and
   `zsh -lc` sequences, safe command separators, quoted strings, and
-  concatenated literal words.
+  concatenated literal words. Exec spawning now also resolves Codex-shaped shell
+  types for Bash, Zsh, Sh, PowerShell, and Cmd, derives shell-specific argv,
+  emits Codex-style six-hex chunk ids, and gives non-empty `write_stdin` input
+  the same short reaction window before collecting output.
   Compaction now preserves the canonical
   startup context instead of replacing it with only a summary. AGENTS discovery
   now reads Codex's project-doc config knobs from Codex-home `config.toml` and
@@ -110,7 +119,11 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   managed-config and macOS managed-preferences precedence layers.
   Codex-style `developer_instructions` are now loaded from that same config
   stack and appended to the aggregated developer context alongside the
-  no-approval permissions instructions. Environment context now covers
+  no-approval permissions instructions. Typed runtime `AgentRunOptions`
+  `base_instructions` and `developer_instructions` now match Codex override
+  precedence by beating config layers for model-visible prompt context while
+  preserving the first persisted session base instructions for default resumes.
+  Environment context now covers
   Codex-shaped network, multiple-environment, active-subagent, and disable
   semantics for the runtime facts this harness has. Config-backed
   `instructions` and `model_instructions_file` now override provider base
@@ -175,7 +188,352 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch closed the next high-impact G-028 unified-exec slice:
+The latest batch extended the G-031/G-034 compaction/token lifecycle slice and
+closed one TUI product-display mismatch after three follow-up audits compared
+Codex effective-config provenance, typed context estimation, local compaction
+policy, and dynamic/app/MCP deferred-tool inventory.
+
+- Rate-limit snapshots now emit Codex-style `token_count` events even when a
+  turn has no usage payload. If prior usage info exists, the rate-limit-only
+  token-count event carries it forward; otherwise `info` stays `null`.
+- `token_count.info:null` events no longer reset consumed totals, and
+  rate-limit-only token-count events no longer suppress recomputation after
+  compaction or rollback rewrites.
+- Lossy or legacy `session.compacted` events without replacement history now
+  act as replay barriers like Codex. They clear pre-compaction replay, reinject
+  the current initial context, and prevent stale pre-compaction baselines from
+  hiding context that should be visible again.
+- The active-context estimator now uses more Codex-shaped opaque-payload
+  heuristics: only explicit base64 image data URLs are discounted, resized image
+  payloads use Codex's 7,373-byte estimate, `detail:"original"` images use
+  image-dimension patch counts where possible, and encrypted reasoning/function
+  output content uses Codex's encoded-length estimates instead of a tiny local
+  placeholder.
+- The TUI context bar now reads the latest non-null `token_count.info` for
+  active-context total and `model_context_window`. Legacy `model.usage` is only
+  the fallback for older sessions and remains the cost source; rate-limit-only
+  `info:null` token-count events no longer visually reset the bar.
+- `tool_search` is now parallel-safe, and explorer helper context now says the
+  explorer role applies only after spawning was otherwise authorized. This keeps
+  Codex's delegation gate separate from role-specific guidance.
+- Focused core tests passed for token-count/rate-limit behavior, lossy
+  compaction, context-budget discounting, `tool_search`, explorer context, and
+  the TUI `token_count` display path. Full terminal verification passed with
+  `scripts/verify-terminal-ui.sh` after clearing transient incremental build
+  cache from a full disk. I inspected `/tmp/but-design-loop` deterministic dumps
+  and tmux captures; ANSI and bracketed-paste scans had no matches.
+  The standing Codex-auth smoke passed in
+  `/tmp/but-codex-smoke-token-display.toZWgc`: root `39dfaafb17fb`
+  returned `Paris`, and child `aff7a859f001` returned
+  `agent-parity-smoke-ok`.
+- Remote/v2 compaction is intentionally not a local parity target for this
+  terminal. Codex's v2 path is a server-backed `/responses` compaction protocol;
+  this harness must support Codex, Claude, Gemini, Qwen, and other providers, so
+  local compaction remains the portable implementation. Local now suppresses the
+  `remote_compaction_v2` beta header even if a config layer sets that feature.
+- AWS/Bedrock/Mantle support is now treated as Codex product baggage rather
+  than agent-quality parity. The built-in Bedrock provider, static Bedrock
+  catalog, `AWS_BEARER_TOKEN_BEDROCK`, SigV4/Mantle signing path, AWS provider
+  dependencies, and Bedrock-specific tool-capability exceptions have been
+  removed. Users can still configure ordinary OpenAI-compatible providers
+  explicitly through `model_providers`.
+- Verification after this cleanup passed: focused provider/config tests, full
+  `scripts/verify-terminal-ui.sh`, artifact inspection under
+  `/tmp/but-design-loop`, ANSI/bracketed-paste scan, `git diff --check`, and the
+  standing Codex-auth smoke. Root session `158f2dbc85c0` returned `Paris`; child
+  session `076c3a889dab` read `/tmp/but-codex-agent-parity-smoke.txt` and
+  returned `agent-parity-smoke-ok`.
+- Remaining high-impact gaps from this audit are full `ConfigLayerStack` and
+  effective-config provenance, real websocket transport/ack/fallback semantics,
+  full dynamic/app/MCP deferred tool inventory, and the broader Codex-native
+  typed active-context estimator over `ResponseItem`s rather than the local
+  provider-message JSON projection.
+
+The previous batch closed the next represented G-033/G-032 plugin/app mention
+context slice after four read-only audits compared Codex plugin/app mention
+parsing, effective config, websocket transport, and compaction/token surfaces.
+
+- Core now parses the represented Codex plugin config knobs: `features.plugins`
+  and `[plugins."<plugin>@<marketplace>"].enabled`. Enabled local plugin bundles
+  are summarized from Codex-home cache/curated plugin roots, including manifest
+  descriptions, skill presence, MCP server names, and app connector ids.
+- Initial developer context can now include a Codex-style
+  `<plugins_instructions>` block when enabled plugins are available. Explicit
+  `plugin://` mentions can also materialize developer context for that turn,
+  telling the model which plugin-associated skills, MCP servers, and apps exist.
+- Linked mention parsing now follows Codex sigils for the represented text-link
+  path: `$` for `skill://` and `app://`, `@` for `plugin://`. Wrong-sigil links
+  remain ordinary text instead of silently creating typed mention sidecars.
+- Skill bodies are now scanned for linked `app://` mentions, so a selected skill
+  can add the same model-silent `app_connector_ids` sidecar Codex uses to choose
+  app context. Top-level core, CLI, TUI, child-spawn, and follow-up paths use the
+  cwd-aware materializer so persisted `session.input` and `session.followup`
+  events carry stable mention context.
+- Remaining plugin/app gaps are still product wiring rather than closed parity:
+  full app connector auth/selection, MCP tool exposure from apps, remote plugin
+  install/discovery/sync, plugin inventory UI, plugin provenance inside actual
+  callable tool descriptions, and cloud/admin app requirements. The next
+  high-impact non-plugin candidates remain effective-config provenance,
+  websocket transport, and compaction/token baseline nuances.
+- Focused core/CLI/TUI tests passed, then `scripts/verify-terminal-ui.sh`
+  passed. I inspected `/tmp/but-design-loop` captures including running,
+  developer, stopped/cancelled, bracketed paste, and completed-output; ANSI and
+  bracketed-paste scans had no matches. The standing Codex-auth smoke passed in
+  `/tmp/but-codex-smoke-plugin-mentions.8UyZDQ`: root `bae7b7066d41` returned
+  `Paris`, and child `d9c611efb9b9` returned `agent-parity-smoke-ok`.
+
+The previous batch closed the next G-028 unified-exec completion/cancellation
+slice and documented the parser issue that the standing Codex-auth smoke found.
+
+- The Codex-auth transport failure was a parser-classification bug, not a
+  browser/tool problem: the ChatGPT Codex backend returned a valid SSE body
+  without a `Content-Type` header, and local had routed missing content type to
+  whole-body JSON parsing. The fix is Codex-shaped: only explicit
+  `application/json` responses use the JSON parser; headerless streamed bodies
+  remain on the SSE path.
+- Unified exec now uses a Codex-style bounded post-exit reader drain instead of
+  joining reader threads indefinitely. Completed processes get a 50 ms drain
+  window, so background descendants holding stdout/stderr open cannot hang a
+  turn forever.
+- Background completion now waits a 100 ms trailing-output grace period before
+  finalizing and emits any trailing `command.output` before `command.finished`.
+  If descendants still hold the pipe open after the grace window, local detaches
+  the old buffers so late descendant output does not leak into later polls.
+- Normal `session.done` still preserves running `exec_command` sessions for
+  follow-up `write_stdin`, but cancellation/stop paths now clean up the current
+  agent subtree's unified-exec processes. This is wired through core finalization,
+  CLI `cancel`, and TUI stop.
+- The remaining non-exact G-028 pieces are pause-aware waits, because this
+  terminal has no out-of-band pause signal yet; here-doc command-prefix metadata,
+  which mostly feeds approval/rule logic we are intentionally ignoring; optional
+  zsh-fork and deeper non-Unix policy/parser behavior; explicit reader
+  cancellation internals; and app-server/alternate entry-point shutdown wiring
+  if those surfaces are added later.
+- Focused command/core/CLI/TUI tests passed, then `scripts/verify-terminal-ui.sh`
+  passed. I inspected `/tmp/but-design-loop` captures including running,
+  developer, stopped/cancelled, bracketed paste, and completed-output; ANSI and
+  bracketed-paste scans had no matches. The standing Codex-auth smoke passed in
+  `/tmp/but-codex-smoke-exec-drain.74XsF2`: root `8b7fbd1dc723` returned
+  `Paris`, and child `7bc0c692348f` returned `agent-parity-smoke-ok`.
+
+The previous batch closed the next bounded G-030 collaboration slice and fixed one
+local call-id adaptation that was still stronger than Codex's turn-id behavior.
+
+- `features.default_mode_request_user_input` is now parsed from the Codex-style
+  feature layer. When enabled, the model-visible `request_user_input` tool
+  description says it is available in Default or Plan mode, and runtime dispatch
+  allows Default-mode root requests. The default remains Plan-only.
+- `request_user_input.requested` events now carry the active Codex turn id when
+  a turn lifecycle event is open, falling back to the call id only for older
+  event streams without lifecycle metadata.
+- Request-input response matching now prefers `turn_id` over `call_id`: a
+  stale response with the same call id but a different turn id is ignored, while
+  a matching turn-id response is accepted even if legacy call-id metadata differs.
+- The TUI pending-request state and answer payloads now carry `turn_id`; the
+  composer submits by turn id while preserving call-id fallback for older
+  persisted requests.
+- Focused core/TUI request-input tests passed, `scripts/verify-terminal-ui.sh`
+  passed, `/tmp/but-design-loop` captures were inspected, ANSI/bracketed-paste
+  scans had no matches, and the standing Codex-auth smoke passed in
+  `/tmp/but-codex-smoke-request-input.OZh9L1`: root `77b45dbc6d6d` returned
+  `Paris`, and child `b1b154645669` returned `agent-parity-smoke-ok`.
+
+The batch immediately before this extended the hosted-tool/runtime cleanup
+cluster across G-028, G-026, G-031, and G-032.
+
+- Completed `image_generation_call` response items now save standard base64
+  image bytes under the session artifact root in `generated_images/*.png`,
+  record an `artifact.created` image artifact, and add Codex-style developer
+  context telling the model where generated images are saved and to copy rather
+  than move/delete the original unless asked. Failed decodes are non-fatal and
+  do not inject the context, matching Codex.
+- Immediate `end_turn=false` continuations see that generated-image developer
+  context before the raw hosted image item, so follow-up model turns can refer
+  to the saved file path without guessing.
+- Hosted web search now resolves the default/cached preference to live search
+  under this runtime's no-sandbox/danger-full-access permission posture, while
+  explicit `web_search = "disabled"` still removes the hosted tool. The
+  represented Codex `allowed_web_search_modes` constraint is now honored as
+  well: cached-only requirements keep hosted search cached, live falls back to
+  cached when disallowed, and disabled-only/empty requirements remove the tool.
+- The provider parser now has a regression that inbound `response.processed`
+  stream events are ignored and do not count as completion; real completion
+  still requires `response.completed`, which matches Codex's websocket-only
+  client-to-server `response.processed` semantics. A second regression proves
+  `response.processed` by itself still fails as an incomplete stream.
+- Model-turn request telemetry now records hosted tool counts and fingerprints
+  separately, so the state/debug record reflects hosted `web_search` and
+  `image_generation` as model-visible tools.
+- Time-to-first-token now follows Codex's broader response-event heuristic:
+  first hosted/tool response items, function/custom/tool-search calls, and
+  non-empty reasoning/message response items can set TTFT, not only streamed
+  text deltas.
+- Unified-exec cleanup now has a whole-registry API and close-agent cleanup
+  removes running commands for the target agent plus descendants. CLI
+  `close-agent` uses the same subtree cleanup path, and both CLI and TUI
+  binaries now install a shutdown guard that terminates all registered unified
+  exec processes when the product exits. Normal turn completion still leaves
+  running commands alive for follow-up parity.
+- Focused tests, full terminal verification, and the standing Codex-auth
+  root/subagent smoke passed. The latest smoke state was
+  `/tmp/but-codex-smoke-parity.ZXeC1P`: root returned `Paris`, and the child
+  read `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`.
+
+The batch immediately before this closed the next runtime/history cluster
+across G-028, G-031, and G-033 after the prior shell/hosted-tool audits. It
+also fixed a real Codex-auth subagent smoke blocker that was introduced by
+namespace replay drift.
+
+- Legacy `shell_command` is no longer a wrapper over unified `exec_command`.
+  It now runs as a one-shot classic shell command with no persistent session,
+  hard `timeout_ms`/`timeout` handling, Codex-style `Exit code`/`Wall time`/
+  `Output` model text, `session_id:null` command events, classic
+  `tool.started`/`tool.finished` names, and config-gated login shell behavior.
+- Visible shell handlers now follow Codex parallel-call capability, while
+  hidden legacy `shell_command` compatibility dispatch remains serial.
+- Hosted/raw Responses items now survive the two places where local history was
+  dropping them: immediate `end_turn=false` continuations keep reasoning,
+  web-search, and image-generation response items in the next request, and
+  response-item compaction checkpoints retain hosted web/image calls instead of
+  stripping them.
+- Responses input serialization now preserves `namespace` on assistant tool
+  calls. The Codex-auth subagent smoke previously failed with a 400 because a
+  `spawn_agent` call was replayed without its namespace; after the fix, the
+  smoke completed with real `spawn_agent`, child completion, `wait_agent`, and
+  final `Paris`.
+- At that point, remaining debt in these touched areas was narrower: exact
+  web-search permission profile constraints, full generated-image artifact/UI extraction,
+  pause-aware unified-exec waits/output notifications, optional zsh-fork and
+  deeper non-Unix shell policy, and broader app-server lifecycle/config
+  surfaces.
+
+The batch immediately before this took the G-032 tool-capability cluster after
+the standing Codex-auth root/subagent smoke passed. It closed the most direct
+model-visible gaps in shell-family selection and hosted Responses tool
+exposure, then fixed a G-033 observability bug caught by the same smoke gate.
+
+- Stable Codex feature keys now affect local planning: `features.shell_tool`,
+  `features.unified_exec`, legacy `experimental_use_unified_exec_tool`,
+  `features.image_generation`, top-level `web_search`, deprecated
+  `features.web_search_cached` / `features.web_search_request`, and
+  `[tools.web_search]` settings.
+- Model catalog metadata now preserves `shell_type`, `web_search_tool_type`,
+  and `experimental_supported_tools` from Codex model rows.
+- Shell planning now matches the Codex family selector for represented modes:
+  `shell_tool = false` hides shell tools, `unified_exec = false` exposes legacy
+  `shell_command`, and unified mode exposes `exec_command`/`write_stdin` while
+  keeping `shell_command` registered for hidden legacy dispatch.
+- Parallel dispatch now uses the same config-aware registry as serial dispatch,
+  so disabled shell tools cannot bypass the feature gate through the read-only
+  parallel path.
+- Responses requests now carry hosted `web_search` and `image_generation` as
+  first-class provider-turn specs with provider/model/config gates, instead of
+  forcing those hosted tools through the ordinary function-tool schema.
+- Unknown tool calls now return Codex-style `unsupported call: <tool>`.
+- Session display/status/result paths now use only the session's own
+  `session.done` payload. A late child `agent.completed` event still appears as
+  subagent activity/mail, but it no longer overwrites a completed parent result
+  in CLI `show`, local agent status, dataset summaries, or telemetry.
+
+The batch immediately before this added a represented Codex
+effective-config/session-thread-config layer plus permission/feature gating
+behavior that directly affects model-visible context and tool choice. A
+mandatory Codex-auth smoke then exposed a G-026 provider blocker, which was
+fixed in the same loop: the ChatGPT Codex backend can return a valid SSE body
+without a `Content-Type` header, so the local parser now treats only explicit
+`application/json` responses as whole JSON and otherwise stays on the SSE path.
+
+- `AgentRunOptions` now accepts a session-thread-config layer that mirrors
+  Codex `SessionThreadConfig`: `model_provider`, `model_providers`, and boolean
+  `features`.
+- That layer is applied after ordinary request/session config overrides and
+  before managed config, matching Codex equal-precedence insertion order. It now
+  drives provider selection, beta-feature headers, model request metadata, tool
+  schemas, base/personality context, and snapshot invalidation consistently.
+- `include_permissions_instructions = false` now suppresses only the default
+  permissions block. Runtime developer instructions and collaboration-mode
+  instructions still reach the model, and a non-model-visible suppression marker
+  prevents compaction from reintroducing default permissions later.
+- Runtime options can also suppress permissions instructions for the current
+  run.
+- `features.multi_agent = false` now disables the multi-agent tool family,
+  including deferred v1 tool search, while leaving the rest of the terminal tool
+  surface intact.
+- The Codex-auth health smoke is now documented as a standing gate. After the
+  provider fix, the root smoke completed with `Paris`, and the spawned child
+  smoke read `/tmp/but-codex-subagent-smoke.txt` and completed with
+  `subagent-smoke-ok`.
+- Focused tests cover thread-config precedence over request overrides,
+  managed-config precedence over thread config, permission suppression with
+  developer/collaboration preservation, compaction replay, multi-agent gating,
+  and headerless Codex SSE parsing. Full Rust/Python verification and the
+  Codex-auth root/subagent smokes passed after the provider fix.
+
+The previous batch intentionally took a larger step and closed two separate
+agent-quality clusters: G-033 typed input production/replay across top-level
+CLI/TUI/multi-agent paths, and the next G-028 unified-exec completion/drain
+contract.
+
+- Core now owns reusable typed user-input payload builders. Top-level text can
+  materialize explicit linked references such as `[$Calendar](app://calendar)`,
+  `[@Notes](plugin://notes@example)`, and `[$Docs](skill:///.../SKILL.md)`.
+- CLI `start`, CLI `followup`, CLI `spawn-agent` child input, TUI start, and
+  TUI follow-up now use the same typed payload builder instead of plain
+  `{"text": ...}` events.
+- `skill` references still materialize stable `<skill>` context at event
+  creation time. `app://` and `plugin://` references are persisted as sidecars
+  (`app_connector_ids` and `plugin_mentions`) and are not replayed as ordinary
+  prompt text. Plugin developer context is replayed only when already
+  materialized in the event payload, avoiding invented plugin capabilities.
+- The v1 structured input schema now exposes the `detail` field that the
+  runtime already honored for `image` and `local_image` items.
+- Unified exec now uses one shared `command.finished` emitter for immediate,
+  polled, and background completion paths. Background exit watchers emit unread
+  trailing `command.output` before `command.finished`, completed
+  `write_stdin` responses return `session_id: null`, write-after-exit does not
+  surface stale write errors, and explicit child-agent close paths clean up
+  that child's background commands without restoring normal-turn cleanup.
+- Focused tests cover typed top-level links, materialized plugin context replay,
+  v1 typed input, CLI/TUI typed payload production, v1 image-detail schema,
+  command completion/session-id/write-after-exit cleanup behavior, close-agent
+  command cleanup, and the full command module.
+- Full terminal verification passed through `scripts/verify-terminal-ui.sh`,
+  including Rust/Python suites, deterministic dumps, real tmux terminal smoke,
+  and artifact inspection under `/tmp/but-design-loop`.
+- Read-only subagent audits from that batch kept the remaining G-032
+  provenance/product surfaces open at the time; the current batch closed the
+  hosted-tool and shell-feature-gate portion, while app-server thread-config
+  protocol and effective-config display/provenance remain open.
+
+The batch before that closed two model-visible parity slices: G-032 typed runtime
+instruction overrides and a G-028 unified-exec response/shell fidelity cluster.
+
+- `AgentRunOptions` now has typed `base_instructions` and
+  `developer_instructions` overrides. Runtime base instructions beat config
+  `instructions` and persisted session base for the current provider turn, but
+  only write the durable `session.base_instructions` event when the session has
+  no prior base, matching Codex's session-meta behavior.
+- Runtime developer instructions now beat user and managed config
+  `developer_instructions` in the initial developer context bundle.
+- Unified exec now has a local Codex-shaped shell substrate: detected
+  `ShellType` values for Bash, Zsh, PowerShell, Sh, and Cmd; Codex-style
+  fallback selection; `-lc`/`-c`, PowerShell `-NoProfile -Command`, and Cmd
+  `/c` argv derivation; and `command.started.shell_type` state for auditability.
+- `exec_command` and `write_stdin` model text now use Codex-style random
+  six-hex chunk ids instead of deterministic call-id-derived chunk names.
+- Non-empty `write_stdin` calls now sleep for the Codex 100 ms process reaction
+  window before polling output, reducing missed interactive responses.
+- Focused tests cover runtime base/developer override precedence, shell
+  detection and argv derivation, Codex chunk-id shape, command output
+  truncation, the PTY stdin reaction window, and the full command tool module.
+- Read-only follow-up audits kept the then-remaining high-level G-032 and G-033
+  gaps open: full `ConfigLayerStack`/effective-config provenance and typed
+  plugin/app mention context needed larger product substrate work. A later plugin
+  slice closed the represented mention-context subset, but not full app/plugin
+  product wiring.
+
+The previous batch closed the high-impact G-028 unified-exec slice:
 Codex-style process lifetime across completed turns plus the represented
 tree-sitter shell parser path for safe read-only command classification.
 
@@ -201,8 +559,9 @@ tree-sitter shell parser path for safe read-only command classification.
   `response.processed`, sticky HTTP fallback, and full effective-config
   provenance remain open follow-up clusters rather than this turn's runtime
   slice.
-- Remaining G-028 gaps are shell-mode breadth including PowerShell/cmd and
-  optional zsh-fork behavior, pause-aware deadline extension, notification-based
+- Remaining G-028 gaps are optional zsh-fork behavior, deeper non-Unix shell
+  policy/parser semantics beyond argv derivation, pause-aware deadline extension,
+  notification-based
   output waiting/post-exit drain exactness, here-doc command-prefix metadata,
   code-mode JSON output if this harness adds code mode, and explicit
   shutdown/stop wiring for background command cleanup. Approval logic stays
@@ -222,8 +581,9 @@ The previous batch closed the represented multi-agent v2 config, mailbox,
 completion, concurrency, and usage-hint cluster in G-033.
 
 The previous batch before that closed the Bedrock AWS SigV4/profile-auth
-execution slice in G-032. The earlier Bedrock batch closed the static-catalog
-and bearer-token Mantle execution slice in G-032.
+execution slice in G-032. That slice has since been removed because it was
+Codex product/provider baggage, not portable agent-quality behavior for this
+terminal.
 
 The previous batch closed the TUI runtime config propagation gap in G-032. The
 terminal now accepts Codex-style `--profile/-p` and `--config/-c key=value`, and
@@ -282,7 +642,7 @@ selected `model_provider`, and model capability flags such as
   and whitespace checks. No TUI renderer, keyboard, terminal-output, or
   scrollback paths changed, so the terminal UI verifier was not rerun.
 - Remaining provider/model gaps are command-backed auth execution and 401
-  refresh retry, AWS/Bedrock execution, full built-in provider merge semantics,
+  refresh retry, full built-in provider merge semantics,
   thread-config lock/persistence, remote/cache `/models` plus ETag refresh,
   exact dynamic catalog prompt metadata, and websocket transport/fallback.
 
@@ -369,8 +729,8 @@ reconstructing from deltas, tool-call events, `tool.finished`, and
   fields and uses them for HTTP Responses request construction: selected
   `model_provider`, custom `base_url`, `env_key`, experimental bearer token,
   query params, static/env headers, retry caps, stream timeout, and
-  `wire_api = "responses"` validation. Command-backed auth, AWS/Bedrock
-  execution, full built-in merge semantics, websocket fields, and
+  `wire_api = "responses"` validation. Command-backed auth, full built-in merge
+  semantics, websocket fields, and
   thread-config persistence remain open.
 - Added the Codex response-header/rate-limit metadata slice. Local Responses
   streams now emit server-model, rate-limit, models-etag, and
@@ -859,9 +1219,12 @@ The biggest remaining categories are:
   output buffering, final transcript events, no-newline partial output,
   stdin write-error model text, cross-turn background process lifetime, and the
   represented Unix tree-sitter shell parser path are now partially aligned.
-  Still open: shell-mode breadth, pause-aware waits, notification/post-exit
-  drain exactness, here-doc metadata, code-mode JSON, and explicit product stop
-  cleanup wiring.
+  Shell type/path resolution, shell-specific argv derivation, six-hex chunk ids,
+  and the non-empty stdin reaction window are now aligned for the represented
+  runtime. Still open: optional zsh-fork behavior, deeper non-Unix
+  policy/parser semantics beyond argv derivation, pause-aware waits,
+  notification/post-exit drain exactness, here-doc metadata, code-mode JSON, and
+  app-server/alternate-product shutdown wiring if those entry points are added.
 - Patch semantics: contextual/parser semantics, preverification/runtime
   sequencing, streaming custom-tool progress snapshots, success/failure
   lifecycle events, and committed-delta reporting after runtime failures are
@@ -873,24 +1236,25 @@ The biggest remaining categories are:
   rejection, local TUI/CLI mode controls, the `request_user_input` answer path,
   structured option/notes/unanswered handling, active and completed question
   rendering, Plan-mode-only proposed-plan rendering, active-turn `/plan` safety,
-  and the Plan-mode medium reasoning preset are now implemented. Remaining open
-  work is app-server-compatible collaboration/request lifecycle events and
-  settings broadcasting, exact `turn_id` answer semantics, pending
-  replay/filtering, delegated/MCP compatibility paths, and full feature-flag
-  breadth such as the default-mode request-user-input flag.
+  the Plan-mode medium reasoning preset, the default-mode request-input feature
+  flag, and `turn_id`-preferred request-input responses are now implemented.
+  Remaining open work is app-server-compatible collaboration/request lifecycle
+  events and settings broadcasting, pending interactive replay/filtering,
+  delegated/MCP compatibility paths, and broader feature-flag coverage.
 - Turn lifecycle and finalization: interrupted-turn replay now includes Codex's
   model-visible `<turn_aborted>` marker and `aborted` missing-call outputs, and
   local sidecars now cover Codex-shaped task start/complete/abort,
   final-answer extraction, retry stream errors, consumed token totals,
   recomputed active-context token counts, and latest rate-limit snapshots.
   Still open: fully typed app-server lifecycle surfaces,
-  config-gated/developer-role interrupt marker variants, remote/v2 compaction
-  item handling, exact typed token estimation, and resume/fork context breadth.
+  config-gated/developer-role interrupt marker variants, local-only compaction
+  timing/baseline nuances, exact typed token estimation, and resume/fork context
+  breadth.
 - Full config/model and multi-agent systems: the represented model catalog
   substrate now drives request metadata, tool capability gates, spawn-agent
   validation, tool-output truncation, remote/cache refresh, TUI picker rows,
-  TUI `--profile`/`-c` runtime propagation, and Bedrock static catalog plus
-  bearer-token and AWS SigV4 Mantle execution. Still open: complete
+  and TUI `--profile`/`-c` runtime propagation. AWS/Bedrock/Mantle support is
+  intentionally removed as provider baggage. Still open: complete
   `ConfigLayerStack`, thread snapshots, v1 multi-agent tools, true app-server
   mailbox/input-queue semantics, and app-server bridge events.
 
@@ -899,8 +1263,9 @@ The biggest remaining categories are:
 - Exact Codex instruction layering beyond the now-aligned no-approval
   permissions fragment, simple AGENTS plus environment startup context,
   config-backed `developer_instructions`, config-backed base instructions,
-  session-persisted base instructions, compaction reinjection, and
-  fallback-provider priority mapping. Still open: separate developer
+  typed runtime base/developer instruction overrides, session-persisted base
+  instructions, compaction reinjection, and fallback-provider priority mapping.
+  Still open: separate developer
   exceptions, apps/skills/plugins/collaboration/personality/realtime developer
   sections, precise later-turn permission/profile updates, token-accounting use
   of frozen session base instructions, and rollout/resume reference-context
@@ -914,7 +1279,7 @@ The biggest remaining categories are:
   provider-object default-resume snapshots are now implemented. Still open:
   websocket client metadata and W3C trace metadata, attestation headers, richer
   app-server/turn-metadata enrichment, websocket or alternate transport
-  fallback, `response.processed`, app-server thread-settings/session-config
+  fallback, client-side websocket `response.processed` ack, app-server thread-settings/session-config
   notification surfaces beyond the core
   `session.config_snapshot`, and app-server lifecycle/token replay surfaces.
 - Tool schema parity beyond the now-closed direct v2 terminal schema surface:
@@ -923,11 +1288,12 @@ The biggest remaining categories are:
 - Full runtime shell approval, sandbox, and execpolicy behavior: rule files,
   prefix-rule approvals, feature-enabled additional-permission normalization
   and approval, network denial handling, full tree-sitter parser parity beyond
-  the tested Unix plain-command edge cases, Codex shell-mode breadth including
-  PowerShell/Windows heuristics and optional zsh-fork behavior, pause-aware wait
+  the tested Unix plain-command edge cases, deeper non-Unix shell policy/parser
+  semantics beyond the now-aligned PowerShell/Cmd argv derivation, optional
+  zsh-fork behavior, pause-aware wait
   deadline extension, notification/post-exit drain exactness, here-doc metadata,
-  code-mode JSON if this terminal adds code-mode, explicit product stop cleanup
-  wiring, and exact prompt-vs-allow behavior for non-dangerous unmatched
+  code-mode JSON if this terminal adds code-mode, app-server/alternate-product
+  shutdown wiring if those entry points are added, and exact prompt-vs-allow behavior for non-dangerous unmatched
   commands.
 - Full patch sandbox execution, protected-path approval prompts, and approval
   decision logic are intentionally out of scope for this experiment unless the
@@ -966,9 +1332,9 @@ The biggest remaining categories are:
   Codex/OpenAI dataset runs, and CLI config defaults now share one active
   config/catalog substrate. Core
   `session.config_snapshot` now also carries a Codex-shaped provider object for
-  default resumes, and Bedrock static catalog plus bearer-token and AWS SigV4
-  Mantle execution are represented. Still open: full `ConfigLayerStack`,
-  thread/project layer behavior, harness/API `ConfigOverrides.base_instructions`,
+  default resumes. AWS/Bedrock/Mantle support is intentionally removed as
+  provider baggage. Still open: full `ConfigLayerStack`,
+  thread/project layer behavior,
   full app-server provider/model snapshot protocol surfaces on resume/fork
   beyond the represented core event, richer Codex doctor/status-style config
   displays, unsupported-verbosity warning
@@ -976,9 +1342,10 @@ The biggest remaining categories are:
   this terminal runtime.
 - Plan-mode collaboration behavior beyond the implemented collaboration
   instructions, mode controls, request-input answer UI, proposed-plan rendering,
-  and reasoning preset: full app-server collaboration/request events, exact
-  `turn_id` response semantics, pending interactive replay/filtering,
-  delegated/MCP compatibility paths, and feature-flag breadth.
+  reasoning preset, default-mode request-input gate, and turn-id answer path:
+  full app-server collaboration/request events, pending interactive
+  replay/filtering, delegated/MCP compatibility paths, and broader feature-flag
+  breadth.
 - Multi-agent family routing now follows Codex's feature gate for represented
   sessions: `features.multi_agent_v2.enabled = true` selects the v2 task-path
   surface, while the default surface is the namespaced legacy
@@ -1007,9 +1374,9 @@ The biggest remaining categories are:
 - Codex turn lifecycle parity: fully typed `TurnComplete`/`TurnAborted` events,
   websocket-only previous-response transport placement, `response.processed`
   ack and sticky fallback, TTFT/duration/app-server notification exactness,
-  config-gated/developer-role interrupt marker variants, remote/v2 compaction
-  item handling, exact resume/fork `TurnContextItem` persistence, full typed
-  auth-refresh transport retry, exact typed token estimation, and full
+  config-gated/developer-role interrupt marker variants, local-only compaction
+  timing/baseline nuances, exact resume/fork `TurnContextItem` persistence, full
+  typed auth-refresh transport retry, exact typed token estimation, and full
   app-server compaction/token-window lifecycle.
 
 ## Definition of Done

@@ -1,10 +1,4 @@
 use anyhow::{anyhow, bail, Context, Result};
-use aws_config::BehaviorVersion;
-use aws_credential_types::provider::error::CredentialsError;
-use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
-use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
-use aws_sigv4::sign::v4;
-use aws_types::region::Region;
 use base64::{
     engine::general_purpose::{self, URL_SAFE_NO_PAD},
     Engine as _,
@@ -14,7 +8,6 @@ use browser_use_protocol::{
     ToolCall, ToolSpec,
 };
 use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
-use http::{Request as HttpRequest, Uri};
 use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
@@ -25,7 +18,6 @@ use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
-use std::str::FromStr;
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime};
@@ -35,23 +27,6 @@ const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
 const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
 const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
 const CODEX_REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
-const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
-const BEDROCK_MANTLE_SERVICE_NAME: &str = "bedrock-mantle";
-const BEDROCK_MANTLE_SUPPORTED_REGIONS: &[&str] = &[
-    "us-east-2",
-    "us-east-1",
-    "us-west-2",
-    "us-gov-west-1",
-    "ap-southeast-3",
-    "ap-south-1",
-    "ap-northeast-1",
-    "eu-central-1",
-    "eu-west-1",
-    "eu-west-2",
-    "eu-south-1",
-    "eu-north-1",
-    "sa-east-1",
-];
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum ProviderErrorKind {
@@ -168,6 +143,7 @@ pub struct ProviderTurn {
     pub messages: Vec<Value>,
     pub previous_response_id: Option<String>,
     pub tools: Vec<ToolSpec>,
+    pub hosted_tools: Vec<HostedToolSpec>,
     pub output_schema: Option<Value>,
     pub output_schema_strict: bool,
     pub prompt_cache_key: Option<String>,
@@ -194,6 +170,7 @@ impl Default for ProviderTurn {
             messages: Vec::new(),
             previous_response_id: None,
             tools: Vec::new(),
+            hosted_tools: Vec::new(),
             output_schema: None,
             output_schema_strict: true,
             prompt_cache_key: None,
@@ -202,6 +179,161 @@ impl Default for ProviderTurn {
             turn_state: None,
         }
     }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum HostedToolSpec {
+    WebSearch {
+        external_web_access: bool,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        filters: Option<WebSearchFilters>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        user_location: Option<WebSearchUserLocation>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search_context_size: Option<WebSearchContextSize>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        search_content_types: Option<Vec<String>>,
+    },
+    ImageGeneration {
+        output_format: String,
+    },
+}
+
+#[derive(
+    Clone, Copy, Debug, Default, PartialEq, Eq, PartialOrd, Ord, Hash, Serialize, Deserialize,
+)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchMode {
+    Disabled,
+    #[default]
+    Cached,
+    Live,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchContextSize {
+    Low,
+    Medium,
+    High,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchLocation {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchToolConfig {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_size: Option<WebSearchContextSize>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub location: Option<WebSearchLocation>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchFilters {
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub allowed_domains: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct WebSearchUserLocation {
+    #[serde(default)]
+    pub r#type: WebSearchUserLocationType,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub country: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub city: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timezone: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum WebSearchUserLocationType {
+    #[default]
+    Approximate,
+}
+
+impl HostedToolSpec {
+    pub fn web_search(
+        mode: WebSearchMode,
+        config: Option<&WebSearchToolConfig>,
+        tool_type: WebSearchToolType,
+    ) -> Option<Self> {
+        let external_web_access = match mode {
+            WebSearchMode::Disabled => return None,
+            WebSearchMode::Cached => false,
+            WebSearchMode::Live => true,
+        };
+        let search_content_types = match tool_type {
+            WebSearchToolType::Text => None,
+            WebSearchToolType::TextAndImage => Some(vec!["text".to_string(), "image".to_string()]),
+        };
+        Some(Self::WebSearch {
+            external_web_access,
+            filters: config.and_then(|config| {
+                config
+                    .allowed_domains
+                    .as_ref()
+                    .map(|allowed_domains| WebSearchFilters {
+                        allowed_domains: Some(allowed_domains.clone()),
+                    })
+            }),
+            user_location: config.and_then(|config| {
+                config
+                    .location
+                    .as_ref()
+                    .map(|location| WebSearchUserLocation {
+                        r#type: WebSearchUserLocationType::Approximate,
+                        country: location.country.clone(),
+                        region: location.region.clone(),
+                        city: location.city.clone(),
+                        timezone: location.timezone.clone(),
+                    })
+            }),
+            search_context_size: config.and_then(|config| config.context_size),
+            search_content_types,
+        })
+    }
+
+    pub fn image_generation_png() -> Self {
+        Self::ImageGeneration {
+            output_format: "png".to_string(),
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelShellType {
+    Default,
+    Local,
+    UnifiedExec,
+    Disabled,
+    #[default]
+    ShellCommand,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum WebSearchToolType {
+    #[default]
+    Text,
+    TextAndImage,
 }
 
 #[derive(Clone, Debug, PartialEq)]
@@ -301,46 +433,6 @@ fn send_provider_request(
 ) -> Result<reqwest::blocking::Response, ProviderError> {
     for attempt in 0..=retry.max_retries {
         match make_request().send() {
-            Ok(response) => {
-                if retry.should_retry_status(response.status(), attempt) {
-                    std::thread::sleep(retry.delay(attempt + 1));
-                    continue;
-                }
-                return Ok(response);
-            }
-            Err(error) => {
-                if retry.should_retry_send_error(&error, attempt) {
-                    std::thread::sleep(retry.delay(attempt + 1));
-                    continue;
-                }
-                return Err(provider_send_error(operation, &error));
-            }
-        }
-    }
-    Err(ProviderError::non_retryable(
-        ProviderErrorKind::RetryLimit,
-        format!("{operation}: retry limit reached"),
-    ))
-}
-
-fn send_provider_prepared_request(
-    operation: &str,
-    retry: ProviderRequestRetryConfig,
-    client: &reqwest::blocking::Client,
-    mut make_request: impl FnMut() -> Result<reqwest::blocking::Request, ProviderError>,
-) -> Result<reqwest::blocking::Response, ProviderError> {
-    for attempt in 0..=retry.max_retries {
-        let request = match make_request() {
-            Ok(request) => request,
-            Err(error) => {
-                if error.is_retryable() && attempt < retry.max_retries {
-                    std::thread::sleep(retry.delay(attempt + 1));
-                    continue;
-                }
-                return Err(error);
-            }
-        };
-        match client.execute(request) {
             Ok(response) => {
                 if retry.should_retry_status(response.status(), attempt) {
                     std::thread::sleep(retry.delay(attempt + 1));
@@ -576,6 +668,8 @@ struct StaticModelRequestInfo {
     supports_search_tool: bool,
     supports_image_input: bool,
     supports_image_detail_original: bool,
+    shell_type: ModelShellType,
+    web_search_tool_type: WebSearchToolType,
     truncation_policy: ModelTruncationPolicyInfo,
 }
 
@@ -593,6 +687,8 @@ impl StaticModelRequestInfo {
             supports_search_tool: false,
             supports_image_input: true,
             supports_image_detail_original: false,
+            shell_type: ModelShellType::ShellCommand,
+            web_search_tool_type: WebSearchToolType::Text,
             truncation_policy: default_model_truncation_policy(),
         }
     }
@@ -611,6 +707,9 @@ pub struct ModelRequestInfo {
     pub supports_search_tool: bool,
     pub supports_image_input: bool,
     pub supports_image_detail_original: bool,
+    pub shell_type: ModelShellType,
+    pub web_search_tool_type: WebSearchToolType,
+    pub experimental_supported_tools: Vec<String>,
     pub context_window: Option<i64>,
     pub max_context_window: Option<i64>,
     pub auto_compact_token_limit: Option<i64>,
@@ -687,6 +786,9 @@ impl From<StaticModelRequestInfo> for ModelRequestInfo {
             supports_search_tool: info.supports_search_tool,
             supports_image_input: info.supports_image_input,
             supports_image_detail_original: info.supports_image_detail_original,
+            shell_type: info.shell_type,
+            web_search_tool_type: info.web_search_tool_type,
+            experimental_supported_tools: Vec::new(),
             context_window: Some(272_000),
             max_context_window: Some(272_000),
             auto_compact_token_limit: None,
@@ -752,6 +854,12 @@ pub struct ModelCatalogEntryInfo {
     pub supports_search_tool: bool,
     #[serde(default)]
     pub supports_image_detail_original: bool,
+    #[serde(default)]
+    pub shell_type: ModelShellType,
+    #[serde(default)]
+    pub web_search_tool_type: WebSearchToolType,
+    #[serde(default)]
+    pub experimental_supported_tools: Vec<String>,
     #[serde(default = "default_input_modalities")]
     pub input_modalities: Vec<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -799,14 +907,6 @@ pub struct ModelServiceTierInfo {
 pub struct ModelMessagesInfo {
     pub instructions_template: Option<String>,
     pub instructions_variables: Option<ModelInstructionsVariablesInfo>,
-}
-
-pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
-
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
-pub struct AmazonBedrockAwsAuthConfig {
-    pub profile: Option<String>,
-    pub region: Option<String>,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -892,6 +992,9 @@ impl ModelCatalogEntryInfo {
                 .iter()
                 .any(|modality| modality == "image"),
             supports_image_detail_original: self.supports_image_detail_original,
+            shell_type: self.shell_type,
+            web_search_tool_type: self.web_search_tool_type,
+            experimental_supported_tools: self.experimental_supported_tools.clone(),
             context_window: self.context_window,
             max_context_window: self.max_context_window,
             auto_compact_token_limit: self.auto_compact_token_limit,
@@ -984,110 +1087,6 @@ pub fn bundled_model_presets() -> Vec<ModelPresetInfo> {
 
 pub fn bundled_model_catalog() -> ModelCatalog {
     codex_bundled_model_catalog().clone()
-}
-
-pub fn amazon_bedrock_model_catalog() -> ModelCatalog {
-    ModelCatalog {
-        models: vec![
-            amazon_bedrock_gpt_5_4_catalog_entry(0),
-            amazon_bedrock_oss_catalog_entry("openai.gpt-oss-120b", "GPT OSS 120B on Bedrock", 1),
-            amazon_bedrock_oss_catalog_entry("openai.gpt-oss-20b", "GPT OSS 20B on Bedrock", 2),
-        ],
-    }
-}
-
-fn amazon_bedrock_gpt_5_4_catalog_entry(priority: i32) -> ModelCatalogEntryInfo {
-    ModelCatalogEntryInfo {
-        slug: AMAZON_BEDROCK_GPT_5_4_MODEL_ID.to_string(),
-        display_name: "gpt-5.4".to_string(),
-        description: Some("Strong model for everyday coding.".to_string()),
-        default_reasoning_level: Some("medium".to_string()),
-        supported_reasoning_levels: vec![
-            reasoning_effort_info("minimal", "Minimal reasoning"),
-            reasoning_effort_info("low", "Fast responses with lighter reasoning"),
-            reasoning_effort_info(
-                "medium",
-                "Balances speed and reasoning depth for everyday tasks",
-            ),
-            reasoning_effort_info("high", "Greater reasoning depth for complex problems"),
-        ],
-        visibility: "list".to_string(),
-        supported_in_api: true,
-        priority,
-        service_tiers: vec![ModelServiceTierInfo {
-            id: "priority".to_string(),
-            name: "fast".to_string(),
-            description: "Fastest inference with increased plan usage".to_string(),
-        }],
-        default_service_tier: None,
-        base_instructions: CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS.to_string(),
-        model_messages: None,
-        supports_reasoning_summaries: true,
-        default_reasoning_summary: "none".to_string(),
-        support_verbosity: true,
-        default_verbosity: Some("medium".to_string()),
-        supports_parallel_tool_calls: true,
-        supports_search_tool: true,
-        supports_image_detail_original: true,
-        input_modalities: vec!["text".to_string(), "image".to_string()],
-        context_window: Some(272_000),
-        max_context_window: Some(1_000_000),
-        auto_compact_token_limit: None,
-        truncation_policy: ModelTruncationPolicyInfo {
-            mode: ModelTruncationPolicyMode::Tokens,
-            limit: 10_000,
-        },
-    }
-}
-
-fn amazon_bedrock_oss_catalog_entry(
-    slug: &str,
-    display_name: &str,
-    priority: i32,
-) -> ModelCatalogEntryInfo {
-    ModelCatalogEntryInfo {
-        slug: slug.to_string(),
-        display_name: display_name.to_string(),
-        description: Some(display_name.to_string()),
-        default_reasoning_level: Some("medium".to_string()),
-        supported_reasoning_levels: vec![
-            reasoning_effort_info("low", "Fast responses with lighter reasoning"),
-            reasoning_effort_info(
-                "medium",
-                "Balances speed and reasoning depth for everyday tasks",
-            ),
-            reasoning_effort_info("high", "Greater reasoning depth for complex problems"),
-        ],
-        visibility: "list".to_string(),
-        supported_in_api: true,
-        priority,
-        service_tiers: Vec::new(),
-        default_service_tier: None,
-        base_instructions: CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS.to_string(),
-        model_messages: None,
-        supports_reasoning_summaries: true,
-        default_reasoning_summary: "none".to_string(),
-        support_verbosity: false,
-        default_verbosity: None,
-        supports_parallel_tool_calls: true,
-        supports_search_tool: false,
-        supports_image_detail_original: false,
-        input_modalities: vec!["text".to_string()],
-        context_window: Some(128_000),
-        max_context_window: Some(128_000),
-        auto_compact_token_limit: None,
-        truncation_policy: ModelTruncationPolicyInfo {
-            mode: ModelTruncationPolicyMode::Tokens,
-            limit: 10_000,
-        },
-    }
-}
-
-fn reasoning_effort_info(effort: &str, description: &str) -> ModelReasoningEffortInfo {
-    ModelReasoningEffortInfo {
-        effort: effort.to_string(),
-        description: Some(description.to_string()),
-    }
 }
 
 fn codex_bundled_model_catalog() -> &'static ModelCatalog {
@@ -1276,6 +1275,14 @@ pub trait ModelProvider {
         true
     }
 
+    fn supports_hosted_web_search(&self) -> bool {
+        false
+    }
+
+    fn supports_hosted_image_generation(&self) -> bool {
+        false
+    }
+
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>>;
 
     fn stream_turn(
@@ -1309,241 +1316,6 @@ pub struct ProviderCommandAuthConfig {
 pub struct ProviderCommandAuth {
     config: ProviderCommandAuthConfig,
     cached: Arc<Mutex<Option<CachedProviderCommandToken>>>,
-}
-
-#[derive(Clone, Debug)]
-enum OpenAIResponsesRequestAuth {
-    AmazonBedrockSigV4(AmazonBedrockSigV4Auth),
-}
-
-impl OpenAIResponsesRequestAuth {
-    fn apply(
-        &self,
-        request: reqwest::blocking::Request,
-    ) -> Result<reqwest::blocking::Request, ProviderError> {
-        match self {
-            Self::AmazonBedrockSigV4(auth) => auth.apply(request),
-        }
-    }
-}
-
-#[derive(Clone)]
-struct AmazonBedrockSigV4Auth {
-    credentials_provider: SharedCredentialsProvider,
-    region: String,
-    service: String,
-    runtime: Arc<tokio::runtime::Runtime>,
-}
-
-impl std::fmt::Debug for AmazonBedrockSigV4Auth {
-    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("AmazonBedrockSigV4Auth")
-            .field("region", &self.region)
-            .field("service", &self.service)
-            .finish_non_exhaustive()
-    }
-}
-
-impl AmazonBedrockSigV4Auth {
-    fn load(config: AmazonBedrockAwsAuthConfig) -> Result<Self, ProviderError> {
-        let runtime = tokio::runtime::Builder::new_current_thread()
-            .enable_all()
-            .build()
-            .map_err(|error| {
-                amazon_bedrock_auth_error(format!(
-                    "failed to resolve Amazon Bedrock auth: failed to create AWS auth runtime: {error}"
-                ))
-            })?;
-        let runtime = Arc::new(runtime);
-        let sdk_config = runtime.block_on(async {
-            let mut loader = aws_config::defaults(BehaviorVersion::latest());
-            if let Some(profile) = config
-                .profile
-                .as_deref()
-                .map(str::trim)
-                .filter(|profile| !profile.is_empty())
-            {
-                loader = loader.profile_name(profile);
-            }
-            if let Some(region) = config
-                .region
-                .as_deref()
-                .map(str::trim)
-                .filter(|region| !region.is_empty())
-            {
-                loader = loader.region(Region::new(region.to_string()));
-            }
-            loader.load().await
-        });
-        let credentials_provider = sdk_config.credentials_provider().ok_or_else(|| {
-            amazon_bedrock_auth_error(
-                "failed to resolve Amazon Bedrock auth: AWS SDK config did not resolve a credentials provider",
-            )
-        })?;
-        let region = sdk_config
-            .region()
-            .map(ToString::to_string)
-            .ok_or_else(|| {
-                amazon_bedrock_auth_error(
-                    "failed to resolve Amazon Bedrock auth: AWS SDK config did not resolve a region",
-                )
-            })?;
-        let service = BEDROCK_MANTLE_SERVICE_NAME.to_string();
-        if service.trim().is_empty() {
-            return Err(amazon_bedrock_auth_error(
-                "failed to resolve Amazon Bedrock auth: AWS service name must not be empty",
-            ));
-        }
-        Ok(Self {
-            credentials_provider,
-            region,
-            service,
-            runtime,
-        })
-    }
-
-    fn region(&self) -> &str {
-        &self.region
-    }
-
-    fn apply(
-        &self,
-        mut request: reqwest::blocking::Request,
-    ) -> Result<reqwest::blocking::Request, ProviderError> {
-        remove_headers_not_preserved_by_bedrock_mantle(request.headers_mut());
-        let body = request
-            .body()
-            .and_then(reqwest::blocking::Body::as_bytes)
-            .map(<[u8]>::to_vec)
-            .unwrap_or_default();
-        let (signed_url, signed_headers) = self.sign_request(
-            request.method().clone(),
-            request.url().as_str(),
-            request.headers(),
-            &body,
-        )?;
-        *request.url_mut() = reqwest::Url::parse(&signed_url).map_err(|error| {
-            amazon_bedrock_auth_error(format!(
-                "failed to sign Amazon Bedrock request: signed request URL is not valid: {error}"
-            ))
-        })?;
-        *request.headers_mut() = signed_headers;
-        Ok(request)
-    }
-
-    fn sign_request(
-        &self,
-        method: reqwest::Method,
-        url: &str,
-        headers: &reqwest::header::HeaderMap,
-        body: &[u8],
-    ) -> Result<(String, reqwest::header::HeaderMap), ProviderError> {
-        let credentials = self
-            .runtime
-            .block_on(self.credentials_provider.provide_credentials())
-            .map_err(amazon_bedrock_credentials_error)?;
-        let signable_headers = headers
-            .iter()
-            .map(|(name, value)| {
-                Ok::<_, ProviderError>((
-                    name.as_str(),
-                    value.to_str().map_err(|error| {
-                        amazon_bedrock_auth_error(format!(
-                            "failed to sign Amazon Bedrock request: request contains a non-UTF8 header value: {error}"
-                        ))
-                    })?,
-                ))
-            })
-            .collect::<Result<Vec<_>, _>>()?;
-        let signable_request = SignableRequest::new(
-            method.as_str(),
-            url,
-            signable_headers.into_iter(),
-            SignableBody::Bytes(body),
-        )
-        .map_err(|error| {
-            amazon_bedrock_auth_error(format!(
-                "failed to sign Amazon Bedrock request: failed to build signable request: {error}"
-            ))
-        })?;
-        let identity = credentials.clone().into();
-        let signing_params = v4::SigningParams::builder()
-            .identity(&identity)
-            .region(&self.region)
-            .name(&self.service)
-            .time(SystemTime::now())
-            .settings(SigningSettings::default())
-            .build()
-            .map_err(|error| {
-                amazon_bedrock_auth_error(format!(
-                    "failed to sign Amazon Bedrock request: failed to build SigV4 signing params: {error}"
-                ))
-            })?;
-        let (instructions, _signature) = sign(signable_request, &signing_params.into())
-            .map_err(|error| {
-                amazon_bedrock_auth_error(format!(
-                    "failed to sign Amazon Bedrock request: SigV4 signing failed: {error}"
-                ))
-            })?
-            .into_parts();
-        let uri = Uri::from_str(url).map_err(|error| {
-            amazon_bedrock_auth_error(format!(
-                "failed to sign Amazon Bedrock request: request URL is not a valid URI: {error}"
-            ))
-        })?;
-        let mut http_request = HttpRequest::builder()
-            .method(method)
-            .uri(uri)
-            .body(())
-            .map_err(|error| {
-                amazon_bedrock_auth_error(format!(
-                    "failed to sign Amazon Bedrock request: failed to construct HTTP request for signing: {error}"
-                ))
-            })?;
-        *http_request.headers_mut() = headers.clone();
-        instructions.apply_to_request_http1x(&mut http_request);
-        Ok((
-            http_request.uri().to_string(),
-            http_request.headers().clone(),
-        ))
-    }
-}
-
-fn amazon_bedrock_credentials_error(error: CredentialsError) -> ProviderError {
-    let message =
-        format!("failed to sign Amazon Bedrock request: failed to load AWS credentials: {error}");
-    if matches!(
-        error,
-        CredentialsError::ProviderTimedOut(_) | CredentialsError::ProviderError(_)
-    ) {
-        ProviderError::retryable(message, None)
-    } else {
-        amazon_bedrock_auth_error(message)
-    }
-}
-
-fn amazon_bedrock_auth_error(message: impl Into<String>) -> ProviderError {
-    ProviderError::non_retryable(ProviderErrorKind::InvalidRequest, message)
-}
-
-pub fn amazon_bedrock_mantle_base_url(region: &str) -> Result<String> {
-    let region = region.trim();
-    if BEDROCK_MANTLE_SUPPORTED_REGIONS.contains(&region) {
-        Ok(format!("https://bedrock-mantle.{region}.api.aws/openai/v1"))
-    } else {
-        bail!("Amazon Bedrock Mantle does not support region `{region}`");
-    }
-}
-
-fn remove_headers_not_preserved_by_bedrock_mantle(headers: &mut reqwest::header::HeaderMap) {
-    let headers_to_remove = headers
-        .keys()
-        .filter(|name| name.as_str().contains('_'))
-        .cloned()
-        .collect::<Vec<_>>();
-    for name in headers_to_remove {
-        headers.remove(name);
-    }
 }
 
 #[derive(Clone, Debug)]
@@ -1759,7 +1531,6 @@ impl ModelProvider for ScriptedProvider {
 pub struct OpenAIResponsesProvider {
     api_key: Option<String>,
     command_auth: Option<ProviderCommandAuth>,
-    request_auth: Option<OpenAIResponsesRequestAuth>,
     model: String,
     base_url: String,
     provider_name: String,
@@ -1791,7 +1562,6 @@ impl OpenAIResponsesProvider {
         Self {
             api_key,
             command_auth: None,
-            request_auth: None,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             provider_name: "openai".to_string(),
@@ -1834,34 +1604,6 @@ impl OpenAIResponsesProvider {
         self.command_auth = Some(ProviderCommandAuth::new(auth));
         self
     }
-
-    pub fn with_amazon_bedrock_sigv4_auth(
-        model: impl Into<String>,
-        aws: AmazonBedrockAwsAuthConfig,
-        request_options: ProviderRequestOptions,
-    ) -> Result<Self> {
-        let auth = AmazonBedrockSigV4Auth::load(aws)?;
-        let base_url = amazon_bedrock_mantle_base_url(auth.region())?;
-        Ok(Self::with_optional_api_key(None, model, base_url)
-            .with_provider_name(AMAZON_BEDROCK_PROVIDER_ID)
-            .with_request_options(request_options)
-            .with_request_auth(OpenAIResponsesRequestAuth::AmazonBedrockSigV4(auth)))
-    }
-
-    fn with_request_auth(mut self, request_auth: OpenAIResponsesRequestAuth) -> Self {
-        self.request_auth = Some(request_auth);
-        self
-    }
-
-    #[cfg(test)]
-    fn with_amazon_bedrock_sigv4_auth_for_test(
-        mut self,
-        aws: AmazonBedrockAwsAuthConfig,
-    ) -> Result<Self> {
-        let auth = AmazonBedrockSigV4Auth::load(aws)?;
-        self.request_auth = Some(OpenAIResponsesRequestAuth::AmazonBedrockSigV4(auth));
-        Ok(self)
-    }
 }
 
 impl ModelProvider for OpenAIResponsesProvider {
@@ -1873,8 +1615,8 @@ impl ModelProvider for OpenAIResponsesProvider {
         &self.model
     }
 
-    fn supports_namespace_tools(&self) -> bool {
-        self.provider_name != AMAZON_BEDROCK_PROVIDER_ID
+    fn supports_hosted_web_search(&self) -> bool {
+        true
     }
 
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
@@ -1965,7 +1707,7 @@ impl OpenAIResponsesProvider {
         let instructions = turn.instructions_or_default(&self.instructions).to_string();
         let model_info = model_request_info_for_turn(&self.model, &turn);
         let input = messages_to_responses_input_for_model(&turn.messages, &model_info)?;
-        let tools = tool_specs_to_responses_tools(&turn.tools);
+        let tools = tool_specs_to_responses_tools_with_hosted(&turn.tools, &turn.hosted_tools);
         let mut body = json!({
             "model": self.model,
             "input": input,
@@ -2003,11 +1745,7 @@ impl OpenAIResponsesProvider {
             /*auto_previous_response_reuse*/ false,
         )?;
 
-        let command_auth = if self.request_auth.is_none() {
-            self.command_auth.clone()
-        } else {
-            None
-        };
+        let command_auth = self.command_auth.clone();
         let command_auth_token = command_auth
             .as_ref()
             .map(ProviderCommandAuth::access_token)
@@ -2020,34 +1758,18 @@ impl OpenAIResponsesProvider {
                 .header("Accept", "text/event-stream");
             request = apply_query_params(request, &self.request_options.query_params);
             request = apply_extra_headers(request, Some(&self.request_options.headers));
-            if self.request_auth.is_none() {
-                if let Some(api_key) = auth_token
-                    .or(self.api_key.as_deref())
-                    .filter(|key| !key.is_empty())
-                {
-                    request = request.bearer_auth(api_key);
-                }
+            if let Some(api_key) = auth_token
+                .or(self.api_key.as_deref())
+                .filter(|key| !key.is_empty())
+            {
+                request = request.bearer_auth(api_key);
             }
             apply_extra_headers(request, extra_headers.as_ref()).json(&body)
         };
         let send_with_auth = |auth_token: Option<&str>| {
-            if let Some(request_auth) = self.request_auth.as_ref() {
-                send_provider_prepared_request(
-                    "send OpenAI Responses request",
-                    request_retry,
-                    &self.client,
-                    || {
-                        let request = build_request(auth_token).build().map_err(|error| {
-                            provider_send_error("send OpenAI Responses request", &error)
-                        })?;
-                        request_auth.apply(request)
-                    },
-                )
-            } else {
-                send_provider_request("send OpenAI Responses request", request_retry, || {
-                    build_request(auth_token)
-                })
-            }
+            send_provider_request("send OpenAI Responses request", request_retry, || {
+                build_request(auth_token)
+            })
         };
 
         let mut response = match send_with_auth(command_auth_token.as_deref()) {
@@ -3407,6 +3129,14 @@ impl ModelProvider for CodexResponsesProvider {
         &self.model
     }
 
+    fn supports_hosted_web_search(&self) -> bool {
+        true
+    }
+
+    fn supports_hosted_image_generation(&self) -> bool {
+        true
+    }
+
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
         let stream_idle_timeout = stream_idle_timeout_for_turn(&turn);
         let turn_state = turn.turn_state.clone();
@@ -3510,7 +3240,7 @@ impl CodexResponsesProvider {
         let instructions = turn.instructions_or_default(&self.instructions).to_string();
         let model_info = model_request_info_for_turn(&self.model, &turn);
         let input = messages_to_responses_input_for_model(&turn.messages, &model_info)?;
-        let tools = tool_specs_to_responses_tools(&turn.tools);
+        let tools = tool_specs_to_responses_tools_with_hosted(&turn.tools, &turn.hosted_tools);
         let mut body = json!({
             "model": self.model,
             "input": input,
@@ -5023,7 +4753,15 @@ fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str
     ]
 }
 
+#[cfg(test)]
 fn tool_specs_to_responses_tools(tools: &[ToolSpec]) -> Vec<Value> {
+    tool_specs_to_responses_tools_with_hosted(tools, &[])
+}
+
+fn tool_specs_to_responses_tools_with_hosted(
+    tools: &[ToolSpec],
+    hosted_tools: &[HostedToolSpec],
+) -> Vec<Value> {
     let mut output = Vec::new();
     let mut namespace_indices = HashMap::<String, usize>::new();
     for tool in tools {
@@ -5094,7 +4832,43 @@ fn tool_specs_to_responses_tools(tools: &[ToolSpec]) -> Vec<Value> {
             }
         }
     }
+    output.extend(hosted_tools.iter().map(hosted_tool_to_responses_tool));
     output
+}
+
+fn hosted_tool_to_responses_tool(tool: &HostedToolSpec) -> Value {
+    match tool {
+        HostedToolSpec::WebSearch {
+            external_web_access,
+            filters,
+            user_location,
+            search_context_size,
+            search_content_types,
+        } => {
+            let mut value = json!({
+                "type": "web_search",
+                "external_web_access": external_web_access,
+            });
+            if let Some(filters) = filters {
+                value["filters"] = serde_json::to_value(filters).unwrap_or(Value::Null);
+            }
+            if let Some(user_location) = user_location {
+                value["user_location"] = serde_json::to_value(user_location).unwrap_or(Value::Null);
+            }
+            if let Some(search_context_size) = search_context_size {
+                value["search_context_size"] =
+                    serde_json::to_value(search_context_size).unwrap_or(Value::Null);
+            }
+            if let Some(search_content_types) = search_content_types {
+                value["search_content_types"] = json!(search_content_types);
+            }
+            value
+        }
+        HostedToolSpec::ImageGeneration { output_format } => json!({
+            "type": "image_generation",
+            "output_format": output_format,
+        }),
+    }
 }
 
 fn tool_specs_to_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
@@ -6033,21 +5807,30 @@ fn tool_call_to_responses_input(call: &Value) -> Result<Value> {
         .get("name")
         .and_then(Value::as_str)
         .context("assistant tool call missing name")?;
+    let namespace = call.get("namespace").and_then(Value::as_str);
     let arguments = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
     if let Some(input) = arguments.as_str() {
-        return Ok(json!({
+        let mut item = json!({
             "type": "custom_tool_call",
             "call_id": call_id,
             "name": name,
             "input": input,
-        }));
+        });
+        if let Some(namespace) = namespace {
+            item["namespace"] = Value::String(namespace.to_string());
+        }
+        return Ok(item);
     }
-    Ok(json!({
+    let mut item = json!({
         "type": "function_call",
         "call_id": call_id,
         "name": name,
         "arguments": json_string(arguments)?,
-    }))
+    });
+    if let Some(namespace) = namespace {
+        item["namespace"] = Value::String(namespace.to_string());
+    }
+    Ok(item)
 }
 
 fn json_string(value: Value) -> Result<String> {
@@ -6532,7 +6315,7 @@ fn find_model_pricing_data<'a>(
             return Some(data);
         }
     }
-    for prefix in ["anthropic/", "openai/", "google/", "azure/", "bedrock/"] {
+    for prefix in ["anthropic/", "openai/", "google/", "azure/"] {
         let prefixed = format!("{prefix}{model}");
         if let Some(data) = pricing_data.get(&prefixed) {
             return Some(data);
@@ -6629,12 +6412,6 @@ mod tests {
         fn set_str(key: &'static str, value: &str) -> Self {
             let old_value = std::env::var_os(key);
             std::env::set_var(key, value);
-            Self { key, old_value }
-        }
-
-        fn remove(key: &'static str) -> Self {
-            let old_value = std::env::var_os(key);
-            std::env::remove_var(key);
             Self { key, old_value }
         }
     }
@@ -7013,6 +6790,54 @@ mod tests {
     }
 
     #[test]
+    fn responses_tools_encode_hosted_web_search_and_image_generation_like_codex() {
+        let hosted = vec![
+            HostedToolSpec::web_search(
+                WebSearchMode::Live,
+                Some(&WebSearchToolConfig {
+                    context_size: Some(WebSearchContextSize::High),
+                    allowed_domains: Some(vec!["example.com".to_string()]),
+                    location: Some(WebSearchLocation {
+                        country: Some("US".to_string()),
+                        region: Some("CA".to_string()),
+                        city: Some("San Francisco".to_string()),
+                        timezone: Some("America/Los_Angeles".to_string()),
+                    }),
+                }),
+                WebSearchToolType::TextAndImage,
+            )
+            .expect("web search spec"),
+            HostedToolSpec::image_generation_png(),
+        ];
+        let tools = tool_specs_to_responses_tools_with_hosted(&[], &hosted);
+
+        assert_eq!(
+            tools[0],
+            json!({
+                "type": "web_search",
+                "external_web_access": true,
+                "filters": {"allowed_domains": ["example.com"]},
+                "user_location": {
+                    "type": "approximate",
+                    "country": "US",
+                    "region": "CA",
+                    "city": "San Francisco",
+                    "timezone": "America/Los_Angeles",
+                },
+                "search_context_size": "high",
+                "search_content_types": ["text", "image"],
+            })
+        );
+        assert_eq!(
+            tools[1],
+            json!({
+                "type": "image_generation",
+                "output_format": "png",
+            })
+        );
+    }
+
+    #[test]
     fn responses_tools_coalesce_namespaced_function_tools_like_codex() {
         let tools = tool_specs_to_responses_tools(&[
             ToolSpec {
@@ -7181,6 +7006,42 @@ mod tests {
         assert_eq!(input[1]["status"], "completed");
         assert_eq!(input[2]["type"], "image_generation_call");
         assert_eq!(input[2]["id"], "ig_123");
+        Ok(())
+    }
+
+    #[test]
+    fn responses_input_preserves_namespaced_assistant_tool_calls_like_codex() -> Result<()> {
+        let input = messages_to_responses_input(&[json!({
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "call_spawn",
+                    "name": "spawn_agent",
+                    "namespace": "agents",
+                    "arguments": {"message": "inspect"}
+                },
+                {
+                    "id": "call_patch",
+                    "name": "apply_patch",
+                    "namespace": "tools",
+                    "arguments": "*** Begin Patch\n*** End Patch"
+                }
+            ]
+        })])?;
+
+        let spawn = input
+            .iter()
+            .find(|item| item.get("call_id").and_then(Value::as_str) == Some("call_spawn"))
+            .context("spawn call")?;
+        assert_eq!(spawn["type"], "function_call");
+        assert_eq!(spawn["namespace"], "agents");
+        let patch = input
+            .iter()
+            .find(|item| item.get("call_id").and_then(Value::as_str) == Some("call_patch"))
+            .context("patch call")?;
+        assert_eq!(patch["type"], "custom_tool_call");
+        assert_eq!(patch["namespace"], "tools");
         Ok(())
     }
 
@@ -7471,6 +7332,115 @@ mod tests {
             end_turn: Some(false),
         }));
         assert!(events.contains(&ModelEvent::Done));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_responses_provider_parses_sse_without_content_type_like_codex_backend() -> Result<()> {
+        let sse = concat!(
+            "event: response.created\n",
+            "data: {\"type\":\"response.created\",\"response\":{\"id\":\"resp_no_content_type\",\"output\":[]}}\n\n",
+            "event: response.output_text.delta\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Paris\"}\n\n",
+            "event: response.completed\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_no_content_type\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_status_sequence_server(vec![MockHttpResponse::new(
+            200,
+            "OK",
+            sse,
+            "text/event-stream",
+        )
+        .without_content_type()])?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Paris".to_string(),
+        }));
+        assert!(events.contains(&ModelEvent::Done));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_responses_provider_ignores_response_processed_without_completing_turn() -> Result<()> {
+        let sse = concat!(
+            "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"Codex\"}}}\n\n",
+            "data: {\"type\":\"response.processed\",\"response_id\":\"resp_processed\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_processed\",\"output\":[{\"type\":\"web_search_call\",\"id\":\"ws_1\",\"status\":\"completed\",\"action\":{\"type\":\"search\",\"query\":\"Codex\"}}],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "search"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        let raw_items = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event,
+                    ModelEvent::ResponseOutputItem { item }
+                        if item.get("type").and_then(Value::as_str) == Some("web_search_call")
+                            && item.get("id").and_then(Value::as_str) == Some("ws_1")
+                )
+            })
+            .count();
+        assert_eq!(raw_items, 1);
+        assert!(events.contains(&ModelEvent::ResponseCompleted {
+            response_id: Some("resp_processed".to_string()),
+            end_turn: None,
+        }));
+        assert!(events.contains(&ModelEvent::Done));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_responses_provider_response_processed_alone_is_not_completion() -> Result<()> {
+        let sse = "data: {\"type\":\"response.processed\",\"response_id\":\"resp_processed\"}\n\n";
+        let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "search"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("response.processed alone should not complete the turn");
+        handle.join().expect("mock server thread");
+        assert!(format!("{err:#}").contains("stream closed before response.completed"));
         Ok(())
     }
 
@@ -8559,166 +8529,6 @@ mod tests {
     }
 
     #[test]
-    fn amazon_bedrock_model_catalog_uses_codex_static_models() {
-        let catalog = amazon_bedrock_model_catalog();
-        let slugs = catalog
-            .models
-            .iter()
-            .map(|entry| entry.slug.as_str())
-            .collect::<Vec<_>>();
-        assert_eq!(
-            slugs,
-            vec![
-                "openai.gpt-5.4",
-                "openai.gpt-oss-120b",
-                "openai.gpt-oss-20b"
-            ]
-        );
-
-        let gpt = &catalog.models[0];
-        assert_eq!(gpt.display_name, "gpt-5.4");
-        assert_eq!(
-            gpt.description.as_deref(),
-            Some("Strong model for everyday coding.")
-        );
-        assert_eq!(gpt.default_reasoning_level.as_deref(), Some("medium"));
-        assert_eq!(
-            gpt.supported_reasoning_levels
-                .iter()
-                .map(|level| level.effort.as_str())
-                .collect::<Vec<_>>(),
-            vec!["minimal", "low", "medium", "high"]
-        );
-        assert_eq!(gpt.service_tiers[0].id, "priority");
-        assert_eq!(gpt.service_tiers[0].name, "fast");
-        assert_eq!(gpt.default_verbosity.as_deref(), Some("medium"));
-        assert!(gpt.support_verbosity);
-        assert!(gpt.supports_parallel_tool_calls);
-        assert!(gpt.supports_image_detail_original);
-        assert_eq!(gpt.input_modalities, vec!["text", "image"]);
-        assert_eq!(gpt.context_window, Some(272_000));
-        assert_eq!(gpt.max_context_window, Some(1_000_000));
-        assert_eq!(
-            gpt.truncation_policy.mode,
-            ModelTruncationPolicyMode::Tokens
-        );
-        assert_eq!(gpt.truncation_policy.limit, 10_000);
-
-        let oss = &catalog.models[1];
-        assert_eq!(oss.display_name, "GPT OSS 120B on Bedrock");
-        assert_eq!(oss.default_reasoning_level.as_deref(), Some("medium"));
-        assert_eq!(
-            oss.supported_reasoning_levels
-                .iter()
-                .map(|level| level.effort.as_str())
-                .collect::<Vec<_>>(),
-            vec!["low", "medium", "high"]
-        );
-        assert!(oss.service_tiers.is_empty());
-        assert!(!oss.support_verbosity);
-        assert_eq!(oss.default_verbosity, None);
-        assert!(oss.supports_parallel_tool_calls);
-        assert!(!oss.supports_image_detail_original);
-        assert_eq!(oss.input_modalities, vec!["text"]);
-        assert_eq!(oss.context_window, Some(128_000));
-        assert_eq!(oss.max_context_window, Some(128_000));
-    }
-
-    #[test]
-    fn amazon_bedrock_mantle_base_url_matches_codex_supported_regions() -> Result<()> {
-        assert_eq!(
-            amazon_bedrock_mantle_base_url(" ap-northeast-1 ")?,
-            "https://bedrock-mantle.ap-northeast-1.api.aws/openai/v1"
-        );
-        assert_eq!(
-            amazon_bedrock_mantle_base_url("us-gov-west-1")?,
-            "https://bedrock-mantle.us-gov-west-1.api.aws/openai/v1"
-        );
-        let error = amazon_bedrock_mantle_base_url("us-west-1")
-            .expect_err("unsupported Bedrock region should fail");
-        assert!(
-            format!("{error:#}")
-                .contains("Amazon Bedrock Mantle does not support region `us-west-1`"),
-            "{error:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn openai_responses_provider_amazon_bedrock_sigv4_signs_request_and_strips_mantle_headers(
-    ) -> Result<()> {
-        let _lock = ENV_LOCK.lock().expect("env lock");
-        let _access_key = EnvVarGuard::set_str("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
-        let _secret_key = EnvVarGuard::set_str(
-            "AWS_SECRET_ACCESS_KEY",
-            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
-        );
-        let _session_token = EnvVarGuard::set_str("AWS_SESSION_TOKEN", "session-token");
-        let _metadata_disabled = EnvVarGuard::set_str("AWS_EC2_METADATA_DISABLED", "true");
-        let _profile = EnvVarGuard::remove("AWS_PROFILE");
-        let _region = EnvVarGuard::remove("AWS_REGION");
-        let _default_region = EnvVarGuard::remove("AWS_DEFAULT_REGION");
-        let _config_file =
-            EnvVarGuard::set_str("AWS_CONFIG_FILE", "/tmp/browser-use-empty-aws-config");
-        let _credentials_file = EnvVarGuard::set_str(
-            "AWS_SHARED_CREDENTIALS_FILE",
-            "/tmp/browser-use-empty-aws-credentials",
-        );
-
-        let (base_url, headers_rx, handle) =
-            spawn_request_header_capture_server(MockHttpResponse::new(
-                200,
-                "OK",
-                codex_completed_sse("bedrock_resp"),
-                "text/event-stream",
-            ))?;
-        let provider =
-            OpenAIResponsesProvider::with_optional_api_key(None, "openai.gpt-5.4", base_url)
-                .with_provider_name(AMAZON_BEDROCK_PROVIDER_ID)
-                .with_request_options(ProviderRequestOptions {
-                    query_params: Vec::new(),
-                    headers: HashMap::from([(
-                        "x-amzn-mantle-client-agent".to_string(),
-                        "codex".to_string(),
-                    )]),
-                })
-                .with_amazon_bedrock_sigv4_auth_for_test(AmazonBedrockAwsAuthConfig {
-                    profile: None,
-                    region: Some("us-west-2".to_string()),
-                })?;
-        let events = provider.start_turn(ProviderTurn {
-            messages: vec![json!({"role": "user", "content": "finish"})],
-            extra_headers: Some(HashMap::from([
-                (
-                    "future_identity_header".to_string(),
-                    "019dae79-15c3-70c3-8736-3219b8602b37".to_string(),
-                ),
-                ("session_id".to_string(), "session".to_string()),
-                ("thread_id".to_string(), "thread".to_string()),
-                ("x-client-request-id".to_string(), "request-id".to_string()),
-            ])),
-            ..ProviderTurn::default()
-        })?;
-        handle.join().expect("mock server thread");
-        let headers = headers_rx.recv().expect("request headers");
-        let headers_lower = headers.to_ascii_lowercase();
-
-        assert!(events.contains(&ModelEvent::Done));
-        assert!(headers_lower.contains("\r\nauthorization: aws4-hmac-sha256 "));
-        assert!(headers_lower.contains("credential=akidexample/"));
-        assert!(headers_lower.contains("/us-west-2/bedrock-mantle/aws4_request"));
-        assert!(headers_lower.contains("\r\nx-amz-date: "));
-        assert!(headers_lower.contains("\r\nx-amz-security-token: session-token\r\n"));
-        assert!(headers_lower.contains("\r\nx-amzn-mantle-client-agent: codex\r\n"));
-        assert!(headers_lower.contains("\r\nx-client-request-id: request-id\r\n"));
-        assert!(!headers_lower.contains("\r\nauthorization: bearer "));
-        assert!(!headers_lower.contains("\r\nfuture_identity_header:"));
-        assert!(!headers_lower.contains("\r\nsession_id:"));
-        assert!(!headers_lower.contains("\r\nthread_id:"));
-        Ok(())
-    }
-
-    #[test]
     fn openai_responses_provider_serializes_model_request_settings() -> Result<()> {
         let response_body = json!({
             "id": "resp_123",
@@ -8987,6 +8797,9 @@ mod tests {
                     "supports_parallel_tool_calls": true,
                     "supports_search_tool": true,
                     "supports_image_detail_original": true,
+                    "shell_type": "disabled",
+                    "web_search_tool_type": "text_and_image",
+                    "experimental_supported_tools": ["image_generation"],
                     "context_window": 1000,
                     "max_context_window": 2000,
                     "auto_compact_token_limit": 800,
@@ -9011,6 +8824,9 @@ mod tests {
         assert!(info.supports_parallel_tool_calls);
         assert!(info.supports_search_tool);
         assert!(info.supports_image_detail_original);
+        assert_eq!(info.shell_type, ModelShellType::Disabled);
+        assert_eq!(info.web_search_tool_type, WebSearchToolType::TextAndImage);
+        assert_eq!(info.experimental_supported_tools, vec!["image_generation"]);
         assert_eq!(info.resolved_context_window(), Some(1000));
         assert_eq!(info.auto_compact_token_limit(), Some(800));
         assert_eq!(info.tool_output_token_budget(), 123);
@@ -10798,7 +10614,7 @@ mod tests {
         status: u16,
         reason: &'static str,
         body: String,
-        content_type: &'static str,
+        content_type: Option<&'static str>,
         headers: Vec<(&'static str, &'static str)>,
     }
 
@@ -10813,9 +10629,14 @@ mod tests {
                 status,
                 reason,
                 body: body.into(),
-                content_type,
+                content_type: Some(content_type),
                 headers: Vec::new(),
             }
+        }
+
+        fn without_content_type(mut self) -> Self {
+            self.content_type = None;
+            self
         }
 
         fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
@@ -10825,21 +10646,20 @@ mod tests {
     }
 
     fn mock_http_response_bytes(response: &MockHttpResponse) -> String {
+        let content_type_header = response
+            .content_type
+            .map(|content_type| format!("Content-Type: {content_type}\r\n"))
+            .unwrap_or_default();
         let extra_headers = response
             .headers
             .iter()
             .map(|(name, value)| format!("{name}: {value}\r\n"))
             .collect::<String>();
-        let content_type = if response.content_type.is_empty() {
-            String::new()
-        } else {
-            format!("Content-Type: {}\r\n", response.content_type)
-        };
         format!(
             "HTTP/1.1 {} {}\r\n{}{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
             response.status,
             response.reason,
-            content_type,
+            content_type_header,
             extra_headers,
             response.body.len(),
             response.body

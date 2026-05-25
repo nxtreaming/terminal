@@ -15,10 +15,11 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use browser_use_core::{
-    configured_model_for_cwd_with_options, configured_model_provider_id_for_cwd_with_options,
-    default_model_for_cwd_with_options, install_process_crypto_provider,
-    model_catalog_for_cwd_with_options, parse_config_overrides, product_analytics, AgentRunOptions,
-    CollaborationModeKind, ConfigOverrides,
+    cleanup_unified_exec_commands_for_agent_subtree, configured_model_for_cwd_with_options,
+    configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
+    install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
+    product_analytics, typed_user_input_payload_from_text_for_cwd, AgentRunOptions,
+    CollaborationModeKind, ConfigOverrides, UnifiedExecShutdownCleanup,
 };
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
@@ -271,6 +272,7 @@ pub(crate) struct RequestUserInputQuestion {
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct PendingRequestUserInput {
     pub(crate) call_id: String,
+    pub(crate) turn_id: String,
     pub(crate) questions: Vec<RequestUserInputQuestion>,
 }
 
@@ -292,6 +294,7 @@ pub(crate) struct RequestUserInputAnswerDraft {
 pub(crate) struct RequestUserInputState {
     pub(crate) session_id: String,
     pub(crate) call_id: String,
+    pub(crate) turn_id: String,
     pub(crate) current_idx: usize,
     pub(crate) focus: RequestUserInputFocus,
     pub(crate) answers: Vec<RequestUserInputAnswerDraft>,
@@ -830,16 +833,25 @@ fn pending_request_user_input_from_events(
         .map(|idx| idx.saturating_add(1))
         .unwrap_or(0);
     let recent_events = &events[start_idx..];
-    let answered = recent_events
+    let mut answered = HashSet::new();
+    for event in recent_events
         .iter()
         .filter(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
-        .filter_map(|event| {
-            event
-                .payload
-                .get("call_id")
-                .and_then(serde_json::Value::as_str)
-        })
-        .collect::<HashSet<_>>();
+    {
+        if let Some(turn_id) = event
+            .payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            answered.insert(turn_id);
+        } else if let Some(call_id) = event
+            .payload
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)
+        {
+            answered.insert(call_id);
+        }
+    }
     recent_events.iter().find_map(|event| {
         if event.event_type != REQUEST_USER_INPUT_REQUEST_EVENT {
             return None;
@@ -848,13 +860,19 @@ fn pending_request_user_input_from_events(
             .payload
             .get("call_id")
             .and_then(serde_json::Value::as_str)?;
-        if answered.contains(call_id) {
+        let turn_id = event
+            .payload
+            .get("turn_id")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or(call_id);
+        if answered.contains(turn_id) || answered.contains(call_id) {
             return None;
         }
         let questions = event.payload.get("questions")?.clone();
         let questions = serde_json::from_value::<Vec<RequestUserInputQuestion>>(questions).ok()?;
         Some(Some(PendingRequestUserInput {
             call_id: call_id.to_string(),
+            turn_id: turn_id.to_string(),
             questions,
         }))
     })?
@@ -878,6 +896,7 @@ impl RequestUserInputState {
         Self {
             session_id,
             call_id: request.call_id.clone(),
+            turn_id: request.turn_id.clone(),
             current_idx: 0,
             focus: RequestUserInputFocus::Options,
             answers,
@@ -948,7 +967,8 @@ fn request_user_input_state_response_payload(
         );
     }
     serde_json::json!({
-        "call_id": request.call_id,
+        "turn_id": request.turn_id.clone(),
+        "call_id": request.call_id.clone(),
         "questions": request.questions.clone(),
         "answers": answers,
     })
@@ -970,7 +990,8 @@ fn request_user_input_response_payload(
         );
     }
     serde_json::json!({
-        "call_id": request.call_id,
+        "turn_id": request.turn_id.clone(),
+        "call_id": request.call_id.clone(),
         "questions": request.questions.clone(),
         "answers": answers,
     })
@@ -1525,7 +1546,11 @@ impl App {
     ) -> RequestUserInputState {
         self.request_input
             .as_ref()
-            .filter(|state| state.session_id == session_id && state.call_id == request.call_id)
+            .filter(|state| {
+                state.session_id == session_id
+                    && state.call_id == request.call_id
+                    && state.turn_id == request.turn_id
+            })
             .cloned()
             .unwrap_or_else(|| RequestUserInputState::new(session_id.to_string(), request))
     }
@@ -1534,6 +1559,7 @@ impl App {
         let should_reset = self.request_input.as_ref().is_none_or(|state| {
             state.session_id != session_id
                 || state.call_id != request.call_id
+                || state.turn_id != request.turn_id
                 || state.answers.len() != request.questions.len()
         });
         if should_reset {
@@ -2106,7 +2132,7 @@ impl App {
             let text = self.composer.take_trimmed();
             self.dispatch(AppCommand::AnswerRequestUserInput {
                 session_id,
-                call_id: request.call_id,
+                call_id: request.turn_id,
                 text,
             })?;
             return Ok(());
@@ -2240,7 +2266,8 @@ impl App {
                 if !self.ensure_agent_ready_for_selection(&selection)? {
                     return Ok(());
                 }
-                let session = self.store.create_session(None, std::env::current_dir()?)?;
+                let cwd = std::env::current_dir()?;
+                let session = self.store.create_session(None, &cwd)?;
                 self.append_session_model_selection(&session.id, &selection)?;
                 let options = self.configured_agent_options()?;
                 browser_use_core::append_workspace_context_event_with_options(
@@ -2251,7 +2278,7 @@ impl App {
                 self.store.append_event(
                     &session.id,
                     "session.input",
-                    serde_json::json!({ "text": text }),
+                    typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
                 )?;
                 self.selected_session_id = Some(session.id.clone());
                 self.native_history.reset_with_clear();
@@ -2268,10 +2295,14 @@ impl App {
                         return Ok(());
                     }
                 }
+                let session = self
+                    .store
+                    .load_session(&session_id)?
+                    .with_context(|| format!("unknown session id: {session_id}"))?;
                 self.store.append_event(
                     &session_id,
                     "session.followup",
-                    serde_json::json!({ "text": text }),
+                    typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
                 )?;
                 if !active {
                     self.start_agent_for_session(session_id)?;
@@ -2286,7 +2317,7 @@ impl App {
                     self.status_notice = Some("No pending user-input request.".to_string());
                     return Ok(());
                 };
-                if request.call_id != call_id {
+                if request.turn_id != call_id && request.call_id != call_id {
                     self.status_notice =
                         Some("That user-input request is no longer pending.".to_string());
                     return Ok(());
@@ -2422,6 +2453,7 @@ impl App {
             return Ok(false);
         }
         self.store.request_cancel(&id, "stopped from terminal")?;
+        cleanup_unified_exec_commands_for_agent_subtree(&self.store, &id)?;
         Ok(true)
     }
 
@@ -4513,6 +4545,7 @@ fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
 
 fn main() -> Result<()> {
     install_process_crypto_provider();
+    let _unified_exec_cleanup = UnifiedExecShutdownCleanup::new();
     install_agent_panic_hook();
     load_dotenv()?;
     let args = Args::parse();
@@ -5863,6 +5896,79 @@ mod redesign_tests {
     }
 
     #[test]
+    fn tui_start_task_persists_typed_input_payload_for_linked_mentions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.dispatch(AppCommand::StartTask(
+            "check [$Calendar](app://calendar)".to_string(),
+        ))?;
+
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session")?;
+        let input = app
+            .store
+            .events_for_session(&session_id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert_eq!(
+            input.payload["app_connector_ids"],
+            serde_json::json!(["calendar"])
+        );
+        assert!(!input.payload["content"]
+            .as_array()
+            .context("input content")?
+            .iter()
+            .any(|part| part["text"].as_str().unwrap_or_default().contains("app://")));
+        Ok(())
+    }
+
+    #[test]
+    fn tui_followup_persists_typed_input_payload_for_linked_mentions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "existing turn"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "then use [@Notes](plugin://notes@example)".to_string(),
+        })?;
+
+        let followup = app
+            .store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.followup")
+            .context("session.followup")?;
+        assert_eq!(
+            followup.payload["plugin_mentions"][0]["path"],
+            "plugin://notes@example"
+        );
+        assert!(!followup.payload["content"]
+            .as_array()
+            .context("followup content")?
+            .iter()
+            .any(|part| part["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("plugin://")));
+        Ok(())
+    }
+
+    #[test]
     fn request_user_input_submit_answers_pending_request_not_followup() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -5877,6 +5983,7 @@ mod redesign_tests {
             &session.id,
             REQUEST_USER_INPUT_REQUEST_EVENT,
             serde_json::json!({
+                "turn_id": "turn-current",
                 "call_id": "ask_scope",
                 "questions": [{
                     "id": "scope",
@@ -5913,12 +6020,63 @@ mod redesign_tests {
             .iter()
             .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
             .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["turn_id"],
+            serde_json::json!("turn-current")
+        );
         assert_eq!(response.payload["call_id"], serde_json::json!("ask_scope"));
         assert_eq!(
             response.payload["answers"]["scope"]["answers"],
             serde_json::json!(["Build now"])
         );
         assert!(app.composer.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_pending_prefers_turn_id_over_stale_call_id_response() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "turn_id": "turn-current",
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_RESPONSE_EVENT,
+            serde_json::json!({
+                "turn_id": "turn-stale",
+                "call_id": "ask_scope",
+                "answers": {
+                    "scope": {
+                        "answers": ["Plan (Recommended)"]
+                    }
+                }
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        let pending = app
+            .pending_request_user_input(&session.id)
+            .context("pending request")?;
+        assert_eq!(pending.turn_id, "turn-current");
+        assert_eq!(pending.call_id, "ask_scope");
         Ok(())
     }
 
@@ -6791,6 +6949,70 @@ mod redesign_tests {
         let composer_row = row_containing(&completed_screen, "Ask a follow-up...");
         let result_row = row_containing(&completed_screen, "Everything should sit near the top.");
         assert!(composer_row > result_row);
+        Ok(())
+    }
+
+    #[test]
+    fn composer_context_bar_uses_latest_token_count_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect token count"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Context accounting is visible."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.usage",
+            serde_json::json!({"input_tokens": 999, "cost_usd": 0.0123}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": {
+                    "last_token_usage": {
+                        "input_tokens": 0,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 0,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 12345
+                    },
+                    "total_token_usage": {
+                        "input_tokens": 20,
+                        "cached_input_tokens": 0,
+                        "output_tokens": 10,
+                        "reasoning_output_tokens": 0,
+                        "total_tokens": 30
+                    },
+                    "model_context_window": 100000
+                },
+                "rate_limits": null,
+                "turn_idx": 0
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "token_count",
+            serde_json::json!({
+                "info": null,
+                "rate_limits": {"limit_id": "codex"},
+                "turn_idx": 0
+            }),
+        )?;
+
+        app.selected_session_id = Some(session.id);
+        let screen = render_dump(&mut app)?;
+
+        assert!(screen.contains("12.3k/100k"));
+        assert!(!screen.contains("999/60k"));
+        assert!(screen.contains("$0.0123"));
         Ok(())
     }
 
@@ -8994,15 +9216,15 @@ wire_api = "responses"
             &session.id,
             "browser.state",
             serde_json::json!({
-                "title": "Amazon Web Services Sign-In",
+                "title": "Example Account Sign-In",
                 "tabs": 2,
-                "url": "https://signin.aws.amazon.com/signin?redirect_uri=https%3A%2F%2Faws.amazon.com%2Fmarketplace%2Fmanagement%2Fseller-settings%2Faccount%2Fcustom-notification-submitted%3F%26isauthcode%3Dtrue&client_id=arn%3Aaws%3Aiam%3A%3A015428540659%3Auser%2Fawsmp-contessa&forceMobileApp=0",
+                "url": "https://accounts.example.com/signin?redirect_uri=https%3A%2F%2Fconsole.example.com%2Fworkspace%2Fmanagement%2Fsettings%2Fnotifications%2Fcustom-notification-submitted%3F%26isauthcode%3Dtrue&client_id=example-client-id-with-a-long-value&forceMobileApp=0",
             }),
         )?;
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("signin.aws.amazon.com/signin?..."));
+        assert!(screen.contains("accounts.example.com/signin?..."));
         assert!(!screen.contains("redirect_uri=https"));
         Ok(())
     }

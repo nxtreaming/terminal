@@ -10,19 +10,21 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
     append_workspace_context_event, canonical_agent_path_from_task_name, canonical_agent_reference,
-    collect_agent_tree, configured_model_provider_id_for_cwd_with_options,
-    default_model_for_cwd_with_options, display_agent_path_for_session, final_statuses_for_v1_wait,
-    install_process_crypto_provider, last_task_message_for_agent, local_agent_status_value,
-    model_catalog_for_cwd_with_options, parse_config_overrides, product_analytics,
-    record_browser_script_response_events, record_python_response_final_event,
-    record_python_worker_event, resolve_agent_reference_in_tree, root_session_id,
-    run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
-    run_fake_agent, update_parent_from_child_run, AgentRunOptions, CollaborationModeKind,
-    ConfigOverrides, FakeAgentOptions, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    cleanup_unified_exec_commands_for_agent_subtree, collect_agent_tree,
+    configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
+    display_agent_path_for_session, final_statuses_for_v1_wait, install_process_crypto_provider,
+    last_task_message_for_agent, local_agent_status_value, model_catalog_for_cwd_with_options,
+    parse_config_overrides, product_analytics, record_browser_script_response_events,
+    record_python_response_final_event, record_python_worker_event,
+    resolve_agent_reference_in_tree, root_session_id, run_agent_from_config,
+    run_existing_session_from_config, run_existing_session_with_provider, run_fake_agent,
+    typed_user_input_payload_from_text_for_cwd, update_parent_from_child_run, AgentRunOptions,
+    CollaborationModeKind, ConfigOverrides, FakeAgentOptions, ProviderBackend, ProviderRunConfig,
+    RunConfigValueSource, UnifiedExecShutdownCleanup,
 };
 use browser_use_protocol::{
-    browser_summary_from_events, failure_from_events, result_from_events,
-    sanitized_agent_context_from_events, task_from_events,
+    browser_summary_from_events, failure_from_events, sanitized_agent_context_from_events,
+    session_result_from_events, task_from_events,
 };
 use browser_use_providers::{
     claude_code_oauth_authorize_url, claude_code_oauth_pkce,
@@ -560,6 +562,7 @@ struct DatasetTaskPaths {
 
 fn main() -> Result<()> {
     install_process_crypto_provider();
+    let _unified_exec_cleanup = UnifiedExecShutdownCleanup::new();
     load_dotenv()?;
     let mut args = Args::parse();
     args.state_dir = resolve_state_dir(&args.state_dir);
@@ -1141,11 +1144,12 @@ fn sessions(store: &Store, command: SessionsCommand) -> Result<()> {
 }
 
 fn start(store: &Store, text: String) -> Result<()> {
-    let task = store.create_session(None, std::env::current_dir()?)?;
+    let cwd = std::env::current_dir()?;
+    let task = store.create_session(None, &cwd)?;
     store.append_event(
         &task.id,
         "session.input",
-        serde_json::json!({ "text": text }),
+        typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
     println!("{}", task.id);
     Ok(())
@@ -1480,11 +1484,11 @@ fn notify_parent_after_cli_child_run(
 }
 
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
-    ensure_task_exists(store, task_id)?;
+    let session = ensure_task_exists(store, task_id)?;
     store.append_event(
         task_id,
         "session.followup",
-        serde_json::json!({ "text": text }),
+        typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
     )?;
     println!("followup {task_id}");
     Ok(())
@@ -1505,6 +1509,7 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
 fn cancel(store: &Store, task_id: &str, reason: &str) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     store.request_cancel(task_id, reason)?;
+    cleanup_unified_exec_commands_for_agent_subtree(store, task_id)?;
     notify_parent_agent_done(store, &task)?;
     println!("cancelled {task_id}");
     Ok(())
@@ -1546,7 +1551,7 @@ fn show(store: &Store, task_id: &str) -> Result<()> {
     if let Some(url) = browser.url {
         println!("Browser: {url}");
     }
-    if let Some(result) = result_from_events(&events) {
+    if let Some(result) = session_result_from_events(&events) {
         println!();
         println!("Result");
         println!("{result}");
@@ -2588,7 +2593,7 @@ fn spawn_agent(
     store.append_event(
         &child.id,
         "session.input",
-        serde_json::json!({ "text": message }),
+        typed_user_input_payload_from_text_for_cwd(&message, &child.cwd)?,
     )?;
     store.append_event(
         parent_id,
@@ -2694,6 +2699,7 @@ fn close_agent(store: &Store, current_id: Option<&str>, target: &str, reason: &s
         .agent_summary_for_child(&child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
     let previous_status = local_agent_status_value(store, &child, Some(&summary))?;
+    cleanup_unified_exec_commands_for_agent_subtree(store, &child_id)?;
     store.close_child_agent(&child_id, reason)?;
     store.append_event(
         &summary.parent_session_id,
@@ -3380,10 +3386,14 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         browser_mode: Some(config.browser_mode.clone()),
         collaboration_mode: AgentRunOptions::default().collaboration_mode,
         include_environment_context: true,
+        include_permissions_instructions: true,
         environment_context_environments: Vec::new(),
         environment_context_network: None,
         config_profile: None,
         config_overrides: Vec::new(),
+        session_thread_config: None,
+        base_instructions: None,
+        developer_instructions: None,
         model_provider_id: Some(config.provider.clone()),
         model_provider_id_source: RunConfigValueSource::Explicit,
         python_tool_timeout_seconds: config.python_timeout_seconds,
@@ -3434,7 +3444,7 @@ fn dataset_attempt_result(
 ) -> Result<Value> {
     let session = ensure_task_exists(store, session_id)?;
     let events = store.events_for_session(session_id)?;
-    let final_result = result_from_events(&events);
+    let final_result = session_result_from_events(&events);
     let final_result_chars = final_result.as_deref().map(str::len).unwrap_or(0);
     let usage = usage_summary_from_events(&events);
     let session_failure = failure_from_events(&events);
@@ -4523,6 +4533,106 @@ mod tests {
         assert!(err
             .to_string()
             .contains("either --task-name or --path, not both"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_start_and_followup_persist_typed_input_payload_for_linked_mentions() -> Result<()> {
+        let temp = unique_cli_test_dir("typed-input-start-followup")?;
+        let state_dir = temp.join("state");
+        let store = Store::open(&state_dir)?;
+
+        start(
+            &store,
+            "check [$Calendar](app://calendar) availability".to_string(),
+        )?;
+        let session = store
+            .list_sessions()?
+            .into_iter()
+            .next()
+            .context("created session")?;
+        let input = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert_eq!(
+            input.payload["app_connector_ids"],
+            serde_json::json!(["calendar"])
+        );
+        assert!(!input.payload["content"]
+            .as_array()
+            .context("input content")?
+            .iter()
+            .any(|part| part["text"].as_str().unwrap_or_default().contains("app://")));
+
+        followup(
+            &store,
+            &session.id,
+            "then use [@Notes](plugin://notes@example)".to_string(),
+        )?;
+        let followup = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.followup")
+            .context("session.followup")?;
+        assert_eq!(
+            followup.payload["plugin_mentions"][0]["path"],
+            "plugin://notes@example"
+        );
+        assert!(!followup.payload["content"]
+            .as_array()
+            .context("followup content")?
+            .iter()
+            .any(|part| part["text"]
+                .as_str()
+                .unwrap_or_default()
+                .contains("plugin://")));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_spawn_agent_uses_typed_payload_for_child_input() -> Result<()> {
+        let temp = unique_cli_test_dir("spawn-agent-typed-input")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+
+        spawn_agent(
+            &store,
+            &parent.id,
+            "inspect [$Calendar](app://calendar)".to_string(),
+            Some("typed_child".to_string()),
+            None,
+            None,
+            None,
+        )?;
+
+        let child = store
+            .list_child_agents(&parent.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        let input = store
+            .events_for_session(&child.child_session_id)?
+            .into_iter()
+            .find(|event| event.event_type == "session.input")
+            .context("child session.input")?;
+        assert_eq!(
+            input.payload["app_connector_ids"],
+            serde_json::json!(["calendar"])
+        );
+        assert!(!input.payload["content"]
+            .as_array()
+            .context("child input content")?
+            .iter()
+            .any(|part| part["text"].as_str().unwrap_or_default().contains("app://")));
 
         std::fs::remove_dir_all(temp)?;
         Ok(())

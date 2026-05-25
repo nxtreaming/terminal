@@ -388,19 +388,30 @@ pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
 }
 
 pub fn result_from_events(events: &[EventRecord]) -> Option<String> {
+    session_result_from_events(events).or_else(|| {
+        events
+            .iter()
+            .rev()
+            .find_map(|event| match event.event_type.as_str() {
+                "agent.completed" => event
+                    .payload
+                    .get("payload")
+                    .and_then(|payload| payload.get("result"))
+                    .and_then(Value::as_str)
+                    .map(str::trim)
+                    .filter(|result| !result.is_empty())
+                    .map(normalize_result_text),
+                _ => None,
+            })
+    })
+}
+
+pub fn session_result_from_events(events: &[EventRecord]) -> Option<String> {
     events
         .iter()
         .rev()
         .find_map(|event| match event.event_type.as_str() {
             "session.done" => session_done_result_text(&event.payload),
-            "agent.completed" => event
-                .payload
-                .get("payload")
-                .and_then(|payload| payload.get("result"))
-                .and_then(Value::as_str)
-                .map(str::trim)
-                .filter(|result| !result.is_empty())
-                .map(normalize_result_text),
             _ => None,
         })
 }
@@ -844,7 +855,7 @@ pub fn sanitized_agent_context_from_events(events: &[EventRecord]) -> Value {
     }
     serde_json::json!({
         "task": task_from_events(events),
-        "result": result_from_events(events),
+        "result": session_result_from_events(events),
         "failure": failure_from_events(events),
         "browser": {
             "status": browser.status,
@@ -1172,7 +1183,7 @@ pub fn project_workbench(
         .as_ref()
         .is_some_and(|session| session.status == SessionStatus::Done)
     {
-        result_from_events(events_for_current)
+        session_result_from_events(events_for_current)
     } else {
         None
     };
@@ -1431,6 +1442,44 @@ mod tests {
             payload: json!({"result": format!("{answer}{answer}")}),
         }];
         assert_eq!(result_from_events(&events).as_deref(), Some(answer));
+    }
+
+    #[test]
+    fn session_result_ignores_subagent_completion_after_done() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "e1".to_string(),
+                session_id: "parent".to_string(),
+                ts_ms: 1,
+                event_type: "session.done".to_string(),
+                payload: json!({"result": "parent answer"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "e2".to_string(),
+                session_id: "parent".to_string(),
+                ts_ms: 2,
+                event_type: "agent.completed".to_string(),
+                payload: json!({
+                    "child_session_id": "child",
+                    "status": "done",
+                    "payload": {"result": "child answer"},
+                }),
+            },
+        ];
+
+        assert_eq!(
+            session_result_from_events(&events).as_deref(),
+            Some("parent answer")
+        );
+        assert_eq!(
+            result_from_events(&events).as_deref(),
+            Some("parent answer")
+        );
+
+        let context = sanitized_agent_context_from_events(&events);
+        assert_eq!(context["result"], "parent answer");
     }
 
     #[test]

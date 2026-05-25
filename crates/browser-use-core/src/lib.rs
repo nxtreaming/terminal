@@ -14,23 +14,24 @@ mod tools;
 use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{
-    failure_from_events, result_from_events, sanitized_agent_context_from_events, EventRecord,
-    ModelEvent, SessionMeta, SessionStatus, ToolCall, ToolSpec,
+    failure_from_events, sanitized_agent_context_from_events, session_result_from_events,
+    EventRecord, ModelEvent, SessionMeta, SessionStatus, ToolCall, ToolSpec,
 };
 use browser_use_providers::{
-    amazon_bedrock_mantle_base_url, amazon_bedrock_model_catalog, bundled_model_catalog,
-    default_agent_instructions, default_agent_instructions_for_model_and_personality_with_catalog,
+    bundled_model_catalog, default_agent_instructions,
+    default_agent_instructions_for_model_and_personality_with_catalog,
     default_agent_instructions_for_personality, default_permissions_instructions,
     default_personality_message_for_model_and_personality_with_catalog, load_codex_auth,
     model_request_info_for_catalog, model_supported_service_tiers_for_catalog,
     model_supports_original_image_detail_for_catalog, model_supports_service_tier_for_catalog,
     model_switch_request_settings_for_model_with_catalog, refresh_claude_code_oauth,
-    spawn_agent_model_overrides_description_for_catalog, AmazonBedrockAwsAuthConfig,
-    AnthropicMessagesProvider, ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth,
-    CodexResponsesProvider, FakeProvider, ModelCatalog, ModelCatalogEntryInfo, ModelPersonality,
-    ModelProvider, ModelRequestSettings, OpenAICompatibleChatProvider, OpenAIResponsesProvider,
+    spawn_agent_model_overrides_description_for_catalog, AnthropicMessagesProvider,
+    ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth, CodexResponsesProvider, FakeProvider,
+    HostedToolSpec, ModelCatalog, ModelCatalogEntryInfo, ModelPersonality, ModelProvider,
+    ModelRequestSettings, OpenAICompatibleChatProvider, OpenAIResponsesProvider,
     ProviderCommandAuth, ProviderCommandAuthConfig, ProviderError, ProviderRequestOptions,
-    ProviderTurn, ScriptedProvider,
+    ProviderTurn, ScriptedProvider, WebSearchContextSize, WebSearchLocation, WebSearchMode,
+    WebSearchToolConfig,
 };
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::{now_ms, AgentSummary, Store};
@@ -40,13 +41,16 @@ use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use telemetry::{AgentTelemetry, ModelTurnSpanInput};
 use tools::{
-    MultiAgentToolFamily, MultiAgentToolSpecConfig, SpawnAgentRoleDescription, ToolHandlerKind,
-    ToolRegistry,
+    MultiAgentToolFamily, MultiAgentToolSpecConfig, ShellToolSpecConfig, SpawnAgentRoleDescription,
+    ToolHandlerKind, ToolRegistry,
 };
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DEFAULT_TOOL_OUTPUT_TEXT_TOKENS: usize = 2_500;
 const IMAGE_CONTEXT_BUDGET_TOKENS: usize = 2_000;
+const RESIZED_IMAGE_CONTEXT_BYTES_ESTIMATE: usize = 7_373;
+const ORIGINAL_IMAGE_PATCH_SIZE: usize = 32;
+const ORIGINAL_IMAGE_MAX_PATCHES: usize = 10_000;
 const MAX_REQUEST_MAX_RETRIES: usize = 100;
 const DEFAULT_STREAM_MAX_RETRIES: usize = 5;
 const MAX_STREAM_MAX_RETRIES: usize = 100;
@@ -68,7 +72,12 @@ const MULTI_AGENT_USAGE_HINT_CONTEXT_MESSAGE_NAME: &str = "multi_agent_usage_hin
 const MODEL_SWITCH_CONTEXT_MESSAGE_NAME: &str = "model_switch_context";
 const PERSONALITY_CONTEXT_MESSAGE_NAME: &str = "personality_context";
 const COLLABORATION_CONTEXT_MESSAGE_NAME: &str = "collaboration_context";
+const MENTION_CONTEXT_MESSAGE_NAME: &str = "typed_mention_context";
+const GENERATED_IMAGE_CONTEXT_MESSAGE_NAME: &str = "generated_image_context";
 const COLLABORATION_CONTEXT_EVENT: &str = "model.collaboration_context";
+const GENERATED_IMAGE_CONTEXT_EVENT: &str = "model.generated_image_context";
+const PLUGINS_INSTRUCTIONS_OPEN_TAG: &str = "<plugins_instructions>";
+const PLUGINS_INSTRUCTIONS_CLOSE_TAG: &str = "</plugins_instructions>";
 const SESSION_COLLABORATION_MODE_EVENT: &str = "session.collaboration_mode";
 const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
 const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
@@ -84,6 +93,7 @@ const WORKSPACE_CONTEXT_PERMISSIONS_KIND: &str = "permissions";
 const WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND: &str = "multi_agent_v2_usage_hint";
 const WORKSPACE_CONTEXT_AGENTS_KIND: &str = "agents_md";
 const WORKSPACE_CONTEXT_ENVIRONMENT_KIND: &str = "environment_context";
+const GENERATED_IMAGE_ARTIFACTS_DIR: &str = "generated_images";
 const SESSION_STARTUP_WARNING_EVENT: &str = "session.startup_warning";
 const SESSION_INSTRUCTION_SOURCES_EVENT: &str = "session.instruction_sources";
 const SESSION_BASE_INSTRUCTIONS_EVENT: &str = "session.base_instructions";
@@ -130,20 +140,15 @@ const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 const DEFAULT_PROJECT_ROOT_MARKER: &str = ".git";
 const CODEX_CONFIG_FILENAME: &str = "config.toml";
 const CODEX_PROFILE_CONFIG_SUFFIX: &str = ".config.toml";
+const CODEX_PLUGIN_CACHE_DIR: &str = "plugins/cache";
+const CODEX_CURATED_PLUGINS_DIR: &str = ".tmp/plugins/plugins";
 const CODEX_MODELS_CACHE_FILENAME: &str = "models_cache.json";
 const CODEX_MODELS_CACHE_TTL_SECONDS: i64 = 300;
-const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
-const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
-const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
-const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
-const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
-const AWS_BEARER_TOKEN_BEDROCK_ENV_VAR: &str = "AWS_BEARER_TOKEN_BEDROCK";
 const OPENAI_MODEL_PROVIDER_ID: &str = "openai";
 const OLLAMA_MODEL_PROVIDER_ID: &str = "ollama";
 const LMSTUDIO_MODEL_PROVIDER_ID: &str = "lmstudio";
 const RESERVED_CUSTOM_MODEL_PROVIDER_IDS: &[&str] = &[
     OPENAI_MODEL_PROVIDER_ID,
-    AMAZON_BEDROCK_PROVIDER_ID,
     OLLAMA_MODEL_PROVIDER_ID,
     LMSTUDIO_MODEL_PROVIDER_ID,
 ];
@@ -186,7 +191,6 @@ const CODEX_ADVERTISED_BETA_FEATURE_DEFAULTS: &[(&str, bool)] = &[
     ("external_migration", false),
     ("mentions_v2", false),
     ("prevent_idle_sleep", false),
-    ("remote_compaction_v2", false),
 ];
 static TOOL_OUTPUT_ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
@@ -451,10 +455,14 @@ pub struct AgentRunOptions {
     pub browser_mode: Option<String>,
     pub collaboration_mode: CollaborationModeKind,
     pub include_environment_context: bool,
+    pub include_permissions_instructions: bool,
     pub environment_context_environments: Vec<EnvironmentContextEnvironment>,
     pub environment_context_network: Option<EnvironmentNetworkContext>,
     pub config_profile: Option<String>,
     pub config_overrides: ConfigOverrides,
+    pub session_thread_config: Option<toml::Value>,
+    pub base_instructions: Option<String>,
+    pub developer_instructions: Option<String>,
     pub model_provider_id: Option<String>,
     pub model_provider_id_source: RunConfigValueSource,
     pub python_tool_timeout_seconds: u64,
@@ -475,10 +483,14 @@ impl Default for AgentRunOptions {
             browser_mode: None,
             collaboration_mode: CollaborationModeKind::Default,
             include_environment_context: true,
+            include_permissions_instructions: true,
             environment_context_environments: Vec::new(),
             environment_context_network: None,
             config_profile: None,
             config_overrides: Vec::new(),
+            session_thread_config: None,
+            base_instructions: None,
+            developer_instructions: None,
             model_provider_id: None,
             model_provider_id_source: RunConfigValueSource::Default,
             python_tool_timeout_seconds: 120,
@@ -509,6 +521,11 @@ impl AgentRunOptions {
         self
     }
 
+    pub fn with_include_permissions_instructions(mut self, include: bool) -> Self {
+        self.include_permissions_instructions = include;
+        self
+    }
+
     pub fn with_environment_context_environments(
         mut self,
         environments: Vec<EnvironmentContextEnvironment>,
@@ -529,6 +546,29 @@ impl AgentRunOptions {
 
     pub fn with_config_overrides(mut self, overrides: Vec<(String, toml::Value)>) -> Self {
         self.config_overrides = overrides;
+        self
+    }
+
+    pub fn with_session_thread_config(mut self, config: toml::Value) -> Self {
+        self.session_thread_config = Some(config);
+        self
+    }
+
+    pub fn with_session_thread_config_overrides(
+        mut self,
+        overrides: Vec<(String, toml::Value)>,
+    ) -> Self {
+        self.session_thread_config = Some(build_config_overrides_layer(&overrides));
+        self
+    }
+
+    pub fn with_base_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.base_instructions = Some(instructions.into());
+        self
+    }
+
+    pub fn with_developer_instructions(mut self, instructions: impl Into<String>) -> Self {
+        self.developer_instructions = Some(instructions.into());
         self
     }
 
@@ -731,24 +771,34 @@ pub fn append_workspace_context_event_with_options(
     };
     let latest_environment_snapshot = || latest_environment_snapshot_from_events(&events);
     let agents_context = if !has_context_kind(WORKSPACE_CONTEXT_AGENTS_KIND) {
-        let config_profile = options.config_profile.as_deref();
-        Some(load_agents_md_context_for_cwd_with_options(
+        Some(load_agents_md_context_for_cwd_with_run_options(
             Path::new(&session.cwd),
-            config_profile,
-            &options.config_overrides,
+            options,
         )?)
     } else {
         None
     };
     let mut appended = false;
-    let config_developer_instructions = agents_context
-        .as_ref()
-        .and_then(|load| load.developer_instructions.as_deref())
+    let config_developer_instructions = options
+        .developer_instructions
+        .as_deref()
+        .or_else(|| {
+            agents_context
+                .as_ref()
+                .and_then(|load| load.developer_instructions.as_deref())
+        })
         .filter(|text| !text.is_empty())
         .map(str::to_string);
+    let config_plugins_instructions = agents_context
+        .as_ref()
+        .and_then(|load| load.plugins_instructions.clone());
     let config_include_environment_context = agents_context
         .as_ref()
         .is_none_or(|load| load.include_environment_context);
+    let config_include_permissions_instructions = options.include_permissions_instructions
+        && agents_context
+            .as_ref()
+            .is_none_or(|load| load.include_permissions_instructions);
     let config_include_collaboration_mode_instructions = agents_context
         .as_ref()
         .is_none_or(|load| load.include_collaboration_mode_instructions);
@@ -757,16 +807,23 @@ pub fn append_workspace_context_event_with_options(
     let multi_agent_v2_usage_hint =
         if !has_context_kind(WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND) {
             if let Some(agents_context) = agents_context.as_ref() {
-                multi_agent_v2_usage_hint_text_for_session(session, &agents_context.multi_agent_v2)
+                multi_agent_v2_usage_hint_text_for_session(
+                    session,
+                    agents_context.multi_agent_enabled,
+                    &agents_context.multi_agent_v2,
+                )
             } else {
                 let mut warnings = Vec::new();
-                let config = load_agents_md_config(
+                let config = load_agents_md_config_for_options(
                     Path::new(&session.cwd),
                     &mut warnings,
-                    options.config_profile.as_deref(),
-                    &options.config_overrides,
+                    options,
                 )?;
-                multi_agent_v2_usage_hint_text_for_session(session, &config.multi_agent_v2)
+                multi_agent_v2_usage_hint_text_for_session(
+                    session,
+                    config.multi_agent_enabled,
+                    &config.multi_agent_v2,
+                )
             }
         } else {
             None
@@ -783,21 +840,32 @@ pub fn append_workspace_context_event_with_options(
         appended = true;
     }
     if !has_context_kind(WORKSPACE_CONTEXT_PERMISSIONS_KIND) {
-        let mut developer_sections = vec![default_permissions_instructions().to_string()];
+        let mut developer_sections = Vec::new();
+        if config_include_permissions_instructions {
+            developer_sections.push(default_permissions_instructions().to_string());
+        }
         if let Some(developer_instructions) = config_developer_instructions {
             developer_sections.push(developer_instructions);
         }
         if let Some(collaboration_context) = collaboration_context.as_ref() {
             developer_sections.push(collaboration_context.clone());
         }
-        store.append_event(
-            &session.id,
-            "workspace.context",
+        if let Some(plugins_instructions) = config_plugins_instructions {
+            developer_sections.push(plugins_instructions);
+        }
+        let payload = if developer_sections.is_empty() {
+            serde_json::json!({
+                "kind": WORKSPACE_CONTEXT_PERMISSIONS_KIND,
+                "suppressed": true,
+            })
+        } else {
             serde_json::json!({
                 "kind": WORKSPACE_CONTEXT_PERMISSIONS_KIND,
                 "content": developer_sections.join("\n\n"),
-            }),
-        )?;
+                "permissions_instructions_included": config_include_permissions_instructions,
+            })
+        };
+        store.append_event(&session.id, "workspace.context", payload)?;
         appended = true;
     } else if let Some(collaboration_context) = collaboration_context.as_ref() {
         let latest_collaboration_context = events.iter().rev().find_map(|event| {
@@ -939,8 +1007,12 @@ pub fn append_workspace_context_event_with_options(
 
 fn multi_agent_v2_usage_hint_text_for_session(
     session: &SessionMeta,
+    multi_agent_enabled: bool,
     config: &MultiAgentV2Config,
 ) -> Option<String> {
+    if !multi_agent_enabled {
+        return None;
+    }
     let hint = if session.parent_id.is_some() {
         config.subagent_usage_hint_text.as_deref()
     } else {
@@ -1008,7 +1080,7 @@ pub fn run_agent_with_provider<P: ModelProvider>(
     store.append_event(
         &session.id,
         "session.input",
-        serde_json::json!({ "text": task_text }),
+        typed_user_input_payload_from_text_for_cwd(task_text, cwd.as_ref())?,
     )?;
     let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
     run_loaded_session_with_provider(store, provider, session, messages, options)
@@ -1025,7 +1097,7 @@ pub fn run_agent_from_config(
     store.append_event(
         &session.id,
         "session.input",
-        serde_json::json!({ "text": task_text }),
+        typed_user_input_payload_from_text_for_cwd(task_text, cwd.as_ref())?,
     )?;
     run_existing_session_from_config(store, &session.id, config)
 }
@@ -1296,27 +1368,8 @@ fn load_provider_config_for_session(
     options: &AgentRunOptions,
 ) -> Result<AgentsMdConfig> {
     let mut warnings = Vec::new();
-    let mut config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
-    let selected_provider_id = options
-        .model_provider_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned)
-        .or_else(|| {
-            config
-                .model_provider_id
-                .as_deref()
-                .map(str::trim)
-                .filter(|value| !value.is_empty())
-                .map(ToOwned::to_owned)
-        });
-    apply_selected_provider_model_catalog(&mut config, selected_provider_id.as_deref());
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(config)
 }
 
@@ -1422,9 +1475,6 @@ fn configured_openai_responses_provider(
     let Some(provider_config) = config.model_providers.get(provider_id) else {
         return Ok(None);
     };
-    if provider_id == AMAZON_BEDROCK_PROVIDER_ID {
-        return configured_amazon_bedrock_responses_provider(model, provider_config).map(Some);
-    }
     let base_url = provider_config
         .base_url
         .clone()
@@ -1452,10 +1502,6 @@ fn configured_openai_responses_provider_from_snapshot(
             snapshot.wire_api
         );
     }
-    if snapshot.id == AMAZON_BEDROCK_PROVIDER_ID {
-        let provider_config = codex_model_provider_config_from_snapshot(snapshot)?;
-        return configured_amazon_bedrock_responses_provider(model, &provider_config);
-    }
     let base_url = snapshot
         .base_url
         .clone()
@@ -1469,55 +1515,6 @@ fn configured_openai_responses_provider_from_snapshot(
         provider = provider.with_command_auth_config(auth.to_config());
     }
     Ok(provider)
-}
-
-fn configured_amazon_bedrock_responses_provider(
-    model: String,
-    provider_config: &CodexModelProviderConfig,
-) -> Result<OpenAIResponsesProvider> {
-    let aws = provider_config.aws.clone().unwrap_or_default();
-    let request_options = provider_request_options(provider_config);
-    if let Some(api_key) = amazon_bedrock_bearer_token_from_env() {
-        let region = amazon_bedrock_region_from_config(&aws)?;
-        let base_url = amazon_bedrock_base_url(&region)?;
-        return Ok(
-            OpenAIResponsesProvider::with_optional_api_key(Some(api_key), model, base_url)
-                .with_provider_name(AMAZON_BEDROCK_PROVIDER_ID)
-                .with_request_options(request_options),
-        );
-    }
-    OpenAIResponsesProvider::with_amazon_bedrock_sigv4_auth(
-        model,
-        AmazonBedrockAwsAuthConfig {
-            profile: aws.profile,
-            region: aws.region,
-        },
-        request_options,
-    )
-}
-
-fn amazon_bedrock_bearer_token_from_env() -> Option<String> {
-    std::env::var(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR)
-        .ok()
-        .map(|token| token.trim().to_string())
-        .filter(|token| !token.is_empty())
-}
-
-fn amazon_bedrock_region_from_config(aws: &ModelProviderAwsAuthInfo) -> Result<String> {
-    aws.region
-        .as_deref()
-        .map(str::trim)
-        .filter(|region| !region.is_empty())
-        .map(ToOwned::to_owned)
-        .with_context(|| {
-            format!(
-                "Amazon Bedrock bearer token auth requires `model_providers.amazon-bedrock.aws.region`"
-            )
-        })
-}
-
-fn amazon_bedrock_base_url(region: &str) -> Result<String> {
-    amazon_bedrock_mantle_base_url(region)
 }
 
 fn provider_api_key(
@@ -1649,7 +1646,6 @@ fn model_provider_info_snapshot(
             .auth
             .as_ref()
             .map(ProviderCommandAuthConfigSnapshot::from_config),
-        aws: provider_config.aws.clone(),
         wire_api: codex_wire_api_key(provider_config.wire_api).to_string(),
         query_params: provider_config.query_params.clone(),
         http_headers: provider_config.http_headers.clone(),
@@ -1686,7 +1682,6 @@ fn codex_model_provider_config_from_snapshot(
             .auth
             .as_ref()
             .map(ProviderCommandAuthConfigSnapshot::to_config),
-        aws: snapshot.aws.clone(),
     })
 }
 
@@ -2296,12 +2291,8 @@ fn codex_beta_features_header_for_session(
     options: &AgentRunOptions,
 ) -> Result<Option<String>> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(config.beta_features_header())
 }
 
@@ -2806,7 +2797,9 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     }));
                 }
                 let mut assistant_text = String::new();
+                let mut assistant_full_text = String::new();
                 let mut tool_calls = Vec::new();
+                let mut assistant_message_tool_calls = Vec::new();
                 let step_span = telemetry.start_step_span(
                     &agent_span,
                     &session.id,
@@ -2820,6 +2813,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &options,
                     provider.model_name(),
                     provider.supports_namespace_tools(),
+                )?;
+                let turn_hosted_tools = hosted_tool_specs_for_session(
+                    &session,
+                    &options,
+                    provider.model_name(),
+                    provider.supports_hosted_web_search(),
+                    provider.supports_hosted_image_generation(),
                 )?;
                 let model_span = telemetry.start_model_turn_span(ModelTurnSpanInput {
                     parent: &step_span,
@@ -2851,6 +2851,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             stream_idle_timeout_ms,
                             messages: turn_messages,
                             tools: turn_tools.clone(),
+                            hosted_tools: turn_hosted_tools,
                             output_schema: options.final_output_json_schema.clone(),
                             output_schema_strict: options.final_output_json_schema_strict,
                             prompt_cache_key: Some(session.id.clone()),
@@ -2894,13 +2895,16 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 for event in provider_turn_result.events {
                     match event {
                         ModelEvent::TextDelta { text } => {
-                            if let Some(delta) = assistant_delta_to_append(&assistant_text, &text) {
+                            if let Some(delta) =
+                                assistant_delta_to_append(&assistant_full_text, &text)
+                            {
                                 store.append_event(
                                     &session.id,
                                     "model.delta",
                                     serde_json::json!({ "text": delta }),
                                 )?;
                                 assistant_text.push_str(&delta);
+                                assistant_full_text.push_str(&delta);
                             }
                         }
                         ModelEvent::ThinkingDelta { .. } => {}
@@ -2920,9 +2924,10 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             )?;
                         }
                         ModelEvent::ResponseOutputItem { item } => {
-                            record_model_response_output_item(
+                            let generated_image_context = record_model_response_output_item(
                                 store,
                                 &session.id,
+                                &session,
                                 provider,
                                 turn_idx,
                                 provider_turn_result.attempts,
@@ -2941,6 +2946,17 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             ) {
                                 response_assistant_text = Some(text);
                             }
+                            if raw_response_item_survives_live_turn_history(&item) {
+                                push_live_assistant_turn_message(
+                                    &mut messages,
+                                    &mut assistant_text,
+                                    &mut assistant_message_tool_calls,
+                                );
+                                if let Some(context) = generated_image_context {
+                                    messages.push(context);
+                                }
+                                messages.push(item);
+                            }
                         }
                         ModelEvent::ToolCall { call } => {
                             store.append_event(
@@ -2948,6 +2964,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 "model.tool_call",
                                 serde_json::to_value(&call)?,
                             )?;
+                            assistant_message_tool_calls.push(call.clone());
                             tool_calls.push(call);
                         }
                         ModelEvent::ResponseCompleted {
@@ -2991,6 +3008,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 turn_idx,
                                 provider_turn_result.attempts,
                                 &snapshot,
+                            )?;
+                            append_codex_token_count_rate_limits_only(
+                                store,
+                                &session.id,
+                                turn_idx,
                             )?;
                         }
                         ModelEvent::ModelVerifications { verifications } => {
@@ -3048,13 +3070,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 }
                 ensure_not_cancelled(store, &session.id)?;
 
-                if !assistant_text.is_empty() || !tool_calls.is_empty() {
-                    messages.push(serde_json::json!({
-                        "role": "assistant",
-                        "content": assistant_text,
-                        "tool_calls": tool_calls.iter().map(tool_call_message).collect::<Vec<_>>(),
-                    }));
-                }
+                push_live_assistant_turn_message(
+                    &mut messages,
+                    &mut assistant_text,
+                    &mut assistant_message_tool_calls,
+                );
                 maybe_compact_messages_with_context(
                     store,
                     &session.id,
@@ -3069,7 +3089,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     let assistant_finalization_text = response_final_answer_text
                         .as_deref()
                         .or(response_assistant_text.as_deref())
-                        .unwrap_or(&assistant_text);
+                        .unwrap_or(&assistant_full_text);
                     let (visible_assistant_text, proposed_plan) =
                         visible_assistant_text_and_proposed_plan(
                             assistant_finalization_text,
@@ -3188,6 +3208,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     let cancelled = is_cancelled(store, &session.id)?;
     let final_events = store.events_for_session(&session.id).unwrap_or_default();
     if cancelled {
+        let _ = cleanup_unified_exec_commands_for_agent_subtree(store, &session.id);
         telemetry.record_agent_output(&agent_span, "cancelled");
     } else if let Err(error) = &result {
         let output = failure_from_events(&final_events).unwrap_or_else(|| format!("{error:#}"));
@@ -3201,7 +3222,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             )?;
         }
     } else {
-        if let Some(output) = result_from_events(&final_events) {
+        if let Some(output) = session_result_from_events(&final_events) {
             telemetry.record_agent_output(&agent_span, &output);
         }
         agent_span.set_ok();
@@ -3286,11 +3307,11 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
         let mut custom_tool_input_buffers = HashMap::<String, String>::new();
         let mut custom_tool_progress_snapshots = HashMap::<String, String>::new();
         match provider.stream_turn(turn.clone(), &mut |event| {
+            if time_to_first_token_ms.is_none() && model_event_records_turn_ttft(&event) {
+                time_to_first_token_ms = Some(turn_started_at.elapsed().as_millis() as i64);
+            }
             match &event {
                 ModelEvent::TextDelta { text } => {
-                    if time_to_first_token_ms.is_none() && !text.is_empty() {
-                        time_to_first_token_ms = Some(turn_started_at.elapsed().as_millis() as i64);
-                    }
                     if let Some(delta) = assistant_delta_to_append(&streamed_text, text) {
                         record_model_stream_delta(
                             store,
@@ -3304,9 +3325,6 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                     }
                 }
                 ModelEvent::ThinkingDelta { text, label } => {
-                    if time_to_first_token_ms.is_none() && !text.is_empty() {
-                        time_to_first_token_ms = Some(turn_started_at.elapsed().as_millis() as i64);
-                    }
                     if let Some(delta) = assistant_delta_to_append(&streamed_thinking_text, text) {
                         record_model_thinking_delta(
                             store,
@@ -3451,6 +3469,74 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                 thread::sleep(delay);
             }
         }
+    }
+}
+
+fn model_event_records_turn_ttft(event: &ModelEvent) -> bool {
+    match event {
+        ModelEvent::TextDelta { text } | ModelEvent::ThinkingDelta { text, .. } => !text.is_empty(),
+        ModelEvent::ToolCall { .. } => true,
+        ModelEvent::ResponseOutputItem { item } => response_item_records_turn_ttft(item),
+        ModelEvent::CustomToolCallInputDelta { .. }
+        | ModelEvent::Usage { .. }
+        | ModelEvent::ResponseCompleted { .. }
+        | ModelEvent::ServerModel { .. }
+        | ModelEvent::ModelRateLimits { .. }
+        | ModelEvent::ModelVerifications { .. }
+        | ModelEvent::ModelsEtag { .. }
+        | ModelEvent::ServerReasoningIncluded { .. }
+        | ModelEvent::Done => false,
+    }
+}
+
+fn response_item_records_turn_ttft(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|parts| {
+                parts.iter().any(|part| {
+                    matches!(
+                        part.get("type").and_then(Value::as_str),
+                        Some("output_text") | Some("text")
+                    ) && part
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .is_some_and(|text| !text.is_empty())
+                })
+            }),
+        Some("reasoning") => {
+            let summary_has_text =
+                item.get("summary")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                        })
+                    });
+            let content_has_text =
+                item.get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part.get("text")
+                                .and_then(Value::as_str)
+                                .is_some_and(|text| !text.is_empty())
+                        })
+                    });
+            summary_has_text || content_has_text
+        }
+        Some("local_shell_call")
+        | Some("function_call")
+        | Some("custom_tool_call")
+        | Some("tool_search_call")
+        | Some("web_search_call")
+        | Some("image_generation_call")
+        | Some("compaction")
+        | Some("context_compaction") => true,
+        _ => false,
     }
 }
 
@@ -3604,21 +3690,26 @@ fn record_model_turn_request<P: ModelProvider>(
 ) -> Result<()> {
     let messages_value = Value::Array(turn.messages.clone());
     let tools_value = serde_json::to_value(&turn.tools)?;
+    let hosted_tools_value = serde_json::to_value(&turn.hosted_tools)?;
     let mut payload = serde_json::json!({
         "turn_idx": turn_idx,
         "provider": provider.provider_name(),
         "model": provider.model_name(),
         "message_count": turn.messages.len(),
         "tool_count": turn.tools.len(),
+        "hosted_tool_count": turn.hosted_tools.len(),
+        "model_visible_tool_count": turn.tools.len() + turn.hosted_tools.len(),
         "estimated_context_chars": estimated_context_chars(&turn.messages)?,
         "estimated_context_tokens": estimated_context_tokens(&turn.messages)?,
         "input_image_count": count_input_images(&messages_value),
         "messages_fingerprint": value_fingerprint(&messages_value)?,
         "tools_fingerprint": value_fingerprint(&tools_value)?,
+        "hosted_tools_fingerprint": value_fingerprint(&hosted_tools_value)?,
     });
     if record_full_model_io() {
         payload["messages"] = messages_value;
         payload["tools"] = tools_value;
+        payload["hosted_tools"] = hosted_tools_value;
     }
     if let Some(instructions) = turn.instructions.as_deref() {
         let instructions_value = Value::String(instructions.to_string());
@@ -3643,11 +3734,12 @@ fn record_model_turn_request<P: ModelProvider>(
 fn record_model_response_output_item<P: ModelProvider>(
     store: &Store,
     session_id: &str,
+    session: &SessionMeta,
     provider: &P,
     turn_idx: usize,
     attempt: usize,
     item: &Value,
-) -> Result<()> {
+) -> Result<Option<Value>> {
     store.append_event(
         session_id,
         "model.response.output_item",
@@ -3659,7 +3751,99 @@ fn record_model_response_output_item<P: ModelProvider>(
             "item": item,
         }),
     )?;
-    Ok(())
+    save_image_generation_result_artifact(store, session, item)
+}
+
+fn save_image_generation_result_artifact(
+    store: &Store,
+    session: &SessionMeta,
+    item: &Value,
+) -> Result<Option<Value>> {
+    if item.get("type").and_then(Value::as_str) != Some("image_generation_call") {
+        return Ok(None);
+    }
+    if item.get("status").and_then(Value::as_str) != Some("completed") {
+        return Ok(None);
+    }
+    let Some(result) = item.get("result").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let call_id = item
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.is_empty())
+        .unwrap_or("generated_image");
+    let bytes = match general_purpose::STANDARD.decode(result.trim().as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(_) => return Ok(None),
+    };
+    let path = image_generation_artifact_path(session, call_id);
+    if let Some(parent) = path.parent() {
+        if std::fs::create_dir_all(parent).is_err() {
+            return Ok(None);
+        }
+    }
+    if std::fs::write(&path, bytes).is_err() {
+        return Ok(None);
+    }
+    let output_dir = path
+        .parent()
+        .map(|parent| parent.display().to_string())
+        .unwrap_or_else(|| session.artifact_root.clone());
+    let artifact = serde_json::json!({
+        "kind": "image",
+        "path": path.display().to_string(),
+        "mime": "image/png",
+        "source": "image_generation_call",
+        "call_id": call_id,
+        "bytes": std::fs::metadata(&path).ok().and_then(|metadata| i64::try_from(metadata.len()).ok()),
+    });
+    record_tool_artifact(store, &session.id, "image_generation", &artifact)?;
+    let context = generated_image_context_text(&output_dir, &path.display().to_string());
+    store.append_event(
+        &session.id,
+        GENERATED_IMAGE_CONTEXT_EVENT,
+        serde_json::json!({
+            "source": "image_generation_call",
+            "call_id": call_id,
+            "path": path.display().to_string(),
+            "directory": output_dir,
+            "content": context,
+        }),
+    )?;
+    Ok(Some(generated_image_context_message(context)))
+}
+
+fn image_generation_artifact_path(session: &SessionMeta, call_id: &str) -> PathBuf {
+    Path::new(&session.artifact_root)
+        .join(GENERATED_IMAGE_ARTIFACTS_DIR)
+        .join(format!(
+            "{}.png",
+            sanitize_generated_image_component(call_id)
+        ))
+}
+
+fn generated_image_context_text(image_output_dir: &str, image_output_path: &str) -> String {
+    format!(
+        "Generated images are saved to {image_output_dir} as {image_output_path} by default.\nIf you need to use a generated image at another path, copy it and leave the original in place unless the user explicitly asks you to delete it."
+    )
+}
+
+fn sanitize_generated_image_component(value: &str) -> String {
+    let mut sanitized = value
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_alphanumeric() || ch == '-' || ch == '_' {
+                ch
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>();
+    if sanitized.is_empty() {
+        sanitized = "generated_image".to_string();
+    }
+    sanitized
 }
 
 fn record_model_response_input_item(
@@ -4017,16 +4201,33 @@ fn context_budget_value(value: &Value) -> Value {
         Value::Array(items) => Value::Array(items.iter().map(context_budget_value).collect()),
         Value::Object(map) => {
             let mut out = Map::with_capacity(map.len());
+            let item_type = map.get("type").and_then(Value::as_str);
+            let detail = map.get("detail").and_then(Value::as_str);
             for (key, value) in map {
-                if key == "image_url"
-                    && value
+                if key == "image_url" {
+                    if let Some(replacement) = value
                         .as_str()
-                        .is_some_and(|url| url.starts_with("data:image/"))
-                {
+                        .and_then(|url| image_url_context_budget_replacement(url, detail))
+                    {
+                        out.insert(key.clone(), Value::String(replacement));
+                    } else {
+                        out.insert(key.clone(), context_budget_value(value));
+                    }
+                } else if key == "encrypted_content" {
+                    let replacement = value
+                        .as_str()
+                        .map(|content| {
+                            encrypted_content_context_budget_replacement(content, item_type)
+                        })
+                        .unwrap_or_else(|| {
+                            "[encrypted content omitted from text budget]".to_string()
+                        });
+                    out.insert(key.clone(), Value::String(replacement));
+                } else if key == "result" && item_type == Some("image_generation_call") {
                     out.insert(
                         key.clone(),
                         Value::String(format!(
-                            "[image data omitted from text budget]{}",
+                            "[generated image data omitted from text budget]{}",
                             ".".repeat(token_budget_to_char_budget(IMAGE_CONTEXT_BUDGET_TOKENS))
                         )),
                     );
@@ -4038,6 +4239,162 @@ fn context_budget_value(value: &Value) -> Value {
         }
         other => other.clone(),
     }
+}
+
+fn image_url_context_budget_replacement(url: &str, detail: Option<&str>) -> Option<String> {
+    parse_base64_image_data_url_payload(url)?;
+    let estimated_bytes = if detail.is_some_and(|detail| detail.eq_ignore_ascii_case("original")) {
+        estimate_original_image_context_bytes(url).unwrap_or(RESIZED_IMAGE_CONTEXT_BYTES_ESTIMATE)
+    } else {
+        RESIZED_IMAGE_CONTEXT_BYTES_ESTIMATE
+    };
+    Some(format!(
+        "[image data omitted from text budget]{}",
+        ".".repeat(estimated_bytes)
+    ))
+}
+
+fn parse_base64_image_data_url_payload(url: &str) -> Option<&str> {
+    if !url
+        .get(.."data:".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("data:"))
+    {
+        return None;
+    }
+    let comma_index = url.find(',')?;
+    let metadata = &url[..comma_index];
+    let payload = &url[comma_index + 1..];
+    let metadata_without_scheme = &metadata["data:".len()..];
+    let mut parts = metadata_without_scheme.split(';');
+    let mime_type = parts.next().unwrap_or_default();
+    let has_base64_marker = parts.any(|part| part.eq_ignore_ascii_case("base64"));
+    if !mime_type
+        .get(.."image/".len())
+        .is_some_and(|prefix| prefix.eq_ignore_ascii_case("image/"))
+    {
+        return None;
+    }
+    has_base64_marker.then_some(payload)
+}
+
+fn estimate_original_image_context_bytes(url: &str) -> Option<usize> {
+    let payload = parse_base64_image_data_url_payload(url)?;
+    let bytes = general_purpose::STANDARD.decode(payload).ok()?;
+    let (width, height) = image_dimensions_from_bytes(&bytes)?;
+    let patches_wide = usize::try_from(width)
+        .ok()?
+        .div_ceil(ORIGINAL_IMAGE_PATCH_SIZE);
+    let patches_high = usize::try_from(height)
+        .ok()?
+        .div_ceil(ORIGINAL_IMAGE_PATCH_SIZE);
+    let patch_count = patches_wide
+        .saturating_mul(patches_high)
+        .min(ORIGINAL_IMAGE_MAX_PATCHES);
+    Some(token_budget_to_char_budget(patch_count))
+}
+
+fn image_dimensions_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    png_dimensions_from_bytes(bytes)
+        .or_else(|| gif_dimensions_from_bytes(bytes))
+        .or_else(|| jpeg_dimensions_from_bytes(bytes))
+}
+
+fn png_dimensions_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    const PNG_SIGNATURE: &[u8; 8] = b"\x89PNG\r\n\x1a\n";
+    if bytes.len() < 24 || &bytes[..8] != PNG_SIGNATURE || &bytes[12..16] != b"IHDR" {
+        return None;
+    }
+    let width = u32::from_be_bytes(bytes[16..20].try_into().ok()?);
+    let height = u32::from_be_bytes(bytes[20..24].try_into().ok()?);
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn gif_dimensions_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 10 || !matches!(&bytes[..6], b"GIF87a" | b"GIF89a") {
+        return None;
+    }
+    let width = u16::from_le_bytes(bytes[6..8].try_into().ok()?) as u32;
+    let height = u16::from_le_bytes(bytes[8..10].try_into().ok()?) as u32;
+    (width > 0 && height > 0).then_some((width, height))
+}
+
+fn jpeg_dimensions_from_bytes(bytes: &[u8]) -> Option<(u32, u32)> {
+    if bytes.len() < 4 || bytes[0] != 0xff || bytes[1] != 0xd8 {
+        return None;
+    }
+    let mut offset = 2usize;
+    while offset + 4 <= bytes.len() {
+        while offset < bytes.len() && bytes[offset] == 0xff {
+            offset += 1;
+        }
+        if offset >= bytes.len() {
+            return None;
+        }
+        let marker = bytes[offset];
+        offset += 1;
+        if matches!(marker, 0xd8 | 0xd9 | 0x01) || (0xd0..=0xd7).contains(&marker) {
+            continue;
+        }
+        if offset + 2 > bytes.len() {
+            return None;
+        }
+        let segment_len = u16::from_be_bytes(bytes[offset..offset + 2].try_into().ok()?) as usize;
+        if segment_len < 2 || offset + segment_len > bytes.len() {
+            return None;
+        }
+        if matches!(
+            marker,
+            0xc0 | 0xc1
+                | 0xc2
+                | 0xc3
+                | 0xc5
+                | 0xc6
+                | 0xc7
+                | 0xc9
+                | 0xca
+                | 0xcb
+                | 0xcd
+                | 0xce
+                | 0xcf
+        ) {
+            if segment_len < 7 {
+                return None;
+            }
+            let height = u16::from_be_bytes(bytes[offset + 3..offset + 5].try_into().ok()?) as u32;
+            let width = u16::from_be_bytes(bytes[offset + 5..offset + 7].try_into().ok()?) as u32;
+            return (width > 0 && height > 0).then_some((width, height));
+        }
+        offset += segment_len;
+    }
+    None
+}
+
+fn encrypted_content_context_budget_replacement(content: &str, item_type: Option<&str>) -> String {
+    let estimated_bytes = match item_type {
+        Some("reasoning" | "compaction" | "context_compaction") => {
+            estimate_reasoning_context_bytes(content.len())
+        }
+        Some("encrypted_content") => {
+            estimate_encrypted_function_output_context_bytes(content.len())
+        }
+        _ => 0,
+    };
+    format!(
+        "[encrypted content omitted from text budget]{}",
+        ".".repeat(estimated_bytes)
+    )
+}
+
+fn estimate_reasoning_context_bytes(encoded_len: usize) -> usize {
+    encoded_len
+        .saturating_mul(3)
+        .checked_div(4)
+        .unwrap_or(0)
+        .saturating_sub(650)
+}
+
+fn estimate_encrypted_function_output_context_bytes(encoded_len: usize) -> usize {
+    encoded_len.saturating_mul(9).div_ceil(16)
 }
 
 fn compacted_user_history_messages(messages: &[Value]) -> Vec<Value> {
@@ -4169,14 +4526,22 @@ fn provider_base_instructions_for_session(
     model: &str,
 ) -> Result<Option<String>> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let events = store.events_for_session(&session.id)?;
     let persisted = session_base_instructions_from_events(&events);
+
+    if let Some(base_instructions) = options.base_instructions.clone() {
+        if persisted.is_none() {
+            append_session_base_instructions_event(
+                store,
+                &session.id,
+                &base_instructions,
+                "runtime_override",
+            )?;
+        }
+        return Ok(Some(base_instructions));
+    }
 
     if let Some(base_instructions) = config.base_instructions_override()? {
         if persisted.is_none() {
@@ -4373,12 +4738,6 @@ impl ProviderCommandAuthConfigSnapshot {
     }
 }
 
-#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
-struct ModelProviderAwsAuthInfo {
-    profile: Option<String>,
-    region: Option<String>,
-}
-
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 struct SessionModelProviderInfoSnapshot {
     id: String,
@@ -4388,7 +4747,6 @@ struct SessionModelProviderInfoSnapshot {
     env_key_instructions: Option<String>,
     experimental_bearer_token: Option<String>,
     auth: Option<ProviderCommandAuthConfigSnapshot>,
-    aws: Option<ModelProviderAwsAuthInfo>,
     wire_api: String,
     query_params: BTreeMap<String, String>,
     http_headers: BTreeMap<String, String>,
@@ -4504,10 +4862,46 @@ fn append_session_config_snapshot_event(
 }
 
 fn config_has_any_override(options: &AgentRunOptions, keys: &[&str], prefixes: &[String]) -> bool {
-    options.config_overrides.iter().any(|(key, _)| {
-        keys.iter().any(|candidate| key == candidate)
-            || prefixes.iter().any(|prefix| key.starts_with(prefix))
+    config_override_pairs_have_any_override(&options.config_overrides, keys, prefixes)
+        || options
+            .session_thread_config
+            .as_ref()
+            .is_some_and(|value| toml_value_has_any_override(value, "", keys, prefixes))
+}
+
+fn config_override_pairs_have_any_override(
+    overrides: &[(String, toml::Value)],
+    keys: &[&str],
+    prefixes: &[String],
+) -> bool {
+    overrides
+        .iter()
+        .any(|(key, _)| config_path_matches(key, keys, prefixes))
+}
+
+fn toml_value_has_any_override(
+    value: &toml::Value,
+    prefix: &str,
+    keys: &[&str],
+    prefixes: &[String],
+) -> bool {
+    let Some(table) = value.as_table() else {
+        return false;
+    };
+    table.iter().any(|(key, value)| {
+        let path = if prefix.is_empty() {
+            key.clone()
+        } else {
+            format!("{prefix}.{key}")
+        };
+        config_path_matches(&path, keys, prefixes)
+            || toml_value_has_any_override(value, &path, keys, prefixes)
     })
+}
+
+fn config_path_matches(key: &str, keys: &[&str], prefixes: &[String]) -> bool {
+    keys.iter().any(|candidate| key == *candidate)
+        || prefixes.iter().any(|prefix| key.starts_with(prefix))
 }
 
 fn should_use_snapshot_model_settings(
@@ -4550,12 +4944,11 @@ fn should_use_snapshot_provider_runtime_config(options: &AgentRunOptions) -> boo
 fn run_config_has_model_resume_override(config: &ProviderRunConfig) -> bool {
     config.model_source == RunConfigValueSource::Explicit
         || config.options.model_provider_id_source == RunConfigValueSource::Explicit
-        || config.options.config_overrides.iter().any(|(key, _)| {
-            matches!(
-                key.as_str(),
-                "model" | "model_provider" | "model_reasoning_effort"
-            )
-        })
+        || config_has_any_override(
+            &config.options,
+            &["model", "model_provider", "model_reasoning_effort"],
+            &[],
+        )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -4696,7 +5089,7 @@ fn last_agent_message_from_events(
 ) -> Option<String> {
     last_agent_message_from_response_items(events, collaboration_mode, true)
         .or_else(|| {
-            result_from_events(events)
+            session_result_from_events(events)
                 .map(|result| strip_hidden_assistant_markup(&result, collaboration_mode).0)
         })
         .or_else(|| last_agent_message_from_response_items(events, collaboration_mode, false))
@@ -4954,7 +5347,13 @@ fn response_item_type_is_api_history_item(item_type: &str, item: &Value) -> bool
 fn raw_response_item_survives_compaction_checkpoint(item: &Value) -> bool {
     matches!(
         item.get("type").and_then(Value::as_str),
-        Some("compaction" | "compaction_summary" | "context_compaction")
+        Some(
+            "web_search_call"
+                | "image_generation_call"
+                | "compaction"
+                | "compaction_summary"
+                | "context_compaction"
+        )
     )
 }
 
@@ -5228,15 +5627,8 @@ fn append_codex_token_count_event(
     turn_idx: usize,
 ) -> Result<()> {
     let last_token_usage = model_usage_to_codex_token_usage(usage);
-    let previous_total = store
-        .events_for_session(session_id)?
-        .iter()
-        .rev()
-        .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
-        .and_then(|event| event.payload.get("info"))
-        .and_then(|info| info.get("total_token_usage"))
-        .cloned()
-        .unwrap_or_else(empty_codex_token_usage);
+    let previous_total =
+        latest_codex_total_token_usage_from_events(&store.events_for_session(session_id)?);
     let total_token_usage = add_codex_token_usage(&previous_total, &last_token_usage);
     store.append_event(
         session_id,
@@ -5259,11 +5651,12 @@ fn append_codex_token_count_rate_limits_only(
     session_id: &str,
     turn_idx: usize,
 ) -> Result<()> {
+    let info = latest_codex_token_count_info(store, session_id)?;
     store.append_event(
         session_id,
         CODEX_TOKEN_COUNT_EVENT,
         serde_json::json!({
-            "info": Value::Null,
+            "info": info,
             "rate_limits": latest_codex_rate_limits(store, session_id)?,
             "turn_idx": turn_idx,
         }),
@@ -5321,7 +5714,7 @@ fn maybe_append_recomputed_codex_token_count_after_history_rewrite(
     let Some(history_rewrite_seq) = latest_token_relevant_history_rewrite_seq(&events) else {
         return Ok(());
     };
-    if latest_codex_token_count_seq(&events).is_some_and(|seq| seq > history_rewrite_seq) {
+    if latest_codex_token_count_info_seq(&events).is_some_and(|seq| seq > history_rewrite_seq) {
         return Ok(());
     }
     append_recomputed_codex_token_count_event(
@@ -5346,24 +5739,61 @@ fn latest_token_relevant_history_rewrite_seq(events: &[EventRecord]) -> Option<i
         .map(|event| event.seq)
 }
 
-fn latest_codex_token_count_seq(events: &[EventRecord]) -> Option<i64> {
-    events
+fn latest_codex_token_count_info_seq(events: &[EventRecord]) -> Option<i64> {
+    events.iter().enumerate().rev().find_map(|(index, event)| {
+        if event.event_type != CODEX_TOKEN_COUNT_EVENT
+            || event
+                .payload
+                .get("info")
+                .and_then(|info| info.get("total_token_usage"))
+                .is_none()
+            || token_count_event_is_rate_limits_only(events, index)
+        {
+            return None;
+        }
+        Some(event.seq)
+    })
+}
+
+fn token_count_event_is_rate_limits_only(events: &[EventRecord], index: usize) -> bool {
+    events[..index]
         .iter()
         .rev()
-        .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
-        .map(|event| event.seq)
+        .find(|event| event.event_type != CODEX_TOKEN_COUNT_EVENT)
+        .is_some_and(|event| event.event_type == "model.rate_limits")
 }
 
 fn latest_codex_total_token_usage(store: &Store, session_id: &str) -> Result<Value> {
+    Ok(latest_codex_total_token_usage_from_events(
+        &store.events_for_session(session_id)?,
+    ))
+}
+
+fn latest_codex_token_count_info(store: &Store, session_id: &str) -> Result<Value> {
     Ok(store
         .events_for_session(session_id)?
         .iter()
         .rev()
-        .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
-        .and_then(|event| event.payload.get("info"))
-        .and_then(|info| info.get("total_token_usage"))
+        .filter(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+        .filter_map(|event| event.payload.get("info"))
+        .find(|info| !info.is_null())
         .cloned()
-        .unwrap_or_else(empty_codex_token_usage))
+        .unwrap_or(Value::Null))
+}
+
+fn latest_codex_total_token_usage_from_events(events: &[EventRecord]) -> Value {
+    events
+        .iter()
+        .rev()
+        .filter_map(|event| {
+            (event.event_type == CODEX_TOKEN_COUNT_EVENT)
+                .then(|| event.payload.get("info"))
+                .flatten()
+                .and_then(|info| info.get("total_token_usage"))
+                .cloned()
+        })
+        .next()
+        .unwrap_or_else(empty_codex_token_usage)
 }
 
 fn record_model_rate_limits(
@@ -5609,12 +6039,8 @@ fn model_switch_context_for_session(
         return Ok(None);
     }
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let Some(model_instructions) = config.default_base_instructions_for_model(next_model) else {
         return Ok(None);
     };
@@ -5638,12 +6064,8 @@ fn personality_context_for_session(
     }
 
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let Some(personality_message) =
         default_personality_message_for_model_and_personality_with_catalog(
             next_model,
@@ -5689,12 +6111,8 @@ fn provider_model_request_settings_for_session(
     options: &AgentRunOptions,
 ) -> Result<ModelRequestSettings> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let mut settings = config.model_request_settings;
     if options.collaboration_mode == CollaborationModeKind::Plan {
         settings.reasoning_effort = Some(
@@ -5712,12 +6130,8 @@ fn resolved_model_request_info_for_session(
     model: &str,
 ) -> Result<browser_use_providers::ModelRequestInfo> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(resolved_model_request_info_from_config(&config, model))
 }
 
@@ -5759,12 +6173,8 @@ fn provider_request_max_retries_for_session(
     model_provider_id: &str,
 ) -> Result<Option<usize>> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(config
         .provider_request_max_retries
         .get(model_provider_id)
@@ -5778,12 +6188,8 @@ fn provider_stream_config_for_session(
     model_provider_id: &str,
 ) -> Result<(Option<usize>, Option<u64>)> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok((
         config
             .provider_stream_max_retries
@@ -5802,12 +6208,8 @@ fn provider_personality_for_session(
     options: &AgentRunOptions,
 ) -> Result<ModelPersonality> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     Ok(config.personality)
 }
 
@@ -5928,15 +6330,21 @@ fn append_new_external_session_messages(
 }
 
 fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -> Vec<Value> {
-    let (replay_start_seq, mut messages, has_compaction_checkpoint) =
+    let (replay_start_seq, mut messages, initial_context_already_in_history) =
         latest_compaction_replacement_history(events)
-            .map(|(seq, messages)| (seq, messages, true))
+            .map(|state| {
+                (
+                    state.seq,
+                    state.messages,
+                    state.initial_context_already_in_history,
+                )
+            })
             .unwrap_or_else(|| (0, Vec::new(), false));
     let replay_events = rollback_filtered_events_after(events, replay_start_seq, &mut messages);
     provider_messages_from_event_slice(
         &replay_events,
         &mut messages,
-        has_compaction_checkpoint,
+        initial_context_already_in_history,
         false,
     )
 }
@@ -5944,16 +6352,22 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
 fn provider_messages_from_events_for_fork(
     events: &[browser_use_protocol::EventRecord],
 ) -> Vec<Value> {
-    let (replay_start_seq, mut messages, has_compaction_checkpoint) =
+    let (replay_start_seq, mut messages, initial_context_already_in_history) =
         latest_compaction_replacement_history(events)
-            .map(|(seq, messages)| (seq, messages, true))
+            .map(|state| {
+                (
+                    state.seq,
+                    state.messages,
+                    state.initial_context_already_in_history,
+                )
+            })
             .unwrap_or_else(|| (0, Vec::new(), false));
     let replay_events =
         rollback_filtered_events_after_for_fork(events, replay_start_seq, &mut messages);
     provider_messages_from_event_slice(
         &replay_events,
         &mut messages,
-        has_compaction_checkpoint,
+        initial_context_already_in_history,
         true,
     )
 }
@@ -5963,15 +6377,37 @@ struct CompactionCheckpoint {
     messages: Vec<Value>,
     response_items: Option<Vec<Value>>,
     context_baseline: Option<PreviousTurnSettings>,
+    has_replacement_history: bool,
 }
 
-fn latest_compaction_replacement_history(events: &[EventRecord]) -> Option<(i64, Vec<Value>)> {
+struct CompactionReplayState {
+    seq: i64,
+    messages: Vec<Value>,
+    initial_context_already_in_history: bool,
+}
+
+fn latest_compaction_replacement_history(events: &[EventRecord]) -> Option<CompactionReplayState> {
     latest_compaction_checkpoint(events).map(|checkpoint| {
         let messages = match checkpoint.response_items {
             Some(response_items) => response_items_to_provider_messages(&response_items),
             None => checkpoint.messages,
         };
-        (checkpoint.seq, messages)
+        let mut initial_context_already_in_history = checkpoint.has_replacement_history;
+        let mut messages = messages;
+        if !initial_context_already_in_history {
+            let mut initial_context =
+                initial_context_messages_from_events(events, None, true, true);
+            if !initial_context.is_empty() {
+                initial_context.append(&mut messages);
+                messages = initial_context;
+                initial_context_already_in_history = true;
+            }
+        }
+        CompactionReplayState {
+            seq: checkpoint.seq,
+            messages,
+            initial_context_already_in_history,
+        }
     })
 }
 
@@ -5983,8 +6419,9 @@ fn latest_compaction_checkpoint(events: &[EventRecord]) -> Option<CompactionChec
         let messages = event
             .payload
             .get("replacement_messages")
-            .and_then(Value::as_array)?
-            .clone();
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
         let response_items = event
             .payload
             .get("replacement_response_items")
@@ -5999,6 +6436,8 @@ fn latest_compaction_checkpoint(events: &[EventRecord]) -> Option<CompactionChec
             messages,
             response_items,
             context_baseline,
+            has_replacement_history: event.payload.get("replacement_messages").is_some()
+                || event.payload.get("replacement_response_items").is_some(),
         })
     })
 }
@@ -6124,6 +6563,7 @@ fn contextual_event_targets_turn(event: &EventRecord, target_seq: i64) -> bool {
             | MODEL_SWITCH_CONTEXT_EVENT
             | PERSONALITY_CONTEXT_EVENT
             | COLLABORATION_CONTEXT_EVENT
+            | GENERATED_IMAGE_CONTEXT_EVENT
     ) && event.payload.get("before_seq").and_then(Value::as_i64) == Some(target_seq)
 }
 
@@ -6174,6 +6614,8 @@ fn is_contextual_provider_message(message: &Value) -> bool {
             | Some(MODEL_SWITCH_CONTEXT_MESSAGE_NAME)
             | Some(PERSONALITY_CONTEXT_MESSAGE_NAME)
             | Some(COLLABORATION_CONTEXT_MESSAGE_NAME)
+            | Some(MENTION_CONTEXT_MESSAGE_NAME)
+            | Some(GENERATED_IMAGE_CONTEXT_MESSAGE_NAME)
     )
 }
 
@@ -6275,6 +6717,7 @@ fn provider_messages_from_event_slice(
                 MODEL_SWITCH_CONTEXT_EVENT
                     | PERSONALITY_CONTEXT_EVENT
                     | COLLABORATION_CONTEXT_EVENT
+                    | GENERATED_IMAGE_CONTEXT_EVENT
             )
         })
         .filter_map(|event| {
@@ -6389,7 +6832,7 @@ fn provider_messages_from_event_slice(
                         })
                         .unwrap_or_default();
                     let explorer_instruction = if role.to_ascii_lowercase().contains("explor") {
-                        "As the explorer, inspect the repository/codebase directly with local tools from the task cwd. Use `.` for the repository root; do not use your canonical task name as a directory. Do not spawn another explorer for this same repository-analysis task unless explicitly instructed."
+                        "As the explorer, inspect the repository/codebase directly with local tools from the task cwd. This explorer role only applies after spawning was otherwise authorized. Use `.` for the repository root; do not use your canonical task name as a directory. Do not spawn another explorer for this same repository-analysis task unless explicitly instructed."
                     } else {
                         ""
                     };
@@ -6446,6 +6889,26 @@ fn provider_messages_from_event_slice(
             }
             "workspace.context" => {
                 continue;
+            }
+            GENERATED_IMAGE_CONTEXT_EVENT => {
+                if event
+                    .payload
+                    .get("before_seq")
+                    .and_then(Value::as_i64)
+                    .is_some()
+                {
+                    continue;
+                }
+                flush_assistant(
+                    messages,
+                    &mut assistant_text,
+                    &mut assistant_phase,
+                    &mut assistant_tool_calls,
+                );
+                if let Some(content) = event.payload.get("content").and_then(Value::as_str) {
+                    messages.push(generated_image_context_message(content.to_string()));
+                    turn_open = true;
+                }
             }
             "session.input" | "session.followup" => {
                 suppress_terminal_tail = false;
@@ -6783,6 +7246,16 @@ where
         let Some(kind) = event.payload.get("kind").and_then(Value::as_str) else {
             continue;
         };
+        if kind == WORKSPACE_CONTEXT_PERMISSIONS_KIND
+            && event
+                .payload
+                .get("suppressed")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+        {
+            saw_permissions = true;
+            continue;
+        }
         let Some(content) = event.payload.get("content").and_then(Value::as_str) else {
             continue;
         };
@@ -6929,10 +7402,22 @@ fn personality_context_message(text: String) -> Value {
     })
 }
 
+fn generated_image_context_message(text: String) -> Value {
+    serde_json::json!({
+        "role": "developer",
+        "name": GENERATED_IMAGE_CONTEXT_MESSAGE_NAME,
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
+    })
+}
+
 fn developer_context_message_for_event(event_type: &str, text: String) -> Value {
     match event_type {
         PERSONALITY_CONTEXT_EVENT => personality_context_message(text),
         COLLABORATION_CONTEXT_EVENT => collaboration_context_message(text),
+        GENERATED_IMAGE_CONTEXT_EVENT => generated_image_context_message(text),
         _ => model_switch_context_message(text),
     }
 }
@@ -7333,6 +7818,7 @@ fn task_text_from_provider_messages(messages: &[Value]) -> Option<String> {
             && !is_turn_aborted_message(message)
             && !is_compaction_summary_message(message)
             && !is_skill_context_message(message)
+            && !is_mention_context_message(message)
             && !is_subagent_notification_context_message(message))
         .then(|| message_content_text(message))
         .filter(|text| !text.trim().is_empty())
@@ -7378,6 +7864,7 @@ fn session_event_user_content(payload: &Value) -> Option<Value> {
 
 fn session_event_user_messages(payload: &Value) -> Vec<Value> {
     let mut messages = Vec::new();
+    messages.extend(mention_context_messages_from_payload(payload));
     if let Some(content) = session_event_user_content(payload) {
         messages.push(serde_json::json!({
             "role": "user",
@@ -7386,6 +7873,79 @@ fn session_event_user_messages(payload: &Value) -> Vec<Value> {
     }
     messages.extend(skill_context_messages_from_payload(payload));
     messages
+}
+
+fn mention_context_messages_from_payload(payload: &Value) -> Vec<Value> {
+    payload
+        .get("mention_context_messages")
+        .and_then(Value::as_array)
+        .map(|messages| {
+            messages
+                .iter()
+                .filter(|message| is_mention_context_message(message))
+                .cloned()
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn app_connector_ids_from_items(items: &[Value]) -> Vec<String> {
+    let mut seen = HashSet::new();
+    let mut connectors = Vec::new();
+    for item in items {
+        let Some(path) = item.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(connector_id) = path.strip_prefix("app://") else {
+            continue;
+        };
+        let connector_id = connector_id.trim();
+        if connector_id.is_empty() || !seen.insert(connector_id.to_string()) {
+            continue;
+        }
+        connectors.push(connector_id.to_string());
+    }
+    connectors
+}
+
+fn plugin_mentions_from_items(items: &[Value]) -> Vec<Value> {
+    let mut seen = HashSet::new();
+    let mut mentions = Vec::new();
+    for item in items {
+        let Some(path) = item.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(plugin_id) = path.strip_prefix("plugin://") else {
+            continue;
+        };
+        let plugin_id = plugin_id.trim();
+        if plugin_id.is_empty() || !seen.insert(path.to_string()) {
+            continue;
+        }
+        mentions.push(serde_json::json!({
+            "name": item.get("name").and_then(Value::as_str).unwrap_or_default(),
+            "path": path,
+            "plugin": plugin_id,
+        }));
+    }
+    mentions
+}
+
+fn unique_non_empty_array<T>(values: Vec<T>) -> Option<Vec<T>> {
+    (!values.is_empty()).then_some(values)
+}
+
+fn unique_non_empty_strings(values: Vec<String>) -> Option<Vec<String>> {
+    let mut seen = HashSet::new();
+    let mut unique = Vec::new();
+    for value in values {
+        let value = value.trim();
+        if value.is_empty() || !seen.insert(value.to_string()) {
+            continue;
+        }
+        unique.push(value.to_string());
+    }
+    unique_non_empty_array(unique)
 }
 
 fn skill_context_messages_from_payload(payload: &Value) -> Vec<Value> {
@@ -7448,11 +8008,32 @@ fn skill_context_messages_from_items(items: &[Value]) -> Vec<Value> {
     messages
 }
 
+fn app_connector_ids_from_skill_context_messages(messages: &[Value]) -> Vec<String> {
+    let mut connector_ids = Vec::new();
+    for message in messages {
+        connector_ids.extend(app_connector_ids_from_linked_text(&message_content_text(
+            message,
+        )));
+    }
+    connector_ids
+}
+
+fn app_connector_ids_from_linked_text(text: &str) -> Vec<String> {
+    collab_items_from_linked_mentions(text)
+        .map(|items| app_connector_ids_from_items(&items))
+        .unwrap_or_default()
+}
+
 fn is_skill_context_message(message: &Value) -> bool {
     message.get("role").and_then(Value::as_str) == Some("user")
         && message_content_text(message)
             .trim_start()
             .starts_with("<skill>")
+}
+
+fn is_mention_context_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("developer")
+        && message.get("name").and_then(Value::as_str) == Some(MENTION_CONTEXT_MESSAGE_NAME)
 }
 
 fn is_subagent_notification_context_message(message: &Value) -> bool {
@@ -7508,13 +8089,14 @@ fn browser_tool_registry_for_session(
     namespace_tools_supported: bool,
 ) -> Result<ToolRegistry> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(
-        Path::new(&session.cwd),
-        &mut warnings,
-        options.config_profile.as_deref(),
-        &options.config_overrides,
-    )?;
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
     let mut multi_agent_tool_config = config.multi_agent_v2.tool_spec_config();
+    multi_agent_tool_config.request_user_input_default_mode_enabled =
+        config.request_user_input_default_mode_enabled;
+    if !config.multi_agent_enabled {
+        multi_agent_tool_config.family = MultiAgentToolFamily::Disabled;
+    }
     if multi_agent_tool_config.family == MultiAgentToolFamily::V1 || !namespace_tools_supported {
         multi_agent_tool_config.tool_namespace = None;
     }
@@ -7535,9 +8117,95 @@ fn browser_tool_registry_for_session(
     Ok(ToolRegistry::browser_agent_with_agent_type_description_and_model_description_and_multi_agent_config(
         tools::spawn_agent_type_description_for_roles(role_descriptions),
         multi_agent_tool_config,
+        ShellToolSpecConfig {
+            shell_tool_enabled: config.shell_tool_enabled,
+            unified_exec_enabled: config.unified_exec_enabled,
+            model_shell_type: resolved_model_request_info_from_config(&config, model_name).shell_type,
+            allow_login_shell: config.allow_login_shell,
+        },
         model_supports_original_image_detail_for_catalog(model_name, config.model_catalog.as_ref()),
         model_overrides_description,
     ))
+}
+
+fn hosted_tool_specs_for_session(
+    session: &browser_use_protocol::SessionMeta,
+    options: &AgentRunOptions,
+    model_name: &str,
+    hosted_web_search_supported: bool,
+    hosted_image_generation_supported: bool,
+) -> Result<Vec<HostedToolSpec>> {
+    let mut warnings = Vec::new();
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
+    let model_info = resolved_model_request_info_from_config(&config, model_name);
+    let mut tools = Vec::new();
+    if hosted_web_search_supported {
+        if let Some(web_search) = HostedToolSpec::web_search(
+            resolve_web_search_mode_for_current_permissions(
+                config.web_search_mode,
+                config.web_search_allowed_modes.as_ref(),
+            ),
+            config.web_search_config.as_ref(),
+            model_info.web_search_tool_type,
+        ) {
+            tools.push(web_search);
+        }
+    }
+    if hosted_image_generation_supported
+        && config.image_generation_enabled
+        && model_info.supports_image_input
+    {
+        tools.push(HostedToolSpec::image_generation_png());
+    }
+    Ok(tools)
+}
+
+fn resolve_web_search_mode_for_current_permissions(
+    mode: Option<WebSearchMode>,
+    allowed_modes: Option<&BTreeSet<WebSearchMode>>,
+) -> WebSearchMode {
+    if let Some(allowed_modes) = allowed_modes {
+        let preferred = mode.unwrap_or_else(|| default_web_search_mode_for_allowed(allowed_modes));
+        if preferred != WebSearchMode::Disabled {
+            for candidate in [
+                WebSearchMode::Live,
+                WebSearchMode::Cached,
+                WebSearchMode::Disabled,
+            ] {
+                if allowed_modes.contains(&candidate) {
+                    return candidate;
+                }
+            }
+        }
+        if allowed_modes.contains(&preferred) {
+            return preferred;
+        }
+        for candidate in [
+            WebSearchMode::Cached,
+            WebSearchMode::Live,
+            WebSearchMode::Disabled,
+        ] {
+            if allowed_modes.contains(&candidate) {
+                return candidate;
+            }
+        }
+        return WebSearchMode::Disabled;
+    }
+    match mode.unwrap_or_default() {
+        WebSearchMode::Disabled => WebSearchMode::Disabled,
+        WebSearchMode::Cached | WebSearchMode::Live => WebSearchMode::Live,
+    }
+}
+
+fn default_web_search_mode_for_allowed(allowed_modes: &BTreeSet<WebSearchMode>) -> WebSearchMode {
+    if allowed_modes.contains(&WebSearchMode::Cached) {
+        WebSearchMode::Cached
+    } else if allowed_modes.contains(&WebSearchMode::Live) {
+        WebSearchMode::Live
+    } else {
+        WebSearchMode::Disabled
+    }
 }
 
 fn tool_call_message(call: &ToolCall) -> Value {
@@ -7550,6 +8218,41 @@ fn tool_call_message(call: &ToolCall) -> Value {
         message["namespace"] = Value::String(namespace.to_string());
     }
     message
+}
+
+fn push_live_assistant_turn_message(
+    messages: &mut Vec<Value>,
+    assistant_text: &mut String,
+    assistant_tool_calls: &mut Vec<ToolCall>,
+) {
+    if assistant_text.is_empty() && assistant_tool_calls.is_empty() {
+        return;
+    }
+    messages.push(serde_json::json!({
+        "role": "assistant",
+        "content": std::mem::take(assistant_text),
+        "tool_calls": std::mem::take(assistant_tool_calls)
+            .iter()
+            .map(tool_call_message)
+            .collect::<Vec<_>>(),
+    }));
+}
+
+fn raw_response_item_survives_live_turn_history(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some(
+            "reasoning"
+                | "web_search_call"
+                | "image_generation_call"
+                | "tool_search_call"
+                | "tool_search_output"
+                | "local_shell_call"
+                | "compaction"
+                | "compaction_summary"
+                | "context_compaction"
+        )
+    ) && is_raw_response_item_provider_message(item)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -7588,6 +8291,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
             outcomes.extend(dispatch_parallel_tool_batch(
                 store,
                 session,
+                &registry,
                 batch,
                 telemetry,
                 step_span,
@@ -7624,6 +8328,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
 fn dispatch_parallel_tool_batch(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
+    registry: &ToolRegistry,
     batch: Vec<ToolCall>,
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
@@ -7638,6 +8343,7 @@ fn dispatch_parallel_tool_batch(
         return Ok(vec![dispatch_parallel_tool_call_for_turn(
             store,
             session,
+            registry,
             call,
             telemetry,
             step_span,
@@ -7668,11 +8374,13 @@ fn dispatch_parallel_tool_batch(
             let state_dir = state_dir.clone();
             let session = session.clone();
             let notifier = notifier.clone();
+            let registry = registry.clone();
             thread::spawn(move || {
                 let store = Store::open_with_optional_notifier(state_dir, notifier)?;
                 dispatch_parallel_tool_call_recoverably(
                     &store,
                     &session,
+                    &registry,
                     &call,
                     tool_output_token_budget,
                 )
@@ -7767,6 +8475,7 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
 fn dispatch_parallel_tool_call_for_turn(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
+    registry: &ToolRegistry,
     call: ToolCall,
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
@@ -7777,6 +8486,7 @@ fn dispatch_parallel_tool_call_for_turn(
     let outcome = match dispatch_parallel_tool_call_recoverably(
         store,
         session,
+        registry,
         &call,
         tool_output_token_budget,
     ) {
@@ -7841,10 +8551,11 @@ fn dispatch_tool_call_recoverably<P: ModelProvider>(
 fn dispatch_parallel_tool_call_recoverably(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
+    registry: &ToolRegistry,
     call: &ToolCall,
     tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    match dispatch_parallel_tool_call(store, session, call, tool_output_token_budget) {
+    match dispatch_parallel_tool_call(store, session, registry, call, tool_output_token_budget) {
         Ok(outcome) => Ok(outcome),
         Err(error) if tool_error_is_recoverable(&error) => {
             dispatch_recovered_tool_error(store, session, call, error)
@@ -7890,15 +8601,21 @@ fn tool_error_is_recoverable(error: &anyhow::Error) -> bool {
 fn dispatch_parallel_tool_call(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
+    registry: &ToolRegistry,
     call: &ToolCall,
     tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    match ToolRegistry::browser_agent()
-        .handler_for_namespaced(call.namespace.as_deref(), &call.name)
-    {
+    match registry.handler_for_namespaced(call.namespace.as_deref(), &call.name) {
         Some(ToolHandlerKind::ExecCommand) => {
             dispatch_exec_command_tool(store, session, call, tool_output_token_budget)
         }
+        Some(ToolHandlerKind::ShellCommand) => dispatch_shell_command_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            registry.allow_login_shell(),
+        ),
         Some(ToolHandlerKind::ReadFile) => {
             dispatch_read_file_tool(store, session, call, tool_output_token_budget)
         }
@@ -7910,6 +8627,9 @@ fn dispatch_parallel_tool_call(
         }
         Some(ToolHandlerKind::ViewImage) => {
             dispatch_view_image_tool(store, session, call, false, tool_output_token_budget)
+        }
+        Some(ToolHandlerKind::ToolSearch) => {
+            dispatch_tool_search_tool(store, session, call, registry)
         }
         _ => dispatch_unknown_tool(store, session, call),
     }
@@ -7925,10 +8645,19 @@ fn hidden_legacy_file_tool_handler(name: &str) -> Option<ToolHandlerKind> {
 }
 
 fn tool_call_supports_parallel(registry: &ToolRegistry, call: &ToolCall) -> bool {
-    match registry.handler_for_namespaced(call.namespace.as_deref(), &call.name) {
-        Some(ToolHandlerKind::ExecCommand) => {
-            tools::command::exec_command_is_known_read_only(&call.arguments)
-        }
+    let handler = registry
+        .direct_handler_for_namespaced(call.namespace.as_deref(), &call.name)
+        .or_else(|| {
+            (call.namespace.is_none() && call.name == "tool_search")
+                .then(|| registry.handler_for_namespaced(None, "tool_search"))
+                .flatten()
+        });
+    match handler {
+        Some(
+            ToolHandlerKind::ExecCommand
+            | ToolHandlerKind::ShellCommand
+            | ToolHandlerKind::ToolSearch,
+        ) => true,
         _ => false,
     }
 }
@@ -7989,6 +8718,13 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::ExecCommand => {
             dispatch_exec_command_tool(store, session, call, tool_output_token_budget)
         }
+        ToolHandlerKind::ShellCommand => dispatch_shell_command_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            registry.allow_login_shell(),
+        ),
         ToolHandlerKind::WriteStdin => {
             dispatch_write_stdin_tool(store, session, call, tool_output_token_budget)
         }
@@ -8013,7 +8749,9 @@ fn dispatch_tool_call<P: ModelProvider>(
             tool_output_token_budget,
         ),
         ToolHandlerKind::UpdatePlan => dispatch_update_plan_tool(store, session, call),
-        ToolHandlerKind::RequestUserInput => dispatch_request_user_input_tool(store, session, call),
+        ToolHandlerKind::RequestUserInput => {
+            dispatch_request_user_input_tool(store, session, call, options)
+        }
         ToolHandlerKind::SpawnAgent => {
             dispatch_spawn_agent_tool(store, provider, session, call, options, base_instructions)
         }
@@ -8066,6 +8804,33 @@ fn dispatch_exec_command_tool(
             session,
             call,
             "exec_command",
+            &result.model_text,
+            usize::MAX,
+        )?],
+    })
+}
+
+fn dispatch_shell_command_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+    allow_login_shell: bool,
+) -> Result<ToolDispatchOutcome> {
+    let result = tools::command::shell_command_with_budget(
+        store,
+        session,
+        call,
+        tool_output_token_budget,
+        allow_login_shell,
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_text_message(
+            store,
+            session,
+            call,
+            "shell_command",
             &result.model_text,
             usize::MAX,
         )?],
@@ -8697,9 +9462,12 @@ struct AgentsMdLoad {
     sources: Vec<String>,
     warnings: Vec<String>,
     developer_instructions: Option<String>,
+    include_permissions_instructions: bool,
     include_collaboration_mode_instructions: bool,
     include_environment_context: bool,
+    multi_agent_enabled: bool,
     multi_agent_v2: MultiAgentV2Config,
+    plugins_instructions: Option<String>,
     #[allow(dead_code)]
     base_instructions: Option<String>,
 }
@@ -8960,13 +9728,41 @@ fn agents_md_context_for_cwd_with_options(
     Ok(load_agents_md_context_for_cwd_with_options(cwd, config_profile, config_overrides)?.context)
 }
 
+#[cfg(test)]
 fn load_agents_md_context_for_cwd_with_options(
     cwd: &Path,
     config_profile: Option<&str>,
     config_overrides: &[(String, toml::Value)],
 ) -> Result<AgentsMdLoad> {
+    load_agents_md_context_for_cwd_with_thread_config(cwd, config_profile, config_overrides, None)
+}
+
+fn load_agents_md_context_for_cwd_with_run_options(
+    cwd: &Path,
+    options: &AgentRunOptions,
+) -> Result<AgentsMdLoad> {
+    load_agents_md_context_for_cwd_with_thread_config(
+        cwd,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+        options.session_thread_config.as_ref(),
+    )
+}
+
+fn load_agents_md_context_for_cwd_with_thread_config(
+    cwd: &Path,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+    session_thread_config: Option<&toml::Value>,
+) -> Result<AgentsMdLoad> {
     let mut warnings = Vec::new();
-    let config = load_agents_md_config(cwd, &mut warnings, config_profile, config_overrides)?;
+    let config = load_agents_md_config_with_thread_config(
+        cwd,
+        &mut warnings,
+        config_profile,
+        config_overrides,
+        session_thread_config,
+    )?;
     let mut sources = Vec::new();
     let mut parts = Vec::new();
     if let Some((path, text)) = load_global_agents_md(&mut warnings) {
@@ -9002,15 +9798,20 @@ fn load_agents_md_context_for_cwd_with_options(
         })
     };
     let base_instructions = config.base_instructions()?;
+    let plugin_summaries = codex_plugin_capability_summaries_for_config(&config);
+    let plugins_instructions = render_available_plugins_instructions(&plugin_summaries);
     Ok(AgentsMdLoad {
         context,
         sources,
         warnings,
         base_instructions,
         developer_instructions: config.developer_instructions,
+        include_permissions_instructions: config.include_permissions_instructions,
         include_collaboration_mode_instructions: config.include_collaboration_mode_instructions,
         include_environment_context: config.include_environment_context,
+        multi_agent_enabled: config.multi_agent_enabled,
         multi_agent_v2: config.multi_agent_v2,
+        plugins_instructions,
     })
 }
 
@@ -9028,6 +9829,17 @@ struct MultiAgentV2Config {
     hide_spawn_agent_metadata: bool,
     enabled: bool,
     non_code_mode_only: bool,
+}
+
+#[derive(Clone, Debug)]
+struct CodexPluginConfig {
+    enabled: bool,
+}
+
+impl Default for CodexPluginConfig {
+    fn default() -> Self {
+        Self { enabled: true }
+    }
 }
 
 impl Default for MultiAgentV2Config {
@@ -9067,6 +9879,7 @@ impl MultiAgentV2Config {
             max_concurrent_threads_per_session: self.max_concurrent_threads_per_session,
             tool_namespace: self.tool_namespace.clone(),
             non_code_mode_only: self.non_code_mode_only,
+            request_user_input_default_mode_enabled: false,
         }
     }
 }
@@ -9081,8 +9894,10 @@ struct AgentsMdConfig {
     model_instructions_file: Option<PathBuf>,
     developer_instructions: Option<String>,
     agent_roles: BTreeMap<String, AgentRoleDefinition>,
+    multi_agent_enabled: bool,
     multi_agent_v2: MultiAgentV2Config,
     personality: ModelPersonality,
+    include_permissions_instructions: bool,
     include_collaboration_mode_instructions: bool,
     include_environment_context: bool,
     model_request_settings: ModelRequestSettings,
@@ -9094,6 +9909,16 @@ struct AgentsMdConfig {
     tool_output_token_limit: Option<usize>,
     plan_mode_reasoning_effort: Option<String>,
     advertised_beta_features: BTreeMap<String, bool>,
+    shell_tool_enabled: bool,
+    unified_exec_enabled: bool,
+    allow_login_shell: bool,
+    image_generation_enabled: bool,
+    web_search_mode: Option<WebSearchMode>,
+    web_search_allowed_modes: Option<BTreeSet<WebSearchMode>>,
+    web_search_config: Option<WebSearchToolConfig>,
+    request_user_input_default_mode_enabled: bool,
+    plugins_enabled: bool,
+    plugins: BTreeMap<String, CodexPluginConfig>,
     model_provider_id: Option<String>,
     model_providers: BTreeMap<String, CodexModelProviderConfig>,
     provider_request_max_retries: BTreeMap<String, usize>,
@@ -9112,8 +9937,10 @@ impl Default for AgentsMdConfig {
             model_instructions_file: None,
             developer_instructions: None,
             agent_roles: BTreeMap::new(),
+            multi_agent_enabled: true,
             multi_agent_v2: MultiAgentV2Config::default(),
             personality: ModelPersonality::Pragmatic,
+            include_permissions_instructions: true,
             include_collaboration_mode_instructions: true,
             include_environment_context: true,
             model_request_settings: ModelRequestSettings::default(),
@@ -9125,6 +9952,16 @@ impl Default for AgentsMdConfig {
             tool_output_token_limit: None,
             plan_mode_reasoning_effort: None,
             advertised_beta_features: default_codex_advertised_beta_features(),
+            shell_tool_enabled: true,
+            unified_exec_enabled: !cfg!(windows),
+            allow_login_shell: true,
+            image_generation_enabled: true,
+            web_search_mode: None,
+            web_search_allowed_modes: None,
+            web_search_config: None,
+            request_user_input_default_mode_enabled: false,
+            plugins_enabled: true,
+            plugins: BTreeMap::new(),
             model_provider_id: None,
             model_providers: default_model_providers(),
             provider_request_max_retries: BTreeMap::new(),
@@ -9189,44 +10026,7 @@ fn default_codex_advertised_beta_features() -> BTreeMap<String, bool> {
 }
 
 fn default_model_providers() -> BTreeMap<String, CodexModelProviderConfig> {
-    BTreeMap::from([(
-        AMAZON_BEDROCK_PROVIDER_ID.to_string(),
-        amazon_bedrock_model_provider_config(ModelProviderAwsAuthInfo::default()),
-    )])
-}
-
-fn amazon_bedrock_model_provider_config(aws: ModelProviderAwsAuthInfo) -> CodexModelProviderConfig {
-    CodexModelProviderConfig {
-        name: AMAZON_BEDROCK_PROVIDER_NAME.to_string(),
-        base_url: Some(AMAZON_BEDROCK_DEFAULT_BASE_URL.to_string()),
-        wire_api: CodexWireApi::Responses,
-        http_headers: BTreeMap::from([(
-            AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
-            AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.to_string(),
-        )]),
-        requires_openai_auth: false,
-        supports_websockets: false,
-        aws: Some(aws),
-        ..Default::default()
-    }
-}
-
-fn apply_selected_provider_model_catalog(
-    config: &mut AgentsMdConfig,
-    selected_provider_id: Option<&str>,
-) {
-    if selected_provider_id
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        != Some(AMAZON_BEDROCK_PROVIDER_ID)
-    {
-        return;
-    }
-    if config.model_catalog.is_none() {
-        config.model_catalog = Some(amazon_bedrock_model_catalog());
-        config.model_catalog_cache_etag = None;
-        config.model_catalog_refresh_allowed = false;
-    }
+    BTreeMap::new()
 }
 
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
@@ -9247,7 +10047,6 @@ struct CodexModelProviderConfig {
     requires_openai_auth: bool,
     supports_websockets: bool,
     auth: Option<ProviderCommandAuthConfig>,
-    aws: Option<ModelProviderAwsAuthInfo>,
 }
 
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -9277,6 +10076,30 @@ fn load_agents_md_config(
     warnings: &mut Vec<String>,
     config_profile: Option<&str>,
     config_overrides: &[(String, toml::Value)],
+) -> Result<AgentsMdConfig> {
+    load_agents_md_config_with_thread_config(cwd, warnings, config_profile, config_overrides, None)
+}
+
+fn load_agents_md_config_for_options(
+    cwd: &Path,
+    warnings: &mut Vec<String>,
+    options: &AgentRunOptions,
+) -> Result<AgentsMdConfig> {
+    load_agents_md_config_with_thread_config(
+        cwd,
+        warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+        options.session_thread_config.as_ref(),
+    )
+}
+
+fn load_agents_md_config_with_thread_config(
+    cwd: &Path,
+    warnings: &mut Vec<String>,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+    session_thread_config: Option<&toml::Value>,
 ) -> Result<AgentsMdConfig> {
     let mut config = AgentsMdConfig::default();
     let Some(base) = codex_home_dir() else {
@@ -9367,6 +10190,10 @@ fn load_agents_md_config(
         )?;
     }
 
+    if let Some(session_thread_config) = session_thread_config {
+        apply_session_thread_config_layer(&mut config, session_thread_config, cwd, warnings)?;
+    }
+
     let managed_config_path = managed_codex_config_path(&base);
     if let Some(managed_config) = read_codex_config_toml(&managed_config_path)? {
         apply_agents_md_config_layer(
@@ -9388,13 +10215,6 @@ fn load_agents_md_config(
             warnings,
         )?;
     }
-    let selected_provider_id = config
-        .model_provider_id
-        .as_deref()
-        .map(str::trim)
-        .filter(|value| !value.is_empty())
-        .map(ToOwned::to_owned);
-    apply_selected_provider_model_catalog(&mut config, selected_provider_id.as_deref());
     if config.model_catalog.is_none() {
         if let Some(snapshot) = load_fresh_models_cache(&base) {
             config.model_catalog = Some(snapshot.catalog);
@@ -9410,6 +10230,50 @@ fn build_config_overrides_layer(config_overrides: &[(String, toml::Value)]) -> t
         apply_toml_override(&mut root, path, value.clone());
     }
     root
+}
+
+fn apply_session_thread_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    cwd: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let Some(table) = value.as_table() else {
+        bail!("Invalid session thread config: expected a TOML table.");
+    };
+    validate_session_thread_config_features(value)?;
+    let mut layer = toml::map::Map::new();
+    for key in ["model_provider", "model_providers", "features"] {
+        if let Some(value) = table.get(key) {
+            layer.insert(key.to_string(), value.clone());
+        }
+    }
+    if layer.is_empty() {
+        return Ok(());
+    }
+    apply_agents_md_config_layer(
+        config,
+        &toml::Value::Table(layer),
+        Path::new("session thread config"),
+        cwd,
+        ConfigLayerKind::NonProject,
+        warnings,
+    )
+}
+
+fn validate_session_thread_config_features(value: &toml::Value) -> Result<()> {
+    let Some(features) = value.get("features") else {
+        return Ok(());
+    };
+    let Some(features) = features.as_table() else {
+        bail!("Invalid session thread config `features`: expected a table.");
+    };
+    for (key, value) in features {
+        if !value.is_bool() {
+            bail!("Invalid session thread config `features.{key}`: expected a boolean.");
+        }
+    }
+    Ok(())
 }
 
 fn apply_toml_override(root: &mut toml::Value, path: &str, value: toml::Value) {
@@ -9860,12 +10724,38 @@ fn apply_agents_md_config_layer(
     {
         config.include_environment_context = include_environment_context;
     }
+    if let Some(include_permissions_instructions) =
+        toml_optional_bool(value, "include_permissions_instructions", path)?
+    {
+        config.include_permissions_instructions = include_permissions_instructions;
+    }
     if let Some(include_collaboration_mode_instructions) =
         toml_optional_bool(value, "include_collaboration_mode_instructions", path)?
     {
         config.include_collaboration_mode_instructions = include_collaboration_mode_instructions;
     }
+    if let Some(allow_login_shell) = toml_optional_bool(value, "allow_login_shell", path)? {
+        config.allow_login_shell = allow_login_shell;
+    }
+    if let Some(web_search_mode) =
+        toml_optional_enum_string(value, "web_search", path, &["disabled", "cached", "live"])?
+    {
+        config.web_search_mode = Some(match web_search_mode.as_str() {
+            "disabled" => WebSearchMode::Disabled,
+            "cached" => WebSearchMode::Cached,
+            "live" => WebSearchMode::Live,
+            _ => unreachable!("validated web_search value"),
+        });
+    }
+    apply_allowed_web_search_modes_config_layer(config, value, path)?;
+    if let Some(use_unified_exec) =
+        toml_optional_bool(value, "experimental_use_unified_exec_tool", path)?
+    {
+        config.unified_exec_enabled = use_unified_exec;
+    }
+    apply_web_search_tool_config_layer(config, value, path)?;
     apply_codex_features_config_layer(config, value, path)?;
+    apply_codex_plugins_config_layer(config, value, path)?;
     apply_multi_agent_v2_config_layer(config, value, path)?;
     if let Some(reasoning_effort) = toml_optional_enum_string(
         value,
@@ -9938,7 +10828,64 @@ fn apply_codex_features_config_layer(
             path.display()
         );
     };
+    if let Some(enabled) =
+        toml_optional_nested_enabled_bool(value, &["features", "multi_agent"], path)?
+    {
+        config.multi_agent_enabled = enabled;
+    }
+    if let Some(enabled) =
+        toml_optional_nested_enabled_bool(value, &["features", "shell_tool"], path)?
+    {
+        config.shell_tool_enabled = enabled;
+    }
+    if let Some(enabled) =
+        toml_optional_nested_enabled_bool(value, &["features", "unified_exec"], path)?
+    {
+        config.unified_exec_enabled = enabled;
+    }
+    if let Some(enabled) =
+        toml_optional_nested_enabled_bool(value, &["features", "image_generation"], path)?
+    {
+        config.image_generation_enabled = enabled;
+    }
+    if let Some(enabled) = toml_optional_nested_enabled_bool(value, &["features", "plugins"], path)?
+    {
+        config.plugins_enabled = enabled;
+    }
+    if let Some(enabled) = toml_optional_nested_enabled_bool(
+        value,
+        &["features", "default_mode_request_user_input"],
+        path,
+    )? {
+        config.request_user_input_default_mode_enabled = enabled;
+    }
+    if config.web_search_mode.is_none()
+        && toml_optional_nested_enabled_bool(value, &["features", "web_search_cached"], path)?
+            == Some(true)
+    {
+        config.web_search_mode = Some(WebSearchMode::Cached);
+    }
+    if config.web_search_mode.is_none()
+        && toml_optional_nested_enabled_bool(value, &["features", "web_search_request"], path)?
+            == Some(true)
+    {
+        config.web_search_mode = Some(WebSearchMode::Live);
+    }
     for (key, value) in features {
+        if matches!(
+            key.as_str(),
+            "multi_agent"
+                | "multi_agent_v2"
+                | "shell_tool"
+                | "unified_exec"
+                | "image_generation"
+                | "plugins"
+                | "default_mode_request_user_input"
+                | "web_search_cached"
+                | "web_search_request"
+        ) {
+            continue;
+        }
         if !config.advertised_beta_features.contains_key(key.as_str()) {
             continue;
         }
@@ -9963,6 +10910,488 @@ fn apply_codex_features_config_layer(
             path.display()
         );
     }
+    Ok(())
+}
+
+fn apply_codex_plugins_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+) -> Result<()> {
+    let Some(raw_plugins) = value.get("plugins") else {
+        return Ok(());
+    };
+    let Some(plugins) = raw_plugins.as_table() else {
+        bail!(
+            "Invalid Codex config `plugins` from `{}`: expected a table.",
+            path.display()
+        );
+    };
+    for (plugin_name, plugin_value) in plugins {
+        let Some(plugin_table) = plugin_value.as_table() else {
+            bail!(
+                "Invalid Codex config `plugins.{plugin_name}` from `{}`: expected a table.",
+                path.display()
+            );
+        };
+        let mut plugin_config = config.plugins.get(plugin_name).cloned().unwrap_or_default();
+        if let Some(enabled) = plugin_table.get("enabled") {
+            let Some(enabled) = enabled.as_bool() else {
+                bail!(
+                    "Invalid Codex config `plugins.{plugin_name}.enabled` from `{}`: expected a boolean.",
+                    path.display()
+                );
+            };
+            plugin_config.enabled = enabled;
+        }
+        config.plugins.insert(plugin_name.clone(), plugin_config);
+    }
+    Ok(())
+}
+
+fn apply_allowed_web_search_modes_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+) -> Result<()> {
+    let Some(raw_modes) = value.get("allowed_web_search_modes") else {
+        return Ok(());
+    };
+    let Some(raw_modes) = raw_modes.as_array() else {
+        bail!(
+            "Invalid Codex config `allowed_web_search_modes` from `{}`: expected an array of strings.",
+            path.display()
+        );
+    };
+    let mut modes = BTreeSet::from([WebSearchMode::Disabled]);
+    for raw_mode in raw_modes {
+        let Some(raw_mode) = raw_mode.as_str() else {
+            bail!(
+                "Invalid Codex config `allowed_web_search_modes` from `{}`: expected an array of strings.",
+                path.display()
+            );
+        };
+        let mode = match raw_mode {
+            "disabled" => WebSearchMode::Disabled,
+            "cached" => WebSearchMode::Cached,
+            "live" => WebSearchMode::Live,
+            _ => bail!(
+                "Invalid Codex config `allowed_web_search_modes` from `{}`: expected one of `disabled`, `cached`, `live`.",
+                path.display()
+            ),
+        };
+        modes.insert(mode);
+    }
+    config.web_search_allowed_modes = Some(modes);
+    Ok(())
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalPluginCapabilitySummary {
+    config_name: String,
+    display_name: String,
+    description: Option<String>,
+    has_skills: bool,
+    mcp_server_names: Vec<String>,
+    app_connector_ids: Vec<String>,
+}
+
+#[derive(Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct LocalPluginManifest {
+    #[serde(default)]
+    name: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    skills: Option<String>,
+    #[serde(default)]
+    mcp_servers: Option<String>,
+    #[serde(default)]
+    apps: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct LocalPluginMcpFile {
+    #[serde(default, rename = "mcpServers")]
+    mcp_servers: BTreeMap<String, Value>,
+}
+
+#[derive(Deserialize)]
+struct LocalPluginAppsFile {
+    #[serde(default)]
+    apps: BTreeMap<String, LocalPluginAppConfig>,
+}
+
+#[derive(Deserialize)]
+struct LocalPluginAppConfig {
+    #[serde(default)]
+    id: String,
+}
+
+fn codex_plugin_capability_summaries_for_config(
+    config: &AgentsMdConfig,
+) -> Vec<LocalPluginCapabilitySummary> {
+    if !config.plugins_enabled || config.plugins.is_empty() {
+        return Vec::new();
+    }
+    let Some(codex_home) = codex_home_dir() else {
+        return Vec::new();
+    };
+    config
+        .plugins
+        .iter()
+        .filter(|(_, plugin_config)| plugin_config.enabled)
+        .filter_map(|(config_name, _)| {
+            local_plugin_summary_for_config_name(&codex_home, config_name)
+        })
+        .collect()
+}
+
+fn local_plugin_summary_for_config_name(
+    codex_home: &Path,
+    config_name: &str,
+) -> Option<LocalPluginCapabilitySummary> {
+    let plugin_root = local_plugin_root_for_config_name(codex_home, config_name)?;
+    let manifest_path = plugin_manifest_path(&plugin_root)?;
+    let manifest = std::fs::read_to_string(manifest_path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<LocalPluginManifest>(&contents).ok())
+        .unwrap_or(LocalPluginManifest {
+            name: None,
+            description: None,
+            skills: None,
+            mcp_servers: None,
+            apps: None,
+        });
+    let plugin_slug = plugin_name_from_config_name(config_name);
+    let display_name = manifest
+        .name
+        .as_deref()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or(plugin_slug)
+        .to_string();
+    let has_skills = plugin_has_skills(&plugin_root, manifest.skills.as_deref());
+    let mut mcp_server_names =
+        plugin_mcp_server_names(&plugin_root, manifest.mcp_servers.as_deref());
+    mcp_server_names.sort();
+    mcp_server_names.dedup();
+    let mut app_connector_ids = plugin_app_connector_ids(&plugin_root, manifest.apps.as_deref());
+    app_connector_ids.sort();
+    app_connector_ids.dedup();
+    Some(LocalPluginCapabilitySummary {
+        config_name: config_name.to_string(),
+        display_name,
+        description: prompt_safe_plugin_description(manifest.description.as_deref()),
+        has_skills,
+        mcp_server_names,
+        app_connector_ids,
+    })
+}
+
+fn local_plugin_root_for_config_name(codex_home: &Path, config_name: &str) -> Option<PathBuf> {
+    let plugin_name = plugin_name_from_config_name(config_name);
+    let marketplace = config_name
+        .split_once('@')
+        .map(|(_, marketplace)| marketplace.trim())
+        .filter(|marketplace| !marketplace.is_empty());
+    let mut candidates = Vec::new();
+    if let Some(marketplace) = marketplace {
+        candidates.push(
+            codex_home
+                .join(CODEX_PLUGIN_CACHE_DIR)
+                .join(marketplace)
+                .join(plugin_name)
+                .join("local"),
+        );
+        candidates.push(
+            codex_home
+                .join(CODEX_PLUGIN_CACHE_DIR)
+                .join(marketplace)
+                .join(plugin_name),
+        );
+    }
+    candidates.push(codex_home.join(CODEX_CURATED_PLUGINS_DIR).join(plugin_name));
+    candidates.push(codex_home.join(CODEX_CURATED_PLUGINS_DIR).join(config_name));
+    for candidate in candidates {
+        if plugin_manifest_path(&candidate).is_some() {
+            return Some(candidate);
+        }
+    }
+    let cache_root = codex_home.join(CODEX_PLUGIN_CACHE_DIR);
+    let entries = std::fs::read_dir(cache_root).ok()?;
+    for marketplace in entries.flatten() {
+        let root = marketplace.path().join(plugin_name);
+        for candidate in [root.join("local"), root] {
+            if plugin_manifest_path(&candidate).is_some() {
+                return Some(candidate);
+            }
+        }
+    }
+    None
+}
+
+fn plugin_name_from_config_name(config_name: &str) -> &str {
+    config_name
+        .split_once('@')
+        .map(|(plugin, _)| plugin.trim())
+        .unwrap_or_else(|| config_name.trim())
+}
+
+fn plugin_manifest_path(plugin_root: &Path) -> Option<PathBuf> {
+    [
+        plugin_root.join(".codex-plugin").join("plugin.json"),
+        plugin_root.join(".claude-plugin").join("plugin.json"),
+    ]
+    .into_iter()
+    .find(|path| path.is_file())
+}
+
+fn plugin_relative_path(plugin_root: &Path, configured: Option<&str>, fallback: &str) -> PathBuf {
+    let relative = configured
+        .map(str::trim)
+        .filter(|path| !path.is_empty())
+        .unwrap_or(fallback)
+        .trim_start_matches("./");
+    plugin_root.join(relative)
+}
+
+fn plugin_has_skills(plugin_root: &Path, configured: Option<&str>) -> bool {
+    let root = plugin_relative_path(plugin_root, configured, "skills");
+    directory_contains_file_named(&root, "SKILL.md", 3)
+}
+
+fn directory_contains_file_named(root: &Path, file_name: &str, max_depth: usize) -> bool {
+    if max_depth == 0 || !root.is_dir() {
+        return false;
+    }
+    let Ok(entries) = std::fs::read_dir(root) else {
+        return false;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == file_name)
+        {
+            return true;
+        }
+        if path.is_dir() && directory_contains_file_named(&path, file_name, max_depth - 1) {
+            return true;
+        }
+    }
+    false
+}
+
+fn plugin_mcp_server_names(plugin_root: &Path, configured: Option<&str>) -> Vec<String> {
+    let path = plugin_relative_path(plugin_root, configured, ".mcp.json");
+    let Some(parsed) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<LocalPluginMcpFile>(&contents).ok())
+    else {
+        return Vec::new();
+    };
+    parsed
+        .mcp_servers
+        .into_keys()
+        .filter(|name| !name.trim().is_empty())
+        .collect()
+}
+
+fn plugin_app_connector_ids(plugin_root: &Path, configured: Option<&str>) -> Vec<String> {
+    let path = plugin_relative_path(plugin_root, configured, ".app.json");
+    let Some(parsed) = std::fs::read_to_string(path)
+        .ok()
+        .and_then(|contents| serde_json::from_str::<LocalPluginAppsFile>(&contents).ok())
+    else {
+        return Vec::new();
+    };
+    parsed
+        .apps
+        .into_values()
+        .filter_map(|app| {
+            let id = app.id.trim();
+            (!id.is_empty()).then(|| id.to_string())
+        })
+        .collect()
+}
+
+fn prompt_safe_plugin_description(description: Option<&str>) -> Option<String> {
+    const MAX_DESCRIPTION_CHARS: usize = 240;
+    let normalized = description?
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if normalized.is_empty() {
+        return None;
+    }
+    if normalized.chars().count() <= MAX_DESCRIPTION_CHARS {
+        return Some(normalized);
+    }
+    Some(
+        normalized
+            .chars()
+            .take(MAX_DESCRIPTION_CHARS)
+            .collect::<String>(),
+    )
+}
+
+fn render_available_plugins_instructions(
+    plugins: &[LocalPluginCapabilitySummary],
+) -> Option<String> {
+    if plugins.is_empty() {
+        return None;
+    }
+    let mut lines = vec![
+        PLUGINS_INSTRUCTIONS_OPEN_TAG.to_string(),
+        "## Plugins".to_string(),
+        "A plugin is a local bundle of skills, MCP servers, and apps. Below is the list of plugins that are enabled and available in this session.".to_string(),
+        "### Available plugins".to_string(),
+    ];
+    lines.extend(plugins.iter().map(|plugin| {
+        if let Some(description) = plugin.description.as_deref() {
+            format!("- `{}`: {description}", plugin.display_name)
+        } else {
+            format!("- `{}`", plugin.display_name)
+        }
+    }));
+    lines.push("### How to use plugins".to_string());
+    lines.push(
+        r###"- Discovery: The list above is the plugins available in this session.
+- Skill naming: If a plugin contributes skills, those skill entries are prefixed with `plugin_name:` in the Skills list.
+- Trigger rules: If the user explicitly names a plugin, prefer capabilities associated with that plugin for that turn.
+- Relationship to capabilities: Plugins are not invoked directly. Use their underlying skills, MCP tools, and app tools to help solve the task.
+- Preference: When a relevant plugin is available, prefer using capabilities associated with that plugin over standalone capabilities that provide similar functionality.
+- Missing/blocked: If the user requests a plugin that is not listed above, or the plugin does not have relevant callable capabilities for the task, say so briefly and continue with the best fallback."###
+            .to_string(),
+    );
+    lines.push(PLUGINS_INSTRUCTIONS_CLOSE_TAG.to_string());
+    Some(lines.join("\n"))
+}
+
+fn render_explicit_plugin_instructions(plugin: &LocalPluginCapabilitySummary) -> Option<String> {
+    let mut lines = vec![format!(
+        "Capabilities from the `{}` plugin:",
+        plugin.display_name
+    )];
+    if plugin.has_skills {
+        lines.push(format!(
+            "- Skills from this plugin are prefixed with `{}:`.",
+            plugin.display_name
+        ));
+    }
+    if !plugin.mcp_server_names.is_empty() {
+        lines.push(format!(
+            "- MCP servers from this plugin available in this session: {}.",
+            plugin
+                .mcp_server_names
+                .iter()
+                .map(|server| format!("`{server}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if !plugin.app_connector_ids.is_empty() {
+        lines.push(format!(
+            "- Apps from this plugin available in this session: {}.",
+            plugin
+                .app_connector_ids
+                .iter()
+                .map(|app| format!("`{app}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ));
+    }
+    if lines.len() == 1 {
+        return None;
+    }
+    lines.push("Use these plugin-associated capabilities to help solve the task.".to_string());
+    Some(lines.join("\n"))
+}
+
+fn apply_web_search_tool_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+) -> Result<()> {
+    let Some(raw) = toml_nested_value(value, &["tools", "web_search"]) else {
+        return Ok(());
+    };
+    if raw.as_bool().is_some() {
+        return Ok(());
+    }
+    let Some(table) = raw.as_table() else {
+        bail!(
+            "Invalid Codex config `tools.web_search` from `{}`: expected a table.",
+            path.display()
+        );
+    };
+    let mut tool_config = config.web_search_config.clone().unwrap_or_default();
+    if let Some(context_size) = table.get("context_size") {
+        let Some(context_size) = context_size.as_str() else {
+            bail!(
+                "Invalid Codex config `tools.web_search.context_size` from `{}`: expected a string.",
+                path.display()
+            );
+        };
+        tool_config.context_size = Some(match context_size {
+            "low" => WebSearchContextSize::Low,
+            "medium" => WebSearchContextSize::Medium,
+            "high" => WebSearchContextSize::High,
+            _ => bail!(
+                "Invalid Codex config `tools.web_search.context_size` from `{}`: expected one of `low`, `medium`, `high`.",
+                path.display()
+            ),
+        });
+    }
+    if let Some(allowed_domains) = table.get("allowed_domains") {
+        let Some(items) = allowed_domains.as_array() else {
+            bail!(
+                "Invalid Codex config `tools.web_search.allowed_domains` from `{}`: expected an array of strings.",
+                path.display()
+            );
+        };
+        let mut domains = Vec::with_capacity(items.len());
+        for item in items {
+            let Some(domain) = item.as_str() else {
+                bail!(
+                    "Invalid Codex config `tools.web_search.allowed_domains` from `{}`: expected an array of strings.",
+                    path.display()
+                );
+            };
+            domains.push(domain.to_string());
+        }
+        tool_config.allowed_domains = Some(domains);
+    }
+    if let Some(location) = table.get("location") {
+        let Some(location) = location.as_table() else {
+            bail!(
+                "Invalid Codex config `tools.web_search.location` from `{}`: expected a table.",
+                path.display()
+            );
+        };
+        let field = |key: &str| -> Result<Option<String>> {
+            let Some(value) = location.get(key) else {
+                return Ok(None);
+            };
+            let Some(value) = value.as_str() else {
+                bail!(
+                    "Invalid Codex config `tools.web_search.location.{key}` from `{}`: expected a string.",
+                    path.display()
+                );
+            };
+            Ok(Some(value.to_string()))
+        };
+        tool_config.location = Some(WebSearchLocation {
+            country: field("country")?,
+            region: field("region")?,
+            city: field("city")?,
+            timezone: field("timezone")?,
+        });
+    }
+    config.web_search_config = Some(tool_config);
     Ok(())
 }
 
@@ -10172,25 +11601,6 @@ fn apply_model_provider_request_retry_config_layer(
         );
     };
     for (provider_id, provider_config) in model_providers {
-        if provider_id == AMAZON_BEDROCK_PROVIDER_ID {
-            let aws = parse_amazon_bedrock_provider_override(provider_config)?;
-            let mut provider = config
-                .model_providers
-                .get(provider_id)
-                .cloned()
-                .unwrap_or_else(|| amazon_bedrock_model_provider_config(Default::default()));
-            if let Some(aws) = aws {
-                let built_in_aws = provider.aws.get_or_insert_with(Default::default);
-                if let Some(profile) = aws.profile {
-                    built_in_aws.profile = Some(profile);
-                }
-                if let Some(region) = aws.region {
-                    built_in_aws.region = Some(region);
-                }
-            }
-            config.model_providers.insert(provider_id.clone(), provider);
-            continue;
-        }
         if RESERVED_CUSTOM_MODEL_PROVIDER_IDS.contains(&provider_id.as_str()) {
             bail!(
                 "model_providers contains reserved built-in provider IDs: `{provider_id}`. Built-in providers cannot be overridden. Rename your custom provider (for example, `openai-custom`)."
@@ -10236,48 +11646,6 @@ fn apply_model_provider_request_retry_config_layer(
         config.model_providers.insert(provider_id.clone(), provider);
     }
     Ok(())
-}
-
-fn parse_amazon_bedrock_provider_override(
-    provider_config: &toml::Value,
-) -> Result<Option<ModelProviderAwsAuthInfo>> {
-    let Some(provider_config) = provider_config.as_table() else {
-        bail!("Invalid Codex config `model_providers.{AMAZON_BEDROCK_PROVIDER_ID}`: expected a table.");
-    };
-    if provider_config.keys().any(|key| key != "aws") {
-        bail!(
-            "model_providers.{AMAZON_BEDROCK_PROVIDER_ID} only supports changing `aws.profile` and `aws.region`; other non-default provider fields are not supported"
-        );
-    }
-    if let Some(aws) = provider_config.get("aws") {
-        let Some(aws) = aws.as_table() else {
-            bail!("model_providers.{AMAZON_BEDROCK_PROVIDER_ID}.aws: expected a table");
-        };
-        if aws.keys().any(|key| key != "profile" && key != "region") {
-            bail!(
-                "model_providers.{AMAZON_BEDROCK_PROVIDER_ID} only supports changing `aws.profile` and `aws.region`; other non-default provider fields are not supported"
-            );
-        }
-        return Ok(Some(ModelProviderAwsAuthInfo {
-            profile: toml_table_optional_string(aws, "profile", AMAZON_BEDROCK_PROVIDER_ID)?,
-            region: toml_table_optional_string(aws, "region", AMAZON_BEDROCK_PROVIDER_ID)?,
-        }));
-    }
-    Ok(None)
-}
-
-fn toml_table_optional_string(
-    table: &toml::map::Map<String, toml::Value>,
-    key: &str,
-    table_name: &str,
-) -> Result<Option<String>> {
-    let Some(value) = table.get(key) else {
-        return Ok(None);
-    };
-    let Some(text) = value.as_str() else {
-        bail!("model_providers.{table_name}.aws.{key}: expected a string");
-    };
-    Ok(Some(text.to_string()))
 }
 
 fn apply_model_provider_config_table(
@@ -10339,7 +11707,7 @@ fn apply_model_provider_config_table(
         provider.supports_websockets = supports_websockets;
     }
     if value.get("aws").is_some() {
-        bail!("model_providers.{provider_id}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}`");
+        bail!("model_providers.{provider_id}: provider aws is not supported");
     }
     if let Some(auth) = value.get("auth") {
         let Some(auth) = auth.as_table() else {
@@ -10723,11 +12091,13 @@ fn parse_agent_role_file_metadata(
     };
     let role_name = match role_file_optional_string(table, path, "name")? {
         Some(role_name) => role_name,
-        None if let Some(role_name_hint) = role_name_hint => role_name_hint.to_string(),
-        None => bail!(
-            "agent role file at {} must define a non-empty `name`",
-            path.display()
-        ),
+        None => match role_name_hint {
+            Some(role_name_hint) => role_name_hint.to_string(),
+            None => bail!(
+                "agent role file at {} must define a non-empty `name`",
+                path.display()
+            ),
+        },
     };
     let description = role_file_optional_string(table, path, "description")?;
     if role_name_hint.is_none() && description.is_none() {
@@ -11533,21 +12903,63 @@ fn normalize_request_user_input_args(
     Ok(args)
 }
 
-fn request_user_input_unavailable_message(mode: CollaborationModeKind) -> Option<&'static str> {
+fn request_user_input_unavailable_message(
+    mode: CollaborationModeKind,
+    default_mode_enabled: bool,
+) -> Option<&'static str> {
     match mode {
         CollaborationModeKind::Plan => None,
+        CollaborationModeKind::Default if default_mode_enabled => None,
         CollaborationModeKind::Default => Some("request_user_input is unavailable in Default mode"),
     }
 }
 
+fn active_request_user_input_turn_id(events: &[EventRecord], fallback_call_id: &str) -> String {
+    let terminal_turn_ids = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                CODEX_TURN_COMPLETE_EVENT | CODEX_TURN_ABORTED_EVENT
+            )
+        })
+        .filter_map(|event| {
+            event
+                .payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+        })
+        .collect::<HashSet<_>>();
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.event_type == CODEX_TURN_STARTED_EVENT)
+        .filter_map(|event| {
+            event
+                .payload
+                .get("turn_id")
+                .and_then(Value::as_str)
+                .filter(|turn_id| !terminal_turn_ids.contains(*turn_id))
+                .map(str::to_string)
+        })
+        .next()
+        .unwrap_or_else(|| fallback_call_id.to_string())
+}
+
 fn request_user_input_response_from_event(
     event: &EventRecord,
+    turn_id: &str,
     call_id: &str,
 ) -> Option<RequestUserInputResponse> {
     if event.event_type != REQUEST_USER_INPUT_RESPONSE_EVENT {
         return None;
     }
-    if event.payload.get("call_id").and_then(Value::as_str) != Some(call_id) {
+    if let Some(response_turn_id) = event.payload.get("turn_id").and_then(Value::as_str) {
+        if response_turn_id != turn_id {
+            return None;
+        }
+    } else if event.payload.get("call_id").and_then(Value::as_str) != Some(call_id) {
         return None;
     }
     serde_json::from_value::<RequestUserInputResponse>(event.payload.clone())
@@ -11565,6 +12977,7 @@ fn wait_for_request_user_input_response(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     after_seq: i64,
+    turn_id: &str,
     call_id: &str,
 ) -> Result<RequestUserInputResponse> {
     let mut last_seq = after_seq;
@@ -11576,7 +12989,8 @@ fn wait_for_request_user_input_response(
             if event.event_type == "session.cancelled" {
                 bail!("{REQUEST_USER_INPUT_TOOL_NAME} was cancelled before receiving a response");
             }
-            if let Some(response) = request_user_input_response_from_event(&event, call_id) {
+            if let Some(response) = request_user_input_response_from_event(&event, turn_id, call_id)
+            {
                 return Ok(response);
             }
         }
@@ -11587,6 +13001,7 @@ fn dispatch_request_user_input_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
     if session.parent_id.is_some() {
         return dispatch_tool_validation_error(
@@ -11597,9 +13012,16 @@ fn dispatch_request_user_input_tool(
         );
     }
     let events = store.events_for_session(&session.id)?;
+    let turn_id = active_request_user_input_turn_id(&events, &call.id);
     let current_mode =
         latest_collaboration_mode_from_events(&events).unwrap_or(CollaborationModeKind::Default);
-    if let Some(message) = request_user_input_unavailable_message(current_mode) {
+    let mut warnings = Vec::new();
+    let config =
+        load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
+    if let Some(message) = request_user_input_unavailable_message(
+        current_mode,
+        config.request_user_input_default_mode_enabled,
+    ) {
         return dispatch_tool_validation_error(store, session, call, message);
     }
     let args: RequestUserInputArgs = match serde_json::from_value(call.arguments.clone()) {
@@ -11631,12 +13053,18 @@ fn dispatch_request_user_input_tool(
         &session.id,
         REQUEST_USER_INPUT_REQUEST_EVENT,
         serde_json::json!({
+            "turn_id": turn_id,
             "call_id": call.id,
             "questions": args.questions,
         }),
     )?;
-    let response =
-        wait_for_request_user_input_response(store, session, request_event.seq, &call.id)?;
+    let response = wait_for_request_user_input_response(
+        store,
+        session,
+        request_event.seq,
+        &turn_id,
+        &call.id,
+    )?;
     let content = serde_json::to_string(&response)?;
     store.append_event(
         &session.id,
@@ -12050,6 +13478,7 @@ fn close_direct_active_child_subtrees(store: &Store, session_id: &str) -> Result
             .load_session(&agent.child_session_id)?
             .is_some_and(|session| session.status.is_active());
         if child_is_active || !subtree_active.is_empty() {
+            cleanup_unified_exec_commands_for_agent_subtree(store, &agent.child_session_id)?;
             store.close_child_agent(&agent.child_session_id, "parent finished task")?;
             store.append_event(
                 session_id,
@@ -12383,9 +13812,9 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
         append_workspace_context_event_with_options(store, &child, &child_options)?;
     }
     let input_payload = if let Some(input) = legacy_input.as_ref() {
-        collab_input_event_payload(input)
+        collab_input_event_payload_with_context(input, Path::new(&child.cwd))?
     } else {
-        serde_json::json!({ "text": message.trim() })
+        typed_user_input_payload_from_text_for_cwd(message.trim(), Path::new(&child.cwd))?
     };
     store.append_event(&child.id, "session.input", input_payload)?;
     store.append_event(
@@ -12578,7 +14007,7 @@ pub fn update_parent_from_child_run(
         .load_session(child_id)?
         .with_context(|| format!("unknown child session id: {child_id}"))?;
     let child_events = store.events_for_session(child_id)?;
-    let result = result_from_events(&child_events);
+    let result = session_result_from_events(&child_events);
     let failure = failure_from_events(&child_events).or(run_error);
     let status = child.status.as_str().to_string();
     let event_type = match status.as_str() {
@@ -12734,6 +14163,9 @@ struct CollabInput {
     content: Value,
     items: Option<Vec<Value>>,
     skill_context_messages: Option<Vec<Value>>,
+    mention_context_messages: Option<Vec<Value>>,
+    app_connector_ids: Option<Vec<String>>,
+    plugin_mentions: Option<Vec<Value>>,
 }
 
 fn spawn_agent_message_from_call(call: &ToolCall, legacy_v1: bool) -> String {
@@ -12778,6 +14210,9 @@ fn parse_collab_input(
                 content: Value::String(message.to_string()),
                 items: None,
                 skill_context_messages: None,
+                mention_context_messages: None,
+                app_connector_ids: None,
+                plugin_mentions: None,
             })
         }
         (None, Some(items)) => collab_input_from_items(items),
@@ -12791,17 +14226,64 @@ fn collab_input_from_items(items: &Value) -> Result<CollabInput, String> {
     if items.is_empty() {
         return Err("Items can't be empty".to_string());
     }
-    let preview = items
+    let item_values = items.clone();
+    let preview = collab_items_preview(&item_values);
+    Ok(collab_input_from_item_values(preview, item_values))
+}
+
+pub fn typed_user_input_payload_from_text(text: &str) -> Value {
+    collab_input_event_payload(&typed_collab_input_from_text(text))
+}
+
+pub fn typed_user_input_payload_from_text_for_cwd(
+    text: &str,
+    cwd: impl AsRef<Path>,
+) -> Result<Value> {
+    collab_input_event_payload_with_context(&typed_collab_input_from_text(text), cwd.as_ref())
+}
+
+pub fn typed_user_input_payload_from_items(items: &Value) -> Result<Value, String> {
+    collab_input_from_items(items).map(|input| collab_input_event_payload(&input))
+}
+
+pub fn typed_user_input_payload_from_items_for_cwd(
+    items: &Value,
+    cwd: impl AsRef<Path>,
+) -> Result<Value> {
+    let input = collab_input_from_items(items).map_err(anyhow::Error::msg)?;
+    collab_input_event_payload_with_context(&input, cwd.as_ref())
+}
+
+fn typed_collab_input_from_text(text: &str) -> CollabInput {
+    if let Some(items) = collab_items_from_linked_mentions(text) {
+        return collab_input_from_item_values(text.to_string(), items);
+    }
+    CollabInput {
+        preview: text.to_string(),
+        content: Value::String(text.to_string()),
+        items: None,
+        skill_context_messages: None,
+        mention_context_messages: None,
+        app_connector_ids: None,
+        plugin_mentions: None,
+    }
+}
+
+fn collab_items_preview(items: &[Value]) -> String {
+    items
         .iter()
         .map(collab_item_preview)
         .filter(|preview| !preview.is_empty())
         .collect::<Vec<_>>()
-        .join("\n");
+        .join("\n")
+}
+
+fn collab_input_from_item_values(preview: String, item_values: Vec<Value>) -> CollabInput {
     let mut parts = Vec::new();
-    for item in items {
+    for item in &item_values {
         collab_item_content_parts(item, &mut parts);
     }
-    let fallback_preview = items
+    let fallback_preview = item_values
         .iter()
         .filter(|item| collab_item_allows_preview_fallback(item))
         .map(collab_item_preview)
@@ -12814,18 +14296,26 @@ fn collab_input_from_items(items: &Value) -> Result<CollabInput, String> {
             "text": fallback_preview,
         }));
     }
-    let item_values = items.clone();
     let skill_context_messages = if collab_items_include_skill(&item_values) {
-        Some(skill_context_messages_from_items(&item_values))
+        unique_non_empty_array(skill_context_messages_from_items(&item_values))
     } else {
         None
     };
-    Ok(CollabInput {
+    let mut app_connector_ids = app_connector_ids_from_items(&item_values);
+    if let Some(messages) = skill_context_messages.as_ref() {
+        app_connector_ids.extend(app_connector_ids_from_skill_context_messages(messages));
+    }
+    let app_connector_ids = unique_non_empty_strings(app_connector_ids);
+    let plugin_mentions = unique_non_empty_array(plugin_mentions_from_items(&item_values));
+    CollabInput {
         preview,
         content: Value::Array(parts),
         items: Some(item_values),
         skill_context_messages,
-    })
+        mention_context_messages: None,
+        app_connector_ids,
+        plugin_mentions,
+    }
 }
 
 fn collab_input_event_payload(input: &CollabInput) -> Value {
@@ -12839,13 +14329,206 @@ fn collab_input_event_payload(input: &CollabInput) -> Value {
     if let Some(messages) = input.skill_context_messages.as_ref() {
         payload["skill_context_messages"] = Value::Array(messages.clone());
     }
+    if let Some(messages) = input.mention_context_messages.as_ref() {
+        payload["mention_context_messages"] = Value::Array(messages.clone());
+    }
+    if let Some(connector_ids) = input.app_connector_ids.as_ref() {
+        payload["app_connector_ids"] = Value::Array(
+            connector_ids
+                .iter()
+                .cloned()
+                .map(Value::String)
+                .collect::<Vec<_>>(),
+        );
+    }
+    if let Some(mentions) = input.plugin_mentions.as_ref() {
+        payload["plugin_mentions"] = Value::Array(mentions.clone());
+    }
     payload
+}
+
+fn collab_input_event_payload_with_context(input: &CollabInput, cwd: &Path) -> Result<Value> {
+    let mut input = input.clone();
+    materialize_mention_context_messages(&mut input, cwd)?;
+    Ok(collab_input_event_payload(&input))
+}
+
+fn materialize_mention_context_messages(input: &mut CollabInput, cwd: &Path) -> Result<()> {
+    if input.mention_context_messages.is_some()
+        || input
+            .plugin_mentions
+            .as_ref()
+            .is_none_or(|mentions| mentions.is_empty())
+    {
+        return Ok(());
+    }
+    let mut warnings = Vec::new();
+    let config =
+        load_agents_md_config_for_options(cwd, &mut warnings, &AgentRunOptions::default())?;
+    let plugin_summaries = codex_plugin_capability_summaries_for_config(&config);
+    if plugin_summaries.is_empty() {
+        return Ok(());
+    }
+    let mentioned_plugin_names = input
+        .plugin_mentions
+        .as_ref()
+        .into_iter()
+        .flatten()
+        .filter_map(|mention| mention.get("plugin").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|plugin| !plugin.is_empty())
+        .collect::<HashSet<_>>();
+    let mut messages = Vec::new();
+    for plugin in plugin_summaries
+        .iter()
+        .filter(|plugin| mentioned_plugin_names.contains(plugin.config_name.as_str()))
+    {
+        let Some(text) = render_explicit_plugin_instructions(plugin) else {
+            continue;
+        };
+        messages.push(serde_json::json!({
+            "role": "developer",
+            "name": MENTION_CONTEXT_MESSAGE_NAME,
+            "content": [{
+                "type": "input_text",
+                "text": text,
+            }],
+        }));
+    }
+    if !messages.is_empty() {
+        input.mention_context_messages = Some(messages);
+    }
+    Ok(())
 }
 
 fn collab_items_include_skill(items: &[Value]) -> bool {
     items
         .iter()
         .any(|item| item.get("type").and_then(Value::as_str) == Some("skill"))
+}
+
+fn collab_items_from_linked_mentions(text: &str) -> Option<Vec<Value>> {
+    let mut items = Vec::new();
+    let mut search_from = 0;
+    let mut last_emit = 0;
+    let mut found = false;
+
+    while let Some(open_rel) = text[search_from..].find('[') {
+        let open = search_from + open_rel;
+        let Some(close_rel) = text[open + 1..].find(']') else {
+            break;
+        };
+        let close = open + 1 + close_rel;
+        if !text[close + 1..].starts_with('(') {
+            search_from = open + 1;
+            continue;
+        }
+        let target_start = close + 2;
+        let Some(target_rel) = text[target_start..].find(')') else {
+            break;
+        };
+        let target_end = target_start + target_rel;
+        let label = &text[open + 1..close];
+        let target = &text[target_start..target_end];
+        let Some(item) = collab_item_from_linked_target(label, target) else {
+            search_from = open + 1;
+            continue;
+        };
+        push_collab_text_item(&mut items, &text[last_emit..open]);
+        items.push(item);
+        found = true;
+        last_emit = target_end + 1;
+        search_from = last_emit;
+    }
+
+    if !found {
+        return None;
+    }
+    push_collab_text_item(&mut items, &text[last_emit..]);
+    Some(items)
+}
+
+fn collab_item_from_linked_target(label: &str, target: &str) -> Option<Value> {
+    let target = target.trim();
+    let display_name = linked_target_display_name(label, target);
+    let label = label.trim();
+    if target.starts_with("app://") {
+        if !label.starts_with('$') {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "type": "mention",
+            "name": display_name,
+            "path": target,
+        }));
+    }
+    if target.starts_with("plugin://") {
+        if !label.starts_with('@') {
+            return None;
+        }
+        return Some(serde_json::json!({
+            "type": "mention",
+            "name": display_name,
+            "path": target,
+        }));
+    }
+    let Some(skill_path) = target.strip_prefix("skill://") else {
+        return None;
+    };
+    if !label.starts_with('$') {
+        return None;
+    }
+    let skill_path = skill_path.trim();
+    if skill_path.is_empty()
+        || !Path::new(skill_path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "SKILL.md")
+    {
+        return None;
+    }
+    Some(serde_json::json!({
+        "type": "skill",
+        "name": display_name,
+        "path": skill_path,
+    }))
+}
+
+fn linked_target_display_name(label: &str, target: &str) -> String {
+    let label = label
+        .trim()
+        .trim_start_matches(['$', '@'])
+        .trim()
+        .to_string();
+    if !label.is_empty() {
+        return label;
+    }
+    if let Some(connector_id) = target.strip_prefix("app://") {
+        return connector_id.to_string();
+    }
+    if let Some(plugin_id) = target.strip_prefix("plugin://") {
+        return plugin_id.to_string();
+    }
+    target
+        .strip_prefix("skill://")
+        .and_then(|path| {
+            Path::new(path)
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str())
+        })
+        .unwrap_or_default()
+        .to_string()
+}
+
+fn push_collab_text_item(items: &mut Vec<Value>, text: &str) {
+    if text.is_empty() {
+        return;
+    }
+    items.push(serde_json::json!({
+        "type": "text",
+        "text": text,
+    }));
 }
 
 fn collab_item_preview(item: &Value) -> String {
@@ -13610,6 +15293,41 @@ pub fn collect_agent_tree(store: &Store, parent_session_id: &str) -> Result<Vec<
     Ok(out)
 }
 
+pub fn cleanup_unified_exec_commands_for_session(session_id: &str) -> usize {
+    tools::command::cleanup_session_commands(session_id)
+}
+
+pub fn cleanup_unified_exec_commands_for_agent_subtree(
+    store: &Store,
+    root_session_id: &str,
+) -> Result<usize> {
+    let mut session_ids = Vec::new();
+    collect_agent_subtree_session_ids(store, root_session_id, &mut session_ids)?;
+    Ok(session_ids
+        .iter()
+        .map(|session_id| cleanup_unified_exec_commands_for_session(session_id))
+        .sum())
+}
+
+pub fn cleanup_all_unified_exec_commands() -> usize {
+    tools::command::cleanup_all_commands()
+}
+
+#[derive(Debug, Default)]
+pub struct UnifiedExecShutdownCleanup;
+
+impl UnifiedExecShutdownCleanup {
+    pub fn new() -> Self {
+        Self
+    }
+}
+
+impl Drop for UnifiedExecShutdownCleanup {
+    fn drop(&mut self) {
+        cleanup_all_unified_exec_commands();
+    }
+}
+
 fn collect_agent_tree_into(
     store: &Store,
     parent_session_id: &str,
@@ -13620,6 +15338,18 @@ fn collect_agent_tree_into(
         if child.status != "closed" {
             collect_agent_tree_into(store, &child.child_session_id, out)?;
         }
+    }
+    Ok(())
+}
+
+fn collect_agent_subtree_session_ids(
+    store: &Store,
+    root_session_id: &str,
+    out: &mut Vec<String>,
+) -> Result<()> {
+    out.push(root_session_id.to_string());
+    for child in store.list_child_agents(root_session_id)? {
+        collect_agent_subtree_session_ids(store, &child.child_session_id, out)?;
     }
     Ok(())
 }
@@ -13756,7 +15486,8 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
     {
         store.request_cancel(target_session_id, "interrupted by parent agent")?;
     }
-    let followup_payload = collab_input_event_payload(&input);
+    let followup_payload =
+        collab_input_event_payload_with_context(&input, Path::new(&target_session.cwd))?;
     let followup = store.append_event(target_session_id, "session.followup", followup_payload)?;
     store.append_event(
         &session.id,
@@ -14374,7 +16105,7 @@ pub fn local_agent_status_value(
     if let Some(failure) = failure_from_events(&events) {
         return Ok(serde_json::json!({ "errored": failure }));
     }
-    if let Some(result) = result_from_events(&events) {
+    if let Some(result) = session_result_from_events(&events) {
         return Ok(serde_json::json!({ "completed": result }));
     }
     Ok(match session.status {
@@ -14455,6 +16186,7 @@ fn dispatch_close_agent_tool(
         .load_session(&child_session_id)?
         .with_context(|| format!("unknown child session id: {child_session_id}"))?;
     let previous_status = local_agent_status_value(store, &child, target_agent.summary.as_ref())?;
+    cleanup_unified_exec_commands_for_agent_subtree(store, &child_session_id)?;
     store.close_child_agent(&child_session_id, "closed by parent agent")?;
     store.append_event(
         &session.id,
@@ -14541,6 +16273,7 @@ fn dispatch_close_agent_v1_tool(
         }),
     )?;
     let previous_status = local_agent_status_value(store, &child, agent_summary.as_ref())?;
+    cleanup_unified_exec_commands_for_agent_subtree(store, child_session_id)?;
     store.close_child_agent(child_session_id, "closed by parent agent")?;
     store.append_event(
         &session.id,
@@ -14614,7 +16347,7 @@ fn dispatch_unknown_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    let error = format!("unknown tool: {}", call.name);
+    let error = format!("unsupported call: {}", call.name);
     store.append_event(
         &session.id,
         "tool.failed",
@@ -15478,11 +17211,9 @@ mod tests {
             ),
         ]);
         let beta_headers = codex_responses_extra_headers(&store, &parent, &beta_options, None)?;
-        assert_eq!(
-            beta_headers
-                .get(CODEX_BETA_FEATURES_HEADER)
-                .map(String::as_str),
-            Some("remote_compaction_v2")
+        assert!(
+            !beta_headers.contains_key(CODEX_BETA_FEATURES_HEADER),
+            "local must not advertise remote_compaction_v2 until the server-backed client path exists"
         );
 
         let child = store.create_child_session(
@@ -16117,6 +17848,65 @@ x-env = "CORP_HEADER"
         assert_eq!(
             session_base_instructions_from_events(&events).as_deref(),
             Some(persisted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_runtime_base_instructions_override_matches_codex_precedence() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "instructions = \"config base should lose\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "capture runtime base instructions",
+                &project,
+                AgentRunOptions::default().with_base_instructions("runtime base"),
+            )?;
+            std::fs::write(codex_home.join("config.toml"), "")?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default().with_base_instructions("runtime base v2"),
+            )?;
+            Ok(session_id)
+        })?;
+
+        assert_eq!(
+            provider.captured_instructions(),
+            vec![
+                Some("runtime base".to_string()),
+                Some("runtime base".to_string()),
+                Some("runtime base v2".to_string()),
+            ]
+        );
+        let events = store.events_for_session(&session_id)?;
+        let base_events = events
+            .iter()
+            .filter(|event| event.event_type == SESSION_BASE_INSTRUCTIONS_EVENT)
+            .collect::<Vec<_>>();
+        assert_eq!(base_events.len(), 1);
+        assert_eq!(base_events[0].payload["source"], "runtime_override");
+        assert_eq!(
+            session_base_instructions_from_events(&events).as_deref(),
+            Some("runtime base")
         );
         Ok(())
     }
@@ -17125,6 +18915,9 @@ x-env = "CORP_HEADER"
                 supports_parallel_tool_calls: false,
                 supports_search_tool: false,
                 supports_image_detail_original: false,
+                shell_type: browser_use_providers::ModelShellType::ShellCommand,
+                web_search_tool_type: browser_use_providers::WebSearchToolType::Text,
+                experimental_supported_tools: Vec::new(),
                 input_modalities: vec!["text".to_string()],
                 context_window: None,
                 max_context_window: None,
@@ -17356,261 +19149,6 @@ cwd = "auth-cwd"
         assert_eq!(auth.timeout_ms, 1234);
         assert_eq!(auth.refresh_interval_ms, 0);
         assert_eq!(auth.cwd, codex_home.join("auth-cwd"));
-        Ok(())
-    }
-
-    #[test]
-    fn amazon_bedrock_provider_override_uses_static_catalog_like_codex() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(
-            codex_home.join("models_cache.json"),
-            format!(
-                r#"{{
-  "fetched_at": "{}",
-  "client_version": "{}",
-  "etag": "etag-cache",
-  "models": [
-    {{
-      "slug": "cached-model",
-      "display_name": "Cached",
-      "description": "Cached",
-      "default_reasoning_level": "high",
-      "supported_reasoning_levels": [{{"effort": "high"}}],
-      "visibility": "list",
-      "supported_in_api": true,
-      "priority": 0,
-      "base_instructions": "Cached base",
-      "supports_reasoning_summaries": true,
-      "default_reasoning_summary": "none",
-      "input_modalities": ["text"]
-    }}
-  ]
-}}"#,
-                Utc::now().to_rfc3339(),
-                codex_client_version_to_whole()
-            ),
-        )?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            r#"
-model_provider = "amazon-bedrock"
-
-[model_providers.amazon-bedrock.aws]
-profile = "prod"
-region = "us-west-2"
-"#,
-        )?;
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(project.join(".git"))?;
-
-        let (config, default_model) = with_codex_home(&codex_home, || -> Result<_> {
-            let mut warnings = Vec::new();
-            let config = load_agents_md_config(&project, &mut warnings, None, &[])?;
-            let default_model = default_model_for_cwd_with_options(&project, None, &[], true)?;
-            Ok((config, default_model))
-        })?;
-
-        assert_eq!(
-            config.model_provider_id.as_deref(),
-            Some(AMAZON_BEDROCK_PROVIDER_ID)
-        );
-        let provider = config
-            .model_providers
-            .get(AMAZON_BEDROCK_PROVIDER_ID)
-            .context("amazon bedrock provider")?;
-        assert_eq!(provider.name, AMAZON_BEDROCK_PROVIDER_NAME);
-        assert_eq!(
-            provider.base_url.as_deref(),
-            Some(AMAZON_BEDROCK_DEFAULT_BASE_URL)
-        );
-        assert!(!provider.requires_openai_auth);
-        assert!(!provider.supports_websockets);
-        assert_eq!(
-            provider
-                .http_headers
-                .get(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER)
-                .map(String::as_str),
-            Some(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE)
-        );
-        assert_eq!(
-            provider.aws.as_ref().and_then(|aws| aws.profile.as_deref()),
-            Some("prod")
-        );
-        assert_eq!(
-            provider.aws.as_ref().and_then(|aws| aws.region.as_deref()),
-            Some("us-west-2")
-        );
-        let catalog = config.model_catalog.as_ref().context("bedrock catalog")?;
-        assert!(!config.model_catalog_refresh_allowed);
-        assert_eq!(config.model_catalog_cache_etag.as_deref(), None);
-        assert_eq!(catalog.models[0].slug, "openai.gpt-5.4");
-        assert!(!catalog
-            .models
-            .iter()
-            .any(|model| model.slug == "cached-model"));
-        assert_eq!(default_model, "openai.gpt-5.4");
-
-        let snapshot = model_provider_info_snapshot(AMAZON_BEDROCK_PROVIDER_ID, provider);
-        let restored = codex_model_provider_config_from_snapshot(&snapshot)?;
-        assert_eq!(restored.aws, provider.aws);
-        Ok(())
-    }
-
-    #[test]
-    fn amazon_bedrock_provider_override_rejects_non_aws_fields_like_codex() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            r#"
-[model_providers.amazon-bedrock]
-base_url = "https://example.test/v1"
-"#,
-        )?;
-        let project = temp.path().join("project");
-        std::fs::create_dir_all(project.join(".git"))?;
-
-        let error = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
-            let mut warnings = Vec::new();
-            load_agents_md_config(&project, &mut warnings, None, &[])
-        })
-        .expect_err("bedrock non-aws override should fail");
-
-        assert!(
-            format!("{error:#}").contains("only supports changing `aws.profile` and `aws.region`"),
-            "{error:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn amazon_bedrock_bearer_auth_requires_region_like_codex() -> Result<()> {
-        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
-        let _token = EnvVarGuard::set_str(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR, "bedrock-token");
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path().join("state"))?;
-        let config = AgentsMdConfig::default();
-
-        let error = configured_openai_responses_provider(
-            &store,
-            "openai.gpt-5.4".to_string(),
-            &config,
-            AMAZON_BEDROCK_PROVIDER_ID,
-        )
-        .expect_err("bedrock bearer token without region should fail");
-
-        assert!(
-            format!("{error:#}").contains(
-                "Amazon Bedrock bearer token auth requires `model_providers.amazon-bedrock.aws.region`"
-            ),
-            "{error:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn amazon_bedrock_bearer_auth_constructs_region_provider_like_codex() -> Result<()> {
-        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
-        let _token = EnvVarGuard::set_str(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR, "bedrock-token");
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path().join("state"))?;
-        let mut config = AgentsMdConfig::default();
-        config.model_providers.insert(
-            AMAZON_BEDROCK_PROVIDER_ID.to_string(),
-            amazon_bedrock_model_provider_config(ModelProviderAwsAuthInfo {
-                profile: Some("prod".to_string()),
-                region: Some("us-west-2".to_string()),
-            }),
-        );
-
-        let provider = configured_openai_responses_provider(
-            &store,
-            "openai.gpt-5.4".to_string(),
-            &config,
-            AMAZON_BEDROCK_PROVIDER_ID,
-        )?
-        .context("bedrock provider")?;
-
-        assert_eq!(provider.provider_name(), AMAZON_BEDROCK_PROVIDER_ID);
-        assert_eq!(provider.model_name(), "openai.gpt-5.4");
-        assert_eq!(
-            amazon_bedrock_base_url("us-west-2")?,
-            "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
-        );
-        let invalid_region = amazon_bedrock_base_url("antarctica-test-1")
-            .expect_err("unsupported Bedrock region should fail");
-        assert!(
-            format!("{invalid_region:#}")
-                .contains("Amazon Bedrock Mantle does not support region `antarctica-test-1`"),
-            "{invalid_region:#}"
-        );
-        Ok(())
-    }
-
-    #[test]
-    fn amazon_bedrock_sigv4_auth_constructs_provider_without_bearer_token_like_codex() -> Result<()>
-    {
-        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
-        let _token = EnvVarGuard::remove(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR);
-        let _metadata_disabled = EnvVarGuard::set_str("AWS_EC2_METADATA_DISABLED", "true");
-        let _profile = EnvVarGuard::remove("AWS_PROFILE");
-        let _region = EnvVarGuard::remove("AWS_REGION");
-        let _default_region = EnvVarGuard::remove("AWS_DEFAULT_REGION");
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path().join("state"))?;
-        let mut config = AgentsMdConfig::default();
-        config.model_providers.insert(
-            AMAZON_BEDROCK_PROVIDER_ID.to_string(),
-            amazon_bedrock_model_provider_config(ModelProviderAwsAuthInfo {
-                profile: None,
-                region: Some("us-east-1".to_string()),
-            }),
-        );
-
-        let provider = configured_openai_responses_provider(
-            &store,
-            "openai.gpt-5.4".to_string(),
-            &config,
-            AMAZON_BEDROCK_PROVIDER_ID,
-        )?
-        .context("bedrock provider")?;
-
-        assert_eq!(provider.provider_name(), AMAZON_BEDROCK_PROVIDER_ID);
-        assert_eq!(provider.model_name(), "openai.gpt-5.4");
-        Ok(())
-    }
-
-    #[test]
-    fn amazon_bedrock_sigv4_auth_rejects_unsupported_runtime_region_like_codex() -> Result<()> {
-        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
-        let _token = EnvVarGuard::remove(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR);
-        let _metadata_disabled = EnvVarGuard::set_str("AWS_EC2_METADATA_DISABLED", "true");
-        let _profile = EnvVarGuard::remove("AWS_PROFILE");
-        let temp = tempfile::tempdir()?;
-        let store = Store::open(temp.path().join("state"))?;
-        let mut config = AgentsMdConfig::default();
-        config.model_providers.insert(
-            AMAZON_BEDROCK_PROVIDER_ID.to_string(),
-            amazon_bedrock_model_provider_config(ModelProviderAwsAuthInfo {
-                profile: None,
-                region: Some("antarctica-test-1".to_string()),
-            }),
-        );
-
-        let error = configured_openai_responses_provider(
-            &store,
-            "openai.gpt-5.4".to_string(),
-            &config,
-            AMAZON_BEDROCK_PROVIDER_ID,
-        )
-        .expect_err("unsupported Bedrock runtime region should fail");
-
-        assert!(
-            format!("{error:#}")
-                .contains("Amazon Bedrock Mantle does not support region `antarctica-test-1`"),
-            "{error:#}"
-        );
         Ok(())
     }
 
@@ -18780,6 +20318,78 @@ command = "print-token"
     }
 
     #[test]
+    fn lossy_compaction_event_is_replay_barrier_and_reinjects_context_like_codex() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "permissions".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "workspace.context".to_string(),
+                payload: serde_json::json!({
+                    "kind": WORKSPACE_CONTEXT_PERMISSIONS_KIND,
+                    "content": "checkpoint permissions",
+                }),
+            },
+            EventRecord {
+                seq: 2,
+                id: "environment".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "workspace.context".to_string(),
+                payload: serde_json::json!({
+                    "kind": WORKSPACE_CONTEXT_ENVIRONMENT_KIND,
+                    "content": "<environment_context><cwd>/tmp/project</cwd></environment_context>",
+                }),
+            },
+            EventRecord {
+                seq: 3,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "old prompt should not replay"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "old-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "old answer should not replay"}),
+            },
+            EventRecord {
+                seq: 5,
+                id: "legacy-compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({"reason": "legacy_lossy_compaction"}),
+            },
+            EventRecord {
+                seq: 6,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 6,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue after lossy compaction"}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("checkpoint permissions"));
+        assert!(provider_text.contains("<environment_context>"));
+        assert!(provider_text.contains("continue after lossy compaction"));
+        assert!(!provider_text.contains("old prompt should not replay"));
+        assert!(!provider_text.contains("old answer should not replay"));
+    }
+
+    #[test]
     fn provider_messages_resume_from_response_item_compaction_checkpoint() {
         let events = vec![
             EventRecord {
@@ -18955,9 +20565,14 @@ command = "print-token"
         assert!(!response_items
             .iter()
             .any(|item| { item.get("type").and_then(Value::as_str) == Some("reasoning") }));
-        assert!(!response_items
-            .iter()
-            .any(|item| { item.get("type").and_then(Value::as_str) == Some("web_search_call") }));
+        assert!(response_items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("web_search_call")
+                && item.get("id").and_then(Value::as_str) == Some("ws_checkpoint")
+        }));
+        assert!(response_items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                && item.get("id").and_then(Value::as_str) == Some("ig_checkpoint")
+        }));
         assert!(response_items.iter().any(|item| {
             item.get("type").and_then(Value::as_str) == Some("compaction")
                 && item.get("encrypted_content").and_then(Value::as_str)
@@ -19872,6 +21487,57 @@ command = "print-token"
     }
 
     #[test]
+    fn lossy_compaction_clears_pre_compaction_baseline_like_codex() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "first".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "first prompt"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "baseline".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: CONTEXT_BASELINE_EVENT.to_string(),
+                payload: serde_json::json!({
+                    "turn_seq": 1,
+                    "provider": "codex",
+                    "model": "gpt-5.2",
+                    "personality": "friendly",
+                    "model_config_seq": 2,
+                }),
+            },
+            EventRecord {
+                seq: 3,
+                id: "legacy-compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({"reason": "legacy_lossy_compaction"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue"}),
+            },
+        ];
+
+        let settings = previous_turn_settings_from_events(&events);
+        assert_eq!(settings.provider, None);
+        assert_eq!(settings.model, None);
+        assert_eq!(settings.personality, None);
+        assert_eq!(settings.model_config_seq, None);
+        assert_eq!(current_turn_user_message_seq(&events), Some(4));
+    }
+
+    #[test]
     fn agents_md_context_uses_project_root_to_cwd_order() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -20046,6 +21712,129 @@ command = "print-token"
     }
 
     #[test]
+    fn workspace_context_can_disable_permissions_but_keep_developer_and_collaboration_like_codex(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_permissions_instructions = false\ndeveloper_instructions = \"Stay focused.\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let developer_text = message_content_text(&messages[0]);
+
+        assert_eq!(messages[0]["role"], "developer");
+        assert!(!developer_text.contains("<permissions instructions>"));
+        assert!(developer_text.contains("Stay focused."));
+        assert!(developer_text.contains("<collaboration_mode># Collaboration Mode: Default"));
+        Ok(())
+    }
+
+    #[test]
+    fn config_parses_include_permissions_instructions_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_permissions_instructions = false\n",
+        )?;
+
+        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let mut warnings = Vec::new();
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })?;
+        assert!(!config.include_permissions_instructions);
+
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_permissions_instructions = \"false\"\n",
+        )?;
+        let error = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let mut warnings = Vec::new();
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })
+        .expect_err("non-bool include_permissions_instructions should fail");
+        assert!(error.to_string().contains("expected a boolean"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_runtime_option_can_disable_permissions_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options = AgentRunOptions::default().with_include_permissions_instructions(false);
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let developer_text = message_content_text(&messages[0]);
+
+        assert!(!developer_text.contains("<permissions instructions>"));
+        assert!(developer_text.contains("<collaboration_mode># Collaboration Mode: Default"));
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_does_not_reinject_suppressed_permissions_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_permissions_instructions = false\ninclude_collaboration_mode_instructions = false\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "workspace.context"
+                && event.payload["kind"] == WORKSPACE_CONTEXT_PERMISSIONS_KIND
+                && event.payload["suppressed"] == true
+        }));
+        let mut messages = vec![serde_json::json!({
+            "role": "user",
+            "content": "x".repeat(2000),
+        })];
+
+        maybe_compact_messages(&store, &session.id, &mut messages, 500)?;
+
+        assert!(messages
+            .iter()
+            .all(|message| !message_content_text(message).contains("<permissions instructions>")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.get("name").and_then(Value::as_str)
+                == Some(PERMISSIONS_CONTEXT_MESSAGE_NAME)));
+        Ok(())
+    }
+
+    #[test]
     fn workspace_context_can_disable_collaboration_mode_instructions_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -20143,6 +21932,28 @@ command = "print-token"
     }
 
     #[test]
+    fn request_user_input_default_mode_feature_updates_tool_description_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options = AgentRunOptions::default().with_config_overrides(vec![(
+            "features.default_mode_request_user_input".to_string(),
+            toml::Value::Boolean(true),
+        )]);
+
+        let spec = browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)?
+            .into_iter()
+            .find(|spec| spec.name == REQUEST_USER_INPUT_TOOL_NAME)
+            .expect("request_user_input spec");
+
+        assert_eq!(
+            spec.description,
+            "Request user input for one to three short questions and wait for the response. This tool is only available in Default or Plan mode."
+        );
+        Ok(())
+    }
+
+    #[test]
     fn collaboration_mode_tool_visibility_matches_codex_runtime_contract() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path().join("state"))?;
@@ -20186,6 +21997,264 @@ command = "print-token"
     }
 
     #[test]
+    fn request_user_input_default_mode_feature_allows_default_mode_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, temp.path())?;
+        let options = AgentRunOptions::default().with_config_overrides(vec![(
+            "features.default_mode_request_user_input".to_string(),
+            toml::Value::Boolean(true),
+        )]);
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        let session_id = session.id.clone();
+        let state_dir_for_thread = state_dir.clone();
+        let responder = thread::spawn(move || -> Result<()> {
+            let store = Store::open(state_dir_for_thread)?;
+            let mut last_seq = 0;
+            loop {
+                let events = store.wait_for_events_after_seq(
+                    &session_id,
+                    last_seq,
+                    Duration::from_secs(5),
+                )?;
+                for event in events {
+                    last_seq = last_seq.max(event.seq);
+                    if event.event_type == REQUEST_USER_INPUT_REQUEST_EVENT {
+                        store.append_event(
+                            &session_id,
+                            REQUEST_USER_INPUT_RESPONSE_EVENT,
+                            serde_json::json!({
+                                "call_id": event.payload["call_id"],
+                                "answers": {
+                                    "scope": {
+                                        "answers": ["Continue"]
+                                    }
+                                }
+                            }),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+        });
+        let outcome = dispatch_request_user_input_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "ask_default".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "questions": [{
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Continue?",
+                        "options": [
+                            {"label": "Continue", "description": "Continue now."},
+                            {"label": "Stop", "description": "Stop now."}
+                        ]
+                    }]
+                }),
+            },
+            &options,
+        )?;
+        responder
+            .join()
+            .map_err(|_| anyhow!("responder thread panicked"))??;
+
+        let content = outcome.messages[0]["content"].as_str().context("content")?;
+        let response: Value = serde_json::from_str(content)?;
+        assert_eq!(
+            response["answers"]["scope"]["answers"],
+            serde_json::json!(["Continue"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_request_uses_active_turn_id_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, temp.path())?;
+        let options =
+            AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        store.append_event(
+            &session.id,
+            CODEX_TURN_STARTED_EVENT,
+            serde_json::json!({"turn_id": "turn-active"}),
+        )?;
+        let session_id = session.id.clone();
+        let state_dir_for_thread = state_dir.clone();
+        let responder = thread::spawn(move || -> Result<()> {
+            let store = Store::open(state_dir_for_thread)?;
+            let mut last_seq = 0;
+            loop {
+                let events = store.wait_for_events_after_seq(
+                    &session_id,
+                    last_seq,
+                    Duration::from_secs(5),
+                )?;
+                for event in events {
+                    last_seq = last_seq.max(event.seq);
+                    if event.event_type == REQUEST_USER_INPUT_REQUEST_EVENT {
+                        assert_eq!(event.payload["turn_id"], "turn-active");
+                        store.append_event(
+                            &session_id,
+                            REQUEST_USER_INPUT_RESPONSE_EVENT,
+                            serde_json::json!({
+                                "turn_id": event.payload["turn_id"],
+                                "answers": {
+                                    "scope": {
+                                        "answers": ["Plan (Recommended)"]
+                                    }
+                                }
+                            }),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+        });
+        let outcome = dispatch_request_user_input_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "ask_scope".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "questions": [{
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Which scope should I use?",
+                        "options": [
+                            {"label": "Plan (Recommended)", "description": "Plan only."},
+                            {"label": "Build", "description": "Build now."}
+                        ]
+                    }]
+                }),
+            },
+            &options,
+        )?;
+        responder
+            .join()
+            .map_err(|_| anyhow!("responder thread panicked"))??;
+
+        let content = outcome.messages[0]["content"].as_str().context("content")?;
+        let response: Value = serde_json::from_str(content)?;
+        assert_eq!(
+            response["answers"]["scope"]["answers"],
+            serde_json::json!(["Plan (Recommended)"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_response_prefers_turn_id_over_call_id_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, temp.path())?;
+        let options =
+            AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        store.append_event(
+            &session.id,
+            CODEX_TURN_STARTED_EVENT,
+            serde_json::json!({"turn_id": "turn-current"}),
+        )?;
+        let session_id = session.id.clone();
+        let state_dir_for_thread = state_dir.clone();
+        let responder = thread::spawn(move || -> Result<()> {
+            let store = Store::open(state_dir_for_thread)?;
+            let mut last_seq = 0;
+            loop {
+                let events = store.wait_for_events_after_seq(
+                    &session_id,
+                    last_seq,
+                    Duration::from_secs(5),
+                )?;
+                for event in events {
+                    last_seq = last_seq.max(event.seq);
+                    if event.event_type == REQUEST_USER_INPUT_REQUEST_EVENT {
+                        store.append_event(
+                            &session_id,
+                            REQUEST_USER_INPUT_RESPONSE_EVENT,
+                            serde_json::json!({
+                                "turn_id": "turn-stale",
+                                "call_id": event.payload["call_id"],
+                                "answers": {
+                                    "scope": {
+                                        "answers": ["Wrong"]
+                                    }
+                                }
+                            }),
+                        )?;
+                        store.append_event(
+                            &session_id,
+                            REQUEST_USER_INPUT_RESPONSE_EVENT,
+                            serde_json::json!({
+                                "turn_id": event.payload["turn_id"],
+                                "call_id": "different-call-id",
+                                "answers": {
+                                    "scope": {
+                                        "answers": ["Right"]
+                                    }
+                                }
+                            }),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+        });
+        let outcome = dispatch_request_user_input_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "ask_scope".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "questions": [{
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Which scope should I use?",
+                        "options": [
+                            {"label": "Right", "description": "Use this answer."},
+                            {"label": "Wrong", "description": "Stale answer."}
+                        ]
+                    }]
+                }),
+            },
+            &options,
+        )?;
+        responder
+            .join()
+            .map_err(|_| anyhow!("responder thread panicked"))??;
+
+        let content = outcome.messages[0]["content"].as_str().context("content")?;
+        let response: Value = serde_json::from_str(content)?;
+        assert_eq!(
+            response["answers"]["scope"]["answers"],
+            serde_json::json!(["Right"])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn request_user_input_rejects_default_mode_and_subagents_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -20211,7 +22280,8 @@ command = "print-token"
             }),
         };
 
-        let default_mode = dispatch_request_user_input_tool(&store, &root, &call)?;
+        let default_mode =
+            dispatch_request_user_input_tool(&store, &root, &call, &AgentRunOptions::default())?;
         assert_eq!(
             default_mode.messages[0]["content"],
             "request_user_input is unavailable in Default mode"
@@ -20219,7 +22289,8 @@ command = "print-token"
 
         let child =
             store.create_child_session(&root.id, temp.path(), Some("/root/child"), None, None)?;
-        let subagent = dispatch_request_user_input_tool(&store, &child, &call)?;
+        let subagent =
+            dispatch_request_user_input_tool(&store, &child, &call, &AgentRunOptions::default())?;
         assert_eq!(
             subagent.messages[0]["content"],
             "request_user_input can only be used by the root thread"
@@ -20290,6 +22361,7 @@ command = "print-token"
                     }]
                 }),
             },
+            &options,
         )?;
         responder
             .join()
@@ -20372,6 +22444,40 @@ command = "print-token"
 
         assert!(developer_text.contains("Managed policy."));
         assert!(!developer_text.contains("Session policy should be skipped."));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_runtime_developer_instructions_override_config_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "developer_instructions = \"User config policy should lose.\"\n",
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            "developer_instructions = \"Managed policy should lose.\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options =
+            AgentRunOptions::default().with_developer_instructions("Runtime policy wins.");
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let developer_text = message_content_text(&messages[0]);
+
+        assert!(developer_text.contains("Runtime policy wins."));
+        assert!(!developer_text.contains("User config policy should lose."));
+        assert!(!developer_text.contains("Managed policy should lose."));
         Ok(())
     }
 
@@ -21750,6 +23856,423 @@ command = "print-token"
     }
 
     #[test]
+    fn thread_config_overrides_request_provider_and_features_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let request_overrides = vec![
+            (
+                "model_provider".to_string(),
+                toml::Value::String("request".to_string()),
+            ),
+            (
+                "model_providers.request.name".to_string(),
+                toml::Value::String("Request".to_string()),
+            ),
+            (
+                "features.remote_compaction_v2".to_string(),
+                toml::Value::Boolean(false),
+            ),
+            (
+                "features.multi_agent".to_string(),
+                toml::Value::Boolean(true),
+            ),
+        ];
+        let thread_config: toml::Value = r#"
+model_provider = "thread"
+
+[features]
+remote_compaction_v2 = true
+multi_agent = false
+
+[model_providers.thread]
+name = "Thread"
+request_max_retries = 7
+"#
+        .parse()?;
+        let options = AgentRunOptions::default()
+            .with_config_overrides(request_overrides)
+            .with_session_thread_config(thread_config);
+
+        let (config, headers, specs) = with_codex_home(&codex_home, || -> Result<_> {
+            let config = load_provider_config_for_session(&session, &options)?;
+            let headers = codex_responses_extra_headers(&store, &session, &options, None)?;
+            let specs = browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)?;
+            Ok((config, headers, specs))
+        })?;
+
+        assert_eq!(config.model_provider_id.as_deref(), Some("thread"));
+        assert_eq!(
+            config.provider_request_max_retries.get("thread").copied(),
+            Some(7)
+        );
+        assert!(!headers
+            .get(CODEX_BETA_FEATURES_HEADER)
+            .is_some_and(|features| features.contains("remote_compaction_v2")));
+        assert!(!config.multi_agent_enabled);
+        assert!(!specs.iter().any(|spec| spec.name == "spawn_agent"));
+        assert!(!specs.iter().any(|spec| spec.name == "tool_search"));
+        Ok(())
+    }
+
+    #[test]
+    fn shell_feature_gates_select_codex_shell_family() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        let disabled = AgentRunOptions::default().with_config_overrides(vec![(
+            "features.shell_tool".to_string(),
+            toml::Value::Boolean(false),
+        )]);
+        let disabled_specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &disabled, "gpt-5.5", true)
+        })?;
+        assert!(!disabled_specs.iter().any(|spec| {
+            matches!(
+                spec.name.as_str(),
+                "exec_command" | "write_stdin" | "shell_command"
+            )
+        }));
+
+        let legacy = AgentRunOptions::default().with_config_overrides(vec![(
+            "features.unified_exec".to_string(),
+            toml::Value::Boolean(false),
+        )]);
+        let legacy_specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &legacy, "gpt-5.5", true)
+        })?;
+        assert!(legacy_specs.iter().any(|spec| spec.name == "shell_command"));
+        assert!(!legacy_specs.iter().any(|spec| spec.name == "exec_command"));
+        assert!(!legacy_specs.iter().any(|spec| spec.name == "write_stdin"));
+
+        let default_registry = with_codex_home(&codex_home, || {
+            browser_tool_registry_for_session(
+                &session,
+                &AgentRunOptions::default(),
+                "gpt-5.5",
+                true,
+            )
+        })?;
+        assert_eq!(
+            default_registry.handler_for("shell_command"),
+            Some(ToolHandlerKind::ShellCommand)
+        );
+        let default_specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
+        })?;
+        assert!(default_specs.iter().any(|spec| spec.name == "exec_command"));
+        assert!(!default_specs
+            .iter()
+            .any(|spec| spec.name == "shell_command"));
+
+        let login_disabled = AgentRunOptions::default().with_config_overrides(vec![(
+            "allow_login_shell".to_string(),
+            toml::Value::Boolean(false),
+        )]);
+        let login_disabled_specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &login_disabled, "gpt-5.5", true)
+        })?;
+        let exec = login_disabled_specs
+            .iter()
+            .find(|spec| spec.name == "exec_command")
+            .expect("exec spec");
+        assert!(exec.input_schema["properties"].get("login").is_none());
+
+        let legacy_login_disabled = AgentRunOptions::default().with_config_overrides(vec![
+            (
+                "features.unified_exec".to_string(),
+                toml::Value::Boolean(false),
+            ),
+            ("allow_login_shell".to_string(), toml::Value::Boolean(false)),
+        ]);
+        let legacy_login_disabled_specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &legacy_login_disabled, "gpt-5.5", true)
+        })?;
+        let shell = legacy_login_disabled_specs
+            .iter()
+            .find(|spec| spec.name == "shell_command")
+            .expect("shell spec");
+        assert!(shell.input_schema["properties"].get("login").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn shell_parallel_support_uses_visible_handler_capability_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let exec_call = ToolCall {
+            id: "exec".to_string(),
+            name: "exec_command".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({"cmd": "printf one"}),
+        };
+        let shell_call = ToolCall {
+            id: "shell".to_string(),
+            name: "shell_command".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({"command": "printf two"}),
+        };
+        let tool_search_call = ToolCall {
+            id: "search_tools".to_string(),
+            name: "tool_search".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({"query": "subagent tools", "limit": 3}),
+        };
+
+        let default_registry = with_codex_home(&codex_home, || {
+            browser_tool_registry_for_session(
+                &session,
+                &AgentRunOptions::default(),
+                "gpt-5.5",
+                true,
+            )
+        })?;
+        assert!(tool_call_supports_parallel(&default_registry, &exec_call));
+        assert!(
+            !tool_call_supports_parallel(&default_registry, &shell_call),
+            "hidden legacy shell_command dispatch remains serial like Codex"
+        );
+        assert!(
+            tool_call_supports_parallel(&default_registry, &tool_search_call),
+            "Codex lets tool_search run in parallel with other parallel-safe calls"
+        );
+
+        let legacy = AgentRunOptions::default().with_config_overrides(vec![(
+            "features.unified_exec".to_string(),
+            toml::Value::Boolean(false),
+        )]);
+        let legacy_registry = with_codex_home(&codex_home, || {
+            browser_tool_registry_for_session(&session, &legacy, "gpt-5.5", true)
+        })?;
+        assert!(tool_call_supports_parallel(&legacy_registry, &shell_call));
+        Ok(())
+    }
+
+    #[test]
+    fn hosted_tools_use_codex_config_model_and_provider_gates() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        let hosted = with_codex_home(&codex_home, || {
+            hosted_tool_specs_for_session(
+                &session,
+                &AgentRunOptions::default(),
+                "gpt-5.5",
+                true,
+                true,
+            )
+        })?;
+        assert!(hosted.iter().any(|tool| matches!(
+            tool,
+            HostedToolSpec::WebSearch {
+                external_web_access: true,
+                ..
+            }
+        )));
+        assert!(hosted.iter().any(|tool| {
+            matches!(tool, HostedToolSpec::ImageGeneration { output_format } if output_format == "png")
+        }));
+
+        let options = AgentRunOptions::default().with_config_overrides(vec![
+            (
+                "web_search".to_string(),
+                toml::Value::String("disabled".to_string()),
+            ),
+            (
+                "features.image_generation".to_string(),
+                toml::Value::Boolean(false),
+            ),
+        ]);
+        let disabled = with_codex_home(&codex_home, || {
+            hosted_tool_specs_for_session(&session, &options, "gpt-5.5", true, true)
+        })?;
+        assert!(disabled.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn web_search_cached_resolves_live_under_danger_full_access_like_codex() -> Result<()> {
+        assert_eq!(
+            resolve_web_search_mode_for_current_permissions(Some(WebSearchMode::Cached), None),
+            WebSearchMode::Live
+        );
+        assert_eq!(
+            resolve_web_search_mode_for_current_permissions(Some(WebSearchMode::Live), None),
+            WebSearchMode::Live
+        );
+        assert_eq!(
+            resolve_web_search_mode_for_current_permissions(None, None),
+            WebSearchMode::Live
+        );
+        assert_eq!(
+            resolve_web_search_mode_for_current_permissions(Some(WebSearchMode::Disabled), None),
+            WebSearchMode::Disabled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn web_search_allowed_modes_fall_back_from_live_like_codex_requirements() -> Result<()> {
+        let cached_only = BTreeSet::from([WebSearchMode::Disabled, WebSearchMode::Cached]);
+        assert_eq!(
+            resolve_web_search_mode_for_current_permissions(
+                Some(WebSearchMode::Cached),
+                Some(&cached_only)
+            ),
+            WebSearchMode::Cached
+        );
+        assert_eq!(
+            resolve_web_search_mode_for_current_permissions(
+                Some(WebSearchMode::Live),
+                Some(&cached_only)
+            ),
+            WebSearchMode::Cached
+        );
+
+        let disabled_only = BTreeSet::from([WebSearchMode::Disabled]);
+        assert_eq!(
+            resolve_web_search_mode_for_current_permissions(None, Some(&disabled_only)),
+            WebSearchMode::Disabled
+        );
+        let live_allowed = BTreeSet::from([WebSearchMode::Disabled, WebSearchMode::Live]);
+        assert_eq!(
+            resolve_web_search_mode_for_current_permissions(None, Some(&live_allowed)),
+            WebSearchMode::Live
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn allowed_web_search_modes_constrain_hosted_tool_like_codex_requirements() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            r#"
+allowed_web_search_modes = ["cached"]
+web_search = "live"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let hosted = with_codex_home(&codex_home, || {
+            hosted_tool_specs_for_session(
+                &session,
+                &AgentRunOptions::default(),
+                "gpt-5.5",
+                true,
+                false,
+            )
+        })?;
+
+        assert_eq!(hosted.len(), 1);
+        let HostedToolSpec::WebSearch {
+            external_web_access,
+            ..
+        } = &hosted[0]
+        else {
+            panic!("expected web search hosted tool");
+        };
+        assert!(!external_web_access);
+        Ok(())
+    }
+
+    #[test]
+    fn model_turn_request_records_hosted_tools_like_codex_visible_tool_set() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let hosted_tools = vec![HostedToolSpec::web_search(
+            WebSearchMode::Cached,
+            None,
+            browser_use_providers::WebSearchToolType::Text,
+        )
+        .context("hosted web search")?];
+
+        record_model_turn_request(
+            &store,
+            &session.id,
+            &FakeProvider::default(),
+            0,
+            &ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "search"})],
+                hosted_tools,
+                ..ProviderTurn::default()
+            },
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let request = events
+            .iter()
+            .find(|event| event.event_type == "model.turn.request")
+            .context("model turn request event")?;
+        assert_eq!(request.payload["tool_count"], 0);
+        assert_eq!(request.payload["hosted_tool_count"], 1);
+        assert_eq!(request.payload["model_visible_tool_count"], 1);
+        assert!(request.payload["hosted_tools_fingerprint"]
+            .as_str()
+            .is_some_and(|value| !value.is_empty()));
+        Ok(())
+    }
+
+    #[test]
+    fn thread_config_loses_to_managed_config_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            r#"
+model_provider = "managed"
+
+[features]
+remote_compaction_v2 = false
+multi_agent = false
+
+[model_providers.managed]
+name = "Managed"
+"#,
+        )?;
+        let thread_config: toml::Value = r#"
+model_provider = "thread"
+
+[features]
+remote_compaction_v2 = true
+multi_agent = true
+
+[model_providers.thread]
+name = "Thread"
+"#
+        .parse()?;
+
+        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let mut warnings = Vec::new();
+            load_agents_md_config_with_thread_config(
+                temp.path(),
+                &mut warnings,
+                None,
+                &[],
+                Some(&thread_config),
+            )
+        })?;
+
+        assert_eq!(config.model_provider_id.as_deref(), Some("managed"));
+        assert!(!config
+            .beta_features_header()
+            .unwrap_or_default()
+            .contains("remote_compaction_v2"));
+        assert!(!config.multi_agent_enabled);
+        assert!(config.model_providers.contains_key("managed"));
+        Ok(())
+    }
+
+    #[test]
     fn agents_md_context_empty_project_root_markers_disable_parent_traversal() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -21937,6 +24460,52 @@ command = "print-token"
     }
 
     #[test]
+    fn provider_loop_records_ttft_for_first_hosted_response_item_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ResponseOutputItem {
+                item: serde_json::json!({
+                    "type": "web_search_call",
+                    "id": "ws_ttft",
+                    "status": "completed",
+                    "action": {"type": "search", "query": "Codex TTFT"}
+                }),
+            },
+            ModelEvent::ResponseOutputItem {
+                item: serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Done"
+                    }]
+                }),
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish after hosted item",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == CODEX_TURN_COMPLETE_EVENT)
+            .context("missing task_complete event")?;
+        assert_eq!(completed.payload["last_agent_message"], "Done");
+        assert!(completed.payload["time_to_first_token_ms"]
+            .as_i64()
+            .is_some());
+        Ok(())
+    }
+
+    #[test]
     fn provider_loop_includes_latest_rate_limits_in_token_count_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -21999,6 +24568,50 @@ command = "print-token"
         assert_eq!(
             token_count.payload["rate_limits"]["credits"]["balance"],
             "18"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_emits_token_count_for_rate_limits_without_usage_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ModelRateLimits {
+                snapshot: browser_use_protocol::RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    primary: Some(browser_use_protocol::RateLimitWindow {
+                        used_percent: 64.0,
+                        window_minutes: Some(300),
+                        resets_at: None,
+                    }),
+                    ..Default::default()
+                },
+            },
+            ModelEvent::TextDelta {
+                text: "Visible answer".to_string(),
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish with only rate-limit metadata",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        let token_count = events
+            .iter()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("missing token_count event")?;
+
+        assert!(token_count.payload["info"].is_null());
+        assert_eq!(token_count.payload["rate_limits"]["limit_id"], "codex");
+        assert_eq!(
+            token_count.payload["rate_limits"]["primary"]["used_percent"],
+            64.0
         );
         Ok(())
     }
@@ -22130,6 +24743,128 @@ command = "print-token"
         assert_eq!(
             latest_token_count.payload["info"]["total_token_usage"]["output_tokens"],
             21
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn token_count_info_null_does_not_reset_consumed_usage_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(4),
+                output_tokens: Some(6),
+                total_tokens: Some(10),
+                ..Default::default()
+            },
+            Some(1000),
+            0,
+        )?;
+        record_model_rate_limits(
+            &store,
+            &session.id,
+            0,
+            1,
+            &browser_use_protocol::RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                ..Default::default()
+            },
+        )?;
+        append_codex_token_count_rate_limits_only(&store, &session.id, 0)?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(2),
+                output_tokens: Some(3),
+                total_tokens: Some(5),
+                ..Default::default()
+            },
+            Some(1000),
+            1,
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let latest_token_count = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("latest token_count")?;
+        assert_eq!(
+            latest_token_count.payload["info"]["last_token_usage"]["total_tokens"],
+            5
+        );
+        assert_eq!(
+            latest_token_count.payload["info"]["total_token_usage"]["total_tokens"],
+            15
+        );
+        assert_eq!(
+            latest_token_count.payload["info"]["total_token_usage"]["input_tokens"],
+            6
+        );
+        assert_eq!(
+            latest_token_count.payload["info"]["total_token_usage"]["output_tokens"],
+            9
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rate_limit_only_token_count_preserves_existing_usage_info_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(8),
+                output_tokens: Some(4),
+                total_tokens: Some(12),
+                ..Default::default()
+            },
+            Some(1000),
+            0,
+        )?;
+        record_model_rate_limits(
+            &store,
+            &session.id,
+            1,
+            1,
+            &browser_use_protocol::RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                primary: Some(browser_use_protocol::RateLimitWindow {
+                    used_percent: 77.0,
+                    window_minutes: Some(300),
+                    resets_at: None,
+                }),
+                ..Default::default()
+            },
+        )?;
+        append_codex_token_count_rate_limits_only(&store, &session.id, 1)?;
+
+        let events = store.events_for_session(&session.id)?;
+        let latest_token_count = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("latest token_count")?;
+        assert_eq!(
+            latest_token_count.payload["info"]["last_token_usage"]["total_tokens"],
+            12
+        );
+        assert_eq!(
+            latest_token_count.payload["info"]["total_token_usage"]["total_tokens"],
+            12
+        );
+        assert_eq!(
+            latest_token_count.payload["rate_limits"]["primary"]["used_percent"],
+            77.0
         );
         Ok(())
     }
@@ -22302,6 +25037,188 @@ command = "print-token"
     }
 
     #[test]
+    fn token_count_info_null_does_not_suppress_history_rewrite_recompute() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "first prompt"}),
+        )?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(5),
+                output_tokens: Some(7),
+                total_tokens: Some(12),
+                ..Default::default()
+            },
+            Some(1000),
+            0,
+        )?;
+        let rollback = store.append_event(
+            &session.id,
+            SESSION_ROLLBACK_EVENT,
+            serde_json::json!({"num_turns": 1}),
+        )?;
+        record_model_rate_limits(
+            &store,
+            &session.id,
+            1,
+            1,
+            &browser_use_protocol::RateLimitSnapshot {
+                limit_id: Some("codex".to_string()),
+                ..Default::default()
+            },
+        )?;
+        append_codex_token_count_rate_limits_only(&store, &session.id, 1)?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+
+        maybe_append_recomputed_codex_token_count_after_history_rewrite(
+            &store,
+            &session.id,
+            &messages,
+            Some("base instructions"),
+            Some(1000),
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let latest_token_count = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("latest token_count")?;
+        assert_eq!(latest_token_count.payload["source"], "recomputed_context");
+        assert_eq!(
+            latest_token_count.payload["history_rewrite_seq"],
+            rollback.seq
+        );
+        assert_eq!(
+            latest_token_count.payload["info"]["total_token_usage"]["total_tokens"],
+            12
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn context_budget_discounts_case_insensitive_images_and_encrypted_items_like_codex(
+    ) -> Result<()> {
+        let huge_payload = "A".repeat(10_000);
+        let messages = vec![serde_json::json!({
+            "role": "user",
+            "content": [
+                {
+                    "type": "input_image",
+                    "image_url": format!("DATA:IMAGE/PNG;base64,{huge_payload}")
+                },
+                {
+                    "type": "reasoning",
+                    "encrypted_content": huge_payload
+                },
+                {
+                    "type": "compaction",
+                    "encrypted_content": huge_payload
+                },
+                {
+                    "type": "context_compaction",
+                    "encrypted_content": huge_payload
+                },
+                {
+                    "type": "image_generation_call",
+                    "result": huge_payload
+                }
+            ]
+        })];
+
+        let budget_text =
+            serde_json::to_string(&context_budget_value(&Value::Array(messages.clone())))?;
+        assert!(
+            !budget_text.contains(&huge_payload[..100]),
+            "raw omitted payload leaked into context budget"
+        );
+        let tokens = estimated_context_tokens(&messages)?;
+        let raw_tokens = approx_token_count(&serde_json::to_string(&Value::Array(messages))?);
+        assert!(
+            tokens < raw_tokens,
+            "encrypted/image payloads should be discounted below raw serialized size: {tokens} >= {raw_tokens}"
+        );
+        assert!(
+            tokens > IMAGE_CONTEXT_BUDGET_TOKENS,
+            "encrypted reasoning should still count materially like Codex, not collapse to a tiny placeholder: {tokens}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn context_budget_discounts_only_base64_image_data_urls_like_codex() -> Result<()> {
+        let payload = "A".repeat(4_000);
+        let non_base64_url = format!("data:image/png,{payload}");
+        let base64_url = format!("data:image/png;charset=utf-8;base64,{payload}");
+        let value = serde_json::json!({
+            "type": "input_image",
+            "image_url": non_base64_url,
+            "detail": "high"
+        });
+        let discounted = context_budget_value(&serde_json::json!({
+            "type": "input_image",
+            "image_url": base64_url,
+            "detail": "high"
+        }));
+
+        assert_eq!(
+            context_budget_value(&value)["image_url"],
+            value["image_url"]
+        );
+        assert_ne!(discounted["image_url"], base64_url);
+        assert!(!discounted["image_url"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(&payload[..100]));
+        Ok(())
+    }
+
+    #[test]
+    fn context_budget_original_detail_images_use_patch_estimate_like_codex() -> Result<()> {
+        let mut png = Vec::from(&b"\x89PNG\r\n\x1a\n"[..]);
+        png.extend_from_slice(&13u32.to_be_bytes());
+        png.extend_from_slice(b"IHDR");
+        png.extend_from_slice(&64u32.to_be_bytes());
+        png.extend_from_slice(&64u32.to_be_bytes());
+        let url = format!(
+            "data:image/png;base64,{}",
+            general_purpose::STANDARD.encode(png)
+        );
+
+        let original = image_url_context_budget_replacement(&url, Some("original"))
+            .context("original detail replacement")?;
+        let high = image_url_context_budget_replacement(&url, Some("high"))
+            .context("high detail replacement")?;
+
+        assert!(original.len() < high.len());
+        assert!(original.ends_with(&".".repeat(16)));
+        assert!(high.ends_with(&".".repeat(RESIZED_IMAGE_CONTEXT_BYTES_ESTIMATE)));
+        Ok(())
+    }
+
+    #[test]
+    fn context_budget_encrypted_items_use_codex_length_heuristics() {
+        let encoded = "A".repeat(2_000);
+        let marker = "[encrypted content omitted from text budget]";
+        let reasoning = encrypted_content_context_budget_replacement(&encoded, Some("reasoning"));
+        let function_output =
+            encrypted_content_context_budget_replacement(&encoded, Some("encrypted_content"));
+        let unknown = encrypted_content_context_budget_replacement(&encoded, Some("message"));
+
+        assert_eq!(reasoning.len().saturating_sub(marker.len()), 850);
+        assert_eq!(function_output.len().saturating_sub(marker.len()), 1_125);
+        assert_eq!(unknown.len().saturating_sub(marker.len()), 0);
+        assert!(!reasoning.contains(&encoded[..100]));
+        assert!(!function_output.contains(&encoded[..100]));
+    }
+
+    #[test]
     fn provider_loop_persists_response_items_and_prefers_final_answer_phase() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -22417,6 +25334,193 @@ command = "print-token"
                 .filter(|event| event.event_type == CODEX_TURN_COMPLETE_EVENT)
                 .count(),
             1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_carries_hosted_response_items_across_end_turn_false() -> Result<()> {
+        #[derive(Default)]
+        struct HostedContinuationProvider {
+            step: std::sync::Mutex<usize>,
+            messages: std::sync::Mutex<Vec<Vec<Value>>>,
+        }
+
+        impl ModelProvider for HostedContinuationProvider {
+            fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                self.messages
+                    .lock()
+                    .expect("messages lock")
+                    .push(turn.messages);
+                let mut step = self.step.lock().expect("step lock");
+                let events = if *step == 0 {
+                    vec![
+                        ModelEvent::ResponseOutputItem {
+                            item: serde_json::json!({
+                                "type": "reasoning",
+                                "id": "rs_live_continue",
+                                "summary": [],
+                                "encrypted_content": "encrypted-live-reasoning"
+                            }),
+                        },
+                        ModelEvent::ResponseOutputItem {
+                            item: serde_json::json!({
+                                "type": "web_search_call",
+                                "id": "ws_live_continue",
+                                "status": "completed",
+                                "action": {"type": "search", "query": "Codex hosted parity"}
+                            }),
+                        },
+                        ModelEvent::ResponseOutputItem {
+                            item: serde_json::json!({
+                                "type": "image_generation_call",
+                                "id": "ig_live_continue",
+                                "status": "completed",
+                                "result": "Zm9v"
+                            }),
+                        },
+                        ModelEvent::ResponseCompleted {
+                            response_id: Some("resp_hosted_continue".to_string()),
+                            end_turn: Some(false),
+                        },
+                        ModelEvent::Done,
+                    ]
+                } else {
+                    vec![
+                        ModelEvent::TextDelta {
+                            text: "final answer".to_string(),
+                        },
+                        ModelEvent::Done,
+                    ]
+                };
+                *step += 1;
+                Ok(events)
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = HostedContinuationProvider::default();
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "continue through hosted calls",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+
+        let captured = provider.messages.lock().expect("messages lock").clone();
+        assert_eq!(captured.len(), 2);
+        let continued_messages = &captured[1];
+        for (item_type, id) in [
+            ("reasoning", "rs_live_continue"),
+            ("web_search_call", "ws_live_continue"),
+            ("image_generation_call", "ig_live_continue"),
+        ] {
+            assert!(
+                continued_messages.iter().any(|message| {
+                    message.get("type").and_then(Value::as_str) == Some(item_type)
+                        && message.get("id").and_then(Value::as_str) == Some(id)
+                }),
+                "{item_type} should be present in the immediate continuation turn"
+            );
+        }
+        assert!(
+            continued_messages.iter().any(|message| {
+                message.get("role").and_then(Value::as_str) == Some("developer")
+                    && message.get("name").and_then(Value::as_str)
+                        == Some(GENERATED_IMAGE_CONTEXT_MESSAGE_NAME)
+                    && message_content_text(message).contains("Generated images are saved to")
+            }),
+            "generated image save instructions should be visible in the immediate continuation turn"
+        );
+
+        let events = store.events_for_session(&session_id)?;
+        let artifact_event = events
+            .iter()
+            .find(|event| {
+                event.event_type == "artifact.created"
+                    && event.payload["name"] == "image_generation"
+                    && event.payload["artifact"]["source"] == "image_generation_call"
+            })
+            .context("missing generated image artifact event")?;
+        let path = artifact_event.payload["artifact"]["path"]
+            .as_str()
+            .context("artifact path")?;
+        assert_eq!(std::fs::read(path)?, b"foo");
+        assert_eq!(store.artifacts_for_session(&session_id)?.len(), 1);
+        assert!(events.iter().any(|event| {
+            event.event_type == GENERATED_IMAGE_CONTEXT_EVENT
+                && event.payload["content"]
+                    .as_str()
+                    .is_some_and(|text| text.contains(path))
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.response.continued"
+                && event.payload["response_id"] == "resp_hosted_continue"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "final answer"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn image_generation_call_bad_result_skips_artifact_and_context_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ResponseOutputItem {
+                item: serde_json::json!({
+                    "type": "image_generation_call",
+                    "id": "../ig/..",
+                    "status": "completed",
+                    "result": "data:image/png;base64,Zm9v"
+                }),
+            },
+            ModelEvent::TextDelta {
+                text: "done".to_string(),
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "generate bad image",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "model.response.output_item"));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "artifact.created"));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == GENERATED_IMAGE_CONTEXT_EVENT));
+        assert!(store.artifacts_for_session(&session_id)?.is_empty());
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "done"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn image_generation_artifact_path_sanitizes_call_id_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let path = image_generation_artifact_path(&session, "../ig/..");
+        assert!(path.starts_with(Path::new(&session.artifact_root)));
+        assert_eq!(
+            path,
+            Path::new(&session.artifact_root)
+                .join(GENERATED_IMAGE_ARTIFACTS_DIR)
+                .join("___ig___.png")
         );
         Ok(())
     }
@@ -23108,6 +26212,102 @@ command = "print-token"
         Ok(())
     }
 
+    #[test]
+    fn cancellation_cleans_up_background_exec_like_codex_stop() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        append_workspace_context_event(&store, &session)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "start then cancel"}),
+        )?;
+        let provider = CancelAfterBackgroundExecProvider {
+            state_dir: temp.path().to_path_buf(),
+            session_id: session.id.clone(),
+            ..Default::default()
+        };
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+
+        let result = run_loaded_session_with_provider(
+            &store,
+            &provider,
+            session.clone(),
+            messages,
+            AgentRunOptions::default(),
+        );
+
+        assert!(result.is_err());
+        assert!(
+            provider.process_id.lock().expect("process id").is_some(),
+            "test provider should observe a running exec session before cancelling"
+        );
+        assert_eq!(
+            cleanup_unified_exec_commands_for_session(&session.id),
+            0,
+            "cancel finalization should already remove background unified exec sessions"
+        );
+        let session = store.load_session(&session.id)?.context("session")?;
+        assert_eq!(session.status, SessionStatus::Cancelled);
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct CancelAfterBackgroundExecProvider {
+        state_dir: std::path::PathBuf,
+        session_id: String,
+        step: std::sync::Mutex<usize>,
+        process_id: std::sync::Mutex<Option<i64>>,
+    }
+
+    impl ModelProvider for CancelAfterBackgroundExecProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let events = match *step {
+                0 => vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "exec_then_cancel".to_string(),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({
+                                "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(10)\"",
+                                "tty": true,
+                                "yield_time_ms": 100,
+                            }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ],
+                _ => {
+                    let content = latest_tool_content(&turn, "exec_command")
+                        .context("exec command tool response")?;
+                    let marker = "Process running with session ID ";
+                    let process_id = content
+                        .lines()
+                        .find_map(|line| line.strip_prefix(marker))
+                        .context("running session id line")?
+                        .parse::<i64>()?;
+                    *self.process_id.lock().expect("process id lock") = Some(process_id);
+                    Store::open(&self.state_dir)?
+                        .request_cancel(&self.session_id, "test cancel")?;
+                    vec![ModelEvent::Done]
+                }
+            };
+            *step += 1;
+            Ok(events)
+        }
+
+        fn provider_name(&self) -> &str {
+            "cancel-after-background-exec"
+        }
+
+        fn model_name(&self) -> &str {
+            "cancel-after-background-exec"
+        }
+    }
+
     #[derive(Default)]
     struct ExecToolOutputInspectingProvider {
         step: std::sync::Mutex<usize>,
@@ -23134,10 +26334,13 @@ command = "print-token"
             } else {
                 let content = latest_tool_content(&turn, "exec_command")
                     .context("exec command tool response")?;
-                assert!(
-                    content.contains("Chunk ID: chunk_exec_1"),
-                    "exec output should use Codex-style chunk header: {content}"
-                );
+                let chunk_id = content
+                    .lines()
+                    .next()
+                    .and_then(|line| line.strip_prefix("Chunk ID: "))
+                    .context("exec output should use Codex-style chunk header")?;
+                assert_eq!(chunk_id.len(), 6);
+                assert!(chunk_id.chars().all(|ch| ch.is_ascii_hexdigit()));
                 assert!(
                     content.contains("Wall time: "),
                     "exec output should include wall time: {content}"
@@ -23455,6 +26658,7 @@ command = "print-token"
     #[test]
     fn legacy_hidden_file_tools_still_dispatch_for_old_sessions() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let patch = r#"*** Begin Patch
 *** Add File: note.txt
@@ -23518,13 +26722,15 @@ command = "print-token"
                 ModelEvent::Done,
             ],
         ]);
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "legacy file tools",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "legacy file tools",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
         let events = store.events_for_session(&session_id)?;
         assert!(events.iter().any(|event| {
             event.event_type == "patch.file_changed" && event.payload["kind"] == "added"
@@ -25452,6 +28658,39 @@ usage_hint_enabled = false
     }
 
     #[test]
+    fn parent_status_keeps_own_result_after_late_child_completion() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "parent answer"}),
+        )?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/late_child"),
+            Some("LateChild"),
+            Some("worker"),
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "child answer"}),
+        )?;
+
+        update_parent_from_child_run(&store, &parent.id, &child.id, None)?;
+
+        let parent = store.load_session(&parent.id)?.context("parent session")?;
+        assert_eq!(
+            local_agent_status_value(&store, &parent, None)?["completed"],
+            "parent answer"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn multi_agent_v2_root_and_subagent_usage_hints_are_standalone_developer_context() -> Result<()>
     {
         let temp = tempfile::tempdir()?;
@@ -26023,6 +29262,41 @@ description = "Missing developer instructions"
     }
 
     #[test]
+    fn explorer_agent_context_qualifies_delegation_authorization_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/repo_explorer"),
+            Some("repo_explorer"),
+            Some("explorer"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.context",
+            serde_json::json!({
+                "role": "explorer",
+                "agent_path": "/root/repo_explorer",
+            }),
+        )?;
+
+        let messages = provider_messages_from_events(&store.events_for_session(&child.id)?);
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(model_text
+            .contains("This explorer role only applies after spawning was otherwise authorized"));
+        assert!(model_text.contains("Use `.` for the repository root"));
+        assert!(model_text
+            .contains("Do not spawn another explorer for this same repository-analysis task"));
+        Ok(())
+    }
+
+    #[test]
     fn multi_agent_v1_collab_input_validation_matches_codex() {
         assert_eq!(
             parse_collab_input(Some(&json!("hello")), Some(&json!([]))).unwrap_err(),
@@ -26095,6 +29369,15 @@ description = "Missing developer instructions"
         assert!(mention_input.content.as_array().is_some_and(Vec::is_empty));
         let mention_payload = collab_input_event_payload(&mention_input);
         assert!(mention_payload.get("skill_context_messages").is_none());
+        assert!(mention_payload.get("mention_context_messages").is_none());
+        assert_eq!(mention_payload["app_connector_ids"], json!(["calendar"]));
+        assert_eq!(
+            mention_payload["plugin_mentions"][0]["path"],
+            "plugin://notes@example"
+        );
+        assert!(mention_payload["plugin_mentions"]
+            .as_array()
+            .is_some_and(|mentions| mentions.len() == 1));
         assert_eq!(mention_payload["items"][0]["path"], "app://calendar");
         assert_eq!(
             mention_payload["items"][1]["path"],
@@ -26195,6 +29478,8 @@ description = "Missing developer instructions"
         assert!(input.payload["skill_context_messages"]
             .as_array()
             .is_some_and(|messages| messages.len() == 1));
+        assert!(input.payload.get("mention_context_messages").is_none());
+        assert_eq!(input.payload["app_connector_ids"], json!(["calendar"]));
         std::fs::write(&skill_path, "This later rewrite should not replay.")?;
 
         let messages = provider_messages_from_events(&child_events);
@@ -26215,6 +29500,7 @@ description = "Missing developer instructions"
                 && message_content_text(message).contains("<skill>\n<name>Docs</name>")
                 && message_content_text(message).contains("Use the internal docs workflow.")
         }));
+        assert!(!messages.iter().any(is_mention_context_message));
         assert!(!messages.iter().any(|message| message_content_text(message)
             .contains("This later rewrite should not replay.")));
         let model_text = messages
@@ -26252,7 +29538,8 @@ description = "Missing developer instructions"
                 "items": [
                     {"type": "text", "text": "look at this"},
                     {"type": "image", "image_url": "data:image/png;base64,abc"},
-                    {"type": "skill", "name": "Review", "path": skill_path.display().to_string()}
+                    {"type": "skill", "name": "Review", "path": skill_path.display().to_string()},
+                    {"type": "mention", "name": "Notes", "path": "plugin://notes@example"}
                 ]
             }),
         };
@@ -26281,6 +29568,11 @@ description = "Missing developer instructions"
         assert!(followup.payload["skill_context_messages"]
             .as_array()
             .is_some_and(|messages| messages.len() == 1));
+        assert!(followup.payload.get("mention_context_messages").is_none());
+        assert_eq!(
+            followup.payload["plugin_mentions"][0]["path"],
+            "plugin://notes@example"
+        );
         std::fs::remove_file(&skill_path)?;
         let messages = provider_messages_from_events(&child_events);
         assert!(messages.iter().any(|message| {
@@ -26295,6 +29587,281 @@ description = "Missing developer instructions"
                 && message_content_text(message).contains("<skill>\n<name>Review</name>")
                 && message_content_text(message).contains("Always check the review checklist.")
         }));
+        assert!(!messages.iter().any(is_mention_context_message));
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!model_text.contains("[mention:$Notes]"));
+        assert!(!model_text.contains("plugin://notes@example"));
+        Ok(())
+    }
+
+    #[test]
+    fn top_level_text_linked_skill_and_mentions_materialize_typed_payload_like_codex() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let skill_path = temp.path().join("skills").join("Docs").join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().context("skill parent")?)?;
+        std::fs::write(&skill_path, "Use docs for this task.")?;
+        let text = format!(
+            "use [$Docs](skill://{}) with [$Calendar](app://calendar) and [@Notes](plugin://notes@example)",
+            skill_path.display()
+        );
+        let payload = typed_user_input_payload_from_text(&text);
+        assert_eq!(payload["text"], text);
+        assert!(payload["items"]
+            .as_array()
+            .is_some_and(|items| items.iter().any(|item| item["type"] == "skill")));
+        assert_eq!(payload["app_connector_ids"], json!(["calendar"]));
+        assert_eq!(payload["plugin_mentions"][0]["plugin"], "notes@example");
+        assert!(payload["skill_context_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() == 1));
+        let messages = session_event_user_messages(&payload);
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_content_text(message).contains("Use docs for this task.")
+        }));
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(model_text.contains("use "));
+        assert!(!model_text.contains("skill://"));
+        assert!(!model_text.contains("[@Notes]"));
+        assert!(!model_text.contains("app://calendar"));
+        assert!(!model_text.contains("plugin://notes@example"));
+        Ok(())
+    }
+
+    #[test]
+    fn materialized_plugin_context_replays_as_developer_context_without_inventory_lookup(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let mut payload =
+            typed_user_input_payload_from_text("use [@Notes](plugin://notes@example) here");
+        payload["mention_context_messages"] = json!([{
+            "role": "developer",
+            "name": MENTION_CONTEXT_MESSAGE_NAME,
+            "content": [{
+                "type": "input_text",
+                "text": "<plugin_mention>\nresolved plugin capabilities\n</plugin_mention>",
+            }],
+        }]);
+        store.append_event(&session.id, "session.input", payload)?;
+
+        let events = store.events_for_session(&session.id)?;
+        let messages = provider_messages_from_events(&events);
+        assert!(messages.iter().any(|message| {
+            is_mention_context_message(message)
+                && message_content_text(message).contains("resolved plugin capabilities")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_content_text(message).contains("use ")
+        }));
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!model_text.contains("[@Notes]"));
+        assert!(!model_text.contains("plugin://notes@example"));
+        Ok(())
+    }
+
+    fn write_mock_codex_plugin_bundle(codex_home: &Path) -> Result<()> {
+        let plugin_root = codex_home
+            .join(CODEX_PLUGIN_CACHE_DIR)
+            .join("test")
+            .join("sample")
+            .join("local");
+        std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+        std::fs::create_dir_all(plugin_root.join("skills").join("sample-search"))?;
+        std::fs::write(
+            plugin_root.join(".codex-plugin").join("plugin.json"),
+            serde_json::json!({
+                "name": "sample",
+                "description": "Inspect sample data",
+            })
+            .to_string(),
+        )?;
+        std::fs::write(
+            plugin_root
+                .join("skills")
+                .join("sample-search")
+                .join("SKILL.md"),
+            "Use sample search.",
+        )?;
+        std::fs::write(
+            plugin_root.join(".mcp.json"),
+            serde_json::json!({
+                "mcpServers": {
+                    "sample": {"command": "sample-mcp"}
+                }
+            })
+            .to_string(),
+        )?;
+        std::fs::write(
+            plugin_root.join(".app.json"),
+            serde_json::json!({
+                "apps": {
+                    "calendar": {"id": "calendar"}
+                }
+            })
+            .to_string(),
+        )?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+[features]
+plugins = true
+
+[plugins."sample@test"]
+enabled = true
+"#,
+        )?;
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_includes_available_plugin_instructions_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        write_mock_codex_plugin_bundle(&codex_home)?;
+        let state_dir = temp.path().join("state");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, &project)?;
+
+        with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?;
+
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(model_text.contains(PLUGINS_INSTRUCTIONS_OPEN_TAG));
+        assert!(model_text.contains("`sample`: Inspect sample data"));
+        assert!(model_text.contains("How to use plugins"));
+        assert!(model_text.contains(PLUGINS_INSTRUCTIONS_CLOSE_TAG));
+        Ok(())
+    }
+
+    #[test]
+    fn explicit_plugin_mention_materializes_configured_capabilities_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        write_mock_codex_plugin_bundle(&codex_home)?;
+        let state_dir = temp.path().join("state");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(&project)?;
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, &project)?;
+
+        let payload = with_codex_home(&codex_home, || {
+            typed_user_input_payload_from_text_for_cwd(
+                "use [@sample](plugin://sample@test)",
+                &project,
+            )
+        })?;
+        assert!(payload["mention_context_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() == 1));
+        let mention_context = payload["mention_context_messages"][0]
+            .get("content")
+            .and_then(Value::as_array)
+            .and_then(|parts| parts.first())
+            .and_then(|part| part.get("text"))
+            .and_then(Value::as_str)
+            .unwrap_or_default();
+        assert!(mention_context.contains("Skills from this plugin"));
+        assert!(mention_context.contains("MCP servers from this plugin"));
+        assert!(mention_context.contains("Apps from this plugin"));
+
+        store.append_event(&session.id, "session.input", payload)?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        assert!(messages.iter().any(|message| {
+            is_mention_context_message(message)
+                && message_content_text(message).contains("MCP servers from this plugin")
+        }));
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!model_text.contains("plugin://sample@test"));
+        assert!(!model_text.contains("[@sample]"));
+        Ok(())
+    }
+
+    #[test]
+    fn linked_mention_text_requires_codex_sigils() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let skill_path = temp.path().join("skills").join("Docs").join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().context("skill parent")?)?;
+        std::fs::write(&skill_path, "Use docs.")?;
+
+        let wrong_plugin =
+            typed_user_input_payload_from_text("use [$sample](plugin://sample@test)");
+        assert!(wrong_plugin.get("plugin_mentions").is_none());
+        assert!(wrong_plugin.get("items").is_none());
+
+        let wrong_app = typed_user_input_payload_from_text("use [@Calendar](app://calendar)");
+        assert!(wrong_app.get("app_connector_ids").is_none());
+        assert!(wrong_app.get("items").is_none());
+
+        let wrong_skill = typed_user_input_payload_from_text(&format!(
+            "use [Docs](skill://{})",
+            skill_path.display()
+        ));
+        assert!(wrong_skill.get("skill_context_messages").is_none());
+        assert!(wrong_skill.get("items").is_none());
+
+        let correct = typed_user_input_payload_from_text(&format!(
+            "use [$Calendar](app://calendar), [@sample](plugin://sample@test), and [$Docs](skill://{})",
+            skill_path.display()
+        ));
+        assert_eq!(correct["app_connector_ids"], json!(["calendar"]));
+        assert_eq!(correct["plugin_mentions"][0]["plugin"], "sample@test");
+        assert!(correct["skill_context_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() == 1));
+        Ok(())
+    }
+
+    #[test]
+    fn skill_body_app_mentions_add_connector_ids_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let skill_path = temp.path().join("skills").join("Docs").join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().context("skill parent")?)?;
+        std::fs::write(
+            &skill_path,
+            "Use [$Calendar](app://calendar) when scheduling is relevant.",
+        )?;
+
+        let payload = typed_user_input_payload_from_text(&format!(
+            "use [$Docs](skill://{})",
+            skill_path.display()
+        ));
+
+        assert_eq!(payload["app_connector_ids"], json!(["calendar"]));
+        assert!(payload["skill_context_messages"]
+            .as_array()
+            .is_some_and(|messages| {
+                messages
+                    .iter()
+                    .any(|message| message_content_text(message).contains("app://calendar"))
+            }));
         Ok(())
     }
 
@@ -26612,6 +30179,7 @@ description = "Missing developer instructions"
     #[test]
     fn spawn_agent_partial_fork_passes_model_and_reasoning_to_child_runner() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         let provider = InstructionCapturingProvider::default();
@@ -26642,14 +30210,16 @@ description = "Missing developer instructions"
             }),
         };
 
-        let outcome = dispatch_spawn_agent_tool(
-            &store,
-            &provider,
-            &session,
-            &call,
-            &AgentRunOptions::default().with_child_agent_runner(runner),
-            &None,
-        )?;
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
 
         let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
         assert_eq!(payload["task_name"], "/root/repo_helper");
@@ -27117,6 +30687,90 @@ description = "Missing developer instructions"
             store.load_session(&child.id)?.expect("child").status,
             SessionStatus::Done
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cleanup_agent_subtree_stops_descendant_unified_exec_sessions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/worker"),
+            None,
+            None,
+        )?;
+        let grandchild = store.create_child_session(
+            &child.id,
+            temp.path(),
+            Some("/root/worker/helper"),
+            None,
+            None,
+        )?;
+        let _child_cleanup = SessionCommandCleanup(child.id.clone());
+        let _grandchild_cleanup = SessionCommandCleanup(grandchild.id.clone());
+
+        let child_started = tools::command::exec_command(
+            &store,
+            &child,
+            &ToolCall {
+                id: "child_long_running".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "cmd": "python3 -u -c \"import time; print('child-ready', flush=True); time.sleep(30)\"",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )?;
+        let grandchild_started = tools::command::exec_command(
+            &store,
+            &grandchild,
+            &ToolCall {
+                id: "grandchild_long_running".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "cmd": "python3 -u -c \"import time; print('grandchild-ready', flush=True); time.sleep(30)\"",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )?;
+        let child_process_id = child_started.content["session_id"]
+            .as_i64()
+            .context("child process id")?;
+        let grandchild_process_id = grandchild_started.content["session_id"]
+            .as_i64()
+            .context("grandchild process id")?;
+
+        assert_eq!(
+            cleanup_unified_exec_commands_for_agent_subtree(&store, &child.id)?,
+            2
+        );
+
+        for (session, process_id) in [
+            (&child, child_process_id),
+            (&grandchild, grandchild_process_id),
+        ] {
+            let error = tools::command::write_stdin(
+                &store,
+                session,
+                &ToolCall {
+                    id: format!("poll_cleaned_{process_id}"),
+                    name: "write_stdin".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({
+                        "session_id": process_id,
+                        "chars": "",
+                        "yield_time_ms": 10,
+                    }),
+                },
+            )
+            .expect_err("cleaned process should no longer be pollable");
+            assert!(format!("{error:#}").contains("unknown command session id"));
+        }
         Ok(())
     }
 
