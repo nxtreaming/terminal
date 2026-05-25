@@ -23491,7 +23491,10 @@ command = "print-token"
             &provider,
             "research flights",
             temp.path(),
-            AgentRunOptions::default(),
+            AgentRunOptions::default().with_config_overrides(vec![(
+                "features.multi_agent_v2.enabled".to_string(),
+                toml::Value::Boolean(true),
+            )]),
         )?;
         let children = store.list_child_agents(&session_id)?;
         assert_eq!(children.len(), 1);
@@ -25314,7 +25317,12 @@ description = "Missing developer instructions"
                 &provider,
                 "understand this repo",
                 temp.path(),
-                AgentRunOptions::default().with_child_agent_runner(runner),
+                AgentRunOptions::default()
+                    .with_config_overrides(vec![(
+                        "features.multi_agent_v2.enabled".to_string(),
+                        toml::Value::Boolean(true),
+                    )])
+                    .with_child_agent_runner(runner),
             )
         })?;
         let parent_events = store.events_for_session(&session_id)?;
