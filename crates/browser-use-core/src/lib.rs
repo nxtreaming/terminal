@@ -7335,9 +7335,23 @@ fn session_event_user_messages(payload: &Value) -> Vec<Value> {
 }
 
 fn skill_context_messages_from_payload(payload: &Value) -> Vec<Value> {
+    if let Some(messages) = payload
+        .get("skill_context_messages")
+        .and_then(Value::as_array)
+    {
+        return messages
+            .iter()
+            .filter(|message| is_skill_context_message(message))
+            .cloned()
+            .collect();
+    }
     let Some(items) = payload.get("items").and_then(Value::as_array) else {
         return Vec::new();
     };
+    skill_context_messages_from_items(items)
+}
+
+fn skill_context_messages_from_items(items: &[Value]) -> Vec<Value> {
     let mut seen_paths = HashSet::new();
     let mut messages = Vec::new();
     for item in items {
@@ -12222,13 +12236,11 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
     if fork_mode != "all" {
         append_workspace_context_event_with_options(store, &child, &child_options)?;
     }
-    let mut input_payload = serde_json::json!({ "text": message.trim() });
-    if let Some(input) = legacy_input.as_ref() {
-        input_payload["content"] = input.content.clone();
-        if let Some(items) = input.items.as_ref() {
-            input_payload["items"] = Value::Array(items.clone());
-        }
-    }
+    let input_payload = if let Some(input) = legacy_input.as_ref() {
+        collab_input_event_payload(input)
+    } else {
+        serde_json::json!({ "text": message.trim() })
+    };
     store.append_event(&child.id, "session.input", input_payload)?;
     store.append_event(
         &session.id,
@@ -12410,7 +12422,7 @@ fn random_index(len: usize) -> usize {
     value % len
 }
 
-fn update_parent_from_child_run(
+pub fn update_parent_from_child_run(
     store: &Store,
     parent_id: &str,
     child_id: &str,
@@ -12575,6 +12587,7 @@ struct CollabInput {
     preview: String,
     content: Value,
     items: Option<Vec<Value>>,
+    skill_context_messages: Option<Vec<Value>>,
 }
 
 fn spawn_agent_message_from_call(call: &ToolCall, legacy_v1: bool) -> String {
@@ -12618,6 +12631,7 @@ fn parse_collab_input(
                 preview: message.to_string(),
                 content: Value::String(message.to_string()),
                 items: None,
+                skill_context_messages: None,
             })
         }
         (None, Some(items)) => collab_input_from_items(items),
@@ -12641,17 +12655,51 @@ fn collab_input_from_items(items: &Value) -> Result<CollabInput, String> {
     for item in items {
         collab_item_content_parts(item, &mut parts);
     }
-    if parts.is_empty() && !preview.trim().is_empty() {
+    let fallback_preview = items
+        .iter()
+        .filter(|item| collab_item_allows_preview_fallback(item))
+        .map(collab_item_preview)
+        .filter(|preview| !preview.is_empty())
+        .collect::<Vec<_>>()
+        .join("\n");
+    if parts.is_empty() && !fallback_preview.trim().is_empty() {
         parts.push(serde_json::json!({
             "type": "input_text",
-            "text": preview,
+            "text": fallback_preview,
         }));
     }
+    let item_values = items.clone();
+    let skill_context_messages = if collab_items_include_skill(&item_values) {
+        Some(skill_context_messages_from_items(&item_values))
+    } else {
+        None
+    };
     Ok(CollabInput {
         preview,
         content: Value::Array(parts),
-        items: Some(items.clone()),
+        items: Some(item_values),
+        skill_context_messages,
     })
+}
+
+fn collab_input_event_payload(input: &CollabInput) -> Value {
+    let mut payload = serde_json::json!({
+        "text": input.preview.trim(),
+        "content": input.content.clone(),
+    });
+    if let Some(items) = input.items.as_ref() {
+        payload["items"] = Value::Array(items.clone());
+    }
+    if let Some(messages) = input.skill_context_messages.as_ref() {
+        payload["skill_context_messages"] = Value::Array(messages.clone());
+    }
+    payload
+}
+
+fn collab_items_include_skill(items: &[Value]) -> bool {
+    items
+        .iter()
+        .any(|item| item.get("type").and_then(Value::as_str) == Some("skill"))
 }
 
 fn collab_item_preview(item: &Value) -> String {
@@ -12678,6 +12726,13 @@ fn collab_item_preview(item: &Value) -> String {
         ),
         _ => "[input]".to_string(),
     }
+}
+
+fn collab_item_allows_preview_fallback(item: &Value) -> bool {
+    !matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("skill") | Some("mention")
+    )
 }
 
 fn collab_item_content_parts(item: &Value, parts: &mut Vec<Value>) {
@@ -12713,16 +12768,7 @@ fn collab_item_content_parts(item: &Value, parts: &mut Vec<Value>) {
             let detail = item.get("detail").and_then(Value::as_str).unwrap_or("high");
             push_collab_local_image_parts(parts, path, detail);
         }
-        Some("skill") => {}
-        Some("mention") => {
-            let preview = collab_item_preview(item);
-            if !preview.trim().is_empty() {
-                parts.push(serde_json::json!({
-                    "type": "input_text",
-                    "text": preview,
-                }));
-            }
-        }
+        Some("skill") | Some("mention") => {}
         _ => {
             parts.push(serde_json::json!({
                 "type": "input_text",
@@ -13308,7 +13354,7 @@ fn spawn_agent_task_name(call: &ToolCall, parent_agent_path: &str) -> Result<Str
     Err("spawn_agent requires task_name".to_string())
 }
 
-fn canonical_agent_path_from_task_name(
+pub fn canonical_agent_path_from_task_name(
     task_name: &str,
     parent_agent_path: &str,
 ) -> Result<String, String> {
@@ -13377,7 +13423,7 @@ fn canonical_agent_path(path: &str) -> String {
     }
 }
 
-fn canonical_agent_reference(reference: &str, current_agent_path: &str) -> String {
+pub fn canonical_agent_reference(reference: &str, current_agent_path: &str) -> String {
     let trimmed = reference.trim();
     if trimmed.starts_with('/') || trimmed == "root" || trimmed.starts_with("root/") {
         return canonical_agent_path(trimmed);
@@ -13393,14 +13439,14 @@ fn canonical_agent_reference(reference: &str, current_agent_path: &str) -> Strin
 }
 
 #[derive(Clone, Debug)]
-struct ResolvedAgentReference {
-    session_id: String,
-    agent_path: String,
-    summary: Option<AgentSummary>,
-    is_root: bool,
+pub struct ResolvedAgentReference {
+    pub session_id: String,
+    pub agent_path: String,
+    pub summary: Option<AgentSummary>,
+    pub is_root: bool,
 }
 
-fn root_session_id(store: &Store, session_id: &str) -> Result<String> {
+pub fn root_session_id(store: &Store, session_id: &str) -> Result<String> {
     let mut current = store
         .load_session(session_id)?
         .with_context(|| format!("unknown session id: {session_id}"))?;
@@ -13412,7 +13458,7 @@ fn root_session_id(store: &Store, session_id: &str) -> Result<String> {
     Ok(current.id)
 }
 
-fn collect_agent_tree(store: &Store, parent_session_id: &str) -> Result<Vec<AgentSummary>> {
+pub fn collect_agent_tree(store: &Store, parent_session_id: &str) -> Result<Vec<AgentSummary>> {
     let mut out = Vec::new();
     collect_agent_tree_into(store, parent_session_id, &mut out)?;
     Ok(out)
@@ -13432,7 +13478,7 @@ fn collect_agent_tree_into(
     Ok(())
 }
 
-fn resolve_agent_reference_in_tree(
+pub fn resolve_agent_reference_in_tree(
     store: &Store,
     current_session_id: &str,
     reference: &str,
@@ -13472,7 +13518,7 @@ fn resolve_agent_reference_in_tree(
         }))
 }
 
-fn display_agent_path_for_session(store: &Store, session_id: &str) -> Result<String> {
+pub fn display_agent_path_for_session(store: &Store, session_id: &str) -> Result<String> {
     if let Some(path) = store.agent_path_for_session(session_id)? {
         if !path.trim().is_empty() {
             return Ok(path);
@@ -13564,13 +13610,7 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
     {
         store.request_cancel(target_session_id, "interrupted by parent agent")?;
     }
-    let mut followup_payload = serde_json::json!({
-        "text": input.preview.trim(),
-        "content": input.content.clone(),
-    });
-    if let Some(items) = input.items.as_ref() {
-        followup_payload["items"] = Value::Array(items.clone());
-    }
+    let followup_payload = collab_input_event_payload(&input);
     let followup = store.append_event(target_session_id, "session.followup", followup_payload)?;
     store.append_event(
         &session.id,
@@ -14174,7 +14214,7 @@ fn dispatch_list_agents_tool(
     })
 }
 
-fn local_agent_status_value(
+pub fn local_agent_status_value(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     agent: Option<&AgentSummary>,
@@ -14204,7 +14244,7 @@ fn local_agent_status_value(
     })
 }
 
-fn last_task_message_for_agent(store: &Store, session_id: &str) -> Result<Option<String>> {
+pub fn last_task_message_for_agent(store: &Store, session_id: &str) -> Result<Option<String>> {
     let events = store.events_for_session(session_id)?;
     let latest_event_message = events.iter().rev().find_map(|event| {
         matches!(
@@ -25598,6 +25638,69 @@ description = "Missing developer instructions"
     }
 
     #[test]
+    fn multi_agent_v1_skill_and_mention_items_are_not_ordinary_user_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let skill_path = temp.path().join("skills").join("Docs").join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().context("skill parent")?)?;
+        std::fs::write(&skill_path, "Use the typed skill body.")?;
+
+        let skill_input = parse_collab_input(
+            None,
+            Some(&json!([
+                {"type": "skill", "name": "Docs", "path": skill_path.display().to_string()}
+            ])),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(skill_input.preview.contains("[skill:$Docs]"));
+        assert!(skill_input.content.as_array().is_some_and(Vec::is_empty));
+        let skill_payload = collab_input_event_payload(&skill_input);
+        assert!(skill_payload["skill_context_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() == 1));
+        let skill_messages = session_event_user_messages(&skill_payload);
+        assert_eq!(skill_messages.len(), 1);
+        assert_eq!(
+            skill_messages[0].get("role").and_then(Value::as_str),
+            Some("user")
+        );
+        assert!(message_content_text(&skill_messages[0]).contains("<skill>\n<name>Docs</name>"));
+        assert!(message_content_text(&skill_messages[0]).contains("Use the typed skill body."));
+        std::fs::write(&skill_path, "This later disk change should not replay.")?;
+        let stable_skill_messages = session_event_user_messages(&skill_payload);
+        assert!(
+            message_content_text(&stable_skill_messages[0]).contains("Use the typed skill body.")
+        );
+        assert!(!message_content_text(&stable_skill_messages[0])
+            .contains("This later disk change should not replay."));
+
+        let mention_input = parse_collab_input(
+            None,
+            Some(&json!([
+                {"type": "mention", "name": "Calendar", "path": "app://calendar"},
+                {"type": "mention", "name": "Plugin", "path": "plugin://notes@example"}
+            ])),
+        )
+        .map_err(anyhow::Error::msg)?;
+        assert!(mention_input
+            .preview
+            .contains("[mention:$Calendar](app://calendar)"));
+        assert!(mention_input
+            .preview
+            .contains("[mention:$Plugin](plugin://notes@example)"));
+        assert!(mention_input.content.as_array().is_some_and(Vec::is_empty));
+        let mention_payload = collab_input_event_payload(&mention_input);
+        assert!(mention_payload.get("skill_context_messages").is_none());
+        assert_eq!(mention_payload["items"][0]["path"], "app://calendar");
+        assert_eq!(
+            mention_payload["items"][1]["path"],
+            "plugin://notes@example"
+        );
+        let mention_messages = session_event_user_messages(&mention_payload);
+        assert!(mention_messages.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn multi_agent_v1_spawn_preserves_typed_items_for_child_replay_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -25655,6 +25758,10 @@ description = "Missing developer instructions"
             .as_str()
             .unwrap_or_default()
             .contains("[skill:$Docs]"));
+        assert!(input.payload["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[mention:$Calendar](app://calendar)"));
         let content = input.payload["content"].as_array().context("content")?;
         assert!(content.iter().any(|part| {
             part["type"] == "input_image" && part["image_url"] == "data:image/png;base64,abc"
@@ -25673,6 +25780,17 @@ description = "Missing developer instructions"
                     .unwrap_or_default()
                     .contains("[skill:$Docs]")
         }));
+        assert!(!content.iter().any(|part| {
+            part["type"] == "input_text"
+                && part["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("[mention:$Calendar]")
+        }));
+        assert!(input.payload["skill_context_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() == 1));
+        std::fs::write(&skill_path, "This later rewrite should not replay.")?;
 
         let messages = provider_messages_from_events(&child_events);
         assert!(messages.iter().any(|message| {
@@ -25692,6 +25810,15 @@ description = "Missing developer instructions"
                 && message_content_text(message).contains("<skill>\n<name>Docs</name>")
                 && message_content_text(message).contains("Use the internal docs workflow.")
         }));
+        assert!(!messages.iter().any(|message| message_content_text(message)
+            .contains("This later rewrite should not replay.")));
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!model_text.contains("[mention:$Calendar]"));
+        assert!(!model_text.contains("app://calendar"));
         Ok(())
     }
 
@@ -25746,6 +25873,10 @@ description = "Missing developer instructions"
             .iter()
             .any(|part| part["type"] == "input_image"
                 && part["image_url"] == "data:image/png;base64,abc"));
+        assert!(followup.payload["skill_context_messages"]
+            .as_array()
+            .is_some_and(|messages| messages.len() == 1));
+        std::fs::remove_file(&skill_path)?;
         let messages = provider_messages_from_events(&child_events);
         assert!(messages.iter().any(|message| {
             message.get("role").and_then(Value::as_str) == Some("user")
