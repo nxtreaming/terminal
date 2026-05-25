@@ -165,8 +165,8 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 ## Latest Batch
 
 The latest batch closed the represented MultiAgentV1 mention/skill ordinary
-user-content suppression slice and the CLI-created child-agent command slice in
-G-033.
+user-content suppression slice and the CLI-created child-agent command breadth
+slice in G-033.
 
 - Structured `mention` items now match Codex's ordinary user-content behavior
   for the represented v1 path: they stay in saved typed `items` and UI preview
@@ -201,18 +201,31 @@ G-033.
   at `/root`, and stores author/recipient path metadata on the `agent.message`
   event.
 - CLI `wait-agent` now waits for mailbox delivery up to a timeout and records
-  wait start/finish events without dumping queued message bodies to stdout.
+  wait start/finish events without dumping queued message bodies to stdout. It
+  also has an explicit `--target` status-wait mode that reuses the core v1
+  final-status reducer for id-targeted legacy waits.
 - CLI `list-agents` now reports the root plus live descendant tree with
-  Codex-shaped `agent_name`, `agent_status`, and `last_task_message` fields, with
-  a structured JSON output option for tool-facing inspection.
+  Codex-shaped `agent_name`, `agent_status`, and `last_task_message` fields,
+  supports Codex-style `--path-prefix` filtering, and omits CLI-only session
+  metadata from the structured output.
 - CLI `close-agent` now rejects root/non-edge sessions, returns the previous
   Codex-shaped local status, closes the child edge, cancels active descendants,
-  and records the parent cancellation event.
+  records the parent cancellation event, and can resolve relative or canonical
+  agent paths when given `--current-id`.
+- CLI `resume-agent` now reopens a closed/cancelled child by id, restores open
+  descendants through the same store path as core v1 `resume_agent`, and returns
+  the Codex-shaped local status payload.
+- A plugin/app mention audit found directly model-visible Codex behavior around
+  available-plugin/app developer context and explicit plugin mention hints, but
+  exact parity depends on plugin capability inventory, app connector inventory,
+  app MCP tool exposure, and plugin/app enablement checks that this terminal does
+  not currently own. The represented typed-input slice remains metadata-safe:
+  app/plugin mentions persist without leaking ordinary prompt text.
 - Remaining multi-agent gaps are app/plugin connector context injection, exact
-  app-server collaboration/input-queue events, CLI resume/reopen breadth and
-  exact product output shape, full rollout persistence semantics, arbitrary role
-  config keys such as sandbox/skills/tools, and code-mode-only runtime behavior
-  if code mode is added.
+  app-server collaboration/input-queue events, exact product output shape for
+  non-modeled CLI/debug surfaces, full rollout persistence semantics, arbitrary
+  role config keys such as sandbox/skills/tools, and code-mode-only runtime
+  behavior if code mode is added.
 - Remaining large non-multi-agent gaps are websocket transport/fallback/
   `response.processed`, richer effective-config provenance and doctor/status
   displays, full app-server thread-config protocol surfaces beyond the
