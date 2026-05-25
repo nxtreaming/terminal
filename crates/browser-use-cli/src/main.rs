@@ -9,10 +9,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
-    install_process_crypto_provider, product_analytics, record_python_response_final_event,
-    record_python_worker_event, run_agent_from_config, run_existing_session_from_config,
-    run_existing_session_with_provider, run_fake_agent, AgentRunOptions, FakeAgentOptions,
-    ProviderBackend, ProviderRunConfig,
+    configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
+    install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
+    product_analytics, record_python_response_final_event, record_python_worker_event,
+    run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
+    run_fake_agent, AgentRunOptions, CollaborationModeKind, ConfigOverrides, FakeAgentOptions,
+    ProviderBackend, ProviderRunConfig, RunConfigValueSource,
 };
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, result_from_events,
@@ -20,10 +22,10 @@ use browser_use_protocol::{
 };
 use browser_use_providers::{
     claude_code_oauth_authorize_url, claude_code_oauth_pkce,
-    exchange_claude_code_authorization_code, load_codex_auth, load_codex_auth_file,
-    parse_claude_code_authorization_input, refresh_claude_code_oauth, AnthropicMessagesProvider,
-    ClaudeCodeOAuthCredential, CodexAuth, CodexResponsesProvider, FakeProvider, ModelProvider,
-    OpenAICompatibleChatProvider, OpenAIResponsesProvider, CLAUDE_CODE_CALLBACK_HOST,
+    exchange_claude_code_authorization_code, load_codex_auth, load_codex_managed_auth,
+    load_codex_managed_auth_file, parse_claude_code_authorization_input, refresh_claude_code_oauth,
+    AnthropicMessagesProvider, ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth,
+    FakeProvider, ModelProvider, OpenAICompatibleChatProvider, CLAUDE_CODE_CALLBACK_HOST,
     CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
@@ -39,8 +41,37 @@ use serde_json::Value;
 struct Args {
     #[arg(long, default_value = "~/.browser-use-terminal")]
     state_dir: PathBuf,
+    /// Layer $CODEX_HOME/<name>.config.toml on top of the base user config.
+    #[arg(long = "profile", short = 'p', global = true)]
+    config_profile: Option<String>,
+    /// Override a configuration value. Use a dotted path and TOML value.
+    #[arg(
+        short = 'c',
+        long = "config",
+        value_name = "key=value",
+        action = clap::ArgAction::Append,
+        global = true
+    )]
+    config_overrides: Vec<String>,
+    #[arg(long = "collaboration-mode", value_enum, default_value_t = CollaborationModeArg::Default, global = true)]
+    collaboration_mode: CollaborationModeArg,
     #[command(subcommand)]
     command: Command,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CollaborationModeArg {
+    Default,
+    Plan,
+}
+
+impl From<CollaborationModeArg> for CollaborationModeKind {
+    fn from(value: CollaborationModeArg) -> Self {
+        match value {
+            CollaborationModeArg::Default => CollaborationModeKind::Default,
+            CollaborationModeArg::Plan => CollaborationModeKind::Plan,
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
@@ -55,13 +86,13 @@ enum Command {
     },
     RunOpenai {
         text: String,
-        #[arg(long, default_value = "gpt-5.5")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
     },
     RunCodex {
         text: String,
-        #[arg(long, default_value = "gpt-5.5")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
     },
     RunAnthropic {
         text: String,
@@ -75,13 +106,13 @@ enum Command {
     },
     RunOpenaiSession {
         task_id: String,
-        #[arg(long, default_value = "gpt-5.5")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
     },
     RunCodexSession {
         task_id: String,
-        #[arg(long, default_value = "gpt-5.5")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
     },
     RunAnthropicSession {
         task_id: String,
@@ -228,8 +259,8 @@ enum Command {
         task_ids: Vec<String>,
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value = "gpt-5.5")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long, default_value_t = 80)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
@@ -257,8 +288,8 @@ enum Command {
         task_ids: Vec<String>,
         #[arg(long)]
         all: bool,
-        #[arg(long, default_value = "gpt-5.5")]
-        model: String,
+        #[arg(long)]
+        model: Option<String>,
         #[arg(long, default_value_t = 80)]
         max_turns: usize,
         #[arg(long, default_value_t = 120)]
@@ -439,6 +470,59 @@ struct DatasetProviderConfig {
     python_timeout_seconds: u64,
 }
 
+trait DatasetRunner: Clone + Send + Sync + 'static {
+    fn run_dataset_session(
+        &self,
+        store: &Store,
+        session_id: &str,
+        options: AgentRunOptions,
+    ) -> Result<()>;
+}
+
+#[derive(Clone)]
+struct DirectDatasetRunner<P> {
+    provider: P,
+}
+
+impl<P> DatasetRunner for DirectDatasetRunner<P>
+where
+    P: ModelProvider + Clone + Send + Sync + 'static,
+{
+    fn run_dataset_session(
+        &self,
+        store: &Store,
+        session_id: &str,
+        options: AgentRunOptions,
+    ) -> Result<()> {
+        run_existing_session_with_provider(store, &self.provider, session_id, options)?;
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ConfigDatasetRunner {
+    config: ProviderRunConfig,
+}
+
+impl DatasetRunner for ConfigDatasetRunner {
+    fn run_dataset_session(
+        &self,
+        store: &Store,
+        session_id: &str,
+        options: AgentRunOptions,
+    ) -> Result<()> {
+        let mut config = self.config.clone();
+        let mut merged_options = options;
+        merged_options.config_profile = config.options.config_profile.clone();
+        merged_options.config_overrides = config.options.config_overrides.clone();
+        merged_options.model_provider_id = config.options.model_provider_id.clone();
+        merged_options.collaboration_mode = config.options.collaboration_mode;
+        config.options = merged_options;
+        run_existing_session_from_config(store, session_id, config)?;
+        Ok(())
+    }
+}
+
 #[derive(Clone, Debug, Serialize)]
 struct DatasetTaskPaths {
     root: PathBuf,
@@ -461,21 +545,76 @@ fn main() -> Result<()> {
         "bu:cli command ran",
         serde_json::json!({ "command": command_name(&args.command), "surface": "cli" }),
     );
+    let config_profile = args.config_profile.clone();
+    let config_overrides = args.config_overrides.clone();
+    let collaboration_mode = args.collaboration_mode.into();
     match args.command {
         Command::Start { text } => start(&store, text),
         Command::RunFake { text, python_code } => run_fake(&store, text, python_code),
-        Command::RunOpenai { text, model } => run_openai(&store, text, model),
-        Command::RunCodex { text, model } => run_codex(&store, text, model),
-        Command::RunAnthropic { text, model } => run_anthropic(&store, text, model),
-        Command::RunOpenrouter { text, model } => run_openrouter(&store, text, model),
-        Command::RunOpenaiSession { task_id, model } => run_openai_session(&store, &task_id, model),
-        Command::RunCodexSession { task_id, model } => run_codex_session(&store, &task_id, model),
-        Command::RunAnthropicSession { task_id, model } => {
-            run_anthropic_session(&store, &task_id, model)
-        }
-        Command::RunOpenrouterSession { task_id, model } => {
-            run_openrouter_session(&store, &task_id, model)
-        }
+        Command::RunOpenai { text, model } => run_openai(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
+        Command::RunCodex { text, model } => run_codex(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
+        Command::RunAnthropic { text, model } => run_anthropic(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
+        Command::RunOpenrouter { text, model } => run_openrouter(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
+        Command::RunOpenaiSession { task_id, model } => run_openai_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
+        Command::RunCodexSession { task_id, model } => run_codex_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
+        Command::RunAnthropicSession { task_id, model } => run_anthropic_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
+        Command::RunOpenrouterSession { task_id, model } => run_openrouter_session(
+            &store,
+            &task_id,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
         Command::Followup { task_id, text } => followup(&store, &task_id, text),
         Command::Finish { task_id, result } => finish(&store, &task_id, result),
         Command::Fail { task_id, error } => fail(&store, &task_id, error),
@@ -490,7 +629,12 @@ fn main() -> Result<()> {
             output_dir,
         } => export(&store, &task_id, output_dir),
         Command::Import { input } => import(&store, input),
-        Command::Config { command } => config(&store, command),
+        Command::Config { command } => config(
+            &store,
+            command,
+            config_profile.as_deref(),
+            &config_overrides,
+        ),
         Command::Auth { command } => auth(&store, command),
         Command::Diagnostics => diagnostics(&store),
         Command::Trace { task_id, output } => trace(&store, &task_id, output),
@@ -584,6 +728,8 @@ fn main() -> Result<()> {
             model,
             max_turns,
             python_timeout_seconds,
+            config_profile.as_deref(),
+            &config_overrides,
         ),
         Command::DatasetRunCodex {
             dataset,
@@ -618,6 +764,8 @@ fn main() -> Result<()> {
             model,
             max_turns,
             python_timeout_seconds,
+            config_profile.as_deref(),
+            &config_overrides,
         ),
         Command::DatasetRunAnthropic {
             dataset,
@@ -975,10 +1123,102 @@ fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<
     Ok(())
 }
 
-fn cli_agent_options() -> AgentRunOptions {
-    AgentRunOptions::default()
+fn cli_agent_options(
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<AgentRunOptions> {
+    let mut options = AgentRunOptions::default()
+        .with_collaboration_mode(collaboration_mode)
         .with_browser_mode(cli_browser_mode())
-        .with_analytics_source("cli")
+        .with_analytics_source("cli");
+    if let Some(profile) = config_profile {
+        options = options.with_config_profile(profile.to_string());
+    }
+    let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
+    if !config_overrides.is_empty() {
+        options = options.with_config_overrides(config_overrides);
+    }
+    Ok(options)
+}
+
+fn resolve_cli_model_with_source(
+    backend: ProviderBackend,
+    explicit_model: Option<String>,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+) -> Result<(String, RunConfigValueSource)> {
+    if let Some(model) = explicit_model {
+        return Ok((model, RunConfigValueSource::Explicit));
+    }
+    let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
+    let model_source = if config_overrides.iter().any(|(key, _)| key == "model") {
+        RunConfigValueSource::Explicit
+    } else {
+        RunConfigValueSource::Default
+    };
+    Ok((
+        default_cli_model_for_backend_with_overrides(backend, config_profile, &config_overrides)?,
+        model_source,
+    ))
+}
+
+fn default_cli_model_for_backend_with_overrides(
+    backend: ProviderBackend,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<String> {
+    let cwd = std::env::current_dir()?;
+    match backend {
+        ProviderBackend::Codex => {
+            default_model_for_cwd_with_options(cwd, config_profile, config_overrides, true)
+        }
+        ProviderBackend::Openai => {
+            default_model_for_cwd_with_options(cwd, config_profile, config_overrides, false)
+        }
+        ProviderBackend::Anthropic => Ok("claude-sonnet-4-6".to_string()),
+        ProviderBackend::Openrouter => Ok("openai/gpt-5.5".to_string()),
+        ProviderBackend::Fake | ProviderBackend::None => Ok("fake".to_string()),
+    }
+}
+
+fn default_provider_id_for_backend(backend: ProviderBackend) -> &'static str {
+    match backend {
+        ProviderBackend::Codex => "codex",
+        ProviderBackend::Openai => "openai",
+        ProviderBackend::Anthropic => "anthropic",
+        ProviderBackend::Openrouter => "openrouter",
+        ProviderBackend::Fake => "fake",
+        ProviderBackend::None => "none",
+    }
+}
+
+fn resolved_cli_provider_id_for_backend_with_overrides(
+    backend: ProviderBackend,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<String> {
+    Ok(configured_model_provider_id_for_cwd_with_options(
+        std::env::current_dir()?,
+        config_profile,
+        config_overrides,
+    )?
+    .unwrap_or_else(|| default_provider_id_for_backend(backend).to_string()))
+}
+
+fn cli_provider_id_source(config_overrides: &[(String, toml::Value)]) -> RunConfigValueSource {
+    if config_overrides
+        .iter()
+        .any(|(key, _)| key == "model_provider")
+    {
+        RunConfigValueSource::Explicit
+    } else {
+        RunConfigValueSource::Default
+    }
+}
+
+fn parse_cli_config_overrides(raw_config_overrides: &[String]) -> Result<ConfigOverrides> {
+    parse_config_overrides(raw_config_overrides)
 }
 
 fn cli_browser_mode() -> String {
@@ -999,69 +1239,173 @@ fn dataset_browser_mode(options: &DatasetRunOptions) -> String {
         .replace(['_', ' '], "-")
 }
 
-fn run_openai(store: &Store, text: String, model: String) -> Result<()> {
-    let config =
-        ProviderRunConfig::new(ProviderBackend::Openai, model).with_options(cli_agent_options());
+fn run_openai(
+    store: &Store,
+    text: String,
+    model: Option<String>,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
+    let (model, model_source) = resolve_cli_model_with_source(
+        ProviderBackend::Openai,
+        model,
+        config_profile,
+        raw_config_overrides,
+    )?;
+    let config = ProviderRunConfig::new(ProviderBackend::Openai, model)
+        .with_model_source(model_source)
+        .with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+        )?);
     let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
     Ok(())
 }
 
-fn run_codex(store: &Store, text: String, model: String) -> Result<()> {
-    let config =
-        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options());
+fn run_codex(
+    store: &Store,
+    text: String,
+    model: Option<String>,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
+    let (model, model_source) = resolve_cli_model_with_source(
+        ProviderBackend::Codex,
+        model,
+        config_profile,
+        raw_config_overrides,
+    )?;
+    let config = ProviderRunConfig::new(ProviderBackend::Codex, model)
+        .with_model_source(model_source)
+        .with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+        )?);
     let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
     Ok(())
 }
 
-fn run_anthropic(store: &Store, text: String, model: String) -> Result<()> {
-    let config =
-        ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options());
+fn run_anthropic(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
+    let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
+        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+    );
     let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
     Ok(())
 }
 
-fn run_openrouter(store: &Store, text: String, model: String) -> Result<()> {
-    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model)
-        .with_options(cli_agent_options());
+fn run_openrouter(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
+    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
+        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+    );
     let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
     println!("{session_id}");
     Ok(())
 }
 
-fn run_openai_session(store: &Store, task_id: &str, model: String) -> Result<()> {
+fn run_openai_session(
+    store: &Store,
+    task_id: &str,
+    model: Option<String>,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config =
-        ProviderRunConfig::new(ProviderBackend::Openai, model).with_options(cli_agent_options());
+    let (model, model_source) = resolve_cli_model_with_source(
+        ProviderBackend::Openai,
+        model,
+        config_profile,
+        raw_config_overrides,
+    )?;
+    let config = ProviderRunConfig::new(ProviderBackend::Openai, model)
+        .with_model_source(model_source)
+        .with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+        )?);
     let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
 
-fn run_codex_session(store: &Store, task_id: &str, model: String) -> Result<()> {
+fn run_codex_session(
+    store: &Store,
+    task_id: &str,
+    model: Option<String>,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config =
-        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options());
+    let (model, model_source) = resolve_cli_model_with_source(
+        ProviderBackend::Codex,
+        model,
+        config_profile,
+        raw_config_overrides,
+    )?;
+    let config = ProviderRunConfig::new(ProviderBackend::Codex, model)
+        .with_model_source(model_source)
+        .with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+        )?);
     let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
 
-fn run_anthropic_session(store: &Store, task_id: &str, model: String) -> Result<()> {
+fn run_anthropic_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config =
-        ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options());
+    let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
+        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+    );
     let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
 
-fn run_openrouter_session(store: &Store, task_id: &str, model: String) -> Result<()> {
+fn run_openrouter_session(
+    store: &Store,
+    task_id: &str,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model)
-        .with_options(cli_agent_options());
+    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
+        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+    );
     let session_id = run_existing_session_from_config(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
@@ -1239,12 +1583,18 @@ fn import(store: &Store, input: PathBuf) -> Result<()> {
     Ok(())
 }
 
-fn config(store: &Store, command: ConfigCommand) -> Result<()> {
+fn config(
+    store: &Store,
+    command: ConfigCommand,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+) -> Result<()> {
+    let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
     match command {
         ConfigCommand::Init => {
-            for (key, value) in default_settings() {
-                if store.get_setting(key)?.is_none() {
-                    store.set_setting(key, value)?;
+            for (key, value) in default_settings(config_profile, &config_overrides)? {
+                if store.get_setting(&key)?.is_none() {
+                    store.set_setting(&key, &value)?;
                 }
             }
             println!(
@@ -1254,9 +1604,9 @@ fn config(store: &Store, command: ConfigCommand) -> Result<()> {
             Ok(())
         }
         ConfigCommand::Show => {
-            let mut settings = default_settings()
+            let mut settings = default_settings(config_profile, &config_overrides)?
                 .into_iter()
-                .map(|(key, value)| (key.to_string(), value.to_string(), true))
+                .map(|(key, value)| (key, value, true))
                 .collect::<Vec<_>>();
             for (key, value) in store.list_settings()? {
                 if let Some(existing) = settings.iter_mut().find(|(name, _, _)| name == &key) {
@@ -1285,15 +1635,44 @@ fn config(store: &Store, command: ConfigCommand) -> Result<()> {
     }
 }
 
-fn default_settings() -> Vec<(&'static str, &'static str)> {
-    vec![
-        ("account", "Codex login"),
-        ("model", "GPT-5.5"),
-        ("provider.model", "gpt-5.5"),
-        ("browser", "Local Chrome"),
-        ("agent.backend", "codex"),
-        ("setup.complete", "0"),
-    ]
+fn default_settings(
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<Vec<(String, String)>> {
+    let provider_model = default_cli_model_for_backend_with_overrides(
+        ProviderBackend::Codex,
+        config_profile,
+        config_overrides,
+    )?;
+    let display_model =
+        display_model_for_provider_model(&provider_model, config_profile, config_overrides)?;
+    let provider_id = resolved_cli_provider_id_for_backend_with_overrides(
+        ProviderBackend::Codex,
+        config_profile,
+        config_overrides,
+    )?;
+    Ok(vec![
+        ("account".to_string(), "Codex login".to_string()),
+        ("model".to_string(), display_model),
+        ("provider.model".to_string(), provider_model),
+        ("provider.id".to_string(), provider_id),
+        ("browser".to_string(), "Local Chrome".to_string()),
+        ("agent.backend".to_string(), "codex".to_string()),
+        ("setup.complete".to_string(), "0".to_string()),
+    ])
+}
+
+fn display_model_for_provider_model(
+    model: &str,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<String> {
+    let cwd = std::env::current_dir()?;
+    let catalog = model_catalog_for_cwd_with_options(cwd, config_profile, config_overrides)?;
+    Ok(catalog
+        .entry_for_model(model)
+        .map(|entry| entry.display_name.clone())
+        .unwrap_or_else(|| model.to_string()))
 }
 
 fn is_secret_setting(key: &str) -> bool {
@@ -1355,11 +1734,25 @@ fn auth(store: &Store, command: AuthCommand) -> Result<()> {
         ),
         AuthCommand::ImportCodex { input } => {
             let auth = if let Some(input) = input {
-                load_codex_auth_file(input)?
+                let managed_auth = load_codex_managed_auth_file(input)?;
+                let auth = managed_auth.current_auth()?;
+                store_codex_managed_auth(store, &managed_auth)?;
+                auth
             } else {
-                load_codex_auth().context("load external Codex auth for import")?
+                match load_codex_managed_auth() {
+                    Ok(managed_auth) => {
+                        let auth = managed_auth.current_auth()?;
+                        store_codex_managed_auth(store, &managed_auth)?;
+                        auth
+                    }
+                    Err(_) => {
+                        let auth =
+                            load_codex_auth().context("load external Codex auth for import")?;
+                        store_codex_auth(store, &auth)?;
+                        auth
+                    }
+                }
             };
-            store_codex_auth(store, &auth)?;
             println!("Codex login: imported account {}", auth.account_id);
             Ok(())
         }
@@ -1423,7 +1816,16 @@ fn auth_login(
                         .context("auth login codex requires --account-id with --access-token")?,
                 }
             } else {
-                load_codex_auth().context("load external Codex auth for login")?
+                match load_codex_managed_auth() {
+                    Ok(managed_auth) => {
+                        let auth = managed_auth.current_auth()?;
+                        store_codex_managed_auth(store, &managed_auth)?;
+                        store.set_setting("account", "Codex login")?;
+                        println!("Codex login: connected account {}", auth.account_id);
+                        return Ok(());
+                    }
+                    Err(_) => load_codex_auth().context("load external Codex auth for login")?,
+                }
             };
             store_codex_auth(store, &auth)?;
             store.set_setting("account", "Codex login")?;
@@ -1445,6 +1847,10 @@ fn auth_logout(store: &Store, account: AuthAccount) -> Result<()> {
         AuthAccount::Codex => {
             store.delete_setting("auth.codex.access_token")?;
             store.delete_setting("auth.codex.account_id")?;
+            store.delete_setting("auth.codex.id_token")?;
+            store.delete_setting("auth.codex.refresh_token")?;
+            store.delete_setting("auth.codex.source_path")?;
+            store.delete_setting("auth.codex.last_refresh")?;
         }
         AuthAccount::Openai | AuthAccount::Anthropic | AuthAccount::Openrouter => {
             if let Some(key) = api_key_setting(account) {
@@ -1633,6 +2039,48 @@ fn handle_claude_code_callback(
 fn store_codex_auth(store: &Store, auth: &CodexAuth) -> Result<()> {
     store.set_setting("auth.codex.access_token", auth.access_token.trim())?;
     store.set_setting("auth.codex.account_id", auth.account_id.trim())?;
+    store.delete_setting("auth.codex.id_token")?;
+    store.delete_setting("auth.codex.refresh_token")?;
+    store.delete_setting("auth.codex.source_path")?;
+    store.delete_setting("auth.codex.last_refresh")?;
+    Ok(())
+}
+
+fn store_codex_managed_auth(store: &Store, auth: &CodexManagedAuth) -> Result<()> {
+    let snapshot = auth.current_snapshot()?;
+    store.set_setting("auth.codex.access_token", snapshot.access_token.trim())?;
+    store.set_setting("auth.codex.account_id", snapshot.account_id.trim())?;
+    if let Some(id_token) = snapshot
+        .id_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        store.set_setting("auth.codex.id_token", id_token.trim())?;
+    } else {
+        store.delete_setting("auth.codex.id_token")?;
+    }
+    if let Some(refresh_token) = snapshot
+        .refresh_token
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        store.set_setting("auth.codex.refresh_token", refresh_token.trim())?;
+    } else {
+        store.delete_setting("auth.codex.refresh_token")?;
+    }
+    if let Some(source_path) = snapshot.source_path.as_ref() {
+        store.set_setting(
+            "auth.codex.source_path",
+            source_path.to_string_lossy().as_ref(),
+        )?;
+    } else {
+        store.delete_setting("auth.codex.source_path")?;
+    }
+    if let Some(last_refresh) = snapshot.last_refresh {
+        store.set_setting("auth.codex.last_refresh", &last_refresh.to_rfc3339())?;
+    } else {
+        store.delete_setting("auth.codex.last_refresh")?;
+    }
     Ok(())
 }
 
@@ -1769,10 +2217,7 @@ fn stored_codex_auth(store: &Store) -> Result<Option<CodexAuth>> {
     if access_token.trim().is_empty() || account_id.trim().is_empty() {
         return Ok(None);
     }
-    Ok(Some(CodexAuth {
-        access_token,
-        account_id,
-    }))
+    Ok(Some(CodexAuth::new(access_token, account_id)))
 }
 
 fn stored_or_env(store: &Store, setting_key: &str, env_names: &[&str]) -> Result<Option<String>> {
@@ -1794,38 +2239,6 @@ fn setting_or_env_or_default(
     default: &str,
 ) -> Result<String> {
     Ok(stored_or_env(store, setting_key, env_names)?.unwrap_or_else(|| default.to_string()))
-}
-
-fn openai_provider(store: &Store, model: String) -> Result<OpenAIResponsesProvider> {
-    let api_key = stored_or_env(
-        store,
-        "auth.openai.api_key",
-        &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
-    )?
-    .context("run `auth login openai --api-key ...` or set LLM_BROWSER_OPENAI_API_KEY")?;
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.openai.base_url",
-        &["LLM_BROWSER_OPENAI_BASE_URL"],
-        "https://api.openai.com/v1",
-    )?;
-    Ok(OpenAIResponsesProvider::with_base_url(
-        api_key, model, base_url,
-    ))
-}
-
-fn codex_provider(store: &Store, model: String) -> Result<CodexResponsesProvider> {
-    let auth = match stored_codex_auth(store)? {
-        Some(auth) => auth,
-        None => load_codex_auth()?,
-    };
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.codex.base_url",
-        &["LLM_BROWSER_CODEX_BASE_URL"],
-        "https://chatgpt.com/backend-api",
-    )?;
-    Ok(CodexResponsesProvider::with_base_url(auth, model, base_url))
 }
 
 fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesProvider> {
@@ -2204,7 +2617,7 @@ fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) ->
         store,
         dataset,
         options,
-        &provider,
+        DirectDatasetRunner { provider },
         DatasetProviderConfig {
             provider: "fake".to_string(),
             model: "fake".to_string(),
@@ -2251,19 +2664,46 @@ fn dataset_run_openai(
     store: &Store,
     dataset: &str,
     options: DatasetRunOptions,
-    model: String,
+    model: Option<String>,
     max_turns: usize,
     python_timeout_seconds: u64,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
 ) -> Result<()> {
-    let provider = openai_provider(store, model.clone())?;
+    let (model, model_source) = resolve_cli_model_with_source(
+        ProviderBackend::Openai,
+        model,
+        config_profile,
+        raw_config_overrides,
+    )?;
+    let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
+    let provider_id = resolved_cli_provider_id_for_backend_with_overrides(
+        ProviderBackend::Openai,
+        config_profile,
+        &config_overrides,
+    )?;
+    let provider_id_source = cli_provider_id_source(&config_overrides);
     let browser_mode = dataset_browser_mode(&options);
+    let mut agent_options = cli_agent_options(
+        config_profile,
+        raw_config_overrides,
+        CollaborationModeKind::Default,
+    )?;
+    agent_options = if provider_id_source == RunConfigValueSource::Explicit {
+        agent_options.with_model_provider_id(provider_id.clone())
+    } else {
+        agent_options.with_default_model_provider_id(provider_id.clone())
+    };
+    let run_config = ProviderRunConfig::new(ProviderBackend::Openai, model.clone())
+        .with_model_source(model_source)
+        .with_options(agent_options);
     dataset_run_provider(
         store,
         dataset,
         options,
-        &provider,
+        ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
-            provider: "openai".to_string(),
+            provider: provider_id,
             model: model.clone(),
             browser_mode,
             max_turns,
@@ -2276,19 +2716,46 @@ fn dataset_run_codex(
     store: &Store,
     dataset: &str,
     options: DatasetRunOptions,
-    model: String,
+    model: Option<String>,
     max_turns: usize,
     python_timeout_seconds: u64,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
 ) -> Result<()> {
-    let provider = codex_provider(store, model.clone())?;
+    let (model, model_source) = resolve_cli_model_with_source(
+        ProviderBackend::Codex,
+        model,
+        config_profile,
+        raw_config_overrides,
+    )?;
+    let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
+    let provider_id = resolved_cli_provider_id_for_backend_with_overrides(
+        ProviderBackend::Codex,
+        config_profile,
+        &config_overrides,
+    )?;
+    let provider_id_source = cli_provider_id_source(&config_overrides);
     let browser_mode = dataset_browser_mode(&options);
+    let mut agent_options = cli_agent_options(
+        config_profile,
+        raw_config_overrides,
+        CollaborationModeKind::Default,
+    )?;
+    agent_options = if provider_id_source == RunConfigValueSource::Explicit {
+        agent_options.with_model_provider_id(provider_id.clone())
+    } else {
+        agent_options.with_default_model_provider_id(provider_id.clone())
+    };
+    let run_config = ProviderRunConfig::new(ProviderBackend::Codex, model.clone())
+        .with_model_source(model_source)
+        .with_options(agent_options);
     dataset_run_provider(
         store,
         dataset,
         options,
-        &provider,
+        ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
-            provider: "codex".to_string(),
+            provider: provider_id,
             model: model.clone(),
             browser_mode,
             max_turns,
@@ -2311,7 +2778,7 @@ fn dataset_run_anthropic(
         store,
         dataset,
         options,
-        &provider,
+        DirectDatasetRunner { provider },
         DatasetProviderConfig {
             provider: "anthropic".to_string(),
             model: model.clone(),
@@ -2336,7 +2803,7 @@ fn dataset_run_openrouter(
         store,
         dataset,
         options,
-        &provider,
+        DirectDatasetRunner { provider },
         DatasetProviderConfig {
             provider: "openrouter".to_string(),
             model: model.clone(),
@@ -2347,15 +2814,15 @@ fn dataset_run_openrouter(
     )
 }
 
-fn dataset_run_provider<P>(
+fn dataset_run_provider<R>(
     store: &Store,
     dataset: &str,
     options: DatasetRunOptions,
-    provider: &P,
+    runner: R,
     config: DatasetProviderConfig,
 ) -> Result<()>
 where
-    P: ModelProvider + Clone + Send + Sync + 'static,
+    R: DatasetRunner,
 {
     let all_cases = load_dataset_cases(dataset)?;
     let run_id = options
@@ -2412,7 +2879,7 @@ where
             let task_id = case.task_id.clone();
             let run_id = run_id.clone();
             let config = config.clone();
-            let provider = provider.clone();
+            let runner = runner.clone();
             let state_dir = state_dir.clone();
             let tx = tx.clone();
             thread::spawn(move || {
@@ -2421,7 +2888,7 @@ where
                         let store = Store::open(&state_dir)?;
                         run_dataset_case_with_attempts(
                             &store,
-                            &provider,
+                            &runner,
                             &run_id,
                             &case,
                             config,
@@ -2479,9 +2946,9 @@ where
     Ok(())
 }
 
-fn run_dataset_case_with_attempts<P: ModelProvider>(
+fn run_dataset_case_with_attempts<R: DatasetRunner>(
     store: &Store,
-    provider: &P,
+    runner: &R,
     run_id: &str,
     case: &DatasetCase,
     config: DatasetProviderConfig,
@@ -2490,7 +2957,7 @@ fn run_dataset_case_with_attempts<P: ModelProvider>(
     let mut retry_history = Vec::new();
     for attempt in 1..=max_attempts {
         let mut result =
-            run_dataset_case_with_provider(store, provider, run_id, case, config.clone(), attempt)?;
+            run_dataset_case_with_provider(store, runner, run_id, case, config.clone(), attempt)?;
         let ok = result.get("ok").and_then(Value::as_bool).unwrap_or(false);
         if ok {
             if !retry_history.is_empty() {
@@ -2515,9 +2982,9 @@ fn run_dataset_case_with_attempts<P: ModelProvider>(
     bail!("unreachable dataset retry loop")
 }
 
-fn run_dataset_case_with_provider<P: ModelProvider>(
+fn run_dataset_case_with_provider<R: DatasetRunner>(
     store: &Store,
-    provider: &P,
+    runner: &R,
     run_id: &str,
     case: &DatasetCase,
     config: DatasetProviderConfig,
@@ -2530,14 +2997,25 @@ fn run_dataset_case_with_provider<P: ModelProvider>(
         max_turns: config.max_turns,
         max_context_chars: AgentRunOptions::default().max_context_chars,
         browser_mode: Some(config.browser_mode.clone()),
+        collaboration_mode: AgentRunOptions::default().collaboration_mode,
+        include_environment_context: true,
+        environment_context_environments: Vec::new(),
+        environment_context_network: None,
+        config_profile: None,
+        config_overrides: Vec::new(),
+        model_provider_id: Some(config.provider.clone()),
+        model_provider_id_source: RunConfigValueSource::Explicit,
         python_tool_timeout_seconds: config.python_timeout_seconds,
         python_env: dataset_python_env(run_id, case, attempt, &paths, &config),
         child_agent_runner: None,
+        final_output_json_schema: None,
+        final_output_json_schema_strict: true,
         analytics_source: Some("cli".to_string()),
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),
     };
-    let run_error = run_existing_session_with_provider(store, provider, &session_id, agent_options)
+    let run_error = runner
+        .run_dataset_session(store, &session_id, agent_options)
         .err()
         .map(|error| format!("{error:#}"));
     dataset_attempt_result(store, case, &session_id, config, attempt, run_error)
@@ -3259,6 +3737,7 @@ fn usage_summary_from_events(events: &[browser_use_protocol::EventRecord]) -> Va
     let mut input_cached_tokens = 0_i64;
     let mut input_cache_creation_tokens = 0_i64;
     let mut output_tokens = 0_i64;
+    let mut reasoning_output_tokens = 0_i64;
     let mut total_tokens = 0_i64;
     let mut input_cost_usd = 0.0_f64;
     let mut input_cached_cost_usd = 0.0_f64;
@@ -3292,6 +3771,7 @@ fn usage_summary_from_events(events: &[browser_use_protocol::EventRecord]) -> Va
         input_cached_tokens += json_i64(&event.payload, "input_cached_tokens");
         input_cache_creation_tokens += json_i64(&event.payload, "input_cache_creation_tokens");
         output_tokens += json_i64(&event.payload, "output_tokens");
+        reasoning_output_tokens += json_i64(&event.payload, "reasoning_output_tokens");
         total_tokens += json_i64(&event.payload, "total_tokens");
         input_cost_usd += json_f64(&event.payload, "input_cost_usd");
         input_cached_cost_usd += json_f64(&event.payload, "input_cached_cost_usd");
@@ -3305,6 +3785,7 @@ fn usage_summary_from_events(events: &[browser_use_protocol::EventRecord]) -> Va
         "input_cached_tokens": input_cached_tokens,
         "input_cache_creation_tokens": input_cache_creation_tokens,
         "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": total_tokens,
         "input_cost_usd": input_cost_usd,
         "input_cached_cost_usd": input_cached_cost_usd,
@@ -3536,4 +4017,210 @@ fn notify_parent_agent_done(
         }),
     )?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn cli_config_overrides_parse_toml_and_raw_strings_like_codex() -> Result<()> {
+        let parsed = parse_cli_config_overrides(&[
+            "project_doc_max_bytes=7".to_string(),
+            "project_doc_fallback_filenames=[\"SESSION.md\"]".to_string(),
+            "model=gpt-5.5".to_string(),
+            "use_legacy_landlock=true".to_string(),
+        ])?;
+
+        assert_eq!(parsed[0].0, "project_doc_max_bytes");
+        assert_eq!(parsed[0].1.as_integer(), Some(7));
+        assert_eq!(parsed[1].0, "project_doc_fallback_filenames");
+        assert_eq!(
+            parsed[1].1.as_array().and_then(|items| items[0].as_str()),
+            Some("SESSION.md")
+        );
+        assert_eq!(parsed[2].0, "model");
+        assert_eq!(parsed[2].1.as_str(), Some("gpt-5.5"));
+        assert_eq!(parsed[3].0, "features.use_legacy_landlock");
+        assert_eq!(parsed[3].1.as_bool(), Some(true));
+        Ok(())
+    }
+
+    #[test]
+    fn cli_config_overrides_reject_missing_separator() {
+        let error = parse_cli_config_overrides(&["model".to_string()])
+            .expect_err("missing equals should fail");
+
+        assert!(error.to_string().contains("missing '='"));
+    }
+
+    #[test]
+    fn cli_agent_options_pass_collaboration_mode_to_core() -> Result<()> {
+        let options = cli_agent_options(None, &[], CollaborationModeKind::Plan)?;
+
+        assert_eq!(options.collaboration_mode, CollaborationModeKind::Plan);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_default_model_uses_config_model_like_codex() -> Result<()> {
+        let overrides = vec![(
+            "model".to_string(),
+            toml::Value::String("configured-model".to_string()),
+        )];
+
+        assert_eq!(
+            default_cli_model_for_backend_with_overrides(ProviderBackend::Codex, None, &overrides)?,
+            "configured-model"
+        );
+        assert_eq!(
+            default_cli_model_for_backend_with_overrides(
+                ProviderBackend::Openai,
+                None,
+                &overrides
+            )?,
+            "configured-model"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_model_source_treats_config_model_override_as_explicit_like_codex() -> Result<()> {
+        let (model, source) = resolve_cli_model_with_source(
+            ProviderBackend::Codex,
+            None,
+            None,
+            &["model=\"configured-model\"".to_string()],
+        )?;
+
+        assert_eq!(model, "configured-model");
+        assert_eq!(source, RunConfigValueSource::Explicit);
+
+        let (model, source) = resolve_cli_model_with_source(
+            ProviderBackend::Codex,
+            Some("flag-model".to_string()),
+            None,
+            &["model=\"configured-model\"".to_string()],
+        )?;
+
+        assert_eq!(model, "flag-model");
+        assert_eq!(source, RunConfigValueSource::Explicit);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_default_provider_id_uses_config_provider_like_codex() -> Result<()> {
+        let overrides = vec![(
+            "model_provider".to_string(),
+            toml::Value::String("corp".to_string()),
+        )];
+
+        assert_eq!(
+            resolved_cli_provider_id_for_backend_with_overrides(
+                ProviderBackend::Codex,
+                None,
+                &overrides
+            )?,
+            "corp"
+        );
+        assert_eq!(
+            resolved_cli_provider_id_for_backend_with_overrides(
+                ProviderBackend::Openai,
+                None,
+                &overrides
+            )?,
+            "corp"
+        );
+
+        let defaults = default_settings(None, &overrides)?;
+        assert_eq!(
+            defaults
+                .iter()
+                .find(|(key, _)| key == "provider.id")
+                .map(|(_, value)| value.as_str()),
+            Some("corp")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_provider_source_treats_config_provider_override_as_explicit_like_codex() {
+        assert_eq!(cli_provider_id_source(&[]), RunConfigValueSource::Default);
+        assert_eq!(
+            cli_provider_id_source(&[(
+                "model_provider".to_string(),
+                toml::Value::String("corp".to_string())
+            )]),
+            RunConfigValueSource::Explicit
+        );
+    }
+
+    #[test]
+    fn cli_default_model_uses_active_catalog_auth_filtering_like_codex() -> Result<()> {
+        let temp = unique_cli_test_dir("catalog-default")?;
+        let catalog_path = temp.join("models.json");
+        std::fs::write(
+            &catalog_path,
+            serde_json::json!({
+                "models": [
+                    {
+                        "slug": "chatgpt-only",
+                        "display_name": "ChatGPT Only",
+                        "description": "ChatGPT-only default",
+                        "visibility": "list",
+                        "supported_in_api": false,
+                        "priority": 0,
+                        "supports_parallel_tool_calls": true,
+                        "input_modalities": ["text"]
+                    },
+                    {
+                        "slug": "api-supported",
+                        "display_name": "API Supported",
+                        "description": "API-supported default",
+                        "visibility": "list",
+                        "supported_in_api": true,
+                        "priority": 2,
+                        "supports_parallel_tool_calls": true,
+                        "input_modalities": ["text"]
+                    }
+                ]
+            })
+            .to_string(),
+        )?;
+        let overrides = vec![
+            ("model".to_string(), toml::Value::String(String::new())),
+            (
+                "model_catalog_json".to_string(),
+                toml::Value::String(catalog_path.display().to_string()),
+            ),
+        ];
+
+        assert_eq!(
+            default_cli_model_for_backend_with_overrides(ProviderBackend::Codex, None, &overrides)?,
+            "chatgpt-only"
+        );
+        assert_eq!(
+            default_cli_model_for_backend_with_overrides(
+                ProviderBackend::Openai,
+                None,
+                &overrides
+            )?,
+            "api-supported"
+        );
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    fn unique_cli_test_dir(name: &str) -> Result<std::path::PathBuf> {
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)?
+            .as_nanos();
+        let path = std::env::temp_dir().join(format!(
+            "browser-use-cli-{name}-{}-{nanos}",
+            std::process::id()
+        ));
+        std::fs::create_dir_all(&path)?;
+        Ok(path)
+    }
 }

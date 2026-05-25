@@ -1,5 +1,9 @@
 use anyhow::Result;
-use browser_use_protocol::{HistoryRow, TelemetrySummary, WorkbenchState};
+use browser_use_core::CollaborationModeKind;
+use browser_use_protocol::{
+    instruction_sources_from_events, startup_warnings_from_events, HistoryRow, TelemetrySummary,
+    WorkbenchState,
+};
 use ratatui::backend::TestBackend;
 use ratatui::buffer::Buffer;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Margin, Position, Rect};
@@ -11,13 +15,15 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD, MODEL_CHOICES, VISIBLE_MODEL_CHOICES,
+    is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
+    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
 };
 use crate::theme::*;
 use crate::transcript;
 
-use super::{App, ProductState, SetupResultKind, Surface};
+use super::{
+    collaboration_mode_label, App, ProductState, RequestUserInputFocus, SetupResultKind, Surface,
+};
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
 const CONTENT_HORIZONTAL_MARGIN: u16 = 2;
@@ -383,15 +389,21 @@ fn main_bottom_height_for(
     if !surface.is_bottom_pane() {
         return composer_pane_height(app, product_state, area.width);
     }
-    let line_count =
-        surface_lines(surface, app, state, content_width(area.width) as usize).len() as u16;
+    let line_count = surface_lines(
+        surface,
+        app,
+        state,
+        content_width(area.width) as usize,
+        usize::MAX,
+    )
+    .len() as u16;
     let max_height = match surface {
         Surface::Model | Surface::History => area.height.saturating_sub(2).max(6),
         Surface::BrowserSelect => 22,
         _ => 18,
     };
-    // Add room for the surface header (rule + title + description + spacer).
-    let desired = line_count.saturating_add(6).clamp(8, max_height);
+    // Add room for the surface header, footer, borders, and content margins.
+    let desired = line_count.saturating_add(10).clamp(8, max_height);
     let available = area.height.saturating_sub(2).max(4);
     desired.min(available)
 }
@@ -435,7 +447,7 @@ fn render_bottom_pane(
     frame.render_widget(Paragraph::new(header), content_area(chunks[0]));
     let body_area = content_area(chunks[1]);
     let body_width = body_area.width as usize;
-    let mut lines = surface_lines(surface, app, state, body_width);
+    let mut lines = surface_lines(surface, app, state, body_width, body_area.height as usize);
     // For surfaces whose body is a straight list of selectable rows indexed by
     // `selected_row` (currently just History), keep the selection in view by
     // dropping rows from the top once it would otherwise scroll off the bottom.
@@ -546,9 +558,13 @@ fn surface_popup_rect(
     const MIN_W: u16 = 40;
     const MIN_H: u16 = 10;
     const MAX_W: u16 = 84;
-    const MAX_H: u16 = 26;
     const H_MARGIN: u16 = 4;
-    const V_MARGIN: u16 = 2;
+    let max_h = if surface == Surface::Model {
+        area.height
+    } else {
+        26
+    };
+    let v_margin: u16 = if surface == Surface::Model { 0 } else { 2 };
 
     let popup_w = if area.width <= MIN_W {
         area.width
@@ -564,15 +580,16 @@ fn surface_popup_rect(
     let body_inner_width = popup_w
         .saturating_sub(2 + CONTENT_HORIZONTAL_MARGIN * 2)
         .max(1) as usize;
-    let body_line_count = surface_lines(surface, app, state, body_inner_width).len() as u16;
+    let body_line_count =
+        surface_lines(surface, app, state, body_inner_width, usize::MAX).len() as u16;
     let desired_h = body_line_count.saturating_add(8);
 
     let popup_h = if area.height <= MIN_H {
         area.height
     } else {
         desired_h
-            .clamp(MIN_H, MAX_H)
-            .min(area.height.saturating_sub(V_MARGIN.saturating_mul(2)))
+            .clamp(MIN_H, max_h)
+            .min(area.height.saturating_sub(v_margin.saturating_mul(2)))
             .max(MIN_H.min(area.height))
     };
 
@@ -628,7 +645,13 @@ fn render_surface_popup_box(
     Paragraph::new(header).render(content_area(chunks[0]), buffer);
 
     let body_area = content_area(chunks[1]);
-    let mut lines = surface_lines(surface, app, state, body_area.width as usize);
+    let mut lines = surface_lines(
+        surface,
+        app,
+        state,
+        body_area.width as usize,
+        body_area.height as usize,
+    );
     if matches!(surface, Surface::History) {
         let body_h = body_area.height as usize;
         if body_h > 0 && app.selected_row >= body_h {
@@ -888,7 +911,7 @@ fn render_surface(
         app.welcome_logo_rect.set(None);
     }
     let body_width = body_area.width as usize;
-    let mut lines = surface_lines(surface, app, state, body_width);
+    let mut lines = surface_lines(surface, app, state, body_width, body_area.height as usize);
     trim_trailing_whitespace(&mut lines);
     frame.render_widget(
         Paragraph::new(lines)
@@ -914,6 +937,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::ApiKey => ("API key", "Enter your provider API key"),
         Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
         Surface::Model => ("Model", "Choose the model and provider for this session"),
+        Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
         Surface::History => ("History", "Browse and resume previous tasks"),
@@ -959,6 +983,7 @@ fn surface_lines(
     app: &App,
     state: &WorkbenchState,
     width: usize,
+    height: usize,
 ) -> Vec<Line<'static>> {
     match surface {
         Surface::Setup => setup_lines(app, width),
@@ -967,7 +992,8 @@ fn surface_lines(
         Surface::Account => account_lines(app),
         Surface::ApiKey => api_key_lines(app),
         Surface::Telemetry => telemetry_key_lines(app),
-        Surface::Model => model_lines(app),
+        Surface::Model => model_lines(app, height),
+        Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
         Surface::History => history_lines(app, state, width),
@@ -1105,6 +1131,11 @@ fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Lin
     let usage = session_usage(app, state);
     let mut spans = vec![Span::styled(app.model.clone(), accent())];
     spans.push(status_separator());
+    spans.push(Span::styled(
+        collaboration_mode_label(app.collaboration_mode).to_string(),
+        muted(),
+    ));
+    spans.push(status_separator());
     spans.extend(context_bar_spans(usage.context_tokens.unwrap_or(0)));
     if usage.cost_usd > 0.0 {
         spans.push(status_separator());
@@ -1241,7 +1272,20 @@ fn format_token_count(tokens: i64) -> String {
 
 fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
     let current_session = state.current_session.as_ref();
-    let placeholder = if current_session.is_some_and(|session| session.status.is_active()) {
+    let pending_request = current_session
+        .filter(|session| session.status.is_active())
+        .and_then(|session| app.pending_request_user_input(&session.id));
+    let placeholder = if pending_request.is_some() {
+        if app
+            .request_input
+            .as_ref()
+            .is_some_and(|state| state.focus == RequestUserInputFocus::Notes)
+        {
+            "Add notes..."
+        } else {
+            "Answer the agent's question..."
+        }
+    } else if current_session.is_some_and(|session| session.status.is_active()) {
         "Type to steer the agent..."
     } else if current_session.is_some() {
         "Ask a follow-up..."
@@ -1800,47 +1844,85 @@ fn telemetry_key_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
-fn model_lines(app: &App) -> Vec<Line<'static>> {
-    let mut lines = Vec::new();
+fn model_lines(app: &App, height: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
     if let Some(notice) = app.status_notice.as_ref() {
-        lines.push(Line::from(Span::styled(notice.clone(), failed())));
-        lines.push(Line::from(""));
+        lines.push((None, Line::from(Span::styled(notice.clone(), failed()))));
+        lines.push((None, Line::from("")));
     }
-    lines.push(Line::from(Span::styled("recommended", muted())));
-    let mut row_idx = 0;
-    for &idx in VISIBLE_MODEL_CHOICES.iter().filter(|&&idx| idx == 0) {
-        lines.push(model_row(idx, row_idx, app));
-        row_idx += 1;
-    }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("bring your own key", muted())));
-    for &idx in VISIBLE_MODEL_CHOICES
+    lines.push((None, Line::from(Span::styled("recommended", muted()))));
+    let mut row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::Recommended, 0);
+    lines.push((None, Line::from("")));
+    lines.push((
+        None,
+        Line::from(Span::styled("bring your own key", muted())),
+    ));
+    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::BringYourOwnKey, row_idx);
+    lines.push((None, Line::from("")));
+    lines.push((None, Line::from(Span::styled("openrouter", muted()))));
+    push_model_group_lines(&mut lines, app, ModelChoiceGroup::OpenRouter, row_idx);
+    crop_model_lines(lines, app.selected_row, height)
+}
+
+fn push_model_group_lines(
+    lines: &mut Vec<(Option<usize>, Line<'static>)>,
+    app: &App,
+    group: ModelChoiceGroup,
+    mut row_idx: usize,
+) -> usize {
+    for (idx, _) in app
+        .model_choices
         .iter()
-        .filter(|&&idx| (3..=5).contains(&idx))
+        .enumerate()
+        .filter(|(_, choice)| choice.group == group)
     {
-        lines.push(model_row(idx, row_idx, app));
+        lines.push((Some(row_idx), model_row(idx, row_idx, app)));
         row_idx += 1;
     }
-    lines.push(Line::from(""));
-    lines.push(Line::from(Span::styled("openrouter", muted())));
-    for &idx in VISIBLE_MODEL_CHOICES
+    row_idx
+}
+
+fn crop_model_lines(
+    lines: Vec<(Option<usize>, Line<'static>)>,
+    selected_row: usize,
+    height: usize,
+) -> Vec<Line<'static>> {
+    if height == 0 {
+        return Vec::new();
+    }
+    if lines.len() <= height {
+        return lines.into_iter().map(|(_, line)| line).collect();
+    }
+    let selected_line = lines
         .iter()
-        .filter(|&&idx| (6..=8).contains(&idx))
-    {
-        lines.push(model_row(idx, row_idx, app));
-        row_idx += 1;
+        .position(|(row, _)| *row == Some(selected_row))
+        .unwrap_or(0);
+    let visible = height;
+    let mut start = selected_line.saturating_sub(visible / 2);
+    start = start.min(lines.len().saturating_sub(visible));
+    let end = (start + visible).min(lines.len());
+    let mut visible_lines = lines[start..end]
+        .iter()
+        .map(|(_, line)| line.clone())
+        .collect::<Vec<_>>();
+    if start > 0 {
+        visible_lines[0] = Line::from(Span::styled("  ...", muted()));
     }
-    lines
+    if end < lines.len() {
+        let last = visible_lines.len().saturating_sub(1);
+        visible_lines[last] = Line::from(Span::styled("  ...", muted()));
+    }
+    visible_lines
 }
 
 fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
-    let choice = MODEL_CHOICES[idx];
+    let choice = &app.model_choices[idx];
     let is_selected = row_idx == app.selected_row;
     let current =
         app.model_configured && app.model == choice.display && app.account == choice.account;
     let name_style = if is_selected { bold() } else { text_style() };
     let access = access_label(choice.account);
-    let descriptor = descriptor_for(idx);
+    let descriptor = choice.descriptor.as_str();
     let descriptor_style = if descriptor == "needs key" {
         dim()
     } else {
@@ -1848,9 +1930,9 @@ fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
     };
     highlight_selectable_row(
         vec![
-            Span::styled(format!("{:<20}", choice.display), name_style),
+            Span::styled(fixed_width_cell(&choice.display, 20), name_style),
             Span::styled(format!("{:<22}", access), muted()),
-            Span::styled(format!("{:<22}", descriptor), descriptor_style),
+            Span::styled(fixed_width_cell(descriptor, 22), descriptor_style),
             Span::styled(if current { " *" } else { "" }.to_string(), done()),
         ],
         is_selected,
@@ -1861,6 +1943,64 @@ fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
     )
 }
 
+fn fixed_width_cell(value: &str, width: usize) -> String {
+    let char_count = value.chars().count();
+    if char_count <= width {
+        return format!("{value:<width$}");
+    }
+    if width == 0 {
+        return String::new();
+    }
+    let mut out = value
+        .chars()
+        .take(width.saturating_sub(1))
+        .collect::<String>();
+    out.push('~');
+    out
+}
+
+fn mode_lines(app: &App) -> Vec<Line<'static>> {
+    vec![
+        mode_row(
+            0,
+            app,
+            CollaborationModeKind::Default,
+            "Default",
+            "execute tasks and update TODOs",
+        ),
+        mode_row(
+            1,
+            app,
+            CollaborationModeKind::Plan,
+            "Plan",
+            "propose a plan before implementation",
+        ),
+    ]
+}
+
+fn mode_row(
+    row_idx: usize,
+    app: &App,
+    mode: CollaborationModeKind,
+    label: &'static str,
+    description: &'static str,
+) -> Line<'static> {
+    let is_selected = row_idx == app.selected_row;
+    let current = app.collaboration_mode == mode;
+    highlight_selectable_row(
+        vec![
+            Span::styled(
+                format!("{label:<12}"),
+                if is_selected { bold() } else { text_style() },
+            ),
+            Span::styled(format!("{description:<38}"), muted()),
+            Span::styled(if current { " *" } else { "" }.to_string(), done()),
+        ],
+        is_selected,
+        56,
+    )
+}
+
 fn access_label(account: &'static str) -> &'static str {
     if account == ACCOUNT_CODEX {
         "Codex login"
@@ -1868,16 +2008,6 @@ fn access_label(account: &'static str) -> &'static str {
         "Claude Code sub"
     } else {
         account
-    }
-}
-
-fn descriptor_for(idx: usize) -> &'static str {
-    match idx {
-        0 => "best default",
-        1 => "good browser agent",
-        2 => "latest, strongest",
-        7 => "vision + tools",
-        _ => "needs key",
     }
 }
 
@@ -2089,17 +2219,42 @@ fn developer_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> {
         lines.push(Line::from(Span::styled("No task selected.", dim())));
         return lines;
     };
+    let events = app.cached_events_for_session(&session.id);
+    let instruction_sources = instruction_sources_from_events(events);
+    if !instruction_sources.is_empty() {
+        lines.push(Line::from(Span::styled("Instruction sources", bold())));
+        lines.push(Line::from(""));
+        for source in instruction_sources.iter().take(8) {
+            lines.push(kv_line("agents", source));
+        }
+        if instruction_sources.len() > 8 {
+            lines.push(Line::from(Span::styled(
+                format!("{} more source(s)", instruction_sources.len() - 8),
+                dim(),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
+    let startup_warnings = startup_warnings_from_events(events);
+    if !startup_warnings.is_empty() {
+        lines.push(Line::from(Span::styled("Startup warnings", bold())));
+        lines.push(Line::from(""));
+        for warning in startup_warnings.iter().take(4) {
+            lines.push(Line::from(Span::styled(truncate(warning, 80), muted())));
+        }
+        if startup_warnings.len() > 4 {
+            lines.push(Line::from(Span::styled(
+                format!("{} more warning(s)", startup_warnings.len() - 4),
+                dim(),
+            )));
+        }
+        lines.push(Line::from(""));
+    }
     append_telemetry_detail_lines(&mut lines, &state.telemetry);
     lines.push(Line::from(""));
     lines.push(Line::from(Span::styled("Events", bold())));
     lines.push(Line::from(""));
-    for event in app
-        .cached_events_for_session(&session.id)
-        .iter()
-        .rev()
-        .take(12)
-        .rev()
-    {
+    for event in events.iter().rev().take(12).rev() {
         let payload = truncate(&event.payload.to_string(), 44);
         lines.push(Line::from(vec![
             Span::styled(format!("{:>4}  ", event.seq), muted()),

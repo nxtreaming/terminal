@@ -1,4 +1,4 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::fmt;
 #[cfg(not(test))]
 use std::io::Read;
@@ -14,13 +14,18 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use browser_use_core::{install_process_crypto_provider, product_analytics};
+use browser_use_core::{
+    configured_model_for_cwd_with_options, configured_model_provider_id_for_cwd_with_options,
+    default_model_for_cwd_with_options, install_process_crypto_provider,
+    model_catalog_for_cwd_with_options, parse_config_overrides, product_analytics, AgentRunOptions,
+    CollaborationModeKind, ConfigOverrides,
+};
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
 use browser_use_providers::{
     claude_code_oauth_authorize_url, claude_code_oauth_pkce, load_codex_auth,
-    ClaudeCodeOAuthCredential, CodexAuth,
+    load_codex_managed_auth, ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth,
 };
 #[cfg(not(test))]
 use browser_use_providers::{
@@ -51,6 +56,7 @@ use ratatui::style::{Color as RatatuiColor, Modifier};
 use ratatui::text::Line;
 use ratatui::widgets::{Clear as RatatuiClear, Paragraph, Widget};
 use ratatui::{Terminal, TerminalOptions, Viewport};
+use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 
 mod composer;
@@ -71,10 +77,11 @@ use render::{
 };
 use runtime::run_agent_thread;
 use settings::{
-    browser_use_cloud_env_key_present, is_claude_code_account, provider_model_for_display,
-    AgentBackend, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_SETTING, MODEL_CHOICES, VISIBLE_MODEL_CHOICES,
+    browser_use_cloud_env_key_present, display_and_provider_model_for_input,
+    display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
+    model_choices_for_catalog, provider_model_for_display, AgentBackend, ModelChoice,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER,
+    BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -84,6 +91,11 @@ const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
+const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
+const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
+const REQUEST_USER_INPUT_RESPONSE_EVENT: &str = "request_user_input.response";
+const REQUEST_USER_INPUT_OTHER_LABEL: &str = "None of the above";
+const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -91,12 +103,20 @@ const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 struct Args {
     #[arg(long, default_value = "~/.browser-use-terminal")]
     state_dir: PathBuf,
-    #[arg(long, default_value = "GPT-5.5")]
-    model: String,
+    #[arg(long)]
+    model: Option<String>,
+    /// Layer $CODEX_HOME/<name>.config.toml on top of the base user config.
+    #[arg(long = "profile", short = 'p')]
+    config_profile: Option<String>,
+    /// Override a configuration value. Use a dotted path and TOML value.
+    #[arg(short = 'c', long = "config", value_name = "key=value", action = clap::ArgAction::Append)]
+    config_overrides: Vec<String>,
     #[arg(long, default_value = "Codex login")]
     account: String,
     #[arg(long, default_value = "Local Chrome")]
     browser: String,
+    #[arg(long = "collaboration-mode", value_enum, default_value_t = CollaborationModeArg::Default)]
+    collaboration_mode: CollaborationModeArg,
     #[arg(long)]
     dump_screen: bool,
     #[arg(long, default_value_t = 120)]
@@ -113,6 +133,21 @@ struct Args {
     agent: AgentBackend,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum CollaborationModeArg {
+    Default,
+    Plan,
+}
+
+impl From<CollaborationModeArg> for CollaborationModeKind {
+    fn from(value: CollaborationModeArg) -> Self {
+        match value {
+            CollaborationModeArg::Default => CollaborationModeKind::Default,
+            CollaborationModeArg::Plan => CollaborationModeKind::Plan,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum Surface {
     Main,
@@ -123,6 +158,7 @@ enum Surface {
     ApiKey,
     Telemetry,
     Model,
+    Mode,
     Browser,
     BrowserSelect,
     History,
@@ -137,6 +173,7 @@ impl Surface {
                 | Self::ApiKey
                 | Self::Telemetry
                 | Self::Model
+                | Self::Mode
                 | Self::Browser
                 | Self::BrowserSelect
                 | Self::History
@@ -168,6 +205,7 @@ enum ScreenArg {
     Account,
     Telemetry,
     Model,
+    Mode,
     Browser,
     History,
     Developer,
@@ -180,6 +218,7 @@ impl From<ScreenArg> for Surface {
             ScreenArg::Account => Self::Account,
             ScreenArg::Telemetry => Self::Telemetry,
             ScreenArg::Model => Self::Model,
+            ScreenArg::Mode => Self::Mode,
             ScreenArg::Browser => Self::Browser,
             ScreenArg::History => Self::History,
             ScreenArg::Developer => Self::Developer,
@@ -209,6 +248,55 @@ struct SetupResult {
     kind: SetupResultKind,
     account: String,
     message: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RequestUserInputOption {
+    pub(crate) label: String,
+    pub(crate) description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+pub(crate) struct RequestUserInputQuestion {
+    pub(crate) id: String,
+    pub(crate) header: String,
+    pub(crate) question: String,
+    #[serde(rename = "isOther", default)]
+    pub(crate) is_other: bool,
+    #[serde(rename = "isSecret", default)]
+    pub(crate) is_secret: bool,
+    pub(crate) options: Option<Vec<RequestUserInputOption>>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct PendingRequestUserInput {
+    pub(crate) call_id: String,
+    pub(crate) questions: Vec<RequestUserInputQuestion>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum RequestUserInputFocus {
+    Options,
+    Notes,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RequestUserInputAnswerDraft {
+    pub(crate) option_cursor: Option<usize>,
+    pub(crate) committed_option: Option<usize>,
+    pub(crate) notes: String,
+    pub(crate) answer_committed: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct RequestUserInputState {
+    pub(crate) session_id: String,
+    pub(crate) call_id: String,
+    pub(crate) current_idx: usize,
+    pub(crate) focus: RequestUserInputFocus,
+    pub(crate) answers: Vec<RequestUserInputAnswerDraft>,
+    pub(crate) confirm_unanswered: bool,
+    pub(crate) confirm_selected: usize,
 }
 
 #[derive(Debug)]
@@ -261,7 +349,15 @@ impl Drop for CodexLoginFlow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppCommand {
     StartTask(String),
-    SendFollowup { session_id: String, text: String },
+    SendFollowup {
+        session_id: String,
+        text: String,
+    },
+    AnswerRequestUserInput {
+        session_id: String,
+        call_id: String,
+        text: String,
+    },
     RetryTask(String),
     OpenBrowser,
     ReconnectBrowser,
@@ -269,6 +365,8 @@ enum AppCommand {
     OpenHistory,
     SelectHistory(String),
     ChangeModel,
+    ChangeMode,
+    SetCollaborationMode(CollaborationModeKind),
     SignIn,
     ConfigureTelemetry,
     ChangeBrowser,
@@ -280,6 +378,15 @@ enum AppCommand {
     SaveTelemetry(String),
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SessionModelSelection {
+    display_model: String,
+    provider_model: String,
+    account: String,
+    backend: AgentBackend,
+    model_provider_id: Option<String>,
+}
+
 struct App {
     store: Store,
     store_rx: mpsc::Receiver<StoreNotification>,
@@ -287,6 +394,7 @@ struct App {
     args: Args,
     selected_session_id: Option<String>,
     composer: Composer,
+    request_input: Option<RequestUserInputState>,
     surface: Surface,
     selected_row: usize,
     setup_complete: bool,
@@ -294,6 +402,9 @@ struct App {
     model: String,
     model_configured: bool,
     provider_model: String,
+    model_provider_id: Option<String>,
+    model_choices: Vec<ModelChoice>,
+    collaboration_mode: CollaborationModeKind,
     browser: String,
     api_key_account: Option<String>,
     pending_model_after_auth: Option<usize>,
@@ -676,6 +787,437 @@ impl NativeHistoryState {
     }
 }
 
+pub(crate) fn collaboration_mode_label(mode: CollaborationModeKind) -> &'static str {
+    match mode {
+        CollaborationModeKind::Default => "Default",
+        CollaborationModeKind::Plan => "Plan",
+    }
+}
+
+fn collaboration_mode_setting_value(mode: CollaborationModeKind) -> &'static str {
+    match mode {
+        CollaborationModeKind::Default => "default",
+        CollaborationModeKind::Plan => "plan",
+    }
+}
+
+fn collaboration_mode_from_setting(value: &str) -> Option<CollaborationModeKind> {
+    match value.trim().to_ascii_lowercase().as_str() {
+        "default" => Some(CollaborationModeKind::Default),
+        "plan" => Some(CollaborationModeKind::Plan),
+        _ => None,
+    }
+}
+
+fn next_collaboration_mode(mode: CollaborationModeKind) -> CollaborationModeKind {
+    match mode {
+        CollaborationModeKind::Default => CollaborationModeKind::Plan,
+        CollaborationModeKind::Plan => CollaborationModeKind::Default,
+    }
+}
+
+fn pending_request_user_input_from_events(
+    events: &[EventRecord],
+) -> Option<PendingRequestUserInput> {
+    let start_idx = events
+        .iter()
+        .rposition(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.done" | "session.failed" | "session.cancelled"
+            )
+        })
+        .map(|idx| idx.saturating_add(1))
+        .unwrap_or(0);
+    let recent_events = &events[start_idx..];
+    let answered = recent_events
+        .iter()
+        .filter(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+        .filter_map(|event| {
+            event
+                .payload
+                .get("call_id")
+                .and_then(serde_json::Value::as_str)
+        })
+        .collect::<HashSet<_>>();
+    recent_events.iter().find_map(|event| {
+        if event.event_type != REQUEST_USER_INPUT_REQUEST_EVENT {
+            return None;
+        }
+        let call_id = event
+            .payload
+            .get("call_id")
+            .and_then(serde_json::Value::as_str)?;
+        if answered.contains(call_id) {
+            return None;
+        }
+        let questions = event.payload.get("questions")?.clone();
+        let questions = serde_json::from_value::<Vec<RequestUserInputQuestion>>(questions).ok()?;
+        Some(Some(PendingRequestUserInput {
+            call_id: call_id.to_string(),
+            questions,
+        }))
+    })?
+}
+
+impl RequestUserInputState {
+    fn new(session_id: String, request: &PendingRequestUserInput) -> Self {
+        let answers = request
+            .questions
+            .iter()
+            .map(|question| {
+                let option_cursor = (request_user_input_option_count(question) > 0).then_some(0);
+                RequestUserInputAnswerDraft {
+                    option_cursor,
+                    committed_option: None,
+                    notes: String::new(),
+                    answer_committed: false,
+                }
+            })
+            .collect::<Vec<_>>();
+        Self {
+            session_id,
+            call_id: request.call_id.clone(),
+            current_idx: 0,
+            focus: RequestUserInputFocus::Options,
+            answers,
+            confirm_unanswered: false,
+            confirm_selected: 0,
+        }
+    }
+}
+
+fn request_user_input_option_count(question: &RequestUserInputQuestion) -> usize {
+    let option_count = question.options.as_ref().map(Vec::len).unwrap_or_default();
+    if question.is_other && option_count > 0 {
+        option_count.saturating_add(1)
+    } else {
+        option_count
+    }
+}
+
+fn request_user_input_option_label(
+    question: &RequestUserInputQuestion,
+    idx: usize,
+) -> Option<String> {
+    let options = question.options.as_ref()?;
+    if idx < options.len() {
+        return options.get(idx).map(|option| option.label.clone());
+    }
+    if question.is_other && idx == options.len() {
+        return Some(REQUEST_USER_INPUT_OTHER_LABEL.to_string());
+    }
+    None
+}
+
+fn request_user_input_state_answer_values(
+    question: &RequestUserInputQuestion,
+    draft: &RequestUserInputAnswerDraft,
+) -> Vec<String> {
+    if !draft.answer_committed {
+        return Vec::new();
+    }
+    let mut values = draft
+        .committed_option
+        .and_then(|idx| request_user_input_option_label(question, idx))
+        .into_iter()
+        .collect::<Vec<_>>();
+    let note = draft.notes.trim();
+    if !note.is_empty() {
+        values.push(format!("user_note: {note}"));
+    }
+    values
+}
+
+fn request_user_input_state_response_payload(
+    request: &PendingRequestUserInput,
+    state: &RequestUserInputState,
+) -> serde_json::Value {
+    let mut answers = serde_json::Map::new();
+    for (idx, question) in request.questions.iter().enumerate() {
+        let values = state
+            .answers
+            .get(idx)
+            .map(|draft| request_user_input_state_answer_values(question, draft))
+            .unwrap_or_default();
+        answers.insert(
+            question.id.clone(),
+            serde_json::json!({
+                "answers": values,
+            }),
+        );
+    }
+    serde_json::json!({
+        "call_id": request.call_id,
+        "questions": request.questions.clone(),
+        "answers": answers,
+    })
+}
+
+fn request_user_input_response_payload(
+    request: &PendingRequestUserInput,
+    text: &str,
+) -> serde_json::Value {
+    let parts = request_user_input_answer_texts(request, text);
+    let mut answers = serde_json::Map::new();
+    for (idx, question) in request.questions.iter().enumerate() {
+        let answer_text = parts.get(idx).map(String::as_str).unwrap_or_default();
+        answers.insert(
+            question.id.clone(),
+            serde_json::json!({
+                "answers": request_user_input_answer_values(question, answer_text),
+            }),
+        );
+    }
+    serde_json::json!({
+        "call_id": request.call_id,
+        "questions": request.questions.clone(),
+        "answers": answers,
+    })
+}
+
+fn request_user_input_answer_texts(request: &PendingRequestUserInput, text: &str) -> Vec<String> {
+    if let Some(parts) = keyed_request_user_input_answers(request, text) {
+        return parts;
+    }
+    split_request_user_input_answers(text, request.questions.len())
+}
+
+fn keyed_request_user_input_answers(
+    request: &PendingRequestUserInput,
+    text: &str,
+) -> Option<Vec<String>> {
+    if request.questions.len() <= 1 {
+        return None;
+    }
+    let mut parts = vec![String::new(); request.questions.len()];
+    let mut used = vec![false; request.questions.len()];
+    let mut unmatched = Vec::new();
+    for part in request_user_input_text_parts(text) {
+        let Some((raw_key, raw_value)) = part.split_once(':') else {
+            unmatched.push(part);
+            continue;
+        };
+        let Some(idx) = request_user_input_question_index(request, raw_key.trim()) else {
+            unmatched.push(part);
+            continue;
+        };
+        parts[idx] = raw_value.trim().to_string();
+        used[idx] = true;
+    }
+    if !used.iter().any(|is_used| *is_used) {
+        return None;
+    }
+    let mut next_unmatched = unmatched.into_iter();
+    for (idx, is_used) in used.iter_mut().enumerate() {
+        if *is_used {
+            continue;
+        }
+        if let Some(value) = next_unmatched.next() {
+            parts[idx] = value;
+            *is_used = true;
+        }
+    }
+    Some(parts)
+}
+
+fn request_user_input_text_parts(text: &str) -> Vec<String> {
+    text.lines()
+        .flat_map(|line| line.split(';'))
+        .map(str::trim)
+        .filter(|part| !part.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
+fn request_user_input_question_index(
+    request: &PendingRequestUserInput,
+    key: &str,
+) -> Option<usize> {
+    if let Ok(number) = key.trim().parse::<usize>() {
+        return number
+            .checked_sub(1)
+            .filter(|idx| *idx < request.questions.len());
+    }
+    let normalized_key = normalize_request_user_input_key(key);
+    request.questions.iter().position(|question| {
+        normalize_request_user_input_key(&question.id) == normalized_key
+            || normalize_request_user_input_key(&question.header) == normalized_key
+            || normalize_request_user_input_key(&question.question) == normalized_key
+    })
+}
+
+fn normalize_request_user_input_key(value: &str) -> String {
+    value
+        .trim()
+        .trim_matches(|ch: char| matches!(ch, ':' | '.' | ')' | '('))
+        .trim()
+        .to_ascii_lowercase()
+}
+
+fn split_request_user_input_answers(text: &str, question_count: usize) -> Vec<String> {
+    if question_count <= 1 {
+        return vec![text.trim().to_string()];
+    }
+    let line_parts = request_user_input_text_parts(text);
+    if line_parts.len() >= question_count {
+        return line_parts;
+    }
+    line_parts
+}
+
+fn request_user_input_answer_values(
+    question: &RequestUserInputQuestion,
+    answer_text: &str,
+) -> Vec<String> {
+    let answer_text = answer_text.trim();
+    let Some(options) = question
+        .options
+        .as_ref()
+        .filter(|options| !options.is_empty())
+    else {
+        return (!answer_text.is_empty())
+            .then(|| answer_text.to_string())
+            .into_iter()
+            .collect();
+    };
+    if answer_text.is_empty() {
+        return Vec::new();
+    }
+    if matches_ignore_ascii_case(answer_text, "unanswered")
+        || matches_ignore_ascii_case(answer_text, "skip")
+    {
+        return Vec::new();
+    }
+    if let Some((number, note)) = parse_numbered_request_user_input_answer(answer_text) {
+        if let Some(option) = number.checked_sub(1).and_then(|idx| options.get(idx)) {
+            return vec![option.label.clone()];
+        }
+        if question.is_other && number == options.len().saturating_add(1) {
+            let mut out = vec![REQUEST_USER_INPUT_OTHER_LABEL.to_string()];
+            if let Some(note) = note.filter(|note| !note.is_empty()) {
+                out.push(format!("user_note: {note}"));
+            }
+            return out;
+        }
+    }
+    if let Some(option) = options
+        .iter()
+        .find(|option| request_user_input_option_matches(&option.label, answer_text))
+    {
+        return vec![option.label.clone()];
+    }
+    if question.is_other {
+        let note = strip_request_user_input_other_prefix(answer_text).unwrap_or(answer_text);
+        if request_user_input_option_matches(REQUEST_USER_INPUT_OTHER_LABEL, answer_text) {
+            return vec![REQUEST_USER_INPUT_OTHER_LABEL.to_string()];
+        }
+        let mut out = vec![REQUEST_USER_INPUT_OTHER_LABEL.to_string()];
+        if !note.is_empty() && !note.eq_ignore_ascii_case(REQUEST_USER_INPUT_OTHER_LABEL) {
+            out.push(format!("user_note: {note}"));
+        }
+        return out;
+    }
+    vec![answer_text.to_string()]
+}
+
+fn parse_numbered_request_user_input_answer(answer_text: &str) -> Option<(usize, Option<String>)> {
+    let trimmed = answer_text.trim();
+    let digit_len = trimmed
+        .chars()
+        .take_while(|ch| ch.is_ascii_digit())
+        .map(char::len_utf8)
+        .sum::<usize>();
+    if digit_len == 0 {
+        return None;
+    }
+    let number = trimmed[..digit_len].parse::<usize>().ok()?;
+    let rest = trimmed[digit_len..].trim_start();
+    if rest.is_empty() {
+        return Some((number, None));
+    }
+    let note = rest
+        .strip_prefix('.')
+        .or_else(|| rest.strip_prefix(')'))
+        .or_else(|| rest.strip_prefix(':'))
+        .or_else(|| rest.strip_prefix('-'))
+        .map(str::trim);
+    note.map(|note| (number, Some(note.to_string())))
+}
+
+fn request_user_input_option_matches(option_label: &str, answer_text: &str) -> bool {
+    normalize_request_user_input_option_label(option_label)
+        == normalize_request_user_input_option_label(answer_text)
+}
+
+fn normalize_request_user_input_option_label(value: &str) -> String {
+    let trimmed = value.trim();
+    let without_recommended = trimmed
+        .strip_suffix("(Recommended)")
+        .or_else(|| trimmed.strip_suffix("(recommended)"))
+        .map(str::trim)
+        .unwrap_or(trimmed);
+    without_recommended.to_ascii_lowercase()
+}
+
+fn strip_request_user_input_other_prefix(answer_text: &str) -> Option<&str> {
+    let trimmed = answer_text.trim();
+    let lower = trimmed.to_ascii_lowercase();
+    lower
+        .strip_prefix("other:")
+        .map(|_| trimmed["other:".len()..].trim())
+}
+
+fn matches_ignore_ascii_case(left: &str, right: &str) -> bool {
+    left.eq_ignore_ascii_case(right)
+}
+
+fn model_provider_id_for_backend(backend: AgentBackend) -> &'static str {
+    backend.as_setting()
+}
+
+fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionModelSelection> {
+    if event.event_type != SESSION_MODEL_SELECTION_EVENT {
+        return None;
+    }
+    let backend = event
+        .payload
+        .get("backend")
+        .and_then(serde_json::Value::as_str)
+        .and_then(AgentBackend::from_setting)?;
+    let provider_model = event
+        .payload
+        .get("provider_model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)?;
+    let display_model = event
+        .payload
+        .get("display_model")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| provider_model.clone());
+    let account = event
+        .payload
+        .get("account")
+        .and_then(serde_json::Value::as_str)
+        .map(str::to_string)
+        .unwrap_or_else(|| ACCOUNT_CODEX.to_string());
+    let model_provider_id = event
+        .payload
+        .get("model_provider_id")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_string);
+    Some(SessionModelSelection {
+        display_model,
+        provider_model,
+        account,
+        backend,
+        model_provider_id,
+    })
+}
+
 impl App {
     fn new(mut args: Args) -> Result<Self> {
         args.state_dir = resolve_state_dir(&args.state_dir);
@@ -692,24 +1234,86 @@ impl App {
             None
         };
         let surface = args.overlay.map(Into::into).unwrap_or(Surface::Main);
+        let current_dir = std::env::current_dir()?;
+        let config_overrides = parse_config_overrides(&args.config_overrides)?;
+        let config_profile = args.config_profile.as_deref();
         let setup_complete = store.get_setting("setup.complete")?.as_deref() == Some("1");
         let account = store
             .get_setting("account")?
             .unwrap_or_else(|| args.account.clone());
-        let stored_model = store.get_setting("model")?;
-        let had_stored_model = stored_model.is_some();
-        let model_configured = had_stored_model || setup_complete;
-        let model = stored_model.unwrap_or_else(|| args.model.clone());
-        let provider_model = store
-            .get_setting("provider.model")?
-            .unwrap_or_else(|| provider_model_for_display(&model).to_string());
-        let browser = store
-            .get_setting("browser")?
-            .unwrap_or_else(|| args.browser.clone());
         let agent_backend = store
             .get_setting("agent.backend")?
             .and_then(|value| AgentBackend::from_setting(&value))
             .unwrap_or(args.agent);
+        let model_choices =
+            model_catalog_for_cwd_with_options(&current_dir, config_profile, &config_overrides)
+                .map(|catalog| model_choices_for_catalog(&catalog))
+                .unwrap_or_else(|_| fallback_model_choices());
+        let stored_model = store.get_setting("model")?;
+        let had_stored_model = stored_model.is_some();
+        let explicit_model = args
+            .model
+            .as_deref()
+            .map(str::trim)
+            .filter(|model| !model.is_empty());
+        let configured_model =
+            configured_model_for_cwd_with_options(&current_dir, config_profile, &config_overrides)
+                .unwrap_or(None);
+        let selected_model_override = explicit_model.map(ToOwned::to_owned).or(configured_model);
+        let has_model_override = selected_model_override.is_some();
+        let (default_display_model, default_provider_model) = if let Some(model) =
+            selected_model_override.as_deref()
+        {
+            display_and_provider_model_for_input(model, &model_choices)
+        } else {
+            let chatgpt_mode = matches!(agent_backend, AgentBackend::Codex);
+            let provider_model = default_model_for_cwd_with_options(
+                &current_dir,
+                config_profile,
+                &config_overrides,
+                chatgpt_mode,
+            )
+            .unwrap_or_else(|_| "gpt-5.5".to_string());
+            let display_model = display_model_for_provider_model(&provider_model, &model_choices);
+            (display_model, provider_model)
+        };
+        let model_configured = has_model_override || had_stored_model || setup_complete;
+        let model = if has_model_override {
+            default_display_model
+        } else {
+            stored_model.unwrap_or(default_display_model)
+        };
+        let provider_model = if has_model_override {
+            default_provider_model.clone()
+        } else {
+            store.get_setting("provider.model")?.unwrap_or_else(|| {
+                if had_stored_model {
+                    provider_model_for_display(&model, &model_choices)
+                } else {
+                    default_provider_model.clone()
+                }
+            })
+        };
+        let configured_model_provider_id = configured_model_provider_id_for_cwd_with_options(
+            &current_dir,
+            config_profile,
+            &config_overrides,
+        )
+        .unwrap_or(None);
+        let stored_model_provider_id = store
+            .get_setting("provider.id")?
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+        let model_provider_id = configured_model_provider_id
+            .or(stored_model_provider_id)
+            .or_else(|| Some(model_provider_id_for_backend(agent_backend).to_string()));
+        let collaboration_mode = store
+            .get_setting(COLLABORATION_MODE_SETTING)?
+            .and_then(|value| collaboration_mode_from_setting(&value))
+            .unwrap_or_else(|| args.collaboration_mode.into());
+        let browser = store
+            .get_setting("browser")?
+            .unwrap_or_else(|| args.browser.clone());
         let selected_row = 0;
         let _ = had_stored_model;
         let mut app = Self {
@@ -719,6 +1323,7 @@ impl App {
             args,
             selected_session_id,
             composer: Composer::default(),
+            request_input: None,
             surface,
             selected_row,
             setup_complete,
@@ -726,6 +1331,9 @@ impl App {
             model,
             model_configured,
             provider_model,
+            model_provider_id,
+            model_choices,
+            collaboration_mode,
             browser,
             api_key_account: None,
             pending_model_after_auth: None,
@@ -888,6 +1496,575 @@ impl App {
         self.surface == Surface::History || self.selected_session_id.is_none()
     }
 
+    pub(crate) fn pending_request_user_input(
+        &self,
+        session_id: &str,
+    ) -> Option<PendingRequestUserInput> {
+        pending_request_user_input_from_events(self.cached_events_for_session(session_id))
+    }
+
+    fn current_pending_request_user_input(&self) -> Option<(String, PendingRequestUserInput)> {
+        let session_id = self.selected_session_id.as_deref()?;
+        let active = self
+            .state_cache
+            .sessions
+            .iter()
+            .find(|session| session.id == session_id)
+            .is_some_and(|session| session.status.is_active());
+        if !active {
+            return None;
+        }
+        self.pending_request_user_input(session_id)
+            .map(|request| (session_id.to_string(), request))
+    }
+
+    pub(crate) fn request_input_display_state(
+        &self,
+        session_id: &str,
+        request: &PendingRequestUserInput,
+    ) -> RequestUserInputState {
+        self.request_input
+            .as_ref()
+            .filter(|state| state.session_id == session_id && state.call_id == request.call_id)
+            .cloned()
+            .unwrap_or_else(|| RequestUserInputState::new(session_id.to_string(), request))
+    }
+
+    fn ensure_request_input_state(&mut self, session_id: &str, request: &PendingRequestUserInput) {
+        let should_reset = self.request_input.as_ref().is_none_or(|state| {
+            state.session_id != session_id
+                || state.call_id != request.call_id
+                || state.answers.len() != request.questions.len()
+        });
+        if should_reset {
+            self.request_input = Some(RequestUserInputState::new(session_id.to_string(), request));
+        }
+        self.clamp_request_input_state(request);
+    }
+
+    fn clamp_request_input_state(&mut self, request: &PendingRequestUserInput) {
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        if state.current_idx >= request.questions.len() {
+            state.current_idx = request.questions.len().saturating_sub(1);
+        }
+        for (idx, answer) in state.answers.iter_mut().enumerate() {
+            let count = request
+                .questions
+                .get(idx)
+                .map(request_user_input_option_count)
+                .unwrap_or_default();
+            if count == 0 {
+                answer.option_cursor = None;
+                answer.committed_option = None;
+                continue;
+            }
+            if let Some(cursor) = answer.option_cursor {
+                answer.option_cursor = Some(cursor.min(count - 1));
+            }
+            if answer
+                .committed_option
+                .is_some_and(|selected| selected >= count)
+            {
+                answer.committed_option = None;
+                answer.answer_committed = false;
+            }
+        }
+        let current_has_options = request
+            .questions
+            .get(state.current_idx)
+            .is_some_and(|question| request_user_input_option_count(question) > 0);
+        if !current_has_options {
+            state.focus = RequestUserInputFocus::Notes;
+        }
+    }
+
+    fn save_current_request_input_notes(&mut self) {
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        if state.focus != RequestUserInputFocus::Notes {
+            return;
+        }
+        if let Some(answer) = state.answers.get_mut(state.current_idx) {
+            answer.notes = self.composer.input().to_string();
+        }
+    }
+
+    fn restore_current_request_input_notes(&mut self) {
+        let Some(state) = self.request_input.as_ref() else {
+            self.composer.clear();
+            return;
+        };
+        if state.focus == RequestUserInputFocus::Notes {
+            let notes = state
+                .answers
+                .get(state.current_idx)
+                .map(|answer| answer.notes.clone())
+                .unwrap_or_default();
+            self.composer.set_input(notes);
+        } else {
+            self.composer.clear();
+        }
+    }
+
+    fn request_input_state_has_touched_answer(&self) -> bool {
+        self.request_input.as_ref().is_some_and(|state| {
+            state.focus == RequestUserInputFocus::Notes
+                || state.confirm_unanswered
+                || state.answers.iter().any(|answer| {
+                    answer.answer_committed
+                        || answer.committed_option.is_some()
+                        || !answer.notes.trim().is_empty()
+                })
+        })
+    }
+
+    fn move_request_input_question(&mut self, request: &PendingRequestUserInput, next: bool) {
+        if request.questions.is_empty() {
+            return;
+        }
+        self.save_current_request_input_notes();
+        if let Some(state) = self.request_input.as_mut() {
+            let len = request.questions.len();
+            let offset = if next { 1 } else { len.saturating_sub(1) };
+            state.current_idx = (state.current_idx + offset) % len;
+            state.confirm_unanswered = false;
+            let current_has_options = request
+                .questions
+                .get(state.current_idx)
+                .is_some_and(|question| request_user_input_option_count(question) > 0);
+            state.focus = if current_has_options {
+                RequestUserInputFocus::Options
+            } else {
+                RequestUserInputFocus::Notes
+            };
+        }
+        self.restore_current_request_input_notes();
+    }
+
+    fn jump_to_request_input_question(&mut self, request: &PendingRequestUserInput, idx: usize) {
+        if idx >= request.questions.len() {
+            return;
+        }
+        self.save_current_request_input_notes();
+        if let Some(state) = self.request_input.as_mut() {
+            state.current_idx = idx;
+            state.confirm_unanswered = false;
+            let current_has_options = request
+                .questions
+                .get(state.current_idx)
+                .is_some_and(|question| request_user_input_option_count(question) > 0);
+            state.focus = if current_has_options {
+                RequestUserInputFocus::Options
+            } else {
+                RequestUserInputFocus::Notes
+            };
+        }
+        self.restore_current_request_input_notes();
+    }
+
+    fn move_request_input_option(&mut self, request: &PendingRequestUserInput, delta: isize) {
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        let Some(question) = request.questions.get(state.current_idx) else {
+            return;
+        };
+        let count = request_user_input_option_count(question);
+        if count == 0 {
+            return;
+        }
+        let Some(answer) = state.answers.get_mut(state.current_idx) else {
+            return;
+        };
+        let current = answer.option_cursor.unwrap_or(0) as isize;
+        answer.option_cursor = Some((current + delta).rem_euclid(count as isize) as usize);
+        answer.committed_option = None;
+        answer.answer_committed = false;
+    }
+
+    fn clear_current_request_input_selection(&mut self) {
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        let Some(answer) = state.answers.get_mut(state.current_idx) else {
+            return;
+        };
+        answer.option_cursor = None;
+        answer.committed_option = None;
+        answer.answer_committed = false;
+        answer.notes.clear();
+        self.composer.clear();
+    }
+
+    fn commit_current_request_input_answer(&mut self, request: &PendingRequestUserInput) {
+        self.save_current_request_input_notes();
+        let Some(state) = self.request_input.as_mut() else {
+            return;
+        };
+        let Some(question) = request.questions.get(state.current_idx) else {
+            return;
+        };
+        let Some(answer) = state.answers.get_mut(state.current_idx) else {
+            return;
+        };
+        if request_user_input_option_count(question) > 0 {
+            answer.committed_option = answer.option_cursor;
+            answer.answer_committed = answer.committed_option.is_some();
+        } else {
+            answer.answer_committed = !answer.notes.trim().is_empty();
+        }
+    }
+
+    fn first_unanswered_request_input_index(
+        &self,
+        request: &PendingRequestUserInput,
+    ) -> Option<usize> {
+        let state = self.request_input.as_ref()?;
+        request
+            .questions
+            .iter()
+            .enumerate()
+            .find_map(|(idx, question)| {
+                let values = state
+                    .answers
+                    .get(idx)
+                    .map(|draft| request_user_input_state_answer_values(question, draft))
+                    .unwrap_or_default();
+                values.is_empty().then_some(idx)
+            })
+    }
+
+    fn request_input_unanswered_count(&self, request: &PendingRequestUserInput) -> usize {
+        let Some(state) = self.request_input.as_ref() else {
+            return request.questions.len();
+        };
+        request
+            .questions
+            .iter()
+            .enumerate()
+            .filter(|(idx, question)| {
+                state
+                    .answers
+                    .get(*idx)
+                    .map(|draft| request_user_input_state_answer_values(question, draft))
+                    .unwrap_or_default()
+                    .is_empty()
+            })
+            .count()
+    }
+
+    fn open_request_input_unanswered_confirmation(&mut self, request: &PendingRequestUserInput) {
+        let unanswered = self.request_input_unanswered_count(request);
+        if let Some(state) = self.request_input.as_mut() {
+            state.confirm_unanswered = true;
+            state.confirm_selected = 0;
+        }
+        let suffix = if unanswered == 1 {
+            "question"
+        } else {
+            "questions"
+        };
+        self.status_notice = Some(format!(
+            "Submit with {unanswered} unanswered {suffix}? Press Enter to proceed."
+        ));
+    }
+
+    fn submit_request_input_state(
+        &mut self,
+        session_id: &str,
+        request: &PendingRequestUserInput,
+    ) -> Result<()> {
+        let Some(state) = self.request_input.clone() else {
+            return Ok(());
+        };
+        let payload = request_user_input_state_response_payload(request, &state);
+        self.store
+            .append_event(session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+        self.request_input = None;
+        self.composer.clear();
+        self.status_notice = None;
+        Ok(())
+    }
+
+    fn advance_or_submit_request_input(
+        &mut self,
+        session_id: &str,
+        request: &PendingRequestUserInput,
+    ) -> Result<()> {
+        let is_last = self
+            .request_input
+            .as_ref()
+            .is_none_or(|state| state.current_idx + 1 >= request.questions.len());
+        if !is_last {
+            self.move_request_input_question(request, true);
+            return Ok(());
+        }
+        if self.request_input_unanswered_count(request) > 0 {
+            self.open_request_input_unanswered_confirmation(request);
+            return Ok(());
+        }
+        self.submit_request_input_state(session_id, request)
+    }
+
+    fn handle_request_input_confirmation_key(
+        &mut self,
+        session_id: &str,
+        request: &PendingRequestUserInput,
+        key: KeyEvent,
+    ) -> Result<bool> {
+        if !self
+            .request_input
+            .as_ref()
+            .is_some_and(|state| state.confirm_unanswered)
+        {
+            return Ok(false);
+        }
+        match key.code {
+            KeyCode::Esc | KeyCode::Backspace => {
+                if let Some(idx) = self.first_unanswered_request_input_index(request) {
+                    self.jump_to_request_input_question(request, idx);
+                }
+                self.status_notice = None;
+            }
+            KeyCode::Up | KeyCode::Char('k') | KeyCode::Down | KeyCode::Char('j') => {
+                if let Some(state) = self.request_input.as_mut() {
+                    state.confirm_selected = 1usize.saturating_sub(state.confirm_selected.min(1));
+                }
+            }
+            KeyCode::Char('1') | KeyCode::Char('2') => {
+                if let Some(state) = self.request_input.as_mut() {
+                    state.confirm_selected = if matches!(key.code, KeyCode::Char('1')) {
+                        0
+                    } else {
+                        1
+                    };
+                }
+            }
+            KeyCode::Enter => {
+                let proceed = self
+                    .request_input
+                    .as_ref()
+                    .is_none_or(|state| state.confirm_selected == 0);
+                if proceed {
+                    return self
+                        .submit_request_input_state(session_id, request)
+                        .map(|_| true);
+                }
+                if let Some(idx) = self.first_unanswered_request_input_index(request) {
+                    self.jump_to_request_input_question(request, idx);
+                }
+                self.status_notice = None;
+            }
+            _ => {}
+        }
+        Ok(true)
+    }
+
+    fn handle_request_user_input_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.surface != Surface::Main || self.is_slash_palette_active() {
+            return Ok(false);
+        }
+        let Some((session_id, request)) = self.current_pending_request_user_input() else {
+            self.request_input = None;
+            return Ok(false);
+        };
+        self.ensure_request_input_state(&session_id, &request);
+        if self.handle_request_input_confirmation_key(&session_id, &request, key)? {
+            return Ok(true);
+        }
+        let state_uses_composer = self
+            .request_input
+            .as_ref()
+            .is_some_and(|state| state.focus == RequestUserInputFocus::Notes);
+        let composer_has_parser_text = !self.composer.is_empty()
+            && !state_uses_composer
+            && !self.request_input_state_has_touched_answer();
+        if composer_has_parser_text {
+            return Ok(false);
+        }
+        match key {
+            KeyEvent {
+                code: KeyCode::Char('c'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            } => {
+                if !self.composer.is_empty() {
+                    self.composer.clear();
+                    self.save_current_request_input_notes();
+                } else {
+                    self.cancel_current_task()?;
+                    self.request_input = None;
+                }
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                let cleared_notes = self
+                    .request_input
+                    .as_ref()
+                    .is_some_and(|state| state.focus == RequestUserInputFocus::Notes)
+                    || !self.composer.is_empty();
+                if cleared_notes {
+                    if let Some(state) = self.request_input.as_mut() {
+                        state.focus = RequestUserInputFocus::Options;
+                        if let Some(answer) = state.answers.get_mut(state.current_idx) {
+                            answer.notes.clear();
+                            answer.answer_committed = false;
+                        }
+                    }
+                    self.composer.clear();
+                } else {
+                    self.cancel_current_task()?;
+                    self.request_input = None;
+                }
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
+            } => {
+                let focus_is_notes = self
+                    .request_input
+                    .as_ref()
+                    .is_some_and(|state| state.focus == RequestUserInputFocus::Notes);
+                if focus_is_notes {
+                    self.save_current_request_input_notes();
+                    if let Some(state) = self.request_input.as_mut() {
+                        state.focus = RequestUserInputFocus::Options;
+                    }
+                    self.composer.clear();
+                } else {
+                    if let Some(state) = self.request_input.as_mut() {
+                        state.focus = RequestUserInputFocus::Notes;
+                    }
+                    self.restore_current_request_input_notes();
+                }
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char('p'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::PageUp,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Left,
+                ..
+            } => {
+                self.move_request_input_question(&request, false);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char('n'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::PageDown,
+                ..
+            }
+            | KeyEvent {
+                code: KeyCode::Right,
+                ..
+            } => {
+                self.move_request_input_question(&request, true);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Up, ..
+            } => {
+                self.move_request_input_option(&request, -1);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char('k'),
+                ..
+            } if !state_uses_composer => {
+                self.move_request_input_option(&request, -1);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Down,
+                ..
+            } => {
+                self.move_request_input_option(&request, 1);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char('j'),
+                ..
+            } if !state_uses_composer => {
+                self.move_request_input_option(&request, 1);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Backspace | KeyCode::Delete,
+                ..
+            } if !state_uses_composer => {
+                self.clear_current_request_input_selection();
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char(' '),
+                ..
+            } if !state_uses_composer => {
+                self.commit_current_request_input_answer(&request);
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if !state_uses_composer
+                && modifiers.is_empty()
+                && ch.is_ascii_digit()
+                && ch != '0' =>
+            {
+                let digit = ch.to_digit(10).unwrap_or_default() as usize;
+                if let Some(state) = self.request_input.as_mut() {
+                    let current_idx = state.current_idx;
+                    if let Some(question) = request.questions.get(current_idx) {
+                        let count = request_user_input_option_count(question);
+                        if (1..=count).contains(&digit) {
+                            if let Some(answer) = state.answers.get_mut(current_idx) {
+                                answer.option_cursor = Some(digit - 1);
+                            }
+                        }
+                    }
+                }
+                self.commit_current_request_input_answer(&request);
+                self.advance_or_submit_request_input(&session_id, &request)?;
+                Ok(true)
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                self.commit_current_request_input_answer(&request);
+                self.advance_or_submit_request_input(&session_id, &request)?;
+                Ok(true)
+            }
+            _ if state_uses_composer && self.composer.handle_key(key) => {
+                self.save_current_request_input_notes();
+                if let Some(state) = self.request_input.as_mut() {
+                    let current_idx = state.current_idx;
+                    if let Some(answer) = state.answers.get_mut(current_idx) {
+                        answer.answer_committed = false;
+                    }
+                }
+                Ok(true)
+            }
+            _ => Ok(false),
+        }
+    }
+
     fn open_surface(&mut self, surface: Surface) {
         self.close_slash_palette();
         self.surface = surface;
@@ -911,7 +2088,57 @@ impl App {
     }
 
     fn submit(&mut self) -> Result<()> {
+        if let Some((session_id, request)) = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|id| {
+                self.state_cache
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id && session.status.is_active())
+                    .map(|session| session.id.clone())
+            })
+            .and_then(|session_id| {
+                self.pending_request_user_input(&session_id)
+                    .map(|request| (session_id, request))
+            })
+        {
+            let text = self.composer.take_trimmed();
+            self.dispatch(AppCommand::AnswerRequestUserInput {
+                session_id,
+                call_id: request.call_id,
+                text,
+            })?;
+            return Ok(());
+        }
         let text = self.composer.input().trim().to_string();
+        if let Some(plan_text) = text
+            .strip_prefix("/plan")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .map(str::trim)
+        {
+            if self.current_task_is_active()?
+                && self.collaboration_mode != CollaborationModeKind::Plan
+            {
+                self.status_notice = Some(
+                    "Collaboration mode can change after the running turn finishes.".to_string(),
+                );
+                return Ok(());
+            }
+            self.composer.take_trimmed();
+            self.dispatch(AppCommand::SetCollaborationMode(
+                CollaborationModeKind::Plan,
+            ))?;
+            if !plan_text.is_empty() {
+                self.submit_plain_text(plan_text.to_string())?;
+            }
+            return Ok(());
+        }
+        if text == "/mode" {
+            self.composer.take_trimmed();
+            self.dispatch(AppCommand::ChangeMode)?;
+            return Ok(());
+        }
         if text.is_empty() {
             if let Some(session) = self
                 .selected_session_id
@@ -962,8 +2189,37 @@ impl App {
         Ok(())
     }
 
+    fn submit_plain_text(&mut self, text: String) -> Result<()> {
+        if let Some(session) = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|id| {
+                self.state_cache
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+            })
+            .cloned()
+        {
+            self.dispatch(AppCommand::SendFollowup {
+                session_id: session.id,
+                text,
+            })
+        } else {
+            self.dispatch(AppCommand::StartTask(text))
+        }
+    }
+
     fn ensure_agent_ready(&mut self) -> Result<bool> {
-        if let Some(notice) = self.auth_notice()? {
+        let selection = self.current_model_selection();
+        self.ensure_agent_ready_for_selection(&selection)
+    }
+
+    fn ensure_agent_ready_for_selection(
+        &mut self,
+        selection: &SessionModelSelection,
+    ) -> Result<bool> {
+        if let Some(notice) = self.auth_notice_for_selection(selection)? {
             self.status_notice = Some(notice);
             self.open_surface(Surface::Account);
             return Ok(false);
@@ -980,10 +2236,18 @@ impl App {
     fn dispatch(&mut self, command: AppCommand) -> Result<()> {
         match command {
             AppCommand::StartTask(text) => {
-                if !self.ensure_agent_ready()? {
+                let selection = self.current_model_selection();
+                if !self.ensure_agent_ready_for_selection(&selection)? {
                     return Ok(());
                 }
                 let session = self.store.create_session(None, std::env::current_dir()?)?;
+                self.append_session_model_selection(&session.id, &selection)?;
+                let options = self.configured_agent_options()?;
+                browser_use_core::append_workspace_context_event_with_options(
+                    &self.store,
+                    &session,
+                    &options,
+                )?;
                 self.store.append_event(
                     &session.id,
                     "session.input",
@@ -998,8 +2262,11 @@ impl App {
                     .store
                     .load_session(&session_id)?
                     .is_some_and(|session| session.status.is_active());
-                if !active && !self.ensure_agent_ready()? {
-                    return Ok(());
+                if !active {
+                    let selection = self.session_model_selection_or_current(&session_id)?;
+                    if !self.ensure_agent_ready_for_selection(&selection)? {
+                        return Ok(());
+                    }
                 }
                 self.store.append_event(
                     &session_id,
@@ -1010,8 +2277,29 @@ impl App {
                     self.start_agent_for_session(session_id)?;
                 }
             }
+            AppCommand::AnswerRequestUserInput {
+                session_id,
+                call_id,
+                text,
+            } => {
+                let Some(request) = self.pending_request_user_input(&session_id) else {
+                    self.status_notice = Some("No pending user-input request.".to_string());
+                    return Ok(());
+                };
+                if request.call_id != call_id {
+                    self.status_notice =
+                        Some("That user-input request is no longer pending.".to_string());
+                    return Ok(());
+                }
+                let payload = request_user_input_response_payload(&request, &text);
+                self.store
+                    .append_event(&session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+                self.request_input = None;
+                self.status_notice = None;
+            }
             AppCommand::RetryTask(session_id) => {
-                if !self.ensure_agent_ready()? {
+                let selection = self.session_model_selection_or_current(&session_id)?;
+                if !self.ensure_agent_ready_for_selection(&selection)? {
                     return Ok(());
                 }
                 self.store.append_event(
@@ -1035,6 +2323,22 @@ impl App {
                 self.close_surface();
             }
             AppCommand::ChangeModel => self.open_surface(Surface::Model),
+            AppCommand::ChangeMode => self.open_surface(Surface::Mode),
+            AppCommand::SetCollaborationMode(mode) => {
+                if self.collaboration_mode != mode && self.current_task_is_active()? {
+                    self.status_notice = Some(
+                        "Collaboration mode can change after the running turn finishes."
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+                self.collaboration_mode = mode;
+                self.persist_runtime_settings()?;
+                self.status_notice = Some(format!(
+                    "Collaboration mode set to {}.",
+                    collaboration_mode_label(mode)
+                ));
+            }
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
@@ -1050,13 +2354,18 @@ impl App {
     }
 
     fn start_agent_for_session(&self, session_id: String) -> Result<()> {
-        if matches!(self.agent_backend, AgentBackend::None) {
+        let selection = self.session_model_selection_or_current(&session_id)?;
+        if matches!(selection.backend, AgentBackend::None) {
             return Ok(());
         }
         let state_dir = self.args.state_dir.clone();
-        let backend = self.agent_backend;
-        let model = self.provider_model.clone();
+        let backend = selection.backend;
+        let model = selection.provider_model.clone();
+        let model_provider_id = selection.model_provider_id.clone();
         let browser = self.browser.clone();
+        let collaboration_mode = self.collaboration_mode;
+        let config_profile = self.args.config_profile.clone();
+        let config_overrides = self.parsed_config_overrides()?;
         let notifier = self.store.notifier();
         thread::Builder::new()
             .name(format!("browser-use-agent-{session_id}"))
@@ -1065,7 +2374,18 @@ impl App {
                 let failure_session_id = session_id.clone();
                 let failure_notifier = notifier.clone();
                 let result = catch_unwind(AssertUnwindSafe(|| {
-                    run_agent_thread(state_dir, session_id, backend, model, browser, notifier)
+                    run_agent_thread(
+                        state_dir,
+                        session_id,
+                        backend,
+                        model,
+                        model_provider_id,
+                        browser,
+                        collaboration_mode,
+                        config_profile,
+                        config_overrides,
+                        notifier,
+                    )
                 }));
                 match result {
                     Ok(Ok(())) => {}
@@ -1147,6 +2467,18 @@ impl App {
         if key.code != KeyCode::Esc || !key.modifiers.is_empty() {
             self.escape_stop_until = None;
         }
+        let quit_requested = matches!(
+            key,
+            KeyEvent {
+                code: KeyCode::Char('q'),
+                modifiers: KeyModifiers::CONTROL,
+                ..
+            }
+        );
+        if !quit_requested && self.handle_request_user_input_key(key)? {
+            self.drain_store_notifications()?;
+            return Ok(false);
+        }
         match key {
             KeyEvent {
                 code: KeyCode::Char('q'),
@@ -1211,6 +2543,21 @@ impl App {
                 ..
             } if self.is_first_run_setup_visible()? => self.execute_first_run_setup_selection()?,
             _ if self.is_first_run_setup_visible()? => {}
+            KeyEvent {
+                code: KeyCode::BackTab,
+                ..
+            } if self.surface == Surface::Main => {
+                if self.current_task_is_active()? {
+                    self.status_notice = Some(
+                        "Collaboration mode can change after the running turn finishes."
+                            .to_string(),
+                    );
+                } else {
+                    self.dispatch(AppCommand::SetCollaborationMode(next_collaboration_mode(
+                        self.collaboration_mode,
+                    )))?;
+                }
+            }
             KeyEvent {
                 code: KeyCode::Tab, ..
             } => self.open_surface(Surface::History),
@@ -1443,14 +2790,18 @@ impl App {
                 _ => self.cancel_secret_entry(),
             },
             Surface::Model => {
-                let model_index = VISIBLE_MODEL_CHOICES
-                    .get(
-                        self.selected_row
-                            .min(VISIBLE_MODEL_CHOICES.len().saturating_sub(1)),
-                    )
-                    .copied()
-                    .unwrap_or(0);
+                let model_index = self
+                    .selected_row
+                    .min(self.model_choices.len().saturating_sub(1));
                 self.dispatch(AppCommand::SaveModel(model_index))?;
+            }
+            Surface::Mode => {
+                let mode = match self.selected_row.min(1) {
+                    0 => CollaborationModeKind::Default,
+                    _ => CollaborationModeKind::Plan,
+                };
+                self.close_surface();
+                self.dispatch(AppCommand::SetCollaborationMode(mode))?;
             }
             Surface::Browser => match self.selected_row.min(2) {
                 0 => self.dispatch(AppCommand::OpenBrowser)?,
@@ -1662,6 +3013,10 @@ impl App {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
+            PaletteAction::ChangeMode => self.dispatch(AppCommand::ChangeMode)?,
+            PaletteAction::PlanMode => self.dispatch(AppCommand::SetCollaborationMode(
+                CollaborationModeKind::Plan,
+            ))?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
@@ -1708,8 +3063,8 @@ impl App {
         Ok(())
     }
 
-    fn models_for_account(account: &str) -> Vec<usize> {
-        MODEL_CHOICES
+    fn models_for_account(&self, account: &str) -> Vec<usize> {
+        self.model_choices
             .iter()
             .enumerate()
             .filter(|(_, choice)| choice.account == account)
@@ -1717,12 +3072,12 @@ impl App {
             .collect()
     }
 
-    fn default_model_for_account(account: &str) -> Option<usize> {
-        Self::models_for_account(account).into_iter().next()
+    fn default_model_for_account(&self, account: &str) -> Option<usize> {
+        self.models_for_account(account).into_iter().next()
     }
 
     fn advance_after_auth(&mut self) -> Result<()> {
-        if let Some(index) = Self::default_model_for_account(&self.account) {
+        if let Some(index) = self.default_model_for_account(&self.account) {
             return self.save_model(index);
         }
         self.selected_row = 0;
@@ -1731,13 +3086,17 @@ impl App {
     }
 
     fn save_model(&mut self, index: usize) -> Result<()> {
-        let choice = MODEL_CHOICES
-            .get(index.min(MODEL_CHOICES.len().saturating_sub(1)))
-            .unwrap_or(&MODEL_CHOICES[0]);
-        self.model = choice.display.to_string();
+        let choice = self
+            .model_choices
+            .get(index.min(self.model_choices.len().saturating_sub(1)))
+            .cloned()
+            .or_else(|| fallback_model_choices().into_iter().next())
+            .context("no model choices available")?;
+        self.model = choice.display.clone();
         self.account = choice.account.to_string();
-        self.provider_model = choice.provider_model.to_string();
+        self.provider_model = choice.provider_model.clone();
         self.agent_backend = choice.backend;
+        self.model_provider_id = Some(model_provider_id_for_backend(choice.backend).to_string());
         self.model_configured = true;
         self.track_model_selected();
         if self.account == ACCOUNT_CODEX {
@@ -1767,7 +3126,85 @@ impl App {
         } else {
             self.status_notice = Some(format!("Model set to {}.", self.model));
         }
+        if let Some(session_id) = self.selected_session_id.as_deref() {
+            if self
+                .store
+                .load_session(session_id)?
+                .is_some_and(|session| !session.status.is_active())
+            {
+                self.append_session_model_selection(session_id, &self.current_model_selection())?;
+            }
+        }
         self.close_surface();
+        Ok(())
+    }
+
+    fn current_model_selection(&self) -> SessionModelSelection {
+        SessionModelSelection {
+            display_model: self.model.clone(),
+            provider_model: self.provider_model.clone(),
+            account: self.account.clone(),
+            backend: self.agent_backend,
+            model_provider_id: self.model_provider_id.clone(),
+        }
+    }
+
+    fn parsed_config_overrides(&self) -> Result<ConfigOverrides> {
+        parse_config_overrides(&self.args.config_overrides)
+    }
+
+    fn configured_agent_options(&self) -> Result<AgentRunOptions> {
+        let mut options =
+            AgentRunOptions::default().with_collaboration_mode(self.collaboration_mode);
+        if let Some(profile) = self.args.config_profile.as_ref() {
+            options = options.with_config_profile(profile.clone());
+        }
+        let config_overrides = self.parsed_config_overrides()?;
+        if !config_overrides.is_empty() {
+            options = options.with_config_overrides(config_overrides);
+        }
+        Ok(options)
+    }
+
+    fn session_model_selection_or_current(
+        &self,
+        session_id: &str,
+    ) -> Result<SessionModelSelection> {
+        Ok(self
+            .session_model_selection(session_id)?
+            .unwrap_or_else(|| self.current_model_selection()))
+    }
+
+    fn session_model_selection(&self, session_id: &str) -> Result<Option<SessionModelSelection>> {
+        Ok(self
+            .store
+            .events_for_session(session_id)?
+            .iter()
+            .rev()
+            .find_map(session_model_selection_from_event))
+    }
+
+    fn append_session_model_selection(
+        &self,
+        session_id: &str,
+        selection: &SessionModelSelection,
+    ) -> Result<()> {
+        let mut payload = serde_json::json!({
+            "display_model": selection.display_model,
+            "provider_model": selection.provider_model,
+            "account": selection.account,
+            "backend": selection.backend.as_setting(),
+        });
+        if let Some(model_provider_id) = selection
+            .model_provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            payload["model_provider_id"] = serde_json::Value::String(model_provider_id.to_string());
+        }
+        self.store
+            .append_event(session_id, SESSION_MODEL_SELECTION_EVENT, payload)?;
         Ok(())
     }
 
@@ -2137,9 +3574,21 @@ impl App {
         self.store.set_setting("model", &self.model)?;
         self.store
             .set_setting("provider.model", &self.provider_model)?;
+        self.store.set_setting(
+            COLLABORATION_MODE_SETTING,
+            collaboration_mode_setting_value(self.collaboration_mode),
+        )?;
         self.store.set_setting("browser", &self.browser)?;
         self.store
             .set_setting("agent.backend", self.agent_backend.as_setting())?;
+        if let Some(model_provider_id) = self
+            .model_provider_id
+            .as_deref()
+            .map(str::trim)
+            .filter(|value| !value.is_empty())
+        {
+            self.store.set_setting("provider.id", model_provider_id)?;
+        }
         Ok(())
     }
 
@@ -2157,7 +3606,8 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
-            Surface::Model => VISIBLE_MODEL_CHOICES.len(),
+            Surface::Model => self.model_choices.len(),
+            Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::History => self.workbench_state()?.history.len(),
@@ -2217,6 +3667,22 @@ impl App {
     }
 
     fn execute_slash_palette_selection(&mut self) -> Result<()> {
+        let filter = self.palette_filter.trim().trim_start_matches('/');
+        if let Some(plan_text) = filter
+            .strip_prefix("plan")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .map(str::trim)
+            .map(str::to_string)
+        {
+            self.close_slash_palette();
+            self.dispatch(AppCommand::SetCollaborationMode(
+                CollaborationModeKind::Plan,
+            ))?;
+            if !plan_text.is_empty() {
+                self.submit_plain_text(plan_text.to_string())?;
+            }
+            return Ok(());
+        }
         let action = palette::selected_action(&self.palette_filter, self.selected_row);
         if let Some(action) = action {
             self.close_slash_palette();
@@ -2335,7 +3801,14 @@ impl App {
     }
 
     fn auth_notice(&self) -> Result<Option<String>> {
-        let notice = match self.agent_backend {
+        self.auth_notice_for_selection(&self.current_model_selection())
+    }
+
+    fn auth_notice_for_selection(
+        &self,
+        selection: &SessionModelSelection,
+    ) -> Result<Option<String>> {
+        let notice = match selection.backend {
             AgentBackend::Openai
                 if !self.has_stored_or_env(
                     "auth.openai.api_key",
@@ -2359,7 +3832,8 @@ impl App {
                     .to_string(),
             ),
             AgentBackend::Anthropic
-                if is_claude_code_account(&self.account) && !self.has_claude_code_oauth()? =>
+                if is_claude_code_account(&selection.account)
+                    && !self.has_claude_code_oauth()? =>
             {
                 Some(
                     "Claude Code login is missing. Open Claude Code sign-in here before retrying."
@@ -2367,7 +3841,7 @@ impl App {
                 )
             }
             AgentBackend::Anthropic
-                if !is_claude_code_account(&self.account)
+                if !is_claude_code_account(&selection.account)
                     && !self.has_stored_or_env(
                         "auth.anthropic.api_key",
                         &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
@@ -2442,8 +3916,13 @@ impl App {
         {
             return Ok(());
         }
-        let auth = load_codex_auth().context("load local Codex auth")?;
-        self.store_codex_auth(&auth)
+        match load_codex_managed_auth() {
+            Ok(auth) => self.store_codex_managed_auth(&auth),
+            Err(_) => {
+                let auth = load_codex_auth().context("load local Codex auth")?;
+                self.store_codex_auth(&auth)
+            }
+        }
     }
 
     fn store_codex_auth(&self, auth: &CodexAuth) -> Result<()> {
@@ -2451,6 +3930,53 @@ impl App {
             .set_setting("auth.codex.access_token", auth.access_token.trim())?;
         self.store
             .set_setting("auth.codex.account_id", auth.account_id.trim())?;
+        self.store.delete_setting("auth.codex.id_token")?;
+        self.store.delete_setting("auth.codex.refresh_token")?;
+        self.store.delete_setting("auth.codex.source_path")?;
+        self.store.delete_setting("auth.codex.last_refresh")?;
+        Ok(())
+    }
+
+    fn store_codex_managed_auth(&self, auth: &CodexManagedAuth) -> Result<()> {
+        let snapshot = auth.current_snapshot()?;
+        self.store
+            .set_setting("auth.codex.access_token", snapshot.access_token.trim())?;
+        self.store
+            .set_setting("auth.codex.account_id", snapshot.account_id.trim())?;
+        if let Some(id_token) = snapshot
+            .id_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.store
+                .set_setting("auth.codex.id_token", id_token.trim())?;
+        } else {
+            self.store.delete_setting("auth.codex.id_token")?;
+        }
+        if let Some(refresh_token) = snapshot
+            .refresh_token
+            .as_deref()
+            .filter(|value| !value.trim().is_empty())
+        {
+            self.store
+                .set_setting("auth.codex.refresh_token", refresh_token.trim())?;
+        } else {
+            self.store.delete_setting("auth.codex.refresh_token")?;
+        }
+        if let Some(source_path) = snapshot.source_path.as_ref() {
+            self.store.set_setting(
+                "auth.codex.source_path",
+                source_path.to_string_lossy().as_ref(),
+            )?;
+        } else {
+            self.store.delete_setting("auth.codex.source_path")?;
+        }
+        if let Some(last_refresh) = snapshot.last_refresh {
+            self.store
+                .set_setting("auth.codex.last_refresh", &last_refresh.to_rfc3339())?;
+        } else {
+            self.store.delete_setting("auth.codex.last_refresh")?;
+        }
         Ok(())
     }
 
@@ -4048,12 +5574,17 @@ fn seed_demo_if_requested(store: &Store, mode: Option<&str>) -> Result<()> {
 mod redesign_tests {
     use super::*;
 
+    static CODEX_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
     fn args(temp: &tempfile::TempDir) -> Args {
         Args {
             state_dir: temp.path().to_path_buf(),
-            model: "GPT-5.5".to_string(),
+            model: None,
+            config_profile: None,
+            config_overrides: Vec::new(),
             account: "Codex login".to_string(),
             browser: BROWSER_LOCAL_CHROME.to_string(),
+            collaboration_mode: CollaborationModeArg::Default,
             dump_screen: true,
             width: 100,
             height: 28,
@@ -4072,6 +5603,62 @@ mod redesign_tests {
         app.store.set_setting("setup.complete", "1")?;
         app.store.set_setting("browser", "Local Chrome")?;
         Ok(app)
+    }
+
+    fn with_codex_home<T>(codex_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _lock = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
+        let previous = std::env::var_os("CODEX_HOME");
+        unsafe {
+            std::env::set_var("CODEX_HOME", codex_home);
+        }
+        let result = f();
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("CODEX_HOME", value),
+                None => std::env::remove_var("CODEX_HOME"),
+            }
+        }
+        result
+    }
+
+    fn write_tui_model_catalog(codex_home: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(codex_home)?;
+        std::fs::write(
+            codex_home.join("catalog.json"),
+            r#"{
+  "models": [
+    {
+      "slug": "hidden-catalog-model",
+      "display_name": "Hidden Catalog Model",
+      "description": "not picker-visible",
+      "visibility": "none",
+      "supported_in_api": true,
+      "priority": 0
+    },
+    {
+      "slug": "chatgpt-only-catalog",
+      "display_name": "ChatGPT Only Catalog",
+      "description": "ChatGPT-only catalog model",
+      "visibility": "list",
+      "supported_in_api": false,
+      "priority": 1
+    },
+    {
+      "slug": "catalog-gpt",
+      "display_name": "Catalog GPT",
+      "description": "Catalog API model",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 2
+    }
+  ]
+}"#,
+        )?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_catalog_json = \"catalog.json\"\n",
+        )?;
+        Ok(())
     }
 
     #[test]
@@ -4194,6 +5781,7 @@ mod redesign_tests {
         match surface {
             Surface::Account => "Authenticate",
             Surface::Model => "Model",
+            Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::History => "History",
             Surface::Developer => "Developer",
@@ -4202,6 +5790,547 @@ mod redesign_tests {
             Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
             Surface::Main => "",
         }
+    }
+
+    #[test]
+    fn plan_slash_command_starts_task_with_plan_mode_context() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.set_input("/plan draft a migration".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.collaboration_mode, CollaborationModeKind::Plan);
+        assert_eq!(
+            app.store
+                .get_setting(COLLABORATION_MODE_SETTING)?
+                .as_deref(),
+            Some("plan")
+        );
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session")?;
+        let events = app.store.events_for_session(&session_id)?;
+        let mode_idx = events
+            .iter()
+            .position(|event| {
+                event.event_type == "session.collaboration_mode"
+                    && event.payload["mode"] == serde_json::json!("plan")
+            })
+            .context("plan mode event")?;
+        let input_idx = events
+            .iter()
+            .position(|event| {
+                event.event_type == "session.input"
+                    && event.payload["text"] == serde_json::json!("draft a migration")
+            })
+            .context("session input event")?;
+
+        assert!(mode_idx < input_idx);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_slash_command_does_not_submit_old_mode_followup_while_running() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "existing turn"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        app.set_input("/plan revise this".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "session.followup")
+                .count(),
+            0
+        );
+        assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
+        assert_eq!(app.composer.input(), "/plan revise this");
+        assert!(app.status_notice.as_deref().is_some_and(|notice| notice
+            .contains("Collaboration mode can change after the running turn finishes")));
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_submit_answers_pending_request_not_followup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "plan a change"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Questions"));
+        assert!(screen.contains("Scope [scope]"));
+        assert!(screen.contains("Which scope should I use?"));
+        assert!(screen.contains("Answer the agent's question..."));
+
+        app.set_input("2".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "session.followup")
+                .count(),
+            0
+        );
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(response.payload["call_id"], serde_json::json!("ask_scope"));
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Build now"])
+        );
+        assert!(app.composer.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_digit_shortcut_selects_option() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('2'), KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Build now"])
+        );
+        assert!(app.composer.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_notes_append_user_note() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+        for ch in "keep minimal".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Build now", "user_note: keep minimal"])
+        );
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::all_terminal_scrollback_lines(&model, 100));
+        assert!(text.contains("Questions 1/1 answered"));
+        assert!(text.contains("note: keep minimal"));
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_empty_answer_requires_confirmation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_questions",
+                "questions": [
+                    {
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Which scope?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Plan (Recommended)", "description": "Plan only."},
+                            {"label": "Build", "description": "Build now."}
+                        ]
+                    },
+                    {
+                        "id": "risk",
+                        "header": "Risk",
+                        "question": "Which risk level?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Low (Recommended)", "description": "Small change."},
+                            {"label": "High", "description": "Large change."}
+                        ]
+                    }
+                ]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT));
+        assert!(app
+            .status_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Submit with 1 unanswered question")));
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Submit with unanswered questions?"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Plan (Recommended)"])
+        );
+        assert_eq!(
+            response.payload["answers"]["risk"]["answers"],
+            serde_json::json!([])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_accepts_keyed_multi_question_answers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_questions",
+                "questions": [
+                    {
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Which scope?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Plan (Recommended)", "description": "Plan only."},
+                            {"label": "Build", "description": "Build now."}
+                        ]
+                    },
+                    {
+                        "id": "risk",
+                        "header": "Risk",
+                        "question": "Which risk level?",
+                        "isOther": true,
+                        "options": [
+                            {"label": "Low (Recommended)", "description": "Small change."},
+                            {"label": "High", "description": "Large change."}
+                        ]
+                    }
+                ]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        app.set_input("risk: 2\nscope: Plan".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!(["Plan (Recommended)"])
+        );
+        assert_eq!(
+            response.payload["answers"]["risk"]["answers"],
+            serde_json::json!(["High"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_other_number_preserves_user_note() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope should I use?",
+                    "isOther": true,
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build now", "description": "Implement it."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        app.set_input("3: keep this as a design review".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let response = events
+            .iter()
+            .find(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT)
+            .context("request_user_input response event")?;
+        assert_eq!(
+            response.payload["answers"]["scope"]["answers"],
+            serde_json::json!([
+                REQUEST_USER_INPUT_OTHER_LABEL,
+                "user_note: keep this as a design review"
+            ])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_pending_requests_are_fifo() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        for (call_id, question_id) in [("call_1", "first"), ("call_2", "second")] {
+            app.store.append_event(
+                &session.id,
+                REQUEST_USER_INPUT_REQUEST_EVENT,
+                serde_json::json!({
+                    "call_id": call_id,
+                    "questions": [{
+                        "id": question_id,
+                        "header": question_id,
+                        "question": format!("Answer {question_id}?"),
+                        "isOther": true,
+                        "options": [
+                            {"label": "Yes (Recommended)", "description": "Proceed."},
+                            {"label": "No", "description": "Stop."}
+                        ]
+                    }]
+                }),
+            )?;
+        }
+        app.drain_store_notifications()?;
+
+        assert_eq!(
+            app.pending_request_user_input(&session.id)
+                .context("first pending")?
+                .call_id,
+            "call_1"
+        );
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('1'), KeyModifiers::NONE))?);
+        app.drain_store_notifications()?;
+        assert_eq!(
+            app.pending_request_user_input(&session.id)
+                .context("second pending")?
+                .call_id,
+            "call_2"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_pending_request_clears_after_terminal_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.selected_session_id = Some(session.id.clone());
+        app.store.append_event(
+            &session.id,
+            REQUEST_USER_INPUT_REQUEST_EVENT,
+            serde_json::json!({
+                "call_id": "ask_scope",
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope?",
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build", "description": "Build now."}
+                    ]
+                }]
+            }),
+        )?;
+        app.drain_store_notifications()?;
+        assert!(app.pending_request_user_input(&session.id).is_some());
+
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "finished"}),
+        )?;
+        app.drain_store_notifications()?;
+
+        assert!(app.pending_request_user_input(&session.id).is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_proposed_plan_renders_as_plan_not_raw_tags() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "plan the migration"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.collaboration_mode",
+            serde_json::json!({"mode": "plan"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({
+                "text": "Intro\n<proposed_plan>\n- Step 1\n- Step 2\n</proposed_plan>\nOutro",
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+
+        assert!(text.contains("Intro"));
+        assert!(text.contains("Outro"));
+        assert!(text.contains("Proposed Plan"));
+        assert!(text.contains("Step 1"));
+        assert!(!text.contains("<proposed_plan>"));
+        assert!(!text.contains("</proposed_plan>"));
+        Ok(())
+    }
+
+    #[test]
+    fn default_mode_streaming_keeps_literal_proposed_plan_tags() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "write literal tags"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.collaboration_mode",
+            serde_json::json!({"mode": "default"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({
+                "text": "Literal\n<proposed_plan>\nnot a plan\n</proposed_plan>",
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+
+        assert!(text.contains("Literal"));
+        assert!(text.contains("<proposed_plan>"));
+        assert!(text.contains("</proposed_plan>"));
+        assert!(!text.contains("Proposed Plan"));
+        Ok(())
     }
 
     #[test]
@@ -4502,7 +6631,11 @@ mod redesign_tests {
             let temp = tempfile::tempdir()?;
             let mut app = App::new(args(&temp))?;
             app.open_surface(Surface::Model);
-            app.selected_row = 5;
+            app.selected_row = app
+                .model_choices
+                .iter()
+                .position(|choice| choice.provider_model == "moonshotai/kimi-k2.5")
+                .context("Kimi OpenRouter model row")?;
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.model, "Kimi K2.5");
             assert_eq!(app.account, "OpenRouter API key");
@@ -4547,6 +6680,47 @@ mod redesign_tests {
         assert!(!screen.contains("**14 items**"));
         assert!(!screen.contains("`coupon.json`"));
         assert!(!screen.contains("┌"));
+        Ok(())
+    }
+
+    #[test]
+    fn startup_warnings_and_instruction_sources_are_visible() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        let agents_path = temp.path().join("AGENTS.md").display().to_string();
+        app.store.append_event(
+            &session.id,
+            "session.instruction_sources",
+            serde_json::json!({
+                "source": "agents_md",
+                "sources": [agents_path],
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.startup_warning",
+            serde_json::json!({
+                "source": "agents_md",
+                "message": "Project AGENTS.md instructions contain invalid UTF-8",
+            }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect cart"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("• warning"), "{screen}");
+        assert!(screen.contains("invalid UTF-8"), "{screen}");
+
+        app.open_surface(Surface::Developer);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Instruction sources"), "{screen}");
+        assert!(screen.contains("AGENTS.md"), "{screen}");
+        assert!(screen.contains("Startup warnings"), "{screen}");
         Ok(())
     }
 
@@ -4692,11 +6866,15 @@ mod redesign_tests {
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
+        assert!(screen.contains("/mode"));
+        assert!(screen.contains("/plan"));
         assert!(screen.contains("/model"));
-        assert!(screen.contains("/auth"));
+        assert!(!screen.contains("/auth"));
         assert!(!screen.contains("/laminar"));
         assert!(screen.contains("start a new task"));
         assert!(screen.contains("change browser backend"));
+        assert!(screen.contains("choose collaboration mode"));
+        assert!(screen.contains("switch to Plan mode"));
         assert!(!screen.contains("filter actions"));
         assert!(!screen.contains("tab history"));
         assert!(!screen.contains("Open browser"));
@@ -4720,6 +6898,18 @@ mod redesign_tests {
             .enumerate()
             .any(|(idx, line)| idx > input_row && line.contains("/task")));
         assert!(screen.contains("/history"));
+        for ch in "auth".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        let screen = render_dump(&mut app)?;
+        let input_row = row_containing(&screen, "> auth");
+        assert!(screen
+            .lines()
+            .enumerate()
+            .any(|(idx, line)| idx > input_row && line.contains("/auth")));
+        assert!(screen.contains("sign in to a provider"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('u'), KeyModifiers::CONTROL))?);
+        assert_eq!(app.palette_filter(), "");
         for ch in "bro".chars() {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
         }
@@ -4935,6 +7125,223 @@ mod redesign_tests {
     }
 
     #[test]
+    fn model_selector_uses_active_catalog_presets() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        write_tui_model_catalog(&codex_home)?;
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let mut app = ready_app(&temp)?;
+            app.store.set_setting("auth.codex.access_token", "token")?;
+            app.store.set_setting("auth.codex.account_id", "account")?;
+            app.open_surface(Surface::Model);
+
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("ChatGPT Only Catalog"));
+            assert!(screen.contains("Catalog GPT"));
+            assert!(!screen.contains("Hidden Catalog Model"));
+            assert!(!app.model_choices.iter().any(|choice| {
+                choice.account == ACCOUNT_OPENAI && choice.provider_model == "chatgpt-only-catalog"
+            }));
+
+            app.save_model(0)?;
+            assert_eq!(app.provider_model, "chatgpt-only-catalog");
+            assert_eq!(app.model, "ChatGPT Only Catalog");
+            assert_eq!(app.account, ACCOUNT_CODEX);
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_uses_configured_model_and_provider_without_masking_provider() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+model = "configured-corp-model"
+model_provider = "corp"
+
+[model_providers.corp]
+name = "Corp"
+base_url = "https://corp.example/v1"
+env_key = "CORP_API_KEY"
+wire_api = "responses"
+"#,
+        )?;
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let app_args = Args {
+                agent: AgentBackend::Codex,
+                ..args(&temp)
+            };
+            let app = App::new(app_args)?;
+            let selection = app.current_model_selection();
+
+            assert_eq!(app.model, "configured-corp-model");
+            assert_eq!(selection.provider_model, "configured-corp-model");
+            assert_eq!(selection.backend, AgentBackend::Codex);
+            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_and_workspace_context_use_profile_and_config_overrides() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+[model_providers.corp]
+name = "Corp"
+base_url = "https://corp.example/v1"
+env_key = "CORP_API_KEY"
+wire_api = "responses"
+"#,
+        )?;
+        std::fs::write(
+            codex_home.join("work.config.toml"),
+            r#"
+model = "profile-model"
+model_provider = "corp"
+"#,
+        )?;
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let app_args = Args {
+                agent: AgentBackend::Codex,
+                config_profile: Some("work".to_string()),
+                config_overrides: vec![
+                    "model=\"override-model\"".to_string(),
+                    "developer_instructions=\"TUI session policy\"".to_string(),
+                ],
+                ..args(&temp)
+            };
+            let app = App::new(app_args)?;
+            let selection = app.current_model_selection();
+
+            assert_eq!(selection.provider_model, "override-model");
+            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
+
+            let session = app.store.create_session(None, temp.path())?;
+            let options = app.configured_agent_options()?;
+            browser_use_core::append_workspace_context_event_with_options(
+                &app.store, &session, &options,
+            )?;
+            let events = app.store.events_for_session(&session.id)?;
+            let permissions = events
+                .iter()
+                .find(|event| {
+                    event.event_type == "workspace.context"
+                        && event
+                            .payload
+                            .get("kind")
+                            .and_then(serde_json::Value::as_str)
+                            == Some("permissions")
+                })
+                .and_then(|event| event.payload.get("content"))
+                .and_then(serde_json::Value::as_str)
+                .context("permissions workspace context")?;
+            assert!(permissions.contains("TUI session policy"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn startup_config_overrides_beat_stored_model_selection() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        store.set_setting("model", "Stored Model")?;
+        store.set_setting("provider.model", "stored-model")?;
+        store.set_setting("provider.id", "codex")?;
+        drop(store);
+
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+[model_providers.corp]
+name = "Corp"
+base_url = "https://corp.example/v1"
+env_key = "CORP_API_KEY"
+wire_api = "responses"
+"#,
+        )?;
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let app_args = Args {
+                agent: AgentBackend::Codex,
+                config_overrides: vec![
+                    "model=\"override-model\"".to_string(),
+                    "model_provider=\"corp\"".to_string(),
+                ],
+                ..args(&temp)
+            };
+            let app = App::new(app_args)?;
+            let selection = app.current_model_selection();
+
+            assert_eq!(selection.display_model, "override-model");
+            assert_eq!(selection.provider_model, "override-model");
+            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
+    fn model_selection_is_session_scoped_for_followups() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        write_tui_model_catalog(&codex_home)?;
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let mut app = ready_app(&temp)?;
+            app.store.set_setting("auth.openai.api_key", "openai-key")?;
+            let session = app.store.create_session(None, std::env::current_dir()?)?;
+            app.store.append_event(
+                &session.id,
+                "session.input",
+                serde_json::json!({"text": "finished task"}),
+            )?;
+            app.store.append_event(
+                &session.id,
+                "session.done",
+                serde_json::json!({"result": "done"}),
+            )?;
+            app.selected_session_id = Some(session.id.clone());
+
+            let openai_catalog_index = app
+                .model_choices
+                .iter()
+                .position(|choice| {
+                    choice.account == ACCOUNT_OPENAI && choice.provider_model == "catalog-gpt"
+                })
+                .context("OpenAI catalog model row")?;
+            app.save_model(openai_catalog_index)?;
+
+            app.model = "GPT-5.5".to_string();
+            app.provider_model = "gpt-5.5".to_string();
+            app.account = ACCOUNT_CODEX.to_string();
+            app.agent_backend = AgentBackend::Codex;
+
+            let selection = app.session_model_selection_or_current(&session.id)?;
+            assert_eq!(selection.provider_model, "catalog-gpt");
+            assert_eq!(selection.account, ACCOUNT_OPENAI);
+            assert_eq!(selection.backend, AgentBackend::Openai);
+            assert_eq!(selection.model_provider_id.as_deref(), Some("openai"));
+            Ok(())
+        })?;
+        Ok(())
+    }
+
+    #[test]
     fn credential_action_rows_are_real_menu_choices() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -5132,7 +7539,15 @@ mod redesign_tests {
             let temp = tempfile::tempdir()?;
             let mut app = ready_app(&temp)?;
             app.open_surface(Surface::Model);
-            app.selected_row = 3;
+            let opus_index = app
+                .model_choices
+                .iter()
+                .position(|choice| {
+                    choice.account == settings::ACCOUNT_ANTHROPIC
+                        && choice.provider_model == "claude-opus-4-7"
+                })
+                .context("Anthropic Opus model row")?;
+            app.selected_row = opus_index;
 
             let screen = render_dump(&mut app)?;
             assert!(!screen.contains("Claude Code sub"));
@@ -5141,7 +7556,7 @@ mod redesign_tests {
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
-            assert_eq!(app.pending_model_after_auth, Some(5));
+            assert_eq!(app.pending_model_after_auth, Some(opus_index));
             assert_eq!(
                 app.api_key_account.as_deref(),
                 Some(settings::ACCOUNT_ANTHROPIC)
@@ -5228,13 +7643,15 @@ mod redesign_tests {
             Surface::Setup,
             Surface::Account,
             Surface::Model,
+            Surface::Mode,
             Surface::Browser,
             Surface::BrowserSelect,
         ] {
             app.open_surface(surface);
             let count = match surface {
                 Surface::Setup | Surface::Account => ACCOUNT_CHOICES.len(),
-                Surface::Model => VISIBLE_MODEL_CHOICES.len(),
+                Surface::Model => app.model_choices.len(),
+                Surface::Mode => 2,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
                 _ => unreachable!(),
             };
@@ -5312,16 +7729,17 @@ mod redesign_tests {
 
         // The model picker wraps the same way.
         app.open_surface(Surface::Model);
-        for _ in 0..VISIBLE_MODEL_CHOICES.len() - 1 {
+        let model_choice_count = app.model_choices.len();
+        for _ in 0..model_choice_count - 1 {
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         }
-        assert_eq!(app.selected_row, VISIBLE_MODEL_CHOICES.len() - 1);
+        assert_eq!(app.selected_row, model_choice_count - 1);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("DeepSeek V4 Pro"));
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.selected_row, 0);
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
-        assert_eq!(app.selected_row, VISIBLE_MODEL_CHOICES.len() - 1);
+        assert_eq!(app.selected_row, model_choice_count - 1);
         Ok(())
     }
 
@@ -7207,6 +9625,7 @@ mod redesign_tests {
         for surface in [
             Surface::History,
             Surface::Model,
+            Surface::Mode,
             Surface::Browser,
             Surface::BrowserSelect,
             Surface::Account,

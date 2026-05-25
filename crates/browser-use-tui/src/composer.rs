@@ -45,7 +45,6 @@ impl Composer {
         self.cursor
     }
 
-    #[cfg(test)]
     pub(crate) fn set_input(&mut self, value: String) {
         self.text = value;
         self.cursor = self.input_len();

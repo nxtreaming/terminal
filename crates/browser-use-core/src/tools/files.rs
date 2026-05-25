@@ -1,6 +1,7 @@
+use std::ffi::OsStr;
 use std::fs;
 use std::io;
-use std::path::{Path, PathBuf};
+use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
@@ -14,6 +15,9 @@ const DEFAULT_MAX_READ_LINES: usize = 400;
 const DEFAULT_MAX_READ_BYTES: usize = 80_000;
 const DEFAULT_MAX_SEARCH_RESULTS: usize = 100;
 const DEFAULT_MAX_LIST_RESULTS: usize = 200;
+const PATCH_REJECTED_OUTSIDE_PROJECT_REASON: &str =
+    "patch rejected: writing outside of the project; rejected by user approval settings";
+const PROTECTED_PATCH_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
 
 #[derive(Debug)]
 pub(crate) struct FileToolResult {
@@ -257,14 +261,25 @@ pub(crate) fn view_image(
     store: &Store,
     session: &SessionMeta,
     call: &ToolCall,
+    can_request_original_detail: bool,
 ) -> Result<FileToolResult> {
     run_file_tool(store, session, call, "view_image", || {
         let path = required_path(session, &call.arguments)?;
-        let detail = call
+        let requested_detail = call
             .arguments
             .get("detail")
             .and_then(Value::as_str)
-            .unwrap_or("auto");
+            .unwrap_or("high");
+        if !matches!(requested_detail, "high" | "original") {
+            bail!(
+                "view_image.detail only supports `high` or `original`; omit `detail` for default high resized behavior, got `{requested_detail}`"
+            );
+        }
+        let detail = if requested_detail == "original" && can_request_original_detail {
+            "original"
+        } else {
+            "high"
+        };
         let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let mime = image_mime(&path);
         let image = json!({
@@ -291,17 +306,11 @@ pub(crate) fn view_image(
             image.clone(),
         )?;
         Ok(FileToolResult {
-            content: Value::Array(vec![
-                json!({
-                    "type": "output_text",
-                    "text": format!("viewed image: {} ({mime}, {} bytes)", path.display(), bytes.len()),
-                }),
-                json!({
-                    "type": "input_image",
-                    "image_url": format!("data:{mime};base64,{}", general_purpose::STANDARD.encode(bytes)),
-                    "detail": detail,
-                }),
-            ]),
+            content: Value::Array(vec![json!({
+                "type": "input_image",
+                "image_url": format!("data:{mime};base64,{}", general_purpose::STANDARD.encode(bytes)),
+                "detail": detail,
+            })]),
         })
     })
 }
@@ -321,13 +330,10 @@ pub(crate) fn apply_patch_tool(
                 "lines": patch.lines().count(),
             }),
         )?;
-        let ops = parse_patch(patch)?;
         let cwd = PathBuf::from(&session.cwd);
-        let mut changes = Vec::new();
-        for op in ops {
-            changes.push(apply_operation(&cwd, op)?);
-        }
-        for change in &changes {
+        let ops = parse_patch(patch)?;
+        verify_patch_operations(&cwd, &ops)?;
+        let changes = apply_patch_operations(&cwd, ops, |change| {
             store.append_event(
                 &session.id,
                 "patch.file_changed",
@@ -338,7 +344,8 @@ pub(crate) fn apply_patch_tool(
                     "move_path": change.move_path.as_ref().map(|path| path.display().to_string()),
                 }),
             )?;
-        }
+            Ok(())
+        })?;
         store.append_event(
             &session.id,
             "patch.finished",
@@ -347,16 +354,18 @@ pub(crate) fn apply_patch_tool(
                 "changed_files": changes.len(),
             }),
         )?;
-        let mut lines = vec!["Applied patch.".to_string()];
+        let mut lines = vec!["Success. Updated the following files:".to_string()];
         for change in &changes {
-            let mut line = format!("- {} {}", change.kind, change.path.display());
-            if let Some(move_path) = &change.move_path {
-                line.push_str(&format!(" -> {}", move_path.display()));
-            }
+            let marker = match change.kind {
+                "added" => "A",
+                "deleted" => "D",
+                _ => "M",
+            };
+            let line = format!("{marker} {}", change.display_path.display());
             lines.push(line);
         }
         Ok(FileToolResult {
-            content: Value::String(lines.join("\n")),
+            content: Value::String(format!("{}\n", lines.join("\n"))),
         })
     })
 }
@@ -540,6 +549,7 @@ fn fallback_search(
 #[derive(Debug)]
 struct AppliedChange {
     path: PathBuf,
+    display_path: PathBuf,
     kind: &'static str,
     move_path: Option<PathBuf>,
 }
@@ -562,28 +572,42 @@ enum PatchOperation {
 
 #[derive(Debug)]
 struct PatchHunk {
+    context: Option<String>,
     old: Vec<String>,
     new: Vec<String>,
+    end_of_file: bool,
 }
 
 fn parse_patch(patch: &str) -> Result<Vec<PatchOperation>> {
-    let lines = patch.lines().collect::<Vec<_>>();
-    if lines.first().copied() != Some("*** Begin Patch") {
+    let lines = patch_lines(patch);
+    if lines.first().map(|line| line.trim()) != Some("*** Begin Patch") {
         bail!("patch must start with *** Begin Patch");
     }
-    if lines.last().copied() != Some("*** End Patch") {
+    if lines.last().map(|line| line.trim()) != Some("*** End Patch") {
         bail!("patch must end with *** End Patch");
     }
     let mut index = 1;
+    if let Some(line) = lines.get(index) {
+        if let Some(environment_id) = line
+            .trim_start()
+            .strip_prefix("*** Environment ID: ")
+            .map(str::trim)
+        {
+            if environment_id.is_empty() {
+                bail!("apply_patch environment_id cannot be empty");
+            }
+            index += 1;
+        }
+    }
     let mut ops = Vec::new();
     while index < lines.len().saturating_sub(1) {
-        let line = lines[index];
+        let line = lines[index].trim();
         if let Some(path) = line.strip_prefix("*** Add File: ") {
             index += 1;
             let mut content = Vec::new();
             while index < lines.len() {
                 let line = lines[index];
-                if line.starts_with("*** ") {
+                if line.trim_start().starts_with("*** ") {
                     break;
                 }
                 let Some(added) = line.strip_prefix('+') else {
@@ -605,7 +629,7 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchOperation>> {
             index += 1;
             let mut move_path = None;
             if index < lines.len() {
-                if let Some(target) = lines[index].strip_prefix("*** Move to: ") {
+                if let Some(target) = lines[index].trim().strip_prefix("*** Move to: ") {
                     move_path = Some(target.to_string());
                     index += 1;
                 }
@@ -613,47 +637,81 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchOperation>> {
             let mut hunks = Vec::new();
             while index < lines.len() {
                 let line = lines[index];
-                if line.starts_with("*** ") {
-                    break;
-                }
-                if line == "*** End of File" {
+                if line.trim().is_empty() {
                     index += 1;
                     continue;
                 }
-                if !line.starts_with("@@") {
-                    bail!("update hunk must start with @@");
+                if line.trim().starts_with("*** ") {
+                    break;
                 }
-                index += 1;
+                let allow_missing_context = hunks.is_empty();
+                let context = if line == "@@" {
+                    index += 1;
+                    None
+                } else if let Some(context) = line.strip_prefix("@@ ") {
+                    index += 1;
+                    Some(context.to_string())
+                } else if allow_missing_context {
+                    None
+                } else {
+                    bail!("update hunk must start with @@");
+                };
+                if index >= lines.len() {
+                    bail!("update hunk does not contain any lines");
+                }
                 let mut old = Vec::new();
                 let mut new = Vec::new();
+                let mut end_of_file = false;
+                let mut parsed_lines = 0usize;
                 while index < lines.len() {
                     let line = lines[index];
-                    if line.starts_with("@@") || line.starts_with("*** ") {
-                        break;
-                    }
+                    let trimmed = line.trim();
                     if line == "*** End of File" {
+                        if parsed_lines == 0 {
+                            bail!("update hunk does not contain any lines");
+                        }
+                        end_of_file = true;
                         index += 1;
                         break;
                     }
-                    let Some(marker) = line.chars().next() else {
-                        bail!("empty update hunk line");
-                    };
-                    let text = line[marker.len_utf8()..].to_string();
-                    match marker {
-                        ' ' => {
-                            old.push(text.clone());
-                            new.push(text);
+                    if trimmed.starts_with("@@") || trimmed.starts_with("*** ") {
+                        break;
+                    }
+                    match line.chars().next() {
+                        None => {
+                            old.push(String::new());
+                            new.push(String::new());
                         }
-                        '-' => old.push(text),
-                        '+' => new.push(text),
-                        _ => bail!("update hunk lines must start with space, -, or +"),
+                        Some(marker @ (' ' | '-' | '+')) => {
+                            let text = line[marker.len_utf8()..].to_string();
+                            match marker {
+                                ' ' => {
+                                    old.push(text.clone());
+                                    new.push(text);
+                                }
+                                '-' => old.push(text),
+                                '+' => new.push(text),
+                                _ => unreachable!(),
+                            }
+                        }
+                        Some(_) if parsed_lines > 0 => break,
+                        Some(_) => bail!("update hunk lines must start with space, -, or +"),
                     }
                     index += 1;
+                    parsed_lines += 1;
                 }
-                hunks.push(PatchHunk { old, new });
+                if parsed_lines == 0 {
+                    bail!("update hunk does not contain any lines");
+                }
+                hunks.push(PatchHunk {
+                    context,
+                    old,
+                    new,
+                    end_of_file,
+                });
             }
-            if hunks.is_empty() && move_path.is_none() {
-                bail!("update file requires at least one hunk or move target");
+            if hunks.is_empty() {
+                bail!("update file requires at least one hunk");
             }
             ops.push(PatchOperation::Update {
                 path: path.to_string(),
@@ -664,32 +722,111 @@ fn parse_patch(patch: &str) -> Result<Vec<PatchOperation>> {
             bail!("unknown patch directive: {line}");
         }
     }
+    if ops.is_empty() {
+        bail!("No files were modified.");
+    }
     Ok(ops)
 }
 
-fn apply_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange> {
+fn patch_lines(patch: &str) -> Vec<&str> {
+    let lines = patch.trim().lines().collect::<Vec<_>>();
+    if lines.len() >= 3
+        && heredoc_start(lines[0].trim())
+        && lines.last().is_some_and(|line| line.trim() == "EOF")
+    {
+        return lines[1..lines.len() - 1].to_vec();
+    }
+    lines
+}
+
+fn heredoc_start(line: &str) -> bool {
+    matches!(line, "<<EOF" | "<<'EOF'" | "<<\"EOF\"")
+}
+
+fn apply_patch_operations(
+    cwd: &Path,
+    ops: Vec<PatchOperation>,
+    mut on_change: impl FnMut(&AppliedChange) -> Result<()>,
+) -> Result<Vec<AppliedChange>> {
+    if ops.is_empty() {
+        bail!("No files were modified.");
+    }
+    let mut changes = Vec::new();
+    for op in ops {
+        let change = apply_patch_operation(cwd, op)?;
+        on_change(&change)?;
+        changes.push(change);
+    }
+    Ok(changes)
+}
+
+fn verify_patch_operations(cwd: &Path, ops: &[PatchOperation]) -> Result<()> {
+    if ops.is_empty() {
+        bail!("No files were modified.");
+    }
+    for op in ops {
+        match op {
+            PatchOperation::Add { path, .. } => {
+                let path = resolve_patch_path(cwd, path)?;
+                if let Ok(metadata) = fs::metadata(&path) {
+                    if !metadata.is_file() {
+                        bail!(
+                            "Failed to write file {}: path is a directory",
+                            path.display()
+                        );
+                    }
+                }
+            }
+            PatchOperation::Delete { path } => {
+                let path = resolve_patch_path(cwd, path)?;
+                fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read {}", path.display()))?;
+            }
+            PatchOperation::Update {
+                path,
+                move_path,
+                hunks,
+            } => {
+                let path = resolve_patch_path(cwd, path)?;
+                if let Some(move_path) = move_path {
+                    resolve_patch_path(cwd, move_path)?;
+                }
+                let original = fs::read_to_string(&path)
+                    .with_context(|| format!("Failed to read file to update {}", path.display()))?;
+                let original_lines = split_patch_lines(&original);
+                compute_replacements(&original_lines, &path, hunks)?;
+            }
+        }
+    }
+    Ok(())
+}
+
+fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange> {
     match op {
         PatchOperation::Add { path, content } => {
-            let path = resolve_path(cwd, &path);
-            if path.exists() {
-                bail!("file already exists: {}", path.display());
-            }
+            let display_path = PathBuf::from(&path);
+            let path = resolve_patch_path(cwd, &path)?;
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
-            fs::write(&path, content).with_context(|| format!("write {}", path.display()))?;
+            fs::write(&path, content)
+                .with_context(|| format!("Failed to write file {}", path.display()))?;
             Ok(AppliedChange {
                 path,
+                display_path,
                 kind: "added",
                 move_path: None,
             })
         }
         PatchOperation::Delete { path } => {
-            let path = resolve_path(cwd, &path);
-            fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+            let display_path = PathBuf::from(&path);
+            let path = resolve_patch_path(cwd, &path)?;
+            fs::remove_file(&path)
+                .with_context(|| format!("Failed to delete file {}", path.display()))?;
             Ok(AppliedChange {
                 path,
+                display_path,
                 kind: "deleted",
                 move_path: None,
             })
@@ -699,32 +836,36 @@ fn apply_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange> {
             move_path,
             hunks,
         } => {
-            let path = resolve_path(cwd, &path);
-            let original =
-                fs::read_to_string(&path).with_context(|| format!("read {}", path.display()))?;
-            let (mut lines, final_newline) = split_text(&original);
-            let mut cursor = 0;
-            for hunk in hunks {
-                let Some(pos) = find_sequence(&lines, &hunk.old, cursor) else {
-                    bail!("patch hunk did not match {}", path.display());
-                };
-                lines.splice(pos..pos + hunk.old.len(), hunk.new);
-                cursor = pos;
+            let display_path = PathBuf::from(move_path.as_deref().unwrap_or(&path));
+            let path = resolve_patch_path(cwd, &path)?;
+            let move_path = move_path
+                .map(|target| resolve_patch_path(cwd, &target))
+                .transpose()?;
+            let original = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read file to update {}", path.display()))?;
+            let original_lines = split_patch_lines(&original);
+            let replacements = compute_replacements(&original_lines, &path, &hunks)?;
+            let mut new_lines = apply_replacements(original_lines, &replacements);
+            if !new_lines.last().is_some_and(String::is_empty) {
+                new_lines.push(String::new());
             }
-            let new_content = lines_to_text(&lines, final_newline);
-            let move_path = move_path.map(|target| resolve_path(cwd, &target));
-            let write_path = move_path.as_ref().unwrap_or(&path);
-            if let Some(parent) = write_path.parent() {
-                fs::create_dir_all(parent)
-                    .with_context(|| format!("create {}", parent.display()))?;
-            }
-            fs::write(write_path, new_content)
-                .with_context(|| format!("write {}", write_path.display()))?;
-            if move_path.as_ref().is_some_and(|target| target != &path) {
-                fs::remove_file(&path).with_context(|| format!("delete {}", path.display()))?;
+            let new_content = new_lines.join("\n");
+            if let Some(target) = &move_path {
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent)
+                        .with_context(|| format!("create {}", parent.display()))?;
+                }
+                fs::write(target, &new_content)
+                    .with_context(|| format!("Failed to write file {}", target.display()))?;
+                fs::remove_file(&path)
+                    .with_context(|| format!("Failed to remove original {}", path.display()))?;
+            } else {
+                fs::write(&path, &new_content)
+                    .with_context(|| format!("Failed to write file {}", path.display()))?;
             }
             Ok(AppliedChange {
                 path,
+                display_path,
                 kind: if move_path.is_some() {
                     "moved"
                 } else {
@@ -770,6 +911,67 @@ fn resolve_path(cwd: &Path, raw: &str) -> PathBuf {
     } else {
         cwd.join(path)
     }
+}
+
+fn resolve_patch_path(cwd: &Path, raw: &str) -> Result<PathBuf> {
+    let root = normalize_path(cwd);
+    let path = normalize_path(&resolve_path(cwd, raw));
+    if !path.starts_with(&root) {
+        bail!(PATCH_REJECTED_OUTSIDE_PROJECT_REASON);
+    }
+    ensure_patch_path_does_not_touch_protected_metadata(&root, &path)?;
+    ensure_real_path_stays_under_root(&root, &path)?;
+    Ok(path)
+}
+
+fn normalize_path(path: &Path) -> PathBuf {
+    let mut normalized = PathBuf::new();
+    for component in path.components() {
+        match component {
+            Component::CurDir => {}
+            Component::ParentDir => {
+                normalized.pop();
+            }
+            other => normalized.push(other.as_os_str()),
+        }
+    }
+    normalized
+}
+
+fn ensure_patch_path_does_not_touch_protected_metadata(root: &Path, path: &Path) -> Result<()> {
+    let relative = path.strip_prefix(root).unwrap_or(path);
+    let Some(Component::Normal(first_component)) = relative.components().next() else {
+        return Ok(());
+    };
+    if PROTECTED_PATCH_METADATA_NAMES
+        .iter()
+        .any(|name| first_component == OsStr::new(name))
+    {
+        bail!(PATCH_REJECTED_OUTSIDE_PROJECT_REASON);
+    }
+    Ok(())
+}
+
+fn ensure_real_path_stays_under_root(root: &Path, path: &Path) -> Result<()> {
+    let real_root = root.canonicalize().unwrap_or_else(|_| root.to_path_buf());
+    if let Ok(real_path) = path.canonicalize() {
+        if !real_path.starts_with(&real_root) {
+            bail!(PATCH_REJECTED_OUTSIDE_PROJECT_REASON);
+        }
+        return Ok(());
+    }
+
+    let mut ancestor = path.parent();
+    while let Some(parent) = ancestor {
+        if let Ok(real_parent) = parent.canonicalize() {
+            if !real_parent.starts_with(&real_root) {
+                bail!(PATCH_REJECTED_OUTSIDE_PROJECT_REASON);
+            }
+            return Ok(());
+        }
+        ancestor = parent.parent();
+    }
+    Ok(())
 }
 
 fn usize_arg(arguments: &Value, key: &str) -> Option<usize> {
@@ -844,13 +1046,6 @@ fn image_mime(path: &Path) -> &'static str {
     }
 }
 
-fn split_text(text: &str) -> (Vec<String>, bool) {
-    (
-        text.lines().map(ToOwned::to_owned).collect(),
-        text.ends_with('\n'),
-    )
-}
-
 fn lines_to_text(lines: &[String], final_newline: bool) -> String {
     let mut text = lines.join("\n");
     if final_newline && !lines.is_empty() {
@@ -859,15 +1054,156 @@ fn lines_to_text(lines: &[String], final_newline: bool) -> String {
     text
 }
 
-fn find_sequence(lines: &[String], needle: &[String], start: usize) -> Option<usize> {
+fn split_patch_lines(text: &str) -> Vec<String> {
+    let mut lines = text.split('\n').map(ToOwned::to_owned).collect::<Vec<_>>();
+    if lines.last().is_some_and(String::is_empty) {
+        lines.pop();
+    }
+    lines
+}
+
+fn compute_replacements(
+    original_lines: &[String],
+    path: &Path,
+    hunks: &[PatchHunk],
+) -> Result<Vec<(usize, usize, Vec<String>)>> {
+    let mut replacements = Vec::new();
+    let mut line_index = 0usize;
+
+    for hunk in hunks {
+        if let Some(context) = &hunk.context {
+            if let Some(index) = seek_sequence(
+                original_lines,
+                std::slice::from_ref(context),
+                line_index,
+                false,
+            ) {
+                line_index = index + 1;
+            } else {
+                bail!("Failed to find context '{}' in {}", context, path.display());
+            }
+        }
+
+        if hunk.old.is_empty() {
+            let insertion_index = if original_lines.last().is_some_and(String::is_empty) {
+                original_lines.len() - 1
+            } else {
+                original_lines.len()
+            };
+            replacements.push((insertion_index, 0, hunk.new.clone()));
+            continue;
+        }
+
+        let mut pattern = hunk.old.as_slice();
+        let mut new_slice = hunk.new.as_slice();
+        let mut found = seek_sequence(original_lines, pattern, line_index, hunk.end_of_file);
+
+        if found.is_none() && pattern.last().is_some_and(String::is_empty) {
+            pattern = &pattern[..pattern.len() - 1];
+            if new_slice.last().is_some_and(String::is_empty) {
+                new_slice = &new_slice[..new_slice.len() - 1];
+            }
+            found = seek_sequence(original_lines, pattern, line_index, hunk.end_of_file);
+        }
+
+        if let Some(start_index) = found {
+            replacements.push((start_index, pattern.len(), new_slice.to_vec()));
+            line_index = start_index + pattern.len();
+        } else {
+            bail!(
+                "Failed to find expected lines in {}:\n{}",
+                path.display(),
+                hunk.old.join("\n")
+            );
+        }
+    }
+
+    replacements.sort_by(|(left, _, _), (right, _, _)| left.cmp(right));
+    Ok(replacements)
+}
+
+fn apply_replacements(
+    mut lines: Vec<String>,
+    replacements: &[(usize, usize, Vec<String>)],
+) -> Vec<String> {
+    for (start_index, old_len, new_segment) in replacements.iter().rev() {
+        for _ in 0..*old_len {
+            if *start_index < lines.len() {
+                lines.remove(*start_index);
+            }
+        }
+        for (offset, new_line) in new_segment.iter().enumerate() {
+            lines.insert(start_index + offset, new_line.clone());
+        }
+    }
+    lines
+}
+
+fn seek_sequence(
+    lines: &[String],
+    needle: &[String],
+    start: usize,
+    end_of_file: bool,
+) -> Option<usize> {
     if needle.is_empty() {
         return Some(start.min(lines.len()));
     }
     if needle.len() > lines.len() {
         return None;
     }
-    (start.min(lines.len())..=lines.len().saturating_sub(needle.len()))
-        .find(|index| &lines[*index..*index + needle.len()] == needle)
+    let search_start = if end_of_file && lines.len() >= needle.len() {
+        lines.len() - needle.len()
+    } else {
+        start.min(lines.len())
+    };
+    for index in search_start..=lines.len().saturating_sub(needle.len()) {
+        if lines[index..index + needle.len()] == *needle {
+            return Some(index);
+        }
+    }
+    for index in search_start..=lines.len().saturating_sub(needle.len()) {
+        if needle
+            .iter()
+            .enumerate()
+            .all(|(offset, line)| lines[index + offset].trim_end() == line.trim_end())
+        {
+            return Some(index);
+        }
+    }
+    for index in search_start..=lines.len().saturating_sub(needle.len()) {
+        if needle
+            .iter()
+            .enumerate()
+            .all(|(offset, line)| lines[index + offset].trim() == line.trim())
+        {
+            return Some(index);
+        }
+    }
+    for index in search_start..=lines.len().saturating_sub(needle.len()) {
+        if needle.iter().enumerate().all(|(offset, line)| {
+            normalize_common_punctuation(&lines[index + offset])
+                == normalize_common_punctuation(line)
+        }) {
+            return Some(index);
+        }
+    }
+    None
+}
+
+fn normalize_common_punctuation(text: &str) -> String {
+    text.trim()
+        .chars()
+        .map(|ch| match ch {
+            '\u{2010}' | '\u{2011}' | '\u{2012}' | '\u{2013}' | '\u{2014}' | '\u{2015}'
+            | '\u{2212}' => '-',
+            '\u{2018}' | '\u{2019}' | '\u{201A}' | '\u{201B}' => '\'',
+            '\u{201C}' | '\u{201D}' | '\u{201E}' | '\u{201F}' => '"',
+            '\u{00A0}' | '\u{2002}' | '\u{2003}' | '\u{2004}' | '\u{2005}' | '\u{2006}'
+            | '\u{2007}' | '\u{2008}' | '\u{2009}' | '\u{200A}' | '\u{202F}' | '\u{205F}'
+            | '\u{3000}' => ' ',
+            other => other,
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -898,6 +1234,7 @@ mod tests {
             &ToolCall {
                 id: "read_1".to_string(),
                 name: "read_file".to_string(),
+                namespace: None,
                 arguments: json!({"path": "file.txt", "start_line": 2, "max_lines": 1}),
             },
         )
@@ -909,22 +1246,25 @@ mod tests {
     fn apply_patch_add_update_delete_and_move() {
         let tmp = TempDir::new().expect("tmp");
         let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::write(cwd.join("update.txt"), "hello\nworld\n").expect("write update");
+        fs::write(cwd.join("move.txt"), "hello\nrust\n").expect("write move");
+        fs::write(cwd.join("delete.txt"), "obsolete\n").expect("write delete");
         let patch = r#"*** Begin Patch
 *** Add File: a.txt
-+hello
-+world
-*** Update File: a.txt
++added
+*** Update File: update.txt
 @@
  hello
 -world
 +rust
-*** Update File: a.txt
+*** Update File: move.txt
 *** Move to: b.txt
 @@
 -hello
 +hi
  rust
-*** Delete File: b.txt
+*** Delete File: delete.txt
 *** End Patch"#;
         apply_patch_tool(
             &store,
@@ -932,16 +1272,457 @@ mod tests {
             &ToolCall {
                 id: "patch_1".to_string(),
                 name: "apply_patch".to_string(),
+                namespace: None,
                 arguments: json!({"patch": patch}),
             },
         )
         .expect("patch");
-        assert!(!Path::new(&session.cwd).join("a.txt").exists());
-        assert!(!Path::new(&session.cwd).join("b.txt").exists());
+        assert_eq!(
+            fs::read_to_string(cwd.join("a.txt")).expect("read add"),
+            "added\n"
+        );
+        assert_eq!(
+            fs::read_to_string(cwd.join("update.txt")).expect("read update"),
+            "hello\nrust\n"
+        );
+        assert!(!cwd.join("move.txt").exists());
+        assert_eq!(
+            fs::read_to_string(cwd.join("b.txt")).expect("read move"),
+            "hi\nrust\n"
+        );
+        assert!(!cwd.join("delete.txt").exists());
         let events = store.events_for_session(&session.id).expect("events");
         assert!(events
             .iter()
             .any(|event| event.event_type == "patch.file_changed"));
+    }
+
+    #[test]
+    fn apply_patch_verifies_entire_patch_before_writing() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::write(cwd.join("a.txt"), "one\n").expect("write a");
+        fs::write(cwd.join("b.txt"), "two\n").expect("write b");
+        let patch = r#"*** Begin Patch
+*** Update File: a.txt
+@@
+-one
++ONE
+*** Update File: b.txt
+@@
+-missing
++TWO
+*** End Patch"#;
+
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_fail".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        );
+
+        assert!(result.is_err());
+        assert_eq!(
+            fs::read_to_string(cwd.join("a.txt")).expect("read a"),
+            "one\n"
+        );
+        assert_eq!(
+            fs::read_to_string(cwd.join("b.txt")).expect("read b"),
+            "two\n"
+        );
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(events.iter().any(|event| event.event_type == "tool.failed"));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "patch.file_changed"));
+    }
+
+    #[test]
+    fn apply_patch_matches_codex_add_and_update_edge_semantics() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::write(cwd.join("duplicate.txt"), "old content\n").expect("write duplicate");
+        fs::write(cwd.join("no_newline.txt"), "no newline at end").expect("write no newline");
+        let patch = r#"*** Begin Patch
+*** Add File: duplicate.txt
++new content
+*** Update File: no_newline.txt
+@@
+-no newline at end
++first line
++second line
+*** End Patch"#;
+
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_edges".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        )
+        .expect("patch");
+
+        assert_eq!(
+            fs::read_to_string(cwd.join("duplicate.txt")).expect("read duplicate"),
+            "new content\n"
+        );
+        assert_eq!(
+            fs::read_to_string(cwd.join("no_newline.txt")).expect("read no newline"),
+            "first line\nsecond line\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_accepts_codex_raw_patch_wrappers_and_missing_context() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::write(cwd.join("file.txt"), "import foo\n").expect("write file");
+        let patch = r#"
+<<'EOF'
+  *** Begin Patch
+*** Environment ID: local
+*** Update File: file.txt
+ import foo
++bar
+*** End Patch
+EOF
+"#;
+
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_raw_edges".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!(patch),
+            },
+        )
+        .expect("patch");
+
+        assert_eq!(
+            fs::read_to_string(cwd.join("file.txt")).expect("read file"),
+            "import foo\nbar\n"
+        );
+        let content = result.content.as_str().expect("content");
+        assert_eq!(
+            content,
+            "Success. Updated the following files:\nM file.txt\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_honors_context_eof_and_pure_addition_semantics() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::write(
+            cwd.join("target.txt"),
+            "alpha\nneedle\nold one\nmiddle\nold two\ntail\n",
+        )
+        .expect("write target");
+        let patch = r#"*** Begin Patch
+*** Update File: target.txt
+@@ needle
+-old one
++new one
+@@
++appended
+@@
+ old two
+-tail
++tail updated
+*** End of File
+*** End Patch"#;
+
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_context_eof".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        )
+        .expect("patch");
+
+        assert_eq!(
+            fs::read_to_string(cwd.join("target.txt")).expect("read target"),
+            "alpha\nneedle\nnew one\nmiddle\nold two\ntail updated\nappended\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_preverifies_before_runtime_writes_like_codex_tool() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        let patch = r#"*** Begin Patch
+*** Add File: created.txt
++hello
+*** Update File: created.txt
+@@
+-hello
++changed
+*** End Patch"#;
+
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_add_then_update".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(!cwd.join("created.txt").exists());
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "patch.file_changed"));
+    }
+
+    #[test]
+    fn apply_patch_accepts_crlf_and_outer_newlines_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        let patch =
+            "\r\n*** Begin Patch\r\n*** Add File: crlf.txt\r\n+hello\r\n*** End Patch\r\n\r\n";
+
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_crlf".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        )
+        .expect("patch");
+
+        assert_eq!(
+            fs::read_to_string(cwd.join("crlf.txt")).expect("read crlf"),
+            "hello\n"
+        );
+    }
+
+    #[test]
+    fn apply_patch_rejects_empty_update_hunk_even_with_move() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::write(cwd.join("source.txt"), "content\n").expect("write source");
+        let patch = r#"*** Begin Patch
+*** Update File: source.txt
+*** Move to: dest.txt
+*** End Patch"#;
+
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_empty_update".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(cwd.join("source.txt").exists());
+        assert!(!cwd.join("dest.txt").exists());
+    }
+
+    #[test]
+    fn apply_patch_rejects_empty_patch() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_empty".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** End Patch"}),
+            },
+        );
+
+        assert!(result
+            .expect_err("empty patch should fail")
+            .to_string()
+            .contains("No files were modified."));
+    }
+
+    #[test]
+    fn apply_patch_rejects_parent_path_outside_cwd() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        let patch = r#"*** Begin Patch
+*** Add File: ../outside/escape.txt
++outside
+*** End Patch"#;
+
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_outside_parent".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        );
+
+        assert!(result
+            .expect_err("outside path should fail")
+            .to_string()
+            .contains(PATCH_REJECTED_OUTSIDE_PROJECT_REASON));
+        assert!(!outside.join("escape.txt").exists());
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "patch.file_changed"));
+    }
+
+    #[test]
+    fn apply_patch_rejects_absolute_path_outside_cwd() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let outside = tmp.path().join("outside.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+outside\n*** End Patch",
+            outside.display()
+        );
+
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_outside_abs".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        );
+
+        assert!(result
+            .expect_err("outside absolute path should fail")
+            .to_string()
+            .contains(PATCH_REJECTED_OUTSIDE_PROJECT_REASON));
+        assert!(!outside.exists());
+    }
+
+    #[test]
+    fn apply_patch_allows_absolute_path_inside_cwd() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let inside = Path::new(&session.cwd).join("absolute-inside.txt");
+        let patch = format!(
+            "*** Begin Patch\n*** Add File: {}\n+inside\n*** End Patch",
+            inside.display()
+        );
+
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_inside_abs".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        )
+        .expect("inside absolute path should be allowed");
+
+        assert_eq!(fs::read_to_string(inside).expect("read inside"), "inside\n");
+    }
+
+    #[test]
+    fn apply_patch_rejects_protected_workspace_metadata_paths() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::create_dir_all(cwd.join(".git")).expect(".git");
+        fs::create_dir_all(cwd.join(".agents").join("skills")).expect(".agents");
+        let cases = [
+            ("patch_git_metadata", ".git/config"),
+            ("patch_agents_metadata", ".agents/skills/example.md"),
+            ("patch_codex_metadata", ".codex/config.toml"),
+        ];
+
+        for (id, path) in cases {
+            let patch = format!("*** Begin Patch\n*** Add File: {path}\n+blocked\n*** End Patch");
+            let result = apply_patch_tool(
+                &store,
+                &session,
+                &ToolCall {
+                    id: id.to_string(),
+                    name: "apply_patch".to_string(),
+                    namespace: None,
+                    arguments: json!({"patch": patch}),
+                },
+            );
+
+            assert!(
+                result
+                    .expect_err("metadata path should fail")
+                    .to_string()
+                    .contains(PATCH_REJECTED_OUTSIDE_PROJECT_REASON),
+                "{path} should be rejected"
+            );
+            assert!(!cwd.join(path).exists(), "{path} should not be written");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn apply_patch_rejects_symlink_escape() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        let outside = tmp.path().join("outside");
+        fs::create_dir_all(&outside).expect("outside");
+        std::os::unix::fs::symlink(&outside, cwd.join("link")).expect("symlink");
+        let patch = r#"*** Begin Patch
+*** Add File: link/escape.txt
++outside
+*** End Patch"#;
+
+        let result = apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_symlink_escape".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": patch}),
+            },
+        );
+
+        assert!(result
+            .expect_err("symlink escape should fail")
+            .to_string()
+            .contains(PATCH_REJECTED_OUTSIDE_PROJECT_REASON));
+        assert!(!outside.join("escape.txt").exists());
     }
 
     #[test]
@@ -967,6 +1748,7 @@ mod tests {
             &ToolCall {
                 id: "search_1".to_string(),
                 name: "search_files".to_string(),
+                namespace: None,
                 arguments: json!({"query": "target", "glob": "*.rs"}),
             },
         )
@@ -978,6 +1760,7 @@ mod tests {
             &ToolCall {
                 id: "list_1".to_string(),
                 name: "list_files".to_string(),
+                namespace: None,
                 arguments: json!({"query": "alpha"}),
             },
         )
@@ -1006,8 +1789,10 @@ mod tests {
             &ToolCall {
                 id: "image_1".to_string(),
                 name: "view_image".to_string(),
+                namespace: None,
                 arguments: json!({"path": "pixel.png", "detail": "high"}),
             },
+            false,
         )
         .expect("view image");
         assert!(result

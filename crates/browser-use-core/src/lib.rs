@@ -1,4 +1,5 @@
-use std::collections::{BTreeMap, HashMap, HashSet};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
+use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -17,23 +18,176 @@ use browser_use_protocol::{
     ModelEvent, SessionMeta, SessionStatus, ToolCall, ToolSpec,
 };
 use browser_use_providers::{
-    load_codex_auth, refresh_claude_code_oauth, AnthropicMessagesProvider,
-    ClaudeCodeOAuthCredential, CodexAuth, CodexResponsesProvider, FakeProvider, ModelProvider,
-    OpenAICompatibleChatProvider, OpenAIResponsesProvider, ProviderTurn, ScriptedProvider,
+    amazon_bedrock_mantle_base_url, amazon_bedrock_model_catalog, bundled_model_catalog,
+    default_agent_instructions, default_agent_instructions_for_model_and_personality_with_catalog,
+    default_agent_instructions_for_personality, default_permissions_instructions,
+    default_personality_message_for_model_and_personality_with_catalog, load_codex_auth,
+    model_request_info_for_catalog, model_supported_service_tiers_for_catalog,
+    model_supports_original_image_detail_for_catalog, model_supports_service_tier_for_catalog,
+    model_switch_request_settings_for_model_with_catalog, refresh_claude_code_oauth,
+    spawn_agent_model_overrides_description_for_catalog, AmazonBedrockAwsAuthConfig,
+    AnthropicMessagesProvider, ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth,
+    CodexResponsesProvider, FakeProvider, ModelCatalog, ModelCatalogEntryInfo, ModelPersonality,
+    ModelProvider, ModelRequestSettings, OpenAICompatibleChatProvider, OpenAIResponsesProvider,
+    ProviderCommandAuth, ProviderCommandAuthConfig, ProviderError, ProviderRequestOptions,
+    ProviderTurn, ScriptedProvider,
 };
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::{now_ms, AgentSummary, Store};
+use chrono::{Local, Utc};
 use opentelemetry::KeyValue;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Map, Value};
 use telemetry::{AgentTelemetry, ModelTurnSpanInput};
-use tools::{ToolHandlerKind, ToolRegistry};
+use tools::{
+    MultiAgentToolFamily, MultiAgentToolSpecConfig, SpawnAgentRoleDescription, ToolHandlerKind,
+    ToolRegistry,
+};
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
-const MAX_TOOL_OUTPUT_TEXT_TOKENS: usize = 4_000;
+const DEFAULT_TOOL_OUTPUT_TEXT_TOKENS: usize = 2_500;
 const IMAGE_CONTEXT_BUDGET_TOKENS: usize = 2_000;
+const MAX_REQUEST_MAX_RETRIES: usize = 100;
+const DEFAULT_STREAM_MAX_RETRIES: usize = 5;
+const MAX_STREAM_MAX_RETRIES: usize = 100;
+const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
+const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+const COMPACTION_SUMMARY_PREFIX: &str = concat!(
+    "Another language model started to solve this problem and produced a summary of its thinking ",
+    "process. You also have access to the state of the tools that were used by that language ",
+    "model. Use this to build on the work that has already been done and avoid duplicating work. ",
+    "Here is the summary produced by the other language model, use the information in this summary ",
+    "to assist with your own analysis:"
+);
 const BROWSER_PREF_MODE: &str = "browser.preference.mode";
 const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
 const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
+const WORKSPACE_CONTEXT_MESSAGE_NAME: &str = "workspace_context";
+const PERMISSIONS_CONTEXT_MESSAGE_NAME: &str = "permissions_context";
+const MULTI_AGENT_USAGE_HINT_CONTEXT_MESSAGE_NAME: &str = "multi_agent_usage_hint";
+const MODEL_SWITCH_CONTEXT_MESSAGE_NAME: &str = "model_switch_context";
+const PERSONALITY_CONTEXT_MESSAGE_NAME: &str = "personality_context";
+const COLLABORATION_CONTEXT_MESSAGE_NAME: &str = "collaboration_context";
+const COLLABORATION_CONTEXT_EVENT: &str = "model.collaboration_context";
+const SESSION_COLLABORATION_MODE_EVENT: &str = "session.collaboration_mode";
+const COLLABORATION_MODE_OPEN_TAG: &str = "<collaboration_mode>";
+const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
+const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
+const REQUEST_USER_INPUT_RESPONSE_EVENT: &str = "request_user_input.response";
+const REQUEST_USER_INPUT_TOOL_NAME: &str = "request_user_input";
+const PROPOSED_PLAN_OPEN_TAG: &str = "<proposed_plan>";
+const PROPOSED_PLAN_CLOSE_TAG: &str = "</proposed_plan>";
+const TURN_ABORTED_START_MARKER: &str = "<turn_aborted>";
+const TURN_ABORTED_END_MARKER: &str = "</turn_aborted>";
+const TURN_ABORTED_INTERRUPTED_GUIDANCE: &str = "The user interrupted the previous turn on purpose. Any running unified exec processes may still be running in the background. If any tools/commands were aborted, they may have partially executed.";
+const WORKSPACE_CONTEXT_PERMISSIONS_KIND: &str = "permissions";
+const WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND: &str = "multi_agent_v2_usage_hint";
+const WORKSPACE_CONTEXT_AGENTS_KIND: &str = "agents_md";
+const WORKSPACE_CONTEXT_ENVIRONMENT_KIND: &str = "environment_context";
+const SESSION_STARTUP_WARNING_EVENT: &str = "session.startup_warning";
+const SESSION_INSTRUCTION_SOURCES_EVENT: &str = "session.instruction_sources";
+const SESSION_BASE_INSTRUCTIONS_EVENT: &str = "session.base_instructions";
+const SESSION_CONFIG_SNAPSHOT_EVENT: &str = "session.config_snapshot";
+const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
+const CONTEXT_BASELINE_EVENT: &str = "context.baseline";
+const CODEX_TURN_STARTED_EVENT: &str = "task_started";
+const CODEX_TURN_COMPLETE_EVENT: &str = "task_complete";
+const CODEX_TURN_ABORTED_EVENT: &str = "turn_aborted";
+const CODEX_INSTALLATION_ID_SETTING: &str = "codex.installation_id";
+const CODEX_INSTALLATION_ID_HEADER: &str = "x-codex-installation-id";
+const CODEX_WINDOW_ID_SETTING: &str = "codex.window_id";
+const CODEX_HTTP_SESSION_ID_HEADER: &str = "session-id";
+const CODEX_HTTP_THREAD_ID_HEADER: &str = "thread-id";
+const CODEX_HTTP_CLIENT_REQUEST_ID_HEADER: &str = "x-client-request-id";
+const CODEX_BETA_FEATURES_HEADER: &str = "x-codex-beta-features";
+const CODEX_TURN_METADATA_HEADER: &str = "x-codex-turn-metadata";
+const CODEX_WINDOW_ID_HEADER: &str = "x-codex-window-id";
+const CODEX_PARENT_THREAD_ID_HEADER: &str = "x-codex-parent-thread-id";
+const OPENAI_SUBAGENT_HEADER: &str = "x-openai-subagent";
+const OPENAI_SUBAGENT_COLLAB_SPAWN: &str = "collab_spawn";
+const CODEX_TOKEN_COUNT_EVENT: &str = "token_count";
+const CODEX_STREAM_ERROR_EVENT: &str = "stream_error";
+const MODEL_RESPONSE_INPUT_ITEM_EVENT: &str = "model.response.input_item";
+const MODEL_RATE_LIMITS_EVENT: &str = "model.rate_limits";
+const MODEL_VERIFICATION_EVENT: &str = "model.verification";
+const MODEL_SWITCH_CONTEXT_EVENT: &str = "model.switch_context";
+const PERSONALITY_CONTEXT_EVENT: &str = "model.personality_context";
+const OAI_MEMORY_CITATION_OPEN_TAG: &str = "<oai-mem-citation>";
+const OAI_MEMORY_CITATION_CLOSE_TAG: &str = "</oai-mem-citation>";
+const DEFAULT_AGENT_ROLE_NAME: &str = "default";
+const AGENT_TYPE_UNAVAILABLE_ERROR: &str = "agent type is currently not available";
+const DEFAULT_AGENT_NICKNAMES: &str = include_str!("agent_names.txt");
+const AGENTS_MD_MAX_BYTES: usize = 32 * 1024;
+const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
+const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
+const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
+const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
+const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS_UPPER_BOUND: i64 =
+    DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
+const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
+const DEFAULT_AGENTS_MD_FILENAME: &str = "AGENTS.md";
+const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
+const DEFAULT_PROJECT_ROOT_MARKER: &str = ".git";
+const CODEX_CONFIG_FILENAME: &str = "config.toml";
+const CODEX_PROFILE_CONFIG_SUFFIX: &str = ".config.toml";
+const CODEX_MODELS_CACHE_FILENAME: &str = "models_cache.json";
+const CODEX_MODELS_CACHE_TTL_SECONDS: i64 = 300;
+const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
+const AMAZON_BEDROCK_PROVIDER_NAME: &str = "Amazon Bedrock";
+const AMAZON_BEDROCK_DEFAULT_BASE_URL: &str = "https://bedrock-mantle.us-east-1.api.aws/openai/v1";
+const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER: &str = "x-amzn-mantle-client-agent";
+const AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE: &str = "codex";
+const AWS_BEARER_TOKEN_BEDROCK_ENV_VAR: &str = "AWS_BEARER_TOKEN_BEDROCK";
+const OPENAI_MODEL_PROVIDER_ID: &str = "openai";
+const OLLAMA_MODEL_PROVIDER_ID: &str = "ollama";
+const LMSTUDIO_MODEL_PROVIDER_ID: &str = "lmstudio";
+const RESERVED_CUSTOM_MODEL_PROVIDER_IDS: &[&str] = &[
+    OPENAI_MODEL_PROVIDER_ID,
+    AMAZON_BEDROCK_PROVIDER_ID,
+    OLLAMA_MODEL_PROVIDER_ID,
+    LMSTUDIO_MODEL_PROVIDER_ID,
+];
+const CODEX_CHAT_WIRE_API_REMOVED_ERROR: &str = "`wire_api = \"chat\"` is no longer supported.\nHow to fix: set `wire_api = \"responses\"` in your provider config.\nMore info: https://github.com/openai/codex/discussions/7782";
+#[cfg(any(test, not(unix)))]
+const CODEX_MANAGED_CONFIG_FILENAME: &str = "managed_config.toml";
+#[cfg(all(unix, not(test)))]
+const CODEX_MANAGED_CONFIG_SYSTEM_PATH: &str = "/etc/codex/managed_config.toml";
+const CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE: &str = "com.openai.codex:config_toml_base64";
+#[cfg(target_os = "macos")]
+const CODEX_MANAGED_PREFERENCES_APPLICATION_ID: &str = "com.openai.codex";
+#[cfg(target_os = "macos")]
+const CODEX_MANAGED_PREFERENCES_CONFIG_KEY: &str = "config_toml_base64";
+const PROJECT_CODEX_DIR: &str = ".codex";
+#[cfg(all(unix, not(test)))]
+const SYSTEM_CODEX_CONFIG_PATH: &str = "/etc/codex/config.toml";
+#[cfg(test)]
+const TEST_CODEX_SYSTEM_CONFIG_ENV: &str = "BROWSER_USE_TEST_CODEX_SYSTEM_CONFIG";
+#[cfg(test)]
+const TEST_CODEX_MANAGED_CONFIG_ENV: &str = "BROWSER_USE_TEST_CODEX_MANAGED_CONFIG";
+#[cfg(test)]
+const TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV: &str =
+    "BROWSER_USE_TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64";
+const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
+    "openai_base_url",
+    "chatgpt_base_url",
+    "apps_mcp_product_sku",
+    "model_provider",
+    "model_providers",
+    "notify",
+    "profile",
+    "profiles",
+    "experimental_realtime_ws_base_url",
+    "otel",
+];
+const CODEX_ADVERTISED_BETA_FEATURE_DEFAULTS: &[(&str, bool)] = &[
+    ("terminal_resize_reflow", true),
+    ("memories", false),
+    ("network_proxy", false),
+    ("external_migration", false),
+    ("mentions_v2", false),
+    ("prevent_idle_sleep", false),
+    ("remote_compaction_v2", false),
+];
 static TOOL_OUTPUT_ARTIFACT_COUNTER: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Debug, Clone)]
@@ -42,6 +196,28 @@ struct DoneResultFile {
     path: PathBuf,
     bytes: u64,
     mime: &'static str,
+}
+
+#[derive(Clone, Debug)]
+struct CodexTurnLifecycle {
+    turn_id: String,
+    run_id: String,
+    started_at_ms: i64,
+    started_at: Instant,
+    provider: String,
+    model: String,
+    personality: ModelPersonality,
+    collaboration_mode: CollaborationModeKind,
+    model_settings: ModelRequestSettings,
+    model_context_window: Option<i64>,
+    trace_id: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct ProviderTurnResult {
+    events: Vec<ModelEvent>,
+    time_to_first_token_ms: Option<i64>,
+    attempts: usize,
 }
 
 pub struct FakeAgentOptions<'a> {
@@ -62,10 +238,17 @@ pub enum ProviderBackend {
     None,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum RunConfigValueSource {
+    Explicit,
+    Default,
+}
+
 #[derive(Clone, Debug)]
 pub struct ProviderRunConfig {
     pub backend: ProviderBackend,
     pub model: String,
+    pub model_source: RunConfigValueSource,
     pub options: AgentRunOptions,
     pub fake_result: Option<String>,
 }
@@ -75,6 +258,7 @@ impl ProviderRunConfig {
         Self {
             backend,
             model: model.into(),
+            model_source: RunConfigValueSource::Explicit,
             options: AgentRunOptions::default(),
             fake_result: None,
         }
@@ -85,16 +269,67 @@ impl ProviderRunConfig {
         self
     }
 
+    pub fn with_model_source(mut self, source: RunConfigValueSource) -> Self {
+        self.model_source = source;
+        self
+    }
+
     pub fn with_fake_result(mut self, result: impl Into<String>) -> Self {
         self.fake_result = Some(result.into());
         self
     }
 }
 
+pub type ConfigOverrides = Vec<(String, toml::Value)>;
+
+pub fn parse_config_overrides(raw_config_overrides: &[String]) -> Result<ConfigOverrides> {
+    raw_config_overrides
+        .iter()
+        .map(|raw| {
+            let mut parts = raw.splitn(2, '=');
+            let key = parts.next().unwrap_or_default().trim();
+            let value_str = parts
+                .next()
+                .ok_or_else(|| anyhow!("Invalid override (missing '='): {raw}"))?
+                .trim();
+            if key.is_empty() {
+                bail!("Empty key in override: {raw}");
+            }
+            let value = parse_config_override_toml_value(value_str).unwrap_or_else(|| {
+                toml::Value::String(
+                    value_str
+                        .trim()
+                        .trim_matches(|candidate| candidate == '"' || candidate == '\'')
+                        .to_string(),
+                )
+            });
+            Ok((canonicalize_config_override_key(key), value))
+        })
+        .collect()
+}
+
+fn canonicalize_config_override_key(key: &str) -> String {
+    if key == "use_legacy_landlock" {
+        "features.use_legacy_landlock".to_string()
+    } else {
+        key.to_string()
+    }
+}
+
+fn parse_config_override_toml_value(raw: &str) -> Option<toml::Value> {
+    let wrapped = format!("_x_ = {raw}");
+    let mut table = toml::from_str::<toml::Table>(&wrapped).ok()?;
+    table.remove("_x_")
+}
+
 #[derive(Clone, Debug)]
 pub struct ChildAgentRunRequest {
     pub parent_session_id: String,
     pub child_session_id: String,
+    pub model: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub service_tier: Option<String>,
+    pub config_overrides: Vec<(String, toml::Value)>,
 }
 
 #[derive(Clone)]
@@ -118,14 +353,115 @@ impl ChildAgentRunner {
     }
 }
 
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EnvironmentContextEnvironment {
+    pub id: String,
+    pub cwd: String,
+    pub shell: String,
+}
+
+impl EnvironmentContextEnvironment {
+    pub fn new(id: impl Into<String>, cwd: impl Into<String>, shell: impl Into<String>) -> Self {
+        Self {
+            id: id.into(),
+            cwd: cwd.into(),
+            shell: shell.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+pub struct EnvironmentNetworkContext {
+    pub allowed_domains: Vec<String>,
+    pub denied_domains: Vec<String>,
+}
+
+impl EnvironmentNetworkContext {
+    pub fn new(allowed_domains: Vec<String>, denied_domains: Vec<String>) -> Self {
+        Self {
+            allowed_domains,
+            denied_domains,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct EnvironmentContextSnapshot {
+    environments: Vec<EnvironmentContextEnvironment>,
+    current_date: String,
+    timezone: String,
+    network: Option<EnvironmentNetworkContext>,
+    subagents: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, Default, Deserialize, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum CollaborationModeKind {
+    Plan,
+    #[default]
+    Default,
+}
+
+impl CollaborationModeKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Plan => "plan",
+            Self::Default => "default",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct RequestUserInputOption {
+    label: String,
+    description: String,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct RequestUserInputQuestion {
+    id: String,
+    header: String,
+    question: String,
+    #[serde(rename = "isOther", default)]
+    is_other: bool,
+    #[serde(rename = "isSecret", default)]
+    is_secret: bool,
+    options: Option<Vec<RequestUserInputOption>>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct RequestUserInputArgs {
+    questions: Vec<RequestUserInputQuestion>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct RequestUserInputAnswer {
+    answers: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Eq, Serialize)]
+struct RequestUserInputResponse {
+    answers: HashMap<String, RequestUserInputAnswer>,
+}
+
 #[derive(Clone, Debug)]
 pub struct AgentRunOptions {
     pub max_turns: usize,
     pub max_context_chars: usize,
     pub browser_mode: Option<String>,
+    pub collaboration_mode: CollaborationModeKind,
+    pub include_environment_context: bool,
+    pub environment_context_environments: Vec<EnvironmentContextEnvironment>,
+    pub environment_context_network: Option<EnvironmentNetworkContext>,
+    pub config_profile: Option<String>,
+    pub config_overrides: ConfigOverrides,
+    pub model_provider_id: Option<String>,
+    pub model_provider_id_source: RunConfigValueSource,
     pub python_tool_timeout_seconds: u64,
     pub python_env: Vec<(String, String)>,
     pub child_agent_runner: Option<ChildAgentRunner>,
+    pub final_output_json_schema: Option<Value>,
+    pub final_output_json_schema_strict: bool,
     pub analytics_source: Option<String>,
     pub analytics_provider_kind: Option<String>,
     pub analytics_model: Option<String>,
@@ -137,9 +473,19 @@ impl Default for AgentRunOptions {
             max_turns: 80,
             max_context_chars: 240_000,
             browser_mode: None,
+            collaboration_mode: CollaborationModeKind::Default,
+            include_environment_context: true,
+            environment_context_environments: Vec::new(),
+            environment_context_network: None,
+            config_profile: None,
+            config_overrides: Vec::new(),
+            model_provider_id: None,
+            model_provider_id_source: RunConfigValueSource::Default,
             python_tool_timeout_seconds: 120,
             python_env: Vec::new(),
             child_agent_runner: None,
+            final_output_json_schema: None,
+            final_output_json_schema_strict: true,
             analytics_source: None,
             analytics_provider_kind: None,
             analytics_model: None,
@@ -150,6 +496,51 @@ impl Default for AgentRunOptions {
 impl AgentRunOptions {
     pub fn with_browser_mode(mut self, mode: impl Into<String>) -> Self {
         self.browser_mode = Some(mode.into());
+        self
+    }
+
+    pub fn with_collaboration_mode(mut self, mode: CollaborationModeKind) -> Self {
+        self.collaboration_mode = mode;
+        self
+    }
+
+    pub fn with_include_environment_context(mut self, include: bool) -> Self {
+        self.include_environment_context = include;
+        self
+    }
+
+    pub fn with_environment_context_environments(
+        mut self,
+        environments: Vec<EnvironmentContextEnvironment>,
+    ) -> Self {
+        self.environment_context_environments = environments;
+        self
+    }
+
+    pub fn with_environment_context_network(mut self, network: EnvironmentNetworkContext) -> Self {
+        self.environment_context_network = Some(network);
+        self
+    }
+
+    pub fn with_config_profile(mut self, profile: impl Into<String>) -> Self {
+        self.config_profile = Some(profile.into());
+        self
+    }
+
+    pub fn with_config_overrides(mut self, overrides: Vec<(String, toml::Value)>) -> Self {
+        self.config_overrides = overrides;
+        self
+    }
+
+    pub fn with_model_provider_id(mut self, model_provider_id: impl Into<String>) -> Self {
+        self.model_provider_id = Some(model_provider_id.into());
+        self.model_provider_id_source = RunConfigValueSource::Explicit;
+        self
+    }
+
+    pub fn with_default_model_provider_id(mut self, model_provider_id: impl Into<String>) -> Self {
+        self.model_provider_id = Some(model_provider_id.into());
+        self.model_provider_id_source = RunConfigValueSource::Default;
         self
     }
 
@@ -165,6 +556,12 @@ impl AgentRunOptions {
 
     pub fn with_child_agent_runner(mut self, runner: ChildAgentRunner) -> Self {
         self.child_agent_runner = Some(runner);
+        self
+    }
+
+    pub fn with_final_output_json_schema(mut self, schema: Value, strict: bool) -> Self {
+        self.final_output_json_schema = Some(schema);
+        self.final_output_json_schema_strict = strict;
         self
     }
 
@@ -204,6 +601,354 @@ fn browser_mode_instruction(mode: &str) -> String {
     }
 }
 
+fn collaboration_mode_instructions(mode: CollaborationModeKind) -> String {
+    let template = match mode {
+        CollaborationModeKind::Default => {
+            include_str!("../../../prompts/collaboration-mode-default.md")
+        }
+        CollaborationModeKind::Plan => include_str!("../../../prompts/collaboration-mode-plan.md"),
+    };
+    let text = template.replace("{{KNOWN_MODE_NAMES}}", "Default and Plan");
+    format!("{COLLABORATION_MODE_OPEN_TAG}{text}{COLLABORATION_MODE_CLOSE_TAG}")
+}
+
+fn collaboration_context_message(text: String) -> Value {
+    serde_json::json!({
+        "role": "developer",
+        "name": COLLABORATION_CONTEXT_MESSAGE_NAME,
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
+    })
+}
+
+fn latest_collaboration_mode_from_events(events: &[EventRecord]) -> Option<CollaborationModeKind> {
+    events.iter().rev().find_map(|event| {
+        if event.event_type != SESSION_COLLABORATION_MODE_EVENT {
+            return None;
+        }
+        match event.payload.get("mode").and_then(Value::as_str)? {
+            "plan" => Some(CollaborationModeKind::Plan),
+            "default" => Some(CollaborationModeKind::Default),
+            _ => None,
+        }
+    })
+}
+
+fn split_proposed_plan_blocks(text: &str) -> (String, Option<String>) {
+    let mut visible = String::new();
+    let mut latest_plan = None;
+    let mut current_plan = String::new();
+    let mut in_plan = false;
+    let mut saw_plan = false;
+
+    for line in text.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let slug = line_without_newline.trim_start().trim_end();
+        if !in_plan && slug == PROPOSED_PLAN_OPEN_TAG {
+            in_plan = true;
+            saw_plan = true;
+            current_plan.clear();
+            continue;
+        }
+        if in_plan && slug == PROPOSED_PLAN_CLOSE_TAG {
+            in_plan = false;
+            latest_plan = Some(current_plan.clone());
+            continue;
+        }
+        if in_plan {
+            current_plan.push_str(line);
+        } else {
+            visible.push_str(line);
+        }
+    }
+
+    if in_plan && saw_plan {
+        latest_plan = Some(current_plan);
+    }
+    (visible, latest_plan)
+}
+
+fn strip_memory_citations(text: &str) -> String {
+    let mut visible = String::new();
+    let mut rest = text;
+    while let Some(open_idx) = rest.find(OAI_MEMORY_CITATION_OPEN_TAG) {
+        visible.push_str(&rest[..open_idx]);
+        let after_open = &rest[open_idx + OAI_MEMORY_CITATION_OPEN_TAG.len()..];
+        let Some(close_idx) = after_open.find(OAI_MEMORY_CITATION_CLOSE_TAG) else {
+            return visible;
+        };
+        rest = &after_open[close_idx + OAI_MEMORY_CITATION_CLOSE_TAG.len()..];
+    }
+    visible.push_str(rest);
+    visible
+}
+
+fn strip_hidden_assistant_markup(
+    text: &str,
+    mode: CollaborationModeKind,
+) -> (String, Option<String>) {
+    let without_citations = strip_memory_citations(text);
+    if mode == CollaborationModeKind::Plan {
+        split_proposed_plan_blocks(&without_citations)
+    } else {
+        (without_citations, None)
+    }
+}
+
+fn visible_assistant_text_and_proposed_plan(
+    text: &str,
+    mode: CollaborationModeKind,
+) -> (String, Option<String>) {
+    strip_hidden_assistant_markup(text, mode)
+}
+
+pub fn append_workspace_context_event(store: &Store, session: &SessionMeta) -> Result<bool> {
+    append_workspace_context_event_with_options(store, session, &AgentRunOptions::default())
+}
+
+pub fn append_workspace_context_event_with_options(
+    store: &Store,
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+) -> Result<bool> {
+    let events = store.events_for_session(&session.id)?;
+    let before_seq = current_turn_user_message_seq(&events);
+    let has_context_kind = |kind: &str| {
+        events.iter().any(|event| {
+            event.event_type == "workspace.context"
+                && event.payload.get("kind").and_then(Value::as_str) == Some(kind)
+        })
+    };
+    let latest_context_content = |kind: &str| {
+        events.iter().rev().find_map(|event| {
+            (event.event_type == "workspace.context"
+                && event.payload.get("kind").and_then(Value::as_str) == Some(kind))
+            .then(|| event.payload.get("content").and_then(Value::as_str))
+            .flatten()
+        })
+    };
+    let latest_environment_snapshot = || latest_environment_snapshot_from_events(&events);
+    let agents_context = if !has_context_kind(WORKSPACE_CONTEXT_AGENTS_KIND) {
+        let config_profile = options.config_profile.as_deref();
+        Some(load_agents_md_context_for_cwd_with_options(
+            Path::new(&session.cwd),
+            config_profile,
+            &options.config_overrides,
+        )?)
+    } else {
+        None
+    };
+    let mut appended = false;
+    let config_developer_instructions = agents_context
+        .as_ref()
+        .and_then(|load| load.developer_instructions.as_deref())
+        .filter(|text| !text.is_empty())
+        .map(str::to_string);
+    let config_include_environment_context = agents_context
+        .as_ref()
+        .is_none_or(|load| load.include_environment_context);
+    let config_include_collaboration_mode_instructions = agents_context
+        .as_ref()
+        .is_none_or(|load| load.include_collaboration_mode_instructions);
+    let collaboration_context = config_include_collaboration_mode_instructions
+        .then(|| collaboration_mode_instructions(options.collaboration_mode));
+    let multi_agent_v2_usage_hint =
+        if !has_context_kind(WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND) {
+            if let Some(agents_context) = agents_context.as_ref() {
+                multi_agent_v2_usage_hint_text_for_session(session, &agents_context.multi_agent_v2)
+            } else {
+                let mut warnings = Vec::new();
+                let config = load_agents_md_config(
+                    Path::new(&session.cwd),
+                    &mut warnings,
+                    options.config_profile.as_deref(),
+                    &options.config_overrides,
+                )?;
+                multi_agent_v2_usage_hint_text_for_session(session, &config.multi_agent_v2)
+            }
+        } else {
+            None
+        };
+    let previous_collaboration_mode = latest_collaboration_mode_from_events(&events);
+    if previous_collaboration_mode != Some(options.collaboration_mode) {
+        store.append_event(
+            &session.id,
+            SESSION_COLLABORATION_MODE_EVENT,
+            serde_json::json!({
+                "mode": options.collaboration_mode.as_str(),
+            }),
+        )?;
+        appended = true;
+    }
+    if !has_context_kind(WORKSPACE_CONTEXT_PERMISSIONS_KIND) {
+        let mut developer_sections = vec![default_permissions_instructions().to_string()];
+        if let Some(developer_instructions) = config_developer_instructions {
+            developer_sections.push(developer_instructions);
+        }
+        if let Some(collaboration_context) = collaboration_context.as_ref() {
+            developer_sections.push(collaboration_context.clone());
+        }
+        store.append_event(
+            &session.id,
+            "workspace.context",
+            serde_json::json!({
+                "kind": WORKSPACE_CONTEXT_PERMISSIONS_KIND,
+                "content": developer_sections.join("\n\n"),
+            }),
+        )?;
+        appended = true;
+    } else if let Some(collaboration_context) = collaboration_context.as_ref() {
+        let latest_collaboration_context = events.iter().rev().find_map(|event| {
+            (event.event_type == COLLABORATION_CONTEXT_EVENT)
+                .then(|| event.payload.get("content").and_then(Value::as_str))
+                .flatten()
+        });
+        let permissions_contains_current_mode = events.iter().any(|event| {
+            event.event_type == "workspace.context"
+                && event.payload.get("kind").and_then(Value::as_str)
+                    == Some(WORKSPACE_CONTEXT_PERMISSIONS_KIND)
+                && event
+                    .payload
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .is_some_and(|content| content.contains(collaboration_context.as_str()))
+        });
+        let current_mode_is_only_in_initial_permissions = latest_collaboration_context.is_none()
+            && permissions_contains_current_mode
+            && previous_collaboration_mode == Some(options.collaboration_mode);
+        if latest_collaboration_context != Some(collaboration_context.as_str())
+            && !current_mode_is_only_in_initial_permissions
+        {
+            let mut payload = serde_json::json!({
+                "mode": options.collaboration_mode.as_str(),
+                "content": collaboration_context,
+            });
+            if let Some(before_seq) = before_seq {
+                payload["before_seq"] = serde_json::json!(before_seq);
+            }
+            store.append_event(&session.id, COLLABORATION_CONTEXT_EVENT, payload)?;
+            appended = true;
+        }
+    }
+    if let Some(multi_agent_v2_usage_hint) = multi_agent_v2_usage_hint {
+        store.append_event(
+            &session.id,
+            "workspace.context",
+            serde_json::json!({
+                "kind": WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND,
+                "content": multi_agent_v2_usage_hint,
+            }),
+        )?;
+        appended = true;
+    }
+    if let Some(agents_context) = agents_context {
+        let AgentsMdLoad {
+            context,
+            sources,
+            warnings,
+            ..
+        } = agents_context;
+        if context.is_some() || !sources.is_empty() || !warnings.is_empty() {
+            let mut payload = serde_json::json!({
+                "kind": WORKSPACE_CONTEXT_AGENTS_KIND,
+                "sources": sources.clone(),
+                "warnings": warnings.clone(),
+            });
+            if let Some(content) = context.as_ref().map(|context| &context.content) {
+                payload["content"] = Value::String(content.clone());
+            }
+            store.append_event(&session.id, "workspace.context", payload)?;
+            appended = true;
+        }
+        if !sources.is_empty() {
+            store.append_event(
+                &session.id,
+                SESSION_INSTRUCTION_SOURCES_EVENT,
+                serde_json::json!({
+                    "source": "agents_md",
+                    "sources": sources.clone(),
+                }),
+            )?;
+            appended = true;
+        }
+        for warning in warnings {
+            store.append_event(
+                &session.id,
+                SESSION_STARTUP_WARNING_EVENT,
+                serde_json::json!({
+                    "source": "agents_md",
+                    "message": warning,
+                }),
+            )?;
+            appended = true;
+        }
+    }
+    if options.include_environment_context && config_include_environment_context {
+        let environment_snapshot =
+            environment_context_snapshot_for_session(store, session, options)?;
+        let environment_context = render_environment_context_snapshot(&environment_snapshot);
+        let previous_environment_snapshot = latest_environment_snapshot();
+        let compare_subagents = before_seq.is_none();
+        let should_append = previous_environment_snapshot.as_ref().map_or_else(
+            || {
+                latest_context_content(WORKSPACE_CONTEXT_ENVIRONMENT_KIND)
+                    != Some(environment_context.as_str())
+            },
+            |previous| {
+                !environment_context_equals_except_shell(
+                    previous,
+                    &environment_snapshot,
+                    compare_subagents,
+                )
+            },
+        );
+        if should_append {
+            let content = if let (Some(previous), Some(_)) =
+                (previous_environment_snapshot.as_ref(), before_seq)
+            {
+                render_environment_context_update(previous, &environment_snapshot)
+            } else {
+                environment_context
+            };
+            let mut payload = serde_json::json!({
+                "kind": WORKSPACE_CONTEXT_ENVIRONMENT_KIND,
+                "content": content,
+                "environment": environment_snapshot,
+            });
+            if let Some(before_seq) = before_seq {
+                payload["before_seq"] = serde_json::json!(before_seq);
+            }
+            store.append_event(&session.id, "workspace.context", payload)?;
+            appended = true;
+        }
+    } else if has_context_kind(WORKSPACE_CONTEXT_ENVIRONMENT_KIND) {
+        let mut payload = serde_json::json!({
+            "kind": WORKSPACE_CONTEXT_ENVIRONMENT_KIND,
+            "content": "",
+        });
+        if let Some(before_seq) = before_seq {
+            payload["before_seq"] = serde_json::json!(before_seq);
+        }
+        store.append_event(&session.id, "workspace.context", payload)?;
+        appended = true;
+    }
+    Ok(appended)
+}
+
+fn multi_agent_v2_usage_hint_text_for_session(
+    session: &SessionMeta,
+    config: &MultiAgentV2Config,
+) -> Option<String> {
+    let hint = if session.parent_id.is_some() {
+        config.subagent_usage_hint_text.as_deref()
+    } else {
+        config.root_agent_usage_hint_text.as_deref()
+    }?;
+    (!hint.trim().is_empty()).then(|| hint.to_string())
+}
+
 pub fn run_fake_agent(
     store: &Store,
     task_text: &str,
@@ -220,6 +965,7 @@ pub fn run_fake_agent(
                     call: ToolCall {
                         id: "call_python".to_string(),
                         name: "python".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({ "code": code }),
                     },
                 },
@@ -230,6 +976,7 @@ pub fn run_fake_agent(
                     call: ToolCall {
                         id: "call_done".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "result": "Python tool completed."
                         }),
@@ -257,15 +1004,13 @@ pub fn run_agent_with_provider<P: ModelProvider>(
     options: AgentRunOptions,
 ) -> Result<String> {
     let session = store.create_session(None, cwd.as_ref())?;
+    append_workspace_context_event_with_options(store, &session, &options)?;
     store.append_event(
         &session.id,
         "session.input",
         serde_json::json!({ "text": task_text }),
     )?;
-    let messages = vec![serde_json::json!({
-        "role": "user",
-        "content": task_text,
-    })];
+    let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
     run_loaded_session_with_provider(store, provider, session, messages, options)
 }
 
@@ -276,6 +1021,7 @@ pub fn run_agent_from_config(
     config: ProviderRunConfig,
 ) -> Result<String> {
     let session = store.create_session(None, cwd.as_ref())?;
+    append_workspace_context_event_with_options(store, &session, &config.options)?;
     store.append_event(
         &session.id,
         "session.input",
@@ -293,6 +1039,7 @@ pub fn run_existing_session_with_provider<P: ModelProvider>(
     let session = store
         .load_session(session_id)?
         .with_context(|| format!("unknown session id: {session_id}"))?;
+    append_workspace_context_event_with_options(store, &session, &options)?;
     let events = store.events_for_session(session_id)?;
     let messages = provider_messages_from_events(&events);
     run_loaded_session_with_provider(store, provider, session, messages, options)
@@ -303,17 +1050,99 @@ pub fn run_existing_session_from_config(
     session_id: &str,
     mut config: ProviderRunConfig,
 ) -> Result<String> {
+    let provider_kind = provider_backend_kind(config.backend).to_string();
+    let session = store
+        .load_session(session_id)?
+        .with_context(|| format!("unknown session id: {session_id}"))?;
+    let existing_events = store.events_for_session(&session.id)?;
+    let config_snapshot = latest_session_config_snapshot_from_events(&existing_events);
+    if let Some(snapshot) = config_snapshot
+        .as_ref()
+        .filter(|_| !run_config_has_model_resume_override(&config))
+    {
+        if config.model_source == RunConfigValueSource::Default {
+            config.model = snapshot.model.clone();
+        }
+        if config.options.model_provider_id_source == RunConfigValueSource::Default {
+            config.options.model_provider_id = Some(snapshot.model_provider_id.clone());
+        }
+    }
+    let provider_config = load_provider_config_for_session(&session, &config.options)?;
+    let selected_provider_id = config
+        .options
+        .model_provider_id
+        .clone()
+        .or(provider_config.model_provider_id.clone())
+        .unwrap_or_else(|| provider_kind.clone());
+    let snapshot_provider_info = config_snapshot
+        .as_ref()
+        .filter(|_| !run_config_has_model_resume_override(&config))
+        .and_then(|snapshot| snapshot.model_provider_info.as_ref())
+        .filter(|provider_info| provider_info.id == selected_provider_id)
+        .filter(|_| should_use_snapshot_provider_runtime_config(&config.options));
+    if selected_provider_id != provider_kind
+        && !provider_config
+            .model_providers
+            .contains_key(&selected_provider_id)
+        && snapshot_provider_info.is_none()
+    {
+        bail!(
+            "Model provider `{selected_provider_id}` is not available for `{provider_kind}` runs"
+        );
+    }
+    config.options.model_provider_id = Some(selected_provider_id.clone());
     install_config_child_agent_runner(store, &mut config);
-    config.options.analytics_provider_kind =
-        Some(provider_backend_kind(config.backend).to_string());
+    config.options.analytics_provider_kind = Some(provider_kind);
     config.options.analytics_model = Some(config.model.clone());
     match config.backend {
         ProviderBackend::Codex => {
+            if let Some(provider_info) = snapshot_provider_info {
+                let provider = configured_openai_responses_provider_from_snapshot(
+                    store,
+                    config.model.clone(),
+                    provider_info,
+                )?;
+                return run_existing_session_with_provider(
+                    store,
+                    &provider,
+                    session_id,
+                    config.options,
+                );
+            }
+            if let Some(provider) = configured_openai_responses_provider(
+                store,
+                config.model.clone(),
+                &provider_config,
+                &selected_provider_id,
+            )? {
+                return run_existing_session_with_provider(
+                    store,
+                    &provider,
+                    session_id,
+                    config.options,
+                );
+            }
             let provider = codex_provider(store, config.model)?;
             run_existing_session_with_provider(store, &provider, session_id, config.options)
         }
         ProviderBackend::Openai => {
-            let provider = openai_provider(store, config.model)?;
+            let provider = if let Some(provider_info) = snapshot_provider_info {
+                configured_openai_responses_provider_from_snapshot(
+                    store,
+                    config.model.clone(),
+                    provider_info,
+                )?
+            } else {
+                match configured_openai_responses_provider(
+                    store,
+                    config.model.clone(),
+                    &provider_config,
+                    &selected_provider_id,
+                )? {
+                    Some(provider) => provider,
+                    None => openai_provider(store, config.model)?,
+                }
+            };
             run_existing_session_with_provider(store, &provider, session_id, config.options)
         }
         ProviderBackend::Anthropic => {
@@ -348,6 +1177,25 @@ fn provider_backend_kind(backend: ProviderBackend) -> &'static str {
     }
 }
 
+fn selected_model_provider_id_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    provider_name: &str,
+) -> Result<String> {
+    if let Some(model_provider_id) = options
+        .model_provider_id
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    {
+        return Ok(model_provider_id.to_string());
+    }
+    let config = load_provider_config_for_session(session, options)?;
+    Ok(config
+        .model_provider_id
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| provider_name.to_string()))
+}
+
 fn install_config_child_agent_runner(store: &Store, config: &mut ProviderRunConfig) {
     let mut base_options = config.options.clone();
     base_options.child_agent_runner = None;
@@ -373,9 +1221,29 @@ fn config_child_agent_runner(
         let store = Store::open_with_optional_notifier(&state_dir, notifier.clone())?;
         let mut options = options.clone();
         retarget_managed_child_python_env(&mut options, &request.child_session_id);
+        options
+            .config_overrides
+            .extend(request.config_overrides.clone());
+        if let Some(reasoning_effort) = request.reasoning_effort.clone() {
+            options.config_overrides.push((
+                "model_reasoning_effort".to_string(),
+                toml::Value::String(reasoning_effort),
+            ));
+        }
+        if let Some(service_tier) = request.service_tier.clone() {
+            options.config_overrides.push((
+                "service_tier".to_string(),
+                toml::Value::String(service_tier),
+            ));
+        }
         let config = ProviderRunConfig {
             backend,
-            model: model.clone(),
+            model: request.model.clone().unwrap_or_else(|| model.clone()),
+            model_source: if request.model.is_some() {
+                RunConfigValueSource::Explicit
+            } else {
+                RunConfigValueSource::Default
+            },
             options,
             fake_result: fake_result.clone(),
         };
@@ -423,6 +1291,437 @@ fn safe_agent_env_segment(value: &str) -> String {
     }
 }
 
+fn load_provider_config_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+) -> Result<AgentsMdConfig> {
+    let mut warnings = Vec::new();
+    let mut config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    let selected_provider_id = options
+        .model_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            config
+                .model_provider_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .map(ToOwned::to_owned)
+        });
+    apply_selected_provider_model_catalog(&mut config, selected_provider_id.as_deref());
+    Ok(config)
+}
+
+pub fn model_catalog_for_cwd_with_options(
+    cwd: impl AsRef<Path>,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<ModelCatalog> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        cwd.as_ref(),
+        &mut warnings,
+        config_profile,
+        config_overrides,
+    )?;
+    Ok(config.model_catalog.unwrap_or_else(bundled_model_catalog))
+}
+
+pub fn model_catalog_for_cwd(cwd: impl AsRef<Path>) -> Result<ModelCatalog> {
+    model_catalog_for_cwd_with_options(cwd, None, &[])
+}
+
+pub fn configured_model_for_cwd_with_options(
+    cwd: impl AsRef<Path>,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<Option<String>> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        cwd.as_ref(),
+        &mut warnings,
+        config_profile,
+        config_overrides,
+    )?;
+    Ok(config
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(ToOwned::to_owned))
+}
+
+pub fn default_model_for_cwd_with_options(
+    cwd: impl AsRef<Path>,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+    chatgpt_mode: bool,
+) -> Result<String> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        cwd.as_ref(),
+        &mut warnings,
+        config_profile,
+        config_overrides,
+    )?;
+    if let Some(model) = config
+        .model
+        .as_deref()
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+    {
+        return Ok(model.to_string());
+    }
+    Ok(default_model_for_catalog(
+        &config.model_catalog.unwrap_or_else(bundled_model_catalog),
+        chatgpt_mode,
+    )
+    .unwrap_or_else(|| "gpt-5.5".to_string()))
+}
+
+pub fn default_model_for_catalog(catalog: &ModelCatalog, chatgpt_mode: bool) -> Option<String> {
+    catalog
+        .presets(chatgpt_mode)
+        .into_iter()
+        .find(|preset| preset.is_default)
+        .map(|preset| preset.id)
+}
+
+pub fn configured_model_provider_id_for_cwd_with_options(
+    cwd: impl AsRef<Path>,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<Option<String>> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        cwd.as_ref(),
+        &mut warnings,
+        config_profile,
+        config_overrides,
+    )?;
+    Ok(config
+        .model_provider_id
+        .map(|provider_id| provider_id.trim().to_string())
+        .filter(|provider_id| !provider_id.is_empty()))
+}
+
+fn configured_openai_responses_provider(
+    store: &Store,
+    model: String,
+    config: &AgentsMdConfig,
+    provider_id: &str,
+) -> Result<Option<OpenAIResponsesProvider>> {
+    let Some(provider_config) = config.model_providers.get(provider_id) else {
+        return Ok(None);
+    };
+    if provider_id == AMAZON_BEDROCK_PROVIDER_ID {
+        return configured_amazon_bedrock_responses_provider(model, provider_config).map(Some);
+    }
+    let base_url = provider_config
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let api_key = provider_api_key(store, provider_id, provider_config)?;
+    let request_options = provider_request_options(provider_config);
+    let mut provider = OpenAIResponsesProvider::with_optional_api_key(api_key, model, base_url)
+        .with_provider_name(provider_id)
+        .with_request_options(request_options);
+    if let Some(auth) = provider_config.auth.clone() {
+        provider = provider.with_command_auth_config(auth);
+    }
+    Ok(Some(provider))
+}
+
+fn configured_openai_responses_provider_from_snapshot(
+    store: &Store,
+    model: String,
+    snapshot: &SessionModelProviderInfoSnapshot,
+) -> Result<OpenAIResponsesProvider> {
+    if snapshot.wire_api != "responses" {
+        bail!(
+            "Model provider `{}` uses unsupported wire_api `{}`",
+            snapshot.id,
+            snapshot.wire_api
+        );
+    }
+    if snapshot.id == AMAZON_BEDROCK_PROVIDER_ID {
+        let provider_config = codex_model_provider_config_from_snapshot(snapshot)?;
+        return configured_amazon_bedrock_responses_provider(model, &provider_config);
+    }
+    let base_url = snapshot
+        .base_url
+        .clone()
+        .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+    let api_key = provider_api_key_from_snapshot(store, snapshot)?;
+    let request_options = provider_request_options_from_snapshot(snapshot);
+    let mut provider = OpenAIResponsesProvider::with_optional_api_key(api_key, model, base_url)
+        .with_provider_name(&snapshot.id)
+        .with_request_options(request_options);
+    if let Some(auth) = snapshot.auth.as_ref() {
+        provider = provider.with_command_auth_config(auth.to_config());
+    }
+    Ok(provider)
+}
+
+fn configured_amazon_bedrock_responses_provider(
+    model: String,
+    provider_config: &CodexModelProviderConfig,
+) -> Result<OpenAIResponsesProvider> {
+    let aws = provider_config.aws.clone().unwrap_or_default();
+    let request_options = provider_request_options(provider_config);
+    if let Some(api_key) = amazon_bedrock_bearer_token_from_env() {
+        let region = amazon_bedrock_region_from_config(&aws)?;
+        let base_url = amazon_bedrock_base_url(&region)?;
+        return Ok(
+            OpenAIResponsesProvider::with_optional_api_key(Some(api_key), model, base_url)
+                .with_provider_name(AMAZON_BEDROCK_PROVIDER_ID)
+                .with_request_options(request_options),
+        );
+    }
+    OpenAIResponsesProvider::with_amazon_bedrock_sigv4_auth(
+        model,
+        AmazonBedrockAwsAuthConfig {
+            profile: aws.profile,
+            region: aws.region,
+        },
+        request_options,
+    )
+}
+
+fn amazon_bedrock_bearer_token_from_env() -> Option<String> {
+    std::env::var(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR)
+        .ok()
+        .map(|token| token.trim().to_string())
+        .filter(|token| !token.is_empty())
+}
+
+fn amazon_bedrock_region_from_config(aws: &ModelProviderAwsAuthInfo) -> Result<String> {
+    aws.region
+        .as_deref()
+        .map(str::trim)
+        .filter(|region| !region.is_empty())
+        .map(ToOwned::to_owned)
+        .with_context(|| {
+            format!(
+                "Amazon Bedrock bearer token auth requires `model_providers.amazon-bedrock.aws.region`"
+            )
+        })
+}
+
+fn amazon_bedrock_base_url(region: &str) -> Result<String> {
+    amazon_bedrock_mantle_base_url(region)
+}
+
+fn provider_api_key(
+    store: &Store,
+    provider_id: &str,
+    provider_config: &CodexModelProviderConfig,
+) -> Result<Option<String>> {
+    if let Some(token) = provider_config
+        .experimental_bearer_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        return Ok(Some(token.to_string()));
+    }
+    if let Some(env_key) = provider_config.env_key.as_deref() {
+        let token = std::env::var(env_key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| {
+                provider_config
+                    .env_key_instructions
+                    .clone()
+                    .unwrap_or_else(|| format!("set {env_key} for model provider `{provider_id}`"))
+            })?;
+        return Ok(Some(token));
+    }
+    if provider_config.requires_openai_auth {
+        return stored_or_env(
+            store,
+            "auth.openai.api_key",
+            &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+        )
+        .with_context(|| format!("load OpenAI auth for model provider `{provider_id}`"));
+    }
+    Ok(None)
+}
+
+fn provider_api_key_from_snapshot(
+    store: &Store,
+    snapshot: &SessionModelProviderInfoSnapshot,
+) -> Result<Option<String>> {
+    if let Some(token) = snapshot
+        .experimental_bearer_token
+        .as_deref()
+        .filter(|token| !token.trim().is_empty())
+    {
+        return Ok(Some(token.to_string()));
+    }
+    if let Some(env_key) = snapshot.env_key.as_deref() {
+        let token = std::env::var(env_key)
+            .ok()
+            .filter(|value| !value.trim().is_empty())
+            .with_context(|| {
+                snapshot.env_key_instructions.clone().unwrap_or_else(|| {
+                    format!("set {env_key} for model provider `{}`", snapshot.id)
+                })
+            })?;
+        return Ok(Some(token));
+    }
+    if snapshot.requires_openai_auth {
+        return stored_or_env(
+            store,
+            "auth.openai.api_key",
+            &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+        )
+        .with_context(|| format!("load OpenAI auth for model provider `{}`", snapshot.id));
+    }
+    Ok(None)
+}
+
+fn provider_request_options(provider_config: &CodexModelProviderConfig) -> ProviderRequestOptions {
+    let mut headers = HashMap::new();
+    for (key, value) in &provider_config.http_headers {
+        headers.insert(key.clone(), value.clone());
+    }
+    for (header, env_key) in &provider_config.env_http_headers {
+        if let Ok(value) = std::env::var(env_key) {
+            if !value.trim().is_empty() {
+                headers.insert(header.clone(), value);
+            }
+        }
+    }
+    ProviderRequestOptions {
+        query_params: provider_config
+            .query_params
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        headers,
+    }
+}
+
+fn provider_request_options_from_snapshot(
+    snapshot: &SessionModelProviderInfoSnapshot,
+) -> ProviderRequestOptions {
+    let mut headers = HashMap::new();
+    for (key, value) in &snapshot.http_headers {
+        headers.insert(key.clone(), value.clone());
+    }
+    for (header, env_key) in &snapshot.env_http_headers {
+        if let Ok(value) = std::env::var(env_key) {
+            if !value.trim().is_empty() {
+                headers.insert(header.clone(), value);
+            }
+        }
+    }
+    ProviderRequestOptions {
+        query_params: snapshot
+            .query_params
+            .iter()
+            .map(|(key, value)| (key.clone(), value.clone()))
+            .collect(),
+        headers,
+    }
+}
+
+fn model_provider_info_snapshot(
+    provider_id: &str,
+    provider_config: &CodexModelProviderConfig,
+) -> SessionModelProviderInfoSnapshot {
+    SessionModelProviderInfoSnapshot {
+        id: provider_id.to_string(),
+        name: provider_config.name.clone(),
+        base_url: provider_config.base_url.clone(),
+        env_key: provider_config.env_key.clone(),
+        env_key_instructions: provider_config.env_key_instructions.clone(),
+        experimental_bearer_token: provider_config.experimental_bearer_token.clone(),
+        auth: provider_config
+            .auth
+            .as_ref()
+            .map(ProviderCommandAuthConfigSnapshot::from_config),
+        aws: provider_config.aws.clone(),
+        wire_api: codex_wire_api_key(provider_config.wire_api).to_string(),
+        query_params: provider_config.query_params.clone(),
+        http_headers: provider_config.http_headers.clone(),
+        env_http_headers: provider_config.env_http_headers.clone(),
+        request_max_retries: provider_config.request_max_retries,
+        stream_max_retries: provider_config.stream_max_retries,
+        stream_idle_timeout_ms: provider_config.stream_idle_timeout_ms,
+        websocket_connect_timeout_ms: provider_config.websocket_connect_timeout_ms,
+        requires_openai_auth: provider_config.requires_openai_auth,
+        supports_websockets: provider_config.supports_websockets,
+    }
+}
+
+fn codex_model_provider_config_from_snapshot(
+    snapshot: &SessionModelProviderInfoSnapshot,
+) -> Result<CodexModelProviderConfig> {
+    Ok(CodexModelProviderConfig {
+        name: snapshot.name.clone(),
+        base_url: snapshot.base_url.clone(),
+        env_key: snapshot.env_key.clone(),
+        env_key_instructions: snapshot.env_key_instructions.clone(),
+        experimental_bearer_token: snapshot.experimental_bearer_token.clone(),
+        wire_api: parse_codex_wire_api(&snapshot.wire_api)?,
+        query_params: snapshot.query_params.clone(),
+        http_headers: snapshot.http_headers.clone(),
+        env_http_headers: snapshot.env_http_headers.clone(),
+        request_max_retries: snapshot.request_max_retries,
+        stream_max_retries: snapshot.stream_max_retries,
+        stream_idle_timeout_ms: snapshot.stream_idle_timeout_ms,
+        websocket_connect_timeout_ms: snapshot.websocket_connect_timeout_ms,
+        requires_openai_auth: snapshot.requires_openai_auth,
+        supports_websockets: snapshot.supports_websockets,
+        auth: snapshot
+            .auth
+            .as_ref()
+            .map(ProviderCommandAuthConfigSnapshot::to_config),
+        aws: snapshot.aws.clone(),
+    })
+}
+
+fn apply_model_provider_info_snapshot_to_config(
+    config: &mut AgentsMdConfig,
+    snapshot: &SessionModelProviderInfoSnapshot,
+) -> Result<()> {
+    let provider = codex_model_provider_config_from_snapshot(snapshot)?;
+    if let Some(request_max_retries) = provider.request_max_retries {
+        config.provider_request_max_retries.insert(
+            snapshot.id.clone(),
+            request_max_retries.min(MAX_REQUEST_MAX_RETRIES),
+        );
+    } else {
+        config.provider_request_max_retries.remove(&snapshot.id);
+    }
+    if let Some(stream_max_retries) = provider.stream_max_retries {
+        config.provider_stream_max_retries.insert(
+            snapshot.id.clone(),
+            stream_max_retries.min(MAX_STREAM_MAX_RETRIES),
+        );
+    } else {
+        config.provider_stream_max_retries.remove(&snapshot.id);
+    }
+    if let Some(stream_idle_timeout_ms) = provider.stream_idle_timeout_ms {
+        config
+            .provider_stream_idle_timeout_ms
+            .insert(snapshot.id.clone(), stream_idle_timeout_ms);
+    } else {
+        config.provider_stream_idle_timeout_ms.remove(&snapshot.id);
+    }
+    config.model_providers.insert(snapshot.id.clone(), provider);
+    Ok(())
+}
+
 fn openai_provider(store: &Store, model: String) -> Result<OpenAIResponsesProvider> {
     let api_key = stored_or_env(
         store,
@@ -442,16 +1741,19 @@ fn openai_provider(store: &Store, model: String) -> Result<OpenAIResponsesProvid
 }
 
 fn codex_provider(store: &Store, model: String) -> Result<CodexResponsesProvider> {
-    let auth = match stored_codex_auth(store)? {
-        Some(auth) => auth,
-        None => load_codex_auth()?,
-    };
     let base_url = setting_or_env_or_default(
         store,
         "auth.codex.base_url",
         &["LLM_BROWSER_CODEX_BASE_URL"],
         "https://chatgpt.com/backend-api",
     )?;
+    if let Some(auth) = stored_codex_managed_auth(store)? {
+        return CodexResponsesProvider::with_managed_base_url(auth, model, base_url);
+    }
+    let auth = match stored_codex_auth(store)? {
+        Some(auth) => auth,
+        None => load_codex_auth()?,
+    };
     Ok(CodexResponsesProvider::with_base_url(auth, model, base_url))
 }
 
@@ -467,10 +1769,25 @@ fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesP
         .as_deref()
         .is_some_and(is_claude_code_account)
     {
-        let auth_token = claude_code_access_token(store)?;
-        return Ok(AnthropicMessagesProvider::with_auth_token(
-            auth_token, model, base_url,
-        ));
+        return match claude_code_provider_auth(store)? {
+            ClaudeCodeProviderAuth::Refreshable(credential) => {
+                let state_dir = store.state_dir().to_path_buf();
+                Ok(
+                    AnthropicMessagesProvider::with_claude_code_oauth_persistence(
+                        credential,
+                        model,
+                        base_url,
+                        move |credential| {
+                            let store = Store::open(&state_dir)?;
+                            store_claude_code_oauth(&store, credential)
+                        },
+                    ),
+                )
+            }
+            ClaudeCodeProviderAuth::StaticToken(auth_token) => Ok(
+                AnthropicMessagesProvider::with_auth_token(auth_token, model, base_url),
+            ),
+        };
     }
     let api_key = stored_or_env(
         store,
@@ -480,6 +1797,42 @@ fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesP
     .context("run `auth login anthropic --api-key ...` or set LLM_BROWSER_ANTHROPIC_API_KEY")?;
     Ok(AnthropicMessagesProvider::with_base_url(
         api_key, model, base_url,
+    ))
+}
+
+enum ClaudeCodeProviderAuth {
+    Refreshable(ClaudeCodeOAuthCredential),
+    StaticToken(String),
+}
+
+fn claude_code_provider_auth(store: &Store) -> Result<ClaudeCodeProviderAuth> {
+    if let Some(refresh_token) = store.get_setting("auth.claude_code.refresh_token")? {
+        let refresh_token = refresh_token.trim().to_string();
+        if !refresh_token.is_empty() {
+            let access_token = store
+                .get_setting("auth.claude_code.access_token")?
+                .unwrap_or_default();
+            let expires_ms = store
+                .get_setting("auth.claude_code.expires_ms")?
+                .and_then(|value| value.parse::<i64>().ok())
+                .unwrap_or(0);
+            if access_token.trim().is_empty() || expires_ms <= now_ms() + 60_000 {
+                let credential = refresh_claude_code_oauth(&refresh_token)
+                    .context("refresh Claude Code OAuth token")?;
+                store_claude_code_oauth(store, &credential)?;
+                return Ok(ClaudeCodeProviderAuth::Refreshable(credential));
+            }
+            return Ok(ClaudeCodeProviderAuth::Refreshable(
+                ClaudeCodeOAuthCredential {
+                    access_token: access_token.trim().to_string(),
+                    refresh_token,
+                    expires_ms,
+                },
+            ));
+        }
+    }
+    Ok(ClaudeCodeProviderAuth::StaticToken(
+        claude_code_access_token(store)?,
     ))
 }
 
@@ -580,10 +1933,35 @@ fn stored_codex_auth(store: &Store) -> Result<Option<CodexAuth>> {
     if access_token.trim().is_empty() || account_id.trim().is_empty() {
         return Ok(None);
     }
-    Ok(Some(CodexAuth {
-        access_token,
-        account_id,
-    }))
+    Ok(Some(CodexAuth::new(access_token, account_id)))
+}
+
+fn stored_codex_managed_auth(store: &Store) -> Result<Option<CodexManagedAuth>> {
+    let Some(auth) = stored_codex_auth(store)? else {
+        return Ok(None);
+    };
+    let source_path = store
+        .get_setting("auth.codex.source_path")?
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from);
+    let refresh_token = store
+        .get_setting("auth.codex.refresh_token")?
+        .filter(|value| !value.trim().is_empty());
+    if source_path.is_none() && refresh_token.is_none() {
+        return Ok(None);
+    }
+    let id_token = store
+        .get_setting("auth.codex.id_token")?
+        .filter(|value| !value.trim().is_empty());
+    let last_refresh = store.get_setting("auth.codex.last_refresh")?;
+    Ok(Some(CodexManagedAuth::from_stored_parts(
+        auth.access_token,
+        auth.account_id,
+        id_token,
+        refresh_token,
+        source_path,
+        last_refresh,
+    )))
 }
 
 fn stored_or_env(store: &Store, setting_key: &str, env_names: &[&str]) -> Result<Option<String>> {
@@ -605,6 +1983,400 @@ fn setting_or_env_or_default(
     default: &str,
 ) -> Result<String> {
     Ok(stored_or_env(store, setting_key, env_names)?.unwrap_or_else(|| default.to_string()))
+}
+
+#[derive(Debug)]
+struct RemoteModelsResponse {
+    models: Vec<ModelCatalogEntryInfo>,
+    etag: Option<String>,
+}
+
+fn maybe_refresh_model_catalog_online_if_uncached(
+    store: &Store,
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    config: &mut AgentsMdConfig,
+    model_provider_id: &str,
+    provider_name: &str,
+) -> Result<()> {
+    if !config.model_catalog_refresh_allowed || config.model_catalog.is_some() {
+        return Ok(());
+    }
+    if session
+        .parent_id
+        .as_deref()
+        .is_some_and(|parent_id| !parent_id.is_empty())
+    {
+        return Ok(());
+    }
+    refresh_model_catalog_online(
+        store,
+        session,
+        options,
+        config,
+        model_provider_id,
+        provider_name,
+    )
+}
+
+fn refresh_model_catalog_after_models_etag(
+    store: &Store,
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    config: &mut AgentsMdConfig,
+    model_provider_id: &str,
+    provider_name: &str,
+    etag: &str,
+) -> Result<()> {
+    if !config.model_catalog_refresh_allowed {
+        return Ok(());
+    }
+    if config.model_catalog_cache_etag.as_deref() == Some(etag) {
+        if let Some(codex_home) = codex_home_dir() {
+            let _ = renew_models_cache_ttl(&codex_home);
+        }
+        return Ok(());
+    }
+    refresh_model_catalog_online(
+        store,
+        session,
+        options,
+        config,
+        model_provider_id,
+        provider_name,
+    )
+}
+
+fn refresh_model_catalog_online(
+    store: &Store,
+    _session: &SessionMeta,
+    _options: &AgentRunOptions,
+    config: &mut AgentsMdConfig,
+    model_provider_id: &str,
+    provider_name: &str,
+) -> Result<()> {
+    let Some(endpoint) =
+        remote_models_endpoint_for_provider(store, config, model_provider_id, provider_name)?
+    else {
+        return Ok(());
+    };
+    let Some(codex_home) = codex_home_dir() else {
+        return Ok(());
+    };
+    let response = match fetch_remote_models(endpoint) {
+        Ok(response) => response,
+        Err(_) => return Ok(()),
+    };
+    let remote_models = response.models;
+    let etag = response.etag;
+    let _ = persist_models_cache(&codex_home, remote_models.clone(), etag.clone());
+    config.model_catalog = Some(model_catalog_from_remote_models(remote_models, true));
+    config.model_catalog_cache_etag = etag;
+    Ok(())
+}
+
+#[derive(Debug)]
+struct RemoteModelsEndpoint {
+    url: String,
+    auth: RemoteModelsAuth,
+    request_options: ProviderRequestOptions,
+}
+
+#[derive(Clone, Debug)]
+enum RemoteModelsAuth {
+    Codex {
+        access_token: String,
+        account_id: String,
+    },
+    ManagedCodex(CodexManagedAuth),
+    Command(ProviderCommandAuth),
+}
+
+fn remote_models_endpoint_for_provider(
+    store: &Store,
+    config: &AgentsMdConfig,
+    model_provider_id: &str,
+    provider_name: &str,
+) -> Result<Option<RemoteModelsEndpoint>> {
+    if let Some(provider_config) = config.model_providers.get(model_provider_id) {
+        if let Some(auth) = provider_config.auth.clone() {
+            let base_url = provider_config
+                .base_url
+                .clone()
+                .unwrap_or_else(|| "https://api.openai.com/v1".to_string());
+            return Ok(Some(RemoteModelsEndpoint {
+                url: openai_models_url(&base_url),
+                auth: RemoteModelsAuth::Command(ProviderCommandAuth::new(auth)),
+                request_options: provider_request_options(provider_config),
+            }));
+        }
+    }
+    if model_provider_id != "codex" && provider_name != "codex" {
+        return Ok(None);
+    }
+    let managed_auth = stored_codex_managed_auth(store)?;
+    let auth = if managed_auth.is_none() {
+        stored_codex_auth(store)?.or_else(|| load_codex_auth().ok())
+    } else {
+        None
+    };
+    if managed_auth.is_none() && auth.is_none() {
+        return Ok(None);
+    }
+    let base_url = setting_or_env_or_default(
+        store,
+        "auth.codex.base_url",
+        &["LLM_BROWSER_CODEX_BASE_URL"],
+        "https://chatgpt.com/backend-api",
+    )?;
+    let auth = if let Some(managed_auth) = managed_auth {
+        RemoteModelsAuth::ManagedCodex(managed_auth)
+    } else {
+        let auth = auth.expect("checked auth presence");
+        RemoteModelsAuth::Codex {
+            access_token: auth.access_token,
+            account_id: auth.account_id,
+        }
+    };
+    Ok(Some(RemoteModelsEndpoint {
+        url: codex_models_url(&base_url),
+        auth,
+        request_options: ProviderRequestOptions::default(),
+    }))
+}
+
+fn fetch_remote_models(endpoint: RemoteModelsEndpoint) -> Result<RemoteModelsResponse> {
+    let client = reqwest::blocking::Client::builder()
+        .timeout(MODELS_REFRESH_TIMEOUT)
+        .build()?;
+    let response = match &endpoint.auth {
+        RemoteModelsAuth::Codex {
+            access_token,
+            account_id,
+        } => send_remote_models_request(
+            &client,
+            &endpoint,
+            Some(access_token),
+            Some(account_id),
+            true,
+        )?,
+        RemoteModelsAuth::ManagedCodex(managed_auth) => {
+            let _ = managed_auth.refresh_if_stale();
+            let auth = managed_auth.current_auth()?;
+            send_remote_models_request(
+                &client,
+                &endpoint,
+                Some(&auth.access_token),
+                Some(&auth.account_id),
+                true,
+            )?
+        }
+        RemoteModelsAuth::Command(command_auth) => {
+            let token = command_auth.access_token()?;
+            let response =
+                send_remote_models_request(&client, &endpoint, Some(&token), None, false)?;
+            if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                let refreshed = command_auth.refresh_access_token()?;
+                send_remote_models_request(&client, &endpoint, Some(&refreshed), None, false)?
+            } else {
+                response
+            }
+        }
+    };
+    let status = response.status();
+    let headers = response.headers().clone();
+    let body = response.text().unwrap_or_default();
+    if !status.is_success() {
+        bail!("Codex models request failed ({status}): {body}");
+    }
+    let catalog: ModelCatalog =
+        serde_json::from_str(&body).context("parse Codex models response")?;
+    let etag = headers
+        .get(reqwest::header::ETAG)
+        .and_then(|value| value.to_str().ok())
+        .map(ToOwned::to_owned);
+    Ok(RemoteModelsResponse {
+        models: catalog.models,
+        etag,
+    })
+}
+
+fn send_remote_models_request(
+    client: &reqwest::blocking::Client,
+    endpoint: &RemoteModelsEndpoint,
+    bearer_token: Option<&str>,
+    chatgpt_account_id: Option<&str>,
+    include_originator: bool,
+) -> reqwest::Result<reqwest::blocking::Response> {
+    let mut request = client
+        .get(&endpoint.url)
+        .query(&[("client_version", codex_client_version_to_whole())]);
+    for (key, value) in &endpoint.request_options.query_params {
+        request = request.query(&[(key.as_str(), value.as_str())]);
+    }
+    for (key, value) in &endpoint.request_options.headers {
+        request = request.header(key, value);
+    }
+    if let Some(token) = bearer_token.filter(|token| !token.trim().is_empty()) {
+        request = request.bearer_auth(token);
+    }
+    if let Some(account_id) = chatgpt_account_id.filter(|account_id| !account_id.trim().is_empty())
+    {
+        request = request.header("chatgpt-account-id", account_id);
+    }
+    if include_originator {
+        request = request.header("originator", "browser-use-terminal");
+    }
+    request.send()
+}
+
+fn openai_models_url(base_url: &str) -> String {
+    let normalized = base_url.trim_end_matches('/');
+    if normalized.ends_with("/models") {
+        normalized.to_string()
+    } else {
+        format!("{normalized}/models")
+    }
+}
+
+fn codex_models_url(base_url: &str) -> String {
+    let normalized = base_url.trim_end_matches('/');
+    if normalized.ends_with("/codex/models") {
+        normalized.to_string()
+    } else if normalized.ends_with("/codex") {
+        format!("{normalized}/models")
+    } else {
+        format!("{normalized}/codex/models")
+    }
+}
+
+fn codex_responses_extra_headers(
+    store: &Store,
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    turn_metadata_header: Option<&str>,
+) -> Result<HashMap<String, String>> {
+    let mut headers = HashMap::new();
+    headers.insert(CODEX_HTTP_SESSION_ID_HEADER.to_string(), session.id.clone());
+    headers.insert(CODEX_HTTP_THREAD_ID_HEADER.to_string(), session.id.clone());
+    headers.insert(
+        CODEX_HTTP_CLIENT_REQUEST_ID_HEADER.to_string(),
+        session.id.clone(),
+    );
+    headers.insert(
+        CODEX_WINDOW_ID_HEADER.to_string(),
+        stable_codex_window_id(store)?,
+    );
+    if let Some(parent_id) = session.parent_id.as_deref().filter(|id| !id.is_empty()) {
+        headers.insert(
+            OPENAI_SUBAGENT_HEADER.to_string(),
+            OPENAI_SUBAGENT_COLLAB_SPAWN.to_string(),
+        );
+        headers.insert(
+            CODEX_PARENT_THREAD_ID_HEADER.to_string(),
+            parent_id.to_string(),
+        );
+    }
+    if let Some(turn_metadata_header) =
+        turn_metadata_header.filter(|value| !value.trim().is_empty())
+    {
+        headers.insert(
+            CODEX_TURN_METADATA_HEADER.to_string(),
+            turn_metadata_header.to_string(),
+        );
+    }
+    if let Some(beta_features_header) = codex_beta_features_header_for_session(session, options)? {
+        headers.insert(CODEX_BETA_FEATURES_HEADER.to_string(), beta_features_header);
+    }
+    Ok(headers)
+}
+
+fn codex_beta_features_header_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+) -> Result<Option<String>> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    Ok(config.beta_features_header())
+}
+
+fn codex_responses_turn_metadata_header(
+    session: &SessionMeta,
+    lifecycle: &CodexTurnLifecycle,
+) -> Result<String> {
+    let thread_source = if session
+        .parent_id
+        .as_deref()
+        .is_some_and(|parent_id| !parent_id.is_empty())
+    {
+        "subagent"
+    } else {
+        "user"
+    };
+    let metadata = serde_json::json!({
+        "session_id": session.id.clone(),
+        "thread_id": session.id.clone(),
+        "thread_source": thread_source,
+        "turn_id": lifecycle.turn_id.clone(),
+        "sandbox": "none",
+        "turn_started_at_unix_ms": lifecycle.started_at_ms,
+    });
+    json_to_ascii_string(&metadata)
+}
+
+fn json_to_ascii_string(value: &Value) -> Result<String> {
+    let raw = serde_json::to_string(value)?;
+    let mut out = String::with_capacity(raw.len());
+    for ch in raw.chars() {
+        if ch.is_ascii() {
+            out.push(ch);
+            continue;
+        }
+        let code = ch as u32;
+        if code <= 0xffff {
+            write!(&mut out, "\\u{code:04x}")?;
+        } else {
+            let code = code - 0x1_0000;
+            let high = 0xd800 + ((code >> 10) & 0x3ff);
+            let low = 0xdc00 + (code & 0x3ff);
+            write!(&mut out, "\\u{high:04x}\\u{low:04x}")?;
+        }
+    }
+    Ok(out)
+}
+
+fn codex_responses_client_metadata(store: &Store) -> Result<HashMap<String, String>> {
+    Ok(HashMap::from([(
+        CODEX_INSTALLATION_ID_HEADER.to_string(),
+        stable_codex_installation_id(store)?,
+    )]))
+}
+
+fn stable_codex_installation_id(store: &Store) -> Result<String> {
+    if let Some(installation_id) = store.get_setting(CODEX_INSTALLATION_ID_SETTING)? {
+        if !installation_id.trim().is_empty() {
+            return Ok(installation_id);
+        }
+    }
+    let installation_id = uuid::Uuid::new_v4().to_string();
+    store.set_setting(CODEX_INSTALLATION_ID_SETTING, &installation_id)?;
+    Ok(installation_id)
+}
+
+fn stable_codex_window_id(store: &Store) -> Result<String> {
+    if let Some(window_id) = store.get_setting(CODEX_WINDOW_ID_SETTING)? {
+        if !window_id.trim().is_empty() {
+            return Ok(window_id);
+        }
+    }
+    let window_id = uuid::Uuid::new_v4().to_string();
+    store.set_setting(CODEX_WINDOW_ID_SETTING, &window_id)?;
+    Ok(window_id)
 }
 
 fn task_analytics_properties(session: &SessionMeta, options: &AgentRunOptions) -> Value {
@@ -632,6 +2404,7 @@ fn task_analytics_summary_from_events(events: &[EventRecord]) -> Value {
     let mut input_cached_tokens = 0_i64;
     let mut input_cache_creation_tokens = 0_i64;
     let mut output_tokens = 0_i64;
+    let mut reasoning_output_tokens = 0_i64;
     let mut total_tokens = 0_i64;
     let mut tool_counts = BTreeMap::<String, i64>::new();
 
@@ -648,6 +2421,8 @@ fn task_analytics_summary_from_events(events: &[EventRecord]) -> Value {
                 input_cache_creation_tokens +=
                     json_payload_i64(&event.payload, "input_cache_creation_tokens");
                 output_tokens += event_output_tokens;
+                reasoning_output_tokens +=
+                    json_payload_i64(&event.payload, "reasoning_output_tokens");
                 total_tokens += if event_total_tokens > 0 {
                     event_total_tokens
                 } else {
@@ -672,6 +2447,7 @@ fn task_analytics_summary_from_events(events: &[EventRecord]) -> Value {
         "input_cached_tokens": input_cached_tokens,
         "input_cache_creation_tokens": input_cache_creation_tokens,
         "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
         "total_tokens": total_tokens,
         "tool_call_count": tool_call_count,
         "unique_tool_count": tool_counts.len(),
@@ -754,6 +2530,8 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             }),
         )?;
     }
+    let mut codex_lifecycle = None::<CodexTurnLifecycle>;
+    let mut turn_time_to_first_token_ms = None::<i64>;
     let result = (|| -> Result<String> {
         let mut python_env = options.python_env.clone();
         if !python_env
@@ -781,14 +2559,217 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 "session.status",
                 serde_json::json!({ "status": "running" }),
             )?;
-            store.append_event(
+            let pre_run_events = store.events_for_session(&session.id)?;
+            let config_snapshot = latest_session_config_snapshot_from_events(&pre_run_events);
+            let previous_model = latest_model_name_from_events(&pre_run_events);
+            let model_switch_before_seq = current_turn_user_message_seq(&pre_run_events);
+            let current_personality = provider_personality_for_session(&session, &options)?;
+            let model_provider_id = selected_model_provider_id_for_session(
+                &session,
+                &options,
+                provider.provider_name(),
+            )?;
+            let mut turn_config = load_provider_config_for_session(&session, &options)?;
+            if let Some(provider_info) = config_snapshot
+                .as_ref()
+                .filter(|snapshot| {
+                    snapshot.model == provider.model_name()
+                        && snapshot.model_provider_id == model_provider_id
+                })
+                .and_then(|snapshot| snapshot.model_provider_info.as_ref())
+                .filter(|provider_info| provider_info.id == model_provider_id)
+                .filter(|_| should_use_snapshot_provider_runtime_config(&options))
+            {
+                apply_model_provider_info_snapshot_to_config(&mut turn_config, provider_info)?;
+            }
+            maybe_refresh_model_catalog_online_if_uncached(
+                store,
+                &session,
+                &options,
+                &mut turn_config,
+                &model_provider_id,
+                provider.provider_name(),
+            )?;
+            let model_config_event = store.append_event(
                 &session.id,
                 "model.config",
                 serde_json::json!({
-                    "provider": provider.provider_name(),
+                    "provider": model_provider_id,
                     "model": provider.model_name(),
+                    "personality": model_personality_key(current_personality),
                 }),
             )?;
+            let turn_instructions = provider_base_instructions_for_session(
+                store,
+                &session,
+                &options,
+                provider.model_name(),
+            )?;
+            let mut model_settings =
+                provider_model_request_settings_for_session(&session, &options)?;
+            let mut model_request_info =
+                resolved_model_request_info_from_config(&turn_config, provider.model_name());
+            let request_max_retries =
+                provider_request_max_retries_for_session(&session, &options, &model_provider_id)?;
+            let (stream_max_retries, stream_idle_timeout_ms) =
+                provider_stream_config_for_session(&session, &options, &model_provider_id)?;
+            let matching_config_snapshot = config_snapshot.as_ref().filter(|snapshot| {
+                snapshot.model == provider.model_name()
+                    && snapshot.model_provider_id == model_provider_id
+            });
+            let model_provider_info_snapshot = matching_config_snapshot
+                .and_then(|snapshot| snapshot.model_provider_info.clone())
+                .filter(|provider_info| provider_info.id == model_provider_id)
+                .filter(|_| should_use_snapshot_provider_runtime_config(&options))
+                .or_else(|| {
+                    turn_config
+                        .model_providers
+                        .get(&model_provider_id)
+                        .map(|provider_config| {
+                            model_provider_info_snapshot(&model_provider_id, provider_config)
+                        })
+                });
+            if let Some(snapshot) = matching_config_snapshot {
+                if should_use_snapshot_model_settings(&options, snapshot) {
+                    model_settings = snapshot.model_settings.clone();
+                }
+                if should_use_snapshot_model_request_info(&options) {
+                    model_request_info = snapshot.model_request_info.clone();
+                }
+            }
+            let (request_max_retries, stream_max_retries, stream_idle_timeout_ms) =
+                if let Some(snapshot) = matching_config_snapshot
+                    .filter(|_| should_use_snapshot_provider_runtime_config(&options))
+                {
+                    (
+                        snapshot.request_max_retries,
+                        snapshot.stream_max_retries,
+                        snapshot.stream_idle_timeout_ms,
+                    )
+                } else {
+                    (
+                        request_max_retries,
+                        stream_max_retries,
+                        stream_idle_timeout_ms,
+                    )
+                };
+            if previous_model
+                .as_deref()
+                .is_some_and(|previous| previous != provider.model_name())
+            {
+                model_settings = model_switch_request_settings_for_model_with_catalog(
+                    provider.model_name(),
+                    &model_settings,
+                    turn_config.model_catalog.as_ref(),
+                );
+            }
+            if let Some(model_switch_context) = model_switch_context_for_session(
+                &session,
+                &options,
+                previous_model.as_deref(),
+                provider.model_name(),
+            )? {
+                let mut payload = serde_json::json!({
+                    "previous_model": previous_model,
+                    "model": provider.model_name(),
+                    "content": model_switch_context,
+                });
+                if let Some(before_seq) = model_switch_before_seq {
+                    payload["before_seq"] = serde_json::json!(before_seq);
+                }
+                let content = payload
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                store.append_event(&session.id, MODEL_SWITCH_CONTEXT_EVENT, payload)?;
+                insert_model_switch_context_message(
+                    &mut messages,
+                    model_switch_context_message(content),
+                );
+            }
+            if let Some(personality_context) = personality_context_for_session(
+                &session,
+                &options,
+                &pre_run_events,
+                previous_model.as_deref(),
+                provider.model_name(),
+                current_personality,
+                turn_instructions.as_deref(),
+            )? {
+                let mut payload = serde_json::json!({
+                    "personality": model_personality_key(current_personality),
+                    "content": personality_context,
+                });
+                if let Some(before_seq) = model_switch_before_seq {
+                    payload["before_seq"] = serde_json::json!(before_seq);
+                }
+                let content = payload
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                store.append_event(&session.id, PERSONALITY_CONTEXT_EVENT, payload)?;
+                insert_model_switch_context_message(
+                    &mut messages,
+                    personality_context_message(content),
+                );
+            }
+            if let Some(turn_seq) = model_switch_before_seq {
+                append_context_baseline_event(
+                    store,
+                    &session,
+                    &run_id,
+                    turn_seq,
+                    &model_provider_id,
+                    provider.model_name(),
+                    current_personality,
+                    options.collaboration_mode,
+                    &model_settings,
+                    model_config_event.seq,
+                )?;
+            }
+            append_session_config_snapshot_event(
+                store,
+                &session,
+                options
+                    .analytics_provider_kind
+                    .as_deref()
+                    .unwrap_or_else(|| provider.provider_name()),
+                provider.provider_name(),
+                &model_provider_id,
+                model_provider_info_snapshot.as_ref(),
+                provider.model_name(),
+                current_personality,
+                options.collaboration_mode,
+                &model_settings,
+                &model_request_info,
+                request_max_retries,
+                stream_max_retries,
+                stream_idle_timeout_ms,
+            )?;
+            let mut model_context_window = model_request_info
+                .resolved_context_window()
+                .or_else(|| model_context_window_for_options(&options));
+            maybe_append_recomputed_codex_token_count_after_history_rewrite(
+                store,
+                &session.id,
+                &messages,
+                turn_instructions.as_deref(),
+                model_context_window,
+            )?;
+            codex_lifecycle = Some(codex_turn_lifecycle(
+                store,
+                &session,
+                &run_id,
+                &model_provider_id,
+                provider.model_name(),
+                current_personality,
+                options.collaboration_mode,
+                &model_settings,
+                model_context_window,
+                agent_span.trace_id(),
+            )?);
 
             let mut deadline_warning_emitted = false;
             let mut last_external_session_message_seq =
@@ -802,11 +2783,14 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &mut last_external_session_message_seq,
                 )?;
                 normalize_provider_messages(&mut messages);
-                maybe_compact_messages(
+                maybe_compact_messages_with_context(
                     store,
                     &session.id,
                     &mut messages,
                     options.max_context_chars,
+                    turn_instructions.as_deref(),
+                    model_context_window,
+                    Some(turn_idx),
                 )?;
                 normalize_provider_messages(&mut messages);
                 if maybe_emit_deadline_warning(
@@ -831,7 +2815,12 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 );
 
                 let turn_messages = messages.clone();
-                let turn_tools = browser_tool_specs();
+                let turn_tools = browser_tool_specs_for_session(
+                    &session,
+                    &options,
+                    provider.model_name(),
+                    provider.supports_namespace_tools(),
+                )?;
                 let model_span = telemetry.start_model_turn_span(ModelTurnSpanInput {
                     parent: &step_span,
                     session_id: &session.id,
@@ -841,83 +2830,68 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     messages: &turn_messages,
                     tools: &turn_tools,
                 });
-                let provider_events = match start_provider_turn_with_retries(
+                let provider_turn_result = match start_provider_turn_with_retries(
                     store,
                     &session.id,
                     provider,
-                    ProviderTurn {
-                        messages: turn_messages,
-                        tools: turn_tools.clone(),
+                    {
+                        let turn_client_metadata = codex_responses_client_metadata(store)?;
+                        let turn_metadata_header = codex_lifecycle
+                            .as_ref()
+                            .map(|lifecycle| {
+                                codex_responses_turn_metadata_header(&session, lifecycle)
+                            })
+                            .transpose()?;
+                        ProviderTurn {
+                            instructions: turn_instructions.clone(),
+                            model_settings: model_settings.clone(),
+                            model_request_info: Some(model_request_info.clone()),
+                            request_max_retries,
+                            stream_max_retries,
+                            stream_idle_timeout_ms,
+                            messages: turn_messages,
+                            tools: turn_tools.clone(),
+                            output_schema: options.final_output_json_schema.clone(),
+                            output_schema_strict: options.final_output_json_schema_strict,
+                            prompt_cache_key: Some(session.id.clone()),
+                            client_metadata: Some(turn_client_metadata),
+                            extra_headers: Some(codex_responses_extra_headers(
+                                store,
+                                &session,
+                                &options,
+                                turn_metadata_header.as_deref(),
+                            )?),
+                            ..ProviderTurn::default()
+                        }
                     },
                     turn_idx,
                 ) {
-                    Ok(events) => {
+                    Ok(result) => {
                         telemetry.record_model_events(
                             &model_span,
                             provider.provider_name(),
                             turn_idx,
-                            &events,
+                            &result.events,
                         );
-                        events
+                        result
                     }
                     Err(error) => {
-                        if is_context_overflow_provider_error(&format!("{error:#}")) {
-                            model_span.record_error(error.as_ref());
-                            store.append_event(
-                                &session.id,
-                                "model.turn.context_overflow",
-                                serde_json::json!({
-                                    "turn_idx": turn_idx,
-                                    "provider": provider.provider_name(),
-                                    "model": provider.model_name(),
-                                    "error": format!("{error:#}"),
-                                    "action": "compact_and_retry_once",
-                                }),
-                            )?;
-                            force_compact_messages(
-                                store,
-                                &session.id,
-                                &mut messages,
-                                options.max_context_chars,
-                                "provider_context_overflow",
-                            )?;
-                            normalize_provider_messages(&mut messages);
-                            let retry_messages = messages.clone();
-                            match start_provider_turn_with_retries(
-                                store,
-                                &session.id,
-                                provider,
-                                ProviderTurn {
-                                    messages: retry_messages,
-                                    tools: turn_tools,
-                                },
-                                turn_idx,
-                            ) {
-                                Ok(events) => {
-                                    telemetry.record_model_events(
-                                        &model_span,
-                                        provider.provider_name(),
-                                        turn_idx,
-                                        &events,
-                                    );
-                                    events
-                                }
-                                Err(retry_error) => {
-                                    model_span.record_error(retry_error.as_ref());
-                                    step_span.record_error(retry_error.as_ref());
-                                    return Err(retry_error);
-                                }
-                            }
-                        } else {
-                            model_span.record_error(error.as_ref());
-                            step_span.record_error(error.as_ref());
-                            return Err(error);
-                        }
+                        model_span.record_error(error.as_ref());
+                        step_span.record_error(error.as_ref());
+                        return Err(error);
                     }
                 };
                 drop(model_span);
+                if turn_time_to_first_token_ms.is_none() {
+                    turn_time_to_first_token_ms = provider_turn_result.time_to_first_token_ms;
+                }
 
-                for event in provider_events {
+                let mut response_end_turn = None;
+                let mut response_id = None::<String>;
+                let mut response_final_answer_text = None::<String>;
+                let mut response_assistant_text = None::<String>;
+                let mut model_verification_emitted = false;
+                for event in provider_turn_result.events {
                     match event {
                         ModelEvent::TextDelta { text } => {
                             if let Some(delta) = assistant_delta_to_append(&assistant_text, &text) {
@@ -934,8 +2908,38 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             store.append_event(
                                 &session.id,
                                 "model.usage",
-                                serde_json::to_value(usage)?,
+                                serde_json::to_value(&usage)?,
                             )?;
+                            append_codex_token_count_event(
+                                store,
+                                &session.id,
+                                &usage,
+                                model_context_window,
+                                turn_idx,
+                            )?;
+                        }
+                        ModelEvent::ResponseOutputItem { item } => {
+                            record_model_response_output_item(
+                                store,
+                                &session.id,
+                                provider,
+                                turn_idx,
+                                provider_turn_result.attempts,
+                                &item,
+                            )?;
+                            if let Some(text) = assistant_message_text_from_response_item(
+                                &item,
+                                options.collaboration_mode,
+                                true,
+                            ) {
+                                response_final_answer_text = Some(text);
+                            } else if let Some(text) = assistant_message_text_from_response_item(
+                                &item,
+                                options.collaboration_mode,
+                                false,
+                            ) {
+                                response_assistant_text = Some(text);
+                            }
                         }
                         ModelEvent::ToolCall { call } => {
                             store.append_event(
@@ -944,6 +2948,99 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 serde_json::to_value(&call)?,
                             )?;
                             tool_calls.push(call);
+                        }
+                        ModelEvent::ResponseCompleted {
+                            response_id: completed_response_id,
+                            end_turn,
+                        } => {
+                            response_id = completed_response_id.clone();
+                            response_end_turn = end_turn;
+                            store.append_event(
+                                &session.id,
+                                "model.response.completed",
+                                serde_json::json!({
+                                    "turn_idx": turn_idx,
+                                    "attempts": provider_turn_result.attempts,
+                                    "provider": provider.provider_name(),
+                                    "model": provider.model_name(),
+                                    "response_id": completed_response_id,
+                                    "end_turn": end_turn,
+                                }),
+                            )?;
+                        }
+                        ModelEvent::ServerModel {
+                            model: server_model,
+                        } => {
+                            store.append_event(
+                                &session.id,
+                                "model.server_model",
+                                serde_json::json!({
+                                    "turn_idx": turn_idx,
+                                    "attempts": provider_turn_result.attempts,
+                                    "provider": provider.provider_name(),
+                                    "model": provider.model_name(),
+                                    "server_model": server_model,
+                                }),
+                            )?;
+                        }
+                        ModelEvent::ModelRateLimits { snapshot } => {
+                            record_model_rate_limits(
+                                store,
+                                &session.id,
+                                turn_idx,
+                                provider_turn_result.attempts,
+                                &snapshot,
+                            )?;
+                        }
+                        ModelEvent::ModelVerifications { verifications } => {
+                            if !model_verification_emitted {
+                                record_model_verifications(
+                                    store,
+                                    &session.id,
+                                    turn_idx,
+                                    provider_turn_result.attempts,
+                                    &verifications,
+                                )?;
+                                model_verification_emitted = true;
+                            }
+                        }
+                        ModelEvent::ModelsEtag { etag } => {
+                            store.append_event(
+                                &session.id,
+                                "model.models_etag",
+                                serde_json::json!({
+                                    "turn_idx": turn_idx,
+                                    "attempts": provider_turn_result.attempts,
+                                    "etag": etag,
+                                }),
+                            )?;
+                            refresh_model_catalog_after_models_etag(
+                                store,
+                                &session,
+                                &options,
+                                &mut turn_config,
+                                &model_provider_id,
+                                provider.provider_name(),
+                                &etag,
+                            )?;
+                            model_request_info = resolved_model_request_info_from_config(
+                                &turn_config,
+                                provider.model_name(),
+                            );
+                            model_context_window = model_request_info
+                                .resolved_context_window()
+                                .or_else(|| model_context_window_for_options(&options));
+                        }
+                        ModelEvent::ServerReasoningIncluded { included } => {
+                            store.append_event(
+                                &session.id,
+                                "model.server_reasoning_included",
+                                serde_json::json!({
+                                    "turn_idx": turn_idx,
+                                    "attempts": provider_turn_result.attempts,
+                                    "included": included,
+                                }),
+                            )?;
                         }
                         ModelEvent::Done => {}
                     }
@@ -957,16 +3054,50 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         "tool_calls": tool_calls.iter().map(tool_call_message).collect::<Vec<_>>(),
                     }));
                 }
-                maybe_compact_messages(
+                maybe_compact_messages_with_context(
                     store,
                     &session.id,
                     &mut messages,
                     options.max_context_chars,
+                    turn_instructions.as_deref(),
+                    model_context_window,
+                    Some(turn_idx),
                 )?;
 
                 if tool_calls.is_empty() {
-                    if !assistant_text.trim().is_empty() {
-                        let requested_result = assistant_text.trim_end();
+                    let assistant_finalization_text = response_final_answer_text
+                        .as_deref()
+                        .or(response_assistant_text.as_deref())
+                        .unwrap_or(&assistant_text);
+                    let (visible_assistant_text, proposed_plan) =
+                        visible_assistant_text_and_proposed_plan(
+                            assistant_finalization_text,
+                            options.collaboration_mode,
+                        );
+                    if let Some(plan_text) =
+                        proposed_plan.filter(|plan_text| !plan_text.trim().is_empty())
+                    {
+                        store.append_event(
+                            &session.id,
+                            "plan.proposed",
+                            serde_json::json!({ "text": plan_text }),
+                        )?;
+                    }
+                    if response_end_turn == Some(false) {
+                        store.append_event(
+                            &session.id,
+                            "model.response.continued",
+                            serde_json::json!({
+                                "turn_idx": turn_idx,
+                                "response_id": response_id,
+                                "reason": "end_turn_false",
+                            }),
+                        )?;
+                        step_span.set_ok();
+                        continue;
+                    }
+                    if !visible_assistant_text.trim().is_empty() {
+                        let requested_result = visible_assistant_text.trim_end();
                         if let Some(error) = guard_or_close_active_descendants(
                             store,
                             &session.id,
@@ -985,11 +3116,14 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 "role": "user",
                                 "content": error,
                             }));
-                            maybe_compact_messages(
+                            maybe_compact_messages_with_context(
                                 store,
                                 &session.id,
                                 &mut messages,
                                 options.max_context_chars,
+                                turn_instructions.as_deref(),
+                                model_context_window,
+                                Some(turn_idx),
                             )?;
                             step_span.set_ok();
                             continue;
@@ -1013,16 +3147,21 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &mut worker,
                     tool_calls,
                     &options,
+                    &turn_instructions,
+                    model_request_info.tool_output_token_budget(),
                     &telemetry,
                     &step_span,
                     turn_idx,
                 )? {
                     messages.extend(outcome.messages);
-                    maybe_compact_messages(
+                    maybe_compact_messages_with_context(
                         store,
                         &session.id,
                         &mut messages,
                         options.max_context_chars,
+                        turn_instructions.as_deref(),
+                        model_context_window,
+                        Some(turn_idx),
                     )?;
                     if outcome.finished {
                         step_span.set_ok();
@@ -1074,6 +3213,22 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
         }
         agent_span.set_ok();
     }
+    if let Some(lifecycle) = codex_lifecycle.as_ref() {
+        let lifecycle_events = store.events_for_session(&session.id).unwrap_or_default();
+        if cancelled {
+            append_codex_turn_aborted_event(store, &session.id, lifecycle, &lifecycle_events)?;
+        } else {
+            let lifecycle_status = if result.is_ok() { "done" } else { "failed" };
+            append_codex_turn_completed_event(
+                store,
+                &session.id,
+                lifecycle,
+                lifecycle_status,
+                &lifecycle_events,
+                turn_time_to_first_token_ms,
+            )?;
+        }
+    }
     let run_status = if cancelled {
         "cancelled"
     } else if result.is_ok() {
@@ -1117,12 +3272,20 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
     store: &Store,
     session_id: &str,
     provider: &P,
-    turn: ProviderTurn,
+    mut turn: ProviderTurn,
     turn_idx: usize,
-) -> Result<Vec<ModelEvent>> {
+) -> Result<ProviderTurnResult> {
+    if turn.turn_state.is_none() {
+        turn.turn_state = Some(Arc::new(std::sync::Mutex::new(None)));
+    }
     record_model_turn_request(store, session_id, provider, turn_idx, &turn)?;
-    let max_retries = provider_retry_budget(provider.provider_name());
+    let max_retries = turn
+        .stream_max_retries
+        .unwrap_or(DEFAULT_STREAM_MAX_RETRIES)
+        .min(MAX_STREAM_MAX_RETRIES);
     let mut attempt = 0_usize;
+    let turn_started_at = Instant::now();
+    let mut time_to_first_token_ms = None;
     loop {
         let mut events = Vec::new();
         let mut streamed_text = String::new();
@@ -1130,6 +3293,9 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
         match provider.stream_turn(turn.clone(), &mut |event| {
             match &event {
                 ModelEvent::TextDelta { text } => {
+                    if time_to_first_token_ms.is_none() && !text.is_empty() {
+                        time_to_first_token_ms = Some(turn_started_at.elapsed().as_millis() as i64);
+                    }
                     if let Some(delta) = assistant_delta_to_append(&streamed_text, text) {
                         record_model_stream_delta(
                             store,
@@ -1143,6 +3309,9 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                     }
                 }
                 ModelEvent::ThinkingDelta { text, label } => {
+                    if time_to_first_token_ms.is_none() && !text.is_empty() {
+                        time_to_first_token_ms = Some(turn_started_at.elapsed().as_millis() as i64);
+                    }
                     if let Some(delta) = assistant_delta_to_append(&streamed_thinking_text, text) {
                         record_model_thinking_delta(
                             store,
@@ -1156,18 +3325,75 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                         streamed_thinking_text.push_str(&delta);
                     }
                 }
-                ModelEvent::ToolCall { .. } | ModelEvent::Usage { .. } | ModelEvent::Done => {}
+                ModelEvent::ToolCall { .. }
+                | ModelEvent::Usage { .. }
+                | ModelEvent::ResponseOutputItem { item: _ }
+                | ModelEvent::ResponseCompleted { .. }
+                | ModelEvent::ServerModel { .. }
+                | ModelEvent::ModelRateLimits { .. }
+                | ModelEvent::ModelVerifications { .. }
+                | ModelEvent::ModelsEtag { .. }
+                | ModelEvent::ServerReasoningIncluded { .. }
+                | ModelEvent::Done => {}
             }
             events.push(event);
             Ok(())
         }) {
             Ok(()) => {
                 record_model_turn_response(store, session_id, turn_idx, attempt + 1, &events)?;
-                return Ok(events);
+                return Ok(ProviderTurnResult {
+                    events,
+                    time_to_first_token_ms,
+                    attempts: attempt + 1,
+                });
             }
             Err(error) => {
                 let error_chain = format!("{error:#}");
-                let transient = is_transient_provider_error(&error_chain);
+                let provider_error = provider_error_from_anyhow(&error);
+                let transient = provider_error
+                    .map(ProviderError::is_retryable)
+                    .unwrap_or_else(|| is_transient_provider_error(&error_chain));
+                let will_retry = transient && attempt < max_retries;
+                let requested_delay = provider_error.and_then(ProviderError::retry_delay);
+                let codex_error_info = provider_error
+                    .map(|error| provider_error_codex_error_info(error, will_retry))
+                    .unwrap_or_else(|| {
+                        if will_retry {
+                            response_stream_disconnected_error_info(None)
+                        } else {
+                            Value::Null
+                        }
+                    });
+                if let Some(rate_limits) = provider_error.and_then(ProviderError::rate_limits) {
+                    record_model_rate_limits(
+                        store,
+                        session_id,
+                        turn_idx,
+                        attempt + 1,
+                        rate_limits,
+                    )?;
+                    append_codex_token_count_rate_limits_only(store, session_id, turn_idx)?;
+                }
+                store.append_event(
+                    session_id,
+                    CODEX_STREAM_ERROR_EVENT,
+                    serde_json::json!({
+                        "message": if will_retry {
+                            "Model stream error; retrying."
+                        } else {
+                            "Model stream failed."
+                        },
+                        "codex_error_info": codex_error_info,
+                        "additional_details": error_chain.clone(),
+                        "turn_idx": turn_idx,
+                        "attempt": attempt + 1,
+                        "max_retries": max_retries,
+                        "will_retry": will_retry,
+                        "requested_delay_ms": requested_delay.map(|delay| delay.as_millis() as u64),
+                        "provider": provider.provider_name(),
+                        "model": provider.model_name(),
+                    }),
+                )?;
                 store.append_event(
                     session_id,
                     "model.turn.error",
@@ -1177,14 +3403,15 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                         "provider": provider.provider_name(),
                         "model": provider.model_name(),
                         "transient": transient,
-                        "error": error_chain,
+                        "will_retry": will_retry,
+                        "error": error_chain.clone(),
                     }),
                 )?;
-                if !transient || attempt >= max_retries {
+                if !will_retry {
                     return Err(error);
                 }
                 attempt += 1;
-                let delay = provider_retry_delay(attempt);
+                let delay = requested_delay.unwrap_or_else(|| provider_retry_delay(attempt));
                 store.append_event(
                     session_id,
                     "model.turn.retry",
@@ -1193,6 +3420,7 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                         "attempt": attempt,
                         "max_retries": max_retries,
                         "delay_ms": delay.as_millis() as u64,
+                        "requested_delay_ms": requested_delay.map(|delay| delay.as_millis() as u64),
                         "provider": provider.provider_name(),
                         "message": format!("Reconnecting... {attempt}/{max_retries}"),
                         "error": error_chain,
@@ -1255,17 +3483,46 @@ fn record_model_thinking_delta<P: ModelProvider>(
     Ok(())
 }
 
-fn provider_retry_budget(provider_name: &str) -> usize {
-    if let Ok(raw) = std::env::var("LLM_BROWSER_PROVIDER_MAX_RETRIES") {
-        if let Ok(value) = raw.parse::<usize>() {
-            return value.min(10);
+fn provider_error_from_anyhow(error: &anyhow::Error) -> Option<&ProviderError> {
+    error
+        .chain()
+        .find_map(|cause| cause.downcast_ref::<ProviderError>())
+}
+
+fn provider_error_codex_error_info(error: &ProviderError, will_retry: bool) -> Value {
+    use browser_use_providers::ProviderErrorKind;
+
+    match error.kind() {
+        ProviderErrorKind::ContextWindowExceeded => json!("context_window_exceeded"),
+        ProviderErrorKind::QuotaExceeded
+        | ProviderErrorKind::UsageLimitReached
+        | ProviderErrorKind::UsageNotIncluded => json!("usage_limit_exceeded"),
+        ProviderErrorKind::ServerOverloaded => json!("server_overloaded"),
+        ProviderErrorKind::CyberPolicy => json!("cyber_policy"),
+        ProviderErrorKind::RetryLimit => json!({
+            "response_too_many_failed_attempts": {
+                "http_status_code": error.http_status_code()
+            }
+        }),
+        ProviderErrorKind::InternalServerError => json!("internal_server_error"),
+        ProviderErrorKind::Stream
+        | ProviderErrorKind::Retryable
+        | ProviderErrorKind::RequestTimeout
+        | ProviderErrorKind::UnexpectedStatus
+            if will_retry =>
+        {
+            response_stream_disconnected_error_info(error.http_status_code())
         }
+        _ => json!("other"),
     }
-    match provider_name {
-        "codex" => 5,
-        "openai" | "openai-compatible" | "anthropic" => 3,
-        _ => 0,
-    }
+}
+
+fn response_stream_disconnected_error_info(http_status_code: Option<u16>) -> Value {
+    json!({
+        "response_stream_disconnected": {
+            "http_status_code": http_status_code
+        }
+    })
 }
 
 fn provider_retry_delay(attempt: usize) -> Duration {
@@ -1286,6 +3543,9 @@ fn is_transient_provider_error(error: &str) -> bool {
         "invalid_request_error",
         "schema",
         "unsupported",
+        "server_is_overloaded",
+        "server is overloaded",
+        "slow_down",
     ];
     if terminal.iter().any(|needle| error.contains(needle)) {
         return false;
@@ -1301,7 +3561,6 @@ fn is_transient_provider_error(error: &str) -> bool {
         "timed out",
         "timeout",
         "temporarily",
-        "overloaded",
         "rate limit",
         "too many requests",
         "eof",
@@ -1309,22 +3568,6 @@ fn is_transient_provider_error(error: &str) -> bool {
         "503",
         "504",
         "gateway",
-    ]
-    .iter()
-    .any(|needle| error.contains(needle))
-}
-
-fn is_context_overflow_provider_error(error: &str) -> bool {
-    let error = error.to_ascii_lowercase();
-    [
-        "context_length_exceeded",
-        "context length",
-        "context window",
-        "maximum context",
-        "too many tokens",
-        "token limit",
-        "input is too long",
-        "input too long",
     ]
     .iter()
     .any(|needle| error.contains(needle))
@@ -1355,7 +3598,66 @@ fn record_model_turn_request<P: ModelProvider>(
         payload["messages"] = messages_value;
         payload["tools"] = tools_value;
     }
+    if let Some(instructions) = turn.instructions.as_deref() {
+        let instructions_value = Value::String(instructions.to_string());
+        payload["instructions_char_count"] = Value::from(instructions.chars().count() as u64);
+        payload["instructions_fingerprint"] =
+            Value::String(value_fingerprint(&instructions_value)?);
+        if record_full_model_io() {
+            payload["instructions"] = instructions_value;
+        }
+    }
+    if let Some(previous_response_id) = turn
+        .previous_response_id
+        .as_deref()
+        .filter(|id| !id.is_empty())
+    {
+        payload["previous_response_id"] = Value::String(previous_response_id.to_string());
+    }
     store.append_event(session_id, "model.turn.request", payload)?;
+    Ok(())
+}
+
+fn record_model_response_output_item<P: ModelProvider>(
+    store: &Store,
+    session_id: &str,
+    provider: &P,
+    turn_idx: usize,
+    attempt: usize,
+    item: &Value,
+) -> Result<()> {
+    store.append_event(
+        session_id,
+        "model.response.output_item",
+        serde_json::json!({
+            "turn_idx": turn_idx,
+            "attempt": attempt,
+            "provider": provider.provider_name(),
+            "model": provider.model_name(),
+            "item": item,
+        }),
+    )?;
+    Ok(())
+}
+
+fn record_model_response_input_item(
+    store: &Store,
+    session_id: &str,
+    call: &ToolCall,
+    name: &str,
+    content: &Value,
+) -> Result<()> {
+    let item = tool_output_response_item(call, name, content);
+    store.append_event(
+        session_id,
+        MODEL_RESPONSE_INPUT_ITEM_EVENT,
+        serde_json::json!({
+            "source": "tool_output",
+            "name": name,
+            "call_id": call.id,
+            "item": item,
+        }),
+    )?;
     Ok(())
 }
 
@@ -1381,6 +3683,8 @@ fn record_model_turn_response(
         }).sum::<usize>(),
         "tool_call_count": events.iter().filter(|event| matches!(event, ModelEvent::ToolCall { .. })).count(),
         "usage_count": events.iter().filter(|event| matches!(event, ModelEvent::Usage { .. })).count(),
+        "response_output_item_count": events.iter().filter(|event| matches!(event, ModelEvent::ResponseOutputItem { .. })).count(),
+        "response_completed_count": events.iter().filter(|event| matches!(event, ModelEvent::ResponseCompleted { .. })).count(),
         "events_fingerprint": value_fingerprint(&events_value)?,
     });
     if record_full_model_io() {
@@ -1489,18 +3793,39 @@ fn maybe_emit_deadline_warning(
     Ok(true)
 }
 
+#[cfg(test)]
 fn maybe_compact_messages(
     store: &Store,
     session_id: &str,
     messages: &mut Vec<Value>,
     max_context_chars: usize,
 ) -> Result<()> {
+    maybe_compact_messages_with_context(
+        store,
+        session_id,
+        messages,
+        max_context_chars,
+        None,
+        None,
+        None,
+    )
+}
+
+fn maybe_compact_messages_with_context(
+    store: &Store,
+    session_id: &str,
+    messages: &mut Vec<Value>,
+    max_context_chars: usize,
+    base_instructions: Option<&str>,
+    model_context_window: Option<i64>,
+    turn_idx: Option<usize>,
+) -> Result<()> {
     if max_context_chars == 0 {
         return Ok(());
     }
     let max_context_tokens = approx_token_count_from_chars(max_context_chars);
     let before_chars = estimated_context_chars(messages)?;
-    let before_tokens = estimated_context_tokens(messages)?;
+    let before_tokens = estimated_context_tokens_with_instructions(messages, base_instructions)?;
     if before_tokens <= max_context_tokens {
         return Ok(());
     }
@@ -1512,34 +3837,10 @@ fn maybe_compact_messages(
         max_context_tokens,
         before_chars,
         before_tokens,
+        base_instructions,
+        model_context_window,
+        turn_idx,
         "estimated_budget_exceeded",
-    )
-}
-
-fn force_compact_messages(
-    store: &Store,
-    session_id: &str,
-    messages: &mut Vec<Value>,
-    max_context_chars: usize,
-    reason: &str,
-) -> Result<()> {
-    let max_context_chars = if max_context_chars == 0 {
-        80_000
-    } else {
-        max_context_chars
-    };
-    let max_context_tokens = approx_token_count_from_chars(max_context_chars);
-    let before_chars = estimated_context_chars(messages)?;
-    let before_tokens = estimated_context_tokens(messages)?;
-    compact_messages(
-        store,
-        session_id,
-        messages,
-        max_context_chars,
-        max_context_tokens,
-        before_chars,
-        before_tokens,
-        reason,
     )
 }
 
@@ -1552,6 +3853,9 @@ fn compact_messages(
     max_context_tokens: usize,
     before_chars: usize,
     before_tokens: usize,
+    base_instructions: Option<&str>,
+    model_context_window: Option<i64>,
+    turn_idx: Option<usize>,
     reason: &str,
 ) -> Result<()> {
     store.append_event(
@@ -1566,21 +3870,15 @@ fn compact_messages(
             "max_tokens": max_context_tokens,
         }),
     )?;
+    let events = store.events_for_session(session_id)?;
+    let context_baseline = latest_context_baseline_payload_from_events(&events);
     let result = (|| -> Result<()> {
-        let events = store.events_for_session(session_id)?;
         let context = sanitized_agent_context_from_events(&events);
-        let mut compacted = vec![serde_json::json!({
-            "role": "system",
-            "content": compacted_context_system_message(&context)?,
-        })];
-        let recent_messages = recent_messages_to_preserve(messages);
-        for recent_message in recent_messages {
-            let max_recent_content_tokens = (max_context_tokens / 4).max(50);
-            compacted.push(compact_recent_message(
-                recent_message,
-                max_recent_content_tokens,
-            ));
-        }
+        let initial_context = initial_context_messages_from_events(&events, None, true, true);
+        let mut compacted = compacted_user_history_messages(messages);
+        compacted.push(compacted_context_summary_message(&context)?);
+        compacted =
+            insert_initial_context_before_last_real_user_or_summary(compacted, initial_context);
         *messages = compacted;
         Ok(())
     })();
@@ -1592,15 +3890,27 @@ fn compact_messages(
         )?;
         return Err(error);
     }
-    store.append_event(
+    let mut payload = serde_json::json!({
+        "reason": reason,
+        "message_count": messages.len(),
+        "chars": estimated_context_chars(messages)?,
+        "tokens": estimated_context_tokens_with_instructions(messages, base_instructions)?,
+        "replacement_messages": messages.clone(),
+        "replacement_response_items": provider_messages_to_response_items(messages),
+    });
+    if let Some(context_baseline) = context_baseline {
+        payload["context_baseline"] = context_baseline;
+    }
+    let compacted_event = store.append_event(session_id, "session.compacted", payload)?;
+    append_recomputed_codex_token_count_event(
+        store,
         session_id,
-        "session.compacted",
-        serde_json::json!({
-            "reason": reason,
-            "message_count": messages.len(),
-            "chars": estimated_context_chars(messages)?,
-            "tokens": estimated_context_tokens(messages)?,
-        }),
+        messages,
+        base_instructions,
+        model_context_window,
+        turn_idx,
+        reason,
+        Some(compacted_event.seq),
     )?;
     Ok(())
 }
@@ -1610,7 +3920,22 @@ fn estimated_context_chars(messages: &[Value]) -> Result<usize> {
 }
 
 fn estimated_context_tokens(messages: &[Value]) -> Result<usize> {
-    let text = serde_json::to_string(&context_budget_value(&Value::Array(messages.to_vec())))?;
+    estimated_context_tokens_with_instructions(messages, None)
+}
+
+fn estimated_context_tokens_with_instructions(
+    messages: &[Value],
+    base_instructions: Option<&str>,
+) -> Result<usize> {
+    if base_instructions.is_none() {
+        let text = serde_json::to_string(&context_budget_value(&Value::Array(messages.to_vec())))?;
+        return Ok(approx_token_count(&text));
+    }
+    let budget = serde_json::json!({
+        "instructions": base_instructions.unwrap_or_default(),
+        "input": context_budget_value(&Value::Array(messages.to_vec())),
+    });
+    let text = serde_json::to_string(&budget)?;
     Ok(approx_token_count(&text))
 }
 
@@ -1661,79 +3986,83 @@ fn context_budget_value(value: &Value) -> Value {
     }
 }
 
-fn recent_messages_to_preserve(messages: &[Value]) -> Vec<Value> {
-    let Some(message) = messages.last() else {
-        return Vec::new();
-    };
-    match message.get("role").and_then(Value::as_str) {
-        Some("assistant") => {
-            let has_tool_calls = message
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .is_some_and(|calls| !calls.is_empty());
-            if has_tool_calls {
-                vec![message.clone()]
-            } else {
-                Vec::new()
-            }
+fn compacted_user_history_messages(messages: &[Value]) -> Vec<Value> {
+    let mut selected = Vec::new();
+    let mut remaining = COMPACT_USER_MESSAGE_MAX_TOKENS;
+    for message in messages.iter().rev() {
+        if remaining == 0 {
+            break;
         }
-        Some("tool") => {
-            let mut out = Vec::new();
-            if let Some(call_id) = message.get("tool_call_id").and_then(Value::as_str) {
-                if let Some(assistant) = matching_assistant_tool_call(messages, call_id) {
-                    out.push(assistant.clone());
-                }
-            }
-            out.push(message.clone());
-            out
+        if !is_real_user_message_for_compaction(message) {
+            continue;
         }
-        _ => Vec::new(),
+        let text = message_content_text(message);
+        let tokens = approx_token_count(&text);
+        if tokens <= remaining {
+            selected.push(user_text_message(text));
+            remaining = remaining.saturating_sub(tokens);
+        } else {
+            selected.push(user_text_message(truncate_for_context_tokens(
+                &text, remaining,
+            )));
+            break;
+        }
     }
+    selected.reverse();
+    selected
 }
 
-fn matching_assistant_tool_call<'a>(messages: &'a [Value], call_id: &str) -> Option<&'a Value> {
-    messages.iter().rev().skip(1).find(|message| {
-        message.get("role").and_then(Value::as_str) == Some("assistant")
-            && message
-                .get("tool_calls")
-                .and_then(Value::as_array)
-                .is_some_and(|calls| {
-                    calls
-                        .iter()
-                        .any(|call| call.get("id").and_then(Value::as_str) == Some(call_id))
-                })
+fn is_real_user_message_for_compaction(message: &Value) -> bool {
+    is_real_user_message(message)
+        && !is_compaction_summary_message(message)
+        && !message_content_text(message).trim().is_empty()
+}
+
+fn user_text_message(text: String) -> Value {
+    serde_json::json!({
+        "role": "user",
+        "content": text,
     })
 }
 
-fn compact_recent_message(mut message: Value, max_content_tokens: usize) -> Value {
-    let Some(object) = message.as_object_mut() else {
-        return message;
-    };
-    if let Some(content) = object.get_mut("content") {
-        compact_content_value(content, max_content_tokens);
-    }
-    message
+fn compacted_context_summary_message(context: &Value) -> Result<Value> {
+    Ok(user_text_message(format!(
+        "{COMPACTION_SUMMARY_PREFIX}\n{}",
+        compacted_context_system_message(context)?
+    )))
 }
 
-fn compact_content_value(value: &mut Value, max_content_tokens: usize) {
-    match value {
-        Value::String(text) => {
-            if approx_token_count(text) > max_content_tokens {
-                *text = truncate_for_context_tokens(text, max_content_tokens);
-            }
-        }
-        Value::Array(parts) => {
-            for part in parts {
-                if let Some(text) = part.get("text").and_then(Value::as_str) {
-                    if approx_token_count(text) > max_content_tokens {
-                        part["text"] =
-                            Value::String(truncate_for_context_tokens(text, max_content_tokens));
-                    }
-                }
-            }
-        }
-        _ => {}
+fn insert_initial_context_before_last_real_user_or_summary(
+    mut compacted: Vec<Value>,
+    initial_context: Vec<Value>,
+) -> Vec<Value> {
+    if initial_context.is_empty() {
+        return compacted;
     }
+    let mut last_user_or_summary_index = None;
+    let mut last_real_user_index = None;
+    for (index, message) in compacted.iter().enumerate().rev() {
+        if message.get("role").and_then(Value::as_str) != Some("user") {
+            continue;
+        }
+        last_user_or_summary_index.get_or_insert(index);
+        if !is_compaction_summary_message(message) {
+            last_real_user_index = Some(index);
+            break;
+        }
+    }
+    if let Some(index) = last_real_user_index.or(last_user_or_summary_index) {
+        compacted.splice(index..index, initial_context);
+    } else {
+        compacted.extend(initial_context);
+    }
+    compacted
+}
+
+fn is_compaction_summary_message(message: &Value) -> bool {
+    message_content_text(message)
+        .strip_prefix(COMPACTION_SUMMARY_PREFIX)
+        .is_some_and(|suffix| suffix.starts_with('\n'))
 }
 
 fn truncate_for_context_tokens(text: &str, max_tokens: usize) -> String {
@@ -1776,93 +4105,1656 @@ fn compacted_context_system_message(context: &Value) -> Result<String> {
 }
 
 fn browser_agent_contract() -> String {
-    let mut contract = include_str!("../../../prompts/browser-agent-system.md")
-        .trim()
-        .to_string();
-    contract.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
-    contract.push_str(
-        "\n\nThese are the same interaction-skill playbooks from browser-harness. Apply the relevant section when the page mechanic appears.",
-    );
-    for (path, content) in browser_harness_interaction_skills() {
-        contract.push_str("\n\n### ");
-        contract.push_str(path);
-        contract.push_str("\n\n");
-        contract.push_str(content.trim());
-    }
-    contract
+    default_agent_instructions()
 }
 
-fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str)] {
-    &[
-        (
-            "interaction-skills/connection.md",
-            include_str!("../../../prompts/interaction-skills/connection.md"),
+fn provider_base_instructions_for_session(
+    store: &Store,
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    model: &str,
+) -> Result<Option<String>> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    let events = store.events_for_session(&session.id)?;
+    let persisted = session_base_instructions_from_events(&events);
+
+    if let Some(base_instructions) = config.base_instructions_override()? {
+        if persisted.is_none() {
+            append_session_base_instructions_event(
+                store,
+                &session.id,
+                &base_instructions,
+                "config_override",
+            )?;
+        }
+        return Ok(Some(base_instructions));
+    }
+
+    if let Some(base_instructions) = persisted {
+        return Ok(Some(base_instructions));
+    }
+
+    let base_instructions = config.default_base_instructions_for_model(model);
+    if let Some(text) = base_instructions.as_deref() {
+        append_session_base_instructions_event(store, &session.id, text, "model_default")?;
+    }
+    Ok(base_instructions)
+}
+
+fn session_base_instructions_from_events(events: &[EventRecord]) -> Option<String> {
+    events
+        .iter()
+        .find(|event| event.event_type == SESSION_BASE_INSTRUCTIONS_EVENT)
+        .and_then(|event| event.payload.get("text"))
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+fn append_session_base_instructions_event(
+    store: &Store,
+    session_id: &str,
+    text: &str,
+    source: &str,
+) -> Result<()> {
+    store.append_event(
+        session_id,
+        SESSION_BASE_INSTRUCTIONS_EVENT,
+        serde_json::json!({
+            "text": text,
+            "source": source,
+        }),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_context_baseline_event(
+    store: &Store,
+    session: &SessionMeta,
+    turn_id: &str,
+    turn_seq: i64,
+    provider_name: &str,
+    model_name: &str,
+    personality: ModelPersonality,
+    collaboration_mode: CollaborationModeKind,
+    model_settings: &ModelRequestSettings,
+    model_config_seq: i64,
+) -> Result<bool> {
+    let events = store.events_for_session(&session.id)?;
+    if events.iter().any(|event| {
+        event.event_type == CONTEXT_BASELINE_EVENT
+            && event.payload.get("turn_seq").and_then(Value::as_i64) == Some(turn_seq)
+    }) {
+        return Ok(false);
+    }
+
+    let mut workspace_context_seqs = Map::new();
+    let mut developer_context_seqs = Map::new();
+    for event in &events {
+        match event.event_type.as_str() {
+            "workspace.context" => {
+                if let Some(kind) = event.payload.get("kind").and_then(Value::as_str) {
+                    workspace_context_seqs.insert(kind.to_string(), json!(event.seq));
+                }
+            }
+            MODEL_SWITCH_CONTEXT_EVENT
+            | PERSONALITY_CONTEXT_EVENT
+            | COLLABORATION_CONTEXT_EVENT => {
+                developer_context_seqs.insert(event.event_type.clone(), json!(event.seq));
+            }
+            _ => {}
+        }
+    }
+
+    let environment = latest_environment_snapshot_from_events(&events);
+    let turn_context = codex_turn_context_payload(
+        session,
+        turn_id,
+        provider_name,
+        model_name,
+        personality,
+        collaboration_mode,
+        model_settings,
+        environment.as_ref(),
+    )?;
+    let mut payload = serde_json::json!({
+        "turn_seq": turn_seq,
+        "cwd": session.cwd.clone(),
+        "provider": provider_name,
+        "model": model_name,
+        "personality": model_personality_key(personality),
+        "collaboration_mode": collaboration_mode.as_str(),
+        "model_settings": model_request_settings_json(model_settings),
+        "model_config_seq": model_config_seq,
+        "workspace_context_seqs": workspace_context_seqs,
+        "developer_context_seqs": developer_context_seqs,
+        "turn_context": turn_context,
+    });
+    if let Some(environment) = environment {
+        payload["environment"] = serde_json::to_value(environment)?;
+    }
+    store.append_event(&session.id, CONTEXT_BASELINE_EVENT, payload)?;
+    Ok(true)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn codex_turn_context_payload(
+    session: &SessionMeta,
+    turn_id: &str,
+    provider_name: &str,
+    model_name: &str,
+    personality: ModelPersonality,
+    collaboration_mode: CollaborationModeKind,
+    model_settings: &ModelRequestSettings,
+    environment: Option<&EnvironmentContextSnapshot>,
+) -> Result<Value> {
+    let mut payload = serde_json::json!({
+        "turn_id": turn_id,
+        "cwd": session.cwd.clone(),
+        "provider": provider_name,
+        "model": model_name,
+        "personality": model_personality_key(personality),
+        "collaboration_mode": collaboration_mode.as_str(),
+        "collaboration_mode_kind": collaboration_mode.as_str(),
+        "model_settings": model_request_settings_json(model_settings),
+    });
+    if let Some(environment) = environment {
+        payload["current_date"] = Value::String(environment.current_date.clone());
+        payload["timezone"] = Value::String(environment.timezone.clone());
+        payload["environments"] = serde_json::to_value(&environment.environments)?;
+        if let Some(network) = environment.network.as_ref() {
+            payload["network"] = serde_json::to_value(network)?;
+        }
+        if let Some(subagents) = environment.subagents.as_ref() {
+            payload["subagents"] = Value::String(subagents.clone());
+        }
+    }
+    Ok(payload)
+}
+
+fn model_request_settings_json(settings: &ModelRequestSettings) -> Value {
+    serde_json::json!({
+        "reasoning_effort": settings.reasoning_effort.clone(),
+        "reasoning_summary": settings.reasoning_summary.clone(),
+        "model_supports_reasoning_summaries": settings.model_supports_reasoning_summaries,
+        "text_verbosity": settings.text_verbosity.clone(),
+        "service_tier": settings.service_tier.clone(),
+    })
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct ProviderCommandAuthConfigSnapshot {
+    command: String,
+    args: Vec<String>,
+    timeout_ms: u64,
+    refresh_interval_ms: u64,
+    cwd: String,
+}
+
+impl ProviderCommandAuthConfigSnapshot {
+    fn from_config(config: &ProviderCommandAuthConfig) -> Self {
+        Self {
+            command: config.command.clone(),
+            args: config.args.clone(),
+            timeout_ms: config.timeout_ms,
+            refresh_interval_ms: config.refresh_interval_ms,
+            cwd: config.cwd.to_string_lossy().to_string(),
+        }
+    }
+
+    fn to_config(&self) -> ProviderCommandAuthConfig {
+        ProviderCommandAuthConfig {
+            command: self.command.clone(),
+            args: self.args.clone(),
+            timeout_ms: self.timeout_ms,
+            refresh_interval_ms: self.refresh_interval_ms,
+            cwd: PathBuf::from(&self.cwd),
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Serialize, PartialEq, Eq)]
+struct ModelProviderAwsAuthInfo {
+    profile: Option<String>,
+    region: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+struct SessionModelProviderInfoSnapshot {
+    id: String,
+    name: String,
+    base_url: Option<String>,
+    env_key: Option<String>,
+    env_key_instructions: Option<String>,
+    experimental_bearer_token: Option<String>,
+    auth: Option<ProviderCommandAuthConfigSnapshot>,
+    aws: Option<ModelProviderAwsAuthInfo>,
+    wire_api: String,
+    query_params: BTreeMap<String, String>,
+    http_headers: BTreeMap<String, String>,
+    env_http_headers: BTreeMap<String, String>,
+    request_max_retries: Option<usize>,
+    stream_max_retries: Option<usize>,
+    stream_idle_timeout_ms: Option<u64>,
+    websocket_connect_timeout_ms: Option<u64>,
+    requires_openai_auth: bool,
+    supports_websockets: bool,
+}
+
+#[derive(Clone, Debug)]
+struct SessionConfigSnapshot {
+    model: String,
+    model_provider_id: String,
+    model_provider_info: Option<SessionModelProviderInfoSnapshot>,
+    model_settings: ModelRequestSettings,
+    model_request_info: browser_use_providers::ModelRequestInfo,
+    request_max_retries: Option<usize>,
+    stream_max_retries: Option<usize>,
+    stream_idle_timeout_ms: Option<u64>,
+    collaboration_mode: Option<String>,
+}
+
+fn session_config_snapshot_from_event(event: &EventRecord) -> Option<SessionConfigSnapshot> {
+    if event.event_type != SESSION_CONFIG_SNAPSHOT_EVENT {
+        return None;
+    }
+    let payload = &event.payload;
+    let model = payload.get("model")?.as_str()?.to_string();
+    let model_provider_id = payload.get("model_provider_id")?.as_str()?.to_string();
+    let model_settings =
+        model_request_settings_from_json(payload.get("model_settings").unwrap_or(&Value::Null));
+    let model_request_info = payload
+        .get("model_request_info")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+        .unwrap_or_else(browser_use_providers::ModelRequestInfo::unknown);
+    Some(SessionConfigSnapshot {
+        model,
+        model_provider_id,
+        model_provider_info: payload
+            .get("model_provider_info")
+            .cloned()
+            .and_then(|value| serde_json::from_value(value).ok()),
+        model_settings,
+        model_request_info,
+        request_max_retries: payload
+            .get("request_max_retries")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        stream_max_retries: payload
+            .get("stream_max_retries")
+            .and_then(Value::as_u64)
+            .and_then(|value| usize::try_from(value).ok()),
+        stream_idle_timeout_ms: payload
+            .get("stream_idle_timeout_ms")
+            .and_then(Value::as_u64),
+        collaboration_mode: payload
+            .get("collaboration_mode")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    })
+}
+
+fn latest_session_config_snapshot_from_events(
+    events: &[EventRecord],
+) -> Option<SessionConfigSnapshot> {
+    rollback_filtered_events(events)
+        .iter()
+        .rev()
+        .find_map(|event| session_config_snapshot_from_event(event))
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_session_config_snapshot_event(
+    store: &Store,
+    session: &SessionMeta,
+    backend: &str,
+    provider_name: &str,
+    model_provider_id: &str,
+    model_provider_info: Option<&SessionModelProviderInfoSnapshot>,
+    model_name: &str,
+    personality: ModelPersonality,
+    collaboration_mode: CollaborationModeKind,
+    model_settings: &ModelRequestSettings,
+    model_request_info: &browser_use_providers::ModelRequestInfo,
+    request_max_retries: Option<usize>,
+    stream_max_retries: Option<usize>,
+    stream_idle_timeout_ms: Option<u64>,
+) -> Result<()> {
+    store.append_event(
+        &session.id,
+        SESSION_CONFIG_SNAPSHOT_EVENT,
+        serde_json::json!({
+            "backend": backend,
+            "provider": provider_name,
+            "model_provider_id": model_provider_id,
+            "model_provider_info": model_provider_info,
+            "model": model_name,
+            "cwd": session.cwd,
+            "personality": model_personality_key(personality),
+            "collaboration_mode": collaboration_mode.as_str(),
+            "model_settings": model_request_settings_json(model_settings),
+            "model_request_info": model_request_info,
+            "request_max_retries": request_max_retries,
+            "stream_max_retries": stream_max_retries,
+            "stream_idle_timeout_ms": stream_idle_timeout_ms,
+        }),
+    )?;
+    Ok(())
+}
+
+fn config_has_any_override(options: &AgentRunOptions, keys: &[&str], prefixes: &[String]) -> bool {
+    options.config_overrides.iter().any(|(key, _)| {
+        keys.iter().any(|candidate| key == candidate)
+            || prefixes.iter().any(|prefix| key.starts_with(prefix))
+    })
+}
+
+fn should_use_snapshot_model_settings(
+    options: &AgentRunOptions,
+    snapshot: &SessionConfigSnapshot,
+) -> bool {
+    snapshot.collaboration_mode.as_deref() == Some(options.collaboration_mode.as_str())
+        && !config_has_any_override(
+            options,
+            &[
+                "model_reasoning_effort",
+                "model_reasoning_summary",
+                "model_supports_reasoning_summaries",
+                "model_verbosity",
+                "service_tier",
+                "plan_mode_reasoning_effort",
+            ],
+            &[],
+        )
+}
+
+fn should_use_snapshot_model_request_info(options: &AgentRunOptions) -> bool {
+    !config_has_any_override(
+        options,
+        &[
+            "model_catalog_json",
+            "model_context_window",
+            "model_auto_compact_token_limit",
+            "tool_output_token_limit",
+        ],
+        &[],
+    )
+}
+
+fn should_use_snapshot_provider_runtime_config(options: &AgentRunOptions) -> bool {
+    options.model_provider_id_source == RunConfigValueSource::Default
+        && !config_has_any_override(options, &["model_provider"], &[])
+}
+
+fn run_config_has_model_resume_override(config: &ProviderRunConfig) -> bool {
+    config.model_source == RunConfigValueSource::Explicit
+        || config.options.model_provider_id_source == RunConfigValueSource::Explicit
+        || config.options.config_overrides.iter().any(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "model" | "model_provider" | "model_reasoning_effort"
+            )
+        })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn codex_turn_lifecycle(
+    store: &Store,
+    session: &SessionMeta,
+    run_id: &str,
+    provider_name: &str,
+    model_name: &str,
+    personality: ModelPersonality,
+    collaboration_mode: CollaborationModeKind,
+    model_settings: &ModelRequestSettings,
+    model_context_window: Option<i64>,
+    trace_id: Option<String>,
+) -> Result<CodexTurnLifecycle> {
+    let started_at_ms = now_ms();
+    let lifecycle = CodexTurnLifecycle {
+        turn_id: run_id.to_string(),
+        run_id: run_id.to_string(),
+        started_at_ms,
+        started_at: Instant::now(),
+        provider: provider_name.to_string(),
+        model: model_name.to_string(),
+        personality,
+        collaboration_mode,
+        model_settings: model_settings.clone(),
+        model_context_window,
+        trace_id,
+    };
+    store.append_event(
+        &session.id,
+        CODEX_TURN_STARTED_EVENT,
+        serde_json::json!({
+            "turn_id": lifecycle.turn_id.clone(),
+            "trace_id": lifecycle.trace_id.clone(),
+            "started_at": ms_to_unix_seconds(started_at_ms),
+            "started_at_ms": started_at_ms,
+            "model_context_window": model_context_window,
+            "collaboration_mode_kind": collaboration_mode.as_str(),
+            "provider": provider_name,
+            "model": model_name,
+            "cwd": session.cwd.clone(),
+            "run_id": run_id,
+            "personality": model_personality_key(personality),
+            "model_settings": model_request_settings_json(model_settings),
+        }),
+    )?;
+    Ok(lifecycle)
+}
+
+fn append_codex_turn_completed_event(
+    store: &Store,
+    session_id: &str,
+    lifecycle: &CodexTurnLifecycle,
+    status: &str,
+    events: &[EventRecord],
+    time_to_first_token_ms: Option<i64>,
+) -> Result<()> {
+    if has_lifecycle_terminal_event(events, &lifecycle.turn_id) {
+        return Ok(());
+    }
+    let completed_at_ms = now_ms();
+    let last_agent_message = last_agent_message_from_events(events, lifecycle.collaboration_mode);
+    store.append_event(
+        session_id,
+        CODEX_TURN_COMPLETE_EVENT,
+        serde_json::json!({
+            "turn_id": lifecycle.turn_id.clone(),
+            "last_agent_message": last_agent_message,
+            "started_at_ms": lifecycle.started_at_ms,
+            "completed_at": ms_to_unix_seconds(completed_at_ms),
+            "completed_at_ms": completed_at_ms,
+            "duration_ms": lifecycle.started_at.elapsed().as_millis() as i64,
+            "time_to_first_token_ms": time_to_first_token_ms,
+            "status": status,
+            "provider": lifecycle.provider.clone(),
+            "model": lifecycle.model.clone(),
+            "run_id": lifecycle.run_id.clone(),
+            "personality": model_personality_key(lifecycle.personality),
+            "collaboration_mode_kind": lifecycle.collaboration_mode.as_str(),
+            "model_context_window": lifecycle.model_context_window,
+            "model_settings": model_request_settings_json(&lifecycle.model_settings),
+        }),
+    )?;
+    Ok(())
+}
+
+fn append_codex_turn_aborted_event(
+    store: &Store,
+    session_id: &str,
+    lifecycle: &CodexTurnLifecycle,
+    events: &[EventRecord],
+) -> Result<()> {
+    if has_lifecycle_terminal_event(events, &lifecycle.turn_id) {
+        return Ok(());
+    }
+    let completed_at_ms = now_ms();
+    let reason = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "session.cancelled")
+        .and_then(|event| event.payload.get("reason"))
+        .and_then(Value::as_str)
+        .unwrap_or("interrupted");
+    store.append_event(
+        session_id,
+        CODEX_TURN_ABORTED_EVENT,
+        serde_json::json!({
+            "turn_id": lifecycle.turn_id.clone(),
+            "reason": "interrupted",
+            "message": reason,
+            "started_at_ms": lifecycle.started_at_ms,
+            "completed_at": ms_to_unix_seconds(completed_at_ms),
+            "completed_at_ms": completed_at_ms,
+            "duration_ms": lifecycle.started_at.elapsed().as_millis() as i64,
+            "status": "cancelled",
+            "provider": lifecycle.provider.clone(),
+            "model": lifecycle.model.clone(),
+            "run_id": lifecycle.run_id.clone(),
+            "collaboration_mode_kind": lifecycle.collaboration_mode.as_str(),
+        }),
+    )?;
+    Ok(())
+}
+
+fn has_lifecycle_terminal_event(events: &[EventRecord], turn_id: &str) -> bool {
+    events.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            CODEX_TURN_COMPLETE_EVENT | CODEX_TURN_ABORTED_EVENT
+        ) && event.payload.get("turn_id").and_then(Value::as_str) == Some(turn_id)
+    })
+}
+
+fn last_agent_message_from_events(
+    events: &[EventRecord],
+    collaboration_mode: CollaborationModeKind,
+) -> Option<String> {
+    last_agent_message_from_response_items(events, collaboration_mode, true)
+        .or_else(|| {
+            result_from_events(events)
+                .map(|result| strip_hidden_assistant_markup(&result, collaboration_mode).0)
+        })
+        .or_else(|| last_agent_message_from_response_items(events, collaboration_mode, false))
+        .or_else(|| {
+            let mut text = String::new();
+            for event in events {
+                match event.event_type.as_str() {
+                    "model.delta" => {
+                        if let Some(delta) = event.payload.get("text").and_then(Value::as_str) {
+                            text.push_str(delta);
+                        }
+                    }
+                    "session.input" | "session.followup" | "model.tool_call" => text.clear(),
+                    _ => {}
+                }
+            }
+            (!text.trim().is_empty())
+                .then(|| strip_hidden_assistant_markup(&text, collaboration_mode).0)
+        })
+        .map(|text| text.trim_end().to_string())
+        .filter(|text| !text.trim().is_empty())
+}
+
+fn last_agent_message_from_response_items(
+    events: &[EventRecord],
+    collaboration_mode: CollaborationModeKind,
+    require_final_answer_phase: bool,
+) -> Option<String> {
+    let mut last_message = None;
+    for event in events {
+        match event.event_type.as_str() {
+            "session.input" | "session.followup" => last_message = None,
+            "model.response.output_item" => {
+                let Some(item) = event.payload.get("item") else {
+                    continue;
+                };
+                let Some(text) = assistant_message_text_from_response_item(
+                    item,
+                    collaboration_mode,
+                    require_final_answer_phase,
+                ) else {
+                    continue;
+                };
+                last_message = Some(text);
+            }
+            _ => {}
+        }
+    }
+    last_message
+}
+
+fn assistant_message_text_from_response_item(
+    item: &Value,
+    collaboration_mode: CollaborationModeKind,
+    require_final_answer_phase: bool,
+) -> Option<String> {
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("assistant")
+    {
+        return None;
+    }
+    let phase = item.get("phase").and_then(Value::as_str);
+    if require_final_answer_phase && phase != Some("final_answer") {
+        return None;
+    }
+    let text = response_message_item_text(item)?;
+    let text = strip_hidden_assistant_markup(&text, collaboration_mode).0;
+    (!text.trim().is_empty()).then(|| text.trim_end().to_string())
+}
+
+fn response_message_item_text(item: &Value) -> Option<String> {
+    let mut text = String::new();
+    for part in item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+    {
+        if matches!(
+            part.get("type").and_then(Value::as_str),
+            Some("output_text") | Some("text")
+        ) {
+            if let Some(part_text) = part.get("text").and_then(Value::as_str) {
+                text.push_str(part_text);
+            }
+        }
+    }
+    (!text.is_empty()).then_some(text)
+}
+
+fn response_output_item_tool_call_value(item: &Value) -> Option<Value> {
+    let item_type = item.get("type").and_then(Value::as_str)?;
+    let name = item.get("name").and_then(Value::as_str)?;
+    let call_id = item
+        .get("call_id")
+        .or_else(|| item.get("id"))
+        .and_then(Value::as_str)?;
+    let namespace = item.get("namespace").and_then(Value::as_str);
+    let arguments = match item_type {
+        "function_call" => item
+            .get("arguments")
+            .and_then(Value::as_str)
+            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
+            .unwrap_or_else(|| serde_json::json!({})),
+        "custom_tool_call" => Value::String(
+            item.get("input")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
         ),
-        (
-            "interaction-skills/cookies.md",
-            include_str!("../../../prompts/interaction-skills/cookies.md"),
+        _ => return None,
+    };
+    let mut call = serde_json::json!({
+        "id": call_id,
+        "name": name,
+        "arguments": arguments,
+    });
+    if let Some(namespace) = namespace {
+        call["namespace"] = Value::String(namespace.to_string());
+    }
+    Some(call)
+}
+
+fn tool_call_id_from_value(call: &Value) -> Option<&str> {
+    call.get("id")
+        .or_else(|| call.get("call_id"))
+        .and_then(Value::as_str)
+}
+
+fn provider_messages_to_response_items(messages: &[Value]) -> Vec<Value> {
+    let mut items = Vec::new();
+    let mut tool_call_kinds = HashMap::<String, String>::new();
+    for message in messages {
+        if is_raw_response_item_provider_message(message) {
+            if raw_response_item_survives_compaction_checkpoint(message) {
+                items.push(message.clone());
+            }
+            continue;
+        }
+
+        let role = message
+            .get("role")
+            .and_then(Value::as_str)
+            .unwrap_or("user");
+        if role == "tool" {
+            let Some(call_id) = message.get("tool_call_id").and_then(Value::as_str) else {
+                continue;
+            };
+            let kind = tool_call_kinds
+                .get(call_id)
+                .map(String::as_str)
+                .unwrap_or("function_call");
+            let name = message
+                .get("name")
+                .and_then(Value::as_str)
+                .unwrap_or("tool");
+            items.push(tool_message_response_item(message, call_id, name, kind));
+            continue;
+        }
+
+        if let Some(message_item) = provider_message_response_item(message, role) {
+            items.push(message_item);
+        }
+        if role == "assistant" {
+            for call in message
+                .get("tool_calls")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                if let Some(item) = response_output_item_from_tool_call_value(call) {
+                    if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                        let kind = item
+                            .get("type")
+                            .and_then(Value::as_str)
+                            .unwrap_or("function_call");
+                        tool_call_kinds.insert(call_id.to_string(), kind.to_string());
+                    }
+                    items.push(item);
+                }
+            }
+        }
+    }
+    items
+}
+
+fn response_items_to_provider_messages(items: &[Value]) -> Vec<Value> {
+    let mut messages = Vec::new();
+    let mut tool_names = HashMap::<String, String>::new();
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(message) = response_message_item_provider_message(item) {
+                    messages.push(message);
+                }
+            }
+            Some("function_call") | Some("custom_tool_call") => {
+                if let Some(call) = response_output_item_tool_call_value(item) {
+                    if let Some(call_id) = tool_call_id_from_value(&call) {
+                        if let Some(name) = call.get("name").and_then(Value::as_str) {
+                            tool_names.insert(call_id.to_string(), name.to_string());
+                        }
+                    }
+                    messages.push(serde_json::json!({
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [call],
+                    }));
+                }
+            }
+            Some("function_call_output") | Some("custom_tool_call_output") => {
+                messages.push(response_input_item_tool_message(
+                    item,
+                    &Value::Null,
+                    &tool_names,
+                ));
+            }
+            Some(_) if is_raw_response_item_provider_message(item) => {
+                messages.push(item.clone());
+            }
+            _ => {}
+        }
+    }
+    messages
+}
+
+fn is_raw_response_item_provider_message(item: &Value) -> bool {
+    let Some(item_type) = item.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    response_item_type_is_api_history_item(item_type, item)
+}
+
+fn response_item_type_is_api_history_item(item_type: &str, item: &Value) -> bool {
+    match item_type {
+        "message" => item.get("role").and_then(Value::as_str) != Some("system"),
+        "function_call_output"
+        | "function_call"
+        | "tool_search_call"
+        | "tool_search_output"
+        | "custom_tool_call"
+        | "custom_tool_call_output"
+        | "local_shell_call"
+        | "reasoning"
+        | "web_search_call"
+        | "image_generation_call"
+        | "compaction"
+        | "compaction_summary"
+        | "context_compaction" => true,
+        "compaction_trigger" | "other" => false,
+        _ => false,
+    }
+}
+
+fn raw_response_item_survives_compaction_checkpoint(item: &Value) -> bool {
+    matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("compaction" | "compaction_summary" | "context_compaction")
+    )
+}
+
+fn response_message_item_provider_message(item: &Value) -> Option<Value> {
+    let role = item.get("role").and_then(Value::as_str).unwrap_or("user");
+    let content = item
+        .get("content")
+        .and_then(Value::as_array)
+        .map(|parts| {
+            parts
+                .iter()
+                .filter_map(response_item_content_part_to_message_part)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    if content.is_empty() {
+        return None;
+    }
+    let mut message = serde_json::json!({
+        "role": role,
+        "content": content,
+    });
+    if let Some(phase) = item.get("phase").and_then(Value::as_str) {
+        message["phase"] = Value::String(phase.to_string());
+    }
+    Some(message)
+}
+
+fn response_item_content_part_to_message_part(part: &Value) -> Option<Value> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_image") => {
+            let image_url = part.get("image_url").and_then(Value::as_str)?;
+            let mut out = serde_json::json!({
+                "type": "input_image",
+                "image_url": image_url,
+            });
+            if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+                out["detail"] = Value::String(detail.to_string());
+            }
+            Some(out)
+        }
+        Some("input_text") | Some("output_text") | Some("text") | None => part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| serde_json::json!({ "type": "input_text", "text": text })),
+        _ => None,
+    }
+}
+
+fn provider_message_response_item(message: &Value, role: &str) -> Option<Value> {
+    let content = provider_message_content_items(message, role);
+    if content.is_empty() {
+        return None;
+    }
+    let mut item = serde_json::json!({
+        "type": "message",
+        "role": role,
+        "content": content,
+    });
+    if role == "assistant" {
+        if let Some(phase) = message.get("phase").and_then(Value::as_str) {
+            item["phase"] = Value::String(phase.to_string());
+        }
+    }
+    Some(item)
+}
+
+fn provider_message_content_items(message: &Value, role: &str) -> Vec<Value> {
+    let text_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    match message.get("content") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            vec![serde_json::json!({ "type": text_type, "text": text })]
+        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| response_content_item_from_message_part(part, text_type))
+            .collect(),
+        Some(other) if !other.is_null() => {
+            vec![serde_json::json!({ "type": text_type, "text": other.to_string() })]
+        }
+        _ => Vec::new(),
+    }
+}
+
+fn response_content_item_from_message_part(part: &Value, text_type: &str) -> Option<Value> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_image") => {
+            let image_url = part.get("image_url").and_then(Value::as_str)?;
+            let mut out = serde_json::json!({
+                "type": "input_image",
+                "image_url": image_url,
+            });
+            if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+                out["detail"] = Value::String(detail.to_string());
+            }
+            Some(out)
+        }
+        Some("input_text") | Some("output_text") | Some("text") | None => part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| serde_json::json!({ "type": text_type, "text": text })),
+        _ => None,
+    }
+}
+
+fn response_output_item_from_tool_call_value(call: &Value) -> Option<Value> {
+    let name = call.get("name").and_then(Value::as_str)?;
+    let call_id = tool_call_id_from_value(call)?;
+    let namespace = call.get("namespace").and_then(Value::as_str);
+    if call.get("arguments").is_some_and(Value::is_string) {
+        let mut item = serde_json::json!({
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": name,
+            "input": call.get("arguments").and_then(Value::as_str).unwrap_or_default(),
+        });
+        if let Some(namespace) = namespace {
+            item["namespace"] = Value::String(namespace.to_string());
+        }
+        Some(item)
+    } else {
+        let mut item = serde_json::json!({
+            "type": "function_call",
+            "call_id": call_id,
+            "name": name,
+            "arguments": serde_json::to_string(call.get("arguments").unwrap_or(&Value::Null)).ok()?,
+        });
+        if let Some(namespace) = namespace {
+            item["namespace"] = Value::String(namespace.to_string());
+        }
+        Some(item)
+    }
+}
+
+fn tool_message_response_item(message: &Value, call_id: &str, name: &str, kind: &str) -> Value {
+    let output =
+        response_item_output_from_tool_content(message.get("content").unwrap_or(&Value::Null));
+    if kind == "custom_tool_call" {
+        serde_json::json!({
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "name": name,
+            "output": output,
+        })
+    } else {
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call_id,
+            "output": output,
+        })
+    }
+}
+
+fn tool_output_response_item(call: &ToolCall, name: &str, content: &Value) -> Value {
+    let output = response_item_output_from_tool_content(content);
+    if call.arguments.is_string() {
+        serde_json::json!({
+            "type": "custom_tool_call_output",
+            "call_id": call.id,
+            "name": name,
+            "output": output,
+        })
+    } else {
+        serde_json::json!({
+            "type": "function_call_output",
+            "call_id": call.id,
+            "output": output,
+        })
+    }
+}
+
+fn response_item_output_from_tool_content(content: &Value) -> Value {
+    match content {
+        Value::String(text) => Value::String(text.clone()),
+        Value::Array(parts) => Value::Array(
+            parts
+                .iter()
+                .filter_map(|part| response_content_item_from_message_part(part, "input_text"))
+                .collect(),
         ),
-        (
-            "interaction-skills/cross-origin-iframes.md",
-            include_str!("../../../prompts/interaction-skills/cross-origin-iframes.md"),
+        Value::Null => Value::String(String::new()),
+        other => Value::String(other.to_string()),
+    }
+}
+
+fn response_input_item_call_id(item: &Value) -> Option<&str> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call_output") | Some("custom_tool_call_output") => {
+            item.get("call_id").and_then(Value::as_str)
+        }
+        _ => None,
+    }
+}
+
+fn response_input_item_tool_message(
+    item: &Value,
+    payload: &Value,
+    tool_names: &HashMap<String, String>,
+) -> Value {
+    let call_id = response_input_item_call_id(item).unwrap_or_default();
+    let name = payload
+        .get("name")
+        .and_then(Value::as_str)
+        .or_else(|| item.get("name").and_then(Value::as_str))
+        .or_else(|| tool_names.get(call_id).map(String::as_str))
+        .unwrap_or("tool");
+    serde_json::json!({
+        "role": "tool",
+        "tool_call_id": call_id,
+        "name": name,
+        "content": tool_content_from_response_input_item(item),
+    })
+}
+
+fn tool_content_from_response_input_item(item: &Value) -> Value {
+    match item.get("output") {
+        Some(Value::String(text)) => Value::String(text.clone()),
+        Some(Value::Array(parts)) => Value::Array(
+            parts
+                .iter()
+                .filter_map(|part| response_input_item_part_to_tool_content_part(part))
+                .collect(),
         ),
-        (
-            "interaction-skills/dialogs.md",
-            include_str!("../../../prompts/interaction-skills/dialogs.md"),
-        ),
-        (
-            "interaction-skills/downloads.md",
-            include_str!("../../../prompts/interaction-skills/downloads.md"),
-        ),
-        (
-            "interaction-skills/drag-and-drop.md",
-            include_str!("../../../prompts/interaction-skills/drag-and-drop.md"),
-        ),
-        (
-            "interaction-skills/dropdowns.md",
-            include_str!("../../../prompts/interaction-skills/dropdowns.md"),
-        ),
-        (
-            "interaction-skills/iframes.md",
-            include_str!("../../../prompts/interaction-skills/iframes.md"),
-        ),
-        (
-            "interaction-skills/network-requests.md",
-            include_str!("../../../prompts/interaction-skills/network-requests.md"),
-        ),
-        (
-            "interaction-skills/print-as-pdf.md",
-            include_str!("../../../prompts/interaction-skills/print-as-pdf.md"),
-        ),
-        (
-            "interaction-skills/profile-sync.md",
-            include_str!("../../../prompts/interaction-skills/profile-sync.md"),
-        ),
-        (
-            "interaction-skills/screenshots.md",
-            include_str!("../../../prompts/interaction-skills/screenshots.md"),
-        ),
-        (
-            "interaction-skills/scrolling.md",
-            include_str!("../../../prompts/interaction-skills/scrolling.md"),
-        ),
-        (
-            "interaction-skills/shadow-dom.md",
-            include_str!("../../../prompts/interaction-skills/shadow-dom.md"),
-        ),
-        (
-            "interaction-skills/tabs.md",
-            include_str!("../../../prompts/interaction-skills/tabs.md"),
-        ),
-        (
-            "interaction-skills/uploads.md",
-            include_str!("../../../prompts/interaction-skills/uploads.md"),
-        ),
-        (
-            "interaction-skills/viewport.md",
-            include_str!("../../../prompts/interaction-skills/viewport.md"),
-        ),
-    ]
+        Some(other) if !other.is_null() => Value::String(other.to_string()),
+        _ => Value::String(String::new()),
+    }
+}
+
+fn response_input_item_part_to_tool_content_part(part: &Value) -> Option<Value> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_image") => {
+            let image_url = part.get("image_url").and_then(Value::as_str)?;
+            let mut out = serde_json::json!({
+                "type": "input_image",
+                "image_url": image_url,
+            });
+            if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+                out["detail"] = Value::String(detail.to_string());
+            }
+            Some(out)
+        }
+        Some("input_text") | Some("output_text") | Some("text") | None => part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| serde_json::json!({ "type": "output_text", "text": text })),
+        _ => None,
+    }
+}
+
+fn ms_to_unix_seconds(ms: i64) -> i64 {
+    ms / 1000
+}
+
+fn model_context_window_for_options(options: &AgentRunOptions) -> Option<i64> {
+    (options.max_context_chars > 0)
+        .then(|| approx_token_count_from_chars(options.max_context_chars) as i64)
+}
+
+fn append_codex_token_count_event(
+    store: &Store,
+    session_id: &str,
+    usage: &browser_use_protocol::ModelUsage,
+    model_context_window: Option<i64>,
+    turn_idx: usize,
+) -> Result<()> {
+    let last_token_usage = model_usage_to_codex_token_usage(usage);
+    let previous_total = store
+        .events_for_session(session_id)?
+        .iter()
+        .rev()
+        .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+        .and_then(|event| event.payload.get("info"))
+        .and_then(|info| info.get("total_token_usage"))
+        .cloned()
+        .unwrap_or_else(empty_codex_token_usage);
+    let total_token_usage = add_codex_token_usage(&previous_total, &last_token_usage);
+    store.append_event(
+        session_id,
+        CODEX_TOKEN_COUNT_EVENT,
+        serde_json::json!({
+            "info": {
+                "total_token_usage": total_token_usage,
+                "last_token_usage": last_token_usage,
+                "model_context_window": model_context_window,
+            },
+            "rate_limits": latest_codex_rate_limits(store, session_id)?,
+            "turn_idx": turn_idx,
+        }),
+    )?;
+    Ok(())
+}
+
+fn append_codex_token_count_rate_limits_only(
+    store: &Store,
+    session_id: &str,
+    turn_idx: usize,
+) -> Result<()> {
+    store.append_event(
+        session_id,
+        CODEX_TOKEN_COUNT_EVENT,
+        serde_json::json!({
+            "info": Value::Null,
+            "rate_limits": latest_codex_rate_limits(store, session_id)?,
+            "turn_idx": turn_idx,
+        }),
+    )?;
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn append_recomputed_codex_token_count_event(
+    store: &Store,
+    session_id: &str,
+    messages: &[Value],
+    base_instructions: Option<&str>,
+    model_context_window: Option<i64>,
+    turn_idx: Option<usize>,
+    reason: &str,
+    history_rewrite_seq: Option<i64>,
+) -> Result<()> {
+    let active_context_tokens =
+        estimated_context_tokens_with_instructions(messages, base_instructions)? as i64;
+    let last_token_usage = serde_json::json!({
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": active_context_tokens,
+    });
+    let total_token_usage = latest_codex_total_token_usage(store, session_id)?;
+    let mut payload = serde_json::json!({
+        "info": {
+            "total_token_usage": total_token_usage,
+            "last_token_usage": last_token_usage,
+            "model_context_window": model_context_window,
+        },
+        "rate_limits": latest_codex_rate_limits(store, session_id)?,
+        "turn_idx": turn_idx,
+        "source": "recomputed_context",
+        "reason": reason,
+    });
+    if let Some(history_rewrite_seq) = history_rewrite_seq {
+        payload["history_rewrite_seq"] = Value::from(history_rewrite_seq);
+    }
+    store.append_event(session_id, CODEX_TOKEN_COUNT_EVENT, payload)?;
+    Ok(())
+}
+
+fn maybe_append_recomputed_codex_token_count_after_history_rewrite(
+    store: &Store,
+    session_id: &str,
+    messages: &[Value],
+    base_instructions: Option<&str>,
+    model_context_window: Option<i64>,
+) -> Result<()> {
+    let events = store.events_for_session(session_id)?;
+    let Some(history_rewrite_seq) = latest_token_relevant_history_rewrite_seq(&events) else {
+        return Ok(());
+    };
+    if latest_codex_token_count_seq(&events).is_some_and(|seq| seq > history_rewrite_seq) {
+        return Ok(());
+    }
+    append_recomputed_codex_token_count_event(
+        store,
+        session_id,
+        messages,
+        base_instructions,
+        model_context_window,
+        None,
+        "history_rewrite_recomputed",
+        Some(history_rewrite_seq),
+    )
+}
+
+fn latest_token_relevant_history_rewrite_seq(events: &[EventRecord]) -> Option<i64> {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event_type == "session.compacted" || event.event_type == SESSION_ROLLBACK_EVENT
+        })
+        .map(|event| event.seq)
+}
+
+fn latest_codex_token_count_seq(events: &[EventRecord]) -> Option<i64> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+        .map(|event| event.seq)
+}
+
+fn latest_codex_total_token_usage(store: &Store, session_id: &str) -> Result<Value> {
+    Ok(store
+        .events_for_session(session_id)?
+        .iter()
+        .rev()
+        .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+        .and_then(|event| event.payload.get("info"))
+        .and_then(|info| info.get("total_token_usage"))
+        .cloned()
+        .unwrap_or_else(empty_codex_token_usage))
+}
+
+fn record_model_rate_limits(
+    store: &Store,
+    session_id: &str,
+    turn_idx: usize,
+    attempts: usize,
+    snapshot: &browser_use_protocol::RateLimitSnapshot,
+) -> Result<()> {
+    store.append_event(
+        session_id,
+        MODEL_RATE_LIMITS_EVENT,
+        serde_json::json!({
+            "turn_idx": turn_idx,
+            "attempts": attempts,
+            "snapshot": serde_json::to_value(snapshot)?,
+        }),
+    )?;
+    Ok(())
+}
+
+fn record_model_verifications(
+    store: &Store,
+    session_id: &str,
+    turn_idx: usize,
+    attempts: usize,
+    verifications: &[browser_use_protocol::ModelVerification],
+) -> Result<()> {
+    store.append_event(
+        session_id,
+        MODEL_VERIFICATION_EVENT,
+        serde_json::json!({
+            "turn_idx": turn_idx,
+            "attempts": attempts,
+            "verifications": serde_json::to_value(verifications)?,
+        }),
+    )?;
+    Ok(())
+}
+
+fn latest_codex_rate_limits(store: &Store, session_id: &str) -> Result<Value> {
+    Ok(store
+        .events_for_session(session_id)?
+        .iter()
+        .rev()
+        .find(|event| event.event_type == MODEL_RATE_LIMITS_EVENT)
+        .and_then(|event| event.payload.get("snapshot"))
+        .cloned()
+        .unwrap_or(Value::Null))
+}
+
+fn model_usage_to_codex_token_usage(usage: &browser_use_protocol::ModelUsage) -> Value {
+    let input_tokens = usage.input_tokens.unwrap_or_default();
+    let cached_input_tokens = usage.input_cached_tokens.unwrap_or_default();
+    let output_tokens = usage.output_tokens.unwrap_or_default();
+    let reasoning_output_tokens = usage.reasoning_output_tokens.unwrap_or_default();
+    let total_tokens = usage
+        .total_tokens
+        .unwrap_or(input_tokens + output_tokens + reasoning_output_tokens);
+    serde_json::json!({
+        "input_tokens": input_tokens,
+        "cached_input_tokens": cached_input_tokens,
+        "output_tokens": output_tokens,
+        "reasoning_output_tokens": reasoning_output_tokens,
+        "total_tokens": total_tokens,
+    })
+}
+
+fn empty_codex_token_usage() -> Value {
+    serde_json::json!({
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": 0,
+    })
+}
+
+fn add_codex_token_usage(left: &Value, right: &Value) -> Value {
+    serde_json::json!({
+        "input_tokens": json_payload_i64(left, "input_tokens") + json_payload_i64(right, "input_tokens"),
+        "cached_input_tokens": json_payload_i64(left, "cached_input_tokens") + json_payload_i64(right, "cached_input_tokens"),
+        "output_tokens": json_payload_i64(left, "output_tokens") + json_payload_i64(right, "output_tokens"),
+        "reasoning_output_tokens": json_payload_i64(left, "reasoning_output_tokens") + json_payload_i64(right, "reasoning_output_tokens"),
+        "total_tokens": json_payload_i64(left, "total_tokens") + json_payload_i64(right, "total_tokens"),
+    })
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct PreviousTurnSettings {
+    provider: Option<String>,
+    model: Option<String>,
+    personality: Option<ModelPersonality>,
+    model_settings: Option<ModelRequestSettings>,
+    turn_seq: Option<i64>,
+    model_config_seq: Option<i64>,
+}
+
+fn previous_turn_settings_from_events(events: &[EventRecord]) -> PreviousTurnSettings {
+    let checkpoint = latest_compaction_checkpoint(events);
+    let mut checkpoint_messages = checkpoint
+        .as_ref()
+        .map(|checkpoint| checkpoint.messages.clone())
+        .unwrap_or_default();
+    let events = rollback_filtered_events_after(
+        events,
+        checkpoint
+            .as_ref()
+            .map(|checkpoint| checkpoint.seq)
+            .unwrap_or(0),
+        &mut checkpoint_messages,
+    );
+    let real_user_turn_seqs = events
+        .iter()
+        .filter(|event| is_real_user_event(event))
+        .map(|event| event.seq)
+        .collect::<HashSet<_>>();
+    if let Some(settings) = events.iter().rev().find_map(|event| {
+        if event.event_type != CONTEXT_BASELINE_EVENT {
+            return None;
+        }
+        let settings = previous_turn_settings_from_baseline_payload(&event.payload)?;
+        settings
+            .turn_seq
+            .is_some_and(|turn_seq| real_user_turn_seqs.contains(&turn_seq))
+            .then_some(settings)
+    }) {
+        return settings;
+    }
+    if checkpoint_messages.iter().any(is_real_user_message) {
+        if let Some(settings) = checkpoint.and_then(|checkpoint| checkpoint.context_baseline) {
+            return settings;
+        }
+    }
+    previous_turn_settings_from_legacy_events(&events)
+}
+
+fn latest_context_baseline_payload_from_events(events: &[EventRecord]) -> Option<Value> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == CONTEXT_BASELINE_EVENT)
+        .map(|event| event.payload.clone())
+}
+
+fn previous_turn_settings_from_baseline_payload(payload: &Value) -> Option<PreviousTurnSettings> {
+    let model = payload
+        .get("model")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+    let personality = payload
+        .get("personality")
+        .and_then(Value::as_str)
+        .and_then(model_personality_from_key);
+    if model.is_none() && personality.is_none() {
+        return None;
+    }
+    Some(PreviousTurnSettings {
+        provider: payload
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        model,
+        personality,
+        model_settings: payload
+            .get("model_settings")
+            .map(model_request_settings_from_json),
+        turn_seq: payload.get("turn_seq").and_then(Value::as_i64),
+        model_config_seq: payload.get("model_config_seq").and_then(Value::as_i64),
+    })
+}
+
+fn previous_turn_settings_from_legacy_events(events: &[&EventRecord]) -> PreviousTurnSettings {
+    let mut settings = PreviousTurnSettings::default();
+    if let Some(event) = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "model.config")
+    {
+        settings.provider = event
+            .payload
+            .get("provider")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        settings.model = event
+            .payload
+            .get("model")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned);
+        settings.personality = event
+            .payload
+            .get("personality")
+            .and_then(Value::as_str)
+            .and_then(model_personality_from_key);
+        settings.model_config_seq = Some(event.seq);
+    }
+    if settings.personality.is_none() {
+        settings.personality = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == PERSONALITY_CONTEXT_EVENT)
+            .and_then(|event| event.payload.get("personality"))
+            .and_then(Value::as_str)
+            .and_then(model_personality_from_key);
+    }
+    settings
+}
+
+fn model_request_settings_from_json(value: &Value) -> ModelRequestSettings {
+    ModelRequestSettings {
+        reasoning_effort: value
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        reasoning_summary: value
+            .get("reasoning_summary")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        model_supports_reasoning_summaries: value
+            .get("model_supports_reasoning_summaries")
+            .and_then(Value::as_bool),
+        text_verbosity: value
+            .get("text_verbosity")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        service_tier: value
+            .get("service_tier")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+    }
+}
+
+fn model_switch_context_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    previous_model: Option<&str>,
+    next_model: &str,
+) -> Result<Option<String>> {
+    let Some(previous_model) = previous_model else {
+        return Ok(None);
+    };
+    if previous_model == next_model {
+        return Ok(None);
+    }
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    let Some(model_instructions) = config.default_base_instructions_for_model(next_model) else {
+        return Ok(None);
+    };
+    if model_instructions.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(render_model_switch_context(&model_instructions)))
+}
+
+fn personality_context_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    existing_events: &[EventRecord],
+    previous_model: Option<&str>,
+    next_model: &str,
+    current_personality: ModelPersonality,
+    turn_instructions: Option<&str>,
+) -> Result<Option<String>> {
+    if previous_model.is_some_and(|previous_model| previous_model != next_model) {
+        return Ok(None);
+    }
+
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    let Some(personality_message) =
+        default_personality_message_for_model_and_personality_with_catalog(
+            next_model,
+            current_personality,
+            config.model_catalog.as_ref(),
+        )
+    else {
+        return Ok(None);
+    };
+    if personality_message.is_empty() {
+        return Ok(None);
+    };
+
+    if latest_personality_context_from_events(existing_events) == Some(current_personality) {
+        return Ok(None);
+    }
+
+    if turn_instructions
+        == config
+            .default_base_instructions_for_model(next_model)
+            .as_deref()
+    {
+        return Ok(None);
+    }
+
+    Ok(Some(render_personality_context(&personality_message)))
+}
+
+fn render_model_switch_context(model_instructions: &str) -> String {
+    format!(
+        "<model_switch>\nThe user was previously using a different model. Please continue the conversation according to the following instructions:\n\n{model_instructions}\n</model_switch>"
+    )
+}
+
+fn render_personality_context(personality_message: &str) -> String {
+    format!(
+        "<personality_spec> The user has requested a new communication style. Future messages should adhere to the following personality: \n{personality_message} </personality_spec>"
+    )
+}
+
+fn provider_model_request_settings_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+) -> Result<ModelRequestSettings> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    let mut settings = config.model_request_settings;
+    if options.collaboration_mode == CollaborationModeKind::Plan {
+        settings.reasoning_effort = Some(
+            config
+                .plan_mode_reasoning_effort
+                .unwrap_or_else(|| "medium".to_string()),
+        );
+    }
+    Ok(settings)
+}
+
+fn resolved_model_request_info_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    model: &str,
+) -> Result<browser_use_providers::ModelRequestInfo> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    Ok(resolved_model_request_info_from_config(&config, model))
+}
+
+fn resolved_model_request_info_from_config(
+    config: &AgentsMdConfig,
+    model: &str,
+) -> browser_use_providers::ModelRequestInfo {
+    let mut model_info = model_request_info_for_catalog(model, config.model_catalog.as_ref());
+    if config
+        .model_request_settings
+        .model_supports_reasoning_summaries
+        == Some(true)
+    {
+        model_info.supports_reasoning_summaries = true;
+    }
+    if let Some(context_window) = config.model_context_window {
+        model_info.context_window = Some(
+            model_info
+                .max_context_window
+                .map_or(context_window, |max_context_window| {
+                    context_window.min(max_context_window)
+                }),
+        );
+    }
+    if let Some(auto_compact_token_limit) = config.model_auto_compact_token_limit {
+        model_info.auto_compact_token_limit = Some(auto_compact_token_limit);
+    }
+    if let Some(tool_output_token_limit) = config.tool_output_token_limit {
+        model_info.truncation_policy = model_info
+            .truncation_policy
+            .with_token_limit(tool_output_token_limit);
+    }
+    model_info
+}
+
+fn provider_request_max_retries_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    model_provider_id: &str,
+) -> Result<Option<usize>> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    Ok(config
+        .provider_request_max_retries
+        .get(model_provider_id)
+        .copied()
+        .map(|value| value.min(MAX_REQUEST_MAX_RETRIES)))
+}
+
+fn provider_stream_config_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+    model_provider_id: &str,
+) -> Result<(Option<usize>, Option<u64>)> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    Ok((
+        config
+            .provider_stream_max_retries
+            .get(model_provider_id)
+            .copied()
+            .map(|value| value.min(MAX_STREAM_MAX_RETRIES)),
+        config
+            .provider_stream_idle_timeout_ms
+            .get(model_provider_id)
+            .copied(),
+    ))
+}
+
+fn provider_personality_for_session(
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+) -> Result<ModelPersonality> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    Ok(config.personality)
 }
 
 fn render_prompt_template(template: &str, replacements: &[(&str, &str)]) -> String {
@@ -1886,6 +5778,48 @@ fn latest_session_message_seq(store: &Store, session_id: &str) -> Result<i64> {
         .map(|event| event.seq)
         .max()
         .unwrap_or(0))
+}
+
+fn first_user_message_seq_from_iter<'a, I>(events: I) -> Option<i64>
+where
+    I: IntoIterator<Item = &'a EventRecord>,
+{
+    events
+        .into_iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.input" | "session.followup"
+            )
+        })
+        .map(|event| event.seq)
+        .min()
+}
+
+fn latest_model_name_from_events(events: &[EventRecord]) -> Option<String> {
+    previous_turn_settings_from_events(events).model
+}
+
+fn latest_personality_context_from_events(events: &[EventRecord]) -> Option<ModelPersonality> {
+    previous_turn_settings_from_events(events).personality
+}
+
+fn current_turn_user_message_seq(events: &[EventRecord]) -> Option<i64> {
+    let latest_model_config_seq = previous_turn_settings_from_events(events)
+        .model_config_seq
+        .unwrap_or(0);
+    let events = rollback_filtered_events(events);
+    events
+        .iter()
+        .filter(|event| {
+            event.seq > latest_model_config_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+        })
+        .map(|event| event.seq)
+        .max()
 }
 
 fn append_new_external_session_messages(
@@ -1922,39 +5856,470 @@ fn append_new_external_session_messages(
             "content": text,
         }));
     }
+    for mail in store.drain_agent_messages_for_agent(session_id)? {
+        let author_path = display_agent_path_for_session(store, &mail.author_session_id)?;
+        let recipient_path = display_agent_path_for_session(store, &mail.target_session_id)?;
+        let event = store.append_event(
+            session_id,
+            "agent.mailbox_input",
+            serde_json::json!({
+                "id": mail.id,
+                "author_session_id": mail.author_session_id,
+                "target_session_id": mail.target_session_id,
+                "author_path": author_path,
+                "recipient_path": recipient_path,
+                "content": mail.content,
+                "trigger_turn": mail.trigger_turn,
+            }),
+        )?;
+        if let Some(message) = inter_agent_provider_message_from_event(&event) {
+            messages.push(message);
+        }
+    }
     Ok(())
 }
 
 fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -> Vec<Value> {
+    let (replay_start_seq, mut messages, has_compaction_checkpoint) =
+        latest_compaction_replacement_history(events)
+            .map(|(seq, messages)| (seq, messages, true))
+            .unwrap_or_else(|| (0, Vec::new(), false));
+    let replay_events = rollback_filtered_events_after(events, replay_start_seq, &mut messages);
+    provider_messages_from_event_slice(
+        &replay_events,
+        &mut messages,
+        has_compaction_checkpoint,
+        false,
+    )
+}
+
+fn provider_messages_from_events_for_fork(
+    events: &[browser_use_protocol::EventRecord],
+) -> Vec<Value> {
+    let (replay_start_seq, mut messages, has_compaction_checkpoint) =
+        latest_compaction_replacement_history(events)
+            .map(|(seq, messages)| (seq, messages, true))
+            .unwrap_or_else(|| (0, Vec::new(), false));
+    let replay_events =
+        rollback_filtered_events_after_for_fork(events, replay_start_seq, &mut messages);
+    provider_messages_from_event_slice(
+        &replay_events,
+        &mut messages,
+        has_compaction_checkpoint,
+        true,
+    )
+}
+
+struct CompactionCheckpoint {
+    seq: i64,
+    messages: Vec<Value>,
+    response_items: Option<Vec<Value>>,
+    context_baseline: Option<PreviousTurnSettings>,
+}
+
+fn latest_compaction_replacement_history(events: &[EventRecord]) -> Option<(i64, Vec<Value>)> {
+    latest_compaction_checkpoint(events).map(|checkpoint| {
+        let messages = match checkpoint.response_items {
+            Some(response_items) => response_items_to_provider_messages(&response_items),
+            None => checkpoint.messages,
+        };
+        (checkpoint.seq, messages)
+    })
+}
+
+fn latest_compaction_checkpoint(events: &[EventRecord]) -> Option<CompactionCheckpoint> {
+    events.iter().rev().find_map(|event| {
+        if event.event_type != "session.compacted" {
+            return None;
+        }
+        let messages = event
+            .payload
+            .get("replacement_messages")
+            .and_then(Value::as_array)?
+            .clone();
+        let response_items = event
+            .payload
+            .get("replacement_response_items")
+            .and_then(Value::as_array)
+            .cloned();
+        let context_baseline = event
+            .payload
+            .get("context_baseline")
+            .and_then(previous_turn_settings_from_baseline_payload);
+        Some(CompactionCheckpoint {
+            seq: event.seq,
+            messages,
+            response_items,
+            context_baseline,
+        })
+    })
+}
+
+fn rollback_filtered_events(events: &[EventRecord]) -> Vec<&EventRecord> {
     let mut messages = Vec::new();
+    rollback_filtered_events_after(events, 0, &mut messages)
+}
+
+fn rollback_filtered_events_after<'a>(
+    events: &'a [EventRecord],
+    after_seq: i64,
+    messages: &mut Vec<Value>,
+) -> Vec<&'a EventRecord> {
+    rollback_filtered_events_after_with_options(events, after_seq, messages, true)
+}
+
+fn rollback_filtered_events_after_for_fork<'a>(
+    events: &'a [EventRecord],
+    after_seq: i64,
+    messages: &mut Vec<Value>,
+) -> Vec<&'a EventRecord> {
+    rollback_filtered_events_after_with_options(events, after_seq, messages, true)
+}
+
+fn rollback_filtered_events_after_with_options<'a>(
+    events: &'a [EventRecord],
+    after_seq: i64,
+    messages: &mut Vec<Value>,
+    count_inter_agent_turns: bool,
+) -> Vec<&'a EventRecord> {
+    let mut replay_events = Vec::new();
+    for event in events.iter().filter(|event| event.seq > after_seq) {
+        if event.event_type == SESSION_ROLLBACK_EVENT {
+            rollback_last_n_user_turns(
+                &mut replay_events,
+                messages,
+                rollback_turn_count(&event.payload),
+                count_inter_agent_turns,
+            );
+        } else {
+            replay_events.push(event);
+        }
+    }
+    replay_events
+}
+
+fn rollback_turn_count(payload: &Value) -> usize {
+    match payload
+        .get("num_turns")
+        .or_else(|| payload.get("turns"))
+        .or_else(|| payload.get("n"))
+        .and_then(Value::as_u64)
+    {
+        Some(count) => usize::try_from(count).unwrap_or(usize::MAX),
+        None => 1,
+    }
+}
+
+fn rollback_last_n_user_turns(
+    events: &mut Vec<&EventRecord>,
+    checkpoint_messages: &mut Vec<Value>,
+    mut count: usize,
+    count_inter_agent_turns: bool,
+) {
+    while count > 0 {
+        if rollback_last_user_event_turn(events, count_inter_agent_turns)
+            || rollback_last_user_message_turn(checkpoint_messages, count_inter_agent_turns)
+        {
+            count -= 1;
+        } else {
+            break;
+        }
+    }
+}
+
+fn rollback_last_user_event_turn(
+    events: &mut Vec<&EventRecord>,
+    count_inter_agent_turns: bool,
+) -> bool {
+    let Some(user_pos) = events
+        .iter()
+        .rposition(|event| is_real_user_event_for_rollback(event, count_inter_agent_turns))
+    else {
+        return false;
+    };
+    let target_seq = events[user_pos].seq;
+    let mut truncate_at = user_pos;
+    while truncate_at > 0 && contextual_event_targets_turn(events[truncate_at - 1], target_seq) {
+        truncate_at -= 1;
+    }
+    events.truncate(truncate_at);
+    true
+}
+
+fn is_real_user_event_for_rollback(event: &EventRecord, count_inter_agent_turns: bool) -> bool {
+    is_real_user_event(event)
+        || (count_inter_agent_turns && agent_message_is_inter_agent_turn_event(event))
+}
+
+fn is_real_user_event(event: &EventRecord) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "session.input" | "session.followup"
+    )
+}
+
+fn agent_message_is_inter_agent_turn_event(event: &EventRecord) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "agent.message" | "agent.mailbox_input"
+    ) && event
+        .payload
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some()
+}
+
+fn contextual_event_targets_turn(event: &EventRecord, target_seq: i64) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "workspace.context"
+            | MODEL_SWITCH_CONTEXT_EVENT
+            | PERSONALITY_CONTEXT_EVENT
+            | COLLABORATION_CONTEXT_EVENT
+    ) && event.payload.get("before_seq").and_then(Value::as_i64) == Some(target_seq)
+}
+
+fn rollback_last_user_message_turn(
+    messages: &mut Vec<Value>,
+    count_inter_agent_turns: bool,
+) -> bool {
+    let Some(user_pos) = messages
+        .iter()
+        .rposition(|message| is_user_message_for_rollback(message, count_inter_agent_turns))
+    else {
+        return false;
+    };
+    let has_prior_real_user = messages[..user_pos]
+        .iter()
+        .any(|message| is_user_message_for_rollback(message, count_inter_agent_turns));
+    let mut truncate_at = user_pos;
+    if has_prior_real_user {
+        while truncate_at > 0 && is_contextual_provider_message(&messages[truncate_at - 1]) {
+            truncate_at -= 1;
+        }
+    }
+    messages.truncate(truncate_at);
+    true
+}
+
+fn is_user_message_for_rollback(message: &Value, count_inter_agent_turns: bool) -> bool {
+    is_real_user_message(message)
+        || (count_inter_agent_turns && provider_message_is_inter_agent_instruction(message))
+}
+
+fn is_real_user_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && message.get("name").is_none()
+        && !is_turn_aborted_message(message)
+}
+
+fn is_contextual_provider_message(message: &Value) -> bool {
+    if is_turn_aborted_message(message) {
+        return true;
+    }
+    matches!(
+        message.get("name").and_then(Value::as_str),
+        Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
+            | Some(PERMISSIONS_CONTEXT_MESSAGE_NAME)
+            | Some(MODEL_SWITCH_CONTEXT_MESSAGE_NAME)
+            | Some(PERSONALITY_CONTEXT_MESSAGE_NAME)
+            | Some(COLLABORATION_CONTEXT_MESSAGE_NAME)
+    )
+}
+
+fn provider_history_has_open_turn(messages: &[Value]) -> bool {
+    let Some(user_pos) = messages
+        .iter()
+        .rposition(|message| is_user_message_for_rollback(message, true))
+    else {
+        return false;
+    };
+    !messages[user_pos + 1..].iter().any(is_turn_aborted_message)
+}
+
+fn inter_agent_provider_message_from_event(event: &EventRecord) -> Option<Value> {
+    let content = event.payload.get("content").and_then(Value::as_str)?;
+    let author = event
+        .payload
+        .get("author_path")
+        .and_then(Value::as_str)
+        .unwrap_or("/root");
+    let recipient = event
+        .payload
+        .get("recipient_path")
+        .and_then(Value::as_str)
+        .or_else(|| event.payload.get("agent_path").and_then(Value::as_str))
+        .unwrap_or("/root");
+    let trigger_turn = event
+        .payload
+        .get("trigger_turn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    Some(serde_json::json!({
+        "role": "assistant",
+        "phase": "commentary",
+        "content": serde_json::to_string(&serde_json::json!({
+            "author": author,
+            "recipient": recipient,
+            "other_recipients": [],
+            "content": content,
+            "trigger_turn": trigger_turn,
+        })).ok()?,
+    }))
+}
+
+fn provider_messages_from_event_slice(
+    events: &[&browser_use_protocol::EventRecord],
+    messages: &mut Vec<Value>,
+    has_compaction_checkpoint: bool,
+    include_agent_messages: bool,
+) -> Vec<Value> {
     let mut assistant_text = String::new();
+    let mut assistant_phase = None::<String>;
     let mut assistant_tool_calls = Vec::<Value>::new();
     let mut tool_names = HashMap::<String, String>::new();
     let mut emitted_tool_messages = HashSet::<String>::new();
+    let mut turn_open = has_compaction_checkpoint && provider_history_has_open_turn(messages);
+    let mut suppress_terminal_tail = false;
+    let first_user_message_seq = first_user_message_seq_from_iter(events.iter().copied());
+    let mut initial_context_messages = if has_compaction_checkpoint {
+        Vec::new()
+    } else {
+        initial_context_messages_from_iter(
+            events.iter().copied(),
+            first_user_message_seq,
+            false,
+            false,
+        )
+    };
+    let mut emitted_initial_context_messages = has_compaction_checkpoint;
+    let mut workspace_contexts_by_before_seq = events
+        .iter()
+        .filter(|event| event.event_type == "workspace.context")
+        .filter_map(|event| {
+            let before_seq = event.payload.get("before_seq").and_then(Value::as_i64)?;
+            if !has_compaction_checkpoint && Some(before_seq) == first_user_message_seq {
+                return None;
+            }
+            workspace_context_message_from_payload(&event.payload)
+                .map(|message| (before_seq, message))
+        })
+        .fold(
+            HashMap::<i64, Vec<Value>>::new(),
+            |mut acc, (seq, message)| {
+                acc.entry(seq).or_default().push(message);
+                acc
+            },
+        );
+    let mut developer_contexts_by_before_seq = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                MODEL_SWITCH_CONTEXT_EVENT
+                    | PERSONALITY_CONTEXT_EVENT
+                    | COLLABORATION_CONTEXT_EVENT
+            )
+        })
+        .filter_map(|event| {
+            let before_seq = event.payload.get("before_seq").and_then(Value::as_i64)?;
+            let content = event.payload.get("content").and_then(Value::as_str)?;
+            Some((
+                before_seq,
+                developer_context_message_for_event(&event.event_type, content.to_string()),
+            ))
+        })
+        .fold(
+            HashMap::<i64, Vec<Value>>::new(),
+            |mut acc, (seq, message)| {
+                acc.entry(seq).or_default().push(message);
+                acc
+            },
+        );
 
     fn flush_assistant(
         messages: &mut Vec<Value>,
         assistant_text: &mut String,
+        assistant_phase: &mut Option<String>,
         assistant_tool_calls: &mut Vec<Value>,
     ) {
         if assistant_text.is_empty() && assistant_tool_calls.is_empty() {
             return;
         }
-        messages.push(serde_json::json!({
+        let mut message = serde_json::json!({
             "role": "assistant",
             "content": std::mem::take(assistant_text),
             "tool_calls": std::mem::take(assistant_tool_calls),
-        }));
+        });
+        if let Some(phase) = assistant_phase.take() {
+            message["phase"] = Value::String(phase);
+        }
+        messages.push(message);
+    }
+
+    fn merge_response_item_assistant_text(
+        messages: &mut Vec<Value>,
+        assistant_text: &mut String,
+        assistant_phase: &mut Option<String>,
+        assistant_tool_calls: &mut Vec<Value>,
+        text: &str,
+        phase: Option<&str>,
+    ) {
+        if text.is_empty() {
+            return;
+        }
+        if assistant_text == text || assistant_text.trim() == text.trim() {
+            assistant_text.clear();
+            assistant_text.push_str(text);
+            *assistant_phase = phase.map(ToOwned::to_owned);
+            return;
+        }
+        if !assistant_text.is_empty()
+            && assistant_text.ends_with(text)
+            && assistant_text.len() > text.len()
+        {
+            let prefix_len = assistant_text.len() - text.len();
+            let prefix = assistant_text[..prefix_len].to_string();
+            assistant_text.clear();
+            assistant_text.push_str(&prefix);
+            flush_assistant(
+                messages,
+                assistant_text,
+                assistant_phase,
+                assistant_tool_calls,
+            );
+            assistant_text.push_str(text);
+            *assistant_phase = phase.map(ToOwned::to_owned);
+            return;
+        }
+        if !assistant_text.is_empty() || !assistant_tool_calls.is_empty() {
+            flush_assistant(
+                messages,
+                assistant_text,
+                assistant_phase,
+                assistant_tool_calls,
+            );
+        }
+        assistant_text.push_str(text);
+        *assistant_phase = phase.map(ToOwned::to_owned);
     }
 
     for event in events {
         match event.event_type.as_str() {
             "agent.context" => {
                 flush_assistant(
-                    &mut messages,
+                    messages,
                     &mut assistant_text,
+                    &mut assistant_phase,
                     &mut assistant_tool_calls,
                 );
+                if let Some(fork_response_items) = event
+                    .payload
+                    .get("fork_response_items")
+                    .and_then(Value::as_array)
+                {
+                    messages.extend(response_items_to_provider_messages(fork_response_items));
+                }
                 let mut sections = Vec::new();
                 if let Some(role) = event.payload.get("role").and_then(Value::as_str) {
                     let canonical_task_sentence = event
@@ -1981,12 +6346,16 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                         ],
                     ));
                 }
-                if let Some(context) = event.payload.get("context") {
-                    let context = context.to_string();
-                    sections.push(render_prompt_template(
-                        include_str!("../../../prompts/helper-session-inherited-context.md"),
-                        &[("{{context}}", &context)],
-                    ));
+                let has_fork_history = event.payload.get("history_mode").and_then(Value::as_str)
+                    == Some("fork_response_items");
+                if !has_fork_history {
+                    if let Some(context) = event.payload.get("context") {
+                        let context = context.to_string();
+                        sections.push(render_prompt_template(
+                            include_str!("../../../prompts/helper-session-inherited-context.md"),
+                            &[("{{context}}", &context)],
+                        ));
+                    }
                 }
                 if !sections.is_empty() {
                     messages.push(serde_json::json!({
@@ -1995,10 +6364,71 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                     }));
                 }
             }
-            "session.input" | "session.followup" => {
+            "agent.message" => {
+                if include_agent_messages {
+                    flush_assistant(
+                        messages,
+                        &mut assistant_text,
+                        &mut assistant_phase,
+                        &mut assistant_tool_calls,
+                    );
+                    if let Some(message) = inter_agent_provider_message_from_event(event) {
+                        messages.push(message);
+                    }
+                }
+            }
+            "agent.mailbox_input" => {
                 flush_assistant(
-                    &mut messages,
+                    messages,
                     &mut assistant_text,
+                    &mut assistant_phase,
+                    &mut assistant_tool_calls,
+                );
+                if let Some(message) = inter_agent_provider_message_from_event(event) {
+                    messages.push(message);
+                }
+            }
+            "workspace.context" => {
+                continue;
+            }
+            "session.input" | "session.followup" => {
+                suppress_terminal_tail = false;
+                if !emitted_initial_context_messages {
+                    flush_assistant(
+                        messages,
+                        &mut assistant_text,
+                        &mut assistant_phase,
+                        &mut assistant_tool_calls,
+                    );
+                    messages.append(&mut initial_context_messages);
+                    emitted_initial_context_messages = true;
+                }
+                if let Some(contexts) = developer_contexts_by_before_seq.remove(&event.seq) {
+                    flush_assistant(
+                        messages,
+                        &mut assistant_text,
+                        &mut assistant_phase,
+                        &mut assistant_tool_calls,
+                    );
+                    for message in contexts {
+                        messages.push(message);
+                    }
+                }
+                if let Some(contexts) = workspace_contexts_by_before_seq.remove(&event.seq) {
+                    flush_assistant(
+                        messages,
+                        &mut assistant_text,
+                        &mut assistant_phase,
+                        &mut assistant_tool_calls,
+                    );
+                    for message in contexts {
+                        messages.push(message);
+                    }
+                }
+                flush_assistant(
+                    messages,
+                    &mut assistant_text,
+                    &mut assistant_phase,
                     &mut assistant_tool_calls,
                 );
                 if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
@@ -2007,36 +6437,166 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                         "content": text,
                     }));
                 }
+                turn_open = true;
+            }
+            MODEL_SWITCH_CONTEXT_EVENT
+            | PERSONALITY_CONTEXT_EVENT
+            | COLLABORATION_CONTEXT_EVENT => {
+                if event
+                    .payload
+                    .get("before_seq")
+                    .and_then(Value::as_i64)
+                    .is_some()
+                {
+                    continue;
+                }
+                flush_assistant(
+                    messages,
+                    &mut assistant_text,
+                    &mut assistant_phase,
+                    &mut assistant_tool_calls,
+                );
+                if let Some(content) = event.payload.get("content").and_then(Value::as_str) {
+                    messages.push(developer_context_message_for_event(
+                        &event.event_type,
+                        content.to_string(),
+                    ));
+                }
+            }
+            "model.response.output_item" => {
+                if suppress_terminal_tail {
+                    continue;
+                }
+                let Some(item) = event.payload.get("item") else {
+                    continue;
+                };
+                match item.get("type").and_then(Value::as_str) {
+                    Some("message") => {
+                        if item.get("role").and_then(Value::as_str) == Some("assistant") {
+                            if let Some(text) = response_message_item_text(item) {
+                                merge_response_item_assistant_text(
+                                    messages,
+                                    &mut assistant_text,
+                                    &mut assistant_phase,
+                                    &mut assistant_tool_calls,
+                                    &text,
+                                    item.get("phase").and_then(Value::as_str),
+                                );
+                                turn_open = true;
+                            }
+                        }
+                    }
+                    Some("function_call") | Some("custom_tool_call") => {
+                        if let Some(call) = response_output_item_tool_call_value(item) {
+                            if let Some(call_id) = tool_call_id_from_value(&call) {
+                                if assistant_tool_calls.iter().any(|existing| {
+                                    tool_call_id_from_value(existing) == Some(call_id)
+                                }) {
+                                    continue;
+                                }
+                                if let Some(name) = call.get("name").and_then(Value::as_str) {
+                                    tool_names.insert(call_id.to_string(), name.to_string());
+                                }
+                            }
+                            assistant_tool_calls.push(call);
+                            turn_open = true;
+                        }
+                    }
+                    Some(_) if is_raw_response_item_provider_message(item) => {
+                        flush_assistant(
+                            messages,
+                            &mut assistant_text,
+                            &mut assistant_phase,
+                            &mut assistant_tool_calls,
+                        );
+                        messages.push(item.clone());
+                        turn_open = true;
+                    }
+                    _ => {}
+                }
+            }
+            MODEL_RESPONSE_INPUT_ITEM_EVENT => {
+                if suppress_terminal_tail {
+                    continue;
+                }
+                let Some(item) = event.payload.get("item") else {
+                    continue;
+                };
+                let Some(call_id) = response_input_item_call_id(item) else {
+                    continue;
+                };
+                flush_assistant(
+                    messages,
+                    &mut assistant_text,
+                    &mut assistant_phase,
+                    &mut assistant_tool_calls,
+                );
+                let message = response_input_item_tool_message(item, &event.payload, &tool_names);
+                if let Some(pos) = messages.iter().rposition(|message| {
+                    message.get("role").and_then(Value::as_str) == Some("tool")
+                        && message.get("tool_call_id").and_then(Value::as_str) == Some(call_id)
+                }) {
+                    messages[pos] = message;
+                } else {
+                    messages.push(message);
+                }
+                emitted_tool_messages.insert(call_id.to_string());
+                turn_open = true;
             }
             "model.delta" => {
+                if suppress_terminal_tail {
+                    continue;
+                }
                 if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
-                    assistant_text.push_str(text);
+                    if let Some(delta) = assistant_delta_to_append(&assistant_text, text) {
+                        assistant_text.push_str(&delta);
+                        turn_open = true;
+                    }
                 }
             }
             "model.tool_call" => {
+                if suppress_terminal_tail {
+                    continue;
+                }
                 let call = event.payload.clone();
                 if let Some(call_id) = call.get("id").and_then(Value::as_str) {
+                    if assistant_tool_calls
+                        .iter()
+                        .any(|existing| tool_call_id_from_value(existing) == Some(call_id))
+                    {
+                        continue;
+                    }
                     if let Some(name) = call.get("name").and_then(Value::as_str) {
                         tool_names.insert(call_id.to_string(), name.to_string());
                     }
                 }
                 assistant_tool_calls.push(call);
+                turn_open = true;
             }
             "tool.output" => {
+                if suppress_terminal_tail {
+                    continue;
+                }
                 flush_assistant(
-                    &mut messages,
+                    messages,
                     &mut assistant_text,
+                    &mut assistant_phase,
                     &mut assistant_tool_calls,
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
                     messages.push(tool_message_from_output_event(&event.payload, call_id));
                     emitted_tool_messages.insert(call_id.to_string());
+                    turn_open = true;
                 }
             }
             "tool.failed" => {
+                if suppress_terminal_tail {
+                    continue;
+                }
                 flush_assistant(
-                    &mut messages,
+                    messages,
                     &mut assistant_text,
+                    &mut assistant_phase,
                     &mut assistant_tool_calls,
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
@@ -2058,13 +6618,18 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                             "content": format!("{name} failed: {error}"),
                         }));
                         emitted_tool_messages.insert(call_id.to_string());
+                        turn_open = true;
                     }
                 }
             }
             "tool.finished" => {
+                if suppress_terminal_tail {
+                    continue;
+                }
                 flush_assistant(
-                    &mut messages,
+                    messages,
                     &mut assistant_text,
+                    &mut assistant_phase,
                     &mut assistant_tool_calls,
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
@@ -2082,19 +6647,331 @@ fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -
                             "content": synthetic_tool_result_text(name),
                         }));
                         emitted_tool_messages.insert(call_id.to_string());
+                        turn_open = true;
                     }
                 }
+            }
+            "session.cancelled" => {
+                let should_insert_marker =
+                    turn_open || !assistant_text.is_empty() || !assistant_tool_calls.is_empty();
+                flush_assistant(
+                    messages,
+                    &mut assistant_text,
+                    &mut assistant_phase,
+                    &mut assistant_tool_calls,
+                );
+                if should_insert_marker {
+                    messages.push(turn_aborted_user_message());
+                }
+                turn_open = false;
+                suppress_terminal_tail = true;
+            }
+            "session.done" | "session.failed" => {
+                flush_assistant(
+                    messages,
+                    &mut assistant_text,
+                    &mut assistant_phase,
+                    &mut assistant_tool_calls,
+                );
+                turn_open = false;
+                suppress_terminal_tail = true;
             }
             _ => {}
         }
     }
     flush_assistant(
-        &mut messages,
+        messages,
         &mut assistant_text,
+        &mut assistant_phase,
         &mut assistant_tool_calls,
     );
-    normalize_provider_messages(&mut messages);
-    messages
+    if !emitted_initial_context_messages {
+        messages.append(&mut initial_context_messages);
+    }
+    normalize_provider_messages(messages);
+    std::mem::take(messages)
+}
+
+fn initial_context_messages_from_events(
+    events: &[EventRecord],
+    first_user_message_seq: Option<i64>,
+    include_all_anchored: bool,
+    inject_default_permissions: bool,
+) -> Vec<Value> {
+    initial_context_messages_from_iter(
+        events.iter(),
+        first_user_message_seq,
+        include_all_anchored,
+        inject_default_permissions,
+    )
+}
+
+fn initial_context_messages_from_iter<'a, I>(
+    events: I,
+    first_user_message_seq: Option<i64>,
+    include_all_anchored: bool,
+    inject_default_permissions: bool,
+) -> Vec<Value>
+where
+    I: IntoIterator<Item = &'a EventRecord>,
+{
+    let mut context_messages = Vec::new();
+    let mut saw_permissions = false;
+    for event in events {
+        if event.event_type != "workspace.context" {
+            continue;
+        }
+        if let Some(before_seq) = event.payload.get("before_seq").and_then(Value::as_i64) {
+            if !include_all_anchored {
+                match first_user_message_seq {
+                    Some(first_user_message_seq) if before_seq == first_user_message_seq => {}
+                    _ => continue,
+                }
+            }
+        }
+        let Some(kind) = event.payload.get("kind").and_then(Value::as_str) else {
+            continue;
+        };
+        let Some(content) = event.payload.get("content").and_then(Value::as_str) else {
+            continue;
+        };
+        match kind {
+            WORKSPACE_CONTEXT_PERMISSIONS_KIND => {
+                saw_permissions = true;
+                context_messages.push(permissions_context_message(content.to_string()));
+            }
+            WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND => {
+                context_messages.push(multi_agent_usage_hint_context_message(content.to_string()));
+            }
+            WORKSPACE_CONTEXT_AGENTS_KIND | WORKSPACE_CONTEXT_ENVIRONMENT_KIND => {
+                context_messages.push(workspace_context_message(vec![content.to_string()]));
+            }
+            _ => {}
+        }
+    }
+    if inject_default_permissions && !saw_permissions {
+        context_messages.insert(
+            0,
+            permissions_context_message(default_permissions_instructions().to_string()),
+        );
+    }
+    move_workspace_context_before_first_user_message(&mut context_messages);
+    context_messages
+}
+
+fn workspace_context_message(sections: Vec<String>) -> Value {
+    let content = sections
+        .into_iter()
+        .map(|text| {
+            serde_json::json!({
+                "type": "input_text",
+                "text": text,
+            })
+        })
+        .collect::<Vec<_>>();
+    serde_json::json!({
+        "role": "user",
+        "name": WORKSPACE_CONTEXT_MESSAGE_NAME,
+        "content": content,
+    })
+}
+
+fn workspace_context_message_from_payload(payload: &Value) -> Option<Value> {
+    let kind = payload.get("kind").and_then(Value::as_str)?;
+    if !matches!(
+        kind,
+        WORKSPACE_CONTEXT_PERMISSIONS_KIND
+            | WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND
+            | WORKSPACE_CONTEXT_AGENTS_KIND
+            | WORKSPACE_CONTEXT_ENVIRONMENT_KIND
+    ) {
+        return None;
+    }
+    let content = payload
+        .get("content")
+        .and_then(Value::as_str)
+        .filter(|content| !content.is_empty())?;
+    match kind {
+        WORKSPACE_CONTEXT_PERMISSIONS_KIND => {
+            Some(permissions_context_message(content.to_string()))
+        }
+        WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND => {
+            Some(multi_agent_usage_hint_context_message(content.to_string()))
+        }
+        _ => Some(workspace_context_message(vec![content.to_string()])),
+    }
+}
+
+fn turn_aborted_user_message() -> Value {
+    serde_json::json!({
+        "role": "user",
+        "content": format!(
+            "{TURN_ABORTED_START_MARKER}\n{TURN_ABORTED_INTERRUPTED_GUIDANCE}\n{TURN_ABORTED_END_MARKER}"
+        ),
+    })
+}
+
+fn is_turn_aborted_message(message: &Value) -> bool {
+    matches!(
+        message.get("role").and_then(Value::as_str),
+        Some("user") | Some("developer")
+    ) && is_turn_aborted_text(&message_content_text(message))
+}
+
+fn is_turn_aborted_text(text: &str) -> bool {
+    let trimmed_start = text.trim_start();
+    let starts_with_marker = trimmed_start
+        .get(..TURN_ABORTED_START_MARKER.len())
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(TURN_ABORTED_START_MARKER));
+    let trimmed_end = trimmed_start.trim_end();
+    let ends_with_marker = trimmed_end
+        .get(
+            trimmed_end
+                .len()
+                .saturating_sub(TURN_ABORTED_END_MARKER.len())..,
+        )
+        .is_some_and(|candidate| candidate.eq_ignore_ascii_case(TURN_ABORTED_END_MARKER));
+    starts_with_marker && ends_with_marker
+}
+
+fn permissions_context_message(text: String) -> Value {
+    serde_json::json!({
+        "role": "developer",
+        "name": PERMISSIONS_CONTEXT_MESSAGE_NAME,
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
+    })
+}
+
+fn multi_agent_usage_hint_context_message(text: String) -> Value {
+    serde_json::json!({
+        "role": "developer",
+        "name": MULTI_AGENT_USAGE_HINT_CONTEXT_MESSAGE_NAME,
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
+    })
+}
+
+fn model_switch_context_message(text: String) -> Value {
+    serde_json::json!({
+        "role": "developer",
+        "name": MODEL_SWITCH_CONTEXT_MESSAGE_NAME,
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
+    })
+}
+
+fn personality_context_message(text: String) -> Value {
+    serde_json::json!({
+        "role": "developer",
+        "name": PERSONALITY_CONTEXT_MESSAGE_NAME,
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
+    })
+}
+
+fn developer_context_message_for_event(event_type: &str, text: String) -> Value {
+    match event_type {
+        PERSONALITY_CONTEXT_EVENT => personality_context_message(text),
+        COLLABORATION_CONTEXT_EVENT => collaboration_context_message(text),
+        _ => model_switch_context_message(text),
+    }
+}
+
+fn insert_model_switch_context_message(messages: &mut Vec<Value>, message: Value) {
+    let insert_at = messages
+        .iter()
+        .rposition(|candidate| {
+            candidate.get("role").and_then(Value::as_str) == Some("user")
+                && candidate.get("name").is_none()
+        })
+        .unwrap_or(messages.len());
+    messages.insert(insert_at, message);
+}
+
+fn model_personality_key(personality: ModelPersonality) -> &'static str {
+    match personality {
+        ModelPersonality::None => "none",
+        ModelPersonality::Friendly => "friendly",
+        ModelPersonality::Pragmatic => "pragmatic",
+    }
+}
+
+fn model_personality_from_key(value: &str) -> Option<ModelPersonality> {
+    match value {
+        "none" => Some(ModelPersonality::None),
+        "friendly" => Some(ModelPersonality::Friendly),
+        "pragmatic" => Some(ModelPersonality::Pragmatic),
+        _ => None,
+    }
+}
+
+fn is_workspace_context_message(message: &Value) -> bool {
+    message.get("name").and_then(Value::as_str) == Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
+}
+
+fn is_permissions_context_message(message: &Value) -> bool {
+    message.get("name").and_then(Value::as_str) == Some(PERMISSIONS_CONTEXT_MESSAGE_NAME)
+}
+
+fn move_workspace_context_before_first_user_message(messages: &mut Vec<Value>) {
+    let mut context_sections = Vec::new();
+    let mut environment_context_section = None;
+    let mut permissions_sections = Vec::new();
+    let mut other_messages = Vec::with_capacity(messages.len());
+    for message in std::mem::take(messages) {
+        if is_workspace_context_message(&message) {
+            let content = message_content_text(&message);
+            if !content.trim().is_empty() {
+                if is_environment_context_section(&content) {
+                    environment_context_section = Some(content);
+                } else {
+                    context_sections.push(content);
+                }
+            }
+        } else if is_permissions_context_message(&message) {
+            let content = message_content_text(&message);
+            if !content.trim().is_empty() {
+                permissions_sections.push(content);
+            }
+        } else {
+            other_messages.push(message);
+        }
+    }
+    if let Some(environment_context_section) = environment_context_section {
+        context_sections.push(environment_context_section);
+    }
+    if context_sections.is_empty() && permissions_sections.is_empty() {
+        *messages = other_messages;
+        return;
+    }
+    let insert_at = other_messages
+        .iter()
+        .position(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(other_messages.len());
+    let mut insert_messages = Vec::new();
+    if !permissions_sections.is_empty() {
+        insert_messages.push(permissions_context_message(
+            permissions_sections.join("\n\n"),
+        ));
+    }
+    if !context_sections.is_empty() {
+        insert_messages.push(workspace_context_message(context_sections));
+    }
+    other_messages.splice(insert_at..insert_at, insert_messages);
+    *messages = other_messages;
+}
+
+fn is_environment_context_section(content: &str) -> bool {
+    content.contains("<environment_context>")
 }
 
 #[derive(Clone, Debug)]
@@ -2140,7 +7017,16 @@ fn normalize_provider_messages(messages: &mut Vec<Value>) {
                     continue;
                 };
                 if let Some(index) = pending.iter().position(|call| call.id == call_id) {
-                    let call = pending.remove(index);
+                    if index > 0 {
+                        let mut earlier_missing =
+                            pending.drain(..index).collect::<Vec<PendingToolCall>>();
+                        append_synthetic_outputs_for_pending(
+                            &mut normalized,
+                            &mut earlier_missing,
+                            &mut emitted_outputs,
+                        );
+                    }
+                    let call = pending.remove(0);
                     normalized.push(normalized_tool_message(message, &call.id, &call.name));
                     emitted_outputs.insert(call.id);
                 } else if let Some(context) = orphan_tool_output_context_message(&message, &call_id)
@@ -2174,10 +7060,7 @@ fn append_synthetic_outputs_for_pending(
                 "role": "tool",
                 "tool_call_id": call.id,
                 "name": call.name,
-                "content": format!(
-                    "{} output was unavailable after history normalization; continue with the available context.",
-                    call.name
-                ),
+                "content": "aborted",
             }));
         }
     }
@@ -2245,11 +7128,20 @@ fn normalized_assistant_tool_calls(message: &Value) -> Vec<Value> {
                         .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
                 })
                 .unwrap_or_else(|| serde_json::json!({}));
-            Some(serde_json::json!({
+            let namespace = call.get("namespace").and_then(Value::as_str).or_else(|| {
+                call.get("function")
+                    .and_then(|function| function.get("namespace"))
+                    .and_then(Value::as_str)
+            });
+            let mut normalized = serde_json::json!({
                 "id": id,
                 "name": name,
                 "arguments": arguments,
-            }))
+            });
+            if let Some(namespace) = namespace {
+                normalized["namespace"] = Value::String(namespace.to_string());
+            }
+            Some(normalized)
         })
         .collect()
 }
@@ -2377,7 +7269,7 @@ fn replay_image_part(image: &Value) -> Option<Value> {
 
 fn synthetic_tool_result_text(name: &str) -> String {
     match name {
-        "update_plan" => "plan updated".to_string(),
+        "update_plan" => "Plan updated".to_string(),
         "done" => "done".to_string(),
         other => format!("{other} completed"),
     }
@@ -2385,9 +7277,12 @@ fn synthetic_tool_result_text(name: &str) -> String {
 
 fn task_text_from_provider_messages(messages: &[Value]) -> Option<String> {
     messages.iter().find_map(|message| {
-        (message.get("role").and_then(Value::as_str) == Some("user"))
-            .then(|| message_content_text(message))
-            .filter(|text| !text.trim().is_empty())
+        (message.get("role").and_then(Value::as_str) == Some("user")
+            && !is_workspace_context_message(message)
+            && !is_turn_aborted_message(message)
+            && !is_compaction_summary_message(message))
+        .then(|| message_content_text(message))
+        .filter(|text| !text.trim().is_empty())
     })
 }
 
@@ -2413,16 +7308,70 @@ struct ToolDispatchOutcome {
     messages: Vec<Value>,
 }
 
-fn browser_tool_specs() -> Vec<ToolSpec> {
-    ToolRegistry::browser_agent().specs()
+fn browser_tool_specs_for_session(
+    session: &browser_use_protocol::SessionMeta,
+    options: &AgentRunOptions,
+    model_name: &str,
+    namespace_tools_supported: bool,
+) -> Result<Vec<ToolSpec>> {
+    Ok(
+        browser_tool_registry_for_session(session, options, model_name, namespace_tools_supported)?
+            .specs()
+            .into_iter()
+            .filter(|spec| namespace_tools_supported || spec.namespace.is_none())
+            .collect(),
+    )
+}
+
+fn browser_tool_registry_for_session(
+    session: &browser_use_protocol::SessionMeta,
+    options: &AgentRunOptions,
+    model_name: &str,
+    namespace_tools_supported: bool,
+) -> Result<ToolRegistry> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        Path::new(&session.cwd),
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )?;
+    let mut multi_agent_tool_config = config.multi_agent_v2.tool_spec_config();
+    if multi_agent_tool_config.family == MultiAgentToolFamily::V1 || !namespace_tools_supported {
+        multi_agent_tool_config.tool_namespace = None;
+    }
+    let role_descriptions =
+        config
+            .agent_roles
+            .iter()
+            .map(|(name, role)| SpawnAgentRoleDescription {
+                name: name.clone(),
+                description: role.description.clone(),
+                config_file: role.config_file.clone(),
+            });
+    let model_overrides_description = config
+        .model_catalog
+        .as_ref()
+        .map(|catalog| spawn_agent_model_overrides_description_for_catalog(catalog, true))
+        .unwrap_or_else(browser_use_providers::spawn_agent_model_overrides_description);
+    Ok(ToolRegistry::browser_agent_with_agent_type_description_and_model_description_and_multi_agent_config(
+        tools::spawn_agent_type_description_for_roles(role_descriptions),
+        multi_agent_tool_config,
+        model_supports_original_image_detail_for_catalog(model_name, config.model_catalog.as_ref()),
+        model_overrides_description,
+    ))
 }
 
 fn tool_call_message(call: &ToolCall) -> Value {
-    serde_json::json!({
+    let mut message = serde_json::json!({
         "id": call.id,
         "name": call.name,
         "arguments": call.arguments,
-    })
+    });
+    if let Some(namespace) = call.namespace.as_deref() {
+        message["namespace"] = Value::String(namespace.to_string());
+    }
+    message
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -2433,11 +7382,18 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
     worker: &mut PythonWorker,
     tool_calls: Vec<ToolCall>,
     options: &AgentRunOptions,
+    base_instructions: &Option<String>,
+    tool_output_token_budget: usize,
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
 ) -> Result<Vec<ToolDispatchOutcome>> {
-    let registry = ToolRegistry::browser_agent();
+    let registry = browser_tool_registry_for_session(
+        session,
+        options,
+        provider.model_name(),
+        provider.supports_namespace_tools(),
+    )?;
     let mut outcomes = Vec::new();
     let mut index = 0;
     while index < tool_calls.len() {
@@ -2452,7 +7408,13 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
             }
             let batch = tool_calls[batch_start..index].to_vec();
             outcomes.extend(dispatch_parallel_tool_batch(
-                store, session, batch, telemetry, step_span, turn_idx,
+                store,
+                session,
+                batch,
+                telemetry,
+                step_span,
+                turn_idx,
+                tool_output_token_budget,
             )?);
             continue;
         }
@@ -2460,7 +7422,17 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
         let call = tool_calls[index].clone();
         index += 1;
         let outcome = dispatch_serial_tool_call_for_turn(
-            store, provider, session, worker, &call, options, telemetry, step_span, turn_idx,
+            store,
+            provider,
+            session,
+            worker,
+            &call,
+            options,
+            base_instructions,
+            tool_output_token_budget,
+            telemetry,
+            step_span,
+            turn_idx,
         )?;
         let finished = outcome.finished;
         outcomes.push(outcome);
@@ -2478,6 +7450,7 @@ fn dispatch_parallel_tool_batch(
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
+    tool_output_token_budget: usize,
 ) -> Result<Vec<ToolDispatchOutcome>> {
     if batch.is_empty() {
         return Ok(Vec::new());
@@ -2485,7 +7458,13 @@ fn dispatch_parallel_tool_batch(
     if batch.len() == 1 {
         let call = batch.into_iter().next().expect("batch not empty");
         return Ok(vec![dispatch_parallel_tool_call_for_turn(
-            store, session, call, telemetry, step_span, turn_idx,
+            store,
+            session,
+            call,
+            telemetry,
+            step_span,
+            turn_idx,
+            tool_output_token_budget,
         )?]);
     }
 
@@ -2513,7 +7492,12 @@ fn dispatch_parallel_tool_batch(
             let notifier = notifier.clone();
             thread::spawn(move || {
                 let store = Store::open_with_optional_notifier(state_dir, notifier)?;
-                dispatch_parallel_tool_call_recoverably(&store, &session, &call)
+                dispatch_parallel_tool_call_recoverably(
+                    &store,
+                    &session,
+                    &call,
+                    tool_output_token_budget,
+                )
             })
         })
         .collect::<Vec<_>>();
@@ -2572,22 +7556,32 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
     worker: &mut PythonWorker,
     call: &ToolCall,
     options: &AgentRunOptions,
+    base_instructions: &Option<String>,
+    tool_output_token_budget: usize,
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
 ) -> Result<ToolDispatchOutcome> {
     let tool_span = telemetry.start_tool_span(step_span, &session.id, turn_idx, call);
-    let outcome =
-        match dispatch_tool_call_recoverably(store, provider, session, worker, call, options) {
-            Ok(outcome) => {
-                record_tool_success(telemetry, &tool_span, &outcome);
-                outcome
-            }
-            Err(error) => {
-                tool_span.record_error(error.as_ref());
-                return Err(error);
-            }
-        };
+    let outcome = match dispatch_tool_call_recoverably(
+        store,
+        provider,
+        session,
+        worker,
+        call,
+        options,
+        base_instructions,
+        tool_output_token_budget,
+    ) {
+        Ok(outcome) => {
+            record_tool_success(telemetry, &tool_span, &outcome);
+            outcome
+        }
+        Err(error) => {
+            tool_span.record_error(error.as_ref());
+            return Err(error);
+        }
+    };
     drop(tool_span);
     Ok(outcome)
 }
@@ -2599,9 +7593,15 @@ fn dispatch_parallel_tool_call_for_turn(
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let tool_span = telemetry.start_tool_span(step_span, &session.id, turn_idx, &call);
-    let outcome = match dispatch_parallel_tool_call_recoverably(store, session, &call) {
+    let outcome = match dispatch_parallel_tool_call_recoverably(
+        store,
+        session,
+        &call,
+        tool_output_token_budget,
+    ) {
         Ok(outcome) => {
             record_tool_success(telemetry, &tool_span, &outcome);
             outcome
@@ -2639,8 +7639,19 @@ fn dispatch_tool_call_recoverably<P: ModelProvider>(
     worker: &mut PythonWorker,
     call: &ToolCall,
     options: &AgentRunOptions,
+    base_instructions: &Option<String>,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    match dispatch_tool_call(store, provider, session, worker, call, options) {
+    match dispatch_tool_call(
+        store,
+        provider,
+        session,
+        worker,
+        call,
+        options,
+        base_instructions,
+        tool_output_token_budget,
+    ) {
         Ok(outcome) => Ok(outcome),
         Err(error) if tool_error_is_recoverable(&error) => {
             dispatch_recovered_tool_error(store, session, call, error)
@@ -2653,8 +7664,9 @@ fn dispatch_parallel_tool_call_recoverably(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    match dispatch_parallel_tool_call(store, session, call) {
+    match dispatch_parallel_tool_call(store, session, call, tool_output_token_budget) {
         Ok(outcome) => Ok(outcome),
         Err(error) if tool_error_is_recoverable(&error) => {
             dispatch_recovered_tool_error(store, session, call, error)
@@ -2688,6 +7700,7 @@ fn dispatch_recovered_tool_error(
             call,
             &call.name,
             &format!("{} failed: {error}", call.name),
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
         )?],
     })
 }
@@ -2700,22 +7713,41 @@ fn dispatch_parallel_tool_call(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    match ToolRegistry::browser_agent().handler_for(&call.name) {
-        Some(ToolHandlerKind::ExecCommand) => dispatch_exec_command_tool(store, session, call),
-        Some(ToolHandlerKind::ReadFile) => dispatch_read_file_tool(store, session, call),
-        Some(ToolHandlerKind::SearchFiles) => dispatch_search_files_tool(store, session, call),
-        Some(ToolHandlerKind::ListFiles) => dispatch_list_files_tool(store, session, call),
-        Some(ToolHandlerKind::ViewImage) => dispatch_view_image_tool(store, session, call),
+    match ToolRegistry::browser_agent()
+        .handler_for_namespaced(call.namespace.as_deref(), &call.name)
+    {
+        Some(ToolHandlerKind::ExecCommand) => {
+            dispatch_exec_command_tool(store, session, call, tool_output_token_budget)
+        }
+        Some(ToolHandlerKind::ReadFile) => {
+            dispatch_read_file_tool(store, session, call, tool_output_token_budget)
+        }
+        Some(ToolHandlerKind::SearchFiles) => {
+            dispatch_search_files_tool(store, session, call, tool_output_token_budget)
+        }
+        Some(ToolHandlerKind::ListFiles) => {
+            dispatch_list_files_tool(store, session, call, tool_output_token_budget)
+        }
+        Some(ToolHandlerKind::ViewImage) => {
+            dispatch_view_image_tool(store, session, call, false, tool_output_token_budget)
+        }
         _ => dispatch_unknown_tool(store, session, call),
     }
 }
 
+fn hidden_legacy_file_tool_handler(name: &str) -> Option<ToolHandlerKind> {
+    match name {
+        "read_file" => Some(ToolHandlerKind::ReadFile),
+        "search_files" => Some(ToolHandlerKind::SearchFiles),
+        "list_files" => Some(ToolHandlerKind::ListFiles),
+        _ => None,
+    }
+}
+
 fn tool_call_supports_parallel(registry: &ToolRegistry, call: &ToolCall) -> bool {
-    match registry.handler_for(&call.name) {
-        Some(
-            ToolHandlerKind::ReadFile | ToolHandlerKind::SearchFiles | ToolHandlerKind::ListFiles,
-        ) => true,
+    match registry.handler_for_namespaced(call.namespace.as_deref(), &call.name) {
         Some(ToolHandlerKind::ExecCommand) => {
             tools::command::exec_command_is_known_read_only(&call.arguments)
         }
@@ -2740,42 +7772,82 @@ fn dispatch_tool_call<P: ModelProvider>(
     worker: &mut PythonWorker,
     call: &ToolCall,
     options: &AgentRunOptions,
+    base_instructions: &Option<String>,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    let registry = ToolRegistry::browser_agent();
+    let registry = browser_tool_registry_for_session(
+        session,
+        options,
+        provider.model_name(),
+        provider.supports_namespace_tools(),
+    )?;
     let Some(handler) = registry
-        .handler_for(&call.name)
+        .handler_for_namespaced(call.namespace.as_deref(), &call.name)
+        .or_else(|| hidden_legacy_file_tool_handler(&call.name))
         .or_else(|| (call.name == "python").then_some(ToolHandlerKind::Python))
     else {
         return dispatch_unknown_tool(store, session, call);
     };
     match handler {
         ToolHandlerKind::Done => dispatch_done_tool(store, session, call),
-        ToolHandlerKind::Browser => dispatch_browser_tool(store, session, call),
-        ToolHandlerKind::BrowserScript => {
-            dispatch_browser_script_tool(store, session, call, options.python_tool_timeout_seconds)
+        ToolHandlerKind::Browser => {
+            dispatch_browser_tool(store, session, call, tool_output_token_budget)
         }
+        ToolHandlerKind::BrowserScript => dispatch_browser_script_tool(
+            store,
+            session,
+            call,
+            options.python_tool_timeout_seconds,
+            tool_output_token_budget,
+        ),
         ToolHandlerKind::Python => dispatch_python_tool(
             store,
             session,
             worker,
             call,
             options.python_tool_timeout_seconds,
+            tool_output_token_budget,
         ),
-        ToolHandlerKind::ExecCommand => dispatch_exec_command_tool(store, session, call),
-        ToolHandlerKind::WriteStdin => dispatch_write_stdin_tool(store, session, call),
-        ToolHandlerKind::ApplyPatch => dispatch_apply_patch_tool(store, session, call),
-        ToolHandlerKind::ReadFile => dispatch_read_file_tool(store, session, call),
-        ToolHandlerKind::SearchFiles => dispatch_search_files_tool(store, session, call),
-        ToolHandlerKind::ListFiles => dispatch_list_files_tool(store, session, call),
-        ToolHandlerKind::ViewImage => dispatch_view_image_tool(store, session, call),
+        ToolHandlerKind::ExecCommand => {
+            dispatch_exec_command_tool(store, session, call, tool_output_token_budget)
+        }
+        ToolHandlerKind::WriteStdin => {
+            dispatch_write_stdin_tool(store, session, call, tool_output_token_budget)
+        }
+        ToolHandlerKind::ApplyPatch => {
+            dispatch_apply_patch_tool(store, session, call, tool_output_token_budget)
+        }
+        ToolHandlerKind::ReadFile => {
+            dispatch_read_file_tool(store, session, call, tool_output_token_budget)
+        }
+        ToolHandlerKind::SearchFiles => {
+            dispatch_search_files_tool(store, session, call, tool_output_token_budget)
+        }
+        ToolHandlerKind::ListFiles => {
+            dispatch_list_files_tool(store, session, call, tool_output_token_budget)
+        }
+        ToolHandlerKind::ViewImage => dispatch_view_image_tool(
+            store,
+            session,
+            call,
+            resolved_model_request_info_for_session(session, options, provider.model_name())?
+                .supports_image_detail_original,
+            tool_output_token_budget,
+        ),
         ToolHandlerKind::UpdatePlan => dispatch_update_plan_tool(store, session, call),
+        ToolHandlerKind::RequestUserInput => dispatch_request_user_input_tool(store, session, call),
         ToolHandlerKind::SpawnAgent => {
-            dispatch_spawn_agent_tool(store, provider, session, call, options)
+            dispatch_spawn_agent_tool(store, provider, session, call, options, base_instructions)
         }
-        ToolHandlerKind::WaitAgent => dispatch_wait_agent_tool(store, session, call),
-        ToolHandlerKind::SendInput => {
-            dispatch_agent_message_tool(store, provider, session, call, "send_input", true, options)
+        ToolHandlerKind::SpawnAgentV1 => {
+            dispatch_spawn_agent_tool(store, provider, session, call, options, base_instructions)
         }
+        ToolHandlerKind::WaitAgent => dispatch_wait_agent_tool(store, session, call, options),
+        ToolHandlerKind::WaitAgentV1 => dispatch_wait_agent_v1_tool(store, session, call),
+        ToolHandlerKind::SendInputV1 => {
+            dispatch_send_input_v1_tool(store, provider, session, call, options)
+        }
+        ToolHandlerKind::ResumeAgentV1 => dispatch_resume_agent_v1_tool(store, session, call),
         ToolHandlerKind::SendMessage => dispatch_agent_message_tool(
             store,
             provider,
@@ -2796,6 +7868,7 @@ fn dispatch_tool_call<P: ModelProvider>(
         ),
         ToolHandlerKind::ListAgents => dispatch_list_agents_tool(store, session, call),
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
+        ToolHandlerKind::CloseAgentV1 => dispatch_close_agent_tool(store, session, call),
     }
 }
 
@@ -2803,16 +7876,19 @@ fn dispatch_exec_command_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    let result = tools::command::exec_command(store, session, call)?;
+    let result =
+        tools::command::exec_command_with_budget(store, session, call, tool_output_token_budget)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_json_message(
+        messages: vec![tool_text_message(
             store,
             session,
             call,
             "exec_command",
-            result.content,
+            &result.model_text,
+            usize::MAX,
         )?],
     })
 }
@@ -2821,16 +7897,19 @@ fn dispatch_write_stdin_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    let result = tools::command::write_stdin(store, session, call)?;
+    let result =
+        tools::command::write_stdin_with_budget(store, session, call, tool_output_token_budget)?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_json_message(
+        messages: vec![tool_text_message(
             store,
             session,
             call,
             "write_stdin",
-            result.content,
+            &result.model_text,
+            usize::MAX,
         )?],
     })
 }
@@ -2839,6 +7918,7 @@ fn dispatch_apply_patch_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let result = tools::files::apply_patch_tool(store, session, call)?;
     Ok(ToolDispatchOutcome {
@@ -2849,6 +7929,7 @@ fn dispatch_apply_patch_tool(
             call,
             "apply_patch",
             result.content,
+            tool_output_token_budget,
         )?],
     })
 }
@@ -2857,6 +7938,7 @@ fn dispatch_read_file_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let result = tools::files::read_file(store, session, call)?;
     Ok(ToolDispatchOutcome {
@@ -2867,6 +7949,7 @@ fn dispatch_read_file_tool(
             call,
             "read_file",
             result.content,
+            tool_output_token_budget,
         )?],
     })
 }
@@ -2875,6 +7958,7 @@ fn dispatch_search_files_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let result = tools::files::search_files(store, session, call)?;
     Ok(ToolDispatchOutcome {
@@ -2885,6 +7969,7 @@ fn dispatch_search_files_tool(
             call,
             "search_files",
             result.content,
+            tool_output_token_budget,
         )?],
     })
 }
@@ -2893,6 +7978,7 @@ fn dispatch_list_files_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let result = tools::files::list_files(store, session, call)?;
     Ok(ToolDispatchOutcome {
@@ -2903,6 +7989,7 @@ fn dispatch_list_files_tool(
             call,
             "list_files",
             result.content,
+            tool_output_token_budget,
         )?],
     })
 }
@@ -2911,8 +7998,10 @@ fn dispatch_view_image_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    can_request_original_detail: bool,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
-    let result = tools::files::view_image(store, session, call)?;
+    let result = tools::files::view_image(store, session, call, can_request_original_detail)?;
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_content_message(
@@ -2921,6 +8010,7 @@ fn dispatch_view_image_tool(
             call,
             "view_image",
             result.content,
+            tool_output_token_budget,
         )?],
     })
 }
@@ -2929,6 +8019,7 @@ fn dispatch_browser_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let cmd = call
         .arguments
@@ -2982,6 +8073,7 @@ fn dispatch_browser_tool(
             call,
             "browser",
             output.content,
+            tool_output_token_budget,
         )?],
     })
 }
@@ -3250,6 +8342,2767 @@ fn browser_display_name(mode: &str) -> &'static str {
     }
 }
 
+#[derive(Debug)]
+struct AgentsMdContext {
+    content: String,
+    #[cfg(test)]
+    sources: Vec<String>,
+    #[cfg(test)]
+    warnings: Vec<String>,
+}
+
+#[derive(Debug)]
+struct AgentsMdLoad {
+    context: Option<AgentsMdContext>,
+    sources: Vec<String>,
+    warnings: Vec<String>,
+    developer_instructions: Option<String>,
+    include_collaboration_mode_instructions: bool,
+    include_environment_context: bool,
+    multi_agent_v2: MultiAgentV2Config,
+    #[allow(dead_code)]
+    base_instructions: Option<String>,
+}
+
+fn environment_context_snapshot_for_session(
+    store: &Store,
+    session: &SessionMeta,
+    options: &AgentRunOptions,
+) -> Result<EnvironmentContextSnapshot> {
+    let (current_date, timezone) = local_time_context();
+    let environments = if options.environment_context_environments.is_empty() {
+        default_environment_context_environments(session)
+    } else {
+        options.environment_context_environments.clone()
+    };
+    let subagents = environment_context_subagents_for_session(store, &session.id)?;
+    Ok(EnvironmentContextSnapshot {
+        environments,
+        current_date,
+        timezone,
+        network: options.environment_context_network.clone(),
+        subagents,
+    })
+}
+
+fn latest_environment_snapshot_from_events(
+    events: &[EventRecord],
+) -> Option<EnvironmentContextSnapshot> {
+    let event = events.iter().rev().find(|event| {
+        event.event_type == "workspace.context"
+            && event.payload.get("kind").and_then(Value::as_str)
+                == Some(WORKSPACE_CONTEXT_ENVIRONMENT_KIND)
+    })?;
+    event
+        .payload
+        .get("environment")
+        .cloned()
+        .and_then(|value| serde_json::from_value(value).ok())
+}
+
+fn default_environment_context_environments(
+    session: &SessionMeta,
+) -> Vec<EnvironmentContextEnvironment> {
+    vec![EnvironmentContextEnvironment::new(
+        "local",
+        session.cwd.clone(),
+        current_user_shell_name(),
+    )]
+}
+
+fn environment_context_subagents_for_session(
+    store: &Store,
+    session_id: &str,
+) -> Result<Option<String>> {
+    let lines = active_descendant_agents(store, session_id)?
+        .into_iter()
+        .map(|agent| {
+            format_subagent_context_line(
+                &environment_context_agent_reference(&agent),
+                agent.agent_nickname.as_deref(),
+            )
+        })
+        .collect::<Vec<_>>();
+    Ok((!lines.is_empty()).then(|| lines.join("\n")))
+}
+
+fn environment_context_agent_reference(agent: &AgentSummary) -> String {
+    agent
+        .agent_path
+        .as_deref()
+        .and_then(|path| {
+            path.rsplit('/')
+                .find(|segment| !segment.trim().is_empty())
+                .map(str::to_string)
+        })
+        .unwrap_or_else(|| agent.child_session_id.clone())
+}
+
+fn format_subagent_context_line(reference: &str, nickname: Option<&str>) -> String {
+    match nickname
+        .map(str::trim)
+        .filter(|nickname| !nickname.is_empty())
+    {
+        Some(nickname) => format!("- {reference}: {nickname}"),
+        None => format!("- {reference}"),
+    }
+}
+
+fn local_time_context() -> (String, String) {
+    match iana_time_zone::get_timezone() {
+        Ok(timezone) => (Local::now().format("%Y-%m-%d").to_string(), timezone),
+        Err(_) => (
+            Utc::now().format("%Y-%m-%d").to_string(),
+            "Etc/UTC".to_string(),
+        ),
+    }
+}
+
+fn current_user_shell_name() -> String {
+    std::env::var("SHELL")
+        .ok()
+        .and_then(|shell| {
+            Path::new(&shell)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(str::to_string)
+        })
+        .filter(|name| !name.trim().is_empty())
+        .unwrap_or_else(|| "bash".to_string())
+}
+
+fn render_environment_context(
+    environments: &[EnvironmentContextEnvironment],
+    current_date: Option<&str>,
+    timezone: Option<&str>,
+    network: Option<&EnvironmentNetworkContext>,
+    subagents: Option<&str>,
+) -> String {
+    let mut lines = Vec::new();
+    match environments {
+        [] => {}
+        [environment] => {
+            lines.push(format!("  <cwd>{}</cwd>", environment.cwd));
+            lines.push(format!("  <shell>{}</shell>", environment.shell));
+        }
+        environments => {
+            lines.push("  <environments>".to_string());
+            for environment in environments {
+                lines.push(format!("    <environment id=\"{}\">", environment.id));
+                lines.push(format!("      <cwd>{}</cwd>", environment.cwd));
+                lines.push(format!("      <shell>{}</shell>", environment.shell));
+                lines.push("    </environment>".to_string());
+            }
+            lines.push("  </environments>".to_string());
+        }
+    }
+    if let Some(current_date) = current_date {
+        lines.push(format!("  <current_date>{current_date}</current_date>"));
+    }
+    if let Some(timezone) = timezone {
+        lines.push(format!("  <timezone>{timezone}</timezone>"));
+    }
+    if let Some(network) = network {
+        lines.push(format!("  {}", render_environment_network_context(network)));
+    }
+    if let Some(subagents) = subagents.map(str::trim).filter(|text| !text.is_empty()) {
+        lines.push("  <subagents>".to_string());
+        lines.extend(subagents.lines().map(|line| format!("    {line}")));
+        lines.push("  </subagents>".to_string());
+    }
+    format!(
+        "<environment_context>\n{}\n</environment_context>",
+        lines.join("\n")
+    )
+}
+
+fn render_environment_context_snapshot(snapshot: &EnvironmentContextSnapshot) -> String {
+    render_environment_context(
+        &snapshot.environments,
+        Some(&snapshot.current_date),
+        Some(&snapshot.timezone),
+        snapshot.network.as_ref(),
+        snapshot.subagents.as_deref(),
+    )
+}
+
+fn render_environment_context_update(
+    previous: &EnvironmentContextSnapshot,
+    next: &EnvironmentContextSnapshot,
+) -> String {
+    let environments = match next.environments.as_slice() {
+        [next_environment] => {
+            let previous_cwd = previous
+                .environments
+                .first()
+                .map(|environment| &environment.cwd);
+            if previous_cwd != Some(&next_environment.cwd) {
+                vec![next_environment.clone()]
+            } else {
+                Vec::new()
+            }
+        }
+        [] => Vec::new(),
+        environments => environments.to_vec(),
+    };
+    let network = if previous.network != next.network {
+        next.network.as_ref()
+    } else {
+        previous.network.as_ref()
+    };
+    render_environment_context(
+        &environments,
+        Some(&next.current_date),
+        Some(&next.timezone),
+        network,
+        None,
+    )
+}
+
+fn environment_context_equals_except_shell(
+    left: &EnvironmentContextSnapshot,
+    right: &EnvironmentContextSnapshot,
+    compare_subagents: bool,
+) -> bool {
+    environment_context_environments_equal_except_shell(&left.environments, &right.environments)
+        && left.current_date == right.current_date
+        && left.timezone == right.timezone
+        && left.network == right.network
+        && (!compare_subagents || left.subagents == right.subagents)
+}
+
+fn environment_context_environments_equal_except_shell(
+    left: &[EnvironmentContextEnvironment],
+    right: &[EnvironmentContextEnvironment],
+) -> bool {
+    match (left, right) {
+        ([], []) => true,
+        ([left], [right]) => left.cwd == right.cwd,
+        _ => {
+            left.len() == right.len()
+                && left
+                    .iter()
+                    .zip(right.iter())
+                    .all(|(left, right)| left.id == right.id && left.cwd == right.cwd)
+        }
+    }
+}
+
+fn render_environment_network_context(network: &EnvironmentNetworkContext) -> String {
+    let mut rendered = "<network enabled=\"true\">".to_string();
+    if !network.allowed_domains.is_empty() {
+        rendered.push_str("<allowed>");
+        rendered.push_str(&network.allowed_domains.join(","));
+        rendered.push_str("</allowed>");
+    }
+    if !network.denied_domains.is_empty() {
+        rendered.push_str("<denied>");
+        rendered.push_str(&network.denied_domains.join(","));
+        rendered.push_str("</denied>");
+    }
+    rendered.push_str("</network>");
+    rendered
+}
+
+#[cfg(test)]
+fn agents_md_context_for_cwd(cwd: &Path) -> Option<AgentsMdContext> {
+    agents_md_context_for_cwd_with_options(cwd, None, &[])
+        .ok()
+        .flatten()
+}
+
+#[cfg(test)]
+fn agents_md_context_for_cwd_with_options(
+    cwd: &Path,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<Option<AgentsMdContext>> {
+    Ok(load_agents_md_context_for_cwd_with_options(cwd, config_profile, config_overrides)?.context)
+}
+
+fn load_agents_md_context_for_cwd_with_options(
+    cwd: &Path,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<AgentsMdLoad> {
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(cwd, &mut warnings, config_profile, config_overrides)?;
+    let mut sources = Vec::new();
+    let mut parts = Vec::new();
+    if let Some((path, text)) = load_global_agents_md(&mut warnings) {
+        sources.push(path.display().to_string());
+        parts.push(text);
+    }
+    match project_agents_md_for_cwd(cwd, &config, &mut warnings) {
+        Ok(Some((project_docs, project_sources))) => {
+            if !parts.is_empty() {
+                parts.push(AGENTS_MD_SEPARATOR.trim().to_string());
+            }
+            sources.extend(project_sources);
+            parts.push(project_docs);
+        }
+        Ok(None) => {}
+        // Codex logs project-doc discovery/read errors and continues without
+        // project AGENTS docs. Keep that failure out of model-visible context.
+        Err(_error) => {}
+    }
+    let context = if parts.is_empty() {
+        None
+    } else {
+        let directory = cwd.display().to_string();
+        Some(AgentsMdContext {
+            content: format!(
+                "# AGENTS.md instructions for {directory}\n\n<INSTRUCTIONS>\n{}\n</INSTRUCTIONS>",
+                parts.join("\n\n")
+            ),
+            #[cfg(test)]
+            sources: sources.clone(),
+            #[cfg(test)]
+            warnings: warnings.clone(),
+        })
+    };
+    let base_instructions = config.base_instructions()?;
+    Ok(AgentsMdLoad {
+        context,
+        sources,
+        warnings,
+        base_instructions,
+        developer_instructions: config.developer_instructions,
+        include_collaboration_mode_instructions: config.include_collaboration_mode_instructions,
+        include_environment_context: config.include_environment_context,
+        multi_agent_v2: config.multi_agent_v2,
+    })
+}
+
+#[derive(Clone, Debug)]
+struct MultiAgentV2Config {
+    max_concurrent_threads_per_session: usize,
+    min_wait_timeout_ms: i64,
+    max_wait_timeout_ms: i64,
+    default_wait_timeout_ms: i64,
+    usage_hint_enabled: bool,
+    usage_hint_text: Option<String>,
+    root_agent_usage_hint_text: Option<String>,
+    subagent_usage_hint_text: Option<String>,
+    tool_namespace: Option<String>,
+    hide_spawn_agent_metadata: bool,
+    enabled: bool,
+    non_code_mode_only: bool,
+}
+
+impl Default for MultiAgentV2Config {
+    fn default() -> Self {
+        Self {
+            max_concurrent_threads_per_session:
+                DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+            min_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,
+            max_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS,
+            default_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS,
+            usage_hint_enabled: true,
+            usage_hint_text: None,
+            root_agent_usage_hint_text: None,
+            subagent_usage_hint_text: None,
+            tool_namespace: None,
+            hide_spawn_agent_metadata: false,
+            enabled: false,
+            non_code_mode_only: false,
+        }
+    }
+}
+
+impl MultiAgentV2Config {
+    fn tool_spec_config(&self) -> MultiAgentToolSpecConfig {
+        MultiAgentToolSpecConfig {
+            family: if self.enabled {
+                MultiAgentToolFamily::V2
+            } else {
+                MultiAgentToolFamily::V1
+            },
+            hide_spawn_agent_metadata: self.hide_spawn_agent_metadata,
+            wait_default_timeout_ms: self.default_wait_timeout_ms,
+            wait_min_timeout_ms: self.min_wait_timeout_ms,
+            wait_max_timeout_ms: self.max_wait_timeout_ms,
+            usage_hint_enabled: self.usage_hint_enabled,
+            usage_hint_text: self.usage_hint_text.clone(),
+            max_concurrent_threads_per_session: self.max_concurrent_threads_per_session,
+            tool_namespace: self.tool_namespace.clone(),
+        }
+    }
+}
+
+#[derive(Clone, Debug)]
+struct AgentsMdConfig {
+    project_doc_max_bytes: usize,
+    project_doc_fallback_filenames: Vec<String>,
+    project_root_markers: Vec<String>,
+    model: Option<String>,
+    instructions: Option<String>,
+    model_instructions_file: Option<PathBuf>,
+    developer_instructions: Option<String>,
+    agent_roles: BTreeMap<String, AgentRoleDefinition>,
+    multi_agent_v2: MultiAgentV2Config,
+    personality: ModelPersonality,
+    include_collaboration_mode_instructions: bool,
+    include_environment_context: bool,
+    model_request_settings: ModelRequestSettings,
+    model_catalog: Option<ModelCatalog>,
+    model_catalog_cache_etag: Option<String>,
+    model_catalog_refresh_allowed: bool,
+    model_context_window: Option<i64>,
+    model_auto_compact_token_limit: Option<i64>,
+    tool_output_token_limit: Option<usize>,
+    plan_mode_reasoning_effort: Option<String>,
+    advertised_beta_features: BTreeMap<String, bool>,
+    model_provider_id: Option<String>,
+    model_providers: BTreeMap<String, CodexModelProviderConfig>,
+    provider_request_max_retries: BTreeMap<String, usize>,
+    provider_stream_max_retries: BTreeMap<String, usize>,
+    provider_stream_idle_timeout_ms: BTreeMap<String, u64>,
+}
+
+impl Default for AgentsMdConfig {
+    fn default() -> Self {
+        Self {
+            project_doc_max_bytes: AGENTS_MD_MAX_BYTES,
+            project_doc_fallback_filenames: Vec::new(),
+            project_root_markers: vec![DEFAULT_PROJECT_ROOT_MARKER.to_string()],
+            model: None,
+            instructions: None,
+            model_instructions_file: None,
+            developer_instructions: None,
+            agent_roles: BTreeMap::new(),
+            multi_agent_v2: MultiAgentV2Config::default(),
+            personality: ModelPersonality::Pragmatic,
+            include_collaboration_mode_instructions: true,
+            include_environment_context: true,
+            model_request_settings: ModelRequestSettings::default(),
+            model_catalog: None,
+            model_catalog_cache_etag: None,
+            model_catalog_refresh_allowed: true,
+            model_context_window: None,
+            model_auto_compact_token_limit: None,
+            tool_output_token_limit: None,
+            plan_mode_reasoning_effort: None,
+            advertised_beta_features: default_codex_advertised_beta_features(),
+            model_provider_id: None,
+            model_providers: default_model_providers(),
+            provider_request_max_retries: BTreeMap::new(),
+            provider_stream_max_retries: BTreeMap::new(),
+            provider_stream_idle_timeout_ms: BTreeMap::new(),
+        }
+    }
+}
+
+impl AgentsMdConfig {
+    fn base_instructions_override(&self) -> Result<Option<String>> {
+        if let Some(path) = &self.model_instructions_file {
+            return read_non_empty_model_instructions_file(path).map(Some);
+        }
+        if self.instructions.is_some() {
+            return Ok(self.instructions.clone());
+        }
+        Ok(None)
+    }
+
+    fn default_base_instructions(&self) -> Option<String> {
+        Some(default_agent_instructions_for_personality(self.personality))
+    }
+
+    fn default_base_instructions_for_model(&self, model: &str) -> Option<String> {
+        Some(
+            default_agent_instructions_for_model_and_personality_with_catalog(
+                model,
+                self.personality,
+                self.model_catalog.as_ref(),
+            ),
+        )
+    }
+
+    fn base_instructions(&self) -> Result<Option<String>> {
+        if let Some(base_instructions) = self.base_instructions_override()? {
+            return Ok(Some(base_instructions));
+        }
+        Ok(self.default_base_instructions())
+    }
+
+    fn beta_features_header(&self) -> Option<String> {
+        let features = CODEX_ADVERTISED_BETA_FEATURE_DEFAULTS
+            .iter()
+            .filter_map(|(key, _)| {
+                self.advertised_beta_features
+                    .get(*key)
+                    .copied()
+                    .unwrap_or(false)
+                    .then_some(*key)
+            })
+            .collect::<Vec<_>>();
+        (!features.is_empty()).then(|| features.join(","))
+    }
+}
+
+fn default_codex_advertised_beta_features() -> BTreeMap<String, bool> {
+    CODEX_ADVERTISED_BETA_FEATURE_DEFAULTS
+        .iter()
+        .map(|(key, enabled)| ((*key).to_string(), *enabled))
+        .collect()
+}
+
+fn default_model_providers() -> BTreeMap<String, CodexModelProviderConfig> {
+    BTreeMap::from([(
+        AMAZON_BEDROCK_PROVIDER_ID.to_string(),
+        amazon_bedrock_model_provider_config(ModelProviderAwsAuthInfo::default()),
+    )])
+}
+
+fn amazon_bedrock_model_provider_config(aws: ModelProviderAwsAuthInfo) -> CodexModelProviderConfig {
+    CodexModelProviderConfig {
+        name: AMAZON_BEDROCK_PROVIDER_NAME.to_string(),
+        base_url: Some(AMAZON_BEDROCK_DEFAULT_BASE_URL.to_string()),
+        wire_api: CodexWireApi::Responses,
+        http_headers: BTreeMap::from([(
+            AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER.to_string(),
+            AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE.to_string(),
+        )]),
+        requires_openai_auth: false,
+        supports_websockets: false,
+        aws: Some(aws),
+        ..Default::default()
+    }
+}
+
+fn apply_selected_provider_model_catalog(
+    config: &mut AgentsMdConfig,
+    selected_provider_id: Option<&str>,
+) {
+    if selected_provider_id
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        != Some(AMAZON_BEDROCK_PROVIDER_ID)
+    {
+        return;
+    }
+    if config.model_catalog.is_none() {
+        config.model_catalog = Some(amazon_bedrock_model_catalog());
+        config.model_catalog_cache_etag = None;
+        config.model_catalog_refresh_allowed = false;
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct CodexModelProviderConfig {
+    name: String,
+    base_url: Option<String>,
+    env_key: Option<String>,
+    env_key_instructions: Option<String>,
+    experimental_bearer_token: Option<String>,
+    wire_api: CodexWireApi,
+    query_params: BTreeMap<String, String>,
+    http_headers: BTreeMap<String, String>,
+    env_http_headers: BTreeMap<String, String>,
+    request_max_retries: Option<usize>,
+    stream_max_retries: Option<usize>,
+    stream_idle_timeout_ms: Option<u64>,
+    websocket_connect_timeout_ms: Option<u64>,
+    requires_openai_auth: bool,
+    supports_websockets: bool,
+    auth: Option<ProviderCommandAuthConfig>,
+    aws: Option<ModelProviderAwsAuthInfo>,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum CodexWireApi {
+    #[default]
+    Responses,
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct AgentRoleDefinition {
+    description: Option<String>,
+    config_file: Option<PathBuf>,
+    nickname_candidates: Option<Vec<String>>,
+}
+
+#[derive(Clone, Debug, Default)]
+struct SpawnAgentRoleConfig {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    nickname_candidates: Option<Vec<String>>,
+    config_overrides: Vec<(String, toml::Value)>,
+}
+
+fn load_agents_md_config(
+    cwd: &Path,
+    warnings: &mut Vec<String>,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+) -> Result<AgentsMdConfig> {
+    let mut config = AgentsMdConfig::default();
+    let Some(base) = codex_home_dir() else {
+        return Ok(config);
+    };
+    if let Some(profile) = config_profile {
+        validate_codex_config_profile_name(profile)?;
+    }
+    let mut pre_project_config = toml::Value::Table(toml::map::Map::new());
+
+    if let Some(config_path) = system_codex_config_path() {
+        if let Some(value) = read_codex_config_toml(&config_path)? {
+            apply_agents_md_config_layer(
+                &mut config,
+                &value,
+                &config_path,
+                config_file_relative_base(&config_path),
+                ConfigLayerKind::NonProject,
+                warnings,
+            )?;
+            merge_toml_value(&mut pre_project_config, &value);
+        }
+    }
+
+    let user_config_path = base.join(CODEX_CONFIG_FILENAME);
+    if let Some(value) = read_codex_config_toml(&user_config_path)? {
+        if let Some(profile) = config_profile {
+            reject_legacy_profile_conflict(&value, profile, &user_config_path)?;
+        }
+        apply_agents_md_config_layer(
+            &mut config,
+            &value,
+            &user_config_path,
+            config_file_relative_base(&user_config_path),
+            ConfigLayerKind::NonProject,
+            warnings,
+        )?;
+        merge_toml_value(&mut pre_project_config, &value);
+    }
+
+    if let Some(profile) = config_profile {
+        let profile_config_path = codex_profile_config_path(&base, profile);
+        if let Some(value) = read_codex_config_toml(&profile_config_path)? {
+            apply_agents_md_config_layer(
+                &mut config,
+                &value,
+                &profile_config_path,
+                config_file_relative_base(&profile_config_path),
+                ConfigLayerKind::NonProject,
+                warnings,
+            )?;
+            merge_toml_value(&mut pre_project_config, &value);
+        }
+    }
+
+    let session_overrides_layer =
+        (!config_overrides.is_empty()).then(|| build_config_overrides_layer(config_overrides));
+    let mut discovery_config = config.clone();
+    if let Some(session_overrides_layer) = session_overrides_layer.as_ref() {
+        apply_agents_md_config_layer(
+            &mut discovery_config,
+            session_overrides_layer,
+            Path::new("session config overrides"),
+            cwd,
+            ConfigLayerKind::NonProject,
+            warnings,
+        )?;
+        merge_toml_value(&mut pre_project_config, session_overrides_layer);
+    }
+
+    load_project_agents_md_config_layers(
+        cwd,
+        &base,
+        &pre_project_config,
+        &discovery_config.project_root_markers,
+        &mut config,
+        warnings,
+    )?;
+
+    if let Some(session_overrides_layer) = session_overrides_layer.as_ref() {
+        apply_agents_md_config_layer(
+            &mut config,
+            session_overrides_layer,
+            Path::new("session config overrides"),
+            cwd,
+            ConfigLayerKind::NonProject,
+            warnings,
+        )?;
+    }
+
+    let managed_config_path = managed_codex_config_path(&base);
+    if let Some(managed_config) = read_codex_config_toml(&managed_config_path)? {
+        apply_agents_md_config_layer(
+            &mut config,
+            &managed_config,
+            &managed_config_path,
+            config_file_relative_base(&managed_config_path),
+            ConfigLayerKind::NonProject,
+            warnings,
+        )?;
+    }
+    if let Some(managed_preferences_config) = read_codex_managed_preferences_config_toml()? {
+        apply_agents_md_config_layer(
+            &mut config,
+            &managed_preferences_config,
+            Path::new(CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE),
+            cwd,
+            ConfigLayerKind::NonProject,
+            warnings,
+        )?;
+    }
+    let selected_provider_id = config
+        .model_provider_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned);
+    apply_selected_provider_model_catalog(&mut config, selected_provider_id.as_deref());
+    if config.model_catalog.is_none() {
+        if let Some(snapshot) = load_fresh_models_cache(&base) {
+            config.model_catalog = Some(snapshot.catalog);
+            config.model_catalog_cache_etag = snapshot.etag;
+        }
+    }
+    Ok(config)
+}
+
+fn build_config_overrides_layer(config_overrides: &[(String, toml::Value)]) -> toml::Value {
+    let mut root = toml::Value::Table(toml::map::Map::new());
+    for (path, value) in config_overrides {
+        apply_toml_override(&mut root, path, value.clone());
+    }
+    root
+}
+
+fn apply_toml_override(root: &mut toml::Value, path: &str, value: toml::Value) {
+    let mut current = root;
+    let mut segments = path.split('.').peekable();
+    while let Some(segment) = segments.next() {
+        let is_last = segments.peek().is_none();
+        if is_last {
+            match current {
+                toml::Value::Table(table) => {
+                    table.insert(segment.to_string(), value);
+                }
+                _ => {
+                    let mut table = toml::map::Map::new();
+                    table.insert(segment.to_string(), value);
+                    *current = toml::Value::Table(table);
+                }
+            }
+            return;
+        }
+        match current {
+            toml::Value::Table(table) => {
+                current = table
+                    .entry(segment.to_string())
+                    .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+            }
+            _ => {
+                *current = toml::Value::Table(toml::map::Map::new());
+                if let toml::Value::Table(table) = current {
+                    current = table
+                        .entry(segment.to_string())
+                        .or_insert_with(|| toml::Value::Table(toml::map::Map::new()));
+                }
+            }
+        }
+    }
+}
+
+fn codex_profile_config_path(codex_home: &Path, profile: &str) -> PathBuf {
+    codex_home.join(format!("{profile}{CODEX_PROFILE_CONFIG_SUFFIX}"))
+}
+
+fn validate_codex_config_profile_name(profile: &str) -> Result<()> {
+    if profile.is_empty()
+        || !profile
+            .bytes()
+            .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("invalid --profile value `{profile}`; pass a plain name such as `work`");
+    }
+    Ok(())
+}
+
+fn reject_legacy_profile_conflict(value: &toml::Value, profile: &str, path: &Path) -> Result<()> {
+    let legacy_profile_is_selected = value
+        .get("profile")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|selected| selected == profile);
+    let legacy_profile_table_exists = value
+        .get("profiles")
+        .and_then(toml::Value::as_table)
+        .is_some_and(|profiles| profiles.contains_key(profile));
+    if legacy_profile_is_selected || legacy_profile_table_exists {
+        let active_profile_path =
+            codex_profile_config_path(path.parent().unwrap_or_else(|| Path::new("")), profile);
+        bail!(
+            "--profile `{profile}` cannot be used while {} contains legacy `profile = \"{profile}\"` or `[profiles.{profile}]` config; move those settings into {} and remove the legacy profile selector/table.",
+            path.display(),
+            active_profile_path.display()
+        );
+    }
+    Ok(())
+}
+
+#[cfg(test)]
+fn system_codex_config_path() -> Option<PathBuf> {
+    std::env::var_os(TEST_CODEX_SYSTEM_CONFIG_ENV).map(PathBuf::from)
+}
+
+#[cfg(all(unix, not(test)))]
+fn system_codex_config_path() -> Option<PathBuf> {
+    Some(PathBuf::from(SYSTEM_CODEX_CONFIG_PATH))
+}
+
+#[cfg(all(not(unix), not(test)))]
+fn system_codex_config_path() -> Option<PathBuf> {
+    None
+}
+
+#[cfg(test)]
+fn managed_codex_config_path(codex_home: &Path) -> PathBuf {
+    std::env::var_os(TEST_CODEX_MANAGED_CONFIG_ENV)
+        .map(PathBuf::from)
+        .unwrap_or_else(|| codex_home.join(CODEX_MANAGED_CONFIG_FILENAME))
+}
+
+#[cfg(all(unix, not(test)))]
+fn managed_codex_config_path(_codex_home: &Path) -> PathBuf {
+    PathBuf::from(CODEX_MANAGED_CONFIG_SYSTEM_PATH)
+}
+
+#[cfg(all(not(unix), not(test)))]
+fn managed_codex_config_path(codex_home: &Path) -> PathBuf {
+    codex_home.join(CODEX_MANAGED_CONFIG_FILENAME)
+}
+
+#[derive(Clone, Copy)]
+enum ConfigLayerKind {
+    NonProject,
+    Project,
+}
+
+fn merge_toml_value(base: &mut toml::Value, overlay: &toml::Value) {
+    match (base, overlay) {
+        (toml::Value::Table(base_table), toml::Value::Table(overlay_table)) => {
+            for (key, overlay_value) in overlay_table {
+                match base_table.get_mut(key) {
+                    Some(base_value) => merge_toml_value(base_value, overlay_value),
+                    None => {
+                        base_table.insert(key.clone(), overlay_value.clone());
+                    }
+                }
+            }
+        }
+        (base_value, overlay_value) => {
+            *base_value = overlay_value.clone();
+        }
+    }
+}
+
+fn read_codex_config_toml(path: &Path) -> Result<Option<toml::Value>> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => {
+            bail!(
+                "Failed to read Codex config from `{}`: {error}",
+                path.display()
+            );
+        }
+    };
+    match data.parse::<toml::Value>() {
+        Ok(value) => Ok(Some(value)),
+        Err(error) => bail!(
+            "Failed to parse Codex config from `{}`: {error}",
+            path.display()
+        ),
+    }
+}
+
+fn load_model_catalog_json(path: &Path) -> Result<ModelCatalog> {
+    let data = std::fs::read_to_string(path).with_context(|| {
+        format!(
+            "Failed to read model_catalog_json from `{}`",
+            path.display()
+        )
+    })?;
+    let catalog = serde_json::from_str::<ModelCatalog>(&data).with_context(|| {
+        format!(
+            "failed to parse model_catalog_json path `{}` as JSON",
+            path.display()
+        )
+    })?;
+    if catalog.models.is_empty() {
+        bail!(
+            "model_catalog_json path `{}` must contain at least one model",
+            path.display()
+        );
+    }
+    Ok(catalog)
+}
+
+#[derive(Clone, Debug)]
+struct ModelsCacheSnapshot {
+    catalog: ModelCatalog,
+    etag: Option<String>,
+}
+
+#[derive(Deserialize, Serialize)]
+struct ModelsCacheFile {
+    fetched_at: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    etag: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_version: Option<String>,
+    models: Vec<ModelCatalogEntryInfo>,
+}
+
+fn codex_client_version_to_whole() -> String {
+    let version = env!("CARGO_PKG_VERSION");
+    version
+        .split_once('-')
+        .map(|(whole, _)| whole)
+        .unwrap_or(version)
+        .to_string()
+}
+
+fn load_fresh_models_cache(codex_home: &Path) -> Option<ModelsCacheSnapshot> {
+    let path = codex_home.join(CODEX_MODELS_CACHE_FILENAME);
+    let data = std::fs::read_to_string(path).ok()?;
+    let cache = serde_json::from_str::<ModelsCacheFile>(&data).ok()?;
+    if cache.client_version.as_deref() != Some(codex_client_version_to_whole().as_str()) {
+        return None;
+    }
+    let fetched_at = chrono::DateTime::parse_from_rfc3339(&cache.fetched_at)
+        .ok()?
+        .with_timezone(&Utc);
+    let age = Utc::now().signed_duration_since(fetched_at);
+    if age > chrono::Duration::seconds(CODEX_MODELS_CACHE_TTL_SECONDS) {
+        return None;
+    }
+    Some(ModelsCacheSnapshot {
+        catalog: model_catalog_from_remote_models(cache.models, false),
+        etag: cache.etag,
+    })
+}
+
+fn persist_models_cache(
+    codex_home: &Path,
+    models: Vec<ModelCatalogEntryInfo>,
+    etag: Option<String>,
+) -> Result<()> {
+    let path = codex_home.join(CODEX_MODELS_CACHE_FILENAME);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let cache = ModelsCacheFile {
+        fetched_at: Utc::now().to_rfc3339(),
+        etag,
+        client_version: Some(codex_client_version_to_whole()),
+        models,
+    };
+    let json = serde_json::to_string_pretty(&cache)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+fn renew_models_cache_ttl(codex_home: &Path) -> Result<()> {
+    let path = codex_home.join(CODEX_MODELS_CACHE_FILENAME);
+    let data = std::fs::read_to_string(&path)?;
+    let mut cache = serde_json::from_str::<ModelsCacheFile>(&data)?;
+    cache.fetched_at = Utc::now().to_rfc3339();
+    let json = serde_json::to_string_pretty(&cache)?;
+    std::fs::write(path, json)?;
+    Ok(())
+}
+
+fn model_catalog_from_remote_models(
+    remote_models: Vec<ModelCatalogEntryInfo>,
+    chatgpt_mode: bool,
+) -> ModelCatalog {
+    let remote_has_picker_visible_model =
+        remote_models.iter().any(|model| model.visibility == "list");
+    if chatgpt_mode && !remote_models.is_empty() && remote_has_picker_visible_model {
+        return ModelCatalog {
+            models: remote_models,
+        };
+    }
+
+    let mut merged = bundled_model_catalog().models;
+    for remote_model in remote_models {
+        if let Some(existing) = merged
+            .iter_mut()
+            .find(|existing| existing.slug == remote_model.slug)
+        {
+            *existing = remote_model;
+        } else {
+            merged.push(remote_model);
+        }
+    }
+    ModelCatalog { models: merged }
+}
+
+fn read_project_codex_config_toml(path: &Path, trusted: bool) -> Result<Option<toml::Value>> {
+    let data = match std::fs::read_to_string(path) {
+        Ok(data) => data,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(None);
+        }
+        Err(error) => bail!(
+            "Failed to read project config file {}: {error}",
+            path.display()
+        ),
+    };
+    match data.parse::<toml::Value>() {
+        Ok(value) => Ok(Some(value)),
+        Err(error) if trusted => {
+            bail!(
+                "Error parsing project config file {}: {error}",
+                path.display()
+            )
+        }
+        Err(_) => Ok(None),
+    }
+}
+
+fn read_codex_managed_preferences_config_toml() -> Result<Option<toml::Value>> {
+    let Some(encoded) = codex_managed_preferences_config_base64()? else {
+        return Ok(None);
+    };
+    let trimmed = encoded.trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let bytes = match general_purpose::STANDARD.decode(trimmed.as_bytes()) {
+        Ok(bytes) => bytes,
+        Err(error) => {
+            bail!(
+                "Failed to decode Codex managed preferences `{}` for AGENTS.md discovery: {error}",
+                CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE,
+            );
+        }
+    };
+    let raw_toml = match String::from_utf8(bytes) {
+        Ok(raw_toml) => raw_toml,
+        Err(error) => {
+            bail!(
+                "Codex managed preferences `{}` for AGENTS.md discovery were not valid UTF-8: {error}",
+                CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE,
+            );
+        }
+    };
+    match raw_toml.parse::<toml::Value>() {
+        Ok(toml::Value::Table(table)) => Ok(Some(toml::Value::Table(table))),
+        Ok(other) => {
+            bail!(
+                "Codex managed preferences `{}` for AGENTS.md discovery must have a TOML table at the root, found {other:?}",
+                CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE,
+            );
+        }
+        Err(error) => bail!(
+            "Failed to parse Codex managed preferences `{}` for AGENTS.md discovery: {error}",
+            CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE,
+        ),
+    }
+}
+
+#[cfg(test)]
+fn codex_managed_preferences_config_base64() -> Result<Option<String>> {
+    Ok(std::env::var(TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV).ok())
+}
+
+#[cfg(all(target_os = "macos", not(test)))]
+fn codex_managed_preferences_config_base64() -> Result<Option<String>> {
+    use core_foundation::base::TCFType;
+    use core_foundation::string::{CFString, CFStringRef};
+    use std::ffi::c_void;
+
+    #[link(name = "CoreFoundation", kind = "framework")]
+    unsafe extern "C" {
+        fn CFPreferencesCopyAppValue(key: CFStringRef, application_id: CFStringRef) -> *mut c_void;
+    }
+
+    let value_ref = unsafe {
+        CFPreferencesCopyAppValue(
+            CFString::new(CODEX_MANAGED_PREFERENCES_CONFIG_KEY).as_concrete_TypeRef(),
+            CFString::new(CODEX_MANAGED_PREFERENCES_APPLICATION_ID).as_concrete_TypeRef(),
+        )
+    };
+    if value_ref.is_null() {
+        return Ok(None);
+    }
+    let value = unsafe { CFString::wrap_under_create_rule(value_ref as _) }.to_string();
+    if value.trim().is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(value))
+}
+
+#[cfg(all(not(target_os = "macos"), not(test)))]
+fn codex_managed_preferences_config_base64() -> Result<Option<String>> {
+    Ok(None)
+}
+
+fn apply_agents_md_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+    relative_base: &Path,
+    layer_kind: ConfigLayerKind,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if let Some(max_bytes) = toml_nonnegative_usize(value, "project_doc_max_bytes", path)? {
+        config.project_doc_max_bytes = max_bytes;
+    }
+    if let Some(fallback_filenames) =
+        toml_string_array(value, "project_doc_fallback_filenames", path)?
+    {
+        config.project_doc_fallback_filenames = fallback_filenames;
+    }
+    if matches!(layer_kind, ConfigLayerKind::NonProject) {
+        if let Some(root_markers) = toml_string_array(value, "project_root_markers", path)? {
+            config.project_root_markers = root_markers;
+        }
+    }
+    if let Some(model_provider_id) = toml_optional_string(value, "model_provider", path)? {
+        config.model_provider_id = Some(model_provider_id);
+    }
+    if let Some(model) = toml_optional_string(value, "model", path)? {
+        config.model = Some(model);
+    }
+    if let Some(instructions) = toml_optional_string(value, "instructions", path)? {
+        config.instructions = Some(instructions);
+    }
+    if let Some(model_instructions_file) =
+        toml_optional_path(value, "model_instructions_file", path, relative_base)?
+    {
+        config.model_instructions_file = Some(model_instructions_file);
+    }
+    if let Some(model_catalog_json) =
+        toml_optional_path(value, "model_catalog_json", path, relative_base)?
+    {
+        config.model_catalog = Some(load_model_catalog_json(&model_catalog_json)?);
+        config.model_catalog_cache_etag = None;
+        config.model_catalog_refresh_allowed = false;
+    }
+    if let Some(developer_instructions) =
+        toml_optional_string(value, "developer_instructions", path)?
+    {
+        config.developer_instructions = Some(developer_instructions);
+    }
+    let declared_role_files =
+        apply_agent_roles_config_layer(config, value, path, relative_base, warnings)?;
+    discover_agent_roles_for_config_layer(
+        config,
+        path,
+        relative_base,
+        &declared_role_files,
+        warnings,
+    )?;
+    if let Some(personality) = toml_optional_enum_string(
+        value,
+        "personality",
+        path,
+        &["none", "friendly", "pragmatic"],
+    )? {
+        config.personality = match personality.as_str() {
+            "none" => ModelPersonality::None,
+            "friendly" => ModelPersonality::Friendly,
+            "pragmatic" => ModelPersonality::Pragmatic,
+            _ => unreachable!("validated personality value"),
+        };
+    }
+    if let Some(include_environment_context) =
+        toml_optional_bool(value, "include_environment_context", path)?
+    {
+        config.include_environment_context = include_environment_context;
+    }
+    if let Some(include_collaboration_mode_instructions) =
+        toml_optional_bool(value, "include_collaboration_mode_instructions", path)?
+    {
+        config.include_collaboration_mode_instructions = include_collaboration_mode_instructions;
+    }
+    apply_codex_features_config_layer(config, value, path)?;
+    apply_multi_agent_v2_config_layer(config, value, path)?;
+    if let Some(reasoning_effort) = toml_optional_enum_string(
+        value,
+        "model_reasoning_effort",
+        path,
+        &["none", "minimal", "low", "medium", "high", "xhigh"],
+    )? {
+        config.model_request_settings.reasoning_effort = Some(reasoning_effort);
+    }
+    if let Some(reasoning_effort) = toml_optional_enum_string(
+        value,
+        "plan_mode_reasoning_effort",
+        path,
+        &["none", "minimal", "low", "medium", "high", "xhigh"],
+    )? {
+        config.plan_mode_reasoning_effort = Some(reasoning_effort);
+    }
+    if let Some(reasoning_summary) = toml_optional_enum_string(
+        value,
+        "model_reasoning_summary",
+        path,
+        &["auto", "concise", "detailed", "none"],
+    )? {
+        config.model_request_settings.reasoning_summary = Some(reasoning_summary);
+    }
+    if let Some(supports_reasoning_summaries) =
+        toml_optional_bool(value, "model_supports_reasoning_summaries", path)?
+    {
+        config
+            .model_request_settings
+            .model_supports_reasoning_summaries = Some(supports_reasoning_summaries);
+    }
+    if let Some(text_verbosity) =
+        toml_optional_enum_string(value, "model_verbosity", path, &["low", "medium", "high"])?
+    {
+        config.model_request_settings.text_verbosity = Some(text_verbosity);
+    }
+    if let Some(service_tier) = toml_optional_service_tier(value, "service_tier", path)? {
+        config.model_request_settings.service_tier = Some(service_tier);
+    }
+    if let Some(model_context_window) = toml_nonnegative_usize(value, "model_context_window", path)?
+    {
+        config.model_context_window = Some(model_context_window as i64);
+    }
+    if let Some(model_auto_compact_token_limit) =
+        toml_nonnegative_usize(value, "model_auto_compact_token_limit", path)?
+    {
+        config.model_auto_compact_token_limit = Some(model_auto_compact_token_limit as i64);
+    }
+    if let Some(tool_output_token_limit) =
+        toml_nonnegative_usize(value, "tool_output_token_limit", path)?
+    {
+        config.tool_output_token_limit = Some(tool_output_token_limit);
+    }
+    apply_model_provider_request_retry_config_layer(config, value, path, relative_base)?;
+    Ok(())
+}
+
+fn apply_codex_features_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+) -> Result<()> {
+    let Some(features) = value.get("features") else {
+        return Ok(());
+    };
+    let Some(features) = features.as_table() else {
+        bail!(
+            "Invalid Codex config `features` from `{}`: expected a table.",
+            path.display()
+        );
+    };
+    for (key, value) in features {
+        if !config.advertised_beta_features.contains_key(key.as_str()) {
+            continue;
+        }
+        if let Some(enabled) = value.as_bool() {
+            config.advertised_beta_features.insert(key.clone(), enabled);
+            continue;
+        }
+        if let Some(table) = value.as_table() {
+            if let Some(enabled) = table.get("enabled") {
+                let Some(enabled) = enabled.as_bool() else {
+                    bail!(
+                        "Invalid Codex config `features.{key}.enabled` from `{}`: expected a boolean.",
+                        path.display()
+                    );
+                };
+                config.advertised_beta_features.insert(key.clone(), enabled);
+            }
+            continue;
+        }
+        bail!(
+            "Invalid Codex config `features.{key}` from `{}`: expected a boolean or table.",
+            path.display()
+        );
+    }
+    Ok(())
+}
+
+fn apply_multi_agent_v2_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+) -> Result<()> {
+    if let Some(enabled) =
+        toml_optional_nested_enabled_bool(value, &["features", "multi_agent_v2"], path)?
+    {
+        config.multi_agent_v2.enabled = enabled;
+    }
+    if let Some(max_concurrent_threads_per_session) = toml_optional_nested_usize(
+        value,
+        &[
+            "features",
+            "multi_agent_v2",
+            "max_concurrent_threads_per_session",
+        ],
+        path,
+    )? {
+        config.multi_agent_v2.max_concurrent_threads_per_session =
+            max_concurrent_threads_per_session;
+    }
+    if let Some(min_wait_timeout_ms) = toml_optional_nested_i64(
+        value,
+        &["features", "multi_agent_v2", "min_wait_timeout_ms"],
+        path,
+    )? {
+        config.multi_agent_v2.min_wait_timeout_ms = min_wait_timeout_ms;
+    }
+    if let Some(max_wait_timeout_ms) = toml_optional_nested_i64(
+        value,
+        &["features", "multi_agent_v2", "max_wait_timeout_ms"],
+        path,
+    )? {
+        config.multi_agent_v2.max_wait_timeout_ms = max_wait_timeout_ms;
+    }
+    if let Some(default_wait_timeout_ms) = toml_optional_nested_i64(
+        value,
+        &["features", "multi_agent_v2", "default_wait_timeout_ms"],
+        path,
+    )? {
+        config.multi_agent_v2.default_wait_timeout_ms = default_wait_timeout_ms;
+    }
+    if let Some(usage_hint_enabled) = toml_optional_nested_bool(
+        value,
+        &["features", "multi_agent_v2", "usage_hint_enabled"],
+        path,
+    )? {
+        config.multi_agent_v2.usage_hint_enabled = usage_hint_enabled;
+    }
+    if let Some(usage_hint_text) = toml_optional_nested_string(
+        value,
+        &["features", "multi_agent_v2", "usage_hint_text"],
+        path,
+    )? {
+        config.multi_agent_v2.usage_hint_text = Some(usage_hint_text);
+    }
+    if let Some(root_agent_usage_hint_text) = toml_optional_nested_string(
+        value,
+        &["features", "multi_agent_v2", "root_agent_usage_hint_text"],
+        path,
+    )? {
+        config.multi_agent_v2.root_agent_usage_hint_text = Some(root_agent_usage_hint_text);
+    }
+    if let Some(subagent_usage_hint_text) = toml_optional_nested_string(
+        value,
+        &["features", "multi_agent_v2", "subagent_usage_hint_text"],
+        path,
+    )? {
+        config.multi_agent_v2.subagent_usage_hint_text = Some(subagent_usage_hint_text);
+    }
+    if let Some(tool_namespace) = toml_optional_nested_string(
+        value,
+        &["features", "multi_agent_v2", "tool_namespace"],
+        path,
+    )? {
+        config.multi_agent_v2.tool_namespace = Some(tool_namespace);
+    }
+    if let Some(hide_spawn_agent_metadata) = toml_optional_nested_bool(
+        value,
+        &["features", "multi_agent_v2", "hide_spawn_agent_metadata"],
+        path,
+    )? {
+        config.multi_agent_v2.hide_spawn_agent_metadata = hide_spawn_agent_metadata;
+    }
+    if let Some(non_code_mode_only) = toml_optional_nested_bool(
+        value,
+        &["features", "multi_agent_v2", "non_code_mode_only"],
+        path,
+    )? {
+        config.multi_agent_v2.non_code_mode_only = non_code_mode_only;
+    }
+    validate_multi_agent_v2_config(&config.multi_agent_v2)?;
+    Ok(())
+}
+
+fn validate_multi_agent_v2_config(config: &MultiAgentV2Config) -> Result<()> {
+    if config.max_concurrent_threads_per_session == 0 {
+        bail!("features.multi_agent_v2.max_concurrent_threads_per_session must be at least 1");
+    }
+    validate_multi_agent_v2_wait_timeout(
+        "features.multi_agent_v2.min_wait_timeout_ms",
+        config.min_wait_timeout_ms,
+    )?;
+    validate_multi_agent_v2_wait_timeout(
+        "features.multi_agent_v2.max_wait_timeout_ms",
+        config.max_wait_timeout_ms,
+    )?;
+    validate_multi_agent_v2_wait_timeout(
+        "features.multi_agent_v2.default_wait_timeout_ms",
+        config.default_wait_timeout_ms,
+    )?;
+    if config.min_wait_timeout_ms > config.max_wait_timeout_ms {
+        bail!(
+            "features.multi_agent_v2.min_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms"
+        );
+    }
+    if config.default_wait_timeout_ms < config.min_wait_timeout_ms {
+        bail!(
+            "features.multi_agent_v2.default_wait_timeout_ms must be at least features.multi_agent_v2.min_wait_timeout_ms"
+        );
+    }
+    if config.default_wait_timeout_ms > config.max_wait_timeout_ms {
+        bail!(
+            "features.multi_agent_v2.default_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms"
+        );
+    }
+    validate_multi_agent_v2_tool_namespace(config.tool_namespace.as_deref())?;
+    Ok(())
+}
+
+fn validate_multi_agent_v2_wait_timeout(label: &str, value: i64) -> Result<()> {
+    if value < 0 {
+        bail!("{label} must be at least 0");
+    }
+    if value > DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS_UPPER_BOUND {
+        bail!(
+            "{label} must be at most {}",
+            DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS_UPPER_BOUND
+        );
+    }
+    Ok(())
+}
+
+fn validate_multi_agent_v2_tool_namespace(namespace: Option<&str>) -> Result<()> {
+    const LABEL: &str = "features.multi_agent_v2.tool_namespace";
+    const MAX_LEN: usize = 64;
+    const RESERVED_RESPONSES_NAMESPACES: &[&str] = &[
+        "api_tool",
+        "browser",
+        "computer",
+        "container",
+        "file_search",
+        "functions",
+        "image_gen",
+        "multi_tool_use",
+        "python",
+        "python_user_visible",
+        "submodel_delegator",
+        "terminal",
+        "tool_search",
+        "web",
+    ];
+    let Some(namespace) = namespace else {
+        return Ok(());
+    };
+    if namespace.is_empty() {
+        bail!("{LABEL} must not be empty");
+    }
+    if namespace.trim() != namespace {
+        bail!("{LABEL} must not have leading or trailing whitespace");
+    }
+    if !namespace
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("{LABEL} must match ^[a-zA-Z0-9_-]+$");
+    }
+    if namespace.chars().count() > MAX_LEN {
+        bail!("{LABEL} must be at most {MAX_LEN} characters");
+    }
+    if namespace == "mcp"
+        || namespace.starts_with("mcp__")
+        || RESERVED_RESPONSES_NAMESPACES.contains(&namespace)
+    {
+        bail!("{LABEL} uses a reserved namespace: {namespace}");
+    }
+    Ok(())
+}
+
+fn apply_model_provider_request_retry_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+    relative_base: &Path,
+) -> Result<()> {
+    let Some(model_providers) = value.get("model_providers") else {
+        return Ok(());
+    };
+    let Some(model_providers) = model_providers.as_table() else {
+        bail!(
+            "Invalid Codex config `model_providers` from `{}`: expected a table.",
+            path.display()
+        );
+    };
+    for (provider_id, provider_config) in model_providers {
+        if provider_id == AMAZON_BEDROCK_PROVIDER_ID {
+            let aws = parse_amazon_bedrock_provider_override(provider_config)?;
+            let mut provider = config
+                .model_providers
+                .get(provider_id)
+                .cloned()
+                .unwrap_or_else(|| amazon_bedrock_model_provider_config(Default::default()));
+            if let Some(aws) = aws {
+                let built_in_aws = provider.aws.get_or_insert_with(Default::default);
+                if let Some(profile) = aws.profile {
+                    built_in_aws.profile = Some(profile);
+                }
+                if let Some(region) = aws.region {
+                    built_in_aws.region = Some(region);
+                }
+            }
+            config.model_providers.insert(provider_id.clone(), provider);
+            continue;
+        }
+        if RESERVED_CUSTOM_MODEL_PROVIDER_IDS.contains(&provider_id.as_str()) {
+            bail!(
+                "model_providers contains reserved built-in provider IDs: `{provider_id}`. Built-in providers cannot be overridden. Rename your custom provider (for example, `openai-custom`)."
+            );
+        }
+        let Some(provider_config) = provider_config.as_table() else {
+            bail!(
+                "Invalid Codex config `model_providers.{provider_id}` from `{}`: expected a table.",
+                path.display()
+            );
+        };
+        let provider_config = toml::Value::Table(provider_config.clone());
+        let mut provider = config
+            .model_providers
+            .get(provider_id)
+            .cloned()
+            .unwrap_or_default();
+        apply_model_provider_config_table(
+            &mut provider,
+            provider_id,
+            &provider_config,
+            path,
+            relative_base,
+        )?;
+        validate_model_provider_config(provider_id, &provider)?;
+        if let Some(request_max_retries) = provider.request_max_retries {
+            config.provider_request_max_retries.insert(
+                provider_id.clone(),
+                request_max_retries.min(MAX_REQUEST_MAX_RETRIES),
+            );
+        }
+        if let Some(stream_max_retries) = provider.stream_max_retries {
+            config.provider_stream_max_retries.insert(
+                provider_id.clone(),
+                stream_max_retries.min(MAX_STREAM_MAX_RETRIES),
+            );
+        }
+        if let Some(stream_idle_timeout_ms) = provider.stream_idle_timeout_ms {
+            config
+                .provider_stream_idle_timeout_ms
+                .insert(provider_id.clone(), stream_idle_timeout_ms);
+        }
+        config.model_providers.insert(provider_id.clone(), provider);
+    }
+    Ok(())
+}
+
+fn parse_amazon_bedrock_provider_override(
+    provider_config: &toml::Value,
+) -> Result<Option<ModelProviderAwsAuthInfo>> {
+    let Some(provider_config) = provider_config.as_table() else {
+        bail!("Invalid Codex config `model_providers.{AMAZON_BEDROCK_PROVIDER_ID}`: expected a table.");
+    };
+    if provider_config.keys().any(|key| key != "aws") {
+        bail!(
+            "model_providers.{AMAZON_BEDROCK_PROVIDER_ID} only supports changing `aws.profile` and `aws.region`; other non-default provider fields are not supported"
+        );
+    }
+    if let Some(aws) = provider_config.get("aws") {
+        let Some(aws) = aws.as_table() else {
+            bail!("model_providers.{AMAZON_BEDROCK_PROVIDER_ID}.aws: expected a table");
+        };
+        if aws.keys().any(|key| key != "profile" && key != "region") {
+            bail!(
+                "model_providers.{AMAZON_BEDROCK_PROVIDER_ID} only supports changing `aws.profile` and `aws.region`; other non-default provider fields are not supported"
+            );
+        }
+        return Ok(Some(ModelProviderAwsAuthInfo {
+            profile: toml_table_optional_string(aws, "profile", AMAZON_BEDROCK_PROVIDER_ID)?,
+            region: toml_table_optional_string(aws, "region", AMAZON_BEDROCK_PROVIDER_ID)?,
+        }));
+    }
+    Ok(None)
+}
+
+fn toml_table_optional_string(
+    table: &toml::map::Map<String, toml::Value>,
+    key: &str,
+    table_name: &str,
+) -> Result<Option<String>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let Some(text) = value.as_str() else {
+        bail!("model_providers.{table_name}.aws.{key}: expected a string");
+    };
+    Ok(Some(text.to_string()))
+}
+
+fn apply_model_provider_config_table(
+    provider: &mut CodexModelProviderConfig,
+    provider_id: &str,
+    value: &toml::Value,
+    path: &Path,
+    relative_base: &Path,
+) -> Result<()> {
+    if let Some(name) = toml_optional_string(value, "name", path)? {
+        provider.name = name;
+    }
+    if let Some(base_url) = toml_optional_string(value, "base_url", path)? {
+        provider.base_url = Some(base_url);
+    }
+    if let Some(env_key) = toml_optional_string(value, "env_key", path)? {
+        provider.env_key = Some(env_key);
+    }
+    if let Some(instructions) = toml_optional_string(value, "env_key_instructions", path)? {
+        provider.env_key_instructions = Some(instructions);
+    }
+    if let Some(token) = toml_optional_string(value, "experimental_bearer_token", path)? {
+        provider.experimental_bearer_token = Some(token);
+    }
+    if let Some(wire_api) = toml_optional_string(value, "wire_api", path)? {
+        provider.wire_api = parse_codex_wire_api(&wire_api)?;
+    }
+    if let Some(query_params) = toml_optional_string_map(value, "query_params", path)? {
+        provider.query_params = query_params;
+    }
+    if let Some(http_headers) = toml_optional_string_map(value, "http_headers", path)? {
+        provider.http_headers = http_headers;
+    }
+    if let Some(env_http_headers) = toml_optional_string_map(value, "env_http_headers", path)? {
+        provider.env_http_headers = env_http_headers;
+    }
+    if let Some(request_max_retries) = toml_nonnegative_usize(value, "request_max_retries", path)? {
+        provider.request_max_retries = Some(request_max_retries.min(MAX_REQUEST_MAX_RETRIES));
+    }
+    if let Some(stream_max_retries) = toml_nonnegative_usize(value, "stream_max_retries", path)? {
+        provider.stream_max_retries = Some(stream_max_retries.min(MAX_STREAM_MAX_RETRIES));
+    }
+    if let Some(stream_idle_timeout_ms) =
+        toml_nonnegative_usize(value, "stream_idle_timeout_ms", path)?
+    {
+        provider.stream_idle_timeout_ms =
+            Some(u64::try_from(stream_idle_timeout_ms).unwrap_or(u64::MAX));
+    }
+    if let Some(websocket_connect_timeout_ms) =
+        toml_nonnegative_usize(value, "websocket_connect_timeout_ms", path)?
+    {
+        provider.websocket_connect_timeout_ms =
+            Some(u64::try_from(websocket_connect_timeout_ms).unwrap_or(u64::MAX));
+    }
+    if let Some(requires_openai_auth) = toml_optional_bool(value, "requires_openai_auth", path)? {
+        provider.requires_openai_auth = requires_openai_auth;
+    }
+    if let Some(supports_websockets) = toml_optional_bool(value, "supports_websockets", path)? {
+        provider.supports_websockets = supports_websockets;
+    }
+    if value.get("aws").is_some() {
+        bail!("model_providers.{provider_id}: provider aws is only supported for `{AMAZON_BEDROCK_PROVIDER_ID}`");
+    }
+    if let Some(auth) = value.get("auth") {
+        let Some(auth) = auth.as_table() else {
+            bail!("model_providers.{provider_id}.auth: expected a table");
+        };
+        provider.auth = Some(parse_provider_command_auth_config(
+            provider_id,
+            auth,
+            path,
+            relative_base,
+        )?);
+    }
+    Ok(())
+}
+
+fn parse_provider_command_auth_config(
+    provider_id: &str,
+    auth: &toml::map::Map<String, toml::Value>,
+    path: &Path,
+    cwd_base: &Path,
+) -> Result<ProviderCommandAuthConfig> {
+    let command = auth
+        .get("command")
+        .and_then(toml::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    if command.trim().is_empty() {
+        bail!("model_providers.{provider_id}: provider auth.command must not be empty");
+    }
+    let args = match auth.get("args") {
+        Some(value) => {
+            let Some(items) = value.as_array() else {
+                bail!(
+                    "Invalid Codex config `model_providers.{provider_id}.auth.args` from `{}`: expected an array of strings.",
+                    path.display()
+                );
+            };
+            let mut args = Vec::new();
+            for item in items {
+                let Some(item) = item.as_str() else {
+                    bail!(
+                        "Invalid Codex config `model_providers.{provider_id}.auth.args` from `{}`: expected an array of strings.",
+                        path.display()
+                    );
+                };
+                args.push(item.to_string());
+            }
+            args
+        }
+        None => Vec::new(),
+    };
+    let timeout_ms = match auth.get("timeout_ms") {
+        Some(value) => {
+            let Some(timeout_ms) = value.as_integer() else {
+                bail!(
+                    "Invalid Codex config `model_providers.{provider_id}.auth.timeout_ms` from `{}`: expected a positive integer.",
+                    path.display()
+                );
+            };
+            if timeout_ms <= 0 {
+                bail!(
+                    "Invalid Codex config `model_providers.{provider_id}.auth.timeout_ms` from `{}`: expected a positive integer.",
+                    path.display()
+                );
+            }
+            u64::try_from(timeout_ms).unwrap_or(u64::MAX)
+        }
+        None => 5_000,
+    };
+    let refresh_interval_ms = match auth.get("refresh_interval_ms") {
+        Some(value) => {
+            let Some(refresh_interval_ms) = value.as_integer() else {
+                bail!(
+                    "Invalid Codex config `model_providers.{provider_id}.auth.refresh_interval_ms` from `{}`: expected a non-negative integer.",
+                    path.display()
+                );
+            };
+            if refresh_interval_ms < 0 {
+                bail!(
+                    "Invalid Codex config `model_providers.{provider_id}.auth.refresh_interval_ms` from `{}`: expected a non-negative integer.",
+                    path.display()
+                );
+            }
+            u64::try_from(refresh_interval_ms).unwrap_or(u64::MAX)
+        }
+        None => 300_000,
+    };
+    let cwd = match auth.get("cwd") {
+        Some(value) => {
+            let Some(raw) = value.as_str() else {
+                bail!(
+                    "Invalid Codex config `model_providers.{provider_id}.auth.cwd` from `{}`: expected a path string.",
+                    path.display()
+                );
+            };
+            let raw = PathBuf::from(raw);
+            if raw.is_absolute() {
+                raw
+            } else {
+                cwd_base.join(raw)
+            }
+        }
+        None => cwd_base.to_path_buf(),
+    };
+    Ok(ProviderCommandAuthConfig {
+        command,
+        args,
+        timeout_ms,
+        refresh_interval_ms,
+        cwd,
+    })
+}
+
+fn parse_codex_wire_api(value: &str) -> Result<CodexWireApi> {
+    match value {
+        "responses" => Ok(CodexWireApi::Responses),
+        "chat" => bail!(CODEX_CHAT_WIRE_API_REMOVED_ERROR),
+        other => bail!("unknown variant `{other}`, expected `responses`"),
+    }
+}
+
+fn codex_wire_api_key(wire_api: CodexWireApi) -> &'static str {
+    match wire_api {
+        CodexWireApi::Responses => "responses",
+    }
+}
+
+fn validate_model_provider_config(
+    provider_id: &str,
+    provider: &CodexModelProviderConfig,
+) -> Result<()> {
+    if provider.name.trim().is_empty() {
+        bail!("model_providers.{provider_id}: provider name must not be empty");
+    }
+    if provider.auth.is_some() {
+        let mut conflicts = Vec::new();
+        if provider.env_key.is_some() {
+            conflicts.push("env_key");
+        }
+        if provider.experimental_bearer_token.is_some() {
+            conflicts.push("experimental_bearer_token");
+        }
+        if provider.requires_openai_auth {
+            conflicts.push("requires_openai_auth");
+        }
+        if !conflicts.is_empty() {
+            bail!(
+                "model_providers.{provider_id}: provider auth cannot be combined with {}",
+                conflicts.join(", ")
+            );
+        }
+    }
+    Ok(())
+}
+
+fn apply_agent_roles_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+    relative_base: &Path,
+    warnings: &mut Vec<String>,
+) -> Result<Vec<PathBuf>> {
+    let mut declared_role_files = Vec::new();
+    let Some(agents) = value.get("agents") else {
+        return Ok(declared_role_files);
+    };
+    let Some(agents_table) = agents.as_table() else {
+        bail!(
+            "Invalid Codex config `agents` from `{}`: expected a table.",
+            path.display()
+        );
+    };
+
+    for (role_name, role_value) in agents_table {
+        let parsed_role = (|| -> Result<(String, AgentRoleDefinition)> {
+            let Some(role_table) = role_value.as_table() else {
+                bail!("agents.{role_name} must be a table");
+            };
+            let role_name = role_name.trim();
+            if role_name.is_empty() {
+                bail!("agent role name cannot be blank");
+            }
+            let description = match role_table.get("description") {
+                Some(value) => {
+                    let Some(description) = value.as_str() else {
+                        bail!(
+                        "Invalid Codex config `agents.{role_name}.description` from `{}`: expected a string.",
+                        path.display()
+                    );
+                    };
+                    let description = description.trim();
+                    if description.is_empty() {
+                        bail!(
+                        "Invalid Codex config `agents.{role_name}.description` from `{}`: cannot be blank.",
+                        path.display()
+                    );
+                    }
+                    Some(description.to_string())
+                }
+                None => None,
+            };
+            let config_file = match role_table.get("config_file") {
+                Some(value) => {
+                    let Some(raw_path) = value.as_str() else {
+                        bail!(
+                        "Invalid Codex config `agents.{role_name}.config_file` from `{}`: expected a path string.",
+                        path.display()
+                    );
+                    };
+                    let role_path = PathBuf::from(raw_path);
+                    let config_file = if role_path.is_absolute() {
+                        role_path
+                    } else {
+                        relative_base.join(role_path)
+                    };
+                    Some(config_file)
+                }
+                None => None,
+            };
+            let nickname_candidates = toml_agent_role_nickname_candidates(
+                role_table.get("nickname_candidates"),
+                &format!("agents.{role_name}.nickname_candidates"),
+            )?;
+            let (role_name, role) = match config_file.as_ref() {
+                Some(config_file) => {
+                    let (resolved_role_name, mut file_role) =
+                        parse_agent_role_file_metadata(config_file, Some(role_name))?;
+                    file_role.description = file_role.description.or(description);
+                    file_role.nickname_candidates =
+                        file_role.nickname_candidates.or(nickname_candidates);
+                    (resolved_role_name, file_role)
+                }
+                None => (
+                    role_name.to_string(),
+                    AgentRoleDefinition {
+                        description,
+                        config_file,
+                        nickname_candidates,
+                    },
+                ),
+            };
+            Ok((role_name, role))
+        })();
+        let (role_name, role) = match parsed_role {
+            Ok(role) => role,
+            Err(error) => {
+                warnings.push(format!("Ignoring malformed agent role definition: {error}"));
+                continue;
+            }
+        };
+        if let Some(config_file) = role.config_file.clone() {
+            declared_role_files.push(config_file);
+        }
+        merge_agent_role_definition(&mut config.agent_roles, role_name.clone(), role);
+        if config
+            .agent_roles
+            .get(&role_name)
+            .and_then(|role| role.description.as_deref())
+            .is_none()
+        {
+            config.agent_roles.remove(&role_name);
+            warnings.push(format!(
+                "Ignoring malformed agent role definition: agent role `{role_name}` must define a description"
+            ));
+        }
+    }
+    Ok(declared_role_files)
+}
+
+fn merge_agent_role_definition(
+    roles: &mut BTreeMap<String, AgentRoleDefinition>,
+    role_name: String,
+    mut role: AgentRoleDefinition,
+) {
+    if let Some(existing) = roles.get(&role_name) {
+        role.description = role.description.or_else(|| existing.description.clone());
+        role.config_file = role.config_file.or_else(|| existing.config_file.clone());
+        role.nickname_candidates = role
+            .nickname_candidates
+            .or_else(|| existing.nickname_candidates.clone());
+    }
+    roles.insert(role_name, role);
+}
+
+fn discover_agent_roles_for_config_layer(
+    config: &mut AgentsMdConfig,
+    config_path: &Path,
+    relative_base: &Path,
+    declared_role_files: &[PathBuf],
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if !config_layer_has_agent_role_directory(config_path) {
+        return Ok(());
+    }
+    let agents_dir = relative_base.join("agents");
+    let role_files = collect_agent_role_files(&agents_dir)?;
+    let mut layer_roles = BTreeMap::new();
+    for role_file in role_files {
+        if declared_role_files
+            .iter()
+            .any(|declared| same_normalized_path(declared, &role_file))
+        {
+            continue;
+        }
+        match parse_agent_role_file_metadata(&role_file, None) {
+            Ok((role_name, role)) => {
+                if layer_roles.contains_key(&role_name) {
+                    warnings.push(format!(
+                        "Ignoring malformed agent role definition: duplicate agent role name `{role_name}` discovered in {}",
+                        agents_dir.display()
+                    ));
+                    continue;
+                }
+                layer_roles.insert(role_name, role);
+            }
+            Err(error) => {
+                warnings.push(format!("Ignoring malformed agent role definition: {error}"))
+            }
+        }
+    }
+    for (role_name, role) in layer_roles {
+        merge_agent_role_definition(&mut config.agent_roles, role_name, role);
+    }
+    Ok(())
+}
+
+fn config_layer_has_agent_role_directory(config_path: &Path) -> bool {
+    let Some(file_name) = config_path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    file_name == CODEX_CONFIG_FILENAME || file_name.ends_with(CODEX_PROFILE_CONFIG_SUFFIX)
+}
+
+fn collect_agent_role_files(dir: &Path) -> Result<Vec<PathBuf>> {
+    let mut files = Vec::new();
+    let mut dirs = vec![dir.to_path_buf()];
+    while let Some(dir) = dirs.pop() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(entries) => entries,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+            Err(error) => {
+                bail!(
+                    "Failed to read Codex agent roles directory `{}`: {error}",
+                    dir.display()
+                );
+            }
+        };
+        for entry in entries {
+            let entry = entry?;
+            let path = entry.path();
+            let metadata = entry.metadata()?;
+            if metadata.is_dir() {
+                dirs.push(path);
+            } else if metadata.is_file()
+                && path
+                    .extension()
+                    .is_some_and(|extension| extension == "toml")
+            {
+                files.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn parse_agent_role_file_metadata(
+    path: &Path,
+    role_name_hint: Option<&str>,
+) -> Result<(String, AgentRoleDefinition)> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read agent role file at {}", path.display()))?;
+    let role_layer: toml::Value = contents
+        .parse()
+        .with_context(|| format!("failed to parse agent role file at {}", path.display()))?;
+    let Some(table) = role_layer.as_table() else {
+        bail!(
+            "agent role file at {} must contain a TOML table",
+            path.display()
+        );
+    };
+    let role_name = match role_file_optional_string(table, path, "name")? {
+        Some(role_name) => role_name,
+        None if let Some(role_name_hint) = role_name_hint => role_name_hint.to_string(),
+        None => bail!(
+            "agent role file at {} must define a non-empty `name`",
+            path.display()
+        ),
+    };
+    let description = role_file_optional_string(table, path, "description")?;
+    if role_name_hint.is_none() && description.is_none() {
+        bail!(
+            "agent role file at {} must define `description`",
+            path.display()
+        );
+    }
+    match role_file_optional_string(table, path, "developer_instructions")? {
+        Some(_) => {}
+        None if role_name_hint.is_none() => bail!(
+            "agent role file at {} must define `developer_instructions`",
+            path.display()
+        ),
+        None => {}
+    }
+    let nickname_candidates = toml_agent_role_nickname_candidates(
+        table.get("nickname_candidates"),
+        &format!("agent role file {}.nickname_candidates", path.display()),
+    )?;
+    Ok((
+        role_name,
+        AgentRoleDefinition {
+            description,
+            config_file: Some(path.to_path_buf()),
+            nickname_candidates,
+        },
+    ))
+}
+
+fn role_file_optional_string(
+    table: &toml::map::Map<String, toml::Value>,
+    path: &Path,
+    key: &str,
+) -> Result<Option<String>> {
+    let Some(value) = table.get(key) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_str() else {
+        bail!(
+            "agent role file at {}.{key} must be a string",
+            path.display()
+        );
+    };
+    let value = value.trim();
+    if value.is_empty() {
+        bail!(
+            "agent role file at {}.{key} cannot be blank",
+            path.display()
+        );
+    }
+    Ok(Some(value.to_string()))
+}
+
+fn toml_agent_role_nickname_candidates(
+    value: Option<&toml::Value>,
+    field_label: &str,
+) -> Result<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let Some(values) = value.as_array() else {
+        bail!("{field_label} must be an array of strings");
+    };
+    if values.is_empty() {
+        bail!("{field_label} must contain at least one name");
+    }
+
+    let mut candidates = Vec::with_capacity(values.len());
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let Some(candidate) = value.as_str() else {
+            bail!("{field_label} must be an array of strings");
+        };
+        let candidate = candidate.trim();
+        if candidate.is_empty() {
+            bail!("{field_label} cannot contain blank names");
+        }
+        if !seen.insert(candidate.to_string()) {
+            bail!("{field_label} cannot contain duplicates");
+        }
+        if !candidate
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+        {
+            bail!(
+                "{field_label} may only contain ASCII letters, digits, spaces, hyphens, and underscores"
+            );
+        }
+        candidates.push(candidate.to_string());
+    }
+    Ok(Some(candidates))
+}
+
+fn config_file_relative_base(path: &Path) -> &Path {
+    path.parent().unwrap_or_else(|| Path::new("."))
+}
+
+fn load_project_agents_md_config_layers(
+    cwd: &Path,
+    codex_home: &Path,
+    user_config: &toml::Value,
+    project_root_markers: &[String],
+    config: &mut AgentsMdConfig,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    let dirs = agents_md_search_dirs_for_markers(cwd, project_root_markers)?;
+    let Some(project_root) = dirs.first().cloned() else {
+        return Ok(());
+    };
+    let trust_map = project_trust_map(user_config);
+    for dir in dirs {
+        let dot_codex = dir.join(PROJECT_CODEX_DIR);
+        if !std::fs::metadata(&dot_codex).is_ok_and(|metadata| metadata.is_dir()) {
+            continue;
+        }
+        if same_normalized_path(&dot_codex, codex_home) {
+            continue;
+        }
+        let config_path = dot_codex.join(CODEX_CONFIG_FILENAME);
+        let trusted = project_config_is_trusted(&trust_map, &dir, &project_root);
+        let Some(mut project_config) = read_project_codex_config_toml(&config_path, trusted)?
+        else {
+            continue;
+        };
+        let ignored_keys = sanitize_project_config(&mut project_config);
+        if !ignored_keys.is_empty() && trusted {
+            warnings.push(project_ignored_config_keys_warning(
+                &config_path,
+                &ignored_keys,
+            ));
+        }
+        if trusted {
+            apply_agents_md_config_layer(
+                config,
+                &project_config,
+                &config_path,
+                config_file_relative_base(&config_path),
+                ConfigLayerKind::Project,
+                warnings,
+            )?;
+        }
+    }
+    Ok(())
+}
+
+fn same_normalized_path(left: &Path, right: &Path) -> bool {
+    let left = left.canonicalize().unwrap_or_else(|_| left.to_path_buf());
+    let right = right.canonicalize().unwrap_or_else(|_| right.to_path_buf());
+    left == right
+}
+
+fn sanitize_project_config(value: &mut toml::Value) -> Vec<String> {
+    let Some(table) = value.as_table_mut() else {
+        return Vec::new();
+    };
+    let mut ignored = Vec::new();
+    for key in PROJECT_LOCAL_CONFIG_DENYLIST {
+        if table.remove(*key).is_some() {
+            ignored.push((*key).to_string());
+        }
+    }
+    ignored
+}
+
+fn project_ignored_config_keys_warning(path: &Path, ignored_keys: &[String]) -> String {
+    format!(
+        concat!(
+            "Ignored unsupported project-local config keys in {}: {}. ",
+            "If you want these settings to apply, manually set them in your ",
+            "user-level config.toml."
+        ),
+        path.display(),
+        ignored_keys.join(", ")
+    )
+}
+
+fn project_trust_map(value: &toml::Value) -> HashMap<String, String> {
+    value
+        .get("projects")
+        .and_then(toml::Value::as_table)
+        .map(|projects| {
+            projects
+                .iter()
+                .filter_map(|(key, project)| {
+                    project
+                        .get("trust_level")
+                        .and_then(toml::Value::as_str)
+                        .map(|trust_level| (key.to_string(), trust_level.to_string()))
+                })
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn project_config_is_trusted(
+    trust_map: &HashMap<String, String>,
+    dir: &Path,
+    project_root: &Path,
+) -> bool {
+    project_trust_level_for_path(trust_map, dir)
+        .or_else(|| project_trust_level_for_path(trust_map, project_root))
+        .is_some_and(|trust_level| trust_level == "trusted")
+}
+
+fn project_trust_level_for_path<'a>(
+    trust_map: &'a HashMap<String, String>,
+    path: &Path,
+) -> Option<&'a str> {
+    normalized_project_trust_keys(path)
+        .into_iter()
+        .find_map(|key| trust_map.get(&key).map(String::as_str))
+}
+
+fn normalized_project_trust_keys(path: &Path) -> Vec<String> {
+    let raw = path.to_string_lossy().to_string();
+    let canonical = path
+        .canonicalize()
+        .unwrap_or_else(|_| path.to_path_buf())
+        .to_string_lossy()
+        .to_string();
+    if raw == canonical {
+        vec![canonical]
+    } else {
+        vec![canonical, raw]
+    }
+}
+
+fn toml_string_array(value: &toml::Value, key: &str, path: &Path) -> Result<Option<Vec<String>>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(items) = value.as_array() else {
+        bail!(
+            "Invalid Codex config `{key}` from `{}`: expected an array of strings.",
+            path.display()
+        );
+    };
+    let mut out = Vec::new();
+    for item in items {
+        let Some(item) = item.as_str() else {
+            bail!(
+                "Invalid Codex config `{key}` from `{}`: expected an array of strings.",
+                path.display()
+            );
+        };
+        let item = item.trim();
+        if !item.is_empty() && !out.iter().any(|existing| existing == item) {
+            out.push(item.to_string());
+        }
+    }
+    Ok(Some(out))
+}
+
+fn toml_nonnegative_usize(value: &toml::Value, key: &str, path: &Path) -> Result<Option<usize>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(max_bytes) = value.as_integer() else {
+        bail!(
+            "Invalid Codex config `{key}` from `{}`: expected a non-negative integer.",
+            path.display()
+        );
+    };
+    match usize::try_from(max_bytes) {
+        Ok(max_bytes) => Ok(Some(max_bytes)),
+        Err(_) => bail!(
+            "Invalid Codex config `{key}` from `{}`: expected a non-negative integer.",
+            path.display()
+        ),
+    }
+}
+
+fn toml_optional_string(value: &toml::Value, key: &str, path: &Path) -> Result<Option<String>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(text) = value.as_str() else {
+        bail!(
+            "Invalid Codex config `{key}` from `{}`: expected a string.",
+            path.display()
+        );
+    };
+    Ok(Some(text.to_string()))
+}
+
+fn toml_optional_string_map(
+    value: &toml::Value,
+    key: &str,
+    path: &Path,
+) -> Result<Option<BTreeMap<String, String>>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(table) = value.as_table() else {
+        bail!(
+            "Invalid Codex config `{key}` from `{}`: expected a table of strings.",
+            path.display()
+        );
+    };
+    let mut out = BTreeMap::new();
+    for (item_key, item_value) in table {
+        let Some(item_value) = item_value.as_str() else {
+            bail!(
+                "Invalid Codex config `{key}.{item_key}` from `{}`: expected a string.",
+                path.display()
+            );
+        };
+        out.insert(item_key.clone(), item_value.to_string());
+    }
+    Ok(Some(out))
+}
+
+fn toml_optional_enum_string(
+    value: &toml::Value,
+    key: &str,
+    path: &Path,
+    allowed: &[&str],
+) -> Result<Option<String>> {
+    let Some(raw) = toml_optional_string(value, key, path)? else {
+        return Ok(None);
+    };
+    if allowed.iter().any(|allowed| *allowed == raw) {
+        Ok(Some(raw))
+    } else {
+        bail!(
+            "Invalid Codex config `{key}` from `{}`: expected one of {}.",
+            path.display(),
+            allowed
+                .iter()
+                .map(|value| format!("`{value}`"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    }
+}
+
+fn toml_optional_service_tier(
+    value: &toml::Value,
+    key: &str,
+    path: &Path,
+) -> Result<Option<String>> {
+    let Some(raw) = toml_optional_string(value, key, path)? else {
+        return Ok(None);
+    };
+    normalize_config_service_tier(&raw)
+        .map(Some)
+        .ok_or_else(|| {
+            anyhow!(
+                "Invalid Codex config `{key}` from `{}`: expected one of `default`, `priority`, `fast`, `flex`.",
+                path.display()
+            )
+        })
+}
+
+fn normalize_config_service_tier(value: &str) -> Option<String> {
+    match value.trim() {
+        "default" => Some("default".to_string()),
+        "fast" | "priority" => Some("priority".to_string()),
+        "flex" => Some("flex".to_string()),
+        _ => None,
+    }
+}
+
+fn toml_optional_path(
+    value: &toml::Value,
+    key: &str,
+    path: &Path,
+    relative_base: &Path,
+) -> Result<Option<PathBuf>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(raw_path) = value.as_str() else {
+        bail!(
+            "Invalid Codex config `{key}` from `{}`: expected a path string.",
+            path.display()
+        );
+    };
+    let path = PathBuf::from(raw_path);
+    if path.is_absolute() {
+        Ok(Some(path))
+    } else {
+        Ok(Some(relative_base.join(path)))
+    }
+}
+
+fn toml_optional_bool(value: &toml::Value, key: &str, path: &Path) -> Result<Option<bool>> {
+    let Some(value) = value.get(key) else {
+        return Ok(None);
+    };
+    let Some(value) = value.as_bool() else {
+        bail!(
+            "Invalid Codex config `{key}` from `{}`: expected a boolean.",
+            path.display()
+        );
+    };
+    Ok(Some(value))
+}
+
+fn toml_optional_nested_bool(
+    value: &toml::Value,
+    keys: &[&str],
+    path: &Path,
+) -> Result<Option<bool>> {
+    let mut current = value;
+    for key in keys {
+        let Some(next) = current.get(key) else {
+            return Ok(None);
+        };
+        current = next;
+    }
+    let Some(value) = current.as_bool() else {
+        bail!(
+            "Invalid Codex config `{}` from `{}`: expected a boolean.",
+            keys.join("."),
+            path.display()
+        );
+    };
+    Ok(Some(value))
+}
+
+fn toml_optional_nested_enabled_bool(
+    value: &toml::Value,
+    keys: &[&str],
+    path: &Path,
+) -> Result<Option<bool>> {
+    let Some(value) = toml_nested_value(value, keys) else {
+        return Ok(None);
+    };
+    if let Some(enabled) = value.as_bool() {
+        return Ok(Some(enabled));
+    }
+    if let Some(table) = value.as_table() {
+        let Some(enabled) = table.get("enabled") else {
+            return Ok(None);
+        };
+        let Some(enabled) = enabled.as_bool() else {
+            bail!(
+                "Invalid Codex config `{}.enabled` from `{}`: expected a boolean.",
+                keys.join("."),
+                path.display()
+            );
+        };
+        return Ok(Some(enabled));
+    }
+    bail!(
+        "Invalid Codex config `{}` from `{}`: expected a boolean or table.",
+        keys.join("."),
+        path.display()
+    )
+}
+
+fn toml_optional_nested_string(
+    value: &toml::Value,
+    keys: &[&str],
+    path: &Path,
+) -> Result<Option<String>> {
+    let Some(value) = toml_nested_value(value, keys) else {
+        return Ok(None);
+    };
+    let Some(text) = value.as_str() else {
+        bail!(
+            "Invalid Codex config `{}` from `{}`: expected a string.",
+            keys.join("."),
+            path.display()
+        );
+    };
+    Ok(Some(text.to_string()))
+}
+
+fn toml_optional_nested_i64(
+    value: &toml::Value,
+    keys: &[&str],
+    path: &Path,
+) -> Result<Option<i64>> {
+    let Some(value) = toml_nested_value(value, keys) else {
+        return Ok(None);
+    };
+    let Some(integer) = value.as_integer() else {
+        bail!(
+            "Invalid Codex config `{}` from `{}`: expected an integer.",
+            keys.join("."),
+            path.display()
+        );
+    };
+    Ok(Some(integer))
+}
+
+fn toml_optional_nested_usize(
+    value: &toml::Value,
+    keys: &[&str],
+    path: &Path,
+) -> Result<Option<usize>> {
+    let Some(integer) = toml_optional_nested_i64(value, keys, path)? else {
+        return Ok(None);
+    };
+    match usize::try_from(integer) {
+        Ok(integer) => Ok(Some(integer)),
+        Err(_) => bail!(
+            "Invalid Codex config `{}` from `{}`: expected a non-negative integer.",
+            keys.join("."),
+            path.display()
+        ),
+    }
+}
+
+fn toml_nested_value<'a>(value: &'a toml::Value, keys: &[&str]) -> Option<&'a toml::Value> {
+    let mut current = value;
+    for key in keys {
+        let next = current.get(key)?;
+        current = next;
+    }
+    Some(current)
+}
+
+fn read_non_empty_model_instructions_file(path: &Path) -> Result<String> {
+    let contents = std::fs::read_to_string(path)
+        .with_context(|| format!("failed to read model instructions file {}", path.display()))?;
+    let contents = contents.trim().to_string();
+    if contents.is_empty() {
+        bail!("model instructions file is empty: {}", path.display());
+    }
+    Ok(contents)
+}
+
+fn codex_home_dir() -> Option<PathBuf> {
+    std::env::var("CODEX_HOME")
+        .ok()
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var("HOME")
+                .ok()
+                .map(|home| PathBuf::from(home).join(".codex"))
+        })
+}
+
+fn load_global_agents_md(warnings: &mut Vec<String>) -> Option<(PathBuf, String)> {
+    let base = codex_home_dir()?;
+    for filename in [LOCAL_AGENTS_MD_FILENAME, DEFAULT_AGENTS_MD_FILENAME] {
+        let path = base.join(filename);
+        let Some(text) = read_agents_md_file(&path, "Global", warnings) else {
+            continue;
+        };
+        return Some((path, text));
+    }
+    None
+}
+
+fn project_agents_md_for_cwd(
+    cwd: &Path,
+    config: &AgentsMdConfig,
+    warnings: &mut Vec<String>,
+) -> std::io::Result<Option<(String, Vec<String>)>> {
+    if config.project_doc_max_bytes == 0 {
+        return Ok(None);
+    }
+    let mut remaining = config.project_doc_max_bytes;
+    let mut sources = Vec::new();
+    let mut parts = Vec::new();
+    for dir in agents_md_search_dirs(cwd, config)? {
+        if remaining == 0 {
+            break;
+        }
+        let Some(path) = agents_md_path_for_dir(&dir, config)? else {
+            continue;
+        };
+        let Some(mut data) = read_project_agents_md_bytes(&path)? else {
+            continue;
+        };
+        warn_invalid_utf8(&path, &data, "Project", warnings);
+        let size = data.len();
+        if size > remaining {
+            data.truncate(remaining);
+        }
+        let text = String::from_utf8_lossy(&data).to_string();
+        if !text.trim().is_empty() {
+            sources.push(path.display().to_string());
+            remaining = remaining.saturating_sub(data.len());
+            parts.push(text);
+        }
+    }
+    Ok((!parts.is_empty()).then(|| (parts.join("\n\n"), sources)))
+}
+
+fn agents_md_path_for_dir(dir: &Path, config: &AgentsMdConfig) -> std::io::Result<Option<PathBuf>> {
+    for filename in agents_md_candidate_filenames(config) {
+        let path = dir.join(filename);
+        match std::fs::metadata(&path) {
+            Ok(metadata) if metadata.is_file() => return Ok(Some(path)),
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error),
+        }
+    }
+    Ok(None)
+}
+
+fn agents_md_candidate_filenames(config: &AgentsMdConfig) -> Vec<&str> {
+    let mut names = vec![LOCAL_AGENTS_MD_FILENAME, DEFAULT_AGENTS_MD_FILENAME];
+    for filename in &config.project_doc_fallback_filenames {
+        let filename = filename.as_str();
+        if !names.contains(&filename) {
+            names.push(filename);
+        }
+    }
+    names
+}
+
+fn read_agents_md_file(path: &Path, source: &str, warnings: &mut Vec<String>) -> Option<String> {
+    let data = read_agents_md_bytes(path, source, warnings)?;
+    warn_invalid_utf8(path, &data, source, warnings);
+    let text = String::from_utf8_lossy(&data).trim().to_string();
+    (!text.is_empty()).then_some(text)
+}
+
+fn read_agents_md_bytes(path: &Path, source: &str, warnings: &mut Vec<String>) -> Option<Vec<u8>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => return None,
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return None,
+        Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => return None,
+        Err(error) => {
+            warnings.push(format!(
+                "Failed to read {source} AGENTS.md instructions from `{}`: {error}",
+                path.display()
+            ));
+            return None;
+        }
+    }
+    match std::fs::read(path) {
+        Ok(data) => Some(data),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+        Err(error) if error.kind() == std::io::ErrorKind::IsADirectory => None,
+        Err(error) => {
+            warnings.push(format!(
+                "Failed to read {source} AGENTS.md instructions from `{}`: {error}",
+                path.display()
+            ));
+            None
+        }
+    }
+}
+
+fn read_project_agents_md_bytes(path: &Path) -> std::io::Result<Option<Vec<u8>>> {
+    match std::fs::metadata(path) {
+        Ok(metadata) if !metadata.is_file() => return Ok(None),
+        Ok(_) => {}
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    }
+    match std::fs::read(path) {
+        Ok(data) => Ok(Some(data)),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+        Err(error) => Err(error),
+    }
+}
+
+fn warn_invalid_utf8(path: &Path, data: &[u8], source: &str, warnings: &mut Vec<String>) {
+    if let Err(error) = std::str::from_utf8(data) {
+        warnings.push(format!(
+            "{source} AGENTS.md instructions from `{}` contain invalid UTF-8: {error}. Invalid byte sequences were replaced.",
+            path.display()
+        ));
+    }
+}
+
+fn agents_md_search_dirs(cwd: &Path, config: &AgentsMdConfig) -> std::io::Result<Vec<PathBuf>> {
+    agents_md_search_dirs_for_markers(cwd, &config.project_root_markers)
+}
+
+fn agents_md_search_dirs_for_markers(
+    cwd: &Path,
+    project_root_markers: &[String],
+) -> std::io::Result<Vec<PathBuf>> {
+    let cwd = cwd.canonicalize().unwrap_or_else(|_| cwd.to_path_buf());
+    let dir = if cwd.is_file() {
+        cwd.parent().unwrap_or(&cwd).to_path_buf()
+    } else {
+        cwd
+    };
+    if project_root_markers.is_empty() {
+        return Ok(vec![dir]);
+    }
+    let mut project_root = None;
+    'ancestors: for ancestor in dir.ancestors() {
+        for marker in project_root_markers {
+            match std::fs::metadata(ancestor.join(marker)) {
+                Ok(_) => {
+                    project_root = Some(ancestor.to_path_buf());
+                    break 'ancestors;
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+    }
+    let Some(project_root) = project_root else {
+        return Ok(vec![dir]);
+    };
+    let mut dirs = Vec::new();
+    let mut cursor = dir.as_path();
+    loop {
+        dirs.push(cursor.to_path_buf());
+        if cursor == project_root {
+            break;
+        }
+        let Some(parent) = cursor.parent() else {
+            break;
+        };
+        cursor = parent;
+    }
+    dirs.reverse();
+    Ok(dirs)
+}
+
 fn display_browser_to_mode(display: &str) -> Option<&'static str> {
     match display {
         "Browser Use cloud" => Some("cloud"),
@@ -3265,6 +11118,7 @@ fn dispatch_browser_script_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
     timeout_seconds: u64,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let code = call
         .arguments
@@ -3316,6 +11170,159 @@ fn dispatch_browser_script_tool(
             call,
             "browser_script",
             browser_script_tool_message_content_value(&response)?,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn normalize_request_user_input_args(
+    mut args: RequestUserInputArgs,
+) -> std::result::Result<RequestUserInputArgs, String> {
+    let missing_options = args
+        .questions
+        .iter()
+        .any(|question| question.options.as_ref().is_none_or(Vec::is_empty));
+    if missing_options {
+        return Err("request_user_input requires non-empty options for every question".to_string());
+    }
+
+    for question in &mut args.questions {
+        question.is_other = true;
+    }
+    Ok(args)
+}
+
+fn request_user_input_unavailable_message(mode: CollaborationModeKind) -> Option<&'static str> {
+    match mode {
+        CollaborationModeKind::Plan => None,
+        CollaborationModeKind::Default => Some("request_user_input is unavailable in Default mode"),
+    }
+}
+
+fn request_user_input_response_from_event(
+    event: &EventRecord,
+    call_id: &str,
+) -> Option<RequestUserInputResponse> {
+    if event.event_type != REQUEST_USER_INPUT_RESPONSE_EVENT {
+        return None;
+    }
+    if event.payload.get("call_id").and_then(Value::as_str) != Some(call_id) {
+        return None;
+    }
+    serde_json::from_value::<RequestUserInputResponse>(event.payload.clone())
+        .ok()
+        .or_else(|| {
+            event
+                .payload
+                .get("response")
+                .cloned()
+                .and_then(|value| serde_json::from_value(value).ok())
+        })
+}
+
+fn wait_for_request_user_input_response(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    after_seq: i64,
+    call_id: &str,
+) -> Result<RequestUserInputResponse> {
+    let mut last_seq = after_seq;
+    loop {
+        for event in
+            store.wait_for_events_after_seq(&session.id, last_seq, Duration::from_millis(250))?
+        {
+            last_seq = last_seq.max(event.seq);
+            if event.event_type == "session.cancelled" {
+                bail!("{REQUEST_USER_INPUT_TOOL_NAME} was cancelled before receiving a response");
+            }
+            if let Some(response) = request_user_input_response_from_event(&event, call_id) {
+                return Ok(response);
+            }
+        }
+    }
+}
+
+fn dispatch_request_user_input_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    if session.parent_id.is_some() {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "request_user_input can only be used by the root thread",
+        );
+    }
+    let events = store.events_for_session(&session.id)?;
+    let current_mode =
+        latest_collaboration_mode_from_events(&events).unwrap_or(CollaborationModeKind::Default);
+    if let Some(message) = request_user_input_unavailable_message(current_mode) {
+        return dispatch_tool_validation_error(store, session, call, message);
+    }
+    let args: RequestUserInputArgs = match serde_json::from_value(call.arguments.clone()) {
+        Ok(args) => args,
+        Err(error) => {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                &format!("failed to parse function arguments: {error}"),
+            );
+        }
+    };
+    let args = match normalize_request_user_input_args(args) {
+        Ok(args) => args,
+        Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+    };
+
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": REQUEST_USER_INPUT_TOOL_NAME,
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let request_event = store.append_event(
+        &session.id,
+        REQUEST_USER_INPUT_REQUEST_EVENT,
+        serde_json::json!({
+            "call_id": call.id,
+            "questions": args.questions,
+        }),
+    )?;
+    let response =
+        wait_for_request_user_input_response(store, session, request_event.seq, &call.id)?;
+    let content = serde_json::to_string(&response)?;
+    store.append_event(
+        &session.id,
+        "tool.output",
+        serde_json::json!({
+            "name": REQUEST_USER_INPUT_TOOL_NAME,
+            "tool_call_id": call.id,
+            "content": content,
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": REQUEST_USER_INPUT_TOOL_NAME,
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_text_message(
+            store,
+            session,
+            call,
+            REQUEST_USER_INPUT_TOOL_NAME,
+            &content,
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
         )?],
     })
 }
@@ -3325,11 +11332,53 @@ fn dispatch_update_plan_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
+    if latest_collaboration_mode_from_events(&store.events_for_session(&session.id)?)
+        == Some(CollaborationModeKind::Plan)
+    {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "update_plan is a TODO/checklist tool and is not allowed in Plan mode",
+        );
+    }
     let Some(plan) = call.arguments.get("plan").and_then(Value::as_array) else {
         return dispatch_tool_validation_error(store, session, call, "update_plan requires plan");
     };
-    let mut in_progress = 0;
+    for field in call
+        .arguments
+        .as_object()
+        .into_iter()
+        .flat_map(|object| object.keys())
+    {
+        if !matches!(field.as_str(), "explanation" | "plan") {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                &format!("update_plan received unknown field: {field}"),
+            );
+        }
+    }
     for item in plan {
+        let Some(item_object) = item.as_object() else {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                "update_plan plan items must be objects",
+            );
+        };
+        for field in item_object.keys() {
+            if !matches!(field.as_str(), "step" | "status") {
+                return dispatch_tool_validation_error(
+                    store,
+                    session,
+                    call,
+                    &format!("update_plan plan item received unknown field: {field}"),
+                );
+            }
+        }
         let step = item
             .get("step")
             .and_then(Value::as_str)
@@ -3356,17 +11405,6 @@ fn dispatch_update_plan_tool(
                 "update_plan statuses must be pending, in_progress, or completed",
             );
         }
-        if status == "in_progress" {
-            in_progress += 1;
-        }
-    }
-    if in_progress > 1 {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            "update_plan allows at most one in_progress item",
-        );
     }
     store.append_event(
         &session.id,
@@ -3401,15 +11439,13 @@ fn dispatch_update_plan_tool(
     )?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_json_message(
+        messages: vec![tool_text_message(
             store,
             session,
             call,
             "update_plan",
-            serde_json::json!({
-                "status": "updated",
-                "items": plan.len(),
-            }),
+            "Plan updated",
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
         )?],
     })
 }
@@ -3425,8 +11461,8 @@ fn dispatch_done_tool(
         .and_then(Value::as_str)
         .or_else(|| call.arguments.get("text").and_then(Value::as_str))
         .unwrap_or("")
-        .trim()
-        .to_string();
+        .trim();
+    let requested_result = strip_memory_citations(requested_result).trim().to_string();
     let requested_result_file = call
         .arguments
         .get("result_file")
@@ -3689,6 +11725,7 @@ fn dispatch_python_tool(
     worker: &mut PythonWorker,
     call: &ToolCall,
     timeout_seconds: u64,
+    tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let code = call
         .arguments
@@ -3722,7 +11759,12 @@ fn dispatch_python_tool(
     if let Some(err) = stream_error {
         return Err(err);
     }
-    let text_artifact = record_python_response_final_event(store, &session.id, &response)?;
+    let text_artifact = record_python_response_final_event_with_budget(
+        store,
+        &session.id,
+        &response,
+        tool_output_token_budget,
+    )?;
     if response.ok {
         store.append_event(
             &session.id,
@@ -3748,7 +11790,12 @@ fn dispatch_python_tool(
         session,
         call,
         "python",
-        python_tool_message_content_value(&response, text_artifact.as_ref())?,
+        python_tool_message_content_value(
+            &response,
+            text_artifact.as_ref(),
+            tool_output_token_budget,
+        )?,
+        tool_output_token_budget,
     )?];
     Ok(ToolDispatchOutcome {
         finished: false,
@@ -3762,19 +11809,28 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
     options: &AgentRunOptions,
+    base_instructions: &Option<String>,
 ) -> Result<ToolDispatchOutcome> {
-    let message = call
-        .arguments
-        .get("message")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
+    let legacy_v1 = call.namespace.as_deref() == Some("multi_agent_v1");
+    if let Err(error) = validate_spawn_agent_arguments(&call.arguments, legacy_v1) {
+        return dispatch_tool_validation_error(store, session, call, &error);
+    }
+    let message = spawn_agent_message_from_call(call, legacy_v1);
+    let message = message.trim();
     if message.is_empty() {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            "spawn_agent requires message",
+            "Empty message can't be sent to an agent",
+        );
+    }
+    if !legacy_v1 && call.arguments.get("fork_context").is_some() {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "fork_context is not supported in MultiAgentV2; use fork_turns instead",
         );
     }
     store.append_event(
@@ -3787,34 +11843,164 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
         }),
     )?;
     let parent_events = store.events_for_session(&session.id)?;
-    let fork_mode = call
-        .arguments
-        .get("fork_mode")
-        .and_then(Value::as_str)
-        .unwrap_or("summary");
-    let fork_turns = call
-        .arguments
-        .get("fork_turns")
-        .and_then(Value::as_u64)
-        .unwrap_or(0) as usize;
-    let inherited_context = inherited_context_for_spawn(&parent_events, fork_mode, fork_turns);
-    let parent_agent_path = display_agent_path_for_session(store, &session.id)?;
-    let agent_path = match spawn_agent_task_name(&call.arguments, &parent_agent_path) {
-        Ok(agent_path) => agent_path,
+    let (fork_mode, fork_turns) = match spawn_agent_fork_mode(call, legacy_v1) {
+        Ok(parsed) => parsed,
         Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
     };
+    let model_override = call
+        .arguments
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    let reasoning_effort_override = match spawn_agent_reasoning_effort(&call.arguments) {
+        Ok(reasoning_effort) => reasoning_effort,
+        Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+    };
+    let requested_service_tier = spawn_agent_service_tier(&call.arguments);
     let agent_role = call
         .arguments
         .get("agent_type")
-        .or_else(|| call.arguments.get("role"))
-        .and_then(Value::as_str);
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|role| !role.is_empty());
+    if fork_mode == "all"
+        && (agent_role.is_some() || model_override.is_some() || reasoning_effort_override.is_some())
+    {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork.",
+        );
+    }
+    let role_config = if fork_mode == "all" {
+        SpawnAgentRoleConfig::default()
+    } else {
+        match resolve_spawn_agent_role_config(Path::new(&session.cwd), options, agent_role) {
+            Ok(config) => config,
+            Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+        }
+    };
+    let effective_model = role_config.model.clone().or_else(|| model_override.clone());
+    let effective_child_model_name = effective_model
+        .as_deref()
+        .unwrap_or_else(|| provider.model_name());
+    let mut effective_reasoning_effort = role_config
+        .reasoning_effort
+        .clone()
+        .or_else(|| reasoning_effort_override.clone());
+    let spawn_config = match load_provider_config_for_session(session, options) {
+        Ok(config) => config,
+        Err(error) => {
+            return dispatch_tool_validation_error(store, session, call, &error.to_string())
+        }
+    };
+    if role_config.model.is_none() {
+        if let Some(requested_model) = model_override.as_deref() {
+            if let Err(error) = validate_spawn_agent_model_override(
+                requested_model,
+                spawn_config.model_catalog.as_ref(),
+                provider.provider_name() == "codex",
+            ) {
+                return dispatch_tool_validation_error(store, session, call, &error);
+            }
+        }
+    }
+    let effective_model_info =
+        resolved_model_request_info_from_config(&spawn_config, effective_child_model_name);
+    if role_config.reasoning_effort.is_none() {
+        if let Some(reasoning_effort) = reasoning_effort_override.as_deref() {
+            if let Err(error) = validate_spawn_agent_reasoning_effort(
+                effective_child_model_name,
+                &effective_model_info.supported_reasoning_efforts,
+                reasoning_effort,
+            ) {
+                return dispatch_tool_validation_error(store, session, call, &error);
+            }
+        }
+    }
+    if model_override.is_some() && effective_reasoning_effort.is_none() {
+        effective_reasoning_effort = effective_model_info.default_reasoning_effort.clone();
+    }
+    let parent_service_tier =
+        match spawn_agent_parent_service_tier(Path::new(&session.cwd), options) {
+            Ok(service_tier) => service_tier,
+            Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+        };
+    let effective_service_tier = match spawn_agent_effective_service_tier(
+        effective_child_model_name,
+        role_config.service_tier.as_deref(),
+        requested_service_tier.as_deref(),
+        parent_service_tier.as_deref(),
+        spawn_config.model_catalog.as_ref(),
+    ) {
+        Ok(service_tier) => service_tier,
+        Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+    };
+    let multi_agent_v2_config = spawn_config.multi_agent_v2.clone();
+    if let Err(error) = enforce_multi_agent_v2_thread_cap(
+        store,
+        &session.id,
+        multi_agent_v2_config.max_concurrent_threads_per_session,
+    ) {
+        return dispatch_tool_validation_error(store, session, call, &error);
+    }
+    let hide_spawn_agent_metadata = multi_agent_v2_config.hide_spawn_agent_metadata;
+    let mut child_options = options.clone();
+    child_options
+        .config_overrides
+        .extend(role_config.config_overrides.clone());
+    if let Some(reasoning_effort) = effective_reasoning_effort.clone() {
+        child_options.config_overrides.push((
+            "model_reasoning_effort".to_string(),
+            toml::Value::String(reasoning_effort),
+        ));
+    }
+    if let Some(service_tier) = effective_service_tier.clone() {
+        child_options.config_overrides.push((
+            "service_tier".to_string(),
+            toml::Value::String(service_tier),
+        ));
+    }
+    let inherited_context = inherited_context_for_spawn(&parent_events, fork_mode, fork_turns);
+    let fork_response_items = fork_response_items_for_spawn(
+        &parent_events,
+        fork_mode,
+        fork_turns,
+        &multi_agent_v2_usage_hint_texts_to_filter(&multi_agent_v2_config),
+    );
+    let history_mode = if fork_mode == "none" {
+        "compact_context"
+    } else {
+        "fork_response_items"
+    };
+    let parent_agent_path = display_agent_path_for_session(store, &session.id)?;
+    let agent_path = match spawn_agent_task_name(call, &parent_agent_path, legacy_v1) {
+        Ok(agent_path) => agent_path,
+        Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+    };
+    let nickname = reserve_spawn_agent_nickname(
+        store,
+        &session.id,
+        role_config.nickname_candidates.as_deref(),
+    )?;
     let child = store.create_child_session(
         &session.id,
         &session.cwd,
         Some(agent_path.as_str()),
-        call.arguments.get("nickname").and_then(Value::as_str),
+        Some(nickname.as_str()),
         agent_role,
     )?;
+    if let Some(base_instructions) = base_instructions {
+        append_session_base_instructions_event(
+            store,
+            &child.id,
+            base_instructions,
+            "parent_session",
+        )?;
+    }
     store.append_event(
         &child.id,
         "agent.context",
@@ -3823,11 +12009,19 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "fork_mode": fork_mode,
             "fork_turns": fork_turns,
             "agent_path": agent_path.clone(),
-            "nickname": call.arguments.get("nickname").and_then(Value::as_str),
+            "nickname": nickname.clone(),
             "role": agent_role,
+            "model": effective_model.clone(),
+            "reasoning_effort": effective_reasoning_effort.clone(),
+            "service_tier": effective_service_tier.clone(),
+            "history_mode": history_mode,
             "context": inherited_context,
+            "fork_response_items": fork_response_items,
         }),
     )?;
+    if fork_mode != "all" {
+        append_workspace_context_event_with_options(store, &child, &child_options)?;
+    }
     store.append_event(
         &child.id,
         "session.input",
@@ -3839,13 +12033,25 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
         serde_json::json!({
             "child_session_id": child.id,
             "agent_path": agent_path.clone(),
-            "nickname": call.arguments.get("nickname").and_then(Value::as_str),
+            "nickname": nickname.clone(),
             "role": agent_role,
             "fork_mode": fork_mode,
+            "model": effective_model.clone(),
+            "reasoning_effort": effective_reasoning_effort.clone(),
+            "service_tier": effective_service_tier.clone(),
         }),
     )?;
     let async_status = if let Some(runner) = options.child_agent_runner.clone() {
-        start_child_agent_background(store, &session.id, &child.id, runner)?;
+        start_child_agent_background(
+            store,
+            &session.id,
+            &child.id,
+            effective_model.clone(),
+            effective_reasoning_effort.clone(),
+            effective_service_tier.clone(),
+            role_config.config_overrides.clone(),
+            runner,
+        )?;
         Some("running")
     } else {
         None
@@ -3858,7 +12064,7 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             "tool_call_id": call.id,
         }),
     )?;
-    let child_result = if let Some(status) = async_status {
+    let _child_result = if let Some(status) = async_status {
         serde_json::json!({
             "child_session_id": child.id,
             "status": status,
@@ -3868,11 +12074,24 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
         })
     } else {
         let run_error =
-            run_existing_session_with_provider(store, provider, &child.id, options.clone())
+            run_existing_session_with_provider(store, provider, &child.id, child_options)
                 .err()
                 .map(|error| format!("{error:#}"));
         update_parent_from_child_run(store, &session.id, &child.id, run_error)?
     };
+    let mut result_payload = if legacy_v1 {
+        serde_json::json!({
+            "agent_id": child.id,
+            "nickname": nickname.clone(),
+        })
+    } else {
+        serde_json::json!({
+            "task_name": agent_path,
+        })
+    };
+    if !legacy_v1 && !hide_spawn_agent_metadata {
+        result_payload["nickname"] = Value::String(nickname);
+    }
     Ok(ToolDispatchOutcome {
         finished: false,
         messages: vec![tool_json_message(
@@ -3880,15 +12099,112 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             session,
             call,
             "spawn_agent",
-            serde_json::json!({
-                "child_session_id": child.id,
-                "task_name": agent_path,
-                "status": child_result.get("status").cloned().unwrap_or(Value::Null),
-                "result": child_result.get("result").cloned().unwrap_or(Value::Null),
-                "failure": child_result.get("failure").cloned().unwrap_or(Value::Null),
-            }),
+            result_payload,
         )?],
     })
+}
+
+fn reserve_spawn_agent_nickname(
+    store: &Store,
+    parent_session_id: &str,
+    role_candidates: Option<&[String]>,
+) -> Result<String> {
+    let candidates = spawn_agent_nickname_candidates(role_candidates);
+    if candidates.is_empty() {
+        bail!("no available agent nicknames");
+    }
+    let used = used_agent_nicknames_for_session_tree(store, parent_session_id)?;
+    let mut reset_count = 0usize;
+    loop {
+        let available = candidates
+            .iter()
+            .map(|candidate| format_agent_nickname(candidate, reset_count))
+            .filter(|candidate| !used.contains(candidate))
+            .collect::<Vec<_>>();
+        if !available.is_empty() {
+            let index = random_index(available.len());
+            return Ok(available[index].clone());
+        }
+        reset_count += 1;
+    }
+}
+
+fn spawn_agent_nickname_candidates(role_candidates: Option<&[String]>) -> Vec<String> {
+    role_candidates
+        .map(|candidates| candidates.to_vec())
+        .unwrap_or_else(|| {
+            DEFAULT_AGENT_NICKNAMES
+                .lines()
+                .map(str::trim)
+                .filter(|candidate| !candidate.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+}
+
+fn used_agent_nicknames_for_session_tree(
+    store: &Store,
+    session_id: &str,
+) -> Result<HashSet<String>> {
+    let root_session_id = root_session_id_for_agent_tree(store, session_id)?;
+    let mut used = HashSet::new();
+    collect_agent_nicknames(store, &root_session_id, &mut used)?;
+    Ok(used)
+}
+
+fn root_session_id_for_agent_tree(store: &Store, session_id: &str) -> Result<String> {
+    let mut session = store
+        .load_session(session_id)?
+        .with_context(|| format!("unknown session id: {session_id}"))?;
+    while let Some(parent_id) = session.parent_id.clone() {
+        session = store
+            .load_session(&parent_id)?
+            .with_context(|| format!("unknown parent session id: {parent_id}"))?;
+    }
+    Ok(session.id)
+}
+
+fn collect_agent_nicknames(
+    store: &Store,
+    parent_session_id: &str,
+    used: &mut HashSet<String>,
+) -> Result<()> {
+    for child in store.list_child_agents(parent_session_id)? {
+        if let Some(nickname) = child.agent_nickname {
+            used.insert(nickname);
+        }
+        collect_agent_nicknames(store, &child.child_session_id, used)?;
+    }
+    Ok(())
+}
+
+fn format_agent_nickname(name: &str, nickname_reset_count: usize) -> String {
+    match nickname_reset_count {
+        0 => name.to_string(),
+        reset_count => {
+            let value = reset_count + 1;
+            let suffix = match value % 100 {
+                11..=13 => "th",
+                _ => match value % 10 {
+                    1 => "st",
+                    2 => "nd",
+                    3 => "rd",
+                    _ => "th",
+                },
+            };
+            format!("{name} the {value}{suffix}")
+        }
+    }
+}
+
+fn random_index(len: usize) -> usize {
+    debug_assert!(len > 0);
+    let bytes = *uuid::Uuid::new_v4().as_bytes();
+    let mut value = 0usize;
+    for byte in bytes.iter().take(std::mem::size_of::<usize>()) {
+        value = (value << 8) | usize::from(*byte);
+    }
+    value % len
 }
 
 fn update_parent_from_child_run(
@@ -3930,13 +12246,46 @@ fn update_parent_from_child_run(
             "payload": payload,
         }),
     )?;
+    if matches!(status.as_str(), "done" | "failed" | "cancelled") {
+        let child_path = display_agent_path_for_session(store, child_id)?;
+        let notification =
+            format_subagent_notification_message(&child_path, status.as_str(), &payload);
+        store.send_agent_message(child_id, parent_id, &notification, false)?;
+    }
     Ok(payload)
+}
+
+fn format_subagent_notification_message(agent_path: &str, status: &str, payload: &Value) -> String {
+    let agent_status = match status {
+        "done" => serde_json::json!({
+            "completed": payload.get("result").cloned().unwrap_or(Value::Null),
+        }),
+        "failed" => serde_json::json!({
+            "errored": payload
+                .get("failure")
+                .and_then(Value::as_str)
+                .unwrap_or("agent failed"),
+        }),
+        "cancelled" => serde_json::json!("shutdown"),
+        _ => serde_json::json!("not_found"),
+    };
+    format!(
+        "<subagent_notification>\n{}\n</subagent_notification>",
+        serde_json::json!({
+            "agent_path": agent_path,
+            "status": agent_status,
+        })
+    )
 }
 
 fn start_child_agent_background(
     store: &Store,
     parent_id: &str,
     child_id: &str,
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    config_overrides: Vec<(String, toml::Value)>,
     runner: ChildAgentRunner,
 ) -> Result<()> {
     let state_dir = store.state_dir().to_path_buf();
@@ -3950,6 +12299,10 @@ fn start_child_agent_background(
                 .run(ChildAgentRunRequest {
                     parent_session_id: parent_id.clone(),
                     child_session_id: child_id.clone(),
+                    model: model.clone(),
+                    reasoning_effort: reasoning_effort.clone(),
+                    service_tier: service_tier.clone(),
+                    config_overrides: config_overrides.clone(),
                 })
                 .err()
                 .map(|error| format!("{error:#}"));
@@ -3964,6 +12317,369 @@ fn start_child_agent_background(
         })
         .context("spawn child agent thread")?;
     Ok(())
+}
+
+const SPAWN_AGENT_ALLOWED_FIELDS: &[&str] = &[
+    "message",
+    "task_name",
+    "agent_type",
+    "model",
+    "reasoning_effort",
+    "service_tier",
+    "fork_turns",
+    "fork_context",
+];
+
+const SPAWN_AGENT_V1_ALLOWED_FIELDS: &[&str] = &[
+    "message",
+    "items",
+    "agent_type",
+    "model",
+    "reasoning_effort",
+    "service_tier",
+    "fork_context",
+];
+
+fn validate_spawn_agent_arguments(arguments: &Value, legacy_v1: bool) -> Result<(), String> {
+    let Some(object) = arguments.as_object() else {
+        return Err(
+            "failed to parse function arguments: invalid type: non-object, expected struct SpawnAgentArgs"
+                .to_string(),
+        );
+    };
+    let allowed = if legacy_v1 {
+        SPAWN_AGENT_V1_ALLOWED_FIELDS
+    } else {
+        SPAWN_AGENT_ALLOWED_FIELDS
+    };
+    for field in object.keys() {
+        if !allowed.contains(&field.as_str()) {
+            return Err(format!(
+                "failed to parse function arguments: unknown field `{field}`, expected one of {}",
+                allowed
+                    .iter()
+                    .map(|field| format!("`{field}`"))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn spawn_agent_message_from_call(call: &ToolCall, legacy_v1: bool) -> String {
+    if let Some(message) = call.arguments.get("message").and_then(Value::as_str) {
+        if !message.trim().is_empty() {
+            return message.to_string();
+        }
+    }
+    if legacy_v1 {
+        return collab_items_preview(call.arguments.get("items"));
+    }
+    String::new()
+}
+
+fn collab_items_preview(items: Option<&Value>) -> String {
+    let Some(items) = items.and_then(Value::as_array) else {
+        return String::new();
+    };
+    items
+        .iter()
+        .filter_map(|item| {
+            item.get("text")
+                .and_then(Value::as_str)
+                .or_else(|| item.as_str())
+                .map(str::to_string)
+                .or_else(|| {
+                    (!item.is_null())
+                        .then(|| serde_json::to_string(item).unwrap_or_else(|_| item.to_string()))
+                })
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn spawn_agent_fork_mode(
+    call: &ToolCall,
+    legacy_v1: bool,
+) -> Result<(&'static str, usize), String> {
+    if legacy_v1 {
+        return Ok(
+            if call
+                .arguments
+                .get("fork_context")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            {
+                ("all", 0)
+            } else {
+                ("none", 0)
+            },
+        );
+    }
+    let fork_turns = call
+        .arguments
+        .get("fork_turns")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|fork_turns| !fork_turns.is_empty())
+        .unwrap_or("all");
+    if fork_turns.eq_ignore_ascii_case("none") {
+        return Ok(("none", 0));
+    }
+    if fork_turns.eq_ignore_ascii_case("all") {
+        return Ok(("all", 0));
+    }
+    let fork_turns = fork_turns.parse::<usize>().map_err(|_| {
+        "fork_turns must be `none`, `all`, or a positive integer string".to_string()
+    })?;
+    if fork_turns == 0 {
+        return Err("fork_turns must be `none`, `all`, or a positive integer string".to_string());
+    }
+    Ok(("last_n", fork_turns))
+}
+
+fn spawn_agent_reasoning_effort(arguments: &Value) -> Result<Option<String>, String> {
+    let Some(reasoning_effort) = arguments
+        .get("reasoning_effort")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|reasoning_effort| !reasoning_effort.is_empty())
+    else {
+        return Ok(None);
+    };
+    if matches!(
+        reasoning_effort,
+        "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+    ) {
+        return Ok(Some(reasoning_effort.to_string()));
+    }
+    Err(format!("invalid reasoning_effort: {reasoning_effort}"))
+}
+
+fn spawn_agent_service_tier(arguments: &Value) -> Option<String> {
+    arguments
+        .get("service_tier")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|service_tier| !service_tier.is_empty())
+        .map(str::to_string)
+}
+
+fn spawn_agent_parent_service_tier(
+    cwd: &Path,
+    options: &AgentRunOptions,
+) -> Result<Option<String>, String> {
+    let mut warnings = Vec::new();
+    load_agents_md_config(
+        cwd,
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )
+    .map(|config| config.model_request_settings.service_tier)
+    .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())
+}
+
+fn spawn_agent_effective_service_tier(
+    model: &str,
+    role_service_tier: Option<&str>,
+    requested_service_tier: Option<&str>,
+    parent_service_tier: Option<&str>,
+    model_catalog: Option<&ModelCatalog>,
+) -> Result<Option<String>, String> {
+    if let Some(requested_service_tier) = requested_service_tier {
+        if !model_supports_service_tier_for_catalog(model, requested_service_tier, model_catalog) {
+            return Err(unsupported_spawn_agent_service_tier_error(
+                model,
+                requested_service_tier,
+                model_catalog,
+            ));
+        }
+    }
+    Ok([
+        role_service_tier,
+        requested_service_tier,
+        parent_service_tier,
+    ]
+    .into_iter()
+    .flatten()
+    .find(|candidate| model_supports_service_tier_for_catalog(model, candidate, model_catalog))
+    .map(str::to_string))
+}
+
+fn unsupported_spawn_agent_service_tier_error(
+    model: &str,
+    service_tier: &str,
+    model_catalog: Option<&ModelCatalog>,
+) -> String {
+    let supported = model_supported_service_tiers_for_catalog(model, model_catalog);
+    let supported = if supported.is_empty() {
+        "none".to_string()
+    } else {
+        supported.join(", ")
+    };
+    format!(
+        "Service tier `{service_tier}` is not supported for model `{model}`. Supported service tiers: {supported}"
+    )
+}
+
+fn validate_spawn_agent_model_override(
+    requested_model: &str,
+    model_catalog: Option<&ModelCatalog>,
+    chatgpt_mode: bool,
+) -> Result<(), String> {
+    let catalog = model_catalog.cloned().unwrap_or_else(bundled_model_catalog);
+    let available = catalog.presets(chatgpt_mode);
+    if available.iter().any(|preset| preset.id == requested_model) {
+        return Ok(());
+    }
+    let available = available
+        .iter()
+        .map(|preset| preset.id.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(format!(
+        "Unknown model `{requested_model}` for spawn_agent. Available models: {available}"
+    ))
+}
+
+fn validate_spawn_agent_reasoning_effort(
+    model: &str,
+    supported_reasoning_efforts: &[String],
+    requested_reasoning_effort: &str,
+) -> Result<(), String> {
+    if supported_reasoning_efforts
+        .iter()
+        .any(|effort| effort == requested_reasoning_effort)
+    {
+        return Ok(());
+    }
+    let supported = supported_reasoning_efforts.join(", ");
+    Err(format!(
+        "Reasoning effort `{requested_reasoning_effort}` is not supported for model `{model}`. Supported reasoning efforts: {supported}"
+    ))
+}
+
+fn resolve_spawn_agent_role_config(
+    cwd: &Path,
+    options: &AgentRunOptions,
+    requested_role: Option<&str>,
+) -> Result<SpawnAgentRoleConfig, String> {
+    let role_name = requested_role.unwrap_or(DEFAULT_AGENT_ROLE_NAME);
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config(
+        cwd,
+        &mut warnings,
+        options.config_profile.as_deref(),
+        &options.config_overrides,
+    )
+    .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+    let role = config
+        .agent_roles
+        .get(role_name)
+        .cloned()
+        .or_else(|| built_in_agent_role_definition(role_name))
+        .ok_or_else(|| format!("unknown agent_type '{role_name}'"))?;
+
+    let mut role_config = spawn_agent_role_runtime_config(&role)?;
+    role_config.nickname_candidates = role.nickname_candidates;
+    Ok(role_config)
+}
+
+fn built_in_agent_role_definition(role_name: &str) -> Option<AgentRoleDefinition> {
+    match role_name {
+        "default" | "explorer" | "worker" => Some(AgentRoleDefinition::default()),
+        _ => None,
+    }
+}
+
+fn spawn_agent_role_runtime_config(
+    role: &AgentRoleDefinition,
+) -> Result<SpawnAgentRoleConfig, String> {
+    let Some(config_file) = role.config_file.as_ref() else {
+        return Ok(SpawnAgentRoleConfig::default());
+    };
+    let mut role_layer = read_spawn_agent_role_layer(config_file)?;
+    let model = role_layer
+        .get("model")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|model| !model.is_empty())
+        .map(str::to_string);
+    let reasoning_effort = role_layer
+        .get("model_reasoning_effort")
+        .and_then(toml::Value::as_str)
+        .map(str::trim)
+        .filter(|reasoning_effort| !reasoning_effort.is_empty())
+        .map(str::to_string);
+    let service_tier = role_layer
+        .get("service_tier")
+        .and_then(toml::Value::as_str)
+        .and_then(normalize_config_service_tier);
+    if let Some(table) = role_layer.as_table_mut() {
+        table.remove("service_tier");
+    }
+    if let Some(reasoning_effort) = reasoning_effort.as_deref() {
+        if !matches!(
+            reasoning_effort,
+            "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+        ) {
+            return Err(AGENT_TYPE_UNAVAILABLE_ERROR.to_string());
+        }
+    }
+    if role_layer
+        .get("developer_instructions")
+        .and_then(toml::Value::as_str)
+        .is_some_and(|instructions| instructions.trim().is_empty())
+    {
+        return Err(AGENT_TYPE_UNAVAILABLE_ERROR.to_string());
+    }
+
+    let mut config_overrides = Vec::new();
+    flatten_toml_config_overrides(None, &mut role_layer, &mut config_overrides);
+    Ok(SpawnAgentRoleConfig {
+        model,
+        reasoning_effort,
+        service_tier,
+        nickname_candidates: None,
+        config_overrides,
+    })
+}
+
+fn read_spawn_agent_role_layer(path: &Path) -> Result<toml::Value, String> {
+    let contents =
+        std::fs::read_to_string(path).map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+    let mut role_layer = contents
+        .parse::<toml::Value>()
+        .map_err(|_| AGENT_TYPE_UNAVAILABLE_ERROR.to_string())?;
+    let Some(table) = role_layer.as_table_mut() else {
+        return Err(AGENT_TYPE_UNAVAILABLE_ERROR.to_string());
+    };
+    table.remove("name");
+    table.remove("description");
+    table.remove("nickname_candidates");
+    Ok(role_layer)
+}
+
+fn flatten_toml_config_overrides(
+    prefix: Option<&str>,
+    value: &mut toml::Value,
+    out: &mut Vec<(String, toml::Value)>,
+) {
+    if let Some(table) = value.as_table_mut() {
+        for (key, nested) in table {
+            let dotted = match prefix {
+                Some(prefix) => format!("{prefix}.{key}"),
+                None => key.clone(),
+            };
+            flatten_toml_config_overrides(Some(&dotted), nested, out);
+        }
+        return;
+    }
+    if let Some(prefix) = prefix {
+        out.push((prefix.to_string(), value.clone()));
+    }
 }
 
 fn inherited_context_for_spawn(
@@ -4016,18 +12732,226 @@ fn inherited_context_for_spawn(
     }
 }
 
-fn spawn_agent_task_name(arguments: &Value, parent_agent_path: &str) -> Result<String, String> {
-    if let Some(task_name) = arguments.get("task_name").and_then(Value::as_str) {
+fn fork_response_items_for_spawn(
+    parent_events: &[browser_use_protocol::EventRecord],
+    fork_mode: &str,
+    fork_turns: usize,
+    multi_agent_v2_usage_hint_texts_to_filter: &[String],
+) -> Vec<Value> {
+    if fork_mode == "none" {
+        return Vec::new();
+    }
+    let mut messages = provider_messages_from_events_for_fork(parent_events);
+    if fork_mode == "last_n" {
+        messages = truncate_provider_messages_to_last_n_fork_turns(messages, fork_turns);
+    }
+    let fork_messages = messages
+        .into_iter()
+        .filter(keep_forked_provider_message)
+        .collect::<Vec<_>>();
+    provider_messages_to_response_items(&fork_messages)
+        .into_iter()
+        .filter(keep_forked_response_item)
+        .filter(|item| {
+            !is_multi_agent_v2_usage_hint_response_item(
+                item,
+                multi_agent_v2_usage_hint_texts_to_filter,
+            )
+        })
+        .collect()
+}
+
+fn multi_agent_v2_usage_hint_texts_to_filter(config: &MultiAgentV2Config) -> Vec<String> {
+    [
+        config.root_agent_usage_hint_text.clone(),
+        config.subagent_usage_hint_text.clone(),
+    ]
+    .into_iter()
+    .flatten()
+    .filter(|text| !text.trim().is_empty())
+    .collect()
+}
+
+fn is_multi_agent_v2_usage_hint_response_item(item: &Value, usage_hint_texts: &[String]) -> bool {
+    if usage_hint_texts.is_empty() {
+        return false;
+    }
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("role").and_then(Value::as_str) != Some("developer")
+    {
+        return false;
+    }
+    let text = item
+        .get("content")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(|part| part.get("text").and_then(Value::as_str))
+        .collect::<String>();
+    usage_hint_texts
+        .iter()
+        .any(|usage_hint_text| usage_hint_text == &text)
+}
+
+fn truncate_provider_messages_to_last_n_fork_turns(
+    messages: Vec<Value>,
+    fork_turns: usize,
+) -> Vec<Value> {
+    if fork_turns == 0 {
+        return Vec::new();
+    }
+    let turn_positions = messages
+        .iter()
+        .enumerate()
+        .filter_map(|(index, message)| {
+            provider_message_is_fork_turn_boundary(message).then_some(index)
+        })
+        .collect::<Vec<_>>();
+    if turn_positions.len() <= fork_turns {
+        return messages;
+    }
+    let keep_index = turn_positions[turn_positions.len().saturating_sub(fork_turns)];
+    messages.into_iter().skip(keep_index).collect()
+}
+
+fn provider_message_is_fork_turn_boundary(message: &Value) -> bool {
+    if is_real_user_message(message) {
+        return true;
+    }
+    provider_message_is_inter_agent_instruction(message)
+        && message_content_is_trigger_turn_inter_agent_envelope(&message_content_text(message))
+}
+
+fn provider_message_is_inter_agent_instruction(message: &Value) -> bool {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return false;
+    }
+    message_content_is_inter_agent_envelope(&message_content_text(message))
+}
+
+fn message_content_is_inter_agent_envelope(text: &str) -> bool {
+    parsed_inter_agent_communication(text).is_some()
+}
+
+fn message_content_is_trigger_turn_inter_agent_envelope(text: &str) -> bool {
+    parsed_inter_agent_communication(text)
+        .and_then(|value| value.get("trigger_turn").and_then(Value::as_bool))
+        == Some(true)
+}
+
+fn parsed_inter_agent_communication(text: &str) -> Option<Value> {
+    let value = serde_json::from_str::<Value>(text).ok()?;
+    if value.get("trigger_turn").and_then(Value::as_bool).is_none() {
+        return None;
+    }
+    if value.get("author").and_then(Value::as_str).is_none()
+        || value.get("recipient").and_then(Value::as_str).is_none()
+        || value.get("content").and_then(Value::as_str).is_none()
+    {
+        return None;
+    }
+    if value
+        .get("other_recipients")
+        .and_then(Value::as_array)
+        .is_some_and(|recipients| {
+            recipients
+                .iter()
+                .any(|recipient| recipient.as_str().is_none())
+        })
+    {
+        return None;
+    }
+    Some(value)
+}
+
+fn keep_forked_provider_message(message: &Value) -> bool {
+    if is_raw_response_item_provider_message(message) {
+        return false;
+    }
+    match message
+        .get("role")
+        .and_then(Value::as_str)
+        .unwrap_or("user")
+    {
+        "system" | "developer" => true,
+        "user" => !is_orphan_tool_output_context_message(message),
+        "assistant" => {
+            message.get("phase").and_then(Value::as_str) == Some("final_answer")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_none_or(Vec::is_empty)
+                && !message_content_text(message).trim().is_empty()
+        }
+        _ => false,
+    }
+}
+
+fn is_orphan_tool_output_context_message(message: &Value) -> bool {
+    message_content_text(message)
+        .starts_with("Tool output retained as context after history normalization.")
+}
+
+fn keep_forked_response_item(item: &Value) -> bool {
+    match item.get("type").and_then(Value::as_str) {
+        Some("message") => match item.get("role").and_then(Value::as_str) {
+            Some("system" | "developer" | "user") => true,
+            Some("assistant") => item.get("phase").and_then(Value::as_str) == Some("final_answer"),
+            _ => false,
+        },
+        _ => false,
+    }
+}
+
+fn spawn_agent_task_name(
+    call: &ToolCall,
+    parent_agent_path: &str,
+    legacy_v1: bool,
+) -> Result<String, String> {
+    if let Some(task_name) = call.arguments.get("task_name").and_then(Value::as_str) {
         return canonical_agent_path_from_task_name(task_name, parent_agent_path);
     }
-    if let Some(path) = arguments.get("path").and_then(Value::as_str) {
-        let trimmed = path.trim();
-        if trimmed.is_empty() {
-            return Err("spawn_agent requires task_name".to_string());
-        }
-        return Ok(canonical_agent_path(trimmed));
+    if legacy_v1 {
+        return canonical_agent_path_from_task_name(
+            &generated_v1_task_name(&call.id, call.arguments.get("agent_type")),
+            parent_agent_path,
+        );
     }
     Err("spawn_agent requires task_name".to_string())
+}
+
+fn generated_v1_task_name(call_id: &str, agent_type: Option<&Value>) -> String {
+    let prefix = agent_type
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|role| !role.is_empty())
+        .unwrap_or("agent");
+    let prefix = prefix
+        .chars()
+        .map(|ch| {
+            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' {
+                ch
+            } else if ch.is_ascii_uppercase() {
+                ch.to_ascii_lowercase()
+            } else {
+                '_'
+            }
+        })
+        .collect::<String>()
+        .trim_matches('_')
+        .to_string();
+    let prefix = if prefix.is_empty() { "agent" } else { &prefix };
+    let suffix = call_id
+        .chars()
+        .filter(|ch| ch.is_ascii_alphanumeric())
+        .take(8)
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if suffix.is_empty() {
+        prefix.to_string()
+    } else {
+        format!("{prefix}_{suffix}")
+    }
 }
 
 fn canonical_agent_path_from_task_name(
@@ -4114,25 +13038,81 @@ fn canonical_agent_reference(reference: &str, current_agent_path: &str) -> Strin
     }
 }
 
-fn resolve_child_agent(
+#[derive(Clone, Debug)]
+struct ResolvedAgentReference {
+    session_id: String,
+    agent_path: String,
+    summary: Option<AgentSummary>,
+    is_root: bool,
+}
+
+fn root_session_id(store: &Store, session_id: &str) -> Result<String> {
+    let mut current = store
+        .load_session(session_id)?
+        .with_context(|| format!("unknown session id: {session_id}"))?;
+    while let Some(parent_id) = current.parent_id.clone() {
+        current = store
+            .load_session(&parent_id)?
+            .with_context(|| format!("unknown parent session id: {parent_id}"))?;
+    }
+    Ok(current.id)
+}
+
+fn collect_agent_tree(store: &Store, parent_session_id: &str) -> Result<Vec<AgentSummary>> {
+    let mut out = Vec::new();
+    collect_agent_tree_into(store, parent_session_id, &mut out)?;
+    Ok(out)
+}
+
+fn collect_agent_tree_into(
     store: &Store,
     parent_session_id: &str,
-    reference: &str,
-) -> Result<Option<AgentSummary>> {
-    let agents = store.list_child_agents(parent_session_id)?;
-    if let Some(agent) = agents
-        .iter()
-        .find(|agent| agent.child_session_id == reference)
-        .cloned()
-    {
-        return Ok(Some(agent));
+    out: &mut Vec<AgentSummary>,
+) -> Result<()> {
+    for child in store.list_child_agents(parent_session_id)? {
+        out.push(child.clone());
+        collect_agent_tree_into(store, &child.child_session_id, out)?;
     }
-    let parent_agent_path = display_agent_path_for_session(store, parent_session_id)?;
-    let canonical = canonical_agent_reference(reference, &parent_agent_path);
-    Ok(agents.into_iter().find(|agent| {
-        agent.agent_path.as_deref() == Some(reference)
-            || agent.agent_path.as_deref() == Some(canonical.as_str())
-    }))
+    Ok(())
+}
+
+fn resolve_agent_reference_in_tree(
+    store: &Store,
+    current_session_id: &str,
+    reference: &str,
+) -> Result<Option<ResolvedAgentReference>> {
+    let reference = reference.trim();
+    if reference.is_empty() {
+        return Ok(None);
+    }
+    let root_id = root_session_id(store, current_session_id)?;
+    let current_agent_path = display_agent_path_for_session(store, current_session_id)?;
+    let canonical = canonical_agent_reference(reference, &current_agent_path);
+    if reference == root_id || canonical == "/root" {
+        return Ok(Some(ResolvedAgentReference {
+            session_id: root_id,
+            agent_path: "/root".to_string(),
+            summary: None,
+            is_root: true,
+        }));
+    }
+    Ok(collect_agent_tree(store, &root_id)?
+        .into_iter()
+        .find_map(|agent| {
+            let path = agent.agent_path.clone().unwrap_or_else(|| {
+                display_agent_path_for_session(store, &agent.child_session_id)
+                    .unwrap_or_else(|_| agent.child_session_id.clone())
+            });
+            (agent.child_session_id == reference
+                || agent.agent_path.as_deref() == Some(reference)
+                || agent.agent_path.as_deref() == Some(canonical.as_str()))
+            .then(|| ResolvedAgentReference {
+                session_id: agent.child_session_id.clone(),
+                agent_path: path,
+                summary: Some(agent),
+                is_root: false,
+            })
+        }))
 }
 
 fn display_agent_path_for_session(store: &Store, session_id: &str) -> Result<String> {
@@ -4151,37 +13131,351 @@ fn display_agent_path_for_session(store: &Store, session_id: &str) -> Result<Str
     }
 }
 
-fn dispatch_wait_agent_tool(
+fn enforce_multi_agent_v2_thread_cap(
     store: &Store,
+    session_id: &str,
+    max_concurrent_threads_per_session: usize,
+) -> std::result::Result<(), String> {
+    let open_threads =
+        multi_agent_v2_open_thread_count(store, session_id).map_err(|error| error.to_string())?;
+    if open_threads >= max_concurrent_threads_per_session {
+        return Err(format!(
+            "maximum concurrent multi-agent threads reached: max_concurrent_threads_per_session = {max_concurrent_threads_per_session}"
+        ));
+    }
+    Ok(())
+}
+
+fn multi_agent_v2_open_thread_count(store: &Store, session_id: &str) -> Result<usize> {
+    let root_id = root_session_id(store, session_id)?;
+    Ok(1 + collect_agent_tree(store, &root_id)?
+        .into_iter()
+        .filter(|agent| agent.status == "open")
+        .count())
+}
+
+fn dispatch_send_input_v1_tool<P: ModelProvider>(
+    store: &Store,
+    provider: &P,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
-    let child_ref = call
-        .arguments
-        .get("target")
-        .or_else(|| call.arguments.get("child_session_id"))
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|target| !target.is_empty());
-    let watched_agents = if let Some(child_ref) = child_ref {
-        let Some(child_summary) = resolve_child_agent(store, &session.id, child_ref)? else {
+    if let Some(invalid) = unexpected_tool_arguments(
+        &call.arguments,
+        &["target", "message", "items", "interrupt"],
+    ) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("unexpected argument `{invalid}` for send_input"),
+        );
+    }
+    let Some(target_session_id) = call.arguments.get("target").and_then(Value::as_str) else {
+        return dispatch_tool_validation_error(store, session, call, "send_input requires target");
+    };
+    let target_session = match store.load_session(target_session_id)? {
+        Some(target_session) => target_session,
+        None => {
             return dispatch_tool_validation_error(
                 store,
                 session,
                 call,
-                "wait_agent can only inspect children of the current session",
-            );
-        };
-        vec![child_summary]
+                &format!("agent id `{target_session_id}` not found"),
+            )
+        }
+    };
+    let message = call
+        .arguments
+        .get("message")
+        .and_then(Value::as_str)
+        .map(str::to_string)
+        .filter(|message| !message.trim().is_empty())
+        .unwrap_or_else(|| collab_items_preview(call.arguments.get("items")));
+    if message.trim().is_empty() {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "Empty message can't be sent to an agent",
+        );
+    }
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "send_input",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    if call
+        .arguments
+        .get("interrupt")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        store.request_cancel(target_session_id, "interrupted by parent agent")?;
+    }
+    let mail = store.send_agent_message(&session.id, target_session_id, &message, true)?;
+    store.append_event(
+        &session.id,
+        "agent.message",
+        serde_json::json!({
+            "id": mail.id,
+            "author_session_id": session.id,
+            "target_session_id": target_session_id,
+            "child_session_id": target_session_id,
+            "content": message,
+            "trigger_turn": true,
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "send_input",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    if let Some(runner) = options.child_agent_runner.clone() {
+        if !target_session.status.is_active() {
+            start_child_agent_background(
+                store,
+                &session.id,
+                target_session_id,
+                None,
+                None,
+                None,
+                Vec::new(),
+                runner,
+            )?;
+        }
     } else {
-        store.list_child_agents(&session.id)?
+        let run_error =
+            run_existing_session_with_provider(store, provider, target_session_id, options.clone())
+                .err()
+                .map(|error| format!("{error:#}"));
+        update_parent_from_child_run(store, &session.id, target_session_id, run_error)?;
+    }
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "send_input",
+            serde_json::json!({ "submission_id": mail.id }),
+        )?],
+    })
+}
+
+fn dispatch_resume_agent_v1_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["id"]) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("unexpected argument `{invalid}` for resume_agent"),
+        );
+    }
+    let Some(target_session_id) = call.arguments.get("id").and_then(Value::as_str) else {
+        return dispatch_tool_validation_error(store, session, call, "resume_agent requires id");
+    };
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "resume_agent",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let status = if let Some(target_session) = store.load_session(target_session_id)? {
+        if target_session.status == SessionStatus::Cancelled {
+            store.set_status(target_session_id, SessionStatus::Created)?;
+            store.set_child_agent_status(target_session_id, "open")?;
+            Value::String("pending_init".to_string())
+        } else {
+            local_agent_status_value(store, &target_session, None)?
+        }
+    } else {
+        Value::String("not_found".to_string())
+    };
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "resume_agent",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "resume_agent",
+            serde_json::json!({ "status": status }),
+        )?],
+    })
+}
+
+fn dispatch_wait_agent_v1_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["targets", "timeout_ms"]) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("unexpected argument `{invalid}` for wait_agent"),
+        );
+    }
+    let targets = call
+        .arguments
+        .get("targets")
+        .and_then(Value::as_array)
+        .map(|targets| targets.iter().filter_map(Value::as_str).collect::<Vec<_>>())
+        .unwrap_or_default();
+    if targets.is_empty() {
+        return dispatch_tool_validation_error(store, session, call, "wait_agent requires targets");
+    }
+    let timeout_ms = call
+        .arguments
+        .get("timeout_ms")
+        .and_then(Value::as_i64)
+        .unwrap_or(DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS);
+    if timeout_ms <= 0 {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "timeout_ms must be greater than zero",
+        );
+    }
+    let timeout_ms = timeout_ms.clamp(
+        DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,
+        DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS,
+    );
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "wait_agent",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let started = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms as u64);
+    let statuses = loop {
+        let statuses = final_statuses_for_v1_wait(store, &targets)?;
+        if !statuses.is_empty() {
+            break statuses;
+        }
+        if started.elapsed() >= timeout {
+            break serde_json::Map::new();
+        }
+        thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())));
+    };
+    let timed_out = statuses.is_empty();
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "wait_agent",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "wait_agent",
+            serde_json::json!({
+                "status": statuses,
+                "timed_out": timed_out,
+            }),
+        )?],
+    })
+}
+
+fn final_statuses_for_v1_wait(
+    store: &Store,
+    targets: &[&str],
+) -> Result<serde_json::Map<String, Value>> {
+    let mut statuses = serde_json::Map::new();
+    for target in targets {
+        let Some(session) = store.load_session(target)? else {
+            statuses.insert(
+                (*target).to_string(),
+                Value::String("not_found".to_string()),
+            );
+            continue;
+        };
+        if session.status.is_active() || session.status == SessionStatus::Created {
+            continue;
+        }
+        statuses.insert(
+            (*target).to_string(),
+            local_agent_status_value(store, &session, None)?,
+        );
+    }
+    Ok(statuses)
+}
+
+fn dispatch_wait_agent_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    options: &AgentRunOptions,
+) -> Result<ToolDispatchOutcome> {
+    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["timeout_ms"]) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("unexpected argument `{invalid}` for wait_agent"),
+        );
+    }
+    let config = match load_provider_config_for_session(session, options) {
+        Ok(config) => config.multi_agent_v2,
+        Err(error) => {
+            return dispatch_tool_validation_error(store, session, call, &error.to_string())
+        }
     };
     let timeout_ms = call
         .arguments
         .get("timeout_ms")
-        .and_then(Value::as_u64)
-        .unwrap_or(300_000)
-        .min(300_000);
+        .and_then(Value::as_i64)
+        .unwrap_or(config.default_wait_timeout_ms);
+    if timeout_ms < config.min_wait_timeout_ms {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("timeout_ms must be at least {}", config.min_wait_timeout_ms),
+        );
+    }
+    if timeout_ms > config.max_wait_timeout_ms {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("timeout_ms must be at most {}", config.max_wait_timeout_ms),
+        );
+    }
     store.append_event(
         &session.id,
         "tool.started",
@@ -4196,28 +13490,13 @@ fn dispatch_wait_agent_tool(
         "agent.wait.started",
         serde_json::json!({
             "tool_call_id": call.id,
-            "target": child_ref,
-            "targets": watched_agents.iter().map(|agent| {
-                serde_json::json!({
-                    "child_session_id": agent.child_session_id,
-                    "task_name": agent.agent_path,
-                    "nickname": agent.agent_nickname,
-                    "role": agent.agent_role,
-                })
-            }).collect::<Vec<_>>(),
             "timeout_ms": timeout_ms,
         }),
     )?;
     let started = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
+    let timeout = Duration::from_millis(timeout_ms as u64);
     let timed_out = loop {
-        let active_count = count_active_watched_agents(store, &watched_agents)?;
-        let wait_condition_met = if child_ref.is_some() {
-            active_count == 0
-        } else {
-            active_count < watched_agents.len()
-        };
-        if timeout_ms == 0 || wait_condition_met || watched_agents.is_empty() {
+        if !store.messages_for_agent(&session.id)?.is_empty() {
             break false;
         }
         if started.elapsed() >= timeout {
@@ -4226,20 +13505,14 @@ fn dispatch_wait_agent_tool(
         thread::sleep(Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())));
     };
     let waited_ms = started.elapsed().as_millis() as u64;
-    let agents = watched_agents
-        .iter()
-        .map(|agent| agent_status_payload(store, agent))
-        .collect::<Result<Vec<_>>>()?;
-    let active_count = count_active_watched_agents(store, &watched_agents)?;
     store.append_event(
         &session.id,
         "agent.wait.finished",
         serde_json::json!({
             "tool_call_id": call.id,
-            "target": child_ref,
             "timed_out": timed_out,
             "waited_ms": waited_ms,
-            "active_count": active_count,
+            "active_count": count_active_watched_agents(store, &live_agents_in_root_tree(store, &session.id)?)?,
         }),
     )?;
     store.append_event(
@@ -4257,86 +13530,34 @@ fn dispatch_wait_agent_tool(
             session,
             call,
             "wait_agent",
-            wait_agent_response_payload(child_ref, agents, timed_out, waited_ms),
+            serde_json::json!({
+                "message": if timed_out { "Wait timed out." } else { "Wait completed." },
+                "timed_out": timed_out,
+            }),
         )?],
     })
+}
+
+fn live_agents_in_root_tree(store: &Store, session_id: &str) -> Result<Vec<AgentSummary>> {
+    let root_id = root_session_id(store, session_id)?;
+    Ok(collect_agent_tree(store, &root_id)?
+        .into_iter()
+        .filter(|agent| agent.status != "closed")
+        .collect())
 }
 
 fn count_active_watched_agents(store: &Store, agents: &[AgentSummary]) -> Result<usize> {
     let mut active = 0;
     for agent in agents {
-        if store
-            .load_session(&agent.child_session_id)?
-            .is_some_and(|session| session.status.is_active())
+        if agent.status == "open"
+            && store
+                .load_session(&agent.child_session_id)?
+                .is_some_and(|session| session.status.is_active())
         {
             active += 1;
         }
     }
     Ok(active)
-}
-
-fn wait_agent_response_payload(
-    child_ref: Option<&str>,
-    agents: Vec<Value>,
-    timed_out: bool,
-    waited_ms: u64,
-) -> Value {
-    let mut payload = serde_json::json!({
-        "timed_out": timed_out,
-        "waited_ms": waited_ms,
-        "agents": agents,
-    });
-    if child_ref.is_some() {
-        if let Some(agent) = payload
-            .get("agents")
-            .and_then(Value::as_array)
-            .and_then(|agents| agents.first())
-            .cloned()
-        {
-            payload["child_session_id"] = agent
-                .get("child_session_id")
-                .cloned()
-                .unwrap_or(Value::Null);
-            payload["task_name"] = agent.get("task_name").cloned().unwrap_or(Value::Null);
-            payload["status"] = agent.get("status").cloned().unwrap_or(Value::Null);
-            payload["result"] = agent.get("result").cloned().unwrap_or(Value::Null);
-            payload["failure"] = agent.get("failure").cloned().unwrap_or(Value::Null);
-            payload["messages"] = agent.get("messages").cloned().unwrap_or(Value::Null);
-        }
-    }
-    payload
-}
-
-fn agent_status_payload(store: &Store, agent: &AgentSummary) -> Result<Value> {
-    let child = store
-        .load_session(&agent.child_session_id)?
-        .with_context(|| format!("unknown child session id: {}", agent.child_session_id))?;
-    let child_events = store.events_for_session(&agent.child_session_id)?;
-    let mut messages = Vec::new();
-    for message in store.messages_for_agent(&agent.child_session_id)? {
-        messages.push(serde_json::json!({
-            "id": message.id,
-            "author_session_id": message.author_session_id,
-            "target_session_id": message.target_session_id,
-            "author_path": display_agent_path_for_session(store, &message.author_session_id)?,
-            "recipient_path": display_agent_path_for_session(store, &message.target_session_id)?,
-            "content": message.content,
-            "trigger_turn": message.trigger_turn,
-            "created_ms": message.created_ms,
-        }));
-    }
-    Ok(serde_json::json!({
-        "child_session_id": agent.child_session_id,
-        "task_name": agent.agent_path,
-        "nickname": agent.agent_nickname,
-        "role": agent.agent_role,
-        "edge_status": agent.status,
-        "status": child.status.as_str(),
-        "result": result_from_events(&child_events),
-        "failure": failure_from_events(&child_events),
-        "messages": messages,
-        "updated_ms": child.updated_ms,
-    }))
 }
 
 fn dispatch_agent_message_tool<P: ModelProvider>(
@@ -4348,12 +13569,15 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
     trigger_turn: bool,
     options: &AgentRunOptions,
 ) -> Result<ToolDispatchOutcome> {
-    let Some(child_ref) = call
-        .arguments
-        .get("target")
-        .or_else(|| call.arguments.get("child_session_id"))
-        .and_then(Value::as_str)
-    else {
+    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["target", "message"]) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("unexpected argument `{invalid}` for {tool_name}"),
+        );
+    }
+    let Some(child_ref) = call.arguments.get("target").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(
             store,
             session,
@@ -4361,20 +13585,27 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
             &format!("{tool_name} requires target"),
         );
     };
-    let Some(child_summary) = resolve_child_agent(store, &session.id, child_ref)? else {
+    let Some(target_agent) = resolve_agent_reference_in_tree(store, &session.id, child_ref)? else {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            &format!("{tool_name} can only message children of the current session"),
+            &format!("live agent path `{child_ref}` not found"),
         );
     };
-    let child_session_id = child_summary.child_session_id.clone();
-    let agent_path = child_summary.agent_path.clone();
+    if trigger_turn && target_agent.is_root {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "Tasks can't be assigned to the root agent",
+        );
+    }
+    let target_session_id = target_agent.session_id.clone();
+    let agent_path = target_agent.agent_path.clone();
     let message = call
         .arguments
         .get("message")
-        .or_else(|| call.arguments.get("input"))
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
@@ -4383,7 +13614,7 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
             store,
             session,
             call,
-            &format!("{tool_name} requires message"),
+            "Empty message can't be sent to an agent",
         );
     }
     store.append_event(
@@ -4396,33 +13627,22 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
         }),
     )?;
     let child = store
-        .load_session(&child_session_id)?
-        .with_context(|| format!("unknown child session id: {child_session_id}"))?;
-    debug_assert_eq!(child.parent_id.as_deref(), Some(session.id.as_str()));
+        .load_session(&target_session_id)?
+        .with_context(|| format!("unknown agent session id: {target_session_id}"))?;
     let child_was_active = child.status.is_active();
-    let mail = store.send_agent_message(&session.id, &child_session_id, message, trigger_turn)?;
+    let mail = store.send_agent_message(&session.id, &target_session_id, message, trigger_turn)?;
     let author_path = display_agent_path_for_session(store, &session.id)?;
-    let recipient_path = match agent_path.clone() {
-        Some(path) => path,
-        None => display_agent_path_for_session(store, &child_session_id)?,
-    };
-    if trigger_turn {
-        store.append_event(
-            &child_session_id,
-            "session.followup",
-            serde_json::json!({ "text": message }),
-        )?;
-    }
+    let recipient_path = agent_path.clone();
     store.append_event(
         &session.id,
         "agent.message",
         serde_json::json!({
             "id": mail.id,
             "author_session_id": session.id,
-            "target_session_id": child_session_id,
+            "target_session_id": target_session_id,
             "author_path": author_path.clone(),
             "recipient_path": recipient_path.clone(),
-            "child_session_id": child_session_id,
+            "child_session_id": target_session_id,
             "content": message,
             "trigger_turn": trigger_turn,
         }),
@@ -4435,67 +13655,41 @@ fn dispatch_agent_message_tool<P: ModelProvider>(
             "tool_call_id": call.id,
         }),
     )?;
-    let child_result = if trigger_turn {
+    if trigger_turn {
         if let Some(runner) = options.child_agent_runner.clone() {
             if !child_was_active {
-                start_child_agent_background(store, &session.id, &child_session_id, runner)?;
+                start_child_agent_background(
+                    store,
+                    &session.id,
+                    &target_session_id,
+                    None,
+                    None,
+                    None,
+                    Vec::new(),
+                    runner,
+                )?;
             }
-            Some(serde_json::json!({
-                "child_session_id": child_session_id,
-                "status": "running",
-                "result": Value::Null,
-                "failure": Value::Null,
-                "background": true,
-            }))
         } else {
             let run_error = run_existing_session_with_provider(
                 store,
                 provider,
-                &child_session_id,
+                &target_session_id,
                 options.clone(),
             )
             .err()
             .map(|error| format!("{error:#}"));
-            Some(update_parent_from_child_run(
-                store,
-                &session.id,
-                &child_session_id,
-                run_error,
-            )?)
+            update_parent_from_child_run(store, &session.id, &target_session_id, run_error)?;
         }
-    } else {
-        None
-    };
+    }
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_json_message(
+        messages: vec![tool_text_message(
             store,
             session,
             call,
             tool_name,
-            serde_json::json!({
-                "message_id": mail.id,
-                "child_session_id": child_session_id,
-                "task_name": agent_path,
-                "author_path": author_path,
-                "recipient_path": recipient_path,
-                "trigger_turn": trigger_turn,
-                "status": child_result
-                    .as_ref()
-                    .and_then(|result| result.get("status"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "result": child_result
-                    .as_ref()
-                    .and_then(|result| result.get("result"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-                "failure": child_result
-                    .as_ref()
-                    .and_then(|result| result.get("failure"))
-                    .cloned()
-                    .unwrap_or(Value::Null),
-            }),
+            "",
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
         )?],
     })
 }
@@ -4505,6 +13699,14 @@ fn dispatch_list_agents_tool(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
+    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["path_prefix"]) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("unexpected argument `{invalid}` for list_agents"),
+        );
+    }
     store.append_event(
         &session.id,
         "tool.started",
@@ -4523,27 +13725,48 @@ fn dispatch_list_agents_tool(
                 .map(|current| canonical_agent_reference(prefix, &current))
         })
         .transpose()?;
-    let agents = store
-        .list_child_agents(&session.id)?
+    let root_id = root_session_id(store, &session.id)?;
+    let root_session = store
+        .load_session(&root_id)?
+        .with_context(|| format!("unknown root session id: {root_id}"))?;
+    let mut agents = Vec::new();
+    if path_prefix
+        .as_deref()
+        .is_none_or(|prefix| prefix == "/root" || "/root".starts_with(&format!("{prefix}/")))
+    {
+        agents.push(serde_json::json!({
+            "agent_name": "/root",
+            "agent_status": local_agent_status_value(store, &root_session, None)?,
+            "last_task_message": "Main thread",
+        }));
+    }
+    for agent in collect_agent_tree(store, &root_id)?
         .into_iter()
-        .filter(|agent| match path_prefix.as_deref() {
-            Some(prefix) => agent
-                .agent_path
-                .as_deref()
-                .is_some_and(|path| path == prefix || path.starts_with(&format!("{prefix}/"))),
-            None => true,
-        })
-        .map(|agent| {
-            serde_json::json!({
-                "child_session_id": agent.child_session_id,
-                "status": agent.status,
-                "task_name": agent.agent_path,
-                "nickname": agent.agent_nickname,
-                "role": agent.agent_role,
-                "updated_ms": agent.updated_ms,
-            })
-        })
-        .collect::<Vec<_>>();
+        .filter(|agent| agent.status != "closed")
+    {
+        let agent_name = agent.agent_path.clone().unwrap_or_else(|| {
+            display_agent_path_for_session(store, &agent.child_session_id)
+                .unwrap_or_else(|_| agent.child_session_id.clone())
+        });
+        if path_prefix.as_deref().is_some_and(|prefix| {
+            agent_name != prefix && !agent_name.starts_with(&format!("{prefix}/"))
+        }) {
+            continue;
+        }
+        let child = store
+            .load_session(&agent.child_session_id)?
+            .with_context(|| format!("unknown child session id: {}", agent.child_session_id))?;
+        agents.push(serde_json::json!({
+            "agent_name": agent_name,
+            "agent_status": local_agent_status_value(store, &child, Some(&agent))?,
+            "last_task_message": last_task_message_for_agent(store, &agent.child_session_id)?,
+        }));
+    }
+    agents.sort_by(|left, right| {
+        left.get("agent_name")
+            .and_then(Value::as_str)
+            .cmp(&right.get("agent_name").and_then(Value::as_str))
+    });
     store.append_event(
         &session.id,
         "tool.finished",
@@ -4564,34 +13787,88 @@ fn dispatch_list_agents_tool(
     })
 }
 
+fn local_agent_status_value(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    agent: Option<&AgentSummary>,
+) -> Result<Value> {
+    if agent.is_some_and(|agent| agent.status == "closed")
+        || session.status == SessionStatus::Cancelled
+    {
+        return Ok(Value::String("shutdown".to_string()));
+    }
+    let events = store.events_for_session(&session.id)?;
+    if let Some(failure) = failure_from_events(&events) {
+        return Ok(serde_json::json!({ "errored": failure }));
+    }
+    if let Some(result) = result_from_events(&events) {
+        return Ok(serde_json::json!({ "completed": result }));
+    }
+    Ok(match session.status {
+        SessionStatus::Created => Value::String("pending_init".to_string()),
+        SessionStatus::Running => Value::String("running".to_string()),
+        SessionStatus::Done => serde_json::json!({
+            "completed": null,
+        }),
+        SessionStatus::Failed => serde_json::json!({
+            "errored": "failed",
+        }),
+        SessionStatus::Cancelled => Value::String("shutdown".to_string()),
+    })
+}
+
+fn last_task_message_for_agent(store: &Store, session_id: &str) -> Result<Option<String>> {
+    let events = store.events_for_session(session_id)?;
+    let latest_event_message = events.iter().rev().find_map(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "session.followup" | "session.input"
+        )
+        .then(|| event.payload.get("text").and_then(Value::as_str))
+        .flatten()
+        .map(|text| (event.ts_ms, text.to_string()))
+    });
+    let latest_mail_message = store
+        .messages_for_agent(session_id)?
+        .into_iter()
+        .last()
+        .map(|message| (message.created_ms, message.content));
+    Ok(match (latest_event_message, latest_mail_message) {
+        (Some(event), Some(mail)) => Some(if mail.0 >= event.0 { mail.1 } else { event.1 }),
+        (Some(event), None) => Some(event.1),
+        (None, Some(mail)) => Some(mail.1),
+        (None, None) => None,
+    })
+}
+
 fn dispatch_close_agent_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
 ) -> Result<ToolDispatchOutcome> {
-    let Some(child_ref) = call
-        .arguments
-        .get("target")
-        .or_else(|| call.arguments.get("child_session_id"))
-        .and_then(Value::as_str)
-    else {
-        return dispatch_tool_validation_error(store, session, call, "close_agent requires target");
-    };
-    let Some(child_summary) = resolve_child_agent(store, &session.id, child_ref)? else {
+    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["target"]) {
         return dispatch_tool_validation_error(
             store,
             session,
             call,
-            "close_agent can only close children of the current session",
+            &format!("unexpected argument `{invalid}` for close_agent"),
+        );
+    }
+    let Some(child_ref) = call.arguments.get("target").and_then(Value::as_str) else {
+        return dispatch_tool_validation_error(store, session, call, "close_agent requires target");
+    };
+    let Some(target_agent) = resolve_agent_reference_in_tree(store, &session.id, child_ref)? else {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("live agent path `{child_ref}` not found"),
         );
     };
-    let child_session_id = child_summary.child_session_id.clone();
-    let agent_path = child_summary.agent_path.clone();
-    let reason = call
-        .arguments
-        .get("reason")
-        .and_then(Value::as_str)
-        .unwrap_or("closed by parent agent");
+    if target_agent.is_root {
+        return dispatch_tool_validation_error(store, session, call, "root is not a spawned agent");
+    }
+    let child_session_id = target_agent.session_id.clone();
     store.append_event(
         &session.id,
         "tool.started",
@@ -4604,15 +13881,15 @@ fn dispatch_close_agent_tool(
     let child = store
         .load_session(&child_session_id)?
         .with_context(|| format!("unknown child session id: {child_session_id}"))?;
-    debug_assert_eq!(child.parent_id.as_deref(), Some(session.id.as_str()));
-    store.close_child_agent(&child_session_id, reason)?;
+    let previous_status = local_agent_status_value(store, &child, target_agent.summary.as_ref())?;
+    store.close_child_agent(&child_session_id, "closed by parent agent")?;
     store.append_event(
         &session.id,
         "agent.cancelled",
         serde_json::json!({
             "child_session_id": child_session_id,
             "status": "cancelled",
-            "payload": { "reason": reason },
+            "payload": { "reason": "closed by parent agent" },
         }),
     )?;
     store.append_event(
@@ -4631,12 +13908,18 @@ fn dispatch_close_agent_tool(
             call,
             "close_agent",
             serde_json::json!({
-                "child_session_id": child_session_id,
-                "task_name": agent_path,
-                "status": "cancelled",
+                "previous_status": previous_status,
             }),
         )?],
     })
+}
+
+fn unexpected_tool_arguments(arguments: &Value, allowed: &[&str]) -> Option<String> {
+    let object = arguments.as_object()?;
+    object
+        .keys()
+        .find(|key| !allowed.iter().any(|allowed| allowed == &key.as_str()))
+        .cloned()
 }
 
 fn dispatch_tool_validation_error(
@@ -4656,7 +13939,14 @@ fn dispatch_tool_validation_error(
     )?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_text_message(store, session, call, &call.name, error)?],
+        messages: vec![tool_text_message(
+            store,
+            session,
+            call,
+            &call.name,
+            error,
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
+        )?],
     })
 }
 
@@ -4677,7 +13967,14 @@ fn dispatch_unknown_tool(
     )?;
     Ok(ToolDispatchOutcome {
         finished: false,
-        messages: vec![tool_text_message(store, session, call, &call.name, &error)?],
+        messages: vec![tool_text_message(
+            store,
+            session,
+            call,
+            &call.name,
+            &error,
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
+        )?],
     })
 }
 
@@ -4689,7 +13986,14 @@ fn tool_json_message(
     content: Value,
 ) -> Result<Value> {
     let content = serde_json::to_string(&content)?;
-    tool_text_message(store, session, call, name, &content)
+    tool_text_message(
+        store,
+        session,
+        call,
+        name,
+        &content,
+        DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
+    )
 }
 
 fn tool_text_message(
@@ -4698,13 +14002,23 @@ fn tool_text_message(
     call: &ToolCall,
     name: &str,
     content: &str,
+    tool_output_token_budget: usize,
 ) -> Result<Value> {
-    let content = spill_large_tool_text(store, &session.id, Some(&call.id), name, content)?;
+    let content = spill_large_tool_text(
+        store,
+        &session.id,
+        Some(&call.id),
+        name,
+        content,
+        tool_output_token_budget,
+    )?;
+    let content_value = Value::String(content);
+    record_model_response_input_item(store, &session.id, call, name, &content_value)?;
     Ok(serde_json::json!({
         "role": "tool",
         "tool_call_id": call.id,
         "name": name,
-        "content": content,
+        "content": content_value,
     }))
 }
 
@@ -4714,8 +14028,17 @@ fn tool_content_message(
     call: &ToolCall,
     name: &str,
     content: Value,
+    tool_output_token_budget: usize,
 ) -> Result<Value> {
-    let content = spill_large_tool_content(store, &session.id, Some(&call.id), name, content)?;
+    let content = spill_large_tool_content(
+        store,
+        &session.id,
+        Some(&call.id),
+        name,
+        content,
+        tool_output_token_budget,
+    )?;
+    record_model_response_input_item(store, &session.id, call, name, &content)?;
     Ok(serde_json::json!({
         "role": "tool",
         "tool_call_id": call.id,
@@ -4730,17 +14053,30 @@ fn spill_large_tool_content(
     call_id: Option<&str>,
     tool_name: &str,
     content: Value,
+    tool_output_token_budget: usize,
 ) -> Result<Value> {
     match content {
         Value::String(text) => Ok(Value::String(spill_large_tool_text(
-            store, session_id, call_id, tool_name, &text,
+            store,
+            session_id,
+            call_id,
+            tool_name,
+            &text,
+            tool_output_token_budget,
         )?)),
-        Value::Array(items) => {
-            spill_large_tool_content_items(store, session_id, call_id, tool_name, items)
-        }
+        Value::Array(items) => spill_large_tool_content_items(
+            store,
+            session_id,
+            call_id,
+            tool_name,
+            items,
+            tool_output_token_budget,
+        ),
         other => {
             let serialized = serde_json::to_string(&other)?;
-            if approx_token_count(&serialized) <= MAX_TOOL_OUTPUT_TEXT_TOKENS {
+            if approx_token_count(&serialized)
+                <= tool_output_serialization_token_budget(tool_output_token_budget)
+            {
                 Ok(other)
             } else {
                 Ok(Value::String(spill_large_tool_text(
@@ -4749,6 +14085,7 @@ fn spill_large_tool_content(
                     call_id,
                     tool_name,
                     &serialized,
+                    tool_output_token_budget,
                 )?))
             }
         }
@@ -4761,6 +14098,7 @@ fn spill_large_tool_content_items(
     call_id: Option<&str>,
     tool_name: &str,
     items: Vec<Value>,
+    tool_output_token_budget: usize,
 ) -> Result<Value> {
     let mut text_segments = Vec::new();
     let mut non_text_items = Vec::new();
@@ -4776,11 +14114,20 @@ fn spill_large_tool_content_items(
         }
     }
     let combined_text = text_segments.join("\n");
-    if approx_token_count(&combined_text) <= MAX_TOOL_OUTPUT_TEXT_TOKENS {
+    if approx_token_count(&combined_text)
+        <= tool_output_serialization_token_budget(tool_output_token_budget)
+    {
         return Ok(Value::Array(items));
     }
 
-    let preview = spill_large_tool_text(store, session_id, call_id, tool_name, &combined_text)?;
+    let preview = spill_large_tool_text(
+        store,
+        session_id,
+        call_id,
+        tool_name,
+        &combined_text,
+        tool_output_token_budget,
+    )?;
     let mut compacted = vec![serde_json::json!({
         "type": "output_text",
         "text": preview,
@@ -4795,28 +14142,33 @@ fn spill_large_tool_text(
     call_id: Option<&str>,
     tool_name: &str,
     text: &str,
+    tool_output_token_budget: usize,
 ) -> Result<String> {
-    if approx_token_count(text) <= MAX_TOOL_OUTPUT_TEXT_TOKENS {
+    if approx_token_count(text) <= tool_output_serialization_token_budget(tool_output_token_budget)
+    {
         return Ok(text.to_string());
     }
-    let artifact = write_tool_output_artifact(store, session_id, tool_name, call_id, text)?;
-    Ok(spilled_tool_output_preview(text, &artifact))
+    let artifact = write_tool_output_artifact(
+        store,
+        session_id,
+        tool_name,
+        call_id,
+        text,
+        tool_output_token_budget,
+    )?;
+    Ok(spilled_tool_output_preview(
+        text,
+        &artifact,
+        tool_output_token_budget,
+    ))
 }
 
-fn spilled_tool_output_preview(text: &str, artifact: &Value) -> String {
-    let path = artifact
-        .get("path")
-        .and_then(Value::as_str)
-        .unwrap_or("<unknown>");
-    let footer = format!("\n\nFull tool output saved to: {path}");
-    let footer_tokens = approx_token_count(&footer);
-    let preview_budget = MAX_TOOL_OUTPUT_TEXT_TOKENS
-        .saturating_sub(footer_tokens)
-        .max(32);
-    format!(
-        "{}{footer}",
-        truncate_for_context_tokens(text, preview_budget)
-    )
+fn spilled_tool_output_preview(
+    text: &str,
+    _artifact: &Value,
+    tool_output_token_budget: usize,
+) -> String {
+    tools::command::codex_formatted_truncate_text(text, tool_output_token_budget)
 }
 
 fn write_tool_output_artifact(
@@ -4825,6 +14177,7 @@ fn write_tool_output_artifact(
     tool_name: &str,
     call_id: Option<&str>,
     text: &str,
+    tool_output_token_budget: usize,
 ) -> Result<Value> {
     let session = store
         .load_session(session_id)?
@@ -4853,7 +14206,7 @@ fn write_tool_output_artifact(
         "bytes": std::fs::metadata(&path).ok().and_then(|metadata| i64::try_from(metadata.len()).ok()),
         "original_chars": text.chars().count(),
         "original_tokens_estimate": approx_token_count(text),
-        "truncated_tokens": MAX_TOOL_OUTPUT_TEXT_TOKENS,
+        "truncated_tokens": tool_output_token_budget,
         "tool_name": tool_name,
         "tool_call_id": call_id,
     });
@@ -4877,6 +14230,10 @@ fn write_tool_output_artifact(
     Ok(artifact)
 }
 
+fn tool_output_serialization_token_budget(tool_output_token_budget: usize) -> usize {
+    tool_output_token_budget.saturating_mul(6).div_ceil(5)
+}
+
 fn sanitize_artifact_filename_component(value: &str) -> String {
     let mut out = String::new();
     for ch in value.chars().take(80) {
@@ -4896,14 +14253,17 @@ fn sanitize_artifact_filename_component(value: &str) -> String {
 fn python_tool_message_content(
     response: &RunPythonResponse,
     text_artifact: Option<&Value>,
+    tool_output_token_budget: usize,
 ) -> String {
     if response.ok {
         let mut parts = Vec::new();
         if !response.text.trim().is_empty() {
             let text = response.text.trim();
-            let text = if approx_token_count(text) > MAX_TOOL_OUTPUT_TEXT_TOKENS {
+            let text = if approx_token_count(text) > tool_output_token_budget {
                 text_artifact
-                    .map(|artifact| spilled_tool_output_preview(text, artifact))
+                    .map(|artifact| {
+                        spilled_tool_output_preview(text, artifact, tool_output_token_budget)
+                    })
                     .unwrap_or_else(|| text.to_string())
             } else {
                 text.to_string()
@@ -4932,8 +14292,9 @@ fn python_tool_message_content(
 fn python_tool_message_content_value(
     response: &RunPythonResponse,
     text_artifact: Option<&Value>,
+    tool_output_token_budget: usize,
 ) -> Result<Value> {
-    let text = python_tool_message_content(response, text_artifact);
+    let text = python_tool_message_content(response, text_artifact, tool_output_token_budget);
     let Some(image_parts) = python_tool_image_output_parts(response)? else {
         return Ok(Value::String(text));
     };
@@ -5054,7 +14415,13 @@ pub fn record_python_response_events(
     session_id: &str,
     response: &RunPythonResponse,
 ) -> Result<Option<Value>> {
-    record_python_response_events_inner(store, session_id, response, true)
+    record_python_response_events_inner(
+        store,
+        session_id,
+        response,
+        true,
+        DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
+    )
 }
 
 pub fn record_python_response_final_event(
@@ -5062,7 +14429,27 @@ pub fn record_python_response_final_event(
     session_id: &str,
     response: &RunPythonResponse,
 ) -> Result<Option<Value>> {
-    record_python_response_events_inner(store, session_id, response, false)
+    record_python_response_final_event_with_budget(
+        store,
+        session_id,
+        response,
+        DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
+    )
+}
+
+fn record_python_response_final_event_with_budget(
+    store: &Store,
+    session_id: &str,
+    response: &RunPythonResponse,
+    tool_output_token_budget: usize,
+) -> Result<Option<Value>> {
+    record_python_response_events_inner(
+        store,
+        session_id,
+        response,
+        false,
+        tool_output_token_budget,
+    )
 }
 
 fn record_browser_script_response_events(
@@ -5125,6 +14512,7 @@ fn record_python_response_events_inner(
     session_id: &str,
     response: &RunPythonResponse,
     include_host_records: bool,
+    tool_output_token_budget: usize,
 ) -> Result<Option<Value>> {
     if include_host_records {
         for output in &response.outputs {
@@ -5155,7 +14543,8 @@ fn record_python_response_events_inner(
         }
     }
 
-    let (text, text_artifact) = spill_large_text_output(store, session_id, &response.text)?;
+    let (text, text_artifact) =
+        spill_large_text_output(store, session_id, &response.text, tool_output_token_budget)?;
     let mut payload = serde_json::json!({
         "name": "python",
         "ok": response.ok,
@@ -5178,13 +14567,21 @@ fn spill_large_text_output(
     store: &Store,
     session_id: &str,
     text: &str,
+    tool_output_token_budget: usize,
 ) -> Result<(String, Option<Value>)> {
-    if approx_token_count(text) <= MAX_TOOL_OUTPUT_TEXT_TOKENS {
+    if approx_token_count(text) <= tool_output_token_budget {
         return Ok((text.to_string(), None));
     }
-    let artifact = write_tool_output_artifact(store, session_id, "python", None, text)?;
+    let artifact = write_tool_output_artifact(
+        store,
+        session_id,
+        "python",
+        None,
+        text,
+        tool_output_token_budget,
+    )?;
     Ok((
-        truncate_for_context_tokens(text, MAX_TOOL_OUTPUT_TEXT_TOKENS),
+        tools::command::codex_formatted_truncate_text(text, tool_output_token_budget),
         Some(artifact),
     ))
 }
@@ -5282,6 +14679,416 @@ fn record_tool_artifact(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    static CODEX_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_path(key: &'static str, value: &Path) -> Self {
+            let old_value = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old_value }
+        }
+
+        fn set_str(key: &'static str, value: &str) -> Self {
+            let old_value = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old_value }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old_value = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
+
+    #[test]
+    fn codex_responses_extra_headers_match_root_and_child_sessions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+
+        let parent_metadata = codex_responses_client_metadata(&store)?;
+        assert!(parent_metadata
+            .get(CODEX_INSTALLATION_ID_HEADER)
+            .is_some_and(|value| !value.is_empty()));
+        let same_parent_metadata = codex_responses_client_metadata(&store)?;
+        assert_eq!(
+            same_parent_metadata.get(CODEX_INSTALLATION_ID_HEADER),
+            parent_metadata.get(CODEX_INSTALLATION_ID_HEADER)
+        );
+
+        let lifecycle = CodexTurnLifecycle {
+            turn_id: "turn-a".to_string(),
+            run_id: "turn-a".to_string(),
+            started_at_ms: 1_700_000_000_123,
+            started_at: Instant::now(),
+            provider: "openai".to_string(),
+            model: "gpt-5".to_string(),
+            personality: ModelPersonality::None,
+            collaboration_mode: CollaborationModeKind::Default,
+            model_settings: ModelRequestSettings::default(),
+            model_context_window: None,
+            trace_id: None,
+        };
+        let parent_turn_metadata = codex_responses_turn_metadata_header(&parent, &lifecycle)?;
+        assert!(parent_turn_metadata.is_ascii());
+        let parent_turn_metadata_json: Value = serde_json::from_str(&parent_turn_metadata)?;
+        assert_eq!(
+            parent_turn_metadata_json["session_id"].as_str(),
+            Some(parent.id.as_str())
+        );
+        assert_eq!(
+            parent_turn_metadata_json["thread_source"].as_str(),
+            Some("user")
+        );
+        assert_eq!(
+            parent_turn_metadata_json["turn_started_at_unix_ms"].as_i64(),
+            Some(1_700_000_000_123)
+        );
+
+        let parent_headers = codex_responses_extra_headers(
+            &store,
+            &parent,
+            &AgentRunOptions::default(),
+            Some(&parent_turn_metadata),
+        )?;
+        assert_eq!(
+            parent_headers.get(CODEX_HTTP_SESSION_ID_HEADER),
+            Some(&parent.id)
+        );
+        assert_eq!(
+            parent_headers.get(CODEX_HTTP_THREAD_ID_HEADER),
+            Some(&parent.id)
+        );
+        assert_eq!(
+            parent_headers.get(CODEX_HTTP_CLIENT_REQUEST_ID_HEADER),
+            Some(&parent.id)
+        );
+        assert!(parent_headers.get(CODEX_WINDOW_ID_HEADER).is_some());
+        assert_eq!(
+            parent_headers.get(CODEX_TURN_METADATA_HEADER),
+            Some(&parent_turn_metadata)
+        );
+        assert_eq!(
+            parent_headers
+                .get(CODEX_BETA_FEATURES_HEADER)
+                .map(String::as_str),
+            Some("terminal_resize_reflow")
+        );
+        assert!(!parent_headers.contains_key(OPENAI_SUBAGENT_HEADER));
+        assert!(!parent_headers.contains_key(CODEX_PARENT_THREAD_ID_HEADER));
+
+        let same_parent_headers =
+            codex_responses_extra_headers(&store, &parent, &AgentRunOptions::default(), None)?;
+        assert_eq!(
+            same_parent_headers.get(CODEX_WINDOW_ID_HEADER),
+            parent_headers.get(CODEX_WINDOW_ID_HEADER)
+        );
+        let beta_options = AgentRunOptions::default().with_config_overrides(vec![
+            (
+                "features.terminal_resize_reflow".to_string(),
+                toml::Value::Boolean(false),
+            ),
+            (
+                "features.remote_compaction_v2".to_string(),
+                toml::Value::Boolean(true),
+            ),
+        ]);
+        let beta_headers = codex_responses_extra_headers(&store, &parent, &beta_options, None)?;
+        assert_eq!(
+            beta_headers
+                .get(CODEX_BETA_FEATURES_HEADER)
+                .map(String::as_str),
+            Some("remote_compaction_v2")
+        );
+
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/research"),
+            Some("research"),
+            Some("explorer"),
+        )?;
+        let child_turn_metadata = codex_responses_turn_metadata_header(&child, &lifecycle)?;
+        let child_turn_metadata_json: Value = serde_json::from_str(&child_turn_metadata)?;
+        assert_eq!(
+            child_turn_metadata_json["thread_source"].as_str(),
+            Some("subagent")
+        );
+        let child_headers = codex_responses_extra_headers(
+            &store,
+            &child,
+            &AgentRunOptions::default(),
+            Some(&child_turn_metadata),
+        )?;
+        assert_eq!(
+            child_headers.get(CODEX_HTTP_SESSION_ID_HEADER),
+            Some(&child.id)
+        );
+        assert_eq!(
+            child_headers
+                .get(OPENAI_SUBAGENT_HEADER)
+                .map(String::as_str),
+            Some(OPENAI_SUBAGENT_COLLAB_SPAWN)
+        );
+        assert_eq!(
+            child_headers.get(CODEX_PARENT_THREAD_ID_HEADER),
+            Some(&parent.id)
+        );
+        assert_eq!(
+            child_headers.get(CODEX_WINDOW_ID_HEADER),
+            parent_headers.get(CODEX_WINDOW_ID_HEADER)
+        );
+        Ok(())
+    }
+
+    fn with_codex_home<T>(codex_home: &Path, f: impl FnOnce() -> T) -> T {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
+        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home);
+        let _system_guard = EnvVarGuard::remove(TEST_CODEX_SYSTEM_CONFIG_ENV);
+        let _managed_guard = EnvVarGuard::remove(TEST_CODEX_MANAGED_CONFIG_ENV);
+        let _managed_preferences_guard =
+            EnvVarGuard::remove(TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
+        f()
+    }
+
+    fn with_codex_home_and_system_config<T>(
+        codex_home: &Path,
+        system_config: &Path,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
+        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home);
+        let _system_guard = EnvVarGuard::set_path(TEST_CODEX_SYSTEM_CONFIG_ENV, system_config);
+        let _managed_guard = EnvVarGuard::remove(TEST_CODEX_MANAGED_CONFIG_ENV);
+        let _managed_preferences_guard =
+            EnvVarGuard::remove(TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
+        f()
+    }
+
+    fn with_codex_home_and_managed_config<T>(
+        codex_home: &Path,
+        managed_config: &Path,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
+        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home);
+        let _system_guard = EnvVarGuard::remove(TEST_CODEX_SYSTEM_CONFIG_ENV);
+        let _managed_guard = EnvVarGuard::set_path(TEST_CODEX_MANAGED_CONFIG_ENV, managed_config);
+        let _managed_preferences_guard =
+            EnvVarGuard::remove(TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
+        f()
+    }
+
+    fn with_codex_home_and_managed_preferences<T>(
+        codex_home: &Path,
+        managed_preferences_base64: &str,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
+        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home);
+        let _system_guard = EnvVarGuard::remove(TEST_CODEX_SYSTEM_CONFIG_ENV);
+        let _managed_guard = EnvVarGuard::remove(TEST_CODEX_MANAGED_CONFIG_ENV);
+        let _managed_preferences_guard = EnvVarGuard::set_str(
+            TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV,
+            managed_preferences_base64,
+        );
+        f()
+    }
+
+    fn create_empty_codex_home(base: &Path) -> Result<PathBuf> {
+        let codex_home = base.join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        Ok(codex_home)
+    }
+
+    fn spawn_models_server(
+        body: String,
+        etag: &str,
+    ) -> Result<(
+        String,
+        std::sync::mpsc::Receiver<String>,
+        std::thread::JoinHandle<()>,
+    )> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let etag = etag.to_string();
+        let handle = std::thread::spawn(move || {
+            if let Ok((mut stream, _)) = listener.accept() {
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                if let Ok(n) = std::io::Read::read(&mut stream, &mut buffer) {
+                    request.extend_from_slice(&buffer[..n]);
+                }
+                let _ = tx.send(String::from_utf8_lossy(&request).to_string());
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: application/json\r\netag: {etag}\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                let _ = std::io::Write::write_all(&mut stream, response.as_bytes());
+            }
+        });
+        Ok((format!("http://{addr}"), rx, handle))
+    }
+
+    #[derive(Debug)]
+    struct CapturedResponsesRequest {
+        request_line: String,
+        headers: String,
+    }
+
+    fn responses_completed_sse(response_id: &str, text: &str) -> String {
+        serde_json::json!({
+            "type": "response.completed",
+            "response": {
+                "id": response_id,
+                "output": [{
+                    "type": "message",
+                    "role": "assistant",
+                    "content": [{"type": "output_text", "text": text}],
+                }],
+                "usage": {"input_tokens": 1, "output_tokens": 1, "total_tokens": 2},
+            },
+        })
+        .to_string()
+    }
+
+    fn responses_sse_body(response_id: &str, text: &str) -> String {
+        format!("data: {}\n\n", responses_completed_sse(response_id, text))
+    }
+
+    fn spawn_responses_capture_server_sequence(
+        bodies: Vec<String>,
+        accept_timeout: Duration,
+    ) -> Result<(
+        String,
+        std::sync::mpsc::Receiver<CapturedResponsesRequest>,
+        std::thread::JoinHandle<usize>,
+    )> {
+        let listener = std::net::TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = std::sync::mpsc::channel();
+        let handle = std::thread::spawn(move || {
+            let mut served = 0;
+            for body in bodies {
+                let started = Instant::now();
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if started.elapsed() >= accept_timeout {
+                                return served;
+                            }
+                            std::thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept responses request: {error}"),
+                    }
+                };
+                let mut request = Vec::new();
+                let mut buffer = [0_u8; 8192];
+                let header_end = loop {
+                    let read = std::io::Read::read(&mut stream, &mut buffer)
+                        .expect("read responses request");
+                    if read == 0 {
+                        panic!("responses request ended before headers");
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                    if let Some(pos) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|pos| pos + 4)
+                    {
+                        break pos;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                let headers_lower = headers.to_ascii_lowercase();
+                let content_length = headers_lower
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .unwrap_or(0);
+                while request.len() < header_end + content_length {
+                    let read = std::io::Read::read(&mut stream, &mut buffer)
+                        .expect("read responses request body");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buffer[..read]);
+                }
+                let request_line = headers.lines().next().unwrap_or_default().to_string();
+                tx.send(CapturedResponsesRequest {
+                    request_line,
+                    headers,
+                })
+                .expect("send captured responses request");
+                let response = format!(
+                    "HTTP/1.1 200 OK\r\ncontent-type: text/event-stream\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+                std::io::Write::write_all(&mut stream, response.as_bytes())
+                    .expect("write responses response");
+                served += 1;
+            }
+            served
+        });
+        Ok((format!("http://{addr}/v1"), rx, handle))
+    }
+
+    fn write_corp_responses_provider_config(
+        codex_home: &Path,
+        base_url: &str,
+        api_version: &str,
+        static_header: &str,
+    ) -> Result<()> {
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                r#"
+model_provider = "corp"
+
+[model_providers.corp]
+name = "Corp"
+base_url = "{base_url}"
+wire_api = "responses"
+request_max_retries = 0
+stream_max_retries = 0
+stream_idle_timeout_ms = 5000
+websocket_connect_timeout_ms = 15000
+requires_openai_auth = false
+supports_websockets = true
+
+[model_providers.corp.query_params]
+api-version = "{api_version}"
+
+[model_providers.corp.http_headers]
+x-static = "{static_header}"
+
+[model_providers.corp.env_http_headers]
+x-env = "CORP_HEADER"
+"#,
+            ),
+        )?;
+        Ok(())
+    }
 
     fn event(event_type: &str, payload: Value) -> EventRecord {
         EventRecord {
@@ -5456,6 +15263,2399 @@ mod tests {
     }
 
     #[test]
+    fn provider_turn_uses_config_inline_instructions_as_base_instructions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "instructions = \"snapshot instructions\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture instructions",
+                &project,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_instructions(),
+            vec![Some("snapshot instructions".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_uses_config_personality_for_default_base_instructions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "personality = \"friendly\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture personality instructions",
+                &project,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        let captured = provider.captured_instructions();
+        let instructions = captured
+            .first()
+            .and_then(Option::as_deref)
+            .expect("instructions");
+        assert!(instructions.contains("supportive teammate as much as code quality"));
+        assert!(!instructions.contains("deeply pragmatic, effective software engineer"));
+        assert!(instructions.contains("Browser Agent Contract"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_persists_default_base_instructions_across_config_changes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "personality = \"friendly\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "capture persisted default instructions",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            std::fs::write(codex_home.join("config.toml"), "personality = \"none\"\n")?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            Ok(session_id)
+        })?;
+
+        let captured = provider.captured_instructions();
+        assert_eq!(captured.len(), 2);
+        assert_eq!(captured[0], captured[1]);
+        let instructions = captured[0].as_deref().expect("instructions");
+        assert!(instructions.contains("supportive teammate as much as code quality"));
+
+        let events = store.events_for_session(&session_id)?;
+        let base_events = events
+            .iter()
+            .filter(|event| event.event_type == SESSION_BASE_INSTRUCTIONS_EVENT)
+            .collect::<Vec<_>>();
+        assert_eq!(base_events.len(), 1);
+        assert_eq!(base_events[0].payload["source"], "model_default");
+        assert_eq!(
+            session_base_instructions_from_events(&events).as_deref(),
+            Some(instructions)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_config_override_temporarily_beats_persisted_base_instructions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "personality = \"friendly\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "capture base override precedence",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            std::fs::write(
+                codex_home.join("config.toml"),
+                "instructions = \"explicit override\"\n",
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            std::fs::write(codex_home.join("config.toml"), "")?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            Ok(session_id)
+        })?;
+
+        let captured = provider.captured_instructions();
+        assert_eq!(captured.len(), 3);
+        let persisted = captured[0].as_deref().expect("persisted instructions");
+        assert!(persisted.contains("supportive teammate as much as code quality"));
+        assert_eq!(captured[1].as_deref(), Some("explicit override"));
+        assert_eq!(captured[2].as_deref(), Some(persisted));
+
+        let events = store.events_for_session(&session_id)?;
+        let base_events = events
+            .iter()
+            .filter(|event| event.event_type == SESSION_BASE_INSTRUCTIONS_EVENT)
+            .collect::<Vec<_>>();
+        assert_eq!(base_events.len(), 1);
+        assert_eq!(base_events[0].payload["source"], "model_default");
+        assert_eq!(
+            session_base_instructions_from_events(&events).as_deref(),
+            Some(persisted)
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_injects_model_switch_context_once_before_resumed_user_message() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let old_model = ModelSwitchCapturingProvider::new("gpt-5.2");
+        let new_model = ModelSwitchCapturingProvider::new("gpt-5.4");
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &old_model,
+                "start on old model",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            let followup = store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "continue after model switch"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &new_model,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            let events = store.events_for_session(&session_id)?;
+            let switch_events = events
+                .iter()
+                .filter(|event| event.event_type == MODEL_SWITCH_CONTEXT_EVENT)
+                .collect::<Vec<_>>();
+            assert_eq!(switch_events.len(), 1);
+            assert_eq!(switch_events[0].payload["previous_model"], "gpt-5.2");
+            assert_eq!(switch_events[0].payload["model"], "gpt-5.4");
+            assert_eq!(switch_events[0].payload["before_seq"], followup.seq);
+
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "continue on same model"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &new_model,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            Ok(session_id)
+        })?;
+
+        assert_eq!(
+            old_model.captured_instructions().first(),
+            new_model.captured_instructions().first()
+        );
+
+        let first_new_model_request = new_model
+            .captured_messages()
+            .into_iter()
+            .next()
+            .context("new model request")?;
+        let switch_index = first_new_model_request
+            .iter()
+            .position(|message| message_content_text(message).contains("<model_switch>"))
+            .context("model switch message")?;
+        let followup_index = first_new_model_request
+            .iter()
+            .position(|message| {
+                message_content_text(message).contains("continue after model switch")
+            })
+            .context("followup message")?;
+        assert!(switch_index < followup_index);
+        assert_eq!(model_switch_message_count(&first_new_model_request), 1);
+
+        let second_new_model_request = new_model
+            .captured_messages()
+            .into_iter()
+            .nth(1)
+            .context("same model request")?;
+        assert_eq!(model_switch_message_count(&second_new_model_request), 1);
+        let events = store.events_for_session(&session_id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == MODEL_SWITCH_CONTEXT_EVENT)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_clamps_reasoning_effort_on_model_switch_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_reasoning_effort = \"minimal\"\nmodel_reasoning_summary = \"none\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let old_model = ModelSwitchCapturingProvider::new("gpt-5.2");
+        let new_model = ModelSwitchCapturingProvider::new("gpt-5.4");
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &old_model,
+                "start with explicit minimal effort",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "continue on switched model"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &new_model,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            Ok(session_id)
+        })?;
+
+        assert_eq!(
+            old_model
+                .captured_model_settings()
+                .first()
+                .and_then(|settings| settings.reasoning_effort.as_deref()),
+            Some("minimal")
+        );
+        assert_eq!(
+            new_model
+                .captured_model_settings()
+                .first()
+                .and_then(|settings| settings.reasoning_effort.as_deref()),
+            Some("medium")
+        );
+        let events = store.events_for_session(&session_id)?;
+        let previous_settings = previous_turn_settings_from_events(&events);
+        assert_eq!(
+            previous_settings
+                .model_settings
+                .as_ref()
+                .and_then(|settings| settings.reasoning_effort.as_deref()),
+            Some("medium")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_injects_personality_context_once_for_same_model_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "personality = \"friendly\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "start friendly",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            std::fs::write(
+                codex_home.join("config.toml"),
+                "personality = \"pragmatic\"\n",
+            )?;
+            let followup = store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "continue pragmatically"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            let events = store.events_for_session(&session_id)?;
+            let personality_events = events
+                .iter()
+                .filter(|event| event.event_type == PERSONALITY_CONTEXT_EVENT)
+                .collect::<Vec<_>>();
+            assert_eq!(personality_events.len(), 1);
+            assert_eq!(personality_events[0].payload["personality"], "pragmatic");
+            assert_eq!(personality_events[0].payload["before_seq"], followup.seq);
+
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "continue same personality"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            Ok(session_id)
+        })?;
+
+        let captured = provider.captured_messages();
+        let personality_request = captured.get(1).context("personality request")?;
+        let spec_index = personality_request
+            .iter()
+            .position(|message| message_content_text(message).contains("<personality_spec>"))
+            .context("personality spec message")?;
+        let followup_index = personality_request
+            .iter()
+            .position(|message| message_content_text(message).contains("continue pragmatically"))
+            .context("followup message")?;
+        assert!(spec_index < followup_index);
+        assert_eq!(personality_spec_message_count(personality_request), 1);
+        assert_eq!(model_switch_message_count(personality_request), 0);
+
+        let same_personality_request = captured.get(2).context("same personality request")?;
+        assert_eq!(personality_spec_message_count(same_personality_request), 1);
+        let events = store.events_for_session(&session_id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == PERSONALITY_CONTEXT_EVENT)
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_skips_personality_context_for_models_without_model_messages() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "personality = \"friendly\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.2");
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "start on unsupported personality model",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            std::fs::write(
+                codex_home.join("config.toml"),
+                "personality = \"pragmatic\"\n",
+            )?;
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "continue without personality spec"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            Ok(session_id)
+        })?;
+
+        let captured = provider.captured_messages();
+        let personality_request = captured.get(1).context("personality request")?;
+        assert_eq!(personality_spec_message_count(personality_request), 0);
+        let captured_instructions = provider.captured_instructions();
+        let instructions = captured_instructions
+            .first()
+            .and_then(Option::as_deref)
+            .context("instructions")?;
+        assert!(!instructions.contains("supportive teammate as much as code quality"));
+        assert!(!instructions.contains("deeply pragmatic, effective software engineer"));
+
+        let events = store.events_for_session(&session_id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == PERSONALITY_CONTEXT_EVENT)
+                .count(),
+            0
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_model_instructions_file_overrides_inline_instructions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(codex_home.join("instructions.md"), " file instructions \n")?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "instructions = \"inline instructions\"\nmodel_instructions_file = \"instructions.md\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture file instructions",
+                &project,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_instructions(),
+            vec![Some("file instructions".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_model_instructions_file_beats_higher_layer_inline_instructions() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(codex_home.join("instructions.md"), "file wins")?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_instructions_file = \"instructions.md\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+        let options = AgentRunOptions::default().with_config_overrides(vec![(
+            "instructions".to_string(),
+            toml::Value::String("higher layer inline instructions".to_string()),
+        )]);
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture cross-key instructions",
+                &project,
+                options,
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_instructions(),
+            vec![Some("file wins".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_managed_instructions_override_session_instructions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let managed_config = temp.path().join("managed_config.toml");
+        std::fs::write(codex_home.join("config.toml"), "")?;
+        std::fs::write(&managed_config, "instructions = \"managed base\"\n")?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+        let options = AgentRunOptions::default().with_config_overrides(vec![(
+            "instructions".to_string(),
+            toml::Value::String("session base".to_string()),
+        )]);
+
+        with_codex_home_and_managed_config(&codex_home, &managed_config, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture managed instructions",
+                &project,
+                options,
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_instructions(),
+            vec![Some("managed base".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_project_model_instructions_file_resolves_relative_to_dot_codex() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )?;
+        std::fs::write(
+            project.join(".codex").join("config.toml"),
+            "model_instructions_file = \"instructions.md\"\n",
+        )?;
+        std::fs::write(
+            project.join(".codex").join("instructions.md"),
+            "project file instructions",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture project file instructions",
+                &project,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_instructions(),
+            vec![Some("project file instructions".to_string())]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_rejects_empty_model_instructions_file_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(codex_home.join("empty.md"), "  \n")?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_instructions_file = \"empty.md\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        let error = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture empty instructions",
+                &project,
+                AgentRunOptions::default(),
+            )
+        })
+        .expect_err("empty model instructions file should fail");
+
+        assert!(
+            format!("{error:#}").contains("model instructions file is empty"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_uses_config_model_request_settings() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_reasoning_effort = \"high\"\nmodel_reasoning_summary = \"detailed\"\nmodel_supports_reasoning_summaries = true\nmodel_verbosity = \"high\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture model request settings",
+                &project,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_model_settings(),
+            vec![ModelRequestSettings {
+                reasoning_effort: Some("high".to_string()),
+                reasoning_summary: Some("detailed".to_string()),
+                model_supports_reasoning_summaries: Some(true),
+                text_verbosity: Some("high".to_string()),
+                service_tier: None,
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_uses_model_catalog_json_for_prompt_and_request_metadata() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("catalog.json"),
+            r#"{
+  "models": [
+    {
+      "slug": "gpt-5.4",
+      "display_name": "Catalog GPT",
+      "description": "Catalog override",
+      "default_reasoning_level": "low",
+      "supported_reasoning_levels": [{"effort": "low"}],
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "base_instructions": "Catalog base instructions",
+      "model_messages": {
+        "instructions_template": "Catalog prompt {{ personality }} :: {{ base_instructions }}",
+        "instructions_variables": {
+          "personality_default": "default catalog personality",
+          "personality_friendly": "friendly catalog personality",
+          "personality_pragmatic": "pragmatic catalog personality"
+        }
+      },
+      "supports_reasoning_summaries": true,
+      "default_reasoning_summary": "none",
+      "support_verbosity": true,
+      "default_verbosity": "medium",
+      "supports_parallel_tool_calls": false,
+	      "supports_image_detail_original": false,
+	      "input_modalities": ["text"],
+	      "context_window": 2500,
+	      "max_context_window": 3000,
+	      "truncation_policy": {"mode": "tokens", "limit": 123}
+	    }
+  ]
+}"#,
+        )?;
+        std::fs::write(
+	            codex_home.join("config.toml"),
+	            "model_catalog_json = \"catalog.json\"\nmodel_context_window = 5000\nmodel_auto_compact_token_limit = 2800\ntool_output_token_limit = 77\n",
+	        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture catalog metadata",
+                &project,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        let instructions = provider
+            .captured_instructions()
+            .first()
+            .and_then(Option::as_deref)
+            .context("captured instructions")?
+            .to_string();
+        assert!(instructions.starts_with(
+            "Catalog prompt pragmatic catalog personality :: {{ base_instructions }}"
+        ));
+        let model_info = provider
+            .captured_model_request_infos()
+            .into_iter()
+            .next()
+            .flatten()
+            .context("model request info")?;
+        assert_eq!(model_info.default_reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(model_info.default_verbosity.as_deref(), Some("medium"));
+        assert!(!model_info.supports_parallel_tool_calls);
+        assert!(!model_info.supports_image_input);
+        assert!(!model_info.supports_image_detail_original);
+        assert_eq!(model_info.context_window, Some(3000));
+        assert_eq!(model_info.auto_compact_token_limit(), Some(2700));
+        assert_eq!(model_info.tool_output_token_budget(), 77);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_uses_fresh_models_cache_when_no_catalog_json_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("models_cache.json"),
+            format!(
+                r#"{{
+  "fetched_at": "{}",
+  "client_version": "{}",
+  "etag": "etag-test",
+  "models": [
+    {{
+      "slug": "gpt-5.4",
+      "display_name": "Cached GPT",
+      "description": "Cached override",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [{{"effort": "high"}}],
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "base_instructions": "Cached base instructions",
+      "supports_reasoning_summaries": true,
+      "default_reasoning_summary": "detailed",
+      "supports_parallel_tool_calls": false,
+      "input_modalities": ["text"]
+    }}
+  ]
+}}"#,
+                Utc::now().to_rfc3339(),
+                codex_client_version_to_whole()
+            ),
+        )?;
+        std::fs::write(codex_home.join("config.toml"), "")?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture cached catalog metadata",
+                &project,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        let captured_instructions = provider.captured_instructions();
+        let instructions = captured_instructions
+            .first()
+            .and_then(Option::as_deref)
+            .context("captured instructions")?;
+        assert!(instructions.starts_with("Cached base instructions"));
+        let model_info = provider
+            .captured_model_request_infos()
+            .into_iter()
+            .next()
+            .flatten()
+            .context("model request info")?;
+        assert_eq!(model_info.default_reasoning_effort.as_deref(), Some("high"));
+        assert!(!model_info.supports_parallel_tool_calls);
+        assert!(!model_info.supports_image_input);
+        Ok(())
+    }
+
+    #[test]
+    fn model_catalog_fetches_remote_models_and_persists_cache_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let remote_body = r#"{
+  "models": [
+    {
+      "slug": "remote-catalog-model",
+      "display_name": "Remote Catalog Model",
+      "description": "Remote model",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "base_instructions": "Remote base instructions",
+      "supports_parallel_tool_calls": true,
+      "input_modalities": ["text"]
+    }
+  ]
+}"#
+        .to_string();
+        let (base_url, requests, handle) = spawn_models_server(remote_body, "\"etag-remote\"")?;
+        let store = Store::open(temp.path().join("state"))?;
+        store.set_setting("auth.codex.access_token", "codex-token")?;
+        store.set_setting("auth.codex.account_id", "codex-account")?;
+        store.set_setting("auth.codex.base_url", &base_url)?;
+        let session = store.create_session(None, temp.path())?;
+        let mut config = AgentsMdConfig::default();
+
+        with_codex_home(&codex_home, || {
+            refresh_model_catalog_online(
+                &store,
+                &session,
+                &AgentRunOptions::default(),
+                &mut config,
+                "codex",
+                "codex",
+            )
+        })?;
+
+        let request = requests.recv_timeout(Duration::from_secs(2))?;
+        let _ = handle.join();
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request.starts_with("GET /codex/models?client_version="));
+        assert!(request_lower.contains("authorization: bearer codex-token"));
+        assert!(request_lower.contains("chatgpt-account-id: codex-account"));
+
+        let catalog = config.model_catalog.context("remote catalog")?;
+        assert_eq!(catalog.models.len(), 1);
+        assert_eq!(catalog.models[0].slug, "remote-catalog-model");
+        assert_eq!(
+            config.model_catalog_cache_etag.as_deref(),
+            Some("\"etag-remote\"")
+        );
+
+        let cache_path = codex_home.join("models_cache.json");
+        let cache: Value = serde_json::from_str(&std::fs::read_to_string(cache_path)?)?;
+        assert_eq!(cache["etag"], "\"etag-remote\"");
+        assert_eq!(cache["client_version"], codex_client_version_to_whole());
+        assert_eq!(cache["models"][0]["slug"], "remote-catalog-model");
+        Ok(())
+    }
+
+    #[test]
+    fn model_catalog_fetches_command_auth_provider_models_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let auth_cwd = temp.path().join("auth-cwd");
+        std::fs::create_dir_all(&auth_cwd)?;
+        let remote_body = r#"{
+  "models": [
+    {
+      "slug": "command-catalog-model",
+      "display_name": "Command Catalog Model",
+      "description": "Command auth model",
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "base_instructions": "Command base instructions",
+      "supports_parallel_tool_calls": true,
+      "input_modalities": ["text"]
+    }
+  ]
+}"#
+        .to_string();
+        let (base_url, requests, handle) = spawn_models_server(remote_body, "\"etag-command\"")?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let mut config = AgentsMdConfig::default();
+        config.model_providers.insert(
+            "corp".to_string(),
+            CodexModelProviderConfig {
+                name: "Corp".to_string(),
+                base_url: Some(format!("{base_url}/v1")),
+                auth: Some(ProviderCommandAuthConfig {
+                    command: "sh".to_string(),
+                    args: vec![
+                        "-c".to_string(),
+                        "pwd >/dev/null; echo command-token".to_string(),
+                    ],
+                    timeout_ms: 5_000,
+                    refresh_interval_ms: 300_000,
+                    cwd: auth_cwd,
+                }),
+                ..CodexModelProviderConfig::default()
+            },
+        );
+
+        with_codex_home(&codex_home, || {
+            refresh_model_catalog_online(
+                &store,
+                &session,
+                &AgentRunOptions::default(),
+                &mut config,
+                "corp",
+                "corp",
+            )
+        })?;
+
+        let request = requests.recv_timeout(Duration::from_secs(2))?;
+        let _ = handle.join();
+        let request_lower = request.to_ascii_lowercase();
+        assert!(request.starts_with("GET /v1/models?client_version="));
+        assert!(request_lower.contains("authorization: bearer command-token"));
+
+        let catalog = config.model_catalog.context("remote catalog")?;
+        assert_eq!(catalog.models[0].slug, "command-catalog-model");
+        assert_eq!(
+            config.model_catalog_cache_etag.as_deref(),
+            Some("\"etag-command\"")
+        );
+        let cache: Value = serde_json::from_str(&std::fs::read_to_string(
+            codex_home.join("models_cache.json"),
+        )?)?;
+        assert_eq!(cache["etag"], "\"etag-command\"");
+        assert_eq!(cache["models"][0]["slug"], "command-catalog-model");
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_provider_auth_keeps_refresh_token_for_401_recovery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        store.set_setting("account", "Claude Code login")?;
+        store.set_setting("auth.claude_code.access_token", "stale-claude-token")?;
+        store.set_setting("auth.claude_code.refresh_token", "refresh-token")?;
+        store.set_setting("auth.claude_code.expires_ms", "9999999999999")?;
+
+        match claude_code_provider_auth(&store)? {
+            ClaudeCodeProviderAuth::Refreshable(credential) => {
+                assert_eq!(credential.access_token, "stale-claude-token");
+                assert_eq!(credential.refresh_token, "refresh-token");
+                assert_eq!(credential.expires_ms, 9_999_999_999_999);
+            }
+            ClaudeCodeProviderAuth::StaticToken(_) => {
+                bail!("Claude Code OAuth credential should remain refreshable")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn claude_code_provider_auth_static_token_has_no_401_recovery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        store.set_setting("account", "Claude Code login")?;
+        store.set_setting("auth.claude_code.access_token", "static-claude-token")?;
+
+        match claude_code_provider_auth(&store)? {
+            ClaudeCodeProviderAuth::StaticToken(token) => {
+                assert_eq!(token, "static-claude-token");
+            }
+            ClaudeCodeProviderAuth::Refreshable(_) => {
+                bail!("Claude Code static token should not gain OAuth 401 recovery")
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn stored_codex_managed_auth_preserves_refresh_source_for_401_recovery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let auth_path = temp.path().join("auth.json");
+        store.set_setting("auth.codex.access_token", "stale-codex-token")?;
+        store.set_setting("auth.codex.account_id", "codex-account")?;
+        store.set_setting("auth.codex.id_token", "id-token")?;
+        store.set_setting("auth.codex.refresh_token", "refresh-token")?;
+        store.set_setting(
+            "auth.codex.source_path",
+            auth_path.to_string_lossy().as_ref(),
+        )?;
+        store.set_setting("auth.codex.last_refresh", "2026-05-25T00:00:00Z")?;
+
+        let managed = stored_codex_managed_auth(&store)?.context("managed auth")?;
+        let snapshot = managed.current_snapshot()?;
+
+        assert_eq!(snapshot.access_token, "stale-codex-token");
+        assert_eq!(snapshot.account_id, "codex-account");
+        assert_eq!(snapshot.id_token.as_deref(), Some("id-token"));
+        assert_eq!(snapshot.refresh_token.as_deref(), Some("refresh-token"));
+        assert_eq!(snapshot.source_path.as_deref(), Some(auth_path.as_path()));
+        assert!(snapshot.last_refresh.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn stored_codex_static_auth_has_no_managed_401_recovery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        store.set_setting("auth.codex.access_token", "static-codex-token")?;
+        store.set_setting("auth.codex.account_id", "codex-account")?;
+
+        assert!(stored_codex_managed_auth(&store)?.is_none());
+        assert_eq!(
+            stored_codex_auth(&store)?,
+            Some(CodexAuth::new("static-codex-token", "codex-account"))
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn matching_models_etag_renews_cache_ttl_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("models_cache.json"),
+            format!(
+                r#"{{
+  "fetched_at": "1970-01-01T00:00:00+00:00",
+  "client_version": "{}",
+  "etag": "\"etag-match\"",
+  "models": []
+}}"#,
+                codex_client_version_to_whole()
+            ),
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let mut config = AgentsMdConfig::default();
+        config.model_catalog_cache_etag = Some("\"etag-match\"".to_string());
+
+        with_codex_home(&codex_home, || {
+            refresh_model_catalog_after_models_etag(
+                &store,
+                &session,
+                &AgentRunOptions::default(),
+                &mut config,
+                "codex",
+                "codex",
+                "\"etag-match\"",
+            )
+        })?;
+
+        let cache: Value = serde_json::from_str(&std::fs::read_to_string(
+            codex_home.join("models_cache.json"),
+        )?)?;
+        assert_ne!(
+            cache["fetched_at"].as_str(),
+            Some("1970-01-01T00:00:00+00:00")
+        );
+        assert_eq!(cache["etag"], "\"etag-match\"");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_models_etag_event_renews_cache_ttl_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let old_fetched_at = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
+        std::fs::write(
+            codex_home.join("models_cache.json"),
+            format!(
+                r#"{{
+  "fetched_at": "{old_fetched_at}",
+  "client_version": "{}",
+  "etag": "\"etag-event\"",
+  "models": []
+}}"#,
+                codex_client_version_to_whole()
+            ),
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = FakeProvider::new(vec![
+            ModelEvent::ModelsEtag {
+                etag: "\"etag-event\"".to_string(),
+            },
+            ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: "done_after_etag".to_string(),
+                    name: "done".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({"result": "etag ok"}),
+                },
+            },
+            ModelEvent::Done,
+        ]);
+        let options = AgentRunOptions::default().with_model_provider_id("codex");
+
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(&store, &provider, "refresh etag", &project, options)
+        })?;
+
+        let cache: Value = serde_json::from_str(&std::fs::read_to_string(
+            codex_home.join("models_cache.json"),
+        )?)?;
+        assert_ne!(cache["fetched_at"].as_str(), Some(old_fetched_at.as_str()));
+        assert_eq!(cache["etag"], "\"etag-event\"");
+        assert!(store
+            .events_for_session(&session_id)?
+            .iter()
+            .any(|event| event.event_type == "model.models_etag"));
+        Ok(())
+    }
+
+    #[test]
+    fn remote_models_merge_with_bundled_when_not_authoritative_like_codex() {
+        let catalog = model_catalog_from_remote_models(
+            vec![ModelCatalogEntryInfo {
+                slug: "hidden-remote-model".to_string(),
+                display_name: "Hidden Remote".to_string(),
+                description: None,
+                default_reasoning_level: None,
+                supported_reasoning_levels: Vec::new(),
+                visibility: "none".to_string(),
+                supported_in_api: true,
+                priority: 0,
+                service_tiers: Vec::new(),
+                default_service_tier: None,
+                base_instructions: "hidden remote".to_string(),
+                model_messages: None,
+                supports_reasoning_summaries: false,
+                default_reasoning_summary: "auto".to_string(),
+                support_verbosity: false,
+                default_verbosity: None,
+                supports_parallel_tool_calls: false,
+                supports_image_detail_original: false,
+                input_modalities: vec!["text".to_string()],
+                context_window: None,
+                max_context_window: None,
+                auto_compact_token_limit: None,
+                truncation_policy: browser_use_providers::default_model_truncation_policy(),
+            }],
+            true,
+        );
+        assert!(catalog
+            .models
+            .iter()
+            .any(|model| model.slug == "hidden-remote-model"));
+        assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.5"));
+    }
+
+    #[test]
+    fn provider_turn_uses_model_provider_request_max_retries_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+        let options = AgentRunOptions::default()
+            .with_model_provider_id("openrouter")
+            .with_config_overrides(vec![
+                (
+                    "model_providers.openrouter.name".to_string(),
+                    toml::Value::String("OpenRouter".to_string()),
+                ),
+                (
+                    "model_providers.openrouter.base_url".to_string(),
+                    toml::Value::String("https://openrouter.ai/api/v1".to_string()),
+                ),
+                (
+                    "model_providers.openrouter.request_max_retries".to_string(),
+                    toml::Value::Integer(150),
+                ),
+                (
+                    "model_providers.openrouter.stream_max_retries".to_string(),
+                    toml::Value::Integer(150),
+                ),
+                (
+                    "model_providers.openrouter.stream_idle_timeout_ms".to_string(),
+                    toml::Value::Integer(9_000),
+                ),
+            ]);
+
+        run_agent_with_provider(
+            &store,
+            &provider,
+            "capture request retries",
+            &project,
+            options,
+        )?;
+        let session = store.list_sessions()?.remove(0);
+        let run = store.runs_for_session(&session.id)?.remove(0);
+
+        assert_eq!(provider.captured_request_max_retries(), vec![Some(100)]);
+        assert_eq!(provider.captured_stream_max_retries(), vec![Some(100)]);
+        assert_eq!(
+            provider.captured_stream_idle_timeout_ms(),
+            vec![Some(9_000)]
+        );
+        let captured_metadata = provider.captured_client_metadata();
+        let installation_id = captured_metadata
+            .first()
+            .and_then(|metadata| metadata.as_ref())
+            .and_then(|metadata| metadata.get(CODEX_INSTALLATION_ID_HEADER));
+        assert!(installation_id.is_some_and(|value| !value.is_empty()));
+        let captured_headers = provider.captured_extra_headers();
+        let turn_metadata_header = captured_headers
+            .first()
+            .and_then(|headers| headers.as_ref())
+            .and_then(|headers| headers.get(CODEX_TURN_METADATA_HEADER))
+            .expect("turn metadata header");
+        let turn_metadata: Value = serde_json::from_str(turn_metadata_header)?;
+        assert_eq!(
+            turn_metadata["session_id"].as_str(),
+            Some(session.id.as_str())
+        );
+        assert_eq!(
+            turn_metadata["thread_id"].as_str(),
+            Some(session.id.as_str())
+        );
+        assert_eq!(turn_metadata["thread_source"].as_str(), Some("user"));
+        assert_eq!(turn_metadata["turn_id"].as_str(), Some(run.id.as_str()));
+        assert_eq!(turn_metadata["sandbox"].as_str(), Some("none"));
+        assert!(turn_metadata["turn_started_at_unix_ms"].as_i64().is_some());
+        assert_eq!(provider.captured_turn_state_present(), vec![true]);
+        Ok(())
+    }
+
+    #[test]
+    fn model_provider_config_parses_codex_request_shape_fields() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+model_provider = "corp"
+
+[model_providers.corp]
+name = "Corp"
+base_url = "https://corp.example.test/v1"
+env_key = "CORP_API_KEY"
+env_key_instructions = "set CORP_API_KEY"
+wire_api = "responses"
+request_max_retries = 150
+stream_max_retries = 150
+stream_idle_timeout_ms = 9000
+websocket_connect_timeout_ms = 15000
+requires_openai_auth = false
+supports_websockets = true
+
+[model_providers.corp.query_params]
+api-version = "2026-05-25"
+
+[model_providers.corp.http_headers]
+x-static = "yes"
+
+[model_providers.corp.env_http_headers]
+x-env = "CORP_HEADER"
+x-missing = "CORP_MISSING_HEADER"
+"#,
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+
+        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let _api_key = EnvVarGuard::set_str("CORP_API_KEY", "corp-token");
+            let _header = EnvVarGuard::set_str("CORP_HEADER", "present");
+            let _missing = EnvVarGuard::remove("CORP_MISSING_HEADER");
+            let mut warnings = Vec::new();
+            load_agents_md_config(&project, &mut warnings, None, &[])
+        })?;
+
+        assert_eq!(config.model_provider_id.as_deref(), Some("corp"));
+        assert_eq!(
+            config.provider_request_max_retries.get("corp").copied(),
+            Some(100)
+        );
+        assert_eq!(
+            config.provider_stream_max_retries.get("corp").copied(),
+            Some(100)
+        );
+        assert_eq!(
+            config.provider_stream_idle_timeout_ms.get("corp").copied(),
+            Some(9000)
+        );
+        let provider = config.model_providers.get("corp").expect("corp provider");
+        assert_eq!(provider.websocket_connect_timeout_ms, Some(15000));
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some("https://corp.example.test/v1")
+        );
+        assert_eq!(
+            provider.query_params.get("api-version").map(String::as_str),
+            Some("2026-05-25")
+        );
+        assert_eq!(
+            provider.http_headers.get("x-static").map(String::as_str),
+            Some("yes")
+        );
+
+        let _header = EnvVarGuard::set_str("CORP_HEADER", "present");
+        let _missing = EnvVarGuard::remove("CORP_MISSING_HEADER");
+        let request_options = provider_request_options(provider);
+        assert_eq!(
+            request_options.query_params,
+            vec![("api-version".to_string(), "2026-05-25".to_string())]
+        );
+        assert_eq!(
+            request_options.headers.get("x-static").map(String::as_str),
+            Some("yes")
+        );
+        assert_eq!(
+            request_options.headers.get("x-env").map(String::as_str),
+            Some("present")
+        );
+        assert!(!request_options.headers.contains_key("x-missing"));
+
+        let store = Store::open(temp.path().join("state"))?;
+        let _api_key = EnvVarGuard::set_str("CORP_API_KEY", "corp-token");
+        let provider =
+            configured_openai_responses_provider(&store, "gpt-5.5".to_string(), &config, "corp")?
+                .expect("configured provider");
+        assert_eq!(provider.provider_name(), "corp");
+        Ok(())
+    }
+
+    #[test]
+    fn model_provider_config_parses_command_auth_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+[model_providers.corp]
+name = "Corp"
+base_url = "https://corp.example.test/v1"
+
+[model_providers.corp.auth]
+command = "./scripts/print-token"
+args = ["  keep spaces  ", "dup", "dup"]
+timeout_ms = 1234
+refresh_interval_ms = 0
+cwd = "auth-cwd"
+"#,
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+
+        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let mut warnings = Vec::new();
+            load_agents_md_config(&project, &mut warnings, None, &[])
+        })?;
+
+        let provider = config.model_providers.get("corp").expect("corp provider");
+        let auth = provider.auth.as_ref().context("provider auth")?;
+        assert_eq!(auth.command, "./scripts/print-token");
+        assert_eq!(
+            auth.args,
+            vec![
+                "  keep spaces  ".to_string(),
+                "dup".to_string(),
+                "dup".to_string()
+            ]
+        );
+        assert_eq!(auth.timeout_ms, 1234);
+        assert_eq!(auth.refresh_interval_ms, 0);
+        assert_eq!(auth.cwd, codex_home.join("auth-cwd"));
+        Ok(())
+    }
+
+    #[test]
+    fn amazon_bedrock_provider_override_uses_static_catalog_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("models_cache.json"),
+            format!(
+                r#"{{
+  "fetched_at": "{}",
+  "client_version": "{}",
+  "etag": "etag-cache",
+  "models": [
+    {{
+      "slug": "cached-model",
+      "display_name": "Cached",
+      "description": "Cached",
+      "default_reasoning_level": "high",
+      "supported_reasoning_levels": [{{"effort": "high"}}],
+      "visibility": "list",
+      "supported_in_api": true,
+      "priority": 0,
+      "base_instructions": "Cached base",
+      "supports_reasoning_summaries": true,
+      "default_reasoning_summary": "none",
+      "input_modalities": ["text"]
+    }}
+  ]
+}}"#,
+                Utc::now().to_rfc3339(),
+                codex_client_version_to_whole()
+            ),
+        )?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+model_provider = "amazon-bedrock"
+
+[model_providers.amazon-bedrock.aws]
+profile = "prod"
+region = "us-west-2"
+"#,
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+
+        let (config, default_model) = with_codex_home(&codex_home, || -> Result<_> {
+            let mut warnings = Vec::new();
+            let config = load_agents_md_config(&project, &mut warnings, None, &[])?;
+            let default_model = default_model_for_cwd_with_options(&project, None, &[], true)?;
+            Ok((config, default_model))
+        })?;
+
+        assert_eq!(
+            config.model_provider_id.as_deref(),
+            Some(AMAZON_BEDROCK_PROVIDER_ID)
+        );
+        let provider = config
+            .model_providers
+            .get(AMAZON_BEDROCK_PROVIDER_ID)
+            .context("amazon bedrock provider")?;
+        assert_eq!(provider.name, AMAZON_BEDROCK_PROVIDER_NAME);
+        assert_eq!(
+            provider.base_url.as_deref(),
+            Some(AMAZON_BEDROCK_DEFAULT_BASE_URL)
+        );
+        assert!(!provider.requires_openai_auth);
+        assert!(!provider.supports_websockets);
+        assert_eq!(
+            provider
+                .http_headers
+                .get(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_HEADER)
+                .map(String::as_str),
+            Some(AMAZON_BEDROCK_MANTLE_CLIENT_AGENT_VALUE)
+        );
+        assert_eq!(
+            provider.aws.as_ref().and_then(|aws| aws.profile.as_deref()),
+            Some("prod")
+        );
+        assert_eq!(
+            provider.aws.as_ref().and_then(|aws| aws.region.as_deref()),
+            Some("us-west-2")
+        );
+        let catalog = config.model_catalog.as_ref().context("bedrock catalog")?;
+        assert!(!config.model_catalog_refresh_allowed);
+        assert_eq!(config.model_catalog_cache_etag.as_deref(), None);
+        assert_eq!(catalog.models[0].slug, "openai.gpt-5.4");
+        assert!(!catalog
+            .models
+            .iter()
+            .any(|model| model.slug == "cached-model"));
+        assert_eq!(default_model, "openai.gpt-5.4");
+
+        let snapshot = model_provider_info_snapshot(AMAZON_BEDROCK_PROVIDER_ID, provider);
+        let restored = codex_model_provider_config_from_snapshot(&snapshot)?;
+        assert_eq!(restored.aws, provider.aws);
+        Ok(())
+    }
+
+    #[test]
+    fn amazon_bedrock_provider_override_rejects_non_aws_fields_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"
+[model_providers.amazon-bedrock]
+base_url = "https://example.test/v1"
+"#,
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+
+        let error = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+            let mut warnings = Vec::new();
+            load_agents_md_config(&project, &mut warnings, None, &[])
+        })
+        .expect_err("bedrock non-aws override should fail");
+
+        assert!(
+            format!("{error:#}").contains("only supports changing `aws.profile` and `aws.region`"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn amazon_bedrock_bearer_auth_requires_region_like_codex() -> Result<()> {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
+        let _token = EnvVarGuard::set_str(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR, "bedrock-token");
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let config = AgentsMdConfig::default();
+
+        let error = configured_openai_responses_provider(
+            &store,
+            "openai.gpt-5.4".to_string(),
+            &config,
+            AMAZON_BEDROCK_PROVIDER_ID,
+        )
+        .expect_err("bedrock bearer token without region should fail");
+
+        assert!(
+            format!("{error:#}").contains(
+                "Amazon Bedrock bearer token auth requires `model_providers.amazon-bedrock.aws.region`"
+            ),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn amazon_bedrock_bearer_auth_constructs_region_provider_like_codex() -> Result<()> {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
+        let _token = EnvVarGuard::set_str(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR, "bedrock-token");
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let mut config = AgentsMdConfig::default();
+        config.model_providers.insert(
+            AMAZON_BEDROCK_PROVIDER_ID.to_string(),
+            amazon_bedrock_model_provider_config(ModelProviderAwsAuthInfo {
+                profile: Some("prod".to_string()),
+                region: Some("us-west-2".to_string()),
+            }),
+        );
+
+        let provider = configured_openai_responses_provider(
+            &store,
+            "openai.gpt-5.4".to_string(),
+            &config,
+            AMAZON_BEDROCK_PROVIDER_ID,
+        )?
+        .context("bedrock provider")?;
+
+        assert_eq!(provider.provider_name(), AMAZON_BEDROCK_PROVIDER_ID);
+        assert_eq!(provider.model_name(), "openai.gpt-5.4");
+        assert_eq!(
+            amazon_bedrock_base_url("us-west-2")?,
+            "https://bedrock-mantle.us-west-2.api.aws/openai/v1"
+        );
+        let invalid_region = amazon_bedrock_base_url("antarctica-test-1")
+            .expect_err("unsupported Bedrock region should fail");
+        assert!(
+            format!("{invalid_region:#}")
+                .contains("Amazon Bedrock Mantle does not support region `antarctica-test-1`"),
+            "{invalid_region:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn amazon_bedrock_sigv4_auth_constructs_provider_without_bearer_token_like_codex() -> Result<()>
+    {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
+        let _token = EnvVarGuard::remove(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR);
+        let _metadata_disabled = EnvVarGuard::set_str("AWS_EC2_METADATA_DISABLED", "true");
+        let _profile = EnvVarGuard::remove("AWS_PROFILE");
+        let _region = EnvVarGuard::remove("AWS_REGION");
+        let _default_region = EnvVarGuard::remove("AWS_DEFAULT_REGION");
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let mut config = AgentsMdConfig::default();
+        config.model_providers.insert(
+            AMAZON_BEDROCK_PROVIDER_ID.to_string(),
+            amazon_bedrock_model_provider_config(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: Some("us-east-1".to_string()),
+            }),
+        );
+
+        let provider = configured_openai_responses_provider(
+            &store,
+            "openai.gpt-5.4".to_string(),
+            &config,
+            AMAZON_BEDROCK_PROVIDER_ID,
+        )?
+        .context("bedrock provider")?;
+
+        assert_eq!(provider.provider_name(), AMAZON_BEDROCK_PROVIDER_ID);
+        assert_eq!(provider.model_name(), "openai.gpt-5.4");
+        Ok(())
+    }
+
+    #[test]
+    fn amazon_bedrock_sigv4_auth_rejects_unsupported_runtime_region_like_codex() -> Result<()> {
+        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
+        let _token = EnvVarGuard::remove(AWS_BEARER_TOKEN_BEDROCK_ENV_VAR);
+        let _metadata_disabled = EnvVarGuard::set_str("AWS_EC2_METADATA_DISABLED", "true");
+        let _profile = EnvVarGuard::remove("AWS_PROFILE");
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let mut config = AgentsMdConfig::default();
+        config.model_providers.insert(
+            AMAZON_BEDROCK_PROVIDER_ID.to_string(),
+            amazon_bedrock_model_provider_config(ModelProviderAwsAuthInfo {
+                profile: None,
+                region: Some("antarctica-test-1".to_string()),
+            }),
+        );
+
+        let error = configured_openai_responses_provider(
+            &store,
+            "openai.gpt-5.4".to_string(),
+            &config,
+            AMAZON_BEDROCK_PROVIDER_ID,
+        )
+        .expect_err("unsupported Bedrock runtime region should fail");
+
+        assert!(
+            format!("{error:#}")
+                .contains("Amazon Bedrock Mantle does not support region `antarctica-test-1`"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_provider_config_rejects_invalid_command_auth_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config_path = temp.path().join("config.toml");
+
+        for (toml_body, expected) in [
+            (
+                r#"
+[model_providers.corp]
+name = "Corp"
+
+[model_providers.corp.auth]
+command = " "
+"#,
+                "provider auth.command must not be empty",
+            ),
+            (
+                r#"
+[model_providers.corp]
+name = "Corp"
+
+[model_providers.corp.auth]
+command = "print-token"
+timeout_ms = 0
+"#,
+                "auth.timeout_ms",
+            ),
+            (
+                r#"
+[model_providers.corp]
+name = "Corp"
+env_key = "CORP_API_KEY"
+
+[model_providers.corp.auth]
+command = "print-token"
+"#,
+                "provider auth cannot be combined with env_key",
+            ),
+            (
+                r#"
+[model_providers.corp]
+name = "Corp"
+experimental_bearer_token = "token"
+
+[model_providers.corp.auth]
+command = "print-token"
+"#,
+                "provider auth cannot be combined with experimental_bearer_token",
+            ),
+            (
+                r#"
+[model_providers.corp]
+name = "Corp"
+requires_openai_auth = true
+
+[model_providers.corp.auth]
+command = "print-token"
+"#,
+                "provider auth cannot be combined with requires_openai_auth",
+            ),
+        ] {
+            let value = toml_body.parse::<toml::Value>()?;
+            let provider_value = value
+                .get("model_providers")
+                .and_then(toml::Value::as_table)
+                .and_then(|providers| providers.get("corp"))
+                .context("corp provider table")?;
+            let mut provider = CodexModelProviderConfig::default();
+            let error = apply_model_provider_config_table(
+                &mut provider,
+                "corp",
+                provider_value,
+                &config_path,
+                temp.path(),
+            )
+            .and_then(|_| validate_model_provider_config("corp", &provider))
+            .expect_err("invalid command auth should fail");
+            assert!(
+                format!("{error:#}").contains(expected),
+                "expected {expected:?} in {error:#}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn model_provider_request_retry_config_rejects_missing_name_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+        let options = AgentRunOptions::default()
+            .with_model_provider_id("openrouter")
+            .with_config_overrides(vec![(
+                "model_providers.openrouter.request_max_retries".to_string(),
+                toml::Value::Integer(1),
+            )]);
+
+        let error = run_agent_with_provider(
+            &store,
+            &provider,
+            "capture request retries",
+            &project,
+            options,
+        )
+        .expect_err("missing provider name should fail like Codex");
+
+        assert!(
+            format!("{error:#}")
+                .contains("model_providers.openrouter: provider name must not be empty"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn model_provider_request_retry_config_rejects_reserved_provider_id_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+        let options = AgentRunOptions::default()
+            .with_model_provider_id("openai")
+            .with_config_overrides(vec![
+                (
+                    "model_providers.openai.name".to_string(),
+                    toml::Value::String("OpenAI Proxy".to_string()),
+                ),
+                (
+                    "model_providers.openai.base_url".to_string(),
+                    toml::Value::String("https://example.test/v1".to_string()),
+                ),
+                (
+                    "model_providers.openai.request_max_retries".to_string(),
+                    toml::Value::Integer(1),
+                ),
+            ]);
+
+        let error = run_agent_with_provider(
+            &store,
+            &provider,
+            "capture request retries",
+            &project,
+            options,
+        )
+        .expect_err("reserved provider id should fail like Codex");
+
+        assert!(
+            format!("{error:#}").contains("reserved built-in provider IDs"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn run_config_fails_when_selected_provider_id_cannot_be_honored() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({ "text": "hello" }),
+        )?;
+        let config = ProviderRunConfig::new(ProviderBackend::Codex, "openai.gpt-5.4").with_options(
+            AgentRunOptions::default().with_config_overrides(vec![(
+                "model_provider".to_string(),
+                toml::Value::String("missing-provider".to_string()),
+            )]),
+        );
+
+        let error = run_existing_session_from_config(&store, &session.id, config)
+            .expect_err("missing provider id should not fall back");
+
+        assert!(
+            error
+                .to_string()
+                .contains("Model provider `missing-provider` is not available"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mode_uses_codex_medium_reasoning_preset() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_reasoning_effort = \"high\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "plan this",
+                &project,
+                AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan),
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_model_settings()[0]
+                .reasoning_effort
+                .as_deref(),
+            Some("medium")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mode_reasoning_effort_config_overrides_preset_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_reasoning_effort = \"high\"\nplan_mode_reasoning_effort = \"low\"\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "plan this",
+                &project,
+                AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan),
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_model_settings()[0]
+                .reasoning_effort
+                .as_deref(),
+            Some("low")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_uses_run_options_final_output_schema_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+        let schema = serde_json::json!({
+            "type": "object",
+            "properties": {
+                "answer": { "type": "string" }
+            },
+            "required": ["answer"],
+            "additionalProperties": false
+        });
+
+        run_agent_with_provider(
+            &store,
+            &provider,
+            "capture final schema",
+            temp.path(),
+            AgentRunOptions::default().with_final_output_json_schema(schema.clone(), false),
+        )?;
+
+        assert_eq!(provider.captured_output_schemas(), vec![Some(schema)]);
+        assert_eq!(provider.captured_output_schema_strict(), vec![false]);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_persists_context_baseline_per_real_turn() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "capture first baseline",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "capture second baseline"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            Ok(session_id)
+        })?;
+
+        let events = store.events_for_session(&session_id)?;
+        let turn_seqs = events
+            .iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+            })
+            .map(|event| event.seq)
+            .collect::<Vec<_>>();
+        let baseline_events = events
+            .iter()
+            .filter(|event| event.event_type == CONTEXT_BASELINE_EVENT)
+            .collect::<Vec<_>>();
+        let baseline_turn_seqs = baseline_events
+            .iter()
+            .filter_map(|event| event.payload.get("turn_seq").and_then(Value::as_i64))
+            .collect::<Vec<_>>();
+
+        assert_eq!(baseline_turn_seqs, turn_seqs);
+        assert_eq!(baseline_events.len(), 2);
+        let project_cwd = project.display().to_string();
+        assert_eq!(
+            baseline_events[0].payload["cwd"].as_str(),
+            Some(project_cwd.as_str())
+        );
+        assert_eq!(
+            baseline_events[0].payload["provider"],
+            provider.provider_name()
+        );
+        assert_eq!(baseline_events[0].payload["model"], provider.model_name());
+        assert_eq!(baseline_events[0].payload["personality"], "pragmatic");
+        assert!(baseline_events[0]
+            .payload
+            .get("environment")
+            .is_some_and(|environment| environment.get("current_date").is_some()));
+        let turn_context = baseline_events[0]
+            .payload
+            .get("turn_context")
+            .context("missing Codex-shaped turn_context")?;
+        assert_eq!(turn_context["cwd"].as_str(), Some(project_cwd.as_str()));
+        assert_eq!(turn_context["provider"], provider.provider_name());
+        assert_eq!(turn_context["model"], provider.model_name());
+        assert_eq!(turn_context["collaboration_mode_kind"], "default");
+        assert!(turn_context
+            .get("current_date")
+            .is_some_and(|value| value.as_str().is_some()));
+        assert!(baseline_events[0]
+            .payload
+            .get("workspace_context_seqs")
+            .and_then(|value| value.get(WORKSPACE_CONTEXT_ENVIRONMENT_KIND))
+            .is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_reuses_session_config_snapshot_when_defaults_change() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_reasoning_effort = \"high\"\nmodel_context_window = 12000\nmodel_auto_compact_token_limit = 8000\ntool_output_token_limit = 123\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "capture first config",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            std::fs::write(
+                codex_home.join("config.toml"),
+                "model_reasoning_effort = \"low\"\nmodel_context_window = 5000\nmodel_auto_compact_token_limit = 3000\ntool_output_token_limit = 44\n",
+            )?;
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "capture resumed config"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default(),
+            )?;
+            Ok(session_id)
+        })?;
+
+        let settings = provider.captured_model_settings();
+        assert_eq!(settings.len(), 2);
+        assert_eq!(settings[0].reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(settings[1].reasoning_effort.as_deref(), Some("high"));
+
+        let infos = provider.captured_model_request_infos();
+        assert_eq!(infos.len(), 2);
+        let first_info = infos[0].as_ref().context("first model request info")?;
+        let resumed_info = infos[1].as_ref().context("resumed model request info")?;
+        assert_eq!(first_info.resolved_context_window(), Some(12000));
+        assert_eq!(resumed_info.resolved_context_window(), Some(12000));
+        assert_eq!(resumed_info.auto_compact_token_limit(), Some(8000));
+        assert_eq!(resumed_info.tool_output_token_budget(), 123);
+
+        let events = store.events_for_session(&session_id)?;
+        let snapshots = events
+            .iter()
+            .filter(|event| event.event_type == SESSION_CONFIG_SNAPSHOT_EVENT)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 2);
+        assert_eq!(snapshots[0].payload["model"], provider.model_name());
+        assert_eq!(
+            snapshots[0].payload["model_provider_id"],
+            provider.provider_name()
+        );
+        assert_eq!(snapshots[0].payload["collaboration_mode"], "default");
+        assert_eq!(
+            snapshots[0].payload["model_settings"]["reasoning_effort"],
+            "high"
+        );
+        assert_eq!(
+            snapshots[0].payload["model_request_info"]["context_window"],
+            12000
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_explicit_config_override_beats_session_config_snapshot() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_reasoning_effort = \"high\"\nmodel_context_window = 12000\ntool_output_token_limit = 123\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "capture first config",
+                &project,
+                AgentRunOptions::default(),
+            )?;
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "capture explicit override"}),
+            )?;
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session_id,
+                AgentRunOptions::default().with_config_overrides(vec![
+                    (
+                        "model_reasoning_effort".to_string(),
+                        toml::Value::String("low".to_string()),
+                    ),
+                    (
+                        "model_context_window".to_string(),
+                        toml::Value::Integer(5000),
+                    ),
+                    (
+                        "tool_output_token_limit".to_string(),
+                        toml::Value::Integer(44),
+                    ),
+                ]),
+            )?;
+            Ok(())
+        })?;
+
+        let settings = provider.captured_model_settings();
+        assert_eq!(settings.len(), 2);
+        assert_eq!(settings[0].reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(settings[1].reasoning_effort.as_deref(), Some("low"));
+
+        let infos = provider.captured_model_request_infos();
+        let resumed_info = infos[1].as_ref().context("resumed model request info")?;
+        assert_eq!(resumed_info.resolved_context_window(), Some(5000));
+        assert_eq!(resumed_info.tool_output_token_budget(), 44);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_resume_reuses_model_provider_info_snapshot_when_config_changes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let (base_a, requests_a, handle_a) = spawn_responses_capture_server_sequence(
+            vec![
+                responses_sse_body("resp-a1", "first done"),
+                responses_sse_body("resp-a2", "second done"),
+            ],
+            Duration::from_secs(20),
+        )?;
+        let (base_b, requests_b, handle_b) = spawn_responses_capture_server_sequence(
+            vec![responses_sse_body("resp-b1", "wrong server")],
+            Duration::from_millis(400),
+        )?;
+        write_corp_responses_provider_config(&codex_home, &base_a, "one", "first-static")?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let session_id = {
+                let _header = EnvVarGuard::set_str("CORP_HEADER", "first-env");
+                run_agent_from_config(
+                    &store,
+                    "capture first provider snapshot",
+                    &project,
+                    ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5"),
+                )?
+            };
+            write_corp_responses_provider_config(&codex_home, &base_b, "two", "second-static")?;
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "resume with changed provider config"}),
+            )?;
+            let _header = EnvVarGuard::set_str("CORP_HEADER", "second-env");
+            run_existing_session_from_config(
+                &store,
+                &session_id,
+                ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5")
+                    .with_model_source(RunConfigValueSource::Default)
+                    .with_options(AgentRunOptions::default().with_config_overrides(vec![(
+                        "model_providers.corp.base_url".to_string(),
+                        toml::Value::String(base_b.clone()),
+                    )])),
+            )?;
+            Ok(session_id)
+        })?;
+
+        let first_request = requests_a.recv_timeout(Duration::from_secs(2))?;
+        let resumed_request = requests_a.recv_timeout(Duration::from_secs(2))?;
+        assert!(requests_b.recv_timeout(Duration::from_millis(500)).is_err());
+        assert_eq!(handle_a.join().expect("join server A"), 2);
+        assert_eq!(handle_b.join().expect("join server B"), 0);
+
+        assert!(first_request
+            .request_line
+            .contains("/v1/responses?api-version=one"));
+        assert!(resumed_request
+            .request_line
+            .contains("/v1/responses?api-version=one"));
+        let first_headers = first_request.headers.to_ascii_lowercase();
+        let resumed_headers = resumed_request.headers.to_ascii_lowercase();
+        assert!(first_headers.contains("x-static: first-static"));
+        assert!(first_headers.contains("x-env: first-env"));
+        assert!(resumed_headers.contains("x-static: first-static"));
+        assert!(resumed_headers.contains("x-env: second-env"));
+
+        let events = store.events_for_session(&session_id)?;
+        let snapshots = events
+            .iter()
+            .filter(|event| event.event_type == SESSION_CONFIG_SNAPSHOT_EVENT)
+            .collect::<Vec<_>>();
+        assert_eq!(snapshots.len(), 2);
+        for snapshot in snapshots {
+            let provider_info = snapshot
+                .payload
+                .get("model_provider_info")
+                .context("missing model provider info snapshot")?;
+            assert_eq!(provider_info["id"].as_str(), Some("corp"));
+            assert_eq!(provider_info["base_url"].as_str(), Some(base_a.as_str()));
+            assert_eq!(provider_info["wire_api"].as_str(), Some("responses"));
+            assert_eq!(provider_info["query_params"]["api-version"], "one");
+            assert_eq!(provider_info["http_headers"]["x-static"], "first-static");
+            assert_eq!(provider_info["env_http_headers"]["x-env"], "CORP_HEADER");
+            assert_eq!(provider_info["websocket_connect_timeout_ms"], 15000);
+            assert_eq!(provider_info["supports_websockets"], true);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_resume_explicit_model_provider_uses_current_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let (base_a, requests_a, handle_a) = spawn_responses_capture_server_sequence(
+            vec![responses_sse_body("resp-a1", "first done")],
+            Duration::from_secs(20),
+        )?;
+        let (base_b, requests_b, handle_b) = spawn_responses_capture_server_sequence(
+            vec![responses_sse_body("resp-b1", "second done")],
+            Duration::from_secs(20),
+        )?;
+        write_corp_responses_provider_config(&codex_home, &base_a, "one", "first-static")?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+
+        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+            let _header = EnvVarGuard::set_str("CORP_HEADER", "first-env");
+            run_agent_from_config(
+                &store,
+                "capture first provider snapshot",
+                &project,
+                ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5"),
+            )
+        })?;
+        write_corp_responses_provider_config(&codex_home, &base_b, "two", "second-static")?;
+        with_codex_home(&codex_home, || -> Result<()> {
+            store.append_event(
+                &session_id,
+                "session.followup",
+                serde_json::json!({"text": "resume with explicit provider"}),
+            )?;
+            let _header = EnvVarGuard::set_str("CORP_HEADER", "second-env");
+            run_existing_session_from_config(
+                &store,
+                &session_id,
+                ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5")
+                    .with_model_source(RunConfigValueSource::Default)
+                    .with_options(AgentRunOptions::default().with_model_provider_id("corp")),
+            )?;
+            Ok(())
+        })?;
+
+        let first_request = requests_a.recv_timeout(Duration::from_secs(2))?;
+        let resumed_request = requests_b.recv_timeout(Duration::from_secs(2))?;
+        assert_eq!(handle_a.join().expect("join server A"), 1);
+        assert_eq!(handle_b.join().expect("join server B"), 1);
+
+        assert!(first_request
+            .request_line
+            .contains("/v1/responses?api-version=one"));
+        assert!(resumed_request
+            .request_line
+            .contains("/v1/responses?api-version=two"));
+        let resumed_headers = resumed_request.headers.to_ascii_lowercase();
+        assert!(resumed_headers.contains("x-static: second-static"));
+        assert!(resumed_headers.contains("x-env: second-env"));
+        Ok(())
+    }
+
+    #[test]
+    fn run_config_model_resume_override_matches_codex_app_server_rule() {
+        let default_resume = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.4")
+            .with_model_source(RunConfigValueSource::Default);
+        assert!(!run_config_has_model_resume_override(&default_resume));
+
+        let explicit_model = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.4");
+        assert!(run_config_has_model_resume_override(&explicit_model));
+
+        let explicit_provider = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.4")
+            .with_model_source(RunConfigValueSource::Default)
+            .with_options(AgentRunOptions::default().with_model_provider_id("openai"));
+        assert!(run_config_has_model_resume_override(&explicit_provider));
+
+        for key in ["model", "model_provider", "model_reasoning_effort"] {
+            let config = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.4")
+                .with_model_source(RunConfigValueSource::Default)
+                .with_options(AgentRunOptions::default().with_config_overrides(vec![(
+                    key.to_string(),
+                    toml::Value::String("override".to_string()),
+                )]));
+            assert!(
+                run_config_has_model_resume_override(&config),
+                "{key} should disable persisted model metadata"
+            );
+        }
+
+        let unrelated_override = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.4")
+            .with_model_source(RunConfigValueSource::Default)
+            .with_options(AgentRunOptions::default().with_config_overrides(vec![(
+                "model_context_window".to_string(),
+                toml::Value::Integer(12000),
+            )]));
+        assert!(!run_config_has_model_resume_override(&unrelated_override));
+    }
+
+    #[test]
+    fn provider_turn_reasoning_summary_support_false_overrides_lower_true() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "model_supports_reasoning_summaries = true\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture model support override",
+                &project,
+                AgentRunOptions::default().with_config_overrides(vec![(
+                    "model_supports_reasoning_summaries".to_string(),
+                    toml::Value::Boolean(false),
+                )]),
+            )
+        })?;
+
+        assert_eq!(
+            provider.captured_model_settings(),
+            vec![ModelRequestSettings {
+                model_supports_reasoning_summaries: Some(false),
+                ..Default::default()
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn provider_messages_replay_assistant_tool_outputs_and_images() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let image_path = temp.path().join("shot.png");
@@ -5525,7 +17725,3413 @@ mod tests {
         assert_eq!(messages[3]["role"], "assistant");
         assert_eq!(messages[3]["tool_calls"][0]["id"], "call_plan");
         assert_eq!(messages[4]["role"], "tool");
-        assert_eq!(messages[4]["content"], "plan updated");
+        assert_eq!(messages[4]["content"], "Plan updated");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_messages_prefer_persisted_response_input_item_tool_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "patch"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.response.output_item",
+            serde_json::json!({
+                "item": {
+                    "type": "custom_tool_call",
+                    "call_id": "call_patch",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch",
+                }
+            }),
+        )?;
+        store.append_event(
+            &session.id,
+            "tool.finished",
+            serde_json::json!({
+                "name": "apply_patch",
+                "tool_call_id": "call_patch",
+            }),
+        )?;
+        store.append_event(
+            &session.id,
+            MODEL_RESPONSE_INPUT_ITEM_EVENT,
+            serde_json::json!({
+                "name": "apply_patch",
+                "call_id": "call_patch",
+                "item": {
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_patch",
+                    "name": "apply_patch",
+                    "output": "Success.\n",
+                }
+            }),
+        )?;
+
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_patch");
+        assert_eq!(
+            messages[1]["tool_calls"][0]["arguments"],
+            "*** Begin Patch\n*** End Patch"
+        );
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_patch");
+        assert_eq!(messages[2]["content"], "Success.\n");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_messages_preserve_namespaced_response_item_tool_calls_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "delegate"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.response.output_item",
+            serde_json::json!({
+                "item": {
+                    "type": "function_call",
+                    "call_id": "call_spawn",
+                    "name": "spawn_agent",
+                    "namespace": "agents",
+                    "arguments": "{\"message\":\"inspect\"}",
+                }
+            }),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.tool_call",
+            serde_json::json!({
+                "id": "call_spawn",
+                "name": "spawn_agent",
+                "namespace": "agents",
+                "arguments": {"message": "inspect"},
+            }),
+        )?;
+
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_spawn");
+        assert_eq!(messages[1]["tool_calls"][0]["name"], "spawn_agent");
+        assert_eq!(messages[1]["tool_calls"][0]["namespace"], "agents");
+
+        let checkpoint_messages = response_items_to_provider_messages(&[serde_json::json!({
+            "type": "function_call",
+            "call_id": "call_wait",
+            "name": "wait_agent",
+            "namespace": "agents",
+            "arguments": "{}",
+        })]);
+        assert_eq!(
+            checkpoint_messages[0]["tool_calls"][0]["namespace"],
+            "agents"
+        );
+
+        let normalized = normalized_assistant_tool_calls(&serde_json::json!({
+            "tool_calls": [{
+                "id": "call_followup",
+                "function": {
+                    "name": "followup_task",
+                    "namespace": "agents",
+                    "arguments": "{\"target\":\"/root\"}",
+                }
+            }]
+        }));
+        assert_eq!(normalized[0]["namespace"], "agents");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_messages_replay_interrupted_turn_like_codex() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "start work"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "tool-call".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.tool_call".to_string(),
+                payload: serde_json::json!({
+                    "id": "call_exec",
+                    "name": "exec_command",
+                    "arguments": {"cmd": "sleep 60"},
+                }),
+            },
+            EventRecord {
+                seq: 3,
+                id: "cancelled".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.cancelled".to_string(),
+                payload: serde_json::json!({"reason": "stopped from terminal"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue"}),
+            },
+        ];
+
+        let messages = provider_messages_from_events(&events);
+
+        assert_eq!(messages[0]["content"], "start work");
+        assert_eq!(messages[1]["role"], "assistant");
+        assert_eq!(messages[1]["tool_calls"][0]["id"], "call_exec");
+        assert_eq!(messages[2]["role"], "tool");
+        assert_eq!(messages[2]["tool_call_id"], "call_exec");
+        assert_eq!(messages[2]["content"], "aborted");
+        assert_eq!(messages[3], turn_aborted_user_message());
+        assert_eq!(messages[4]["content"], "continue");
+    }
+
+    #[test]
+    fn provider_messages_do_not_replay_interrupt_marker_after_terminal_turn() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "answer"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "done"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "done".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.done".to_string(),
+                payload: serde_json::json!({"result": "done"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "cancelled".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "session.cancelled".to_string(),
+                payload: serde_json::json!({"reason": "late stop"}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!provider_text.contains(TURN_ABORTED_START_MARKER));
+    }
+
+    #[test]
+    fn provider_messages_ignore_aborted_turn_tail_after_cancel_event() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "cancel during provider"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "cancelled".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "session.cancelled".to_string(),
+                payload: serde_json::json!({"reason": "test cancel"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "late-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "late assistant text"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "late-tool-call".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "model.tool_call".to_string(),
+                payload: serde_json::json!({
+                    "id": "late_call",
+                    "name": "exec_command",
+                    "arguments": {"cmd": "echo late"},
+                }),
+            },
+            EventRecord {
+                seq: 5,
+                id: "late-tool-output".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: "tool.finished".to_string(),
+                payload: serde_json::json!({
+                    "name": "exec_command",
+                    "tool_call_id": "late_call",
+                }),
+            },
+            EventRecord {
+                seq: 6,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 6,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "new turn"}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains(TURN_ABORTED_START_MARKER));
+        assert!(provider_text.contains("new turn"));
+        assert!(!provider_text.contains("late assistant text"));
+        assert!(!provider_text.contains("late_call"));
+        assert!(!provider_text.contains("exec_command completed"));
+    }
+
+    #[test]
+    fn provider_messages_resume_from_latest_compaction_checkpoint() {
+        let checkpoint = vec![
+            serde_json::json!({
+                "role": "developer",
+                "name": PERMISSIONS_CONTEXT_MESSAGE_NAME,
+                "content": [{"type": "input_text", "text": "checkpoint permissions"}],
+            }),
+            serde_json::json!({
+                "role": "system",
+                "content": "compacted context summary",
+            }),
+        ];
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "old prompt should not replay"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "old-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "old answer should not replay"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({"replacement_messages": checkpoint}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue after compaction"}),
+            },
+            EventRecord {
+                seq: 5,
+                id: "new-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "new answer"}),
+            },
+        ];
+
+        let messages = provider_messages_from_events(&events);
+        let provider_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("checkpoint permissions"));
+        assert!(provider_text.contains("compacted context summary"));
+        assert!(provider_text.contains("continue after compaction"));
+        assert!(provider_text.contains("new answer"));
+        assert!(!provider_text.contains("old prompt should not replay"));
+        assert!(!provider_text.contains("old answer should not replay"));
+    }
+
+    #[test]
+    fn provider_messages_resume_from_response_item_compaction_checkpoint() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "old prompt should not replay"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({
+                    "replacement_messages": [{
+                        "role": "user",
+                        "content": "stale legacy checkpoint should not replay"
+                    }],
+                    "replacement_response_items": [
+                        {
+                            "type": "message",
+                            "role": "developer",
+                            "content": [{
+                                "type": "input_text",
+                                "text": "canonical checkpoint developer context"
+                            }]
+                        },
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{
+                                "type": "input_text",
+                                "text": "canonical compacted summary"
+                            }]
+                        },
+                        {
+                            "type": "function_call",
+                            "call_id": "checkpoint_call",
+                            "name": "exec_command",
+                            "arguments": "{\"cmd\":\"echo checkpoint\"}"
+                        },
+                        {
+                            "type": "function_call_output",
+                            "call_id": "checkpoint_call",
+                            "output": "checkpoint output\n"
+                        }
+                    ]
+                }),
+            },
+            EventRecord {
+                seq: 3,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue after response item compaction"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "new-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "new answer"}),
+            },
+        ];
+
+        let messages = provider_messages_from_events(&events);
+        let provider_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("canonical checkpoint developer context"));
+        assert!(provider_text.contains("canonical compacted summary"));
+        assert!(provider_text.contains("checkpoint output"));
+        assert!(provider_text.contains("continue after response item compaction"));
+        assert!(provider_text.contains("new answer"));
+        assert!(!provider_text.contains("stale legacy checkpoint should not replay"));
+        assert!(!provider_text.contains("old prompt should not replay"));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .is_some_and(|calls| {
+                        calls.iter().any(|call| {
+                            call.get("id").and_then(Value::as_str) == Some("checkpoint_call")
+                                && call.get("name").and_then(Value::as_str) == Some("exec_command")
+                        })
+                    })
+        }));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("tool")
+                && message.get("tool_call_id").and_then(Value::as_str) == Some("checkpoint_call")
+                && message.get("name").and_then(Value::as_str) == Some("exec_command")
+        }));
+    }
+
+    #[test]
+    fn response_item_compaction_checkpoint_keeps_unprojected_api_items() {
+        let events = vec![EventRecord {
+            seq: 1,
+            id: "compacted".to_string(),
+            session_id: "s".to_string(),
+            ts_ms: 1,
+            event_type: "session.compacted".to_string(),
+            payload: serde_json::json!({
+                "replacement_messages": [],
+                "replacement_response_items": [
+                    {
+                        "type": "message",
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "surviving turn"}]
+                    },
+                    {
+                        "type": "reasoning",
+                        "id": "rs_checkpoint",
+                        "summary": [{"type": "summary_text", "text": "checked context"}],
+                        "encrypted_content": "encrypted-reasoning"
+                    },
+                    {
+                        "type": "web_search_call",
+                        "id": "ws_checkpoint",
+                        "status": "completed",
+                        "action": {"type": "search", "query": "Codex parity"}
+                    },
+                    {
+                        "type": "image_generation_call",
+                        "id": "ig_checkpoint",
+                        "status": "completed",
+                        "result": "image-bytes"
+                    },
+                    {
+                        "type": "compaction",
+                        "encrypted_content": "encrypted-compaction"
+                    },
+                    {
+                        "type": "context_compaction",
+                        "encrypted_content": "encrypted-context-compaction"
+                    },
+                    {
+                        "type": "compaction_trigger"
+                    }
+                ]
+            }),
+        }];
+
+        let messages = provider_messages_from_events(&events);
+
+        assert!(messages.iter().any(|message| {
+            message.get("type").and_then(Value::as_str) == Some("reasoning")
+                && message.get("encrypted_content").and_then(Value::as_str)
+                    == Some("encrypted-reasoning")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.get("type").and_then(Value::as_str) == Some("web_search_call")
+                && message.get("id").and_then(Value::as_str) == Some("ws_checkpoint")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.get("type").and_then(Value::as_str) == Some("image_generation_call")
+                && message.get("id").and_then(Value::as_str) == Some("ig_checkpoint")
+        }));
+        assert!(!messages.iter().any(|message| {
+            message.get("type").and_then(Value::as_str) == Some("compaction_trigger")
+        }));
+
+        let response_items = provider_messages_to_response_items(&messages);
+        assert!(!response_items
+            .iter()
+            .any(|item| { item.get("type").and_then(Value::as_str) == Some("reasoning") }));
+        assert!(!response_items
+            .iter()
+            .any(|item| { item.get("type").and_then(Value::as_str) == Some("web_search_call") }));
+        assert!(response_items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("compaction")
+                && item.get("encrypted_content").and_then(Value::as_str)
+                    == Some("encrypted-compaction")
+        }));
+        assert!(response_items.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("context_compaction")
+                && item.get("encrypted_content").and_then(Value::as_str)
+                    == Some("encrypted-context-compaction")
+        }));
+    }
+
+    #[test]
+    fn live_response_output_items_keep_unprojected_api_items() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "start"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "reasoning".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "reasoning",
+                        "id": "rs_live",
+                        "summary": [],
+                        "encrypted_content": "live-reasoning"
+                    }
+                }),
+            },
+            EventRecord {
+                seq: 3,
+                id: "answer".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "content": [{"type": "output_text", "text": "done"}]
+                    }
+                }),
+            },
+        ];
+
+        let messages = provider_messages_from_events(&events);
+
+        assert!(messages.iter().any(|message| {
+            message.get("type").and_then(Value::as_str) == Some("reasoning")
+                && message.get("encrypted_content").and_then(Value::as_str)
+                    == Some("live-reasoning")
+        }));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("assistant")
+                && message_content_text(message).contains("done")
+        }));
+    }
+
+    #[test]
+    fn rollback_can_drop_turns_from_response_item_compaction_checkpoint() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({
+                    "replacement_messages": [],
+                    "replacement_response_items": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "first surviving turn"}]
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "first answer"}]
+                        },
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "rolled back turn"}]
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "rolled back answer"}]
+                        }
+                    ]
+                }),
+            },
+            EventRecord {
+                seq: 2,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("first surviving turn"));
+        assert!(provider_text.contains("first answer"));
+        assert!(!provider_text.contains("rolled back turn"));
+        assert!(!provider_text.contains("rolled back answer"));
+    }
+
+    #[test]
+    fn rollback_after_compaction_keeps_summary_and_drops_followup_turn() {
+        let summary = format!("{COMPACTION_SUMMARY_PREFIX}\ncompact summary");
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({
+                    "replacement_messages": [],
+                    "replacement_response_items": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "first surviving turn"}]
+                        },
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": summary}]
+                        }
+                    ]
+                }),
+            },
+            EventRecord {
+                seq: 2,
+                id: "post-compact".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "rolled back post-compaction turn"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "after-rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "after rollback"}),
+            },
+        ];
+
+        let messages = provider_messages_from_events(&events);
+        let provider_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("first surviving turn"));
+        assert!(provider_text.contains("compact summary"));
+        assert!(provider_text.contains("after rollback"));
+        assert!(!provider_text.contains("rolled back post-compaction turn"));
+        assert_eq!(
+            task_text_from_provider_messages(&messages).as_deref(),
+            Some("first surviving turn")
+        );
+    }
+
+    #[test]
+    fn compaction_checkpoint_keeps_first_suffix_context_update() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "old prompt"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({
+                    "replacement_messages": [{
+                        "role": "system",
+                        "content": "compacted context summary",
+                    }],
+                }),
+            },
+            EventRecord {
+                seq: 3,
+                id: "environment-update".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "workspace.context".to_string(),
+                payload: serde_json::json!({
+                    "kind": WORKSPACE_CONTEXT_ENVIRONMENT_KIND,
+                    "content": "<environment_context>\n  <current_date>2026-05-23</current_date>\n</environment_context>",
+                    "before_seq": 4,
+                }),
+            },
+            EventRecord {
+                seq: 4,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue after compaction"}),
+            },
+        ];
+
+        let messages = provider_messages_from_events(&events);
+        let context_index = messages
+            .iter()
+            .position(|message| message_content_text(message).contains("<environment_context>"))
+            .expect("environment update");
+        let followup_index = messages
+            .iter()
+            .position(|message| message_content_text(message).contains("continue after compaction"))
+            .expect("followup");
+        assert!(context_index < followup_index);
+    }
+
+    #[test]
+    fn provider_messages_apply_rollback_markers_like_codex() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "first".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "first prompt survives"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "first-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "first answer survives"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "rolled-followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "rolled back prompt"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "rolled-context".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "workspace.context".to_string(),
+                payload: serde_json::json!({
+                    "kind": WORKSPACE_CONTEXT_ENVIRONMENT_KIND,
+                    "content": "<environment_context>rolled context</environment_context>",
+                    "before_seq": 3,
+                }),
+            },
+            EventRecord {
+                seq: 5,
+                id: "rolled-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "rolled answer"}),
+            },
+            EventRecord {
+                seq: 6,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 6,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+            EventRecord {
+                seq: 7,
+                id: "new-followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 7,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "replacement prompt"}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("first prompt survives"));
+        assert!(provider_text.contains("first answer survives"));
+        assert!(provider_text.contains("replacement prompt"));
+        assert!(!provider_text.contains("rolled back prompt"));
+        assert!(!provider_text.contains("rolled context"));
+        assert!(!provider_text.contains("rolled answer"));
+    }
+
+    #[test]
+    fn provider_messages_rollback_counts_agent_messages_like_codex() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "first".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "root prompt survives"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "first-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "root answer survives"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "queued-agent-message".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "agent.message".to_string(),
+                payload: serde_json::json!({
+                    "author_path": "/root",
+                    "recipient_path": "/root/worker",
+                    "content": "rolled back inter-agent instruction",
+                    "trigger_turn": false,
+                }),
+            },
+            EventRecord {
+                seq: 4,
+                id: "rolled-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "rolled back parent notes"}),
+            },
+            EventRecord {
+                seq: 5,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+            EventRecord {
+                seq: 6,
+                id: "replacement".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 6,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "replacement prompt"}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("root prompt survives"));
+        assert!(provider_text.contains("root answer survives"));
+        assert!(provider_text.contains("replacement prompt"));
+        assert!(!provider_text.contains("rolled back inter-agent instruction"));
+        assert!(!provider_text.contains("rolled back parent notes"));
+    }
+
+    #[test]
+    fn rollback_trims_pre_turn_context_updates_without_removing_initial_context() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "initial-context".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "workspace.context".to_string(),
+                payload: serde_json::json!({
+                    "kind": WORKSPACE_CONTEXT_ENVIRONMENT_KIND,
+                    "content": "<environment_context>initial context survives</environment_context>",
+                }),
+            },
+            EventRecord {
+                seq: 2,
+                id: "first".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "first prompt survives"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "first-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "first answer survives"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "pre-context".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "workspace.context".to_string(),
+                payload: serde_json::json!({
+                    "kind": WORKSPACE_CONTEXT_ENVIRONMENT_KIND,
+                    "content": "<environment_context>rolled pre-turn context</environment_context>",
+                    "before_seq": 6,
+                }),
+            },
+            EventRecord {
+                seq: 5,
+                id: "pre-developer".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: PERSONALITY_CONTEXT_EVENT.to_string(),
+                payload: serde_json::json!({
+                    "content": "<personality_spec> rolled developer context </personality_spec>",
+                    "before_seq": 6,
+                }),
+            },
+            EventRecord {
+                seq: 6,
+                id: "rolled-followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 6,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "rolled prompt"}),
+            },
+            EventRecord {
+                seq: 7,
+                id: "rolled-delta".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 7,
+                event_type: "model.delta".to_string(),
+                payload: serde_json::json!({"text": "rolled answer"}),
+            },
+            EventRecord {
+                seq: 8,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 8,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("initial context survives"));
+        assert!(provider_text.contains("first prompt survives"));
+        assert!(provider_text.contains("first answer survives"));
+        assert!(!provider_text.contains("rolled pre-turn context"));
+        assert!(!provider_text.contains("rolled developer context"));
+        assert!(!provider_text.contains("rolled prompt"));
+        assert!(!provider_text.contains("rolled answer"));
+    }
+
+    #[test]
+    fn rollback_can_drop_turns_from_compaction_checkpoint_messages() {
+        let checkpoint = vec![
+            serde_json::json!({
+                "role": "developer",
+                "name": PERMISSIONS_CONTEXT_MESSAGE_NAME,
+                "content": [{"type": "input_text", "text": "checkpoint prefix"}],
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": "first checkpoint prompt",
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "first checkpoint answer",
+            }),
+            serde_json::json!({
+                "role": "user",
+                "content": "rolled checkpoint prompt",
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "rolled checkpoint answer",
+            }),
+        ];
+        let events = vec![
+            EventRecord {
+                seq: 10,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 10,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({"replacement_messages": checkpoint}),
+            },
+            EventRecord {
+                seq: 11,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 11,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+            EventRecord {
+                seq: 12,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 12,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "replacement prompt"}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("checkpoint prefix"));
+        assert!(provider_text.contains("first checkpoint prompt"));
+        assert!(provider_text.contains("first checkpoint answer"));
+        assert!(provider_text.contains("replacement prompt"));
+        assert!(!provider_text.contains("rolled checkpoint prompt"));
+        assert!(!provider_text.contains("rolled checkpoint answer"));
+    }
+
+    #[test]
+    fn rollback_can_drop_inter_agent_turns_from_response_item_checkpoint_like_codex() {
+        let inter_agent_content = serde_json::to_string(&serde_json::json!({
+            "author": "/root",
+            "recipient": "/root/worker",
+            "other_recipients": [],
+            "content": "rolled checkpoint inter-agent instruction",
+            "trigger_turn": false,
+        }))
+        .expect("json");
+        let events = vec![
+            EventRecord {
+                seq: 10,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 10,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({
+                    "replacement_messages": [],
+                    "replacement_response_items": [
+                        {
+                            "type": "message",
+                            "role": "user",
+                            "content": [{"type": "input_text", "text": "checkpoint prompt survives"}]
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "content": [{"type": "output_text", "text": "checkpoint answer survives"}]
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "commentary",
+                            "content": [{"type": "output_text", "text": inter_agent_content}]
+                        },
+                        {
+                            "type": "message",
+                            "role": "assistant",
+                            "phase": "commentary",
+                            "content": [{"type": "output_text", "text": "rolled checkpoint parent notes"}]
+                        }
+                    ]
+                }),
+            },
+            EventRecord {
+                seq: 11,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 11,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+            EventRecord {
+                seq: 12,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 12,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "replacement prompt"}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(provider_text.contains("checkpoint prompt survives"));
+        assert!(provider_text.contains("checkpoint answer survives"));
+        assert!(provider_text.contains("replacement prompt"));
+        assert!(!provider_text.contains("rolled checkpoint inter-agent instruction"));
+        assert!(!provider_text.contains("rolled checkpoint parent notes"));
+    }
+
+    #[test]
+    fn rollback_does_not_count_turn_aborted_marker_as_user_turn() {
+        let checkpoint = vec![
+            serde_json::json!({
+                "role": "user",
+                "content": "interrupted prompt",
+            }),
+            serde_json::json!({
+                "role": "assistant",
+                "content": "partial answer",
+                "tool_calls": [{
+                    "id": "call_exec",
+                    "name": "exec_command",
+                    "arguments": {"cmd": "sleep 60"},
+                }],
+            }),
+            turn_aborted_user_message(),
+        ];
+        let events = vec![
+            EventRecord {
+                seq: 10,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 10,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({"replacement_messages": checkpoint}),
+            },
+            EventRecord {
+                seq: 11,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 11,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+        ];
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(!provider_text.contains("interrupted prompt"));
+        assert!(!provider_text.contains("partial answer"));
+        assert!(!provider_text.contains(TURN_ABORTED_START_MARKER));
+    }
+
+    #[test]
+    fn rollback_filtered_turn_settings_ignore_rolled_back_model_config() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "first".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "first prompt"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "old-model".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.config".to_string(),
+                payload: serde_json::json!({"model": "gpt-5.2"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "rolled-followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "rolled prompt"}),
+            },
+            EventRecord {
+                seq: 4,
+                id: "rolled-model".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "model.config".to_string(),
+                payload: serde_json::json!({"model": "gpt-5.4"}),
+            },
+            EventRecord {
+                seq: 5,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+            EventRecord {
+                seq: 6,
+                id: "replacement-followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 6,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "replacement prompt"}),
+            },
+        ];
+
+        assert_eq!(
+            latest_model_name_from_events(&events).as_deref(),
+            Some("gpt-5.2")
+        );
+        assert_eq!(current_turn_user_message_seq(&events), Some(6));
+    }
+
+    #[test]
+    fn previous_turn_settings_prefer_surviving_context_baseline() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "first".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "first prompt"}),
+            },
+            EventRecord {
+                seq: 2,
+                id: "baseline-model".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.config".to_string(),
+                payload: serde_json::json!({
+                    "provider": "codex",
+                    "model": "gpt-5.2",
+                    "personality": "friendly",
+                }),
+            },
+            EventRecord {
+                seq: 3,
+                id: "baseline".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: CONTEXT_BASELINE_EVENT.to_string(),
+                payload: serde_json::json!({
+                    "turn_seq": 1,
+                    "provider": "codex",
+                    "model": "gpt-5.2",
+                    "personality": "friendly",
+                    "model_config_seq": 2,
+                    "model_settings": {
+                        "reasoning_effort": "high",
+                        "reasoning_summary": "detailed",
+                        "model_supports_reasoning_summaries": true,
+                        "text_verbosity": "low",
+                    },
+                }),
+            },
+            EventRecord {
+                seq: 4,
+                id: "incomplete-model".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "model.config".to_string(),
+                payload: serde_json::json!({
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "personality": "pragmatic",
+                }),
+            },
+        ];
+
+        let settings = previous_turn_settings_from_events(&events);
+        assert_eq!(settings.provider.as_deref(), Some("codex"));
+        assert_eq!(settings.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(settings.personality, Some(ModelPersonality::Friendly));
+        assert_eq!(settings.model_config_seq, Some(2));
+        assert_eq!(
+            settings.model_settings,
+            Some(ModelRequestSettings {
+                reasoning_effort: Some("high".to_string()),
+                reasoning_summary: Some("detailed".to_string()),
+                model_supports_reasoning_summaries: Some(true),
+                text_verbosity: Some("low".to_string()),
+                service_tier: None,
+            })
+        );
+        assert_eq!(
+            latest_model_name_from_events(&events).as_deref(),
+            Some("gpt-5.2")
+        );
+        assert_eq!(
+            latest_personality_context_from_events(&events),
+            Some(ModelPersonality::Friendly)
+        );
+    }
+
+    #[test]
+    fn previous_turn_settings_ignore_bare_context_baseline_without_real_turn() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "legacy-model".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "model.config".to_string(),
+                payload: serde_json::json!({
+                    "provider": "codex",
+                    "model": "gpt-5.2",
+                    "personality": "pragmatic",
+                }),
+            },
+            EventRecord {
+                seq: 2,
+                id: "bare-baseline".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: CONTEXT_BASELINE_EVENT.to_string(),
+                payload: serde_json::json!({
+                    "turn_seq": 99,
+                    "provider": "codex",
+                    "model": "gpt-5.4",
+                    "personality": "friendly",
+                    "model_config_seq": 2,
+                }),
+            },
+        ];
+
+        let settings = previous_turn_settings_from_events(&events);
+        assert_eq!(settings.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(settings.personality, Some(ModelPersonality::Pragmatic));
+    }
+
+    #[test]
+    fn compaction_checkpoint_context_baseline_hydrates_previous_settings() {
+        let context_baseline = serde_json::json!({
+            "turn_seq": 1,
+            "provider": "codex",
+            "model": "gpt-5.2",
+            "personality": "friendly",
+            "model_config_seq": 2,
+            "model_settings": {
+                "reasoning_effort": "medium",
+            },
+        });
+        let events = vec![
+            EventRecord {
+                seq: 10,
+                id: "compacted".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 10,
+                event_type: "session.compacted".to_string(),
+                payload: serde_json::json!({
+                    "replacement_messages": [
+                        {"role": "user", "content": "checkpoint prompt"},
+                        {"role": "assistant", "content": "checkpoint answer"}
+                    ],
+                    "context_baseline": context_baseline,
+                }),
+            },
+            EventRecord {
+                seq: 11,
+                id: "followup".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 11,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue"}),
+            },
+        ];
+
+        let settings = previous_turn_settings_from_events(&events);
+        assert_eq!(settings.model.as_deref(), Some("gpt-5.2"));
+        assert_eq!(settings.personality, Some(ModelPersonality::Friendly));
+        assert_eq!(
+            settings.model_settings,
+            Some(ModelRequestSettings {
+                reasoning_effort: Some("medium".to_string()),
+                ..Default::default()
+            })
+        );
+        assert_eq!(current_turn_user_message_seq(&events), Some(11));
+    }
+
+    #[test]
+    fn agents_md_context_uses_project_root_to_cwd_order() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        let nested = project.join("crates").join("demo");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(project.join("AGENTS.md"), "root rule")?;
+        std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
+            .expect("agents context");
+        let context = context.content;
+
+        assert!(context.starts_with("# AGENTS.md instructions for "));
+        assert!(context.contains("<INSTRUCTIONS>"));
+        assert!(context.contains("</INSTRUCTIONS>"));
+        let root_pos = context.find("root rule").expect("root rule");
+        let nested_pos = context.find("nested rule").expect("nested rule");
+        assert!(root_pos < nested_pos, "{context}");
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_replays_before_task_prompt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(project.join("AGENTS.md"), "Prefer focused tests.")?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        assert!(!with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+
+        assert_eq!(
+            messages[0].get("role").and_then(Value::as_str),
+            Some("developer")
+        );
+        assert_eq!(
+            messages[0].get("name").and_then(Value::as_str),
+            Some(PERMISSIONS_CONTEXT_MESSAGE_NAME)
+        );
+        assert!(message_content_text(&messages[0]).contains("<permissions instructions>"));
+        assert!(message_content_text(&messages[0]).contains("Approval policy is currently never"));
+        assert_eq!(
+            messages[1].get("name").and_then(Value::as_str),
+            Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
+        );
+        let context_parts = messages[1]["content"].as_array().expect("context parts");
+        assert_eq!(context_parts.len(), 2);
+        assert!(context_parts[0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Prefer focused tests."));
+        assert!(context_parts[1]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("<environment_context>"));
+        assert!(message_content_text(&messages[1]).contains("Prefer focused tests."));
+        assert!(message_content_text(&messages[1]).contains("<environment_context>"));
+        assert_eq!(message_content_text(&messages[2]), "inspect project");
+        assert_eq!(
+            task_text_from_provider_messages(&messages).as_deref(),
+            Some("inspect project")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_includes_environment_without_agents_md() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect environment"}),
+        )?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let permissions = message_content_text(&messages[0]);
+        let context = message_content_text(&messages[1]);
+
+        assert!(permissions.contains("<permissions instructions>"));
+        assert!(context.contains("<environment_context>"));
+        assert!(context.contains(&format!("  <cwd>{}</cwd>", temp.path().display())));
+        assert!(context.contains("  <shell>"));
+        assert!(context.contains("  <current_date>"));
+        assert!(context.contains("  <timezone>"));
+        assert_eq!(message_content_text(&messages[2]), "inspect environment");
+        assert_eq!(
+            task_text_from_provider_messages(&messages).as_deref(),
+            Some("inspect environment")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_includes_config_developer_instructions() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "developer_instructions = \"Stay focused.\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+
+        assert_eq!(messages[0]["role"], "developer");
+        let developer_text = message_content_text(&messages[0]);
+        assert!(developer_text.contains("<permissions instructions>"));
+        assert!(developer_text.contains("Stay focused."));
+        assert_eq!(
+            messages[1].get("name").and_then(Value::as_str),
+            Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
+        );
+        assert_eq!(message_content_text(&messages[2]), "inspect project");
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_includes_default_collaboration_mode_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let developer_text = message_content_text(&messages[0]);
+
+        assert!(developer_text.contains("<permissions instructions>"));
+        assert!(developer_text.contains("<collaboration_mode># Collaboration Mode: Default"));
+        assert!(developer_text.contains("Known mode names are Default and Plan."));
+        assert!(developer_text
+            .contains("In Default mode, strongly prefer making reasonable assumptions"));
+        assert!(developer_text.contains("</collaboration_mode>"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_can_disable_collaboration_mode_instructions_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_collaboration_mode_instructions = false\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+
+        assert!(!message_content_text(&messages[0]).contains("<collaboration_mode>"));
+        Ok(())
+    }
+
+    #[test]
+    fn collaboration_mode_update_replays_before_followup_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "first turn"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "plan this change"}),
+        )?;
+        let options =
+            AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let plan_index = messages
+            .iter()
+            .position(|message| message_content_text(message).contains("# Plan Mode"))
+            .expect("plan mode context");
+        let followup_index = messages
+            .iter()
+            .position(|message| message_content_text(message).contains("plan this change"))
+            .expect("followup");
+
+        assert!(plan_index < followup_index);
+        assert_eq!(
+            messages[plan_index].get("name").and_then(Value::as_str),
+            Some(COLLABORATION_CONTEXT_MESSAGE_NAME)
+        );
+        assert!(message_content_text(&messages[plan_index]).contains("<proposed_plan>"));
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_tool_spec_matches_codex_contract() {
+        let spec = tools::ToolRegistry::browser_agent()
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == REQUEST_USER_INPUT_TOOL_NAME)
+            .expect("request_user_input spec");
+
+        assert_eq!(
+            spec.description,
+            "Request user input for one to three short questions and wait for the response. This tool is only available in Plan mode."
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["questions"]["description"],
+            "Questions to show the user. Prefer 1 and do not exceed 3"
+        );
+        let question = &spec.input_schema["properties"]["questions"]["items"];
+        assert_eq!(
+            question["required"],
+            serde_json::json!(["id", "header", "question", "options"])
+        );
+        assert_eq!(
+            question["properties"]["options"]["description"],
+            "Provide 2-3 mutually exclusive choices. Put the recommended option first and suffix its label with \"(Recommended)\". Do not include an \"Other\" option in this list; the client will add a free-form \"Other\" option automatically."
+        );
+    }
+
+    #[test]
+    fn collaboration_mode_tool_visibility_matches_codex_runtime_contract() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        let default_tools =
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)?;
+        assert!(default_tools.iter().any(|spec| spec.name == "update_plan"));
+        assert!(default_tools
+            .iter()
+            .any(|spec| spec.name == REQUEST_USER_INPUT_TOOL_NAME));
+
+        let plan_tools = browser_tool_specs_for_session(
+            &session,
+            &AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan),
+            "gpt-5.5",
+            true,
+        )?;
+        assert!(plan_tools.iter().any(|spec| spec.name == "update_plan"));
+        assert!(plan_tools
+            .iter()
+            .any(|spec| spec.name == REQUEST_USER_INPUT_TOOL_NAME));
+
+        let child = store.create_child_session(
+            &session.id,
+            temp.path(),
+            Some("/root/child"),
+            None,
+            None,
+        )?;
+        let child_plan_tools = browser_tool_specs_for_session(
+            &child,
+            &AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan),
+            "gpt-5.5",
+            true,
+        )?;
+        assert!(child_plan_tools
+            .iter()
+            .any(|spec| spec.name == REQUEST_USER_INPUT_TOOL_NAME));
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_rejects_default_mode_and_subagents_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let root = store.create_session(None, temp.path())?;
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &root)
+        })?);
+        let call = ToolCall {
+            id: "ask_1".to_string(),
+            name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "questions": [{
+                    "id": "scope",
+                    "header": "Scope",
+                    "question": "Which scope?",
+                    "options": [
+                        {"label": "Plan (Recommended)", "description": "Plan only."},
+                        {"label": "Build", "description": "Build now."}
+                    ]
+                }]
+            }),
+        };
+
+        let default_mode = dispatch_request_user_input_tool(&store, &root, &call)?;
+        assert_eq!(
+            default_mode.messages[0]["content"],
+            "request_user_input is unavailable in Default mode"
+        );
+
+        let child =
+            store.create_child_session(&root.id, temp.path(), Some("/root/child"), None, None)?;
+        let subagent = dispatch_request_user_input_tool(&store, &child, &call)?;
+        assert_eq!(
+            subagent.messages[0]["content"],
+            "request_user_input can only be used by the root thread"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn request_user_input_waits_for_event_response_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let state_dir = temp.path().join("state");
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, temp.path())?;
+        let options =
+            AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        let session_id = session.id.clone();
+        let state_dir_for_thread = state_dir.clone();
+        let responder = thread::spawn(move || -> Result<()> {
+            let store = Store::open(state_dir_for_thread)?;
+            let mut last_seq = 0;
+            loop {
+                let events = store.wait_for_events_after_seq(
+                    &session_id,
+                    last_seq,
+                    Duration::from_secs(5),
+                )?;
+                for event in events {
+                    last_seq = last_seq.max(event.seq);
+                    if event.event_type == REQUEST_USER_INPUT_REQUEST_EVENT {
+                        assert_eq!(event.payload["questions"][0]["isOther"], true);
+                        store.append_event(
+                            &session_id,
+                            REQUEST_USER_INPUT_RESPONSE_EVENT,
+                            serde_json::json!({
+                                "call_id": event.payload["call_id"],
+                                "answers": {
+                                    "scope": {
+                                        "answers": ["Plan (Recommended)"]
+                                    }
+                                }
+                            }),
+                        )?;
+                        return Ok(());
+                    }
+                }
+            }
+        });
+        let outcome = dispatch_request_user_input_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "ask_scope".to_string(),
+                name: REQUEST_USER_INPUT_TOOL_NAME.to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "questions": [{
+                        "id": "scope",
+                        "header": "Scope",
+                        "question": "Which scope should I use?",
+                        "options": [
+                            {"label": "Plan (Recommended)", "description": "Plan only."},
+                            {"label": "Build", "description": "Build now."}
+                        ]
+                    }]
+                }),
+            },
+        )?;
+        responder
+            .join()
+            .map_err(|_| anyhow!("responder thread panicked"))??;
+
+        let content = outcome.messages[0]["content"].as_str().context("content")?;
+        let response: Value = serde_json::from_str(content)?;
+        assert_eq!(
+            response["answers"]["scope"]["answers"],
+            serde_json::json!(["Plan (Recommended)"])
+        );
+        let events = store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == REQUEST_USER_INPUT_REQUEST_EVENT));
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == REQUEST_USER_INPUT_RESPONSE_EVENT));
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.output"
+                && event.payload["name"] == REQUEST_USER_INPUT_TOOL_NAME
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn plan_mode_proposed_plan_is_recorded_and_stripped_from_final_answer_like_codex() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::TextDelta {
+                text: "Intro\n<proposed_plan>\n- Step 1\n- Step 2\n</proposed_plan>\nOutro"
+                    .to_string(),
+            },
+            ModelEvent::Done,
+        ]]);
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "plan this",
+            temp.path(),
+            AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "plan.proposed" && event.payload["text"] == "- Step 1\n- Step 2\n"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "Intro\nOutro"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_managed_developer_instructions_override_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            "developer_instructions = \"Managed policy.\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options = AgentRunOptions::default().with_config_overrides(vec![(
+            "developer_instructions".to_string(),
+            toml::Value::String("Session policy should be skipped.".to_string()),
+        )]);
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let developer_text = message_content_text(&messages[0]);
+
+        assert!(developer_text.contains("Managed policy."));
+        assert!(!developer_text.contains("Session policy should be skipped."));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_emits_agents_warnings_and_sources_outside_model_context() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(project.join("AGENTS.md"), b"rule before invalid byte \xff")?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        assert!(!with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let events = store.events_for_session(&session.id)?;
+        let agents_context = events
+            .iter()
+            .find(|event| {
+                event.event_type == "workspace.context"
+                    && event.payload.get("kind").and_then(Value::as_str)
+                        == Some(WORKSPACE_CONTEXT_AGENTS_KIND)
+            })
+            .expect("agents workspace context");
+        assert!(agents_context
+            .payload
+            .get("sources")
+            .and_then(Value::as_array)
+            .is_some_and(|sources| sources.iter().any(|source| {
+                source
+                    .as_str()
+                    .is_some_and(|source| source.ends_with("project/AGENTS.md"))
+            })));
+        assert!(agents_context
+            .payload
+            .get("warnings")
+            .and_then(Value::as_array)
+            .is_some_and(|warnings| warnings.iter().any(|warning| {
+                warning
+                    .as_str()
+                    .is_some_and(|warning| warning.contains("invalid UTF-8"))
+            })));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == SESSION_INSTRUCTION_SOURCES_EVENT)
+                .count(),
+            1
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == SESSION_STARTUP_WARNING_EVENT)
+                .count(),
+            1
+        );
+
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(provider_text.contains("rule before invalid byte"));
+        assert!(provider_text.contains('\u{fffd}'));
+        assert!(!provider_text.contains("invalid UTF-8"), "{provider_text}");
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_preserves_agents_warnings_without_agents_content() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )?;
+        std::fs::write(
+            project.join(".codex").join("config.toml"),
+            "openai_base_url = \"https://example.test\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        assert!(!with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect project"}),
+        )?;
+        let events = store.events_for_session(&session.id)?;
+        let agents_context = events
+            .iter()
+            .find(|event| {
+                event.event_type == "workspace.context"
+                    && event.payload.get("kind").and_then(Value::as_str)
+                        == Some(WORKSPACE_CONTEXT_AGENTS_KIND)
+            })
+            .expect("agents warning sentinel");
+        assert!(agents_context.payload.get("content").is_none());
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == SESSION_STARTUP_WARNING_EVENT)
+                .count(),
+            1
+        );
+        let provider_text = provider_messages_from_events(&events)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(provider_text.contains("<environment_context>"));
+        assert!(!provider_text.contains("openai_base_url"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_rejects_invalid_config_value_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_doc_fallback_filenames = \"INSTRUCTIONS.md\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        let error = with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })
+        .expect_err("invalid config value should fail");
+
+        assert!(error
+            .to_string()
+            .contains("Invalid Codex config `project_doc_fallback_filenames`"));
+        assert!(!store
+            .events_for_session(&session.id)?
+            .iter()
+            .any(|event| event.event_type == "workspace.context"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_rejects_invalid_config_profile_name() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options = AgentRunOptions::default().with_config_profile("../work");
+
+        let error = with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })
+        .expect_err("invalid profile should fail");
+
+        assert!(error
+            .to_string()
+            .contains("invalid --profile value `../work`"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_rejects_profile_v2_legacy_profile_conflict() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "profile = \"work\"\n[profiles.work]\nmodel = \"gpt-test\"\n",
+        )?;
+        let options = AgentRunOptions::default().with_config_profile("work");
+
+        let error = with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })
+        .expect_err("legacy profile conflict should fail");
+
+        assert!(error
+            .to_string()
+            .contains("--profile `work` cannot be used"));
+        assert!(!store
+            .events_for_session(&session.id)?
+            .iter()
+            .any(|event| event.event_type == "workspace.context"));
+        Ok(())
+    }
+
+    #[test]
+    fn environment_context_matches_codex_shape() {
+        let context = render_environment_context(
+            &[EnvironmentContextEnvironment::new("local", "/repo", "bash")],
+            Some("2026-02-26"),
+            Some("America/Los_Angeles"),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            context,
+            "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>bash</shell>\n  <current_date>2026-02-26</current_date>\n  <timezone>America/Los_Angeles</timezone>\n</environment_context>"
+        );
+    }
+
+    #[test]
+    fn environment_context_includes_network_like_codex() {
+        let network = EnvironmentNetworkContext::new(
+            vec!["api.example.com".to_string(), "*.openai.com".to_string()],
+            vec!["blocked.example.com".to_string()],
+        );
+        let context = render_environment_context(
+            &[EnvironmentContextEnvironment::new("local", "/repo", "bash")],
+            Some("2026-02-26"),
+            Some("America/Los_Angeles"),
+            Some(&network),
+            None,
+        );
+
+        assert_eq!(
+            context,
+            "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>bash</shell>\n  <current_date>2026-02-26</current_date>\n  <timezone>America/Los_Angeles</timezone>\n  <network enabled=\"true\"><allowed>api.example.com,*.openai.com</allowed><denied>blocked.example.com</denied></network>\n</environment_context>"
+        );
+    }
+
+    #[test]
+    fn environment_context_includes_multiple_environments_like_codex() {
+        let context = render_environment_context(
+            &[
+                EnvironmentContextEnvironment::new("local", "/repo/local", "bash"),
+                EnvironmentContextEnvironment::new("remote", "/repo/remote", "cmd"),
+            ],
+            Some("2026-02-26"),
+            Some("America/Los_Angeles"),
+            None,
+            None,
+        );
+
+        assert_eq!(
+            context,
+            "<environment_context>\n  <environments>\n    <environment id=\"local\">\n      <cwd>/repo/local</cwd>\n      <shell>bash</shell>\n    </environment>\n    <environment id=\"remote\">\n      <cwd>/repo/remote</cwd>\n      <shell>cmd</shell>\n    </environment>\n  </environments>\n  <current_date>2026-02-26</current_date>\n  <timezone>America/Los_Angeles</timezone>\n</environment_context>"
+        );
+    }
+
+    #[test]
+    fn environment_context_includes_active_subagents_like_codex() {
+        let context = render_environment_context(
+            &[EnvironmentContextEnvironment::new("local", "/repo", "bash")],
+            Some("2026-02-26"),
+            Some("America/Los_Angeles"),
+            None,
+            Some("- explorer: Newton\n- worker"),
+        );
+
+        assert_eq!(
+            context,
+            "<environment_context>\n  <cwd>/repo</cwd>\n  <shell>bash</shell>\n  <current_date>2026-02-26</current_date>\n  <timezone>America/Los_Angeles</timezone>\n  <subagents>\n    - explorer: Newton\n    - worker\n  </subagents>\n</environment_context>"
+        );
+    }
+
+    #[test]
+    fn workspace_context_refreshes_environment_context_for_active_subagents() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let _codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+
+        with_codex_home(&_codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?;
+        store.create_child_session(
+            &session.id,
+            &project,
+            Some("/root/explorer"),
+            Some("Newton"),
+            Some("explorer"),
+        )?;
+        with_codex_home(&_codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?;
+
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let context = messages
+            .iter()
+            .map(message_content_text)
+            .find(|text| text.contains("<environment_context>"))
+            .expect("environment context");
+        assert_eq!(context.matches("<environment_context>").count(), 1);
+        assert!(context.contains("<subagents>"));
+        assert!(context.contains("    - explorer: Newton"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_omits_later_subagent_only_environment_update_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial prompt"}),
+        )?;
+        store.create_child_session(
+            &session.id,
+            &project,
+            Some("/root/explorer"),
+            Some("Newton"),
+            Some("explorer"),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "subagent-only refresh"}),
+        )?;
+
+        assert!(!with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        let environment_events = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "workspace.context"
+                    && event.payload["kind"] == WORKSPACE_CONTEXT_ENVIRONMENT_KIND
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(environment_events.len(), 1);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_ignores_shell_only_environment_refresh_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+        let bash_environment = vec![EnvironmentContextEnvironment::new("local", "/repo", "bash")];
+        let zsh_environment = vec![EnvironmentContextEnvironment::new("other", "/repo", "zsh")];
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(
+                &store,
+                &session,
+                &AgentRunOptions::default().with_environment_context_environments(bash_environment),
+            )
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial prompt"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "shell-only refresh"}),
+        )?;
+        assert!(!with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(
+                &store,
+                &session,
+                &AgentRunOptions::default().with_environment_context_environments(zsh_environment),
+            )
+        })?);
+
+        let events = store.events_for_session(&session.id)?;
+        let environment_events = events
+            .iter()
+            .filter(|event| {
+                event.event_type == "workspace.context"
+                    && event.payload["kind"] == WORKSPACE_CONTEXT_ENVIRONMENT_KIND
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(environment_events.len(), 1);
+        let content = environment_events[0].payload["content"]
+            .as_str()
+            .context("environment content")?;
+        assert!(content.contains("<shell>bash</shell>"));
+        assert!(!content.contains("<shell>zsh</shell>"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_refreshes_environment_when_cwd_changes_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+        let first_environment = vec![EnvironmentContextEnvironment::new(
+            "local",
+            "/repo/one",
+            "bash",
+        )];
+        let second_environment = vec![EnvironmentContextEnvironment::new(
+            "local",
+            "/repo/two",
+            "zsh",
+        )];
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(
+                &store,
+                &session,
+                &AgentRunOptions::default()
+                    .with_environment_context_environments(first_environment),
+            )
+        })?);
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial prompt"}),
+        )?;
+        let followup = store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "cwd refresh"}),
+        )?;
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(
+                &store,
+                &session,
+                &AgentRunOptions::default()
+                    .with_environment_context_environments(second_environment),
+            )
+        })?);
+
+        let environment_contents = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "workspace.context"
+                    && event.payload["kind"] == WORKSPACE_CONTEXT_ENVIRONMENT_KIND
+            })
+            .filter_map(|event| {
+                event
+                    .payload
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_string)
+            })
+            .collect::<Vec<_>>();
+        assert_eq!(environment_contents.len(), 2);
+        assert!(environment_contents[0].contains("<cwd>/repo/one</cwd>"));
+        assert!(environment_contents[1].contains("<cwd>/repo/two</cwd>"));
+        assert!(environment_contents[1].contains("<shell>zsh</shell>"));
+        assert!(!environment_contents[1].contains("<cwd>/repo/one</cwd>"));
+        let environment_update = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .filter(|event| {
+                event.event_type == "workspace.context"
+                    && event.payload["kind"] == WORKSPACE_CONTEXT_ENVIRONMENT_KIND
+            })
+            .nth(1)
+            .context("environment update")?;
+        assert_eq!(environment_update.payload["before_seq"], followup.seq);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_update_replays_before_followup_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.2");
+        let network = EnvironmentNetworkContext::new(vec!["api.example.com".to_string()], vec![]);
+
+        let (session_id, followup_seq) =
+            with_codex_home(&codex_home, || -> Result<(String, i64)> {
+                let session_id = run_agent_with_provider(
+                    &store,
+                    &provider,
+                    "start without network context",
+                    &project,
+                    AgentRunOptions::default(),
+                )?;
+                let followup = store.append_event(
+                    &session_id,
+                    "session.followup",
+                    serde_json::json!({"text": "continue with network context"}),
+                )?;
+                run_existing_session_with_provider(
+                    &store,
+                    &provider,
+                    &session_id,
+                    AgentRunOptions::default().with_environment_context_network(network),
+                )?;
+                Ok((session_id, followup.seq))
+            })?;
+
+        let events = store.events_for_session(&session_id)?;
+        let network_update = events
+            .iter()
+            .find(|event| {
+                event.event_type == "workspace.context"
+                    && event.payload["kind"] == WORKSPACE_CONTEXT_ENVIRONMENT_KIND
+                    && event.payload["before_seq"] == followup_seq
+                    && event
+                        .payload
+                        .get("content")
+                        .and_then(Value::as_str)
+                        .is_some_and(|content| content.contains("api.example.com"))
+            })
+            .context("network environment update")?;
+        let update_content = network_update.payload["content"]
+            .as_str()
+            .context("network update content")?;
+        assert!(!update_content.contains("<cwd>"));
+        assert!(!update_content.contains("<shell>"));
+        assert!(update_content.contains("<current_date>"));
+        assert!(update_content.contains("<timezone>"));
+
+        let request = provider
+            .captured_messages()
+            .into_iter()
+            .nth(1)
+            .context("second request")?;
+        let first_turn_index = request
+            .iter()
+            .position(|message| {
+                message_content_text(message).contains("start without network context")
+            })
+            .context("first turn")?;
+        let context_index = request
+            .iter()
+            .position(|message| message_content_text(message).contains("api.example.com"))
+            .context("network environment context")?;
+        let followup_index = request
+            .iter()
+            .position(|message| {
+                message_content_text(message).contains("continue with network context")
+            })
+            .context("followup")?;
+        assert!(first_turn_index < context_index);
+        assert!(context_index < followup_index);
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_can_disable_environment_context_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let _codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+
+        with_codex_home(&_codex_home, || {
+            append_workspace_context_event_with_options(
+                &store,
+                &session,
+                &AgentRunOptions::default().with_include_environment_context(false),
+            )
+        })?;
+
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let provider_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!provider_text.contains("<environment_context>"));
+        Ok(())
+    }
+
+    #[test]
+    fn workspace_context_honors_config_include_environment_context() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "include_environment_context = false\n",
+        )?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, &project)?;
+
+        with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?;
+
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        let provider_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!provider_text.contains("<environment_context>"));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_prefers_override_and_records_global_sources() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            codex_home.join("AGENTS.override.md"),
+            "  global override  \n",
+        )?;
+        std::fs::write(codex_home.join("AGENTS.md"), "global default")?;
+        std::fs::write(project.join("AGENTS.override.md"), "project override")?;
+        std::fs::write(project.join("AGENTS.md"), "project default")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context.content.contains("global override"));
+        assert!(!context.content.contains("  global override"));
+        assert!(context.content.contains("--- project-doc ---"));
+        assert!(context.content.contains("project override"));
+        assert!(!context.content.contains("global default"));
+        assert!(!context.content.contains("project default"));
+        assert!(context.sources.iter().any(|source| {
+            source.ends_with(&format!("{}/{}", "codex-home", LOCAL_AGENTS_MD_FILENAME))
+        }));
+        assert!(context.sources.iter().any(|source| {
+            source.ends_with(&format!("{}/{}", "project", LOCAL_AGENTS_MD_FILENAME))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_uses_configured_fallback_filenames() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_doc_fallback_filenames = [\"INSTRUCTIONS.md\"]\n",
+        )?;
+        std::fs::write(project.join("INSTRUCTIONS.md"), "fallback root rule")?;
+        std::fs::write(nested.join("INSTRUCTIONS.md"), "fallback nested rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
+            .expect("agents context");
+
+        let root_pos = context
+            .content
+            .find("fallback root rule")
+            .expect("root rule");
+        let nested_pos = context
+            .content
+            .find("fallback nested rule")
+            .expect("nested rule");
+        assert!(root_pos < nested_pos, "{}", context.content);
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/INSTRUCTIONS.md")));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("nested/INSTRUCTIONS.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_uses_system_config_without_user_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let system_config = temp.path().join("system-config.toml");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            &system_config,
+            "project_doc_fallback_filenames = [\"SYSTEM.md\"]\n",
+        )?;
+        std::fs::write(project.join("SYSTEM.md"), "system configured rule")?;
+
+        let context = with_codex_home_and_system_config(&codex_home, &system_config, || {
+            agents_md_context_for_cwd(&project)
+        })
+        .expect("agents context");
+
+        assert!(context.content.contains("system configured rule"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/SYSTEM.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_user_config_overrides_system_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let system_config = temp.path().join("system-config.toml");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            &system_config,
+            "project_doc_fallback_filenames = [\"SYSTEM.md\"]\n",
+        )?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_doc_fallback_filenames = [\"USER.md\"]\n",
+        )?;
+        std::fs::write(project.join("SYSTEM.md"), "system rule should be skipped")?;
+        std::fs::write(project.join("USER.md"), "user configured rule")?;
+
+        let context = with_codex_home_and_system_config(&codex_home, &system_config, || {
+            agents_md_context_for_cwd(&project)
+        })
+        .expect("agents context");
+
+        assert!(context.content.contains("user configured rule"));
+        assert!(!context.content.contains("system rule should be skipped"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/USER.md")));
+        assert!(!context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/SYSTEM.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_uses_profile_v2_config_layer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_doc_fallback_filenames = [\"USER.md\"]\n",
+        )?;
+        std::fs::write(
+            codex_home.join("work.config.toml"),
+            "project_doc_fallback_filenames = [\"PROFILE.md\"]\nproject_doc_max_bytes = 7\n",
+        )?;
+        std::fs::write(project.join("USER.md"), "user rule should be skipped")?;
+        std::fs::write(project.join("PROFILE.md"), "profile instructions")?;
+
+        let context = with_codex_home(&codex_home, || {
+            agents_md_context_for_cwd_with_options(&project, Some("work"), &[])
+        })?
+        .expect("agents context");
+
+        assert!(context
+            .content
+            .contains("<INSTRUCTIONS>\nprofile\n</INSTRUCTIONS>"));
+        assert!(!context.content.contains("profile instructions"));
+        assert!(!context.content.contains("user rule should be skipped"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/PROFILE.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_profile_v2_participates_in_project_trust() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(codex_home.join("config.toml"), "")?;
+        std::fs::write(
+            codex_home.join("work.config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )?;
+        std::fs::write(
+            project.join(".codex").join("config.toml"),
+            "project_doc_fallback_filenames = [\"PROJECT.md\"]\n",
+        )?;
+        std::fs::write(project.join("PROJECT.md"), "trusted through profile")?;
+
+        let context = with_codex_home(&codex_home, || {
+            agents_md_context_for_cwd_with_options(&project, Some("work"), &[])
+        })?
+        .expect("agents context");
+
+        assert!(context.content.contains("trusted through profile"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/PROJECT.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_session_overrides_apply_above_project_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )?;
+        std::fs::write(
+            project.join(".codex").join("config.toml"),
+            "project_doc_fallback_filenames = [\"PROJECT.md\"]\nproject_doc_max_bytes = 32\n",
+        )?;
+        std::fs::write(project.join("PROJECT.md"), "project rule should be skipped")?;
+        std::fs::write(project.join("SESSION.md"), "session instructions")?;
+        let overrides = vec![
+            (
+                "project_doc_fallback_filenames".to_string(),
+                toml::Value::Array(vec![toml::Value::String("SESSION.md".to_string())]),
+            ),
+            ("project_doc_max_bytes".to_string(), toml::Value::Integer(7)),
+        ];
+
+        let context = with_codex_home(&codex_home, || {
+            agents_md_context_for_cwd_with_options(&project, None, &overrides)
+        })?
+        .expect("agents context");
+
+        assert!(context
+            .content
+            .contains("<INSTRUCTIONS>\nsession\n</INSTRUCTIONS>"));
+        assert!(!context.content.contains("session instructions"));
+        assert!(!context.content.contains("project rule should be skipped"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/SESSION.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_uses_configured_project_doc_max_bytes() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_doc_max_bytes = 4\n",
+        )?;
+        std::fs::write(project.join("AGENTS.md"), "abcdef")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context
+            .content
+            .contains("<INSTRUCTIONS>\nabcd\n</INSTRUCTIONS>"));
+        assert!(!context.content.contains("abcdef"));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_uses_trusted_project_config_layer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )?;
+        std::fs::write(
+            project.join(".codex").join("config.toml"),
+            "project_doc_fallback_filenames = [\"INSTRUCTIONS.md\"]\nproject_doc_max_bytes = 7\n",
+        )?;
+        std::fs::write(project.join("INSTRUCTIONS.md"), "project instructions")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context
+            .content
+            .contains("<INSTRUCTIONS>\nproject\n</INSTRUCTIONS>"));
+        assert!(!context.content.contains("project instructions"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/INSTRUCTIONS.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_ignores_untrusted_project_config_layer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(codex_home.join("config.toml"), "")?;
+        std::fs::write(codex_home.join("AGENTS.md"), "global rule")?;
+        std::fs::write(
+            project.join(".codex").join("config.toml"),
+            "project_doc_fallback_filenames = [\"INSTRUCTIONS.md\"]\n",
+        )?;
+        std::fs::write(project.join("INSTRUCTIONS.md"), "untrusted project rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context.content.contains("global rule"));
+        assert!(!context.content.contains("untrusted project rule"));
+        assert!(!context.content.contains("--- project-doc ---"));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_ignores_untrusted_project_config_parse_errors() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(codex_home.join("config.toml"), "")?;
+        std::fs::write(codex_home.join("AGENTS.md"), "global rule")?;
+        std::fs::write(project.join(".codex").join("config.toml"), "not = [toml")?;
+        std::fs::write(project.join("AGENTS.md"), "project rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context.content.contains("global rule"));
+        assert!(context.content.contains("project rule"));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_rejects_trusted_project_config_parse_errors() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )?;
+        std::fs::write(project.join(".codex").join("config.toml"), "not = [toml")?;
+
+        let error = with_codex_home(&codex_home, || {
+            load_agents_md_context_for_cwd_with_options(&project, None, &[])
+        })
+        .expect_err("trusted malformed project config should fail");
+
+        assert!(error
+            .to_string()
+            .contains("Error parsing project config file"));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_ignores_project_config_root_markers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )?;
+        std::fs::write(
+            project.join(".codex").join("config.toml"),
+            "project_root_markers = []\n",
+        )?;
+        std::fs::write(project.join("AGENTS.md"), "root rule")?;
+        std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
+            .expect("agents context");
+
+        let root_pos = context.content.find("root rule").expect("root rule");
+        let nested_pos = context.content.find("nested rule").expect("nested rule");
+        assert!(root_pos < nested_pos, "{}", context.content);
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_managed_config_overrides_project_config_layer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                "project_doc_fallback_filenames = [\"USER.md\"]\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
+                project.display()
+            ),
+        )?;
+        std::fs::write(
+            project.join(".codex").join("config.toml"),
+            "project_doc_fallback_filenames = [\"PROJECT.md\"]\nproject_doc_max_bytes = 20\n",
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            "project_doc_fallback_filenames = [\"MANAGED.md\"]\nproject_doc_max_bytes = 7\n",
+        )?;
+        std::fs::write(project.join("USER.md"), "user rule should be skipped")?;
+        std::fs::write(project.join("PROJECT.md"), "project rule should be skipped")?;
+        std::fs::write(project.join("MANAGED.md"), "managed instructions")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context
+            .content
+            .contains("<INSTRUCTIONS>\nmanaged\n</INSTRUCTIONS>"));
+        assert!(!context.content.contains("managed instructions"));
+        assert!(!context.content.contains("user rule should be skipped"));
+        assert!(!context.content.contains("project rule should be skipped"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/MANAGED.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_zero_project_doc_max_bytes_keeps_global_only() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_doc_max_bytes = 0\n",
+        )?;
+        std::fs::write(codex_home.join("AGENTS.md"), "global rule")?;
+        std::fs::write(project.join("AGENTS.md"), "project rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context.content.contains("global rule"));
+        assert!(!context.content.contains("project rule"));
+        assert!(!context.content.contains("--- project-doc ---"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("codex-home/AGENTS.md")));
+        assert!(!context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/AGENTS.md")));
+        Ok(())
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn agents_md_context_project_metadata_error_drops_project_docs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_doc_fallback_filenames = [\"INSTRUCTIONS.md\"]\n",
+        )?;
+        std::fs::write(codex_home.join("AGENTS.md"), "global rule")?;
+        std::os::unix::fs::symlink("AGENTS.md", project.join("AGENTS.md"))?;
+        std::fs::write(project.join("INSTRUCTIONS.md"), "fallback project rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context.content.contains("global rule"));
+        assert!(!context.content.contains("fallback project rule"));
+        assert!(!context.content.contains("--- project-doc ---"));
+        assert!(!context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/INSTRUCTIONS.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_uses_configured_project_root_markers() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_root_markers = [\"WORKSPACE\"]\n",
+        )?;
+        std::fs::write(project.join("WORKSPACE"), "")?;
+        std::fs::write(project.join("AGENTS.md"), "workspace root rule")?;
+        std::fs::write(nested.join("AGENTS.md"), "workspace nested rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
+            .expect("agents context");
+
+        let root_pos = context
+            .content
+            .find("workspace root rule")
+            .expect("root rule");
+        let nested_pos = context
+            .content
+            .find("workspace nested rule")
+            .expect("nested rule");
+        assert!(root_pos < nested_pos, "{}", context.content);
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_managed_config_root_markers_override_user_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_root_markers = []\n",
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            "project_root_markers = [\"WORKSPACE\"]\n",
+        )?;
+        std::fs::write(project.join("WORKSPACE"), "")?;
+        std::fs::write(project.join("AGENTS.md"), "managed root marker rule")?;
+        std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
+            .expect("agents context");
+
+        let root_pos = context
+            .content
+            .find("managed root marker rule")
+            .expect("root rule");
+        let nested_pos = context.content.find("nested rule").expect("nested rule");
+        assert!(root_pos < nested_pos, "{}", context.content);
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_profile_v2_root_markers_override_user_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_root_markers = []\n",
+        )?;
+        std::fs::write(
+            codex_home.join("work.config.toml"),
+            "project_root_markers = [\"WORKSPACE\"]\n",
+        )?;
+        std::fs::write(project.join("WORKSPACE"), "")?;
+        std::fs::write(project.join("AGENTS.md"), "profile root marker rule")?;
+        std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
+
+        let context = with_codex_home(&codex_home, || {
+            agents_md_context_for_cwd_with_options(&nested, Some("work"), &[])
+        })?
+        .expect("agents context");
+
+        let root_pos = context
+            .content
+            .find("profile root marker rule")
+            .expect("root rule");
+        let nested_pos = context.content.find("nested rule").expect("nested rule");
+        assert!(root_pos < nested_pos, "{}", context.content);
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_session_root_markers_participate_before_project_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_root_markers = []\n",
+        )?;
+        std::fs::write(project.join("WORKSPACE"), "")?;
+        std::fs::write(project.join("AGENTS.md"), "session root marker rule")?;
+        std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
+        let overrides = vec![(
+            "project_root_markers".to_string(),
+            toml::Value::Array(vec![toml::Value::String("WORKSPACE".to_string())]),
+        )];
+
+        let context = with_codex_home(&codex_home, || {
+            agents_md_context_for_cwd_with_options(&nested, None, &overrides)
+        })?
+        .expect("agents context");
+
+        let root_pos = context
+            .content
+            .find("session root marker rule")
+            .expect("root rule");
+        let nested_pos = context.content.find("nested rule").expect("nested rule");
+        assert!(root_pos < nested_pos, "{}", context.content);
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_managed_config_overrides_session_overrides() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(project.join("SESSION.md"), "session rule should be skipped")?;
+        std::fs::write(project.join("MANAGED.md"), "managed rule")?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            "project_doc_fallback_filenames = [\"MANAGED.md\"]\n",
+        )?;
+        let overrides = vec![(
+            "project_doc_fallback_filenames".to_string(),
+            toml::Value::Array(vec![toml::Value::String("SESSION.md".to_string())]),
+        )];
+
+        let context = with_codex_home(&codex_home, || {
+            agents_md_context_for_cwd_with_options(&project, None, &overrides)
+        })?
+        .expect("agents context");
+
+        assert!(context.content.contains("managed rule"));
+        assert!(!context.content.contains("session rule should be skipped"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/MANAGED.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_managed_config_path_override_is_used() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let managed_config = temp.path().join("etc-codex-managed_config.toml");
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            project.join("HOME.md"),
+            "codex-home managed rule should be skipped",
+        )?;
+        std::fs::write(project.join("SYSTEM.md"), "system managed rule")?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            "project_doc_fallback_filenames = [\"HOME.md\"]\n",
+        )?;
+        std::fs::write(
+            &managed_config,
+            "project_doc_fallback_filenames = [\"SYSTEM.md\"]\n",
+        )?;
+
+        let context = with_codex_home_and_managed_config(&codex_home, &managed_config, || {
+            agents_md_context_for_cwd(&project)
+        })
+        .expect("agents context");
+
+        assert!(context.content.contains("system managed rule"));
+        assert!(!context
+            .content
+            .contains("codex-home managed rule should be skipped"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/SYSTEM.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_managed_preferences_override_managed_config() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::write(
+            project.join("FILE.md"),
+            "file managed rule should be skipped",
+        )?;
+        std::fs::write(project.join("MDM.md"), "mdm managed rule")?;
+        std::fs::write(
+            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            "project_doc_fallback_filenames = [\"FILE.md\"]\n",
+        )?;
+        let encoded =
+            general_purpose::STANDARD.encode("project_doc_fallback_filenames = [\"MDM.md\"]\n");
+
+        let context = with_codex_home_and_managed_preferences(&codex_home, &encoded, || {
+            agents_md_context_for_cwd(&project)
+        })
+        .expect("agents context");
+
+        assert!(context.content.contains("mdm managed rule"));
+        assert!(!context
+            .content
+            .contains("file managed rule should be skipped"));
+        assert!(context
+            .sources
+            .iter()
+            .any(|source| source.ends_with("project/MDM.md")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_managed_preferences_invalid_base64_fails() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+
+        let error = with_codex_home_and_managed_preferences(&codex_home, "not base64", || {
+            load_agents_md_context_for_cwd_with_options(&project, None, &[])
+        })
+        .expect_err("invalid managed preferences should fail");
+
+        assert!(error.to_string().contains(
+            "Failed to decode Codex managed preferences `com.openai.codex:config_toml_base64`"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_empty_project_root_markers_disable_parent_traversal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        let nested = project.join("nested");
+        std::fs::create_dir_all(project.join(".git"))?;
+        std::fs::create_dir_all(&nested)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "project_root_markers = []\n",
+        )?;
+        std::fs::write(project.join("AGENTS.md"), "root rule should be skipped")?;
+        std::fs::write(nested.join("AGENTS.md"), "nested only rule")?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
+            .expect("agents context");
+
+        assert!(context.content.contains("nested only rule"));
+        assert!(!context.content.contains("root rule should be skipped"));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_warns_for_invalid_utf8_but_not_truncation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let mut data = vec![b'a'; AGENTS_MD_MAX_BYTES + 8];
+        data[0] = 0xff;
+        std::fs::write(project.join("AGENTS.md"), data)?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(context.content.contains('\u{fffd}'));
+        assert!(!context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("content was truncated")));
+        assert!(context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("invalid UTF-8")));
+        Ok(())
+    }
+
+    #[test]
+    fn agents_md_context_warns_about_invalid_utf8_past_truncation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let mut data = vec![b'a'; AGENTS_MD_MAX_BYTES + 8];
+        data[AGENTS_MD_MAX_BYTES + 4] = 0xff;
+        std::fs::write(project.join("AGENTS.md"), data)?;
+
+        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
+            .expect("agents context");
+
+        assert!(!context.content.contains('\u{fffd}'));
+        assert!(context
+            .warnings
+            .iter()
+            .any(|warning| warning.contains("invalid UTF-8")));
         Ok(())
     }
 
@@ -5538,6 +21144,7 @@ mod tests {
                 call: ToolCall {
                     id: "done_1".to_string(),
                     name: "done".to_string(),
+                    namespace: None,
                     arguments: serde_json::json!({"result": "final answer"}),
                 },
             },
@@ -5561,10 +21168,573 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "session.done"
                 && event.payload["result"] == "final answer"));
+        let started = events
+            .iter()
+            .find(|event| event.event_type == CODEX_TURN_STARTED_EVENT)
+            .context("missing Codex-shaped turn start event")?;
+        assert_eq!(started.payload["turn_id"], started.payload["run_id"]);
+        assert_eq!(started.payload["collaboration_mode_kind"], "default");
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == CODEX_TURN_COMPLETE_EVENT)
+            .context("missing Codex-shaped turn complete event")?;
+        assert_eq!(completed.payload["turn_id"], started.payload["turn_id"]);
+        assert_eq!(completed.payload["last_agent_message"], "final answer");
+        assert_eq!(completed.payload["status"], "done");
         let runs = store.runs_for_session(&session_id)?;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "done");
         assert!(runs[0].ended_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_strips_hidden_final_markup_and_records_codex_sidecars() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::TextDelta {
+                text: "Visible <oai-mem-citation>memory source</oai-mem-citation>answer"
+                    .to_string(),
+            },
+            ModelEvent::ResponseCompleted {
+                response_id: Some("resp_1".to_string()),
+                end_turn: Some(true),
+            },
+            ModelEvent::Usage {
+                usage: browser_use_protocol::ModelUsage {
+                    input_tokens: Some(10),
+                    input_cached_tokens: Some(2),
+                    output_tokens: Some(4),
+                    reasoning_output_tokens: Some(1),
+                    total_tokens: Some(14),
+                    ..Default::default()
+                },
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish with hidden markup",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "Visible answer"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.response.completed"
+                && event.payload["response_id"] == "resp_1"
+                && event.payload["end_turn"] == true
+        }));
+        let token_count = events
+            .iter()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("missing token_count event")?;
+        assert_eq!(
+            token_count.payload["info"]["last_token_usage"]["cached_input_tokens"],
+            2
+        );
+        assert_eq!(
+            token_count.payload["info"]["total_token_usage"]["total_tokens"],
+            14
+        );
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == CODEX_TURN_COMPLETE_EVENT)
+            .context("missing task_complete event")?;
+        assert_eq!(completed.payload["last_agent_message"], "Visible answer");
+        assert!(completed.payload["time_to_first_token_ms"]
+            .as_i64()
+            .is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_includes_latest_rate_limits_in_token_count_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ModelRateLimits {
+                snapshot: browser_use_protocol::RateLimitSnapshot {
+                    limit_id: Some("codex".to_string()),
+                    limit_name: Some("Codex".to_string()),
+                    primary: Some(browser_use_protocol::RateLimitWindow {
+                        used_percent: 42.5,
+                        window_minutes: Some(300),
+                        resets_at: Some(1770000000),
+                    }),
+                    secondary: None,
+                    credits: Some(browser_use_protocol::CreditsSnapshot {
+                        has_credits: true,
+                        unlimited: false,
+                        balance: Some("18".to_string()),
+                    }),
+                    plan_type: None,
+                    rate_limit_reached_type: None,
+                },
+            },
+            ModelEvent::TextDelta {
+                text: "Visible answer".to_string(),
+            },
+            ModelEvent::Usage {
+                usage: browser_use_protocol::ModelUsage {
+                    input_tokens: Some(10),
+                    output_tokens: Some(5),
+                    total_tokens: Some(15),
+                    ..Default::default()
+                },
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish with rate limits",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        let token_count = events
+            .iter()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("missing token_count event")?;
+
+        assert_eq!(token_count.payload["rate_limits"]["limit_id"], "codex");
+        assert_eq!(
+            token_count.payload["rate_limits"]["primary"]["used_percent"],
+            42.5
+        );
+        assert_eq!(
+            token_count.payload["rate_limits"]["primary"]["window_minutes"],
+            300
+        );
+        assert_eq!(
+            token_count.payload["rate_limits"]["credits"]["balance"],
+            "18"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_records_first_model_verification_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::ModelVerifications {
+                verifications: vec![browser_use_protocol::ModelVerification::TrustedAccessForCyber],
+            },
+            ModelEvent::ModelVerifications {
+                verifications: vec![browser_use_protocol::ModelVerification::TrustedAccessForCyber],
+            },
+            ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: "done_1".to_string(),
+                    name: "done".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({"result": "verified"}),
+                },
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish with model verification metadata",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        let verification_events = events
+            .iter()
+            .filter(|event| event.event_type == MODEL_VERIFICATION_EVENT)
+            .collect::<Vec<_>>();
+
+        assert_eq!(verification_events.len(), 1);
+        assert_eq!(
+            verification_events[0].payload["verifications"],
+            serde_json::json!(["trusted_access_for_cyber"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn token_count_totals_preserve_consumed_usage_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "first prompt"}),
+        )?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(4),
+                output_tokens: Some(6),
+                total_tokens: Some(10),
+                ..Default::default()
+            },
+            Some(1000),
+            0,
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "rolled prompt"}),
+        )?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(8),
+                output_tokens: Some(12),
+                total_tokens: Some(20),
+                ..Default::default()
+            },
+            Some(1000),
+            1,
+        )?;
+        store.append_event(
+            &session.id,
+            SESSION_ROLLBACK_EVENT,
+            serde_json::json!({"num_turns": 1}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "replacement prompt"}),
+        )?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(2),
+                output_tokens: Some(3),
+                total_tokens: Some(5),
+                ..Default::default()
+            },
+            Some(1000),
+            2,
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let latest_token_count = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("latest token_count")?;
+        assert_eq!(
+            latest_token_count.payload["info"]["last_token_usage"]["total_tokens"],
+            5
+        );
+        assert_eq!(
+            latest_token_count.payload["info"]["total_token_usage"]["total_tokens"],
+            35
+        );
+        assert_eq!(
+            latest_token_count.payload["info"]["total_token_usage"]["input_tokens"],
+            14
+        );
+        assert_eq!(
+            latest_token_count.payload["info"]["total_token_usage"]["output_tokens"],
+            21
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn compaction_emits_recomputed_active_context_token_count_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(11),
+                total_tokens: Some(18),
+                ..Default::default()
+            },
+            Some(1000),
+            0,
+        )?;
+        let mut messages = vec![
+            serde_json::json!({"role": "user", "content": "first surviving prompt"}),
+            serde_json::json!({"role": "assistant", "content": "older answer"}),
+            serde_json::json!({"role": "user", "content": format!("compact {}", "x".repeat(900))}),
+        ];
+
+        maybe_compact_messages_with_context(
+            &store,
+            &session.id,
+            &mut messages,
+            200,
+            Some("base instructions that count too"),
+            Some(1000),
+            Some(1),
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let compacted = events
+            .iter()
+            .find(|event| event.event_type == "session.compacted")
+            .context("missing compaction event")?;
+        let token_count = events
+            .iter()
+            .rev()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("missing recomputed token_count event")?;
+        let expected_active_tokens = estimated_context_tokens_with_instructions(
+            &messages,
+            Some("base instructions that count too"),
+        )? as i64;
+        assert_eq!(token_count.payload["source"], "recomputed_context");
+        assert_eq!(token_count.payload["reason"], "estimated_budget_exceeded");
+        assert_eq!(token_count.payload["history_rewrite_seq"], compacted.seq);
+        assert_eq!(token_count.payload["info"]["model_context_window"], 1000);
+        assert_eq!(token_count.payload["turn_idx"], 1);
+        assert_eq!(
+            token_count.payload["info"]["last_token_usage"]["total_tokens"],
+            expected_active_tokens
+        );
+        assert_eq!(
+            token_count.payload["info"]["last_token_usage"]["input_tokens"],
+            0
+        );
+        assert_eq!(
+            token_count.payload["info"]["total_token_usage"]["total_tokens"],
+            18
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn rollback_recompute_updates_active_tokens_without_changing_consumed_total() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "first prompt"}),
+        )?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(5),
+                output_tokens: Some(7),
+                total_tokens: Some(12),
+                ..Default::default()
+            },
+            Some(1000),
+            0,
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "rolled back prompt"}),
+        )?;
+        append_codex_token_count_event(
+            &store,
+            &session.id,
+            &browser_use_protocol::ModelUsage {
+                input_tokens: Some(13),
+                output_tokens: Some(17),
+                total_tokens: Some(30),
+                ..Default::default()
+            },
+            Some(1000),
+            1,
+        )?;
+        let rollback = store.append_event(
+            &session.id,
+            SESSION_ROLLBACK_EVENT,
+            serde_json::json!({"num_turns": 1}),
+        )?;
+        let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
+        maybe_append_recomputed_codex_token_count_after_history_rewrite(
+            &store,
+            &session.id,
+            &messages,
+            Some("base instructions"),
+            Some(1000),
+        )?;
+        let events_after_first_recompute = store.events_for_session(&session.id)?;
+        let token_count = events_after_first_recompute
+            .iter()
+            .rev()
+            .find(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+            .context("missing recomputed token_count event")?;
+        let expected_active_tokens =
+            estimated_context_tokens_with_instructions(&messages, Some("base instructions"))?
+                as i64;
+
+        assert_eq!(token_count.payload["source"], "recomputed_context");
+        assert_eq!(token_count.payload["reason"], "history_rewrite_recomputed");
+        assert_eq!(token_count.payload["history_rewrite_seq"], rollback.seq);
+        assert_eq!(
+            token_count.payload["info"]["last_token_usage"]["total_tokens"],
+            expected_active_tokens
+        );
+        assert_eq!(
+            token_count.payload["info"]["last_token_usage"]["input_tokens"],
+            0
+        );
+        assert_eq!(
+            token_count.payload["info"]["total_token_usage"]["total_tokens"],
+            42
+        );
+
+        maybe_append_recomputed_codex_token_count_after_history_rewrite(
+            &store,
+            &session.id,
+            &messages,
+            Some("base instructions"),
+            Some(1000),
+        )?;
+        let events_after_second_recompute = store.events_for_session(&session.id)?;
+        assert_eq!(
+            events_after_first_recompute
+                .iter()
+                .filter(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+                .count(),
+            events_after_second_recompute
+                .iter()
+                .filter(|event| event.event_type == CODEX_TOKEN_COUNT_EVENT)
+                .count(),
+            "recompute should not duplicate once a token_count exists after the rewrite"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_persists_response_items_and_prefers_final_answer_phase() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::TextDelta {
+                text: "Checking.\n".to_string(),
+            },
+            ModelEvent::ResponseOutputItem {
+                item: serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Checking.\n"
+                    }]
+                }),
+            },
+            ModelEvent::TextDelta {
+                text: "Final answer".to_string(),
+            },
+            ModelEvent::ResponseOutputItem {
+                item: serde_json::json!({
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{
+                        "type": "output_text",
+                        "text": "Final answer"
+                    }]
+                }),
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish with phased response items",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "model.response.output_item")
+                .count(),
+            2
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "Final answer"
+        }));
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == CODEX_TURN_COMPLETE_EVENT)
+            .context("missing task_complete event")?;
+        assert_eq!(completed.payload["last_agent_message"], "Final answer");
+
+        let assistant_messages = provider_messages_from_events(&events)
+            .into_iter()
+            .filter(|message| message.get("role").and_then(Value::as_str) == Some("assistant"))
+            .map(|message| message_content_text(&message))
+            .collect::<Vec<_>>();
+        assert_eq!(
+            assistant_messages,
+            vec!["Checking.\n".to_string(), "Final answer".to_string()]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_honors_response_end_turn_false_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![
+            vec![
+                ModelEvent::TextDelta {
+                    text: "intermediate text".to_string(),
+                },
+                ModelEvent::ResponseCompleted {
+                    response_id: Some("resp_continue".to_string()),
+                    end_turn: Some(false),
+                },
+                ModelEvent::Done,
+            ],
+            vec![
+                ModelEvent::TextDelta {
+                    text: "final answer".to_string(),
+                },
+                ModelEvent::Done,
+            ],
+        ]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "continue then finish",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.response.continued"
+                && event.payload["response_id"] == "resp_continue"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "final answer"
+        }));
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == CODEX_TURN_COMPLETE_EVENT)
+                .count(),
+            1
+        );
         Ok(())
     }
 
@@ -5703,6 +21873,11 @@ mod tests {
         assert!(events
             .iter()
             .any(|event| event.event_type == "session.cancelled"));
+        assert!(events.iter().any(|event| {
+            event.event_type == CODEX_TURN_ABORTED_EVENT
+                && event.payload["reason"] == "interrupted"
+                && event.payload["status"] == "cancelled"
+        }));
         assert!(!events
             .iter()
             .any(|event| event.event_type == "session.done"));
@@ -5718,7 +21893,7 @@ mod tests {
     }
 
     impl ModelProvider for CancellingProvider {
-        fn provider_name(&self) -> &'static str {
+        fn provider_name(&self) -> &str {
             "cancelling"
         }
 
@@ -5761,6 +21936,16 @@ mod tests {
                     .as_str()
                     .is_some_and(|error| error.contains("provider stream exploded"))
         }));
+        assert!(events.iter().any(|event| {
+            event.event_type == CODEX_STREAM_ERROR_EVENT
+                && event.payload["will_retry"] == false
+                && event.payload["additional_details"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("provider stream exploded"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == CODEX_TURN_COMPLETE_EVENT && event.payload["status"] == "failed"
+        }));
         let runs = store.runs_for_session(&session.id)?;
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "failed");
@@ -5789,15 +21974,184 @@ mod tests {
                 && event.payload["provider"] == "codex"
         }));
         assert!(events.iter().any(|event| {
+            event.event_type == CODEX_STREAM_ERROR_EVENT
+                && event.payload["will_retry"] == true
+                && event.payload["provider"] == "codex"
+                && event.payload["additional_details"]
+                    .as_str()
+                    .is_some_and(|details| details.contains("operation timed out"))
+        }));
+        assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "retry recovered"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_uses_model_provider_stream_max_retries_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = FlakyProvider::default();
+        let options = AgentRunOptions::default()
+            .with_model_provider_id("openrouter")
+            .with_config_overrides(vec![
+                (
+                    "model_providers.openrouter.name".to_string(),
+                    toml::Value::String("OpenRouter".to_string()),
+                ),
+                (
+                    "model_providers.openrouter.base_url".to_string(),
+                    toml::Value::String("https://openrouter.ai/api/v1".to_string()),
+                ),
+                (
+                    "model_providers.openrouter.stream_max_retries".to_string(),
+                    toml::Value::Integer(1),
+                ),
+            ]);
+
+        let session_id =
+            run_agent_with_provider(&store, &provider, "retry provider", &project, options)?;
+
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.turn.retry"
+                && event.payload["message"] == "Reconnecting... 1/1"
+                && event.payload["max_retries"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "retry recovered"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_uses_requested_retry_delay_from_typed_provider_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = RetryDelayProvider::default();
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "retry with delay",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.turn.retry"
+                && event.payload["delay_ms"] == 1
+                && event.payload["requested_delay_ms"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == CODEX_STREAM_ERROR_EVENT
+                && event.payload["will_retry"] == true
+                && event.payload["requested_delay_ms"] == 1
+                && event.payload["codex_error_info"]
+                    == json!({
+                        "response_stream_disconnected": {
+                            "http_status_code": Value::Null
+                        }
+                    })
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "retry-delay recovered"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_does_not_retry_server_overloaded_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ServerOverloadedProvider;
+
+        let result = run_agent_with_provider(
+            &store,
+            &provider,
+            "overloaded",
+            temp.path(),
+            AgentRunOptions::default(),
+        );
+
+        assert!(result.is_err());
+        let session = store.list_sessions()?.remove(0);
+        assert_eq!(session.status, SessionStatus::Failed);
+        let events = store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "model.turn.retry"));
+        assert!(events.iter().any(|event| {
+            event.event_type == CODEX_STREAM_ERROR_EVENT
+                && event.payload["will_retry"] == false
+                && event.payload["codex_error_info"] == "server_overloaded"
+                && event.payload["additional_details"]
+                    .as_str()
+                    .is_some_and(|details| details.contains("server_is_overloaded"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_does_not_retry_typed_terminal_provider_errors_like_codex() -> Result<()> {
+        use browser_use_providers::ProviderErrorKind;
+
+        for (kind, expected_info) in [
+            (ProviderErrorKind::Unauthorized, json!("other")),
+            (ProviderErrorKind::InvalidRequest, json!("other")),
+            (
+                ProviderErrorKind::QuotaExceeded,
+                json!("usage_limit_exceeded"),
+            ),
+            (
+                ProviderErrorKind::UsageNotIncluded,
+                json!("usage_limit_exceeded"),
+            ),
+            (ProviderErrorKind::CyberPolicy, json!("cyber_policy")),
+            (
+                ProviderErrorKind::RetryLimit,
+                json!({
+                    "response_too_many_failed_attempts": {
+                        "http_status_code": Value::Null
+                    }
+                }),
+            ),
+        ] {
+            let temp = tempfile::tempdir()?;
+            let store = Store::open(temp.path())?;
+            let provider = TerminalProviderErrorProvider { kind };
+
+            let result = run_agent_with_provider(
+                &store,
+                &provider,
+                "terminal typed provider error",
+                temp.path(),
+                AgentRunOptions::default(),
+            );
+
+            assert!(result.is_err());
+            let session = store.list_sessions()?.remove(0);
+            assert_eq!(session.status, SessionStatus::Failed);
+            let events = store.events_for_session(&session.id)?;
+            assert!(!events
+                .iter()
+                .any(|event| event.event_type == "model.turn.retry"));
+            assert!(events.iter().any(|event| {
+                event.event_type == CODEX_STREAM_ERROR_EVENT
+                    && event.payload["will_retry"] == false
+                    && event.payload["codex_error_info"] == expected_info
+            }));
+        }
         Ok(())
     }
 
     struct FailingProvider;
 
     impl ModelProvider for FailingProvider {
-        fn provider_name(&self) -> &'static str {
+        fn provider_name(&self) -> &str {
             "failing"
         }
 
@@ -5816,7 +22170,7 @@ mod tests {
     }
 
     impl ModelProvider for FlakyProvider {
-        fn provider_name(&self) -> &'static str {
+        fn provider_name(&self) -> &str {
             "codex"
         }
 
@@ -5839,6 +22193,81 @@ mod tests {
         }
     }
 
+    #[derive(Default)]
+    struct RetryDelayProvider {
+        attempts: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for RetryDelayProvider {
+        fn provider_name(&self) -> &str {
+            "codex"
+        }
+
+        fn model_name(&self) -> &str {
+            "retry-delay"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut attempts = self.attempts.lock().expect("attempt lock");
+            *attempts += 1;
+            if *attempts == 1 {
+                return Err(ProviderError::retryable(
+                    "response.failed (rate_limit_exceeded): Please try again in 1ms.",
+                    Some(Duration::from_millis(1)),
+                )
+                .into());
+            }
+            Ok(vec![
+                ModelEvent::TextDelta {
+                    text: "retry-delay recovered".to_string(),
+                },
+                ModelEvent::Done,
+            ])
+        }
+    }
+
+    struct ServerOverloadedProvider;
+
+    impl ModelProvider for ServerOverloadedProvider {
+        fn provider_name(&self) -> &str {
+            "codex"
+        }
+
+        fn model_name(&self) -> &str {
+            "overloaded"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            Err(ProviderError::non_retryable(
+                browser_use_providers::ProviderErrorKind::ServerOverloaded,
+                "response.failed (server_is_overloaded): Server is overloaded.",
+            )
+            .into())
+        }
+    }
+
+    struct TerminalProviderErrorProvider {
+        kind: browser_use_providers::ProviderErrorKind,
+    }
+
+    impl ModelProvider for TerminalProviderErrorProvider {
+        fn provider_name(&self) -> &str {
+            "codex"
+        }
+
+        fn model_name(&self) -> &str {
+            "terminal-provider-error"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            Err(ProviderError::non_retryable(
+                self.kind,
+                format!("typed terminal provider error: {:?}", self.kind),
+            )
+            .into())
+        }
+    }
+
     #[test]
     fn provider_loop_records_python_tool_timeout_and_continues() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -5849,6 +22278,7 @@ mod tests {
                     call: ToolCall {
                         id: "python_timeout".to_string(),
                         name: "python".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "code": "import time\ntime.sleep(5)",
                         }),
@@ -5861,6 +22291,7 @@ mod tests {
                     call: ToolCall {
                         id: "done_after_timeout".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"result": "timeout recovered"}),
                     },
                 },
@@ -5892,31 +22323,7 @@ mod tests {
     fn provider_can_use_exec_command_tool() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
-        let provider = ScriptedProvider::new(vec![
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "exec_1".to_string(),
-                        name: "exec_command".to_string(),
-                        arguments: serde_json::json!({
-                            "cmd": "printf codex-tool",
-                            "yield_time_ms": 5000,
-                        }),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-            vec![
-                ModelEvent::ToolCall {
-                    call: ToolCall {
-                        id: "done_after_exec".to_string(),
-                        name: "done".to_string(),
-                        arguments: serde_json::json!({"result": "command complete"}),
-                    },
-                },
-                ModelEvent::Done,
-            ],
-        ]);
+        let provider = ExecToolOutputInspectingProvider::default();
         let session_id = run_agent_with_provider(
             &store,
             &provider,
@@ -5935,13 +22342,199 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "command.finished"));
         assert!(events.iter().any(|event| {
+            event.event_type == "tool.finished"
+                && event.payload["name"] == "exec_command"
+                && event.payload["output"]["running"] == false
+                && event.payload["output"]["metadata"]["exit_code"] == 0
+        }));
+        assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "command complete"
         }));
         Ok(())
     }
 
     #[test]
-    fn provider_can_use_file_tools() -> Result<()> {
+    fn provider_sees_write_stdin_closed_for_non_tty_exec_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = WriteStdinClosedInspectingProvider::default();
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "write to non-tty command",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["name"] == "write_stdin"
+                && event.payload["recovered"] == true
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("stdin is closed for this session"))
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "stdin gate matched"
+        }));
+        Ok(())
+    }
+
+    #[derive(Default)]
+    struct ExecToolOutputInspectingProvider {
+        step: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for ExecToolOutputInspectingProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let events = if *step == 0 {
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "exec_1".to_string(),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({
+                                "cmd": "printf codex-tool",
+                                "yield_time_ms": 5000,
+                            }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            } else {
+                let content = latest_tool_content(&turn, "exec_command")
+                    .context("exec command tool response")?;
+                assert!(
+                    content.contains("Chunk ID: chunk_exec_1"),
+                    "exec output should use Codex-style chunk header: {content}"
+                );
+                assert!(
+                    content.contains("Wall time: "),
+                    "exec output should include wall time: {content}"
+                );
+                assert!(
+                    content.contains("Process exited with code 0"),
+                    "exec output should include exit code: {content}"
+                );
+                assert!(
+                    content.contains("Original token count: "),
+                    "exec output should include original token count: {content}"
+                );
+                assert!(
+                    content.ends_with("Output:\ncodex-tool"),
+                    "exec output should end with terminal output: {content}"
+                );
+                assert!(
+                    serde_json::from_str::<Value>(content).is_err(),
+                    "exec output should be model-visible text, not JSON"
+                );
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "done_after_exec".to_string(),
+                            name: "done".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({"result": "command complete"}),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            };
+            *step += 1;
+            Ok(events)
+        }
+    }
+
+    #[derive(Default)]
+    struct WriteStdinClosedInspectingProvider {
+        step: std::sync::Mutex<usize>,
+        process_id: std::sync::Mutex<Option<i64>>,
+    }
+
+    impl ModelProvider for WriteStdinClosedInspectingProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let events = match *step {
+                0 => vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "exec_non_tty".to_string(),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({
+                                "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(5)\"",
+                                "yield_time_ms": 50,
+                            }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ],
+                1 => {
+                    let content = latest_tool_content(&turn, "exec_command")
+                        .context("exec command tool response")?;
+                    let marker = "Process running with session ID ";
+                    let session_id = content
+                        .lines()
+                        .find_map(|line| line.strip_prefix(marker))
+                        .context("running session id line")?
+                        .parse::<i64>()?;
+                    assert!(session_id >= 1000);
+                    *self.process_id.lock().expect("process id lock") = Some(session_id);
+                    vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "write_non_tty".to_string(),
+                                name: "write_stdin".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({
+                                    "session_id": session_id,
+                                    "chars": "hello\n",
+                                    "yield_time_ms": 50,
+                                }),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]
+                }
+                _ => {
+                    let content = latest_tool_content(&turn, "write_stdin")
+                        .context("write_stdin tool response")?;
+                    assert!(
+                        content.contains("write_stdin failed: stdin is closed for this session; rerun exec_command with tty=true to keep stdin open"),
+                        "write_stdin failure should be model-visible and recoverable: {content}"
+                    );
+                    vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "done_after_stdin_gate".to_string(),
+                                name: "done".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({"result": "stdin gate matched"}),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]
+                }
+            };
+            *step += 1;
+            Ok(events)
+        }
+    }
+
+    fn latest_tool_content<'a>(turn: &'a ProviderTurn, name: &str) -> Option<&'a str> {
+        turn.messages.iter().rev().find_map(|message| {
+            if message.get("name").and_then(Value::as_str) == Some(name) {
+                message.get("content").and_then(Value::as_str)
+            } else {
+                None
+            }
+        })
+    }
+
+    #[test]
+    fn legacy_hidden_file_tools_still_dispatch_for_old_sessions() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let patch = r#"*** Begin Patch
@@ -5955,6 +22548,7 @@ mod tests {
                     call: ToolCall {
                         id: "patch_1".to_string(),
                         name: "apply_patch".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({ "patch": patch }),
                     },
                 },
@@ -5965,6 +22559,7 @@ mod tests {
                     call: ToolCall {
                         id: "read_1".to_string(),
                         name: "read_file".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({ "path": "note.txt" }),
                     },
                 },
@@ -5975,6 +22570,7 @@ mod tests {
                     call: ToolCall {
                         id: "search_1".to_string(),
                         name: "search_files".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({ "query": "bravo", "path": "." }),
                     },
                 },
@@ -5985,6 +22581,7 @@ mod tests {
                     call: ToolCall {
                         id: "list_1".to_string(),
                         name: "list_files".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({ "query": "note" }),
                     },
                 },
@@ -5995,6 +22592,7 @@ mod tests {
                     call: ToolCall {
                         id: "done_after_files".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"result": "files complete"}),
                     },
                 },
@@ -6004,7 +22602,7 @@ mod tests {
         let session_id = run_agent_with_provider(
             &store,
             &provider,
-            "use file tools",
+            "legacy file tools",
             temp.path(),
             AgentRunOptions::default(),
         )?;
@@ -6029,6 +22627,7 @@ mod tests {
                     call: ToolCall {
                         id: "missing_read".to_string(),
                         name: "read_file".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({ "path": "missing.txt" }),
                     },
                 },
@@ -6039,6 +22638,7 @@ mod tests {
                     call: ToolCall {
                         id: "done_after_missing".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"result": "recovered"}),
                     },
                 },
@@ -6103,6 +22703,7 @@ mod tests {
                     call: ToolCall {
                         id: "plan_1".to_string(),
                         name: "update_plan".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "explanation": "starting",
                             "plan": [
@@ -6120,6 +22721,7 @@ mod tests {
                     call: ToolCall {
                         id: "done_after_plan".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"result": "planned"}),
                     },
                 },
@@ -6142,6 +22744,181 @@ mod tests {
     }
 
     #[test]
+    fn update_plan_returns_codex_text_output() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let outcome = dispatch_update_plan_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "plan_text".to_string(),
+                name: "update_plan".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "explanation": "starting",
+                    "plan": [
+                        { "step": "Inspect", "status": "completed" },
+                        { "step": "Patch", "status": "in_progress" }
+                    ],
+                }),
+            },
+        )?;
+
+        assert_eq!(outcome.messages.len(), 1);
+        assert_eq!(outcome.messages[0]["content"], "Plan updated");
+        assert!(store.events_for_session(&session.id)?.iter().any(|event| {
+            event.event_type == "plan.updated"
+                && event.payload["explanation"] == "starting"
+                && event.payload["plan"][1]["status"] == "in_progress"
+        }));
+        assert!(store.events_for_session(&session.id)?.iter().any(|event| {
+            event.event_type == MODEL_RESPONSE_INPUT_ITEM_EVENT
+                && event.payload["item"]["type"] == "function_call_output"
+                && event.payload["item"]["call_id"] == "plan_text"
+                && event.payload["item"]["output"] == "Plan updated"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn update_plan_rejects_unknown_fields_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let top_level = dispatch_update_plan_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "plan_extra_top".to_string(),
+                name: "update_plan".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "plan": [{ "step": "Inspect", "status": "pending" }],
+                    "unexpected": true,
+                }),
+            },
+        )?;
+        assert!(top_level.messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field"));
+
+        let item_level = dispatch_update_plan_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "plan_extra_item".to_string(),
+                name: "update_plan".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "plan": [{ "step": "Inspect", "status": "pending", "owner": "agent" }],
+                }),
+            },
+        )?;
+        assert!(item_level.messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("unknown field"));
+
+        Ok(())
+    }
+
+    #[test]
+    fn update_plan_accepts_multiple_in_progress_like_codex_runtime() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let outcome = dispatch_update_plan_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "plan_multiple_in_progress".to_string(),
+                name: "update_plan".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "plan": [
+                        { "step": "Patch core", "status": "in_progress" },
+                        { "step": "Patch tests", "status": "in_progress" }
+                    ],
+                }),
+            },
+        )?;
+
+        assert_eq!(outcome.messages[0]["content"], "Plan updated");
+        assert!(store.events_for_session(&session.id)?.iter().any(|event| {
+            event.event_type == "plan.updated"
+                && event.payload["plan"][0]["status"] == "in_progress"
+                && event.payload["plan"][1]["status"] == "in_progress"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn update_plan_rejects_plan_mode_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let options =
+            AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event_with_options(&store, &session, &options)
+        })?);
+
+        let outcome = dispatch_update_plan_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "plan_mode_update_plan".to_string(),
+                name: "update_plan".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "plan": [{ "step": "Plan", "status": "in_progress" }],
+                }),
+            },
+        )?;
+
+        assert_eq!(
+            outcome.messages[0]["content"],
+            "update_plan is a TODO/checklist tool and is not allowed in Plan mode"
+        );
+        assert!(store.events_for_session(&session.id)?.iter().any(|event| {
+            event.event_type == "tool.failed" && event.payload["name"] == "update_plan"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn update_plan_tool_spec_matches_codex_contract() {
+        let spec = tools::ToolRegistry::browser_agent()
+            .specs()
+            .into_iter()
+            .find(|spec| spec.name == "update_plan")
+            .expect("update_plan tool spec");
+
+        assert_eq!(
+            spec.description,
+            "Updates the task plan.\nProvide an optional explanation and a list of plan items, each with a step and status.\nAt most one step can be in_progress at a time.\n"
+        );
+        assert_eq!(spec.input_schema["required"], json!(["plan"]));
+        assert_eq!(
+            spec.input_schema["properties"]["plan"]["description"],
+            "The list of steps"
+        );
+        assert_eq!(
+            spec.input_schema["properties"]["plan"]["items"]["properties"]["status"]["description"],
+            "One of: pending, in_progress, completed"
+        );
+        assert!(
+            spec.input_schema["properties"]["plan"]["items"]["properties"]["status"]
+                .get("enum")
+                .is_none()
+        );
+    }
+
+    #[test]
     fn provider_messages_are_compacted_when_context_gets_large() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -6154,6 +22931,7 @@ mod tests {
                     call: ToolCall {
                         id: "python_small".to_string(),
                         name: "python".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"code": "result = {'ok': True}"}),
                     },
                 },
@@ -6164,6 +22942,7 @@ mod tests {
                     call: ToolCall {
                         id: "done_after_compact".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"result": "compacted ok"}),
                     },
                 },
@@ -6196,34 +22975,43 @@ mod tests {
     }
 
     #[test]
-    fn provider_context_overflow_forces_compaction_and_retries_once() -> Result<()> {
+    fn provider_context_overflow_is_terminal_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let provider = ContextOverflowRecoveringProvider::default();
-        let session_id = run_agent_with_provider(
+        let result = run_agent_with_provider(
             &store,
             &provider,
             &format!("compact after provider overflow {}", "x".repeat(2048)),
             temp.path(),
             AgentRunOptions::default(),
-        )?;
-        let events = store.events_for_session(&session_id)?;
-        assert!(events
+        );
+        assert!(result.is_err());
+        let session = store.list_sessions()?.remove(0);
+        assert_eq!(session.status, SessionStatus::Failed);
+        let events = store.events_for_session(&session.id)?;
+        assert!(!events
             .iter()
             .any(|event| event.event_type == "model.turn.context_overflow"));
-        assert!(events.iter().any(|event| {
+        assert!(!events.iter().any(|event| {
             event.event_type == "session.compaction_started"
                 && event.payload["reason"] == "provider_context_overflow"
         }));
         assert!(events.iter().any(|event| {
-            event.event_type == "session.done" && event.payload["result"] == "overflow recovered"
+            event.event_type == CODEX_STREAM_ERROR_EVENT
+                && event.payload["will_retry"] == false
+                && event.payload["codex_error_info"] == "context_window_exceeded"
+                && event.payload["additional_details"]
+                    .as_str()
+                    .is_some_and(|details| details.contains("context_length_exceeded"))
         }));
         Ok(())
     }
 
     #[test]
-    fn compaction_keeps_only_pending_tool_call_after_summary() -> Result<()> {
+    fn compaction_rebuilds_codex_style_summary_history_without_tool_calls() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         store.append_event(
@@ -6231,6 +23019,9 @@ mod tests {
             "session.input",
             serde_json::json!({ "text": "compact with pending call" }),
         )?;
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
         let mut messages = vec![
             serde_json::json!({
                 "role": "user",
@@ -6261,13 +23052,60 @@ mod tests {
 
         maybe_compact_messages(&store, &session.id, &mut messages, 500)?;
 
-        assert_eq!(messages.len(), 2);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[1]["tool_calls"][0]["id"], "pending_call");
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "developer");
+        assert!(message_content_text(&messages[0]).contains("<permissions instructions>"));
+        assert_eq!(
+            messages[1].get("name").and_then(Value::as_str),
+            Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
+        );
+        assert!(message_content_text(&messages[1]).contains("<environment_context>"));
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(message_content_text(&messages[2]), "x".repeat(2000));
+        assert_eq!(messages[3]["role"], "user");
+        assert!(is_compaction_summary_message(&messages[3]));
+        assert!(
+            message_content_text(&messages[3]).contains("Compacted prior browser-agent context")
+        );
+        assert!(!messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("assistant")));
         assert!(!messages
             .iter()
             .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")));
+        let compacted_events = store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .filter(|event| event.event_type == "session.compacted")
+            .collect::<Vec<_>>();
+        assert_eq!(compacted_events.len(), 1);
+        assert_eq!(
+            compacted_events[0]
+                .payload
+                .get("replacement_messages")
+                .and_then(Value::as_array)
+                .map(Vec::len),
+            Some(messages.len())
+        );
+        let replacement_response_items = compacted_events[0]
+            .payload
+            .get("replacement_response_items")
+            .and_then(Value::as_array)
+            .expect("replacement response items");
+        assert!(!replacement_response_items.iter().any(|item| {
+            matches!(
+                item.get("type").and_then(Value::as_str),
+                Some(
+                    "function_call"
+                        | "function_call_output"
+                        | "custom_tool_call"
+                        | "custom_tool_call_output"
+                )
+            )
+        }));
+        assert!(replacement_response_items
+            .iter()
+            .all(|item| { item.get("type").and_then(Value::as_str) == Some("message") }));
         Ok(())
     }
 
@@ -6346,8 +23184,9 @@ mod tests {
     }
 
     #[test]
-    fn compaction_preserves_recent_tool_result_after_summary() -> Result<()> {
+    fn compaction_drops_recent_tool_result_from_replacement_history() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         store.append_event(
@@ -6355,6 +23194,9 @@ mod tests {
             "session.input",
             serde_json::json!({ "text": "compact after tool" }),
         )?;
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
         let mut messages = vec![
             serde_json::json!({
                 "role": "user",
@@ -6378,16 +23220,23 @@ mod tests {
 
         maybe_compact_messages(&store, &session.id, &mut messages, 500)?;
 
-        assert_eq!(messages.len(), 3);
-        assert_eq!(messages[0]["role"], "system");
-        assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[1]["tool_calls"][0]["id"], "latest_tool");
-        assert_eq!(messages[2]["role"], "tool");
-        assert_eq!(messages[2]["tool_call_id"], "latest_tool");
-        assert!(messages[2]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("[truncated]"));
+        assert_eq!(messages.len(), 4);
+        assert_eq!(messages[0]["role"], "developer");
+        assert!(message_content_text(&messages[0]).contains("<permissions instructions>"));
+        assert_eq!(
+            messages[1].get("name").and_then(Value::as_str),
+            Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
+        );
+        assert_eq!(messages[2]["role"], "user");
+        assert_eq!(message_content_text(&messages[2]), "x".repeat(2000));
+        assert_eq!(messages[3]["role"], "user");
+        assert!(is_compaction_summary_message(&messages[3]));
+        assert!(!messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("assistant")));
+        assert!(!messages
+            .iter()
+            .any(|message| message.get("role").and_then(Value::as_str) == Some("tool")));
         Ok(())
     }
 
@@ -6418,7 +23267,7 @@ mod tests {
                 "role": "tool",
                 "tool_call_id": "call_done",
                 "name": "update_plan",
-                "content": "plan updated",
+                "content": "Plan updated",
             }),
         ];
 
@@ -6426,12 +23275,9 @@ mod tests {
 
         assert_eq!(messages.len(), 4);
         assert_eq!(messages[1]["role"], "assistant");
-        assert_eq!(messages[2]["tool_call_id"], "call_done");
-        assert_eq!(messages[3]["tool_call_id"], "call_missing");
-        assert!(messages[3]["content"]
-            .as_str()
-            .unwrap_or_default()
-            .contains("history normalization"));
+        assert_eq!(messages[2]["tool_call_id"], "call_missing");
+        assert_eq!(messages[2]["content"], "aborted");
+        assert_eq!(messages[3]["tool_call_id"], "call_done");
         Ok(())
     }
 
@@ -6483,6 +23329,7 @@ mod tests {
             &ToolCall {
                 id: "done_result_file".to_string(),
                 name: "done".to_string(),
+                namespace: None,
                 arguments: serde_json::json!({
                     "result_file": "answer.json",
                 }),
@@ -6543,6 +23390,7 @@ mod tests {
             &ToolCall {
                 id: "done_result_and_file".to_string(),
                 name: "done".to_string(),
+                namespace: None,
                 arguments: serde_json::json!({
                     "result": r#"{"id":2}"#,
                     "result_file": "answer.json",
@@ -6569,6 +23417,34 @@ mod tests {
     }
 
     #[test]
+    fn done_tool_strips_hidden_memory_citations_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let outcome = dispatch_done_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "done_with_citation".to_string(),
+                name: "done".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "result": "Answer<oai-mem-citation>hidden</oai-mem-citation>."
+                }),
+            },
+        )?;
+        assert!(outcome.finished);
+        let events = store.events_for_session(&session.id)?;
+        let done = events
+            .iter()
+            .find(|event| event.event_type == "session.done")
+            .context("missing session.done")?;
+        assert_eq!(done.payload["result"], "Answer.");
+        Ok(())
+    }
+
+    #[test]
     fn provider_loop_emits_deadline_warning_on_final_turn() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -6578,6 +23454,7 @@ mod tests {
                 call: ToolCall {
                     id: "done_final".to_string(),
                     name: "done".to_string(),
+                    namespace: None,
                     arguments: serde_json::json!({"result": "finished on final turn"}),
                 },
             }],
@@ -6618,7 +23495,7 @@ mod tests {
         )?;
         let children = store.list_child_agents(&session_id)?;
         assert_eq!(children.len(), 1);
-        assert_eq!(children[0].status, "closed");
+        assert!(matches!(children[0].status.as_str(), "done" | "closed"));
         assert_eq!(
             children[0].agent_path.as_deref(),
             Some("/root/flight_search")
@@ -6632,9 +23509,6 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "agent.completed"
                 && event.payload["payload"]["result"] == "child inspected constraints"));
-        assert!(parent_events
-            .iter()
-            .any(|event| event.event_type == "agent.cancelled"));
         assert!(parent_events
             .iter()
             .any(|event| event.event_type == "agent.message"
@@ -6656,10 +23530,6 @@ mod tests {
         assert!(parent_events
             .iter()
             .any(|event| event.event_type == "model.tool_call"
-                && event.payload["name"] == "send_input"));
-        assert!(parent_events
-            .iter()
-            .any(|event| event.event_type == "model.tool_call"
                 && event.payload["name"] == "followup_task"));
         assert!(parent_events
             .iter()
@@ -6669,47 +23539,1762 @@ mod tests {
             .iter()
             .any(|event| event.event_type == "model.tool_call"
                 && event.payload["name"] == "list_agents"));
-        assert!(parent_events
-            .iter()
-            .any(|event| event.event_type == "model.tool_call"
-                && event.payload["name"] == "close_agent"));
 
         let child_events = store.events_for_session(&children[0].child_session_id)?;
+        assert_eq!(
+            session_base_instructions_from_events(&child_events),
+            session_base_instructions_from_events(&parent_events)
+        );
         assert!(child_events
             .iter()
             .any(|event| event.event_type == "agent.context"));
         assert!(child_events
             .iter()
             .any(|event| event.event_type == "agent.context"
-                && event.payload["fork_mode"] == "summary"
-                && event.payload["context"]["mode"] == "summary"));
+                && event.payload["fork_mode"] == "last_n"
+                && event.payload["fork_turns"] == 1
+                && event.payload["context"]["mode"] == "last_n"));
         assert!(child_events
             .iter()
             .any(|event| event.event_type == "session.input"
                 && event.payload["text"] == "inspect flight search constraints"));
-        assert!(child_events
+        assert!(!child_events
             .iter()
             .any(|event| event.event_type == "session.followup"
                 && event.payload["text"] == "run the focused follow-up"));
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "agent.mailbox_input"
+                && event.payload["content"] == "run the focused follow-up"
+                && event.payload["trigger_turn"] == true));
         assert_eq!(
             child_events
                 .iter()
                 .filter(|event| event.event_type == "session.done"
                     && event.payload["result"] == "child inspected constraints")
                 .count(),
-            3
+            2
         );
         let mailbox = store.messages_for_agent(&children[0].child_session_id)?;
-        assert_eq!(mailbox.len(), 3);
-        assert!(!mailbox[0].trigger_turn);
-        assert!(mailbox[1].trigger_turn);
-        assert!(mailbox[2].trigger_turn);
+        assert!(mailbox.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_rejects_full_fork_overrides_like_codex_v2() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let call = ToolCall {
+            id: "spawn_full_fork_override".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "agent_type": "explorer",
+            }),
+        };
+
+        let outcome = dispatch_spawn_agent_tool(
+            &store,
+            &provider,
+            &session,
+            &call,
+            &AgentRunOptions::default(),
+            &None,
+        )?;
+
+        let text = message_content_text(&outcome.messages[0]);
+        assert!(text.contains(
+            "Full-history forked agents inherit the parent agent type, model, and reasoning effort"
+        ));
+        assert!(store.events_for_session(&session.id)?.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error.contains("Full-history forked agents inherit"))
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_rejects_unknown_agent_type_like_codex_v2() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let call = ToolCall {
+            id: "spawn_unknown_role".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "agent_type": "missing-role",
+                "fork_turns": "1",
+            }),
+        };
+
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+
+        let text = message_content_text(&outcome.messages[0]);
+        assert!(text.contains("unknown agent_type 'missing-role'"));
+        assert!(store.events_for_session(&session.id)?.iter().any(|event| {
+            event.event_type == "tool.failed"
+                && event.payload["error"]
+                    .as_str()
+                    .is_some_and(|error| error == "unknown agent_type 'missing-role'")
+        }));
+        assert!(store.list_child_agents(&session.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_rejects_legacy_unknown_fields_like_codex_v2() -> Result<()> {
+        for legacy_field in ["role", "path", "nickname", "fork_mode", "items"] {
+            let temp = tempfile::tempdir()?;
+            let store = Store::open(temp.path())?;
+            let session = store.create_session(None, temp.path())?;
+            let provider = InstructionCapturingProvider::default();
+            let mut arguments = serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "fork_turns": "1",
+            });
+            arguments[legacy_field] = match legacy_field {
+                "items" => serde_json::json!([{"type": "text", "text": "inspect"}]),
+                _ => serde_json::json!("legacy"),
+            };
+            let call = ToolCall {
+                id: format!("spawn_legacy_{legacy_field}"),
+                name: "spawn_agent".to_string(),
+                namespace: None,
+                arguments,
+            };
+
+            let outcome = dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default(),
+                &None,
+            )?;
+
+            let text = message_content_text(&outcome.messages[0]);
+            assert!(
+                text.contains(&format!(
+                    "failed to parse function arguments: unknown field `{legacy_field}`"
+                )),
+                "unexpected error for {legacy_field}: {text}"
+            );
+            assert!(store.list_child_agents(&session.id)?.is_empty());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_configured_role_overrides_requested_model_and_reasoning_like_codex() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let role_dir = codex_home.join("agents");
+        std::fs::create_dir_all(&role_dir)?;
+        let role_file = role_dir.join("researcher.toml");
+        std::fs::write(
+            &role_file,
+            "developer_instructions = \"Research carefully\"\nmodel = \"role-model\"\nmodel_reasoning_effort = \"high\"\ninstructions = \"Role base instructions\"\n",
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[agents.researcher]\ndescription = \"Research role\"\nconfig_file = \"./agents/researcher.toml\"\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            tx.send((
+                request.model.clone(),
+                request.reasoning_effort.clone(),
+                request.config_overrides.clone(),
+            ))
+            .expect("send child request");
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_role_override".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "agent_type": "researcher",
+                "fork_turns": "1",
+                "model": "requested-model",
+                "reasoning_effort": "low",
+            }),
+        };
+
+        with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
+
+        let (model, reasoning_effort, config_overrides) =
+            rx.recv_timeout(Duration::from_secs(1))?;
+        assert_eq!(model.as_deref(), Some("role-model"));
+        assert_eq!(reasoning_effort.as_deref(), Some("high"));
+        assert!(config_overrides.iter().any(|(key, value)| {
+            key == "developer_instructions" && value.as_str() == Some("Research carefully")
+        }));
+        assert!(config_overrides
+            .iter()
+            .any(|(key, value)| key == "instructions"
+                && value.as_str() == Some("Role base instructions")));
+        let child = store
+            .list_child_agents(&session.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        let child_events = store.events_for_session(&child.child_session_id)?;
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "workspace.context"
+                && event.payload["kind"] == WORKSPACE_CONTEXT_PERMISSIONS_KIND
+                && event.payload["content"]
+                    .as_str()
+                    .is_some_and(|content| content.contains("Research carefully"))
+        }));
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "agent.context"
+                && event.payload["model"] == "role-model"
+                && event.payload["reasoning_effort"] == "high"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_discovers_user_role_files_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(codex_home.join(CODEX_CONFIG_FILENAME), "")?;
+        let role_dir = codex_home.join("agents").join("research");
+        std::fs::create_dir_all(&role_dir)?;
+        std::fs::write(
+            role_dir.join("researcher.toml"),
+            r#"name = "researcher"
+description = "Research role"
+developer_instructions = "Research carefully"
+model = "role-model"
+model_reasoning_effort = "high"
+"#,
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            tx.send((
+                request.model.clone(),
+                request.reasoning_effort.clone(),
+                request.config_overrides.clone(),
+            ))
+            .expect("send child request");
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_discovered_role".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "agent_type": "researcher",
+                "fork_turns": "1",
+            }),
+        };
+
+        with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
+
+        let (model, reasoning_effort, config_overrides) =
+            rx.recv_timeout(Duration::from_secs(1))?;
+        assert_eq!(model.as_deref(), Some("role-model"));
+        assert_eq!(reasoning_effort.as_deref(), Some("high"));
+        assert!(config_overrides.iter().any(|(key, value)| {
+            key == "developer_instructions" && value.as_str() == Some("Research carefully")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_uses_role_specific_nickname_candidates_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[agents.researcher]\ndescription = \"Research role\"\nnickname_candidates = [\"Atlas\"]\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_role_nickname".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "agent_type": "researcher",
+                "fork_turns": "1",
+            }),
+        };
+
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
+
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert_eq!(payload["nickname"], "Atlas");
+        let child = store
+            .list_child_agents(&session.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        assert_eq!(child.agent_nickname.as_deref(), Some("Atlas"));
+        let child_events = store.events_for_session(&child.child_session_id)?;
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "agent.context" && event.payload["nickname"] == "Atlas"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn declared_role_file_metadata_overrides_inline_metadata_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let role_dir = codex_home.join("agents");
+        std::fs::create_dir_all(&role_dir)?;
+        std::fs::write(
+            role_dir.join("archivist.toml"),
+            r#"name = "researcher"
+description = "File research role"
+nickname_candidates = ["Atlas"]
+developer_instructions = "Research carefully"
+"#,
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[agents.archivist]\ndescription = \"Inline archivist role\"\nconfig_file = \"./agents/archivist.toml\"\nnickname_candidates = [\"Inline\"]\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
+        })?;
+        let spawn_agent = specs
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .context("spawn_agent spec")?;
+        let description = spawn_agent.input_schema["properties"]["agent_type"]["description"]
+            .as_str()
+            .context("agent_type description")?;
+        assert!(description.contains("researcher: {\nFile research role\n}"));
+        assert!(!description.contains("archivist: {\nInline archivist role\n}"));
+
+        let provider = InstructionCapturingProvider::default();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_file_metadata_role".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "agent_type": "researcher",
+                "fork_turns": "1",
+            }),
+        };
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert_eq!(payload["nickname"], "Atlas");
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_tool_description_lists_discovered_user_roles_before_builtins_like_codex(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(codex_home.join(CODEX_CONFIG_FILENAME), "")?;
+        let role_dir = codex_home.join("agents");
+        std::fs::create_dir_all(&role_dir)?;
+        std::fs::write(
+            role_dir.join("researcher.toml"),
+            r#"name = "researcher"
+description = "Research role"
+developer_instructions = "Research carefully"
+"#,
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
+        })?;
+        let spawn_agent = specs
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .context("spawn_agent spec")?;
+        let description = spawn_agent.input_schema["properties"]["agent_type"]["description"]
+            .as_str()
+            .context("agent_type description")?;
+        let researcher = description
+            .find("researcher: {\nResearch role\n}")
+            .context("researcher role")?;
+        let default = description.find("default: {").context("default role")?;
+        assert!(researcher < default);
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_tool_description_marks_locked_role_settings_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let role_dir = codex_home.join("agents");
+        std::fs::create_dir_all(&role_dir)?;
+        std::fs::write(
+            role_dir.join("locked.toml"),
+            "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"\nservice_tier = \"priority\"\ndeveloper_instructions = \"Stay locked\"\n",
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[agents.locked]\ndescription = \"Locked role\"\nconfig_file = \"./agents/locked.toml\"\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
+        })?;
+        let spawn_agent = specs
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .context("spawn_agent spec")?;
+        let description = spawn_agent.input_schema["properties"]["agent_type"]["description"]
+            .as_str()
+            .context("agent_type description")?;
+        assert!(description.contains(
+            "locked: {\nLocked role\n- This role's model is set to `gpt-5.4` and its reasoning effort is set to `high`. These settings cannot be changed.\n- This role's service tier is set to `priority`. If it is supported by the resolved model, it takes precedence over a valid spawn request service tier.\n}"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_schema_hides_metadata_fields_when_configured_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\nhide_spawn_agent_metadata = true\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
+        })?;
+        let spawn_agent = specs
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .context("spawn_agent spec")?;
+        let properties = spawn_agent.input_schema["properties"]
+            .as_object()
+            .context("spawn_agent properties")?;
+        assert!(properties.contains_key("message"));
+        assert!(properties.contains_key("task_name"));
+        assert!(properties.contains_key("fork_turns"));
+        assert!(!properties.contains_key("agent_type"));
+        assert!(!properties.contains_key("model"));
+        assert!(!properties.contains_key("reasoning_effort"));
+        assert!(!properties.contains_key("service_tier"));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v2_config_table_parses_and_validates_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            r#"[features.multi_agent_v2]
+enabled = true
+max_concurrent_threads_per_session = 5
+min_wait_timeout_ms = 2500
+max_wait_timeout_ms = 120000
+default_wait_timeout_ms = 30000
+usage_hint_enabled = false
+usage_hint_text = "Custom delegation guidance."
+root_agent_usage_hint_text = "Root guidance."
+subagent_usage_hint_text = "Subagent guidance."
+tool_namespace = "agents"
+hide_spawn_agent_metadata = true
+non_code_mode_only = true
+"#,
+        )?;
+
+        let config = with_codex_home(&codex_home, || {
+            let mut warnings = Vec::new();
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })?;
+
+        assert_eq!(config.multi_agent_v2.max_concurrent_threads_per_session, 5);
+        assert_eq!(config.multi_agent_v2.min_wait_timeout_ms, 2500);
+        assert_eq!(config.multi_agent_v2.max_wait_timeout_ms, 120000);
+        assert_eq!(config.multi_agent_v2.default_wait_timeout_ms, 30000);
+        assert!(!config.multi_agent_v2.usage_hint_enabled);
+        assert_eq!(
+            config.multi_agent_v2.usage_hint_text.as_deref(),
+            Some("Custom delegation guidance.")
+        );
+        assert_eq!(
+            config.multi_agent_v2.root_agent_usage_hint_text.as_deref(),
+            Some("Root guidance.")
+        );
+        assert_eq!(
+            config.multi_agent_v2.subagent_usage_hint_text.as_deref(),
+            Some("Subagent guidance.")
+        );
+        assert_eq!(
+            config.multi_agent_v2.tool_namespace.as_deref(),
+            Some("agents")
+        );
+        assert!(config.multi_agent_v2.hide_spawn_agent_metadata);
+        assert!(config.multi_agent_v2.non_code_mode_only);
+
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\nmin_wait_timeout_ms = 100\nmax_wait_timeout_ms = 50\n",
+        )?;
+        let error = with_codex_home(&codex_home, || {
+            let mut warnings = Vec::new();
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })
+        .expect_err("invalid wait timeout ordering should fail");
+        assert!(error.to_string().contains(
+            "features.multi_agent_v2.min_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms"
+        ));
+
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\ntool_namespace = \"functions\"\n",
+        )?;
+        let error = with_codex_home(&codex_home, || {
+            let mut warnings = Vec::new();
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })
+        .expect_err("reserved namespace should fail");
+        assert!(error.to_string().contains(
+            "features.multi_agent_v2.tool_namespace uses a reserved namespace: functions"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v2_config_drives_tool_specs_and_wait_validation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            r#"[features.multi_agent_v2]
+enabled = true
+max_concurrent_threads_per_session = 17
+min_wait_timeout_ms = 0
+max_wait_timeout_ms = 50
+default_wait_timeout_ms = 0
+usage_hint_enabled = false
+"#,
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
+        })?;
+        let spawn = specs
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .context("spawn_agent spec")?;
+        assert!(spawn
+            .description
+            .contains("max_concurrent_threads_per_session = 17"));
+        assert!(!spawn.description.contains("### When to delegate"));
+        let wait = specs
+            .iter()
+            .find(|spec| spec.name == "wait_agent")
+            .context("wait_agent spec")?;
+        assert_eq!(
+            wait.input_schema["properties"]["timeout_ms"]["description"],
+            "Optional timeout in milliseconds. Defaults to 0, min 0, max 50."
+        );
+
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_wait_agent_tool(
+                &store,
+                &session,
+                &ToolCall {
+                    id: "wait_default_zero".to_string(),
+                    name: "wait_agent".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({}),
+                },
+                &AgentRunOptions::default(),
+            )
+        })?;
+        let data: Value = serde_json::from_str(
+            outcome.messages[0]["content"]
+                .as_str()
+                .context("wait output")?,
+        )?;
+        assert_eq!(data["timed_out"], true);
+
+        let too_high = with_codex_home(&codex_home, || {
+            dispatch_wait_agent_tool(
+                &store,
+                &session,
+                &ToolCall {
+                    id: "wait_too_high".to_string(),
+                    name: "wait_agent".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({"timeout_ms": 51}),
+                },
+                &AgentRunOptions::default(),
+            )
+        })?;
+        assert_eq!(
+            too_high.messages[0]["content"],
+            "timeout_ms must be at most 50"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v2_configured_tool_namespace_is_visible_when_provider_supports_namespaces_like_codex(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\ntool_namespace = \"agents\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
+        })?;
+        let registry = with_codex_home(&codex_home, || {
+            browser_tool_registry_for_session(
+                &session,
+                &AgentRunOptions::default(),
+                "gpt-5.5",
+                true,
+            )
+        })?;
+
+        for tool_name in [
+            "spawn_agent",
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "close_agent",
+            "list_agents",
+        ] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.name == tool_name)
+                .with_context(|| format!("{tool_name} spec"))?;
+            assert_eq!(spec.namespace.as_deref(), Some("agents"));
+            assert_eq!(
+                spec.namespace_description.as_deref(),
+                Some("Tools for spawning and managing sub-agents.")
+            );
+            assert!(
+                registry
+                    .handler_for_namespaced(Some("agents"), tool_name)
+                    .is_some(),
+                "expected namespaced runtime for {tool_name}"
+            );
+            assert!(
+                registry.handler_for_namespaced(None, tool_name).is_none(),
+                "expected no plain runtime for namespaced {tool_name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v2_configured_tool_namespace_is_ignored_without_provider_namespace_support_like_codex(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\ntool_namespace = \"agents\"\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", false)
+        })?;
+        let registry = with_codex_home(&codex_home, || {
+            browser_tool_registry_for_session(
+                &session,
+                &AgentRunOptions::default(),
+                "gpt-5.5",
+                false,
+            )
+        })?;
+
+        for tool_name in [
+            "spawn_agent",
+            "send_message",
+            "followup_task",
+            "wait_agent",
+            "close_agent",
+            "list_agents",
+        ] {
+            let spec = specs
+                .iter()
+                .find(|spec| spec.name == tool_name)
+                .with_context(|| format!("{tool_name} spec"))?;
+            assert_eq!(spec.namespace, None);
+            assert_eq!(spec.namespace_description, None);
+            assert!(
+                registry.handler_for_namespaced(None, tool_name).is_some(),
+                "expected plain runtime for {tool_name}"
+            );
+            assert!(
+                registry
+                    .handler_for_namespaced(Some("agents"), tool_name)
+                    .is_none(),
+                "expected no namespaced runtime without namespace support for {tool_name}"
+            );
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_enforces_multi_agent_v2_thread_cap_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 1\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = FakeProvider::with_text("child result");
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &ToolCall {
+                    id: "spawn_over_cap".to_string(),
+                    name: "spawn_agent".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({
+                        "message": "inspect this repo",
+                        "task_name": "repo_helper",
+                        "fork_turns": "1",
+                    }),
+                },
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+
+        assert!(outcome.messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("max_concurrent_threads_per_session = 1"));
+        assert!(store.list_child_agents(&session.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn mailbox_messages_are_drained_into_target_turn_once_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/worker"),
+            None,
+            None,
+        )?;
+        store.send_agent_message(&parent.id, &child.id, "hello child", false)?;
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
+
+        with_codex_home(&codex_home, || {
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &child.id,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        let first_turn = provider
+            .captured_messages()
+            .into_iter()
+            .next()
+            .context("captured child turn")?;
+        let text = first_turn
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("\"author\":\"/root\""));
+        assert!(text.contains("\"recipient\":\"/root/worker\""));
+        assert!(text.contains("\"content\":\"hello child\""));
+        assert!(store.messages_for_agent(&child.id)?.is_empty());
+        assert_eq!(
+            store
+                .events_for_session(&child.id)?
+                .iter()
+                .filter(|event| event.event_type == "agent.mailbox_input")
+                .count(),
+            1
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn child_completion_sends_parent_subagent_notification_mail_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/worker"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "child finished"}),
+        )?;
+        update_parent_from_child_run(&store, &parent.id, &child.id, None)?;
+
+        let parent_mail = store.messages_for_agent(&parent.id)?;
+        assert_eq!(parent_mail.len(), 1);
+        assert!(parent_mail[0].content.contains("<subagent_notification>"));
+        assert!(parent_mail[0]
+            .content
+            .contains("\"agent_path\":\"/root/worker\""));
+        assert!(parent_mail[0]
+            .content
+            .contains("\"completed\":\"child finished\""));
+
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
+        with_codex_home(&codex_home, || {
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &parent.id,
+                AgentRunOptions::default(),
+            )
+        })?;
+        let text = provider
+            .captured_messages()
+            .into_iter()
+            .next()
+            .context("captured parent turn")?
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("<subagent_notification>"));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v2_root_and_subagent_usage_hints_are_standalone_developer_context() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            r#"[features.multi_agent_v2]
+enabled = true
+root_agent_usage_hint_text = "Root guidance."
+subagent_usage_hint_text = "Subagent guidance."
+"#,
+        )?;
+        let store = Store::open(temp.path())?;
+        let root = store.create_session(None, temp.path())?;
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &root)
+        })?);
+        store.append_event(
+            &root.id,
+            "session.input",
+            serde_json::json!({"text": "root task"}),
+        )?;
+        let root_messages = provider_messages_from_events(&store.events_for_session(&root.id)?);
+        assert!(root_messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("developer")
+                && message.get("name").and_then(Value::as_str)
+                    == Some(MULTI_AGENT_USAGE_HINT_CONTEXT_MESSAGE_NAME)
+                && message_content_text(message) == "Root guidance."
+        }));
+        assert!(!root_messages
+            .iter()
+            .any(|message| message_content_text(message) == "Subagent guidance."));
+
+        let child =
+            store.create_child_session(&root.id, temp.path(), Some("/root/child"), None, None)?;
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &child)
+        })?);
+        store.append_event(
+            &child.id,
+            "session.input",
+            serde_json::json!({"text": "child task"}),
+        )?;
+        let child_messages = provider_messages_from_events(&store.events_for_session(&child.id)?);
+        assert!(child_messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("developer")
+                && message.get("name").and_then(Value::as_str)
+                    == Some(MULTI_AGENT_USAGE_HINT_CONTEXT_MESSAGE_NAME)
+                && message_content_text(message) == "Subagent guidance."
+        }));
+        assert!(!child_messages
+            .iter()
+            .any(|message| message_content_text(message) == "Root guidance."));
+        Ok(())
+    }
+
+    #[test]
+    fn fork_response_items_strip_parent_multi_agent_usage_hints_like_codex() {
+        let events = vec![
+            EventRecord {
+                seq: 1,
+                id: "root-hint".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "workspace.context".to_string(),
+                payload: serde_json::json!({
+                    "kind": WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND,
+                    "content": "Root guidance.",
+                }),
+            },
+            EventRecord {
+                seq: 2,
+                id: "input".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "parent task"}),
+            },
+            EventRecord {
+                seq: 3,
+                id: "final".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "parent final"}]
+                    }
+                }),
+            },
+        ];
+        let items = fork_response_items_for_spawn(
+            &events,
+            "all",
+            0,
+            &[
+                "Root guidance.".to_string(),
+                "Subagent guidance.".to_string(),
+            ],
+        );
+        let text = response_items_to_provider_messages(&items)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(text.contains("parent task"));
+        assert!(text.contains("parent final"));
+        assert!(!text.contains("Root guidance."));
+    }
+
+    #[test]
+    fn spawn_agent_schema_uses_model_catalog_json_model_guidance() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("catalog.json"),
+            r#"{"models":[{
+  "slug":"catalog-child",
+  "display_name":"Catalog Child",
+  "description":"Catalog child model.",
+  "default_reasoning_level":"low",
+  "supported_reasoning_levels":[{"effort":"low"}],
+  "visibility":"list",
+  "supported_in_api":true,
+  "priority":0,
+  "base_instructions":"Catalog child base",
+  "supports_reasoning_summaries":true,
+  "default_reasoning_summary":"none",
+  "supports_parallel_tool_calls":true
+}]}"#,
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "model_catalog_json = \"catalog.json\"\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(
+                &session,
+                &AgentRunOptions::default(),
+                "catalog-child",
+                true,
+            )
+        })?;
+        let spawn_agent = specs
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .context("spawn_agent spec")?;
+        let description = spawn_agent.description.as_str();
+        assert!(description.contains("- `catalog-child`: Catalog child model."));
+        assert!(!description.contains("gpt-5.5"));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_validates_model_and_reasoning_against_catalog_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("catalog.json"),
+            r#"{"models":[{
+  "slug":"catalog-child",
+  "display_name":"Catalog Child",
+  "description":"Catalog child model.",
+  "default_reasoning_level":"low",
+  "supported_reasoning_levels":[{"effort":"low"}],
+  "visibility":"list",
+  "supported_in_api":true,
+  "priority":0,
+  "base_instructions":"Catalog child base",
+  "supports_reasoning_summaries":true,
+  "default_reasoning_summary":"none",
+  "supports_parallel_tool_calls":true
+}]}"#,
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "model_catalog_json = \"catalog.json\"\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = ModelSwitchCapturingProvider::new("catalog-child");
+        let unknown_model = ToolCall {
+            id: "spawn_unknown_model".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "model": "missing-model",
+                "fork_turns": "1"
+            }),
+        };
+
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &unknown_model,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+        assert!(message_content_text(&outcome.messages[0])
+            .contains("Unknown model `missing-model` for spawn_agent"));
+
+        let unsupported_reasoning = ToolCall {
+            id: "spawn_bad_reasoning".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "model": "catalog-child",
+                "reasoning_effort": "high",
+                "fork_turns": "1"
+            }),
+        };
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &unsupported_reasoning,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+        assert!(message_content_text(&outcome.messages[0])
+            .contains("Reasoning effort `high` is not supported for model `catalog-child`"));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_result_hides_nickname_but_keeps_session_metadata_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\nhide_spawn_agent_metadata = true\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_hidden_metadata".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "fork_turns": "1",
+            }),
+        };
+
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
+
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert_eq!(payload["task_name"], "/root/repo_helper");
+        assert!(payload.get("nickname").is_none());
+        let child = store
+            .list_child_agents(&session.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        assert!(child
+            .agent_nickname
+            .as_deref()
+            .is_some_and(|name| !name.is_empty()));
+        let child_events = store.events_for_session(&child.child_session_id)?;
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "agent.context"
+                && event.payload["nickname"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty())
+        }));
+        let parent_events = store.events_for_session(&session.id)?;
+        assert!(parent_events.iter().any(|event| {
+            event.event_type == "agent.spawned"
+                && event.payload["nickname"]
+                    .as_str()
+                    .is_some_and(|name| !name.is_empty())
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_discovered_agent_role_is_warning_not_fatal_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(codex_home.join(CODEX_CONFIG_FILENAME), "")?;
+        let role_dir = codex_home.join("agents");
+        std::fs::create_dir_all(&role_dir)?;
+        std::fs::write(
+            role_dir.join("bad.toml"),
+            r#"name = "bad"
+description = "Missing developer instructions"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_STARTUP_WARNING_EVENT
+                && event.payload["message"].as_str().is_some_and(|message| {
+                    message.contains("Ignoring malformed agent role definition")
+                        && message.contains("must define `developer_instructions`")
+                })
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn malformed_declared_agent_role_is_warning_not_fatal_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[agents.researcher]\ndescription = \"Research role\"\nnickname_candidates = [\"Atlas\", \" Atlas \"]\n",
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+
+        assert!(with_codex_home(&codex_home, || {
+            append_workspace_context_event(&store, &session)
+        })?);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_STARTUP_WARNING_EVENT
+                && event.payload["message"].as_str().is_some_and(|message| {
+                    message.contains("Ignoring malformed agent role definition")
+                        && message.contains("agents.researcher.nickname_candidates")
+                        && message.contains("cannot contain duplicates")
+                })
+        }));
+
+        let provider = InstructionCapturingProvider::default();
+        let call = ToolCall {
+            id: "spawn_malformed_declared_role".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "agent_type": "researcher",
+                "fork_turns": "1",
+            }),
+        };
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+        assert!(
+            message_content_text(&outcome.messages[0]).contains("unknown agent_type 'researcher'")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_full_fork_accepts_service_tier_like_codex_v2() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            tx.send(request.service_tier.clone())
+                .expect("send child service tier");
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_full_fork_service_tier".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "service_tier": "priority",
+            }),
+        };
+
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
+
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert_eq!(payload["task_name"], "/root/repo_helper");
+        assert_eq!(
+            rx.recv_timeout(Duration::from_secs(1))?.as_deref(),
+            Some("priority")
+        );
+        let child = store
+            .list_child_agents(&session.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        let child_events = store.events_for_session(&child.child_session_id)?;
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "agent.context" && event.payload["service_tier"] == "priority"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_full_fork_seeds_filtered_response_history_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "workspace.context",
+            serde_json::json!({
+                "kind": WORKSPACE_CONTEXT_ENVIRONMENT_KIND,
+                "content": "<environment_context><cwd>/tmp/parent</cwd></environment_context>",
+            }),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "parent task"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.response.output_item",
+            serde_json::json!({
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "commentary",
+                    "content": [{"type": "output_text", "text": "parent scratchpad"}]
+                }
+            }),
+        )?;
+        store.append_event(
+            &session.id,
+            "model.response.output_item",
+            serde_json::json!({
+                "item": {
+                    "type": "message",
+                    "role": "assistant",
+                    "phase": "final_answer",
+                    "content": [{"type": "output_text", "text": "parent final"}]
+                }
+            }),
+        )?;
+        store.append_event(
+            &session.id,
+            "tool.output",
+            serde_json::json!({
+                "name": "python",
+                "tool_call_id": "orphan",
+                "text": "raw parent tool output",
+            }),
+        )?;
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            tx.send(request.child_session_id.clone())
+                .expect("send child session id");
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_full_fork_history".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect forked context",
+                "task_name": "fork_helper",
+            }),
+        };
+
+        with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
+
+        let child_session_id = rx.recv_timeout(Duration::from_secs(1))?;
+        let child_events = store.events_for_session(&child_session_id)?;
+        let context_event = child_events
+            .iter()
+            .find(|event| event.event_type == "agent.context")
+            .context("agent.context")?;
+        assert_eq!(context_event.payload["history_mode"], "fork_response_items");
+        assert_eq!(context_event.payload["fork_mode"], "all");
+        assert!(context_event.payload["fork_response_items"]
+            .as_array()
+            .is_some_and(|items| !items.is_empty()));
+        assert!(!child_events
+            .iter()
+            .any(|event| event.event_type == "workspace.context"));
+
+        let messages = provider_messages_from_events(&child_events);
+        let model_text = messages
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(model_text.contains("parent task"));
+        assert!(model_text.contains("parent final"));
+        assert!(model_text.contains("inspect forked context"));
+        assert!(!model_text.contains("Inherited compact context"));
+        assert!(!model_text.contains("parent scratchpad"));
+        assert!(!model_text.contains("raw parent tool output"));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_rejects_unsupported_requested_service_tier_like_codex_v2() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
+        let call = ToolCall {
+            id: "spawn_bad_service_tier".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "service_tier": "turbo",
+            }),
+        };
+
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+
+        let text = message_content_text(&outcome.messages[0]);
+        assert!(text.contains(
+            "Service tier `turbo` is not supported for model `gpt-5.4`. Supported service tiers: priority"
+        ));
+        assert!(store.list_child_agents(&session.id)?.is_empty());
+
+        let unsupported_model_provider = ModelSwitchCapturingProvider::new("gpt-5.3-codex");
+        let call = ToolCall {
+            id: "spawn_bad_model_service_tier".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "codex_helper",
+                "service_tier": "priority",
+            }),
+        };
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &unsupported_model_provider,
+                &session,
+                &call,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+        assert!(message_content_text(&outcome.messages[0]).contains(
+            "Service tier `priority` is not supported for model `gpt-5.3-codex`. Supported service tiers: none"
+        ));
+
+        let unsupported_mini_provider = ModelSwitchCapturingProvider::new("gpt-5.4-mini");
+        let call = ToolCall {
+            id: "spawn_bad_mini_service_tier".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "mini_helper",
+                "service_tier": "priority",
+            }),
+        };
+        let outcome = with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &unsupported_mini_provider,
+                &session,
+                &call,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+        assert!(message_content_text(&outcome.messages[0]).contains(
+            "Service tier `priority` is not supported for model `gpt-5.4-mini`. Supported service tiers: none"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_role_service_tier_falls_back_to_supported_parent_tier_like_codex() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let role_dir = codex_home.join("agents");
+        std::fs::create_dir_all(&role_dir)?;
+        std::fs::write(
+            role_dir.join("tiered.toml"),
+            "model = \"gpt-5.4\"\nservice_tier = \"turbo\"\ndeveloper_instructions = \"Use the tiered role.\"\n",
+        )?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "service_tier = \"priority\"\n[agents.tiered]\ndescription = \"Tiered role\"\nconfig_file = \"./agents/tiered.toml\"\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            tx.send((
+                request.model.clone(),
+                request.service_tier.clone(),
+                request.config_overrides.clone(),
+            ))
+            .expect("send child request");
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_role_service_tier_fallback".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "tiered_helper",
+                "agent_type": "tiered",
+                "fork_turns": "1",
+            }),
+        };
+
+        with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default().with_child_agent_runner(runner),
+                &None,
+            )
+        })?;
+
+        let (model, service_tier, config_overrides) = rx.recv_timeout(Duration::from_secs(1))?;
+        assert_eq!(model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(service_tier.as_deref(), Some("priority"));
+        assert!(config_overrides
+            .iter()
+            .all(|(key, value)| { key != "service_tier" || value.as_str() != Some("turbo") }));
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_partial_fork_passes_model_and_reasoning_to_child_runner() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InstructionCapturingProvider::default();
+        let (tx, rx) = std::sync::mpsc::channel();
+        let state_dir = store.state_dir().to_path_buf();
+        let runner = ChildAgentRunner::new(move |request| {
+            tx.send((request.model.clone(), request.reasoning_effort.clone()))
+                .expect("send child request");
+            let store = Store::open(&state_dir)?;
+            store.append_event(
+                &request.child_session_id,
+                "session.done",
+                serde_json::json!({"result": "child finished"}),
+            )?;
+            Ok(())
+        });
+        let call = ToolCall {
+            id: "spawn_partial_override".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({
+                "message": "inspect this repo",
+                "task_name": "repo_helper",
+                "agent_type": "explorer",
+                "fork_turns": "1",
+                "model": "gpt-5.4",
+                "reasoning_effort": "low",
+            }),
+        };
+
+        let outcome = dispatch_spawn_agent_tool(
+            &store,
+            &provider,
+            &session,
+            &call,
+            &AgentRunOptions::default().with_child_agent_runner(runner),
+            &None,
+        )?;
+
+        let payload = serde_json::from_str::<Value>(&message_content_text(&outcome.messages[0]))?;
+        assert_eq!(payload["task_name"], "/root/repo_helper");
+        assert!(payload.get("child_session_id").is_none());
+        assert!(payload.get("status").is_none());
+        let (model, reasoning_effort) = rx.recv_timeout(Duration::from_secs(1))?;
+        assert_eq!(model.as_deref(), Some("gpt-5.4"));
+        assert_eq!(reasoning_effort.as_deref(), Some("low"));
+        let child = store
+            .list_child_agents(&session.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        let child_events = store.events_for_session(&child.child_session_id)?;
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "agent.context"
+                && event.payload["fork_mode"] == "last_n"
+                && event.payload["model"] == "gpt-5.4"
+                && event.payload["reasoning_effort"] == "low"
+        }));
         Ok(())
     }
 
     #[test]
     fn spawn_agent_with_child_runner_returns_before_child_finishes_and_wait_blocks() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let state_dir = store.state_dir().to_path_buf();
         let runner = ChildAgentRunner::new(move |request| {
@@ -6723,13 +25308,15 @@ mod tests {
             Ok(())
         });
         let provider = BlockingExplorerParentProvider::default();
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "understand this repo",
-            temp.path(),
-            AgentRunOptions::default().with_child_agent_runner(runner),
-        )?;
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "understand this repo",
+                temp.path(),
+                AgentRunOptions::default().with_child_agent_runner(runner),
+            )
+        })?;
         let parent_events = store.events_for_session(&session_id)?;
         let spawn_finished_seq = parent_events
             .iter()
@@ -6745,7 +25332,7 @@ mod tests {
             .context("agent.completed event")?;
         assert!(spawn_finished_seq < completed_seq);
         assert!(parent_events.iter().any(|event| {
-            event.event_type == "agent.wait.started" && event.payload["target"] == "repo_explorer"
+            event.event_type == "agent.wait.started" && event.payload["timeout_ms"] == 10_000
         }));
         assert!(parent_events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "parent used child"
@@ -6779,6 +25366,7 @@ mod tests {
             &ToolCall {
                 id: "done_blocked".to_string(),
                 name: "done".to_string(),
+                namespace: None,
                 arguments: serde_json::json!({"result": "parent result"}),
             },
         )?;
@@ -6798,6 +25386,7 @@ mod tests {
             &ToolCall {
                 id: "done_close_children".to_string(),
                 name: "done".to_string(),
+                namespace: None,
                 arguments: serde_json::json!({
                     "result": "parent result",
                     "finish_and_close_children": true,
@@ -6809,15 +25398,12 @@ mod tests {
             store.load_session(&parent.id)?.expect("parent").status,
             SessionStatus::Done
         );
-        assert_eq!(
-            store.load_session(&child.id)?.expect("child").status,
-            SessionStatus::Cancelled
-        );
+        assert_eq!(store.list_child_agents(&parent.id)?[0].status, "closed");
         Ok(())
     }
 
     #[test]
-    fn wait_agent_without_target_reports_all_direct_children() -> Result<()> {
+    fn wait_agent_v2_returns_summary_without_child_content() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let parent = store.create_session(None, temp.path())?;
@@ -6845,7 +25431,7 @@ mod tests {
             "session.done",
             serde_json::json!({"result": "done child result"}),
         )?;
-        store.set_child_agent_status(&done.id, "done")?;
+        update_parent_from_child_run(&store, &parent.id, &done.id, None)?;
 
         let outcome = dispatch_wait_agent_tool(
             &store,
@@ -6853,24 +25439,19 @@ mod tests {
             &ToolCall {
                 id: "wait_all".to_string(),
                 name: "wait_agent".to_string(),
-                arguments: serde_json::json!({"timeout_ms": 0}),
+                namespace: None,
+                arguments: serde_json::json!({"timeout_ms": 10_000}),
             },
+            &AgentRunOptions::default(),
         )?;
         let content = outcome.messages[0]["content"]
             .as_str()
             .context("tool content")?;
         let data: Value = serde_json::from_str(content)?;
-        assert_eq!(data["agents"].as_array().context("agents")?.len(), 2);
-        assert!(data["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|agent| agent["status"] == "running"));
-        assert!(data["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|agent| agent["result"] == "done child result"));
+        assert_eq!(data["message"], "Wait completed.");
+        assert_eq!(data["timed_out"], false);
+        assert!(!content.contains("done child result"));
+        assert!(data.get("agents").is_none());
         Ok(())
     }
 
@@ -6904,6 +25485,7 @@ mod tests {
             serde_json::json!({"text": "second running"}),
         )?;
         let state_dir = store.state_dir().to_path_buf();
+        let parent_id = parent.id.clone();
         let second_id = second.id.clone();
         std::thread::spawn(move || {
             std::thread::sleep(Duration::from_millis(80));
@@ -6915,9 +25497,8 @@ mod tests {
                     serde_json::json!({"result": "second finished"}),
                 )
                 .expect("finish child");
-            store
-                .set_child_agent_status(&second_id, "done")
-                .expect("update edge");
+            update_parent_from_child_run(&store, &parent_id, &second_id, None)
+                .expect("update parent from child");
         });
 
         let outcome = dispatch_wait_agent_tool(
@@ -6926,24 +25507,18 @@ mod tests {
             &ToolCall {
                 id: "wait_any".to_string(),
                 name: "wait_agent".to_string(),
-                arguments: serde_json::json!({"timeout_ms": 5_000}),
+                namespace: None,
+                arguments: serde_json::json!({"timeout_ms": 10_000}),
             },
+            &AgentRunOptions::default(),
         )?;
         let content = outcome.messages[0]["content"]
             .as_str()
             .context("tool content")?;
         let data: Value = serde_json::from_str(content)?;
         assert_eq!(data["timed_out"], false);
-        assert!(data["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|agent| agent["result"] == "second finished"));
-        assert!(data["agents"]
-            .as_array()
-            .unwrap()
-            .iter()
-            .any(|agent| agent["status"] == "running"));
+        assert_eq!(data["message"], "Wait completed.");
+        assert!(!content.contains("second finished"));
         Ok(())
     }
 
@@ -6973,46 +25548,274 @@ mod tests {
     }
 
     #[test]
-    fn wait_agent_can_return_after_timeout_for_active_child() -> Result<()> {
+    fn wait_agent_v2_rejects_timeout_below_codex_minimum() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
         let parent = store.create_session(None, temp.path())?;
-        let child = store.create_child_session(
-            &parent.id,
-            temp.path(),
-            Some("/root/helper"),
-            None,
-            None,
-        )?;
-        store.append_event(
-            &child.id,
-            "session.input",
-            serde_json::json!({"text": "still running"}),
-        )?;
         let outcome = dispatch_wait_agent_tool(
             &store,
             &parent,
             &ToolCall {
                 id: "wait_active".to_string(),
                 name: "wait_agent".to_string(),
+                namespace: None,
                 arguments: serde_json::json!({
-                    "target": "/root/helper",
                     "timeout_ms": 1,
                 }),
+            },
+            &AgentRunOptions::default(),
+        )?;
+        let content = outcome.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        assert_eq!(content, "timeout_ms must be at least 10000");
+
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events.iter().any(
+            |event| event.event_type == "tool.failed" && event.payload["name"] == "wait_agent"
+        ));
+        Ok(())
+    }
+
+    #[test]
+    fn list_agents_v2_returns_codex_compact_live_tree() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let researcher = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/researcher"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &researcher.id,
+            "session.input",
+            serde_json::json!({"text": "research docs"}),
+        )?;
+        let worker = store.create_child_session(
+            &researcher.id,
+            temp.path(),
+            Some("/root/researcher/worker"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &worker.id,
+            "session.input",
+            serde_json::json!({"text": "build patch"}),
+        )?;
+        store.append_event(
+            &worker.id,
+            "session.done",
+            serde_json::json!({"result": "worker finished"}),
+        )?;
+        store.set_child_agent_status(&worker.id, "done")?;
+        let closed = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/closed"),
+            None,
+            None,
+        )?;
+        store.close_child_agent(&closed.id, "test close")?;
+
+        let outcome = dispatch_list_agents_tool(
+            &store,
+            &researcher,
+            &ToolCall {
+                id: "list_worker".to_string(),
+                name: "list_agents".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"path_prefix": "worker"}),
             },
         )?;
         let content = outcome.messages[0]["content"]
             .as_str()
             .context("tool content")?;
         let data: Value = serde_json::from_str(content)?;
-        assert_eq!(data["status"], "running");
-        assert_eq!(data["timed_out"], true);
+        assert_eq!(data["agents"].as_array().context("agents")?.len(), 1);
+        assert_eq!(data["agents"][0]["agent_name"], "/root/researcher/worker");
+        assert_eq!(
+            data["agents"][0]["agent_status"],
+            serde_json::json!({"completed": "worker finished"})
+        );
+        assert_eq!(data["agents"][0]["last_task_message"], "build patch");
 
-        let parent_events = store.events_for_session(&parent.id)?;
-        assert!(parent_events
+        let outcome = dispatch_list_agents_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "list_all".to_string(),
+                name: "list_agents".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({}),
+            },
+        )?;
+        let content = outcome.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        let data: Value = serde_json::from_str(content)?;
+        let agent_names = data["agents"]
+            .as_array()
+            .context("agents")?
             .iter()
-            .any(|event| event.event_type == "tool.finished"
-                && event.payload["name"] == "wait_agent"));
+            .filter_map(|agent| agent["agent_name"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            agent_names,
+            vec!["/root", "/root/researcher", "/root/researcher/worker"]
+        );
+        assert_eq!(data["agents"][0]["last_task_message"], "Main thread");
+        assert!(!content.contains("/root/closed"));
+        Ok(())
+    }
+
+    #[test]
+    fn close_agent_v2_rejects_root_and_returns_previous_status() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/worker"),
+            None,
+            None,
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "done before close"}),
+        )?;
+        store.set_child_agent_status(&child.id, "done")?;
+
+        let root_outcome = dispatch_close_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "close_root".to_string(),
+                name: "close_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"target": "/root"}),
+            },
+        )?;
+        assert_eq!(
+            root_outcome.messages[0]["content"]
+                .as_str()
+                .context("root close error")?,
+            "root is not a spawned agent"
+        );
+
+        let outcome = dispatch_close_agent_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "close_worker".to_string(),
+                name: "close_agent".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({"target": "worker"}),
+            },
+        )?;
+        let content = outcome.messages[0]["content"]
+            .as_str()
+            .context("tool content")?;
+        let data: Value = serde_json::from_str(content)?;
+        assert_eq!(
+            data["previous_status"],
+            serde_json::json!({"completed": "done before close"})
+        );
+        assert_eq!(
+            store.load_session(&child.id)?.expect("child").status,
+            SessionStatus::Cancelled
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn v2_message_tools_reject_legacy_fields_and_support_root_send_message() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = FakeProvider::with_text("ok");
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/worker"),
+            None,
+            None,
+        )?;
+
+        let invalid = dispatch_agent_message_tool(
+            &store,
+            &provider,
+            &parent,
+            &ToolCall {
+                id: "send_legacy".to_string(),
+                name: "send_message".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "target": "worker",
+                    "message": "hello",
+                    "interrupt": true,
+                }),
+            },
+            "send_message",
+            false,
+            &AgentRunOptions::default(),
+        )?;
+        assert_eq!(
+            invalid.messages[0]["content"].as_str().unwrap_or_default(),
+            "unexpected argument `interrupt` for send_message"
+        );
+
+        let sent = dispatch_agent_message_tool(
+            &store,
+            &provider,
+            &child,
+            &ToolCall {
+                id: "send_root".to_string(),
+                name: "send_message".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "target": "/root",
+                    "message": "hello root",
+                }),
+            },
+            "send_message",
+            false,
+            &AgentRunOptions::default(),
+        )?;
+        assert_eq!(sent.messages[0]["content"], "");
+        let root_mail = store.messages_for_agent(&parent.id)?;
+        assert_eq!(root_mail.len(), 1);
+        assert_eq!(root_mail[0].content, "hello root");
+        assert!(!root_mail[0].trigger_turn);
+
+        let root_followup = dispatch_agent_message_tool(
+            &store,
+            &provider,
+            &child,
+            &ToolCall {
+                id: "followup_root".to_string(),
+                name: "followup_task".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({
+                    "target": "/root",
+                    "message": "do root work",
+                }),
+            },
+            "followup_task",
+            true,
+            &AgentRunOptions::default(),
+        )?;
+        assert_eq!(
+            root_followup.messages[0]["content"]
+                .as_str()
+                .unwrap_or_default(),
+            "Tasks can't be assigned to the root agent"
+        );
         Ok(())
     }
 
@@ -7087,6 +25890,397 @@ mod tests {
     }
 
     #[test]
+    fn fork_response_items_for_spawn_filter_like_codex() {
+        let events = vec![
+            browser_use_protocol::EventRecord {
+                seq: 1,
+                id: "input-1".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "first task"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 2,
+                id: "commentary".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "working notes"}]
+                    }
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 3,
+                id: "call".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "function_call",
+                        "call_id": "call_1",
+                        "name": "exec_command",
+                        "arguments": "{\"cmd\":\"echo hidden\"}"
+                    }
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 4,
+                id: "reasoning".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "reasoning",
+                        "encrypted_content": "encrypted reasoning"
+                    }
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 5,
+                id: "final-1".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "first final"}]
+                    }
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 6,
+                id: "input-2".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 6,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "second task"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 7,
+                id: "final-2".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 7,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "second final"}]
+                    }
+                }),
+            },
+        ];
+
+        let all_items = fork_response_items_for_spawn(&events, "all", 0, &[]);
+        let all_text = response_items_to_provider_messages(&all_items)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(all_text.contains("first task"));
+        assert!(all_text.contains("first final"));
+        assert!(all_text.contains("second task"));
+        assert!(all_text.contains("second final"));
+        assert!(!all_text.contains("working notes"));
+        assert!(!all_text.contains("encrypted reasoning"));
+        assert!(all_items
+            .iter()
+            .all(|item| item.get("type").and_then(Value::as_str) == Some("message")));
+
+        let last_items = fork_response_items_for_spawn(&events, "last_n", 1, &[]);
+        let last_text = response_items_to_provider_messages(&last_items)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!last_text.contains("first task"));
+        assert!(!last_text.contains("first final"));
+        assert!(last_text.contains("second task"));
+        assert!(last_text.contains("second final"));
+    }
+
+    #[test]
+    fn fork_response_items_last_n_counts_trigger_turn_agent_messages_like_codex() {
+        let events = vec![
+            browser_use_protocol::EventRecord {
+                seq: 1,
+                id: "input-1".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "old parent context"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 2,
+                id: "final-1".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "final_answer",
+                        "content": [{"type": "output_text", "text": "old final answer"}]
+                    }
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 3,
+                id: "queued-message".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "agent.message".to_string(),
+                payload: serde_json::json!({
+                    "author_path": "/root",
+                    "recipient_path": "/root/worker",
+                    "content": "queued mailbox update",
+                    "trigger_turn": false,
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 4,
+                id: "trigger-message".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "agent.message".to_string(),
+                payload: serde_json::json!({
+                    "author_path": "/root",
+                    "recipient_path": "/root/worker",
+                    "content": "triggered mailbox task",
+                    "trigger_turn": true,
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 5,
+                id: "input-2".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "current parent task"}),
+            },
+        ];
+
+        let last_items = fork_response_items_for_spawn(&events, "last_n", 2, &[]);
+        let last_text = response_items_to_provider_messages(&last_items)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!last_text.contains("old parent context"));
+        assert!(!last_text.contains("old final answer"));
+        assert!(!last_text.contains("queued mailbox update"));
+        assert!(!last_text.contains("triggered mailbox task"));
+        assert!(last_text.contains("current parent task"));
+    }
+
+    #[test]
+    fn fork_response_items_last_n_requires_inter_agent_envelope_like_codex() {
+        let events = vec![
+            browser_use_protocol::EventRecord {
+                seq: 1,
+                id: "input-1".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "first real task"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 2,
+                id: "assistant-json".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "{\"trigger_turn\":true}"}]
+                    }
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 3,
+                id: "input-2".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "second real task"}),
+            },
+        ];
+
+        let last_items = fork_response_items_for_spawn(&events, "last_n", 2, &[]);
+        let last_text = response_items_to_provider_messages(&last_items)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(last_text.contains("first real task"));
+        assert!(last_text.contains("second real task"));
+        assert!(!last_text.contains("trigger_turn"));
+    }
+
+    #[test]
+    fn fork_response_items_fork_rollback_counts_non_trigger_agent_messages_like_codex() {
+        let events = vec![
+            browser_use_protocol::EventRecord {
+                seq: 1,
+                id: "input-1".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "preserved root task"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 2,
+                id: "queued-message".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "agent.message".to_string(),
+                payload: serde_json::json!({
+                    "author_path": "/root",
+                    "recipient_path": "/root/worker",
+                    "content": "queued non-trigger instruction",
+                    "trigger_turn": false,
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 3,
+                id: "stale-commentary".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "stale queued response"}]
+                    }
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 4,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 5,
+                id: "input-2".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "current task"}),
+            },
+        ];
+
+        let last_items = fork_response_items_for_spawn(&events, "last_n", 2, &[]);
+        let last_text = response_items_to_provider_messages(&last_items)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(last_text.contains("preserved root task"));
+        assert!(last_text.contains("current task"));
+        assert!(!last_text.contains("queued non-trigger instruction"));
+        assert!(!last_text.contains("stale queued response"));
+    }
+
+    #[test]
+    fn fork_response_items_fork_rollback_discards_rolled_back_trigger_boundary_like_codex() {
+        let events = vec![
+            browser_use_protocol::EventRecord {
+                seq: 1,
+                id: "input-1".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 1,
+                event_type: "session.input".to_string(),
+                payload: serde_json::json!({"text": "old task"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 2,
+                id: "input-2".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 2,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "middle task"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 3,
+                id: "trigger-message".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 3,
+                event_type: "agent.message".to_string(),
+                payload: serde_json::json!({
+                    "author_path": "/root",
+                    "recipient_path": "/root/worker",
+                    "content": "rolled back triggered task",
+                    "trigger_turn": true,
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 4,
+                id: "stale-commentary".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 4,
+                event_type: "model.response.output_item".to_string(),
+                payload: serde_json::json!({
+                    "item": {
+                        "type": "message",
+                        "role": "assistant",
+                        "phase": "commentary",
+                        "content": [{"type": "output_text", "text": "rolled back assistant notes"}]
+                    }
+                }),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 5,
+                id: "rollback".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 5,
+                event_type: SESSION_ROLLBACK_EVENT.to_string(),
+                payload: serde_json::json!({"num_turns": 1}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 6,
+                id: "input-3".to_string(),
+                session_id: "s".to_string(),
+                ts_ms: 6,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "new task"}),
+            },
+        ];
+
+        let last_items = fork_response_items_for_spawn(&events, "last_n", 2, &[]);
+        let last_text = response_items_to_provider_messages(&last_items)
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(!last_text.contains("old task"));
+        assert!(last_text.contains("middle task"));
+        assert!(last_text.contains("new task"));
+        assert!(!last_text.contains("rolled back triggered task"));
+        assert!(!last_text.contains("rolled back assistant notes"));
+    }
+
+    #[test]
     fn existing_session_provider_run_uses_sanitized_agent_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -7137,16 +26331,19 @@ mod tests {
     #[test]
     fn python_image_outputs_are_forwarded_to_next_model_turn() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         std::fs::write(temp.path().join("shot.png"), b"not-really-a-png")?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = ImageInspectingProvider::default();
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "look at page",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "look at page",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
         let events = store.events_for_session(&session_id)?;
         assert!(events.iter().any(|event| event.event_type == "tool.image"));
         assert!(events.iter().any(|event| event.event_type == "session.done"
@@ -7159,11 +26356,14 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        let huge_len = token_budget_to_char_budget(MAX_TOOL_OUTPUT_TEXT_TOKENS) + 1024;
+        let huge_len = token_budget_to_char_budget(tool_output_serialization_token_budget(
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
+        )) + 1024;
         let huge_text = "x".repeat(huge_len);
         let call = ToolCall {
             id: "view_huge".to_string(),
             name: "view_image".to_string(),
+            namespace: None,
             arguments: serde_json::json!({}),
         };
 
@@ -7183,25 +26383,24 @@ mod tests {
                     "detail": "auto",
                 }
             ]),
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
         )?;
 
         let content = message["content"].as_array().context("content array")?;
         assert_eq!(content.len(), 2);
         let preview = content[0]["text"].as_str().context("preview text")?;
-        assert!(preview.contains("[truncated]"));
-        assert!(preview.contains("Full tool output saved to:"));
+        assert!(preview.contains("tokens truncated"));
+        assert!(!preview.contains("Full tool output saved to:"));
         assert_eq!(content[1]["type"], "input_image");
         assert_eq!(content[1]["image_url"], "data:image/png;base64,ZmFrZQ==");
-        let artifact_path = preview
-            .lines()
-            .find_map(|line| line.strip_prefix("Full tool output saved to: "))
+        let artifacts = store.artifacts_for_session(&session.id)?;
+        let artifact_path = artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "tool-output")
+            .map(|artifact| artifact.path.clone())
             .context("artifact path")?;
         let spilled = std::fs::read_to_string(artifact_path)?;
         assert_eq!(spilled.len(), huge_len);
-        assert!(store
-            .artifacts_for_session(&session.id)?
-            .iter()
-            .any(|artifact| artifact.kind == "tool-output"));
         Ok(())
     }
 
@@ -7213,6 +26412,7 @@ mod tests {
         let call = ToolCall {
             id: "exec_huge".to_string(),
             name: "exec_command".to_string(),
+            namespace: None,
             arguments: serde_json::json!({}),
         };
 
@@ -7222,17 +26422,19 @@ mod tests {
             &call,
             "exec_command",
             serde_json::json!({
-                "output": "z".repeat(token_budget_to_char_budget(MAX_TOOL_OUTPUT_TEXT_TOKENS) + 1024),
+                "output": "z".repeat(token_budget_to_char_budget(tool_output_serialization_token_budget(DEFAULT_TOOL_OUTPUT_TEXT_TOKENS)) + 1024),
                 "metadata": {"truncated": true},
             }),
         )?;
 
         let content = message["content"].as_str().context("tool content")?;
-        assert!(content.contains("[truncated]"));
-        assert!(content.contains("Full tool output saved to:"));
-        let artifact_path = content
-            .lines()
-            .find_map(|line| line.strip_prefix("Full tool output saved to: "))
+        assert!(content.contains("tokens truncated"));
+        assert!(!content.contains("Full tool output saved to:"));
+        let artifacts = store.artifacts_for_session(&session.id)?;
+        let artifact_path = artifacts
+            .iter()
+            .find(|artifact| artifact.kind == "tool-output")
+            .map(|artifact| artifact.path.clone())
             .context("artifact path")?;
         let spilled = std::fs::read_to_string(artifact_path)?;
         assert!(spilled.contains("\"metadata\":{\"truncated\":true}"));
@@ -7253,15 +26455,17 @@ mod tests {
                     ModelEvent::ToolCall {
                         call: ToolCall {
                             id: "read_second".to_string(),
-                            name: "read_file".to_string(),
-                            arguments: serde_json::json!({ "path": "second.txt" }),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "cmd": "cat second.txt" }),
                         },
                     },
                     ModelEvent::ToolCall {
                         call: ToolCall {
                             id: "read_first".to_string(),
-                            name: "read_file".to_string(),
-                            arguments: serde_json::json!({ "path": "first.txt" }),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "cmd": "cat first.txt" }),
                         },
                     },
                     ModelEvent::Done,
@@ -7283,6 +26487,7 @@ mod tests {
                         call: ToolCall {
                             id: "done_parallel_reads".to_string(),
                             name: "done".to_string(),
+                            namespace: None,
                             arguments: serde_json::json!({
                                 "result": "parallel reads ok",
                             }),
@@ -7306,7 +26511,11 @@ mod tests {
             let mut step = self.step.lock().expect("step lock");
             if *step == 0 {
                 *step += 1;
-                bail!("context_length_exceeded: input is too long");
+                return Err(ProviderError::non_retryable(
+                    browser_use_providers::ProviderErrorKind::ContextWindowExceeded,
+                    "response.failed (context_length_exceeded): input is too long",
+                )
+                .into());
             }
             let joined = turn
                 .messages
@@ -7322,6 +26531,7 @@ mod tests {
                     call: ToolCall {
                         id: "done_after_overflow".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "result": "overflow recovered",
                         }),
@@ -7345,6 +26555,7 @@ mod tests {
                     call: ToolCall {
                         id: "python_image".to_string(),
                         name: "python".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "code": "emit_image('shot.png', label='page')",
                         }),
@@ -7356,6 +26567,7 @@ mod tests {
                     call: ToolCall {
                         id: "done_image".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "result": "image context ok",
                         }),
@@ -7401,12 +26613,249 @@ mod tests {
                     call: ToolCall {
                         id: "done_existing".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"result": "context ok"}),
                     },
                 },
                 ModelEvent::Done,
             ])
         }
+    }
+
+    #[derive(Default)]
+    struct InstructionCapturingProvider {
+        instructions: std::sync::Mutex<Vec<Option<String>>>,
+        model_settings: std::sync::Mutex<Vec<ModelRequestSettings>>,
+        request_max_retries: std::sync::Mutex<Vec<Option<usize>>>,
+        stream_max_retries: std::sync::Mutex<Vec<Option<usize>>>,
+        stream_idle_timeout_ms: std::sync::Mutex<Vec<Option<u64>>>,
+        model_request_infos: std::sync::Mutex<Vec<Option<browser_use_providers::ModelRequestInfo>>>,
+        client_metadata: std::sync::Mutex<Vec<Option<HashMap<String, String>>>>,
+        extra_headers: std::sync::Mutex<Vec<Option<HashMap<String, String>>>>,
+        turn_state_present: std::sync::Mutex<Vec<bool>>,
+        output_schemas: std::sync::Mutex<Vec<Option<Value>>>,
+        output_schema_strict: std::sync::Mutex<Vec<bool>>,
+    }
+
+    impl InstructionCapturingProvider {
+        fn captured_instructions(&self) -> Vec<Option<String>> {
+            self.instructions.lock().expect("instructions lock").clone()
+        }
+
+        fn captured_model_settings(&self) -> Vec<ModelRequestSettings> {
+            self.model_settings
+                .lock()
+                .expect("model settings lock")
+                .clone()
+        }
+
+        fn captured_request_max_retries(&self) -> Vec<Option<usize>> {
+            self.request_max_retries
+                .lock()
+                .expect("request max retries lock")
+                .clone()
+        }
+
+        fn captured_stream_idle_timeout_ms(&self) -> Vec<Option<u64>> {
+            self.stream_idle_timeout_ms
+                .lock()
+                .expect("stream idle timeout lock")
+                .clone()
+        }
+
+        fn captured_stream_max_retries(&self) -> Vec<Option<usize>> {
+            self.stream_max_retries
+                .lock()
+                .expect("stream max retries lock")
+                .clone()
+        }
+
+        fn captured_model_request_infos(
+            &self,
+        ) -> Vec<Option<browser_use_providers::ModelRequestInfo>> {
+            self.model_request_infos
+                .lock()
+                .expect("model request infos lock")
+                .clone()
+        }
+
+        fn captured_client_metadata(&self) -> Vec<Option<HashMap<String, String>>> {
+            self.client_metadata
+                .lock()
+                .expect("client metadata lock")
+                .clone()
+        }
+
+        fn captured_extra_headers(&self) -> Vec<Option<HashMap<String, String>>> {
+            self.extra_headers
+                .lock()
+                .expect("extra headers lock")
+                .clone()
+        }
+
+        fn captured_turn_state_present(&self) -> Vec<bool> {
+            self.turn_state_present
+                .lock()
+                .expect("turn state present lock")
+                .clone()
+        }
+
+        fn captured_output_schemas(&self) -> Vec<Option<Value>> {
+            self.output_schemas
+                .lock()
+                .expect("output schemas lock")
+                .clone()
+        }
+
+        fn captured_output_schema_strict(&self) -> Vec<bool> {
+            self.output_schema_strict
+                .lock()
+                .expect("output schema strict lock")
+                .clone()
+        }
+    }
+
+    impl ModelProvider for InstructionCapturingProvider {
+        fn model_name(&self) -> &str {
+            "gpt-5.4"
+        }
+
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            self.instructions
+                .lock()
+                .expect("instructions lock")
+                .push(turn.instructions.clone());
+            self.model_settings
+                .lock()
+                .expect("model settings lock")
+                .push(turn.model_settings);
+            self.request_max_retries
+                .lock()
+                .expect("request max retries lock")
+                .push(turn.request_max_retries);
+            self.stream_max_retries
+                .lock()
+                .expect("stream max retries lock")
+                .push(turn.stream_max_retries);
+            self.stream_idle_timeout_ms
+                .lock()
+                .expect("stream idle timeout lock")
+                .push(turn.stream_idle_timeout_ms);
+            self.model_request_infos
+                .lock()
+                .expect("model request infos lock")
+                .push(turn.model_request_info.clone());
+            self.client_metadata
+                .lock()
+                .expect("client metadata lock")
+                .push(turn.client_metadata.clone());
+            self.extra_headers
+                .lock()
+                .expect("extra headers lock")
+                .push(turn.extra_headers.clone());
+            self.turn_state_present
+                .lock()
+                .expect("turn state present lock")
+                .push(turn.turn_state.is_some());
+            self.output_schemas
+                .lock()
+                .expect("output schemas lock")
+                .push(turn.output_schema);
+            self.output_schema_strict
+                .lock()
+                .expect("output schema strict lock")
+                .push(turn.output_schema_strict);
+            Ok(vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_instructions".to_string(),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({"result": "instructions captured"}),
+                    },
+                },
+                ModelEvent::Done,
+            ])
+        }
+    }
+
+    struct ModelSwitchCapturingProvider {
+        model: String,
+        messages: std::sync::Mutex<Vec<Vec<Value>>>,
+        instructions: std::sync::Mutex<Vec<Option<String>>>,
+        model_settings: std::sync::Mutex<Vec<ModelRequestSettings>>,
+    }
+
+    impl ModelSwitchCapturingProvider {
+        fn new(model: impl Into<String>) -> Self {
+            Self {
+                model: model.into(),
+                messages: std::sync::Mutex::new(Vec::new()),
+                instructions: std::sync::Mutex::new(Vec::new()),
+                model_settings: std::sync::Mutex::new(Vec::new()),
+            }
+        }
+
+        fn captured_messages(&self) -> Vec<Vec<Value>> {
+            self.messages.lock().expect("messages lock").clone()
+        }
+
+        fn captured_instructions(&self) -> Vec<Option<String>> {
+            self.instructions.lock().expect("instructions lock").clone()
+        }
+
+        fn captured_model_settings(&self) -> Vec<ModelRequestSettings> {
+            self.model_settings
+                .lock()
+                .expect("model settings lock")
+                .clone()
+        }
+    }
+
+    impl ModelProvider for ModelSwitchCapturingProvider {
+        fn model_name(&self) -> &str {
+            &self.model
+        }
+
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            self.messages
+                .lock()
+                .expect("messages lock")
+                .push(turn.messages);
+            self.instructions
+                .lock()
+                .expect("instructions lock")
+                .push(turn.instructions);
+            self.model_settings
+                .lock()
+                .expect("model settings lock")
+                .push(turn.model_settings);
+            Ok(vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: format!("done_{}", self.model.replace('.', "_")),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({"result": "model switch captured"}),
+                    },
+                },
+                ModelEvent::Done,
+            ])
+        }
+    }
+
+    fn model_switch_message_count(messages: &[Value]) -> usize {
+        messages
+            .iter()
+            .filter(|message| message_content_text(message).contains("<model_switch>"))
+            .count()
+    }
+
+    fn personality_spec_message_count(messages: &[Value]) -> usize {
+        messages
+            .iter()
+            .filter(|message| message_content_text(message).contains("<personality_spec>"))
+            .count()
     }
 
     #[derive(Default)]
@@ -7427,6 +26876,7 @@ mod tests {
                         call: ToolCall {
                             id: "child_done".to_string(),
                             name: "done".to_string(),
+                            namespace: None,
                             arguments: serde_json::json!({
                                 "result": "child inspected constraints",
                             }),
@@ -7441,11 +26891,12 @@ mod tests {
                     call: ToolCall {
                         id: "spawn_1".to_string(),
                         name: "spawn_agent".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "message": "inspect flight search constraints",
                             "task_name": "flight_search",
-                            "nickname": "Flight helper",
-                            "agent_type": "researcher",
+                            "agent_type": "explorer",
+                            "fork_turns": "1",
                         }),
                     },
                 },
@@ -7458,6 +26909,7 @@ mod tests {
                         call: ToolCall {
                             id: "send_1".to_string(),
                             name: "send_message".to_string(),
+                            namespace: None,
                             arguments: serde_json::json!({
                                 "target": "/root/flight_search",
                                 "message": "keep this in your notes",
@@ -7467,47 +26919,38 @@ mod tests {
                 }
                 2 => ModelEvent::ToolCall {
                     call: ToolCall {
-                        id: "send_input_1".to_string(),
-                        name: "send_input".to_string(),
-                        arguments: serde_json::json!({
-                            "target": "flight_search",
-                            "message": "run the codex-style input",
-                        }),
-                    },
-                },
-                3 => ModelEvent::ToolCall {
-                    call: ToolCall {
                         id: "followup_1".to_string(),
                         name: "followup_task".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "target": "flight_search",
                             "message": "run the focused follow-up",
                         }),
                     },
                 },
-                4 => ModelEvent::ToolCall {
+                3 => ModelEvent::ToolCall {
                     call: ToolCall {
                         id: "wait_1".to_string(),
                         name: "wait_agent".to_string(),
-                        arguments: serde_json::json!({
-                            "target": "/root/flight_search",
-                        }),
+                        namespace: None,
+                        arguments: serde_json::json!({"timeout_ms": 0}),
+                    },
+                },
+                4 => ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "list_1".to_string(),
+                        name: "list_agents".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({"path_prefix": "/root"}),
                     },
                 },
                 5 => ModelEvent::ToolCall {
                     call: ToolCall {
-                        id: "list_1".to_string(),
-                        name: "list_agents".to_string(),
-                        arguments: serde_json::json!({"path_prefix": "/root"}),
-                    },
-                },
-                6 => ModelEvent::ToolCall {
-                    call: ToolCall {
                         id: "close_1".to_string(),
                         name: "close_agent".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "target": "flight_search",
-                            "reason": "parent has enough context",
                         }),
                     },
                 },
@@ -7515,6 +26958,7 @@ mod tests {
                     call: ToolCall {
                         id: "done_1".to_string(),
                         name: "done".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "result": "delegation path verified",
                         }),
@@ -7553,24 +26997,27 @@ mod tests {
                     call: ToolCall {
                         id: "spawn_blocking_explorer".to_string(),
                         name: "spawn_agent".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({
                             "message": "map the repository",
                             "task_name": "repo_explorer",
                             "agent_type": "explorer",
+                            "fork_turns": "1",
                         }),
                     },
                 },
                 1 => {
                     let spawn = tool_response_json(&turn, "spawn_agent")
                         .context("spawn_agent tool response")?;
-                    assert_eq!(spawn["status"], "running");
+                    assert_eq!(spawn["task_name"], "/root/repo_explorer");
+                    assert!(spawn.get("status").is_none());
                     ModelEvent::ToolCall {
                         call: ToolCall {
                             id: "wait_blocking_explorer".to_string(),
                             name: "wait_agent".to_string(),
+                            namespace: None,
                             arguments: serde_json::json!({
-                                "target": "repo_explorer",
-                                "timeout_ms": 5_000,
+                                "timeout_ms": 10_000,
                             }),
                         },
                     }
@@ -7578,12 +27025,13 @@ mod tests {
                 2 => {
                     let wait =
                         tool_response_json(&turn, "wait_agent").context("wait_agent response")?;
-                    assert_eq!(wait["status"], "done");
-                    assert_eq!(wait["result"], "repo mapped");
+                    assert_eq!(wait["message"], "Wait completed.");
+                    assert_eq!(wait["timed_out"], false);
                     ModelEvent::ToolCall {
                         call: ToolCall {
                             id: "done_after_blocking_explorer".to_string(),
                             name: "done".to_string(),
+                            namespace: None,
                             arguments: serde_json::json!({"result": "parent used child"}),
                         },
                     }
@@ -7664,15 +27112,11 @@ mod tests {
         assert!(output.payload["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("[truncated]"));
+            .contains("tokens truncated"));
         let artifacts = store.artifacts_for_session(&session_id)?;
-        assert_eq!(
-            artifacts
-                .iter()
-                .filter(|artifact| artifact.kind == "tool-output")
-                .count(),
-            1
-        );
+        assert!(artifacts
+            .iter()
+            .any(|artifact| artifact.kind == "tool-output"));
         Ok(())
     }
 

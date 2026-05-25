@@ -3,6 +3,8 @@ pub(crate) enum PaletteAction {
     NewTask,
     PreviousWork,
     ChangeBrowser,
+    ChangeMode,
+    PlanMode,
     ChooseModel,
     Authenticate,
     Update,
@@ -15,7 +17,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const ITEMS: [PaletteItem; 6] = [
+const ITEMS: [PaletteItem; 8] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -30,6 +32,16 @@ const ITEMS: [PaletteItem; 6] = [
         command: "/browser",
         description: "change browser backend",
         action: PaletteAction::ChangeBrowser,
+    },
+    PaletteItem {
+        command: "/mode",
+        description: "choose collaboration mode",
+        action: PaletteAction::ChangeMode,
+    },
+    PaletteItem {
+        command: "/plan",
+        description: "switch to Plan mode",
+        action: PaletteAction::PlanMode,
     },
     PaletteItem {
         command: "/model",

@@ -1,14 +1,15 @@
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, ChildStdin, Command, Stdio};
+use std::sync::atomic::{AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, OnceLock};
 use std::thread::{self, JoinHandle};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use browser_use_protocol::{SessionMeta, ToolCall};
-use browser_use_store::Store;
+use browser_use_store::{Store, StoreNotifier};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
 
@@ -17,25 +18,41 @@ const DEFAULT_WRITE_STDIN_YIELD_TIME_MS: u64 = 250;
 const MIN_YIELD_TIME_MS: u64 = 250;
 const MIN_EMPTY_POLL_YIELD_TIME_MS: u64 = 5_000;
 const MAX_YIELD_TIME_MS: u64 = 30_000;
+const MAX_EMPTY_POLL_YIELD_TIME_MS: u64 = 300_000;
 const DEFAULT_MAX_OUTPUT_TOKENS: usize = 10_000;
+const UNIFIED_EXEC_OUTPUT_MAX_BYTES: usize = 1024 * 1024;
+const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
 const TOKEN_TO_CHAR_APPROX: usize = 4;
+const STDIN_CLOSED_MESSAGE: &str =
+    "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open";
+const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
+    ("NO_COLOR", "1"),
+    ("TERM", "dumb"),
+    ("LANG", "C.UTF-8"),
+    ("LC_CTYPE", "C.UTF-8"),
+    ("LC_ALL", "C.UTF-8"),
+    ("COLORTERM", ""),
+    ("PAGER", "cat"),
+    ("GIT_PAGER", "cat"),
+    ("GH_PAGER", "cat"),
+    ("CODEX_CI", "1"),
+];
 
 #[derive(Debug)]
 pub(crate) struct CommandToolResult {
+    #[cfg(test)]
     pub(crate) content: Value,
-}
-
-#[derive(Clone, Debug)]
-struct OutputChunk {
-    text: String,
+    pub(crate) model_text: String,
 }
 
 struct ManagedCommand {
     session_id: String,
+    tool_call_id: String,
     process: ManagedProcess,
-    output: Arc<Mutex<Vec<OutputChunk>>>,
-    read_index: usize,
+    output: Arc<Mutex<HeadTailBuffer>>,
     started_at: Instant,
+    last_used: Instant,
+    background_finished: bool,
     readers: Vec<JoinHandle<()>>,
 }
 
@@ -57,12 +74,160 @@ struct ProcessExit {
     success: bool,
 }
 
-static COMMANDS: OnceLock<Mutex<HashMap<String, ManagedCommand>>> = OnceLock::new();
+#[derive(Debug)]
+struct HeadTailBuffer {
+    max_bytes: usize,
+    head_budget: usize,
+    tail_budget: usize,
+    head: VecDeque<Vec<u8>>,
+    tail: VecDeque<Vec<u8>>,
+    head_bytes: usize,
+    tail_bytes: usize,
+    omitted_bytes: usize,
+}
 
+impl Default for HeadTailBuffer {
+    fn default() -> Self {
+        Self::new(UNIFIED_EXEC_OUTPUT_MAX_BYTES)
+    }
+}
+
+impl HeadTailBuffer {
+    fn new(max_bytes: usize) -> Self {
+        let head_budget = max_bytes / 2;
+        let tail_budget = max_bytes.saturating_sub(head_budget);
+        Self {
+            max_bytes,
+            head_budget,
+            tail_budget,
+            head: VecDeque::new(),
+            tail: VecDeque::new(),
+            head_bytes: 0,
+            tail_bytes: 0,
+            omitted_bytes: 0,
+        }
+    }
+
+    fn retained_bytes(&self) -> usize {
+        self.head_bytes.saturating_add(self.tail_bytes)
+    }
+
+    #[cfg(test)]
+    fn omitted_bytes(&self) -> usize {
+        self.omitted_bytes
+    }
+
+    #[cfg(test)]
+    fn to_bytes(&self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.retained_bytes());
+        for chunk in &self.head {
+            out.extend_from_slice(chunk);
+        }
+        for chunk in &self.tail {
+            out.extend_from_slice(chunk);
+        }
+        out
+    }
+
+    fn push_chunk(&mut self, chunk: Vec<u8>) {
+        if self.max_bytes == 0 {
+            self.omitted_bytes = self.omitted_bytes.saturating_add(chunk.len());
+            return;
+        }
+        if self.head_bytes < self.head_budget {
+            let remaining_head = self.head_budget.saturating_sub(self.head_bytes);
+            if chunk.len() <= remaining_head {
+                self.head_bytes = self.head_bytes.saturating_add(chunk.len());
+                self.head.push_back(chunk);
+                return;
+            }
+            let (head_part, tail_part) = chunk.split_at(remaining_head);
+            if !head_part.is_empty() {
+                self.head_bytes = self.head_bytes.saturating_add(head_part.len());
+                self.head.push_back(head_part.to_vec());
+            }
+            self.push_to_tail(tail_part.to_vec());
+            return;
+        }
+        self.push_to_tail(chunk);
+    }
+
+    fn drain_bytes(&mut self) -> Vec<u8> {
+        let mut out = Vec::with_capacity(self.retained_bytes());
+        for chunk in self.head.drain(..) {
+            out.extend_from_slice(&chunk);
+        }
+        for chunk in self.tail.drain(..) {
+            out.extend_from_slice(&chunk);
+        }
+        self.head_bytes = 0;
+        self.tail_bytes = 0;
+        self.omitted_bytes = 0;
+        out
+    }
+
+    fn push_to_tail(&mut self, chunk: Vec<u8>) {
+        if self.tail_budget == 0 {
+            self.omitted_bytes = self.omitted_bytes.saturating_add(chunk.len());
+            return;
+        }
+        if chunk.len() >= self.tail_budget {
+            let start = chunk.len().saturating_sub(self.tail_budget);
+            let kept = chunk[start..].to_vec();
+            let dropped = chunk.len().saturating_sub(kept.len());
+            self.omitted_bytes = self
+                .omitted_bytes
+                .saturating_add(self.tail_bytes)
+                .saturating_add(dropped);
+            self.tail.clear();
+            self.tail_bytes = kept.len();
+            self.tail.push_back(kept);
+            return;
+        }
+        self.tail_bytes = self.tail_bytes.saturating_add(chunk.len());
+        self.tail.push_back(chunk);
+        self.trim_tail_to_budget();
+    }
+
+    fn trim_tail_to_budget(&mut self) {
+        let mut excess = self.tail_bytes.saturating_sub(self.tail_budget);
+        while excess > 0 {
+            match self.tail.front_mut() {
+                Some(front) if excess >= front.len() => {
+                    excess -= front.len();
+                    self.tail_bytes = self.tail_bytes.saturating_sub(front.len());
+                    self.omitted_bytes = self.omitted_bytes.saturating_add(front.len());
+                    self.tail.pop_front();
+                }
+                Some(front) => {
+                    front.drain(..excess);
+                    self.tail_bytes = self.tail_bytes.saturating_sub(excess);
+                    self.omitted_bytes = self.omitted_bytes.saturating_add(excess);
+                    break;
+                }
+                None => break,
+            }
+        }
+    }
+}
+
+static COMMANDS: OnceLock<Mutex<HashMap<i64, ManagedCommand>>> = OnceLock::new();
+static NEXT_PROCESS_ID: AtomicI64 = AtomicI64::new(1000);
+
+#[cfg(test)]
 pub(crate) fn exec_command(
     store: &Store,
     session: &SessionMeta,
     call: &ToolCall,
+) -> Result<CommandToolResult> {
+    exec_command_with_budget(store, session, call, DEFAULT_MAX_OUTPUT_TOKENS)
+}
+
+pub(crate) fn exec_command_with_budget(
+    store: &Store,
+    session: &SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
 ) -> Result<CommandToolResult> {
     let raw_cmd = call
         .arguments
@@ -74,8 +239,26 @@ pub(crate) fn exec_command(
         bail!("exec_command requires cmd");
     }
     let cmd = raw_cmd.to_string();
+    if let Some(reason) = dangerous_command_rejection(&cmd) {
+        bail!("{reason}");
+    }
+    let sandbox_permissions = requested_sandbox_permissions(&call.arguments)?;
+    let additional_permissions_requested =
+        validate_additional_permissions_argument_shape(&call.arguments)?;
+    let effective_sandbox_permissions = if additional_permissions_requested
+        && matches!(sandbox_permissions, SandboxPermissions::UseDefault)
+    {
+        SandboxPermissions::WithAdditionalPermissions
+    } else {
+        sandbox_permissions
+    };
+    if effective_sandbox_permissions.requests_sandbox_override() {
+        bail!(
+            "approval policy is Never; reject command — you cannot ask for escalated permissions if the approval policy is Never"
+        );
+    }
     let yield_time = yield_time(&call.arguments, DEFAULT_EXEC_YIELD_TIME_MS);
-    let max_chars = max_output_chars(&call.arguments);
+    let max_chars = max_output_chars(&call.arguments, tool_output_token_budget);
     let workdir = resolve_workdir(
         session,
         call.arguments.get("workdir").and_then(Value::as_str),
@@ -85,18 +268,19 @@ pub(crate) fn exec_command(
         .get("shell")
         .and_then(Value::as_str)
         .filter(|shell| !shell.trim().is_empty())
-        .map(ToOwned::to_owned)
+        .map(resolve_model_shell)
         .unwrap_or_else(default_shell);
     let login = call
         .arguments
         .get("login")
         .and_then(Value::as_bool)
-        .unwrap_or(false);
+        .unwrap_or(true);
     let tty_requested = call
         .arguments
         .get("tty")
         .and_then(Value::as_bool)
         .unwrap_or(false);
+    let process_id = allocate_process_id();
 
     store.append_event(
         &session.id,
@@ -107,11 +291,23 @@ pub(crate) fn exec_command(
             "arguments": call.arguments,
         }),
     )?;
+
+    let output = Arc::new(Mutex::new(HeadTailBuffer::default()));
+    let (process, readers, tty_allocated) = spawn_process(
+        &shell,
+        login,
+        &cmd,
+        &workdir,
+        tty_requested,
+        output.clone(),
+        &session.id,
+    )?;
     store.append_event(
         &session.id,
         "command.started",
         json!({
             "tool_call_id": call.id,
+            "session_id": process_id,
             "cmd": cmd,
             "workdir": workdir,
             "shell": shell,
@@ -119,17 +315,14 @@ pub(crate) fn exec_command(
             "tty": tty_requested,
         }),
     )?;
-
-    let process_id = format!("cmd_{}", &call.id.replace('-', "_"));
-    let output = Arc::new(Mutex::new(Vec::new()));
-    let (process, readers, tty_allocated) =
-        spawn_process(&shell, login, &cmd, &workdir, tty_requested, output.clone())?;
     let mut managed = ManagedCommand {
         session_id: session.id.clone(),
+        tool_call_id: call.id.clone(),
         process,
         output,
-        read_index: 0,
         started_at: Instant::now(),
+        last_used: Instant::now(),
+        background_finished: false,
         readers,
     };
 
@@ -137,7 +330,7 @@ pub(crate) fn exec_command(
     if let Some(status) = managed.process.try_wait()? {
         finish_readers(&mut managed);
         let text = managed.read_recent_output();
-        emit_command_output(store, &session.id, &process_id, &text)?;
+        emit_command_output(store, &session.id, process_id, &text)?;
         store.append_event(
             &session.id,
             "command.finished",
@@ -149,7 +342,8 @@ pub(crate) fn exec_command(
                 "duration_ms": managed.started_at.elapsed().as_millis() as u64,
             }),
         )?;
-        let content = command_output(CommandOutputPayload {
+        let payload = CommandOutputPayload {
+            chunk_id: chunk_id_for_call(&call.id),
             session_id: None,
             running: false,
             output: &text,
@@ -159,7 +353,9 @@ pub(crate) fn exec_command(
             tty_requested,
             tty_allocated,
             write_error: None,
-        });
+        };
+        let content = command_output(&payload);
+        let model_text = command_model_text(&payload);
         store.append_event(
             &session.id,
             "tool.finished",
@@ -169,11 +365,15 @@ pub(crate) fn exec_command(
                 "output": content,
             }),
         )?;
-        return Ok(CommandToolResult { content });
+        return Ok(CommandToolResult {
+            #[cfg(test)]
+            content,
+            model_text,
+        });
     }
 
     let text = managed.read_recent_output();
-    emit_command_output(store, &session.id, &process_id, &text)?;
+    emit_command_output(store, &session.id, process_id, &text)?;
     store.append_event(
         &session.id,
         "command.waiting",
@@ -183,8 +383,9 @@ pub(crate) fn exec_command(
             "running": true,
         }),
     )?;
-    let content = command_output(CommandOutputPayload {
-        session_id: Some(process_id.clone()),
+    let payload = CommandOutputPayload {
+        chunk_id: chunk_id_for_call(&call.id),
+        session_id: Some(process_id),
         running: true,
         output: &text,
         max_chars,
@@ -193,11 +394,15 @@ pub(crate) fn exec_command(
         tty_requested,
         tty_allocated,
         write_error: None,
-    });
-    commands()
-        .lock()
-        .expect("command registry poisoned")
-        .insert(process_id, managed);
+    };
+    let content = command_output(&payload);
+    let model_text = command_model_text(&payload);
+    store_running_command(store, process_id, managed);
+    spawn_background_completion_watcher(
+        store.state_dir().to_path_buf(),
+        store.notifier(),
+        process_id,
+    );
     store.append_event(
         &session.id,
         "tool.finished",
@@ -207,30 +412,36 @@ pub(crate) fn exec_command(
             "output": content,
         }),
     )?;
-    Ok(CommandToolResult { content })
+    Ok(CommandToolResult {
+        #[cfg(test)]
+        content,
+        model_text,
+    })
 }
 
+#[cfg(test)]
 pub(crate) fn write_stdin(
     store: &Store,
     session: &SessionMeta,
     call: &ToolCall,
 ) -> Result<CommandToolResult> {
-    let process_id = call
-        .arguments
-        .get("session_id")
-        .and_then(Value::as_str)
-        .unwrap_or("")
-        .trim();
-    if process_id.is_empty() {
-        bail!("write_stdin requires session_id");
-    }
+    write_stdin_with_budget(store, session, call, DEFAULT_MAX_OUTPUT_TOKENS)
+}
+
+pub(crate) fn write_stdin_with_budget(
+    store: &Store,
+    session: &SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+) -> Result<CommandToolResult> {
+    let process_id = write_stdin_session_id(&call.arguments)?;
     let chars = call
         .arguments
         .get("chars")
         .and_then(Value::as_str)
         .unwrap_or("");
     let yield_time = write_stdin_yield_time(&call.arguments, chars);
-    let max_chars = max_output_chars(&call.arguments);
+    let max_chars = max_output_chars(&call.arguments, tool_output_token_budget);
     store.append_event(
         &session.id,
         "tool.started",
@@ -244,15 +455,23 @@ pub(crate) fn write_stdin(
     let mut command = {
         let mut commands = commands().lock().expect("command registry poisoned");
         commands
-            .remove(process_id)
+            .remove(&process_id)
             .with_context(|| format!("unknown command session id: {process_id}"))?
     };
     if command.session_id != session.id {
         commands()
             .lock()
             .expect("command registry poisoned")
-            .insert(process_id.to_string(), command);
+            .insert(process_id, command);
         bail!("command session belongs to another task: {process_id}");
+    }
+    command.last_used = Instant::now();
+    if !chars.is_empty() && !command.process.tty_allocated() {
+        commands()
+            .lock()
+            .expect("command registry poisoned")
+            .insert(process_id, command);
+        bail!(STDIN_CLOSED_MESSAGE);
     }
     let write_error = if !chars.is_empty() {
         match command.process.write_all(chars.as_bytes()) {
@@ -284,8 +503,9 @@ pub(crate) fn write_stdin(
 
     let running = status.is_none();
     let tty_allocated = command.process.tty_allocated();
-    let content = command_output(CommandOutputPayload {
-        session_id: Some(process_id.to_string()),
+    let payload = CommandOutputPayload {
+        chunk_id: chunk_id_for_call(&call.id),
+        session_id: Some(process_id),
         running,
         output: &text,
         max_chars,
@@ -294,24 +514,28 @@ pub(crate) fn write_stdin(
         tty_requested: tty_allocated,
         tty_allocated,
         write_error: write_error.as_deref(),
-    });
+    };
+    let content = command_output(&payload);
+    let model_text = command_model_text(&payload);
     if let Some(status) = status {
-        store.append_event(
-            &session.id,
-            "command.finished",
-            json!({
-                "tool_call_id": call.id,
-                "session_id": process_id,
-                "exit_code": status.exit_code,
-                "success": status.success,
-                "duration_ms": command.started_at.elapsed().as_millis() as u64,
-            }),
-        )?;
+        if !command.background_finished {
+            store.append_event(
+                &session.id,
+                "command.finished",
+                json!({
+                    "tool_call_id": command.tool_call_id,
+                    "session_id": process_id,
+                    "exit_code": status.exit_code,
+                    "success": status.success,
+                    "duration_ms": command.started_at.elapsed().as_millis() as u64,
+                }),
+            )?;
+        }
     } else {
         commands()
             .lock()
             .expect("command registry poisoned")
-            .insert(process_id.to_string(), command);
+            .insert(process_id, command);
     }
     store.append_event(
         &session.id,
@@ -322,11 +546,217 @@ pub(crate) fn write_stdin(
             "output": content,
         }),
     )?;
-    Ok(CommandToolResult { content })
+    Ok(CommandToolResult {
+        #[cfg(test)]
+        content,
+        model_text,
+    })
 }
 
-fn commands() -> &'static Mutex<HashMap<String, ManagedCommand>> {
+fn commands() -> &'static Mutex<HashMap<i64, ManagedCommand>> {
     COMMANDS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn allocate_process_id() -> i64 {
+    loop {
+        let process_id = if should_use_deterministic_process_ids() {
+            NEXT_PROCESS_ID.fetch_add(1, Ordering::Relaxed)
+        } else {
+            random_process_id()
+        };
+        let commands = commands().lock().expect("command registry poisoned");
+        if !commands.contains_key(&process_id) {
+            return process_id;
+        }
+    }
+}
+
+fn should_use_deterministic_process_ids() -> bool {
+    cfg!(test)
+}
+
+fn random_process_id() -> i64 {
+    let bytes = *uuid::Uuid::new_v4().as_bytes();
+    let raw = u128::from_be_bytes(bytes);
+    1_000 + i64::try_from(raw % 99_000).expect("bounded process id")
+}
+
+fn store_running_command(store: &Store, process_id: i64, managed: ManagedCommand) {
+    let pruned = {
+        let mut commands = commands().lock().expect("command registry poisoned");
+        let pruned = prune_processes_if_needed(&mut commands);
+        commands.insert(process_id, managed);
+        pruned
+    };
+    if let Some(mut command) = pruned {
+        let _ = command.process.kill();
+        let _ = command.process.wait();
+        finish_readers(&mut command);
+        let _ = store.append_event(
+            &command.session_id,
+            "command.pruned",
+            json!({
+                "reason": "max_unified_exec_processes",
+            }),
+        );
+    }
+}
+
+fn prune_processes_if_needed(
+    commands: &mut HashMap<i64, ManagedCommand>,
+) -> Option<ManagedCommand> {
+    if commands.len() < MAX_UNIFIED_EXEC_PROCESSES {
+        return None;
+    }
+    let meta = commands
+        .iter()
+        .map(|(process_id, command)| (*process_id, command.last_used, command.background_finished))
+        .collect::<Vec<_>>();
+    let process_id = process_id_to_prune_from_meta(&meta)?;
+    commands.remove(&process_id)
+}
+
+fn process_id_to_prune_from_meta(meta: &[(i64, Instant, bool)]) -> Option<i64> {
+    if meta.is_empty() {
+        return None;
+    }
+    let mut by_recency = meta.to_vec();
+    by_recency.sort_by_key(|(_, last_used, _)| std::cmp::Reverse(*last_used));
+    let protected = by_recency
+        .iter()
+        .take(8)
+        .map(|(process_id, _, _)| *process_id)
+        .collect::<std::collections::HashSet<_>>();
+
+    let mut lru = meta.to_vec();
+    lru.sort_by_key(|(_, last_used, _)| *last_used);
+    if let Some((process_id, _, _)) = lru
+        .iter()
+        .find(|(process_id, _, exited)| !protected.contains(process_id) && *exited)
+    {
+        return Some(*process_id);
+    }
+    lru.into_iter()
+        .find(|(process_id, _, _)| !protected.contains(process_id))
+        .map(|(process_id, _, _)| process_id)
+}
+
+fn spawn_background_completion_watcher(
+    state_dir: PathBuf,
+    notifier: Option<StoreNotifier>,
+    process_id: i64,
+) {
+    thread::spawn(move || loop {
+        thread::sleep(Duration::from_millis(100));
+        let event = {
+            let mut commands = commands().lock().expect("command registry poisoned");
+            let Some(command) = commands.get_mut(&process_id) else {
+                return;
+            };
+            if command.background_finished {
+                return;
+            }
+            let status = match command.process.try_wait() {
+                Ok(Some(status)) => status,
+                Ok(None) => continue,
+                Err(_) => return,
+            };
+            finish_readers(command);
+            command.background_finished = true;
+            Some((
+                command.session_id.clone(),
+                command.tool_call_id.clone(),
+                status,
+                command.started_at.elapsed(),
+            ))
+        };
+        if let Some((session_id, tool_call_id, status, duration)) = event {
+            if let Ok(store) = Store::open_with_optional_notifier(&state_dir, notifier.clone()) {
+                let _ = store.append_event(
+                    &session_id,
+                    "command.finished",
+                    json!({
+                        "tool_call_id": tool_call_id,
+                        "session_id": process_id,
+                        "exit_code": status.exit_code,
+                        "success": status.success,
+                        "duration_ms": duration.as_millis() as u64,
+                    }),
+                );
+            }
+        }
+        return;
+    });
+}
+
+fn write_stdin_session_id(arguments: &Value) -> Result<i64> {
+    let Some(value) = arguments.get("session_id") else {
+        bail!("write_stdin requires numeric session_id");
+    };
+    let Some(process_id) = value.as_i64() else {
+        bail!("write_stdin requires numeric session_id");
+    };
+    if process_id <= 0 {
+        bail!("write_stdin requires positive session_id");
+    }
+    Ok(process_id)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SandboxPermissions {
+    UseDefault,
+    RequireEscalated,
+    WithAdditionalPermissions,
+}
+
+impl SandboxPermissions {
+    fn requests_sandbox_override(self) -> bool {
+        !matches!(self, Self::UseDefault)
+    }
+}
+
+fn requested_sandbox_permissions(arguments: &Value) -> Result<SandboxPermissions> {
+    let Some(value) = arguments.get("sandbox_permissions") else {
+        return Ok(SandboxPermissions::UseDefault);
+    };
+    let Some(raw) = value.as_str().map(str::trim) else {
+        bail!("sandbox_permissions must be a string");
+    };
+    match raw {
+        "use_default" => Ok(SandboxPermissions::UseDefault),
+        "require_escalated" => Ok(SandboxPermissions::RequireEscalated),
+        "with_additional_permissions" => Ok(SandboxPermissions::WithAdditionalPermissions),
+        other => bail!(
+            "unsupported sandbox_permissions value {other:?}; expected use_default, require_escalated, or with_additional_permissions"
+        ),
+    }
+}
+
+fn validate_additional_permissions_argument_shape(arguments: &Value) -> Result<bool> {
+    let Some(value) = arguments.get("additional_permissions") else {
+        return Ok(false);
+    };
+    if value.is_null() {
+        return Ok(false);
+    }
+    if !value.is_object() {
+        bail!(
+            "failed to parse function arguments: invalid type: {}, expected struct AdditionalPermissionProfile",
+            json_type_name(value)
+        );
+    }
+    Ok(true)
+}
+
+fn json_type_name(value: &Value) -> &'static str {
+    match value {
+        Value::Null => "null",
+        Value::Bool(_) => "boolean",
+        Value::Number(_) => "number",
+        Value::String(_) => "string",
+        Value::Array(_) => "array",
+        Value::Object(_) => "object",
+    }
 }
 
 pub(crate) fn cleanup_session_commands(session_id: &str) -> usize {
@@ -336,7 +766,7 @@ pub(crate) fn cleanup_session_commands(session_id: &str) -> usize {
         let process_ids = commands
             .iter()
             .filter_map(|(process_id, command)| {
-                (command.session_id == session_id).then(|| process_id.clone())
+                (command.session_id == session_id).then_some(*process_id)
             })
             .collect::<Vec<_>>();
         for process_id in process_ids {
@@ -361,13 +791,16 @@ pub(crate) fn exec_command_is_known_read_only(arguments: &Value) -> bool {
         .and_then(Value::as_str)
         .unwrap_or("")
         .trim();
-    if cmd.is_empty() || has_shell_mutation_syntax(cmd) {
+    if cmd.is_empty() {
         return false;
     }
-    let Some(words) = rough_shell_words(cmd) else {
+    let Some(commands) = commands_for_local_exec_policy(cmd) else {
         return false;
     };
-    command_words_are_known_read_only(&words)
+    !commands.is_empty()
+        && commands
+            .iter()
+            .all(|words| command_words_are_known_read_only(words))
 }
 
 fn spawn_process(
@@ -376,12 +809,13 @@ fn spawn_process(
     cmd: &str,
     workdir: &Path,
     tty_requested: bool,
-    output: Arc<Mutex<Vec<OutputChunk>>>,
+    output: Arc<Mutex<HeadTailBuffer>>,
+    thread_id: &str,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     if tty_requested {
-        return spawn_pty_process(shell, login, cmd, workdir, output);
+        return spawn_pty_process(shell, login, cmd, workdir, output, thread_id);
     }
-    spawn_pipe_process(shell, login, cmd, workdir, output)
+    spawn_pipe_process(shell, login, cmd, workdir, output, thread_id)
 }
 
 fn spawn_pipe_process(
@@ -389,15 +823,17 @@ fn spawn_pipe_process(
     login: bool,
     cmd: &str,
     workdir: &Path,
-    output: Arc<Mutex<Vec<OutputChunk>>>,
+    output: Arc<Mutex<HeadTailBuffer>>,
+    thread_id: &str,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     let mut command = Command::new(shell);
     command
         .args(shell_args(shell, login, cmd))
         .current_dir(workdir)
-        .stdin(Stdio::piped())
+        .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
+    apply_unified_exec_env_to_command(&mut command, thread_id);
     let mut child = command
         .spawn()
         .with_context(|| format!("spawn command via shell {} in {}", shell, workdir.display()))?;
@@ -417,7 +853,8 @@ fn spawn_pty_process(
     login: bool,
     cmd: &str,
     workdir: &Path,
-    output: Arc<Mutex<Vec<OutputChunk>>>,
+    output: Arc<Mutex<HeadTailBuffer>>,
+    thread_id: &str,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     let pty_system = native_pty_system();
     let pair = pty_system.openpty(PtySize {
@@ -431,6 +868,7 @@ fn spawn_pty_process(
     let mut command = CommandBuilder::new(shell);
     command.args(shell_args(shell, login, cmd));
     command.cwd(workdir.as_os_str());
+    apply_unified_exec_env_to_pty_command(&mut command, thread_id);
     let child = pair.slave.spawn_command(command).with_context(|| {
         format!(
             "spawn pty command via shell {} in {}",
@@ -448,6 +886,20 @@ fn spawn_pty_process(
         readers,
         true,
     ))
+}
+
+fn apply_unified_exec_env_to_command(command: &mut Command, thread_id: &str) {
+    for (key, value) in UNIFIED_EXEC_ENV {
+        command.env(key, value);
+    }
+    command.env("CODEX_THREAD_ID", thread_id);
+}
+
+fn apply_unified_exec_env_to_pty_command(command: &mut CommandBuilder, thread_id: &str) {
+    for (key, value) in UNIFIED_EXEC_ENV {
+        command.env(key, value);
+    }
+    command.env("CODEX_THREAD_ID", thread_id);
 }
 
 impl ManagedProcess {
@@ -510,7 +962,7 @@ impl ManagedProcess {
     }
 }
 
-fn spawn_reader<R>(reader: R, output: Arc<Mutex<Vec<OutputChunk>>>) -> JoinHandle<()>
+fn spawn_reader<R>(reader: R, output: Arc<Mutex<HeadTailBuffer>>) -> JoinHandle<()>
 where
     R: std::io::Read + Send + 'static,
 {
@@ -523,16 +975,11 @@ where
                 Ok(_) => output
                     .lock()
                     .expect("command output poisoned")
-                    .push(OutputChunk {
-                        text: String::from_utf8_lossy(&bytes).into_owned(),
-                    }),
+                    .push_chunk(bytes),
                 Err(error) => {
-                    output
-                        .lock()
-                        .expect("command output poisoned")
-                        .push(OutputChunk {
-                            text: format!("[command output read failed: {error}]\n"),
-                        });
+                    output.lock().expect("command output poisoned").push_chunk(
+                        format!("[command output read failed: {error}]\n").into_bytes(),
+                    );
                     break;
                 }
             }
@@ -548,14 +995,8 @@ fn finish_readers(command: &mut ManagedCommand) {
 
 impl ManagedCommand {
     fn read_recent_output(&mut self) -> String {
-        let output = self.output.lock().expect("command output poisoned");
-        let chunks = output
-            .iter()
-            .skip(self.read_index)
-            .map(|chunk| chunk.text.clone())
-            .collect::<String>();
-        self.read_index = output.len();
-        chunks
+        let mut output = self.output.lock().expect("command output poisoned");
+        String::from_utf8_lossy(&output.drain_bytes()).to_string()
     }
 }
 
@@ -573,12 +1014,7 @@ fn wait_for_output(
     Ok(())
 }
 
-fn emit_command_output(
-    store: &Store,
-    session_id: &str,
-    process_id: &str,
-    text: &str,
-) -> Result<()> {
+fn emit_command_output(store: &Store, session_id: &str, process_id: i64, text: &str) -> Result<()> {
     if text.is_empty() {
         return Ok(());
     }
@@ -595,7 +1031,8 @@ fn emit_command_output(
 }
 
 struct CommandOutputPayload<'a> {
-    session_id: Option<String>,
+    chunk_id: String,
+    session_id: Option<i64>,
     running: bool,
     output: &'a str,
     max_chars: usize,
@@ -606,7 +1043,7 @@ struct CommandOutputPayload<'a> {
     write_error: Option<&'a str>,
 }
 
-fn command_output(payload: CommandOutputPayload<'_>) -> Value {
+fn command_output(payload: &CommandOutputPayload<'_>) -> Value {
     let (output, truncated) = cap_output(payload.output, payload.max_chars);
     json!({
         "session_id": payload.session_id,
@@ -621,6 +1058,108 @@ fn command_output(payload: CommandOutputPayload<'_>) -> Value {
             "write_error": payload.write_error,
         }
     })
+}
+
+fn command_model_text(payload: &CommandOutputPayload<'_>) -> String {
+    let output =
+        codex_formatted_truncate_text(payload.output, payload.max_chars / TOKEN_TO_CHAR_APPROX);
+    let mut sections = Vec::new();
+    if !payload.chunk_id.is_empty() {
+        sections.push(format!("Chunk ID: {}", payload.chunk_id));
+    }
+    sections.push(format!(
+        "Wall time: {:.4} seconds",
+        payload.duration.as_secs_f64()
+    ));
+    if let Some(exit_code) = payload.exit_code {
+        sections.push(format!("Process exited with code {exit_code}"));
+    }
+    if payload.running {
+        if let Some(session_id) = &payload.session_id {
+            sections.push(format!("Process running with session ID {session_id}"));
+        }
+    }
+    sections.push(format!(
+        "Original token count: {}",
+        approximate_token_count(payload.output)
+    ));
+    sections.push("Output:".to_string());
+    sections.push(output);
+    sections.join("\n")
+}
+
+fn chunk_id_for_call(call_id: &str) -> String {
+    format!("chunk_{}", call_id.replace('-', "_"))
+}
+
+fn approximate_token_count(text: &str) -> usize {
+    text.len().div_ceil(TOKEN_TO_CHAR_APPROX)
+}
+
+pub(crate) fn codex_formatted_truncate_text(content: &str, max_tokens: usize) -> String {
+    if content.len() <= max_tokens.saturating_mul(TOKEN_TO_CHAR_APPROX) {
+        return content.to_string();
+    }
+    let total_lines = content.lines().count();
+    let truncated = truncate_middle_with_token_budget(content, max_tokens);
+    format!("Total output lines: {total_lines}\n\n{truncated}")
+}
+
+fn truncate_middle_with_token_budget(content: &str, max_tokens: usize) -> String {
+    if content.is_empty() {
+        return String::new();
+    }
+    truncate_middle_with_byte_estimate(content, max_tokens.saturating_mul(TOKEN_TO_CHAR_APPROX))
+}
+
+fn truncate_middle_with_byte_estimate(content: &str, max_bytes: usize) -> String {
+    if max_bytes == 0 {
+        return format!("…{} tokens truncated…", approximate_token_count(content));
+    }
+    if content.len() <= max_bytes {
+        return content.to_string();
+    }
+
+    let left_budget = max_bytes / 2;
+    let right_budget = max_bytes.saturating_sub(left_budget);
+    let tail_start_target = content.len().saturating_sub(right_budget);
+    let mut prefix_end = 0usize;
+    let mut suffix_start = content.len();
+    let mut removed_chars = 0usize;
+    let mut suffix_started = false;
+
+    for (idx, ch) in content.char_indices() {
+        let char_end = idx + ch.len_utf8();
+        if char_end <= left_budget {
+            prefix_end = char_end;
+            continue;
+        }
+        if idx >= tail_start_target {
+            if !suffix_started {
+                suffix_start = idx;
+                suffix_started = true;
+            }
+            continue;
+        }
+        removed_chars = removed_chars.saturating_add(1);
+    }
+
+    if suffix_start < prefix_end {
+        suffix_start = prefix_end;
+    }
+    let removed_bytes = content.len().saturating_sub(max_bytes);
+    let removed_tokens = removed_bytes.div_ceil(TOKEN_TO_CHAR_APPROX);
+    let marker = if removed_tokens == 0 {
+        format!("…{removed_chars} chars truncated…")
+    } else {
+        format!("…{removed_tokens} tokens truncated…")
+    };
+    format!(
+        "{}{}{}",
+        &content[..prefix_end],
+        marker,
+        &content[suffix_start..]
+    )
 }
 
 fn cap_output(output: &str, max_chars: usize) -> (String, bool) {
@@ -650,21 +1189,34 @@ fn cap_output(output: &str, max_chars: usize) -> (String, bool) {
     )
 }
 
-fn max_output_chars(arguments: &Value) -> usize {
-    arguments
+fn max_output_chars(arguments: &Value, tool_output_token_budget: usize) -> usize {
+    let tokens = arguments
         .get("max_output_tokens")
         .and_then(Value::as_u64)
-        .map(|tokens| tokens as usize * TOKEN_TO_CHAR_APPROX)
-        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS * TOKEN_TO_CHAR_APPROX)
+        .and_then(|tokens| usize::try_from(tokens).ok())
+        .unwrap_or(DEFAULT_MAX_OUTPUT_TOKENS)
+        .min(DEFAULT_MAX_OUTPUT_TOKENS)
+        .min(tool_output_token_budget);
+    tokens.saturating_mul(TOKEN_TO_CHAR_APPROX)
 }
 
 fn write_stdin_yield_time(arguments: &Value, chars: &str) -> Duration {
-    let default_ms = if chars.is_empty() {
-        MIN_EMPTY_POLL_YIELD_TIME_MS
+    let millis = if chars.is_empty() {
+        arguments
+            .get("yield_time_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(MIN_EMPTY_POLL_YIELD_TIME_MS)
+            .max(MIN_YIELD_TIME_MS)
+            .clamp(MIN_EMPTY_POLL_YIELD_TIME_MS, MAX_EMPTY_POLL_YIELD_TIME_MS)
     } else {
-        DEFAULT_WRITE_STDIN_YIELD_TIME_MS
+        arguments
+            .get("yield_time_ms")
+            .and_then(Value::as_u64)
+            .unwrap_or(DEFAULT_WRITE_STDIN_YIELD_TIME_MS)
+            .max(MIN_YIELD_TIME_MS)
+            .min(MAX_YIELD_TIME_MS)
     };
-    yield_time(arguments, default_ms)
+    Duration::from_millis(millis)
 }
 
 fn yield_time(arguments: &Value, default_ms: u64) -> Duration {
@@ -694,132 +1246,451 @@ fn default_shell() -> String {
     std::env::var("SHELL").unwrap_or_else(|_| "/bin/sh".to_string())
 }
 
+fn resolve_model_shell(shell: &str) -> String {
+    let path = Path::new(shell.trim());
+    if path.is_file() {
+        return path.to_string_lossy().to_string();
+    }
+    match shell_name(path).as_deref() {
+        Some("bash") => first_available_shell("bash", &["/bin/bash"]),
+        Some("zsh") => first_available_shell("zsh", &["/bin/zsh"]),
+        Some("sh") => first_available_shell("sh", &["/bin/sh"]),
+        _ => ultimate_fallback_shell(),
+    }
+}
+
+fn first_available_shell(binary_name: &str, fallback_paths: &[&str]) -> String {
+    if command_exists_on_path(binary_name) {
+        return binary_name.to_string();
+    }
+    fallback_paths
+        .iter()
+        .find(|path| Path::new(path).is_file())
+        .copied()
+        .unwrap_or_else(|| fallback_paths.first().copied().unwrap_or("/bin/sh"))
+        .to_string()
+}
+
+fn command_exists_on_path(binary_name: &str) -> bool {
+    let Some(path_var) = std::env::var_os("PATH") else {
+        return false;
+    };
+    std::env::split_paths(&path_var).any(|dir| dir.join(binary_name).is_file())
+}
+
+fn ultimate_fallback_shell() -> String {
+    if cfg!(windows) {
+        "cmd.exe".to_string()
+    } else {
+        "/bin/sh".to_string()
+    }
+}
+
+fn shell_name(path: &Path) -> Option<String> {
+    let name = path.file_name()?.to_str()?;
+    let name = name.strip_suffix(".exe").unwrap_or(name);
+    Some(name.to_ascii_lowercase())
+}
+
 fn shell_args(shell: &str, login: bool, cmd: &str) -> Vec<String> {
-    let name = Path::new(shell)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(shell);
-    if login && matches!(name, "bash" | "zsh" | "sh") {
+    let name = shell_name(Path::new(shell)).unwrap_or_else(|| shell.to_ascii_lowercase());
+    if login && matches!(name.as_str(), "bash" | "zsh" | "sh") {
         vec!["-lc".to_string(), cmd.to_string()]
     } else {
         vec!["-c".to_string(), cmd.to_string()]
     }
 }
 
-fn has_shell_mutation_syntax(cmd: &str) -> bool {
-    cmd.contains('\n')
-        || cmd.contains('>')
-        || cmd.contains('<')
-        || cmd.contains('&')
-        || cmd.contains('|')
-        || cmd.contains(';')
-        || cmd.contains('`')
-        || cmd.contains("$(")
+fn dangerous_command_rejection(cmd: &str) -> Option<String> {
+    let dangerous = commands_for_local_exec_policy(cmd)
+        .unwrap_or_default()
+        .iter()
+        .any(|words| command_words_might_be_dangerous(words));
+    dangerous.then(|| {
+        format!(
+            "exec_command rejected `{}`: destructive command would require Codex approval, but this harness has no command approval flow yet",
+            cmd
+        )
+    })
 }
 
-fn rough_shell_words(cmd: &str) -> Option<Vec<String>> {
+fn commands_for_local_exec_policy(cmd: &str) -> Option<Vec<Vec<String>>> {
+    let commands = rough_shell_word_commands(cmd)?;
+    if commands.len() == 1 {
+        if let Some(inner) = shell_lc_plain_commands(&commands[0]) {
+            return Some(inner);
+        }
+    }
+    Some(commands)
+}
+
+fn shell_lc_plain_commands(command: &[String]) -> Option<Vec<Vec<String>>> {
+    let [shell, flag, script] = command else {
+        return None;
+    };
+    if !matches!(flag.as_str(), "-lc" | "-c") {
+        return None;
+    }
+    let shell_name = executable_name_lookup_key(shell)?;
+    if !matches!(shell_name.as_str(), "bash" | "zsh" | "sh") {
+        return None;
+    }
+    let inner = rough_shell_word_commands(script)?;
+    (!inner.is_empty()).then_some(inner)
+}
+
+fn rough_shell_word_commands(cmd: &str) -> Option<Vec<Vec<String>>> {
+    let mut commands = Vec::new();
     let mut words = Vec::new();
     let mut current = String::new();
-    let mut quote = None;
+    let mut word_started = false;
+    let mut quote = ShellQuote::None;
     let mut escaped = false;
-    for ch in cmd.chars() {
+    let mut just_finished_separator = false;
+    let mut iter = cmd.chars().peekable();
+
+    while let Some(ch) = iter.next() {
         if escaped {
             current.push(ch);
+            word_started = true;
+            just_finished_separator = false;
             escaped = false;
             continue;
         }
-        if ch == '\\' {
-            escaped = true;
-            continue;
-        }
         match quote {
-            Some(q) if ch == q => quote = None,
-            Some(_) => current.push(ch),
-            None if ch == '\'' || ch == '"' => quote = Some(ch),
-            None if ch.is_whitespace() => {
-                if !current.is_empty() {
+            ShellQuote::Single if ch == '\'' => quote = ShellQuote::None,
+            ShellQuote::Single => {
+                current.push(ch);
+                word_started = true;
+                just_finished_separator = false;
+            }
+            ShellQuote::Double if ch == '"' => quote = ShellQuote::None,
+            ShellQuote::Double if ch == '$' || ch == '`' => return None,
+            ShellQuote::Double if ch == '\\' => {
+                escaped = true;
+                word_started = true;
+                just_finished_separator = false;
+            }
+            ShellQuote::Double => {
+                current.push(ch);
+                word_started = true;
+                just_finished_separator = false;
+            }
+            ShellQuote::None if ch == '\\' => {
+                escaped = true;
+                word_started = true;
+                just_finished_separator = false;
+            }
+            ShellQuote::None if ch == '\'' => {
+                quote = ShellQuote::Single;
+                word_started = true;
+                just_finished_separator = false;
+            }
+            ShellQuote::None if ch == '"' => {
+                quote = ShellQuote::Double;
+                word_started = true;
+                just_finished_separator = false;
+            }
+            ShellQuote::None if ch.is_whitespace() => {
+                if word_started {
                     words.push(std::mem::take(&mut current));
+                    word_started = false;
                 }
             }
-            None => current.push(ch),
+            ShellQuote::None if ch == '&' => {
+                if iter.peek() != Some(&'&') {
+                    return None;
+                }
+                iter.next();
+                finish_command(&mut commands, &mut words, &mut current, &mut word_started)?;
+                just_finished_separator = true;
+            }
+            ShellQuote::None if ch == '|' => {
+                if iter.peek() == Some(&'|') {
+                    iter.next();
+                }
+                finish_command(&mut commands, &mut words, &mut current, &mut word_started)?;
+                just_finished_separator = true;
+            }
+            ShellQuote::None if ch == ';' => {
+                finish_command(&mut commands, &mut words, &mut current, &mut word_started)?;
+                just_finished_separator = true;
+            }
+            ShellQuote::None if ch == '#' => {
+                return None;
+            }
+            ShellQuote::None
+                if matches!(
+                    ch,
+                    '\n' | '\r' | '<' | '>' | '`' | '$' | '(' | ')' | '{' | '}'
+                ) =>
+            {
+                return None;
+            }
+            ShellQuote::None => {
+                current.push(ch);
+                word_started = true;
+                just_finished_separator = false;
+            }
         }
     }
-    if escaped || quote.is_some() {
+    if escaped || quote != ShellQuote::None || just_finished_separator {
         return None;
     }
-    if !current.is_empty() {
+    if word_started {
         words.push(current);
     }
-    Some(words)
+    if !words.is_empty() {
+        commands.push(words);
+    }
+    (!commands.is_empty()).then_some(commands)
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ShellQuote {
+    None,
+    Single,
+    Double,
+}
+
+fn finish_command(
+    commands: &mut Vec<Vec<String>>,
+    words: &mut Vec<String>,
+    current: &mut String,
+    word_started: &mut bool,
+) -> Option<()> {
+    if *word_started {
+        words.push(std::mem::take(current));
+        *word_started = false;
+    }
+    if words.is_empty() {
+        return None;
+    }
+    commands.push(std::mem::take(words));
+    Some(())
 }
 
 fn command_words_are_known_read_only(words: &[String]) -> bool {
     let Some(first) = words.first().map(String::as_str) else {
         return false;
     };
-    let command = Path::new(first)
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or(first);
-    match command {
-        "cat" | "cut" | "date" | "echo" | "env" | "false" | "grep" | "head" | "id" | "ls"
-        | "nl" | "pwd" | "rg" | "sed" | "stat" | "tail" | "true" | "uname" | "wc" | "which"
-        | "whoami" => read_only_command_args_are_safe(command, &words[1..]),
-        "git" => git_command_is_read_only(&words[1..]),
+    let command = executable_name_lookup_key(first).unwrap_or_else(|| first.to_string());
+    match command.as_str() {
+        "numfmt" | "tac" if cfg!(target_os = "linux") => true,
+        "cat" | "cd" | "cut" | "echo" | "expr" | "false" | "grep" | "head" | "id" | "ls" | "nl"
+        | "paste" | "pwd" | "rev" | "seq" | "stat" | "tail" | "tr" | "true" | "uname" | "uniq"
+        | "wc" | "which" | "whoami" => true,
+        "base64" => base64_command_is_read_only(&words[1..]),
         "find" => find_command_is_read_only(&words[1..]),
+        "rg" => rg_command_is_read_only(&words[1..]),
+        "git" => git_command_is_read_only(words),
+        "sed" => sed_command_is_read_only(words),
         _ => false,
     }
 }
 
-fn read_only_command_args_are_safe(command: &str, args: &[String]) -> bool {
-    match command {
-        "rg" => !args.iter().any(|arg| {
-            matches!(
-                arg.as_str(),
-                "--pre" | "-z" | "--search-zip" | "--hostname-bin"
-            ) || arg.starts_with("--pre=")
-                || arg.starts_with("--hostname-bin=")
-        }),
-        "sed" => !args.iter().any(|arg| arg == "-i" || arg.starts_with("-i")),
-        _ => true,
+fn command_words_might_be_dangerous(words: &[String]) -> bool {
+    let Some(first) = words
+        .first()
+        .and_then(|word| executable_name_lookup_key(word))
+    else {
+        return false;
+    };
+    match first.as_str() {
+        "rm" => matches!(words.get(1).map(String::as_str), Some("-f" | "-rf")),
+        "sudo" => command_words_might_be_dangerous(&words[1..]),
+        _ => false,
     }
 }
 
-fn git_command_is_read_only(args: &[String]) -> bool {
-    let Some(subcommand) = args.iter().find(|arg| !arg.starts_with('-')) else {
+fn base64_command_is_read_only(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        matches!(arg.as_str(), "-o" | "--output")
+            || arg.starts_with("--output=")
+            || (arg.starts_with("-o") && arg != "-o")
+    })
+}
+
+fn rg_command_is_read_only(args: &[String]) -> bool {
+    !args.iter().any(|arg| {
+        matches!(
+            arg.as_str(),
+            "--pre" | "--hostname-bin" | "--search-zip" | "-z"
+        ) || arg.starts_with("--pre=")
+            || arg.starts_with("--hostname-bin=")
+    })
+}
+
+fn sed_command_is_read_only(words: &[String]) -> bool {
+    words.len() <= 4
+        && words.get(1).map(String::as_str) == Some("-n")
+        && is_valid_sed_n_arg(words.get(2).map(String::as_str))
+}
+
+fn git_command_is_read_only(words: &[String]) -> bool {
+    let Some((subcommand_idx, subcommand)) =
+        find_git_subcommand(words, &["status", "log", "diff", "show", "branch"])
+    else {
         return false;
     };
-    let tail = args
-        .iter()
-        .position(|arg| arg == subcommand)
-        .map(|pos| &args[pos + 1..])
-        .unwrap_or(&[]);
-    match subcommand.as_str() {
-        "diff" | "grep" | "log" | "ls-files" | "rev-parse" | "show" | "status" => true,
-        "branch" => tail.iter().all(|arg| {
-            matches!(
-                arg.as_str(),
-                "--show-current"
-                    | "--list"
-                    | "--all"
-                    | "-a"
-                    | "-r"
-                    | "-v"
-                    | "-vv"
-                    | "--verbose"
-                    | "--color"
-                    | "--no-color"
-            ) || arg.starts_with("--color=")
-        }),
-        "worktree" => {
-            tail.first().is_some_and(|arg| arg == "list")
-                && tail
-                    .iter()
-                    .skip(1)
-                    .all(|arg| matches!(arg.as_str(), "--porcelain" | "-z"))
+
+    let global_args = &words[1..subcommand_idx];
+    if git_has_unsafe_global_option(global_args) {
+        return false;
+    }
+
+    let subcommand_args = &words[subcommand_idx + 1..];
+    match subcommand {
+        "status" | "log" | "diff" | "show" => git_subcommand_args_are_read_only(subcommand_args),
+        "branch" => {
+            git_subcommand_args_are_read_only(subcommand_args)
+                && git_branch_is_read_only(subcommand_args)
         }
         _ => false,
     }
+}
+
+fn find_git_subcommand<'a>(words: &'a [String], subcommands: &[&str]) -> Option<(usize, &'a str)> {
+    let first = words
+        .first()
+        .and_then(|word| executable_name_lookup_key(word))?;
+    if first != "git" {
+        return None;
+    }
+
+    let mut skip_next = false;
+    for (idx, arg) in words.iter().enumerate().skip(1) {
+        if skip_next {
+            skip_next = false;
+            continue;
+        }
+
+        let arg = arg.as_str();
+        if is_git_global_option_with_inline_value(arg) {
+            continue;
+        }
+        if is_git_global_option_with_value(arg) {
+            skip_next = true;
+            continue;
+        }
+        if arg == "--" || arg.starts_with('-') {
+            continue;
+        }
+        if subcommands.contains(&arg) {
+            return Some((idx, arg));
+        }
+        return None;
+    }
+    None
+}
+
+fn git_branch_is_read_only(args: &[String]) -> bool {
+    if args.is_empty() {
+        return true;
+    }
+
+    let mut saw_read_only_flag = false;
+    for arg in args.iter().map(String::as_str) {
+        match arg {
+            "--list" | "-l" | "--show-current" | "-a" | "--all" | "-r" | "--remotes" | "-v"
+            | "-vv" | "--verbose" => saw_read_only_flag = true,
+            _ if arg.starts_with("--format=") => saw_read_only_flag = true,
+            _ => return false,
+        }
+    }
+    saw_read_only_flag
+}
+
+#[derive(Clone, Copy)]
+enum GitOptionPattern {
+    Exact(&'static str),
+    ShortWithInlineValue(&'static str),
+    Prefix(&'static str),
+}
+
+impl GitOptionPattern {
+    fn matches(self, arg: &str) -> bool {
+        match self {
+            Self::Exact(option) => arg == option,
+            Self::ShortWithInlineValue(option) => {
+                arg.starts_with(option) && arg.len() > option.len()
+            }
+            Self::Prefix(prefix) => arg.starts_with(prefix),
+        }
+    }
+}
+
+const UNSAFE_GIT_GLOBAL_OPTIONS: &[GitOptionPattern] = &[
+    GitOptionPattern::Exact("-C"),
+    GitOptionPattern::ShortWithInlineValue("-C"),
+    GitOptionPattern::Exact("-c"),
+    GitOptionPattern::ShortWithInlineValue("-c"),
+    GitOptionPattern::Exact("-p"),
+    GitOptionPattern::Exact("--config-env"),
+    GitOptionPattern::Prefix("--config-env="),
+    GitOptionPattern::Exact("--exec-path"),
+    GitOptionPattern::Prefix("--exec-path="),
+    GitOptionPattern::Exact("--git-dir"),
+    GitOptionPattern::Prefix("--git-dir="),
+    GitOptionPattern::Exact("--namespace"),
+    GitOptionPattern::Prefix("--namespace="),
+    GitOptionPattern::Exact("--paginate"),
+    GitOptionPattern::Exact("--super-prefix"),
+    GitOptionPattern::Prefix("--super-prefix="),
+    GitOptionPattern::Exact("--work-tree"),
+    GitOptionPattern::Prefix("--work-tree="),
+];
+
+const UNSAFE_GIT_SUBCOMMAND_OPTIONS: &[GitOptionPattern] = &[
+    GitOptionPattern::Exact("--output"),
+    GitOptionPattern::Prefix("--output="),
+    GitOptionPattern::Exact("--ext-diff"),
+    GitOptionPattern::Exact("--textconv"),
+    GitOptionPattern::Exact("--exec"),
+    GitOptionPattern::Prefix("--exec="),
+];
+
+fn git_has_unsafe_global_option(global_args: &[String]) -> bool {
+    global_args
+        .iter()
+        .map(String::as_str)
+        .any(|arg| git_matches_option_pattern(arg, UNSAFE_GIT_GLOBAL_OPTIONS))
+}
+
+fn git_subcommand_args_are_read_only(args: &[String]) -> bool {
+    !args
+        .iter()
+        .map(String::as_str)
+        .any(|arg| git_matches_option_pattern(arg, UNSAFE_GIT_SUBCOMMAND_OPTIONS))
+}
+
+fn git_matches_option_pattern(arg: &str, patterns: &[GitOptionPattern]) -> bool {
+    patterns.iter().any(|pattern| pattern.matches(arg))
+}
+
+fn is_git_global_option_with_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        "-C" | "-c"
+            | "--config-env"
+            | "--exec-path"
+            | "--git-dir"
+            | "--namespace"
+            | "--super-prefix"
+            | "--work-tree"
+    )
+}
+
+fn is_git_global_option_with_inline_value(arg: &str) -> bool {
+    matches!(
+        arg,
+        s if s.starts_with("--config-env=")
+            || s.starts_with("--exec-path=")
+            || s.starts_with("--git-dir=")
+            || s.starts_with("--namespace=")
+            || s.starts_with("--super-prefix=")
+            || s.starts_with("--work-tree=")
+    ) || ((arg.starts_with("-C") || arg.starts_with("-c")) && arg.len() > 2)
 }
 
 fn find_command_is_read_only(args: &[String]) -> bool {
@@ -827,8 +1698,35 @@ fn find_command_is_read_only(args: &[String]) -> bool {
         matches!(
             arg.as_str(),
             "-delete" | "-exec" | "-execdir" | "-ok" | "-okdir" | "-fls" | "-fprint" | "-fprint0"
-        ) || arg.starts_with("-fprintf")
+        ) || arg == "-fprintf"
     })
+}
+
+fn is_valid_sed_n_arg(arg: Option<&str>) -> bool {
+    let Some(arg) = arg else {
+        return false;
+    };
+    let Some(core) = arg.strip_suffix('p') else {
+        return false;
+    };
+    let parts = core.split(',').collect::<Vec<_>>();
+    match parts.as_slice() {
+        [num] => !num.is_empty() && num.chars().all(|ch| ch.is_ascii_digit()),
+        [start, end] => {
+            !start.is_empty()
+                && !end.is_empty()
+                && start.chars().all(|ch| ch.is_ascii_digit())
+                && end.chars().all(|ch| ch.is_ascii_digit())
+        }
+        _ => false,
+    }
+}
+
+fn executable_name_lookup_key(raw: &str) -> Option<String> {
+    Path::new(raw)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(ToOwned::to_owned)
 }
 
 #[cfg(test)]
@@ -855,6 +1753,7 @@ mod tests {
             &ToolCall {
                 id: "call_exec_completed".to_string(),
                 name: "exec_command".to_string(),
+                namespace: None,
                 arguments: json!({"cmd": "printf hello", "yield_time_ms": 5000}),
             },
         )
@@ -862,10 +1761,150 @@ mod tests {
 
         assert_eq!(result.content["running"], false);
         assert_eq!(result.content["output"], "hello");
+        assert!(result
+            .model_text
+            .contains("Chunk ID: chunk_call_exec_completed"));
+        assert!(result.model_text.contains("Wall time: "));
+        assert!(result.model_text.contains("Process exited with code 0"));
+        assert!(result.model_text.contains("Original token count: "));
+        assert!(result.model_text.ends_with("Output:\nhello"));
         let events = store.events_for_session(&session.id).expect("events");
         assert!(events
             .iter()
             .any(|event| event.event_type == "command.finished"));
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "command.started")
+            .expect("command started event");
+        assert_eq!(started.payload["login"], true);
+        assert!(started.payload["session_id"].as_i64().is_some());
+    }
+
+    #[test]
+    fn exec_command_applies_codex_unified_exec_environment() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_env".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf '%s|%s|%s|%s|%s|%s|%s|%s|%s|%s|%s' \"$NO_COLOR\" \"$TERM\" \"$LANG\" \"$LC_CTYPE\" \"$LC_ALL\" \"$COLORTERM\" \"$PAGER\" \"$GIT_PAGER\" \"$GH_PAGER\" \"$CODEX_CI\" \"$CODEX_THREAD_ID\"",
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("exec");
+
+        assert_eq!(
+            result.content["output"],
+            json!(format!(
+                "1|dumb|C.UTF-8|C.UTF-8|C.UTF-8||cat|cat|cat|1|{}",
+                session.id
+            ))
+        );
+    }
+
+    #[test]
+    fn exec_command_unknown_model_shell_falls_back_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_unknown_shell".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf ok",
+                    "shell": "not-a-real-shell-for-codex-compat",
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("exec");
+
+        assert_eq!(result.content["output"], "ok");
+        let events = store.events_for_session(&session.id).expect("events");
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "command.started")
+            .expect("command started event");
+        assert_eq!(started.payload["shell"], json!(ultimate_fallback_shell()));
+    }
+
+    #[test]
+    fn running_command_emits_background_finished_event_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let started = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_background_finish".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(1.0); print('done', flush=True)\"",
+                    "yield_time_ms": 50,
+                }),
+            },
+        )
+        .expect("exec");
+        let process_id = started.content["session_id"].as_i64().expect("session id");
+        assert_eq!(started.content["running"], true);
+
+        for _ in 0..60 {
+            let events = store.events_for_session(&session.id).expect("events");
+            if events.iter().any(|event| {
+                event.event_type == "command.finished"
+                    && event.payload["session_id"] == json!(process_id)
+            }) {
+                break;
+            }
+            thread::sleep(Duration::from_millis(50));
+        }
+
+        let before_poll_events = store.events_for_session(&session.id).expect("events");
+        let finished_before_poll = before_poll_events
+            .iter()
+            .filter(|event| {
+                event.event_type == "command.finished"
+                    && event.payload["session_id"] == json!(process_id)
+            })
+            .count();
+        assert_eq!(finished_before_poll, 1);
+
+        let polled = write_stdin(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_poll_background_finish".to_string(),
+                name: "write_stdin".to_string(),
+                namespace: None,
+                arguments: json!({"session_id": process_id, "chars": "", "yield_time_ms": 5000}),
+            },
+        )
+        .expect("poll");
+        assert_eq!(polled.content["running"], false);
+        assert!(polled.content["output"]
+            .as_str()
+            .expect("output")
+            .contains("done"));
+
+        let after_poll_events = store.events_for_session(&session.id).expect("events");
+        let finished_after_poll = after_poll_events
+            .iter()
+            .filter(|event| {
+                event.event_type == "command.finished"
+                    && event.payload["session_id"] == json!(process_id)
+            })
+            .count();
+        assert_eq!(finished_after_poll, 1);
     }
 
     #[test]
@@ -889,6 +1928,7 @@ mod tests {
             &ToolCall {
                 id: "call_exec_pty".to_string(),
                 name: "exec_command".to_string(),
+                namespace: None,
                 arguments: json!({
                     "cmd": "printf pty-ok",
                     "tty": true,
@@ -916,18 +1956,25 @@ mod tests {
             &ToolCall {
                 id: "call_exec_running".to_string(),
                 name: "exec_command".to_string(),
+                namespace: None,
                 arguments: json!({
                     "cmd": "python3 -u -c \"import sys; print('ready', flush=True); [print('echo:' + line.strip(), flush=True) for line in sys.stdin]\"",
+                    "tty": true,
                     "yield_time_ms": 100,
                 }),
             },
         )
         .expect("exec");
         let process_id = started.content["session_id"]
-            .as_str()
+            .as_i64()
             .expect("session id")
-            .to_string();
+            .to_owned();
+        assert!(process_id >= 1000);
         assert_eq!(started.content["running"], true);
+        assert!(started
+            .model_text
+            .contains(&format!("Process running with session ID {process_id}")));
+        assert!(started.model_text.contains("Output:\nready"));
 
         let written = write_stdin(
             &store,
@@ -935,6 +1982,7 @@ mod tests {
             &ToolCall {
                 id: "call_write_stdin".to_string(),
                 name: "write_stdin".to_string(),
+                namespace: None,
                 arguments: json!({
                     "session_id": process_id,
                     "chars": "hello\n",
@@ -945,11 +1993,163 @@ mod tests {
         .expect("write stdin");
 
         assert_eq!(written.content["running"], true);
+        assert!(written
+            .model_text
+            .contains(&format!("Process running with session ID {process_id}")));
         assert!(written.content["output"]
             .as_str()
             .expect("output")
             .contains("echo:hello"));
-        stop_for_test(&process_id);
+        stop_for_test(process_id);
+    }
+
+    #[test]
+    fn command_model_text_uses_codex_style_token_truncation() {
+        let output =
+            "this is an example of a long output that should be truncated\nalso some other line";
+        let payload = CommandOutputPayload {
+            chunk_id: "chunk_test".to_string(),
+            session_id: None,
+            running: false,
+            output,
+            max_chars: 10 * TOKEN_TO_CHAR_APPROX,
+            exit_code: Some(0),
+            duration: Duration::from_millis(1250),
+            tty_requested: false,
+            tty_allocated: false,
+            write_error: None,
+        };
+
+        let text = command_model_text(&payload);
+
+        assert!(text.starts_with("Chunk ID: chunk_test\nWall time: 1.2500 seconds\n"));
+        assert!(text.contains("Process exited with code 0\n"));
+        assert!(text.contains("Original token count: 21\n"));
+        assert!(text.contains("Output:\nTotal output lines: 2\n\n"));
+        assert!(text.contains("tokens truncated"));
+        assert!(!text.contains("omitted"));
+        assert!(!text.contains("chars truncated"));
+    }
+
+    #[test]
+    fn max_output_tokens_is_capped_to_local_policy_like_codex() {
+        assert_eq!(
+            max_output_chars(&json!({"max_output_tokens": 6}), DEFAULT_MAX_OUTPUT_TOKENS),
+            6 * TOKEN_TO_CHAR_APPROX
+        );
+        assert_eq!(
+            max_output_chars(
+                &json!({"max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS + 1}),
+                DEFAULT_MAX_OUTPUT_TOKENS,
+            ),
+            DEFAULT_MAX_OUTPUT_TOKENS * TOKEN_TO_CHAR_APPROX
+        );
+        assert_eq!(
+            max_output_chars(
+                &json!({"max_output_tokens": u64::MAX}),
+                DEFAULT_MAX_OUTPUT_TOKENS
+            ),
+            DEFAULT_MAX_OUTPUT_TOKENS * TOKEN_TO_CHAR_APPROX
+        );
+        assert_eq!(
+            max_output_chars(&json!({"max_output_tokens": u64::MAX}), 6),
+            6 * TOKEN_TO_CHAR_APPROX
+        );
+        assert_eq!(
+            max_output_chars(&json!({"max_output_tokens": 6}), 200),
+            6 * TOKEN_TO_CHAR_APPROX
+        );
+    }
+
+    #[test]
+    fn exec_command_clamps_requested_output_to_active_model_policy_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = exec_command_with_budget(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_policy_clamp".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -c \"print('0123456789abcdef' * 20)\"",
+                    "yield_time_ms": 5000,
+                    "max_output_tokens": 70_000,
+                }),
+            },
+            6,
+        )
+        .expect("exec");
+
+        assert_eq!(result.content["metadata"]["truncated"], true);
+        assert!(result.model_text.contains("Original token count: "));
+        assert!(result.model_text.contains("tokens truncated"));
+        assert!(!result.model_text.contains("Full tool output saved to:"));
+    }
+
+    #[test]
+    fn head_tail_buffer_preserves_prefix_and_suffix_like_codex() {
+        let mut buffer = HeadTailBuffer::new(10);
+        buffer.push_chunk(b"0123456789".to_vec());
+        buffer.push_chunk(b"ab".to_vec());
+
+        assert_eq!(buffer.retained_bytes(), 10);
+        assert!(buffer.omitted_bytes() > 0);
+        let rendered = String::from_utf8_lossy(&buffer.to_bytes()).to_string();
+        assert!(rendered.starts_with("01234"), "{rendered:?}");
+        assert!(rendered.ends_with("89ab"), "{rendered:?}");
+
+        let drained = String::from_utf8_lossy(&buffer.drain_bytes()).to_string();
+        assert_eq!(drained, rendered);
+        assert_eq!(buffer.retained_bytes(), 0);
+        assert_eq!(buffer.omitted_bytes(), 0);
+    }
+
+    #[test]
+    fn write_stdin_empty_poll_uses_codex_background_wait_bounds() {
+        assert_eq!(
+            write_stdin_yield_time(&json!({}), "").as_millis(),
+            u128::from(MIN_EMPTY_POLL_YIELD_TIME_MS)
+        );
+        assert_eq!(
+            write_stdin_yield_time(&json!({"yield_time_ms": 10}), "").as_millis(),
+            u128::from(MIN_EMPTY_POLL_YIELD_TIME_MS)
+        );
+        assert_eq!(
+            write_stdin_yield_time(&json!({"yield_time_ms": 120_000}), "").as_millis(),
+            120_000
+        );
+        assert_eq!(
+            write_stdin_yield_time(&json!({"yield_time_ms": 999_000}), "").as_millis(),
+            u128::from(MAX_EMPTY_POLL_YIELD_TIME_MS)
+        );
+        assert_eq!(
+            write_stdin_yield_time(&json!({"yield_time_ms": 999_000}), "input").as_millis(),
+            u128::from(MAX_YIELD_TIME_MS)
+        );
+    }
+
+    #[test]
+    fn command_pruning_prefers_old_exited_processes_like_codex() {
+        let now = Instant::now();
+        let meta = (0..70)
+            .map(|idx| {
+                (
+                    1000 + idx,
+                    now + Duration::from_millis(idx as u64),
+                    idx == 10 || idx == 20,
+                )
+            })
+            .collect::<Vec<_>>();
+
+        assert_eq!(process_id_to_prune_from_meta(&meta), Some(1010));
+
+        let live_meta = meta
+            .iter()
+            .map(|(process_id, last_used, _)| (*process_id, *last_used, false))
+            .collect::<Vec<_>>();
+        assert_eq!(process_id_to_prune_from_meta(&live_meta), Some(1000));
     }
 
     #[test]
@@ -965,6 +2165,7 @@ mod tests {
             &ToolCall {
                 id: "call_exec_cross".to_string(),
                 name: "exec_command".to_string(),
+                namespace: None,
                 arguments: json!({
                     "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(5)\"",
                     "yield_time_ms": 100,
@@ -972,13 +2173,14 @@ mod tests {
             },
         )
         .expect("exec");
-        let process_id = started.content["session_id"].as_str().expect("session id");
+        let process_id = started.content["session_id"].as_i64().expect("session id");
         let error = write_stdin(
             &store,
             &other,
             &ToolCall {
                 id: "call_cross_write".to_string(),
                 name: "write_stdin".to_string(),
+                namespace: None,
                 arguments: json!({"session_id": process_id, "chars": ""}),
             },
         )
@@ -989,7 +2191,84 @@ mod tests {
     }
 
     #[test]
-    fn write_stdin_reports_broken_pipe_without_failing_tool() {
+    fn write_stdin_requires_numeric_session_id_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let error = write_stdin(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_write_string_id".to_string(),
+                name: "write_stdin".to_string(),
+                namespace: None,
+                arguments: json!({"session_id": "1000", "chars": ""}),
+            },
+        )
+        .expect_err("string session ids should not match Codex schema");
+
+        assert!(error.to_string().contains("numeric session_id"));
+    }
+
+    #[test]
+    fn exec_command_non_tty_stdin_is_closed_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_closed_stdin_by_default".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -c \"import sys; data = sys.stdin.read(); print('closed' if data == '' else data)\"",
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("exec");
+
+        assert_eq!(result.content["running"], false);
+        assert_eq!(result.content["output"], "closed\n");
+    }
+
+    #[test]
+    fn exec_command_large_output_uses_codex_style_head_tail_buffer() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_large_head_tail".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "python3 -c \"import sys; sys.stdout.write('A' * 700000); sys.stdout.write('B' * 700000)\"",
+                    "yield_time_ms": 5000,
+                    "max_output_tokens": DEFAULT_MAX_OUTPUT_TOKENS,
+                }),
+            },
+        )
+        .expect("exec");
+
+        let output = result.content["output"].as_str().expect("output");
+        assert!(output.len() <= UNIFIED_EXEC_OUTPUT_MAX_BYTES + 128);
+        assert!(
+            output.starts_with("AAAA"),
+            "missing head: {:?}",
+            &output[..20]
+        );
+        assert!(output.ends_with("BBBB"), "missing tail");
+        assert!(
+            output.contains("omitted") || result.model_text.contains("tokens truncated"),
+            "large output should be marked truncated for local JSON or model text"
+        );
+    }
+
+    #[test]
+    fn write_stdin_rejects_non_tty_input_like_codex() {
         let tmp = TempDir::new().expect("tmp");
         let (store, session) = test_session(&tmp);
         let started = exec_command(
@@ -998,25 +2277,26 @@ mod tests {
             &ToolCall {
                 id: "call_exec_closed_stdin".to_string(),
                 name: "exec_command".to_string(),
+                namespace: None,
                 arguments: json!({
-                    "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(0.6)\"",
+                    "cmd": "python3 -u -c \"import time; print('ready', flush=True); time.sleep(5)\"",
                     "yield_time_ms": 50,
                 }),
             },
         )
         .expect("exec");
         let process_id = started.content["session_id"]
-            .as_str()
+            .as_i64()
             .expect("session id")
-            .to_string();
-        std::thread::sleep(std::time::Duration::from_millis(900));
+            .to_owned();
 
-        let written = write_stdin(
+        let error = write_stdin(
             &store,
             &session,
             &ToolCall {
-                id: "call_write_closed_stdin".to_string(),
+                id: "call_write_non_tty".to_string(),
                 name: "write_stdin".to_string(),
+                namespace: None,
                 arguments: json!({
                     "session_id": process_id,
                     "chars": "stop\n",
@@ -1024,19 +2304,305 @@ mod tests {
                 }),
             },
         )
-        .expect("broken pipe should be a tool result, not a fatal error");
+        .expect_err("non-tty stdin writes should fail like Codex");
 
-        assert!(written.content["metadata"]["write_error"]
-            .as_str()
-            .is_some_and(|error| !error.is_empty()));
+        assert_eq!(error.to_string(), STDIN_CLOSED_MESSAGE);
+
+        assert!(
+            commands()
+                .lock()
+                .expect("command registry poisoned")
+                .contains_key(&process_id),
+            "rejected write should leave command session available"
+        );
+        stop_for_test(process_id);
+    }
+
+    #[test]
+    fn exec_command_rejects_codex_dangerous_rm_before_spawn() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let victim = tmp.path().join("work").join("victim");
+        std::fs::create_dir_all(&victim).expect("victim");
+
+        let error = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_rm_rf".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({"cmd": "rm -rf victim", "yield_time_ms": 5000}),
+            },
+        )
+        .expect_err("dangerous rm should not spawn without approval support");
+
+        assert!(error.to_string().contains("destructive command"));
+        assert!(victim.exists(), "rejected command must not remove files");
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_rejects_nested_codex_dangerous_rm_before_spawn() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let error = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_nested_rm".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "bash -lc 'printf ok && sudo rm -f victim'",
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect_err("nested dangerous rm should not spawn without approval support");
+
+        assert!(error.to_string().contains("destructive command"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_rejects_sandbox_override_without_approval_flow() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let error = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_escalated".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf no-spawn",
+                    "sandbox_permissions": "require_escalated",
+                    "justification": "Do you want to run this without sandbox restrictions?",
+                    "prefix_rule": ["printf"],
+                }),
+            },
+        )
+        .expect_err("unsupported escalation should not spawn");
+
+        assert!(error.to_string().contains("approval policy is Never"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_rejects_additional_permission_override_without_approval_flow() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let error = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_additional_permissions".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf no-spawn",
+                    "sandbox_permissions": "with_additional_permissions",
+                }),
+            },
+        )
+        .expect_err("unsupported additional permissions should not spawn");
+
+        assert!(error.to_string().contains("approval policy is Never"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_treats_additional_permissions_as_sandbox_override() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let error = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_disabled_additional_permissions".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf no-spawn",
+                    "sandbox_permissions": "use_default",
+                    "additional_permissions": {
+                        "network": { "enabled": true }
+                    },
+                }),
+            },
+        )
+        .expect_err("additional_permissions should request a sandbox override");
+
+        assert!(error.to_string().contains("approval policy is Never"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_rejects_malformed_additional_permissions_before_override() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let error = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_bad_additional_permissions".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf no-spawn",
+                    "sandbox_permissions": "with_additional_permissions",
+                    "additional_permissions": "network",
+                }),
+            },
+        )
+        .expect_err("malformed additional_permissions should fail argument parsing");
+
+        assert!(error
+            .to_string()
+            .contains("failed to parse function arguments"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_accepts_null_additional_permissions_as_absent() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_null_additional_permissions".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf ok",
+                    "sandbox_permissions": "use_default",
+                    "additional_permissions": null,
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("null additional_permissions should deserialize like absence");
+
+        assert_eq!(result.content["running"], false);
+        assert_eq!(result.content["output"], "ok");
         let events = store.events_for_session(&session.id).expect("events");
         assert!(events
             .iter()
-            .any(|event| event.event_type == "command.write_error"));
-        stop_for_test(
-            written.content["session_id"]
-                .as_str()
-                .unwrap_or("cmd_call_exec_closed_stdin"),
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_rejects_invalid_sandbox_permission_value() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let error = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_bad_sandbox_permissions".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf no-spawn",
+                    "sandbox_permissions": "danger_full_access",
+                }),
+            },
+        )
+        .expect_err("unknown sandbox_permissions should not spawn");
+
+        assert!(error
+            .to_string()
+            .contains("unsupported sandbox_permissions value"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+    }
+
+    #[test]
+    fn exec_command_accepts_default_sandbox_permission_metadata() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_default_sandbox_permissions".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "cmd": "printf ok",
+                    "sandbox_permissions": "use_default",
+                    "yield_time_ms": 5000,
+                }),
+            },
+        )
+        .expect("default sandbox metadata should be accepted");
+
+        assert_eq!(result.content["running"], false);
+        assert_eq!(result.content["output"], "ok");
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.started"
+                && event.payload["arguments"]["sandbox_permissions"] == "use_default"
+        }));
+        assert!(events
+            .iter()
+            .filter(|event| event.event_type == "command.started")
+            .all(|event| event.payload.get("sandbox_permissions").is_none()));
+    }
+
+    #[test]
+    fn dangerous_detection_matches_codex_rm_subset() {
+        assert!(dangerous_command_rejection("rm -rf /tmp/codex").is_some());
+        assert!(
+            dangerous_command_rejection("/bin/rm -rf /tmp/codex").is_some(),
+            "local keeps path-normalized rm rejection as no-approval hardening"
+        );
+        assert!(dangerous_command_rejection("sudo rm -f /tmp/codex").is_some());
+        assert!(dangerous_command_rejection(
+            "bash -lc 'cargo install cargo-insta && rm -rf /tmp/codex'"
+        )
+        .is_some());
+        assert!(
+            dangerous_command_rejection("rm -fr /tmp/codex").is_none(),
+            "Codex's current direct dangerous classifier only matches -f and -rf"
+        );
+        assert!(
+            dangerous_command_rejection("git reset --hard").is_none(),
+            "git reset is governed by prompt/approval policy, not Codex's dangerous-command classifier"
         );
     }
 
@@ -1055,7 +2621,16 @@ mod tests {
             &json!({"cmd": "git branch --show-current"})
         ));
         assert!(exec_command_is_known_read_only(
+            &json!({"cmd": "ls && pwd"})
+        ));
+        assert!(exec_command_is_known_read_only(
+            &json!({"cmd": "bash -lc 'git status --short && rg -n browser src | wc -l'"})
+        ));
+        assert!(!exec_command_is_known_read_only(
             &json!({"cmd": "git worktree list --porcelain"})
+        ));
+        assert!(!exec_command_is_known_read_only(
+            &json!({"cmd": "git -ccore.pager=cat status"})
         ));
         assert!(!exec_command_is_known_read_only(
             &json!({"cmd": "cargo test"})
@@ -1067,18 +2642,100 @@ mod tests {
             &json!({"cmd": "git worktree add ../new"})
         ));
         assert!(!exec_command_is_known_read_only(
+            &json!({"cmd": "sed -n '/pattern/p' file"})
+        ));
+        assert!(!exec_command_is_known_read_only(
             &json!({"cmd": "sed -i s/a/b/ file"})
         ));
         assert!(!exec_command_is_known_read_only(
             &json!({"cmd": "rg foo > out.txt"})
         ));
+        assert!(!exec_command_is_known_read_only(
+            &json!({"cmd": "ls && rm -rf /tmp/codex"})
+        ));
     }
 
-    fn stop_for_test(process_id: &str) {
+    #[test]
+    fn exec_read_only_detection_matches_codex_unix_safelist_edges() {
+        if cfg!(target_os = "linux") {
+            assert!(exec_command_is_known_read_only(
+                &json!({"cmd": "numfmt 1000"})
+            ));
+            assert!(exec_command_is_known_read_only(
+                &json!({"cmd": "tac Cargo.toml"})
+            ));
+        }
+
+        for cmd in [
+            "base64 -o out.bin",
+            "base64 --output=out.bin",
+            "base64 -ob64.txt",
+            "find . -exec rm {} ;",
+            "find . -delete",
+            "find . -fprintf out %p",
+            "rg --pre cmd pattern",
+            "rg --hostname-bin cmd pattern",
+            "rg --search-zip pattern",
+            "rg -z pattern",
+            "git --paginate log -1",
+            "git -p log -1",
+            "git -C . status",
+            "git --git-dir=.git status",
+            "git --work-tree=. status",
+        ] {
+            assert!(
+                !exec_command_is_known_read_only(&json!({"cmd": cmd})),
+                "{cmd:?} should require normal command policy"
+            );
+        }
+
+        for cmd in ["git log -p -1", "git diff -p", "git show -p HEAD"] {
+            assert!(
+                exec_command_is_known_read_only(&json!({"cmd": cmd})),
+                "{cmd:?} should remain known read-only like Codex"
+            );
+        }
+    }
+
+    #[test]
+    fn shell_wrapper_read_only_detection_rejects_codex_parser_edges() {
+        for cmd in [
+            "bash -lc 'git status --short && rg -n foo src | wc -l'",
+            "zsh -lc 'ls'",
+        ] {
+            assert!(
+                exec_command_is_known_read_only(&json!({"cmd": cmd})),
+                "{cmd:?} should be read-only"
+            );
+        }
+
+        for cmd in [
+            "bash -lc 'git branch -d feature'",
+            "bash -lc 'git --paginate log -1'",
+            "bash -lc 'ls # comment'",
+            "bash -lc 'ls &&'",
+            "bash -lc 'ls ||'",
+            "bash -lc '&& ls'",
+            "bash -lc 'ls ;; pwd'",
+            "bash -lc 'ls | | wc'",
+            "bash -lc 'FOO=bar ls'",
+            "bash -lc 'echo $(pwd)'",
+            "bash -lc 'echo <(pwd)'",
+            "bash -lc 'echo $HOME'",
+            "bash -lc 'ls > out.txt'",
+        ] {
+            assert!(
+                !exec_command_is_known_read_only(&json!({"cmd": cmd})),
+                "{cmd:?} should be rejected by the Codex-style plain-command parser"
+            );
+        }
+    }
+
+    fn stop_for_test(process_id: i64) {
         if let Some(mut command) = commands()
             .lock()
             .expect("command registry poisoned")
-            .remove(process_id)
+            .remove(&process_id)
         {
             let _ = command.process.kill();
             let _ = command.process.wait();

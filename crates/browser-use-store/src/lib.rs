@@ -650,6 +650,30 @@ impl Store {
         Ok(rows)
     }
 
+    pub fn drain_agent_messages_for_agent(
+        &self,
+        target_session_id: &str,
+    ) -> Result<Vec<AgentMessage>> {
+        self.load_session(target_session_id)?
+            .with_context(|| format!("unknown target session id: {target_session_id}"))?;
+        let messages = self.messages_for_agent(target_session_id)?;
+        if messages.is_empty() {
+            return Ok(messages);
+        }
+        let tx = self.conn.unchecked_transaction()?;
+        for message in &messages {
+            tx.execute(
+                "DELETE FROM agent_messages WHERE id = ?1",
+                params![message.id],
+            )?;
+        }
+        tx.commit()?;
+        self.notify(StoreNotification::SessionChanged {
+            session_id: target_session_id.to_string(),
+        });
+        Ok(messages)
+    }
+
     pub fn get_setting(&self, key: &str) -> Result<Option<String>> {
         self.conn
             .query_row(
@@ -1379,6 +1403,10 @@ mod tests {
         let messages = store.messages_for_agent(&child.id)?;
         assert_eq!(messages, vec![message]);
         assert!(messages[0].trigger_turn);
+        let drained = store.drain_agent_messages_for_agent(&child.id)?;
+        assert_eq!(drained, messages);
+        assert!(store.messages_for_agent(&child.id)?.is_empty());
+        assert!(store.drain_agent_messages_for_agent(&child.id)?.is_empty());
         Ok(())
     }
 

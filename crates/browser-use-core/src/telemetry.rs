@@ -316,6 +316,13 @@ impl AgentTelemetry {
                 ModelEvent::ThinkingDelta { .. } => {}
                 ModelEvent::ToolCall { call } => tool_calls.push(call),
                 ModelEvent::Usage { usage: event_usage } => usage = Some(event_usage),
+                ModelEvent::ResponseOutputItem { .. } => {}
+                ModelEvent::ResponseCompleted { .. } => {}
+                ModelEvent::ServerModel { .. }
+                | ModelEvent::ModelRateLimits { .. }
+                | ModelEvent::ModelVerifications { .. }
+                | ModelEvent::ModelsEtag { .. }
+                | ModelEvent::ServerReasoningIncluded { .. } => {}
                 ModelEvent::Done => {}
             }
         }
@@ -587,6 +594,12 @@ fn set_usage_attrs(span: &ActiveSpan, usage: &ModelUsage) {
     }
     if let Some(output_tokens) = usage.output_tokens {
         span.set_attribute(KeyValue::new("gen_ai.usage.output_tokens", output_tokens));
+    }
+    if let Some(reasoning_output_tokens) = usage.reasoning_output_tokens {
+        span.set_attribute(KeyValue::new(
+            "gen_ai.usage.reasoning_output_tokens",
+            reasoning_output_tokens,
+        ));
     }
     if let Some(total_tokens) = usage.total_tokens {
         span.set_attribute(KeyValue::new("llm.usage.total_tokens", total_tokens));
@@ -955,8 +968,12 @@ mod tests {
         })];
         let tools = vec![ToolSpec {
             name: "python".to_string(),
+            namespace: None,
+            namespace_description: None,
             description: "Run Python".to_string(),
             input_schema: serde_json::json!({"type": "object"}),
+            output_schema: None,
+            freeform: None,
         }];
         let step = telemetry.start_step_span(&agent, "session-1", 0, 80);
         let llm = telemetry.start_model_turn_span(ModelTurnSpanInput {
@@ -977,6 +994,7 @@ mod tests {
                     call: ToolCall {
                         id: "call_1".to_string(),
                         name: "python".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"code": "print(1)"}),
                     },
                 },
@@ -1012,6 +1030,7 @@ mod tests {
                     call: ToolCall {
                         id: "call_response_1".to_string(),
                         name: "python".to_string(),
+                        namespace: None,
                         arguments: serde_json::json!({"code": "print(2)"}),
                     },
                 },
@@ -1027,6 +1046,7 @@ mod tests {
             &ToolCall {
                 id: "call_1".to_string(),
                 name: "python".to_string(),
+                namespace: None,
                 arguments: serde_json::json!({"code": "print(1)"}),
             },
         );

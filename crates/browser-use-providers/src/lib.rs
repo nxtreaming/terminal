@@ -1,33 +1,1270 @@
-use anyhow::{bail, Context, Result};
+use anyhow::{anyhow, bail, Context, Result};
+use aws_config::BehaviorVersion;
+use aws_credential_types::provider::error::CredentialsError;
+use aws_credential_types::provider::{ProvideCredentials, SharedCredentialsProvider};
+use aws_sigv4::http_request::{sign, SignableBody, SignableRequest, SigningSettings};
+use aws_sigv4::sign::v4;
+use aws_types::region::Region;
 use base64::{
     engine::general_purpose::{self, URL_SAFE_NO_PAD},
     Engine as _,
 };
-use browser_use_protocol::{ModelEvent, ModelUsage, ToolCall, ToolSpec};
-use serde::Deserialize;
+use browser_use_protocol::{
+    CreditsSnapshot, ModelEvent, ModelUsage, ModelVerification, RateLimitSnapshot, RateLimitWindow,
+    ToolCall, ToolSpec,
+};
+use chrono::{DateTime, Datelike, Local, TimeZone, Utc};
+use http::{Request as HttpRequest, Uri};
+use rand::Rng as _;
+use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{HashMap, HashSet, VecDeque};
+use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
-use std::io::{BufRead, BufReader};
+use std::fs::OpenOptions;
+use std::io::{BufRead, BufReader, Write};
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, OnceLock};
-use std::time::{Duration, SystemTime};
+use std::process::{Command, Stdio};
+use std::str::FromStr;
+use std::sync::{Arc, Mutex, OnceLock};
+use std::thread;
+use std::time::{Duration, Instant, SystemTime};
 use uuid::Uuid;
 
-#[derive(Clone, Debug, Default)]
+const X_CODEX_TURN_STATE_HEADER: &str = "x-codex-turn-state";
+const CODEX_OAUTH_CLIENT_ID: &str = "app_EMoamEEZ73f0CkXaXp7hrann";
+const CODEX_REFRESH_TOKEN_URL: &str = "https://auth.openai.com/oauth/token";
+const CODEX_REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR: &str = "CODEX_REFRESH_TOKEN_URL_OVERRIDE";
+const AMAZON_BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
+const BEDROCK_MANTLE_SERVICE_NAME: &str = "bedrock-mantle";
+const BEDROCK_MANTLE_SUPPORTED_REGIONS: &[&str] = &[
+    "us-east-2",
+    "us-east-1",
+    "us-west-2",
+    "us-gov-west-1",
+    "ap-southeast-3",
+    "ap-south-1",
+    "ap-northeast-1",
+    "eu-central-1",
+    "eu-west-1",
+    "eu-west-2",
+    "eu-south-1",
+    "eu-north-1",
+    "sa-east-1",
+];
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ProviderErrorKind {
+    Stream,
+    Retryable,
+    Unauthorized,
+    ContextWindowExceeded,
+    QuotaExceeded,
+    UsageLimitReached,
+    UsageNotIncluded,
+    InvalidRequest,
+    RetryLimit,
+    InternalServerError,
+    UnexpectedStatus,
+    RequestTimeout,
+    ServerOverloaded,
+    CyberPolicy,
+}
+
+#[derive(Clone, Debug, PartialEq)]
+pub struct ProviderError {
+    kind: ProviderErrorKind,
+    message: String,
+    retry_delay: Option<Duration>,
+    http_status_code: Option<u16>,
+    rate_limits: Option<RateLimitSnapshot>,
+}
+
+impl ProviderError {
+    pub fn stream(message: impl Into<String>) -> Self {
+        Self {
+            kind: ProviderErrorKind::Stream,
+            message: message.into(),
+            retry_delay: None,
+            http_status_code: None,
+            rate_limits: None,
+        }
+    }
+
+    pub fn retryable(message: impl Into<String>, retry_delay: Option<Duration>) -> Self {
+        Self {
+            kind: ProviderErrorKind::Retryable,
+            message: message.into(),
+            retry_delay,
+            http_status_code: None,
+            rate_limits: None,
+        }
+    }
+
+    pub fn non_retryable(kind: ProviderErrorKind, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            message: message.into(),
+            retry_delay: None,
+            http_status_code: None,
+            rate_limits: None,
+        }
+    }
+
+    pub fn kind(&self) -> ProviderErrorKind {
+        self.kind
+    }
+
+    pub fn is_retryable(&self) -> bool {
+        matches!(
+            self.kind,
+            ProviderErrorKind::Stream
+                | ProviderErrorKind::Retryable
+                | ProviderErrorKind::InternalServerError
+                | ProviderErrorKind::UnexpectedStatus
+                | ProviderErrorKind::RequestTimeout
+        )
+    }
+
+    pub fn retry_delay(&self) -> Option<Duration> {
+        self.retry_delay
+    }
+
+    pub fn http_status_code(&self) -> Option<u16> {
+        self.http_status_code
+    }
+
+    pub fn rate_limits(&self) -> Option<&RateLimitSnapshot> {
+        self.rate_limits.as_ref()
+    }
+
+    fn with_http_status_code(mut self, status: reqwest::StatusCode) -> Self {
+        self.http_status_code = Some(status.as_u16());
+        self
+    }
+
+    fn with_rate_limits(mut self, rate_limits: Option<RateLimitSnapshot>) -> Self {
+        self.rate_limits = rate_limits;
+        self
+    }
+}
+
+impl std::fmt::Display for ProviderError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.message)
+    }
+}
+
+impl std::error::Error for ProviderError {}
+
+#[derive(Clone, Debug)]
 pub struct ProviderTurn {
+    pub instructions: Option<String>,
+    pub model_settings: ModelRequestSettings,
+    pub model_request_info: Option<ModelRequestInfo>,
+    pub request_max_retries: Option<usize>,
+    pub stream_max_retries: Option<usize>,
+    pub stream_idle_timeout_ms: Option<u64>,
     pub messages: Vec<Value>,
+    pub previous_response_id: Option<String>,
     pub tools: Vec<ToolSpec>,
+    pub output_schema: Option<Value>,
+    pub output_schema_strict: bool,
+    pub prompt_cache_key: Option<String>,
+    pub client_metadata: Option<HashMap<String, String>>,
+    pub extra_headers: Option<HashMap<String, String>>,
+    pub turn_state: Option<Arc<Mutex<Option<String>>>>,
+}
+
+impl ProviderTurn {
+    fn instructions_or_default<'a>(&'a self, default: &'a str) -> &'a str {
+        self.instructions.as_deref().unwrap_or(default)
+    }
+}
+
+impl Default for ProviderTurn {
+    fn default() -> Self {
+        Self {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
+            model_request_info: None,
+            request_max_retries: None,
+            stream_max_retries: None,
+            stream_idle_timeout_ms: None,
+            messages: Vec::new(),
+            previous_response_id: None,
+            tools: Vec::new(),
+            output_schema: None,
+            output_schema_strict: true,
+            prompt_cache_key: None,
+            client_metadata: None,
+            extra_headers: None,
+            turn_state: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq)]
+struct PreviousResponsesState {
+    response_id: String,
+    request_input: Vec<Value>,
+    response_items: Vec<Value>,
+    non_input_request: Value,
+}
+
+#[derive(Clone, Debug)]
+struct ResponsesRequestBaseline {
+    request_input: Vec<Value>,
+    non_input_request: Value,
+    allow_state_update: bool,
+}
+
+type SharedPreviousResponsesState = Arc<Mutex<Option<PreviousResponsesState>>>;
+
+const MAX_REQUEST_MAX_RETRIES: usize = 100;
+const DEFAULT_STREAM_IDLE_TIMEOUT_MS: u64 = 300_000;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ProviderRequestRetryConfig {
+    max_retries: usize,
+    base_delay: Duration,
+    retry_429: bool,
+    retry_5xx: bool,
+    retry_transport: bool,
+}
+
+impl Default for ProviderRequestRetryConfig {
+    fn default() -> Self {
+        Self {
+            max_retries: 4,
+            base_delay: Duration::from_millis(200),
+            retry_429: false,
+            retry_5xx: true,
+            retry_transport: true,
+        }
+    }
+}
+
+impl ProviderRequestRetryConfig {
+    fn for_turn(self, turn: &ProviderTurn) -> Self {
+        match turn.request_max_retries {
+            Some(max_retries) => Self {
+                max_retries: max_retries.min(MAX_REQUEST_MAX_RETRIES),
+                ..self
+            },
+            None => self,
+        }
+    }
+
+    #[cfg(test)]
+    fn without_retries() -> Self {
+        Self {
+            max_retries: 0,
+            ..Self::default()
+        }
+    }
+
+    #[cfg(test)]
+    fn without_delay() -> Self {
+        Self {
+            base_delay: Duration::ZERO,
+            ..Self::default()
+        }
+    }
+
+    fn should_retry_status(self, status: reqwest::StatusCode, attempt: usize) -> bool {
+        attempt < self.max_retries
+            && ((self.retry_429 && status.as_u16() == 429)
+                || (self.retry_5xx && status.is_server_error()))
+    }
+
+    fn should_retry_send_error(self, error: &reqwest::Error, attempt: usize) -> bool {
+        attempt < self.max_retries && self.retry_transport && !error.is_builder()
+    }
+
+    fn delay(self, retry_number: usize) -> Duration {
+        if self.base_delay.is_zero() {
+            return Duration::ZERO;
+        }
+        let exp = 2_u64.saturating_pow(retry_number.saturating_sub(1).min(63) as u32);
+        let raw_ms = self.base_delay.as_millis() as u64;
+        let raw = raw_ms.saturating_mul(exp);
+        let jitter = rand::rng().random_range(0.9..1.1);
+        Duration::from_millis((raw as f64 * jitter) as u64)
+    }
+}
+
+fn send_provider_request(
+    operation: &str,
+    retry: ProviderRequestRetryConfig,
+    mut make_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
+) -> Result<reqwest::blocking::Response, ProviderError> {
+    for attempt in 0..=retry.max_retries {
+        match make_request().send() {
+            Ok(response) => {
+                if retry.should_retry_status(response.status(), attempt) {
+                    std::thread::sleep(retry.delay(attempt + 1));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                if retry.should_retry_send_error(&error, attempt) {
+                    std::thread::sleep(retry.delay(attempt + 1));
+                    continue;
+                }
+                return Err(provider_send_error(operation, &error));
+            }
+        }
+    }
+    Err(ProviderError::non_retryable(
+        ProviderErrorKind::RetryLimit,
+        format!("{operation}: retry limit reached"),
+    ))
+}
+
+fn send_provider_prepared_request(
+    operation: &str,
+    retry: ProviderRequestRetryConfig,
+    client: &reqwest::blocking::Client,
+    mut make_request: impl FnMut() -> Result<reqwest::blocking::Request, ProviderError>,
+) -> Result<reqwest::blocking::Response, ProviderError> {
+    for attempt in 0..=retry.max_retries {
+        let request = match make_request() {
+            Ok(request) => request,
+            Err(error) => {
+                if error.is_retryable() && attempt < retry.max_retries {
+                    std::thread::sleep(retry.delay(attempt + 1));
+                    continue;
+                }
+                return Err(error);
+            }
+        };
+        match client.execute(request) {
+            Ok(response) => {
+                if retry.should_retry_status(response.status(), attempt) {
+                    std::thread::sleep(retry.delay(attempt + 1));
+                    continue;
+                }
+                return Ok(response);
+            }
+            Err(error) => {
+                if retry.should_retry_send_error(&error, attempt) {
+                    std::thread::sleep(retry.delay(attempt + 1));
+                    continue;
+                }
+                return Err(provider_send_error(operation, &error));
+            }
+        }
+    }
+    Err(ProviderError::non_retryable(
+        ProviderErrorKind::RetryLimit,
+        format!("{operation}: retry limit reached"),
+    ))
+}
+
+fn send_provider_text_request(
+    send_operation: &str,
+    read_operation: &str,
+    retry: ProviderRequestRetryConfig,
+    mut make_request: impl FnMut() -> reqwest::blocking::RequestBuilder,
+) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, String), ProviderError> {
+    for attempt in 0..=retry.max_retries {
+        match make_request().send() {
+            Ok(response) => {
+                let status = response.status();
+                let headers = response.headers().clone();
+                match response.text() {
+                    Ok(body_text) => {
+                        if retry.should_retry_status(status, attempt) {
+                            std::thread::sleep(retry.delay(attempt + 1));
+                            continue;
+                        }
+                        return Ok((status, headers, body_text));
+                    }
+                    Err(error) => {
+                        if retry.should_retry_send_error(&error, attempt) {
+                            std::thread::sleep(retry.delay(attempt + 1));
+                            continue;
+                        }
+                        return Err(provider_send_error(read_operation, &error));
+                    }
+                }
+            }
+            Err(error) => {
+                if retry.should_retry_send_error(&error, attempt) {
+                    std::thread::sleep(retry.delay(attempt + 1));
+                    continue;
+                }
+                return Err(provider_send_error(send_operation, &error));
+            }
+        }
+    }
+    Err(ProviderError::non_retryable(
+        ProviderErrorKind::RetryLimit,
+        format!("{send_operation}: retry limit reached"),
+    ))
+}
+
+fn prepare_previous_response_request_body(
+    body: &mut Value,
+    state: &SharedPreviousResponsesState,
+    explicit_previous_response_id: Option<&str>,
+    auto_previous_response_reuse: bool,
+) -> Result<ResponsesRequestBaseline> {
+    let request_input = body
+        .get("input")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let non_input_request = responses_request_without_input(body);
+    if let Some(previous_response_id) = explicit_previous_response_id.filter(|id| !id.is_empty()) {
+        body["previous_response_id"] = Value::String(previous_response_id.to_string());
+        return Ok(ResponsesRequestBaseline {
+            request_input,
+            non_input_request,
+            allow_state_update: false,
+        });
+    }
+
+    if !auto_previous_response_reuse {
+        return Ok(ResponsesRequestBaseline {
+            request_input,
+            non_input_request,
+            allow_state_update: false,
+        });
+    }
+
+    let previous_state = state
+        .lock()
+        .map_err(|_| anyhow!("previous response state lock poisoned"))?
+        .clone();
+    if let Some(previous_state) = previous_state {
+        let mut reusable_prefix = previous_state.request_input.clone();
+        reusable_prefix.extend(previous_state.response_items.clone());
+        if previous_state.non_input_request == non_input_request
+            && input_starts_with(&request_input, &reusable_prefix)
+        {
+            body["previous_response_id"] = Value::String(previous_state.response_id);
+            body["input"] = Value::Array(request_input[reusable_prefix.len()..].to_vec());
+        }
+    }
+
+    Ok(ResponsesRequestBaseline {
+        request_input,
+        non_input_request,
+        allow_state_update: true,
+    })
+}
+
+fn responses_request_without_input(body: &Value) -> Value {
+    let mut without_input = body.clone();
+    if let Some(object) = without_input.as_object_mut() {
+        object.insert("input".to_string(), Value::Array(Vec::new()));
+        object.remove("previous_response_id");
+    }
+    without_input
+}
+
+fn input_starts_with(input: &[Value], prefix: &[Value]) -> bool {
+    input.len() >= prefix.len()
+        && input
+            .iter()
+            .zip(prefix.iter())
+            .take(prefix.len())
+            .all(|(input, prefix)| input == prefix)
+}
+
+fn update_previous_response_state(
+    state: &SharedPreviousResponsesState,
+    baseline: ResponsesRequestBaseline,
+    response_id: Option<String>,
+    response_items: Vec<Value>,
+) -> Result<()> {
+    let mut guard = state
+        .lock()
+        .map_err(|_| anyhow!("previous response state lock poisoned"))?;
+    if baseline.allow_state_update {
+        if let Some(response_id) = response_id.filter(|id| !id.is_empty()) {
+            *guard = Some(PreviousResponsesState {
+                response_id,
+                request_input: baseline.request_input,
+                response_items,
+                non_input_request: baseline.non_input_request,
+            });
+            return Ok(());
+        }
+    }
+    *guard = None;
+    Ok(())
+}
+
+fn clear_previous_response_state(state: &SharedPreviousResponsesState) -> Result<()> {
+    *state
+        .lock()
+        .map_err(|_| anyhow!("previous response state lock poisoned"))? = None;
+    Ok(())
+}
+
+fn previous_response_result_from_events(events: &[ModelEvent]) -> (Option<String>, Vec<Value>) {
+    let mut response_id = None;
+    let mut response_items = Vec::new();
+    for event in events {
+        match event {
+            ModelEvent::ResponseOutputItem { item } => response_items.push(item.clone()),
+            ModelEvent::ResponseCompleted {
+                response_id: completed_response_id,
+                ..
+            } => {
+                if let Some(completed_response_id) =
+                    completed_response_id.as_deref().filter(|id| !id.is_empty())
+                {
+                    response_id = Some(completed_response_id.to_string());
+                }
+            }
+            _ => {}
+        }
+    }
+    (response_id, response_items)
+}
+
+fn previous_response_prefix_items_for_model(
+    response_items: Vec<Value>,
+    model_info: ModelRequestInfo,
+) -> Vec<Value> {
+    let mut items = response_items
+        .into_iter()
+        .filter_map(|item| raw_response_item_for_responses_input(&item))
+        .collect::<Vec<_>>();
+    strip_images_when_unsupported(&mut items, model_info.supports_image_input);
+    items
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct ModelRequestSettings {
+    pub reasoning_effort: Option<String>,
+    pub reasoning_summary: Option<String>,
+    pub model_supports_reasoning_summaries: Option<bool>,
+    pub text_verbosity: Option<String>,
+    pub service_tier: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum ModelPersonality {
+    None,
+    Friendly,
+    Pragmatic,
+}
+
+const CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS: &str =
+    include_str!("../../../prompts/codex-model-fallback-prompt.md");
+const CODEX_FRIENDLY_PERSONALITY_MESSAGE: &str =
+    "You optimize for team morale and being a supportive teammate as much as code quality.";
+const CODEX_PRAGMATIC_PERSONALITY_MESSAGE: &str =
+    "You are a deeply pragmatic, effective software engineer.";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct StaticModelRequestInfo {
+    supports_reasoning_summaries: bool,
+    default_reasoning_effort: Option<&'static str>,
+    supported_reasoning_efforts: &'static [&'static str],
+    default_reasoning_summary: &'static str,
+    support_verbosity: bool,
+    default_verbosity: Option<&'static str>,
+    supported_service_tiers: &'static [&'static str],
+    supports_parallel_tool_calls: bool,
+    supports_image_input: bool,
+    supports_image_detail_original: bool,
+    truncation_policy: ModelTruncationPolicyInfo,
+}
+
+impl StaticModelRequestInfo {
+    const fn unknown() -> Self {
+        Self {
+            supports_reasoning_summaries: false,
+            default_reasoning_effort: None,
+            supported_reasoning_efforts: &[],
+            default_reasoning_summary: "auto",
+            support_verbosity: false,
+            default_verbosity: None,
+            supported_service_tiers: &[],
+            supports_parallel_tool_calls: false,
+            supports_image_input: true,
+            supports_image_detail_original: false,
+            truncation_policy: default_model_truncation_policy(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelRequestInfo {
+    pub supports_reasoning_summaries: bool,
+    pub default_reasoning_effort: Option<String>,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub default_reasoning_summary: String,
+    pub support_verbosity: bool,
+    pub default_verbosity: Option<String>,
+    pub supported_service_tiers: Vec<String>,
+    pub supports_parallel_tool_calls: bool,
+    pub supports_image_input: bool,
+    pub supports_image_detail_original: bool,
+    pub context_window: Option<i64>,
+    pub max_context_window: Option<i64>,
+    pub auto_compact_token_limit: Option<i64>,
+    pub truncation_policy: ModelTruncationPolicyInfo,
+}
+
+impl ModelRequestInfo {
+    pub fn unknown() -> Self {
+        StaticModelRequestInfo::unknown().into()
+    }
+
+    pub fn resolved_context_window(&self) -> Option<i64> {
+        self.context_window.or(self.max_context_window)
+    }
+
+    pub fn auto_compact_token_limit(&self) -> Option<i64> {
+        let context_limit = self
+            .resolved_context_window()
+            .map(|context_window| (context_window * 9) / 10);
+        match (context_limit, self.auto_compact_token_limit) {
+            (Some(context_limit), Some(configured)) => Some(configured.min(context_limit)),
+            (Some(context_limit), None) => Some(context_limit),
+            (None, configured) => configured,
+        }
+    }
+
+    pub fn tool_output_token_budget(&self) -> usize {
+        self.truncation_policy.token_budget()
+    }
+}
+
+impl ModelTruncationPolicyInfo {
+    pub fn token_budget(&self) -> usize {
+        let limit = usize::try_from(self.limit.max(0)).unwrap_or(usize::MAX);
+        match self.mode {
+            ModelTruncationPolicyMode::Bytes => limit.div_ceil(4),
+            ModelTruncationPolicyMode::Tokens => limit,
+        }
+    }
+
+    pub fn with_token_limit(self, token_limit: usize) -> Self {
+        match self.mode {
+            ModelTruncationPolicyMode::Bytes => Self {
+                mode: ModelTruncationPolicyMode::Bytes,
+                limit: i64::try_from(token_limit.saturating_mul(4)).unwrap_or(i64::MAX),
+            },
+            ModelTruncationPolicyMode::Tokens => Self {
+                mode: ModelTruncationPolicyMode::Tokens,
+                limit: i64::try_from(token_limit).unwrap_or(i64::MAX),
+            },
+        }
+    }
+}
+
+impl From<StaticModelRequestInfo> for ModelRequestInfo {
+    fn from(info: StaticModelRequestInfo) -> Self {
+        Self {
+            supports_reasoning_summaries: info.supports_reasoning_summaries,
+            default_reasoning_effort: info.default_reasoning_effort.map(str::to_string),
+            supported_reasoning_efforts: info
+                .supported_reasoning_efforts
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            default_reasoning_summary: info.default_reasoning_summary.to_string(),
+            support_verbosity: info.support_verbosity,
+            default_verbosity: info.default_verbosity.map(str::to_string),
+            supported_service_tiers: info
+                .supported_service_tiers
+                .iter()
+                .map(|value| (*value).to_string())
+                .collect(),
+            supports_parallel_tool_calls: info.supports_parallel_tool_calls,
+            supports_image_input: info.supports_image_input,
+            supports_image_detail_original: info.supports_image_detail_original,
+            context_window: Some(272_000),
+            max_context_window: Some(272_000),
+            auto_compact_token_limit: None,
+            truncation_policy: info.truncation_policy,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ModelPresetInfo {
+    pub id: String,
+    pub display_name: String,
+    pub description: String,
+    pub default_reasoning_effort: Option<String>,
+    pub supported_reasoning_efforts: Vec<String>,
+    pub supported_service_tiers: Vec<String>,
+    pub supports_personality: bool,
+    pub show_in_picker: bool,
+    pub is_default: bool,
+    pub supported_in_api: bool,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalog {
+    pub models: Vec<ModelCatalogEntryInfo>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelCatalogEntryInfo {
+    pub slug: String,
+    pub display_name: String,
+    #[serde(default)]
+    pub description: Option<String>,
+    #[serde(default)]
+    pub default_reasoning_level: Option<String>,
+    #[serde(default)]
+    pub supported_reasoning_levels: Vec<ModelReasoningEffortInfo>,
+    #[serde(default = "default_model_visibility")]
+    pub visibility: String,
+    #[serde(default = "default_supported_in_api")]
+    pub supported_in_api: bool,
+    #[serde(default)]
+    pub priority: i32,
+    #[serde(default)]
+    pub service_tiers: Vec<ModelServiceTierInfo>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_service_tier: Option<String>,
+    #[serde(default)]
+    pub base_instructions: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub model_messages: Option<ModelMessagesInfo>,
+    #[serde(default)]
+    pub supports_reasoning_summaries: bool,
+    #[serde(default = "default_reasoning_summary")]
+    pub default_reasoning_summary: String,
+    #[serde(default)]
+    pub support_verbosity: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub default_verbosity: Option<String>,
+    #[serde(default)]
+    pub supports_parallel_tool_calls: bool,
+    #[serde(default)]
+    pub supports_image_detail_original: bool,
+    #[serde(default = "default_input_modalities")]
+    pub input_modalities: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_context_window: Option<i64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub auto_compact_token_limit: Option<i64>,
+    #[serde(default = "default_model_truncation_policy")]
+    pub truncation_policy: ModelTruncationPolicyInfo,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelTruncationPolicyInfo {
+    #[serde(default = "default_truncation_policy_mode")]
+    pub mode: ModelTruncationPolicyMode,
+    pub limit: i64,
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ModelTruncationPolicyMode {
+    #[default]
+    Bytes,
+    Tokens,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelReasoningEffortInfo {
+    pub effort: String,
+    #[serde(default)]
+    pub description: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelServiceTierInfo {
+    pub id: String,
+    #[serde(default)]
+    pub name: String,
+    #[serde(default)]
+    pub description: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelMessagesInfo {
+    pub instructions_template: Option<String>,
+    pub instructions_variables: Option<ModelInstructionsVariablesInfo>,
+}
+
+pub const AMAZON_BEDROCK_GPT_5_4_MODEL_ID: &str = "openai.gpt-5.4";
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+pub struct AmazonBedrockAwsAuthConfig {
+    pub profile: Option<String>,
+    pub region: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ModelInstructionsVariablesInfo {
+    pub personality_default: Option<String>,
+    pub personality_friendly: Option<String>,
+    pub personality_pragmatic: Option<String>,
+}
+
+impl ModelCatalog {
+    pub fn presets(&self, chatgpt_mode: bool) -> Vec<ModelPresetInfo> {
+        let mut entries = self.models.iter().collect::<Vec<_>>();
+        entries.sort_by_key(|entry| entry.priority);
+        let mut presets = entries
+            .into_iter()
+            .filter(|entry| chatgpt_mode || entry.supported_in_api)
+            .map(ModelCatalogEntryInfo::to_preset)
+            .collect::<Vec<_>>();
+        mark_default_by_picker_visibility(&mut presets);
+        presets
+    }
+
+    pub fn entry_for_model(&self, model: &str) -> Option<&ModelCatalogEntryInfo> {
+        catalog_entry_by_longest_prefix(model, &self.models)
+            .or_else(|| catalog_entry_by_namespaced_suffix(model, &self.models))
+    }
+
+    pub fn request_info_for_model(&self, model: &str) -> ModelRequestInfo {
+        self.entry_for_model(model)
+            .map(ModelCatalogEntryInfo::request_info)
+            .unwrap_or_else(ModelRequestInfo::unknown)
+    }
+}
+
+impl ModelCatalogEntryInfo {
+    fn to_preset(&self) -> ModelPresetInfo {
+        ModelPresetInfo {
+            id: self.slug.clone(),
+            display_name: self.display_name.clone(),
+            description: self.description.clone().unwrap_or_default(),
+            default_reasoning_effort: self.default_reasoning_level.clone(),
+            supported_reasoning_efforts: self
+                .supported_reasoning_levels
+                .iter()
+                .map(|level| level.effort.clone())
+                .collect(),
+            supported_service_tiers: self
+                .service_tiers
+                .iter()
+                .map(|tier| tier.id.clone())
+                .collect(),
+            supports_personality: self
+                .model_messages
+                .as_ref()
+                .is_some_and(ModelMessagesInfo::supports_personality),
+            show_in_picker: self.visibility == "list",
+            is_default: false,
+            supported_in_api: self.supported_in_api,
+        }
+    }
+
+    pub fn request_info(&self) -> ModelRequestInfo {
+        ModelRequestInfo {
+            supports_reasoning_summaries: self.supports_reasoning_summaries,
+            default_reasoning_effort: self.default_reasoning_level.clone(),
+            supported_reasoning_efforts: self
+                .supported_reasoning_levels
+                .iter()
+                .map(|level| level.effort.clone())
+                .collect(),
+            default_reasoning_summary: self.default_reasoning_summary.clone(),
+            support_verbosity: self.support_verbosity,
+            default_verbosity: self.default_verbosity.clone(),
+            supported_service_tiers: self
+                .service_tiers
+                .iter()
+                .map(|tier| tier.id.clone())
+                .collect(),
+            supports_parallel_tool_calls: self.supports_parallel_tool_calls,
+            supports_image_input: self
+                .input_modalities
+                .iter()
+                .any(|modality| modality == "image"),
+            supports_image_detail_original: self.supports_image_detail_original,
+            context_window: self.context_window,
+            max_context_window: self.max_context_window,
+            auto_compact_token_limit: self.auto_compact_token_limit,
+            truncation_policy: self.truncation_policy,
+        }
+    }
+
+    pub fn get_model_instructions(&self, personality: Option<ModelPersonality>) -> String {
+        if let Some(model_messages) = &self.model_messages {
+            if let Some(template) = model_messages.instructions_template.as_deref() {
+                let personality_message = model_messages
+                    .get_personality_message(personality)
+                    .unwrap_or_default();
+                return template.replace(PERSONALITY_PLACEHOLDER, &personality_message);
+            }
+        }
+        self.base_instructions.clone()
+    }
+}
+
+impl ModelMessagesInfo {
+    fn has_personality_placeholder(&self) -> bool {
+        self.instructions_template
+            .as_deref()
+            .is_some_and(|template| template.contains(PERSONALITY_PLACEHOLDER))
+    }
+
+    fn supports_personality(&self) -> bool {
+        self.has_personality_placeholder()
+            && self
+                .instructions_variables
+                .as_ref()
+                .is_some_and(ModelInstructionsVariablesInfo::is_complete)
+    }
+
+    fn get_personality_message(&self, personality: Option<ModelPersonality>) -> Option<String> {
+        self.instructions_variables
+            .as_ref()
+            .and_then(|variables| variables.get_personality_message(personality))
+    }
+}
+
+impl ModelInstructionsVariablesInfo {
+    fn is_complete(&self) -> bool {
+        self.personality_default.is_some()
+            && self.personality_friendly.is_some()
+            && self.personality_pragmatic.is_some()
+    }
+
+    fn get_personality_message(&self, personality: Option<ModelPersonality>) -> Option<String> {
+        match personality {
+            Some(ModelPersonality::None) => Some(String::new()),
+            Some(ModelPersonality::Friendly) => self.personality_friendly.clone(),
+            Some(ModelPersonality::Pragmatic) => self.personality_pragmatic.clone(),
+            None => self.personality_default.clone(),
+        }
+    }
+}
+
+fn default_model_visibility() -> String {
+    "none".to_string()
+}
+
+fn default_supported_in_api() -> bool {
+    true
+}
+
+fn default_reasoning_summary() -> String {
+    "auto".to_string()
+}
+
+fn default_input_modalities() -> Vec<String> {
+    vec!["text".to_string(), "image".to_string()]
+}
+
+fn default_truncation_policy_mode() -> ModelTruncationPolicyMode {
+    ModelTruncationPolicyMode::Bytes
+}
+
+pub const fn default_model_truncation_policy() -> ModelTruncationPolicyInfo {
+    ModelTruncationPolicyInfo {
+        mode: ModelTruncationPolicyMode::Bytes,
+        limit: 10_000,
+    }
+}
+
+pub fn bundled_model_presets() -> Vec<ModelPresetInfo> {
+    bundled_model_catalog().presets(true)
+}
+
+pub fn bundled_model_catalog() -> ModelCatalog {
+    codex_bundled_model_catalog().clone()
+}
+
+pub fn amazon_bedrock_model_catalog() -> ModelCatalog {
+    ModelCatalog {
+        models: vec![
+            amazon_bedrock_gpt_5_4_catalog_entry(0),
+            amazon_bedrock_oss_catalog_entry("openai.gpt-oss-120b", "GPT OSS 120B on Bedrock", 1),
+            amazon_bedrock_oss_catalog_entry("openai.gpt-oss-20b", "GPT OSS 20B on Bedrock", 2),
+        ],
+    }
+}
+
+fn amazon_bedrock_gpt_5_4_catalog_entry(priority: i32) -> ModelCatalogEntryInfo {
+    ModelCatalogEntryInfo {
+        slug: AMAZON_BEDROCK_GPT_5_4_MODEL_ID.to_string(),
+        display_name: "gpt-5.4".to_string(),
+        description: Some("Strong model for everyday coding.".to_string()),
+        default_reasoning_level: Some("medium".to_string()),
+        supported_reasoning_levels: vec![
+            reasoning_effort_info("minimal", "Minimal reasoning"),
+            reasoning_effort_info("low", "Fast responses with lighter reasoning"),
+            reasoning_effort_info(
+                "medium",
+                "Balances speed and reasoning depth for everyday tasks",
+            ),
+            reasoning_effort_info("high", "Greater reasoning depth for complex problems"),
+        ],
+        visibility: "list".to_string(),
+        supported_in_api: true,
+        priority,
+        service_tiers: vec![ModelServiceTierInfo {
+            id: "priority".to_string(),
+            name: "fast".to_string(),
+            description: "Fastest inference with increased plan usage".to_string(),
+        }],
+        default_service_tier: None,
+        base_instructions: CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS.to_string(),
+        model_messages: None,
+        supports_reasoning_summaries: true,
+        default_reasoning_summary: "none".to_string(),
+        support_verbosity: true,
+        default_verbosity: Some("medium".to_string()),
+        supports_parallel_tool_calls: true,
+        supports_image_detail_original: true,
+        input_modalities: vec!["text".to_string(), "image".to_string()],
+        context_window: Some(272_000),
+        max_context_window: Some(1_000_000),
+        auto_compact_token_limit: None,
+        truncation_policy: ModelTruncationPolicyInfo {
+            mode: ModelTruncationPolicyMode::Tokens,
+            limit: 10_000,
+        },
+    }
+}
+
+fn amazon_bedrock_oss_catalog_entry(
+    slug: &str,
+    display_name: &str,
+    priority: i32,
+) -> ModelCatalogEntryInfo {
+    ModelCatalogEntryInfo {
+        slug: slug.to_string(),
+        display_name: display_name.to_string(),
+        description: Some(display_name.to_string()),
+        default_reasoning_level: Some("medium".to_string()),
+        supported_reasoning_levels: vec![
+            reasoning_effort_info("low", "Fast responses with lighter reasoning"),
+            reasoning_effort_info(
+                "medium",
+                "Balances speed and reasoning depth for everyday tasks",
+            ),
+            reasoning_effort_info("high", "Greater reasoning depth for complex problems"),
+        ],
+        visibility: "list".to_string(),
+        supported_in_api: true,
+        priority,
+        service_tiers: Vec::new(),
+        default_service_tier: None,
+        base_instructions: CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS.to_string(),
+        model_messages: None,
+        supports_reasoning_summaries: true,
+        default_reasoning_summary: "none".to_string(),
+        support_verbosity: false,
+        default_verbosity: None,
+        supports_parallel_tool_calls: true,
+        supports_image_detail_original: false,
+        input_modalities: vec!["text".to_string()],
+        context_window: Some(128_000),
+        max_context_window: Some(128_000),
+        auto_compact_token_limit: None,
+        truncation_policy: ModelTruncationPolicyInfo {
+            mode: ModelTruncationPolicyMode::Tokens,
+            limit: 10_000,
+        },
+    }
+}
+
+fn reasoning_effort_info(effort: &str, description: &str) -> ModelReasoningEffortInfo {
+    ModelReasoningEffortInfo {
+        effort: effort.to_string(),
+        description: Some(description.to_string()),
+    }
+}
+
+fn codex_bundled_model_catalog() -> &'static ModelCatalog {
+    static CATALOG: OnceLock<ModelCatalog> = OnceLock::new();
+    CATALOG.get_or_init(|| {
+        serde_json::from_str(include_str!("../../../prompts/codex-models.json"))
+            .expect("bundled Codex models.json should parse")
+    })
+}
+
+fn bundled_model_catalog_entry(model: &str) -> Option<&'static ModelCatalogEntryInfo> {
+    codex_bundled_model_catalog().entry_for_model(model)
+}
+
+fn mark_default_by_picker_visibility(presets: &mut [ModelPresetInfo]) {
+    for preset in presets.iter_mut() {
+        preset.is_default = false;
+    }
+    if let Some(default) = presets.iter_mut().find(|preset| preset.show_in_picker) {
+        default.is_default = true;
+    } else if let Some(default) = presets.first_mut() {
+        default.is_default = true;
+    }
+}
+
+pub fn spawn_agent_model_overrides_description() -> String {
+    spawn_agent_model_overrides_description_for_presets(bundled_model_presets())
+}
+
+pub fn spawn_agent_model_overrides_description_for_catalog(
+    catalog: &ModelCatalog,
+    chatgpt_mode: bool,
+) -> String {
+    spawn_agent_model_overrides_description_for_presets(catalog.presets(chatgpt_mode))
+}
+
+fn spawn_agent_model_overrides_description_for_presets(presets: Vec<ModelPresetInfo>) -> String {
+    let model_descriptions = presets
+        .into_iter()
+        .filter(|preset| preset.show_in_picker)
+        .take(5)
+        .map(|preset| {
+            let reasoning_efforts_suffix = spawn_agent_reasoning_efforts_suffix(
+                &preset.supported_reasoning_efforts,
+                preset.default_reasoning_effort.as_deref(),
+            );
+            let service_tiers_suffix =
+                spawn_agent_service_tiers_suffix(&preset.supported_service_tiers);
+            format!(
+                "- `{}`: {}{}{}",
+                preset.id, preset.description, reasoning_efforts_suffix, service_tiers_suffix
+            )
+        })
+        .collect::<Vec<_>>()
+        .join("\n");
+    if model_descriptions.is_empty() {
+        "No picker-visible model overrides are currently loaded.".to_string()
+    } else {
+        format!(
+            "Available model overrides (optional; inherited parent model is preferred):\n{model_descriptions}"
+        )
+    }
+}
+
+fn spawn_agent_reasoning_efforts_suffix(
+    supported_efforts: &[String],
+    default_effort: Option<&str>,
+) -> String {
+    let efforts = supported_efforts
+        .iter()
+        .map(|effort| {
+            if Some(effort.as_str()) == default_effort {
+                format!("{effort} (default)")
+            } else {
+                effort.to_string()
+            }
+        })
+        .collect::<Vec<_>>()
+        .join(", ");
+    if efforts.is_empty() {
+        String::new()
+    } else {
+        format!(" Reasoning efforts: {efforts}.")
+    }
+}
+
+fn spawn_agent_service_tiers_suffix(supported_tiers: &[String]) -> String {
+    let tiers = supported_tiers.join(", ");
+    if tiers.is_empty() {
+        String::new()
+    } else {
+        format!(" Service tiers: {tiers}.")
+    }
+}
+
+pub fn model_switch_request_settings_for_model(
+    model: &str,
+    settings: &ModelRequestSettings,
+) -> ModelRequestSettings {
+    model_switch_request_settings_for_model_with_catalog(model, settings, None)
+}
+
+pub fn model_switch_request_settings_for_model_with_catalog(
+    model: &str,
+    settings: &ModelRequestSettings,
+    catalog: Option<&ModelCatalog>,
+) -> ModelRequestSettings {
+    let model_info = model_request_info_for_catalog(model, catalog);
+    let mut settings = settings.clone();
+    settings.reasoning_effort =
+        reasoning_effort_for_model_switch(settings.reasoning_effort.as_deref(), &model_info);
+    settings.service_tier = service_tier_for_model(settings.service_tier.as_deref(), &model_info);
+    settings
+}
+
+pub fn model_supported_service_tiers(model: &str) -> Vec<String> {
+    model_supported_service_tiers_for_catalog(model, None)
+}
+
+pub fn model_supported_service_tiers_for_catalog(
+    model: &str,
+    catalog: Option<&ModelCatalog>,
+) -> Vec<String> {
+    model_request_info_for_catalog(model, catalog).supported_service_tiers
+}
+
+pub fn model_supports_service_tier(model: &str, service_tier: &str) -> bool {
+    model_supports_service_tier_for_catalog(model, service_tier, None)
+}
+
+pub fn model_supports_service_tier_for_catalog(
+    model: &str,
+    service_tier: &str,
+    catalog: Option<&ModelCatalog>,
+) -> bool {
+    model_supported_service_tiers_for_catalog(model, catalog)
+        .iter()
+        .any(|supported| supported == service_tier)
+}
+
+pub fn model_supports_original_image_detail(model: &str) -> bool {
+    model_supports_original_image_detail_for_catalog(model, None)
+}
+
+pub fn model_supports_original_image_detail_for_catalog(
+    model: &str,
+    catalog: Option<&ModelCatalog>,
+) -> bool {
+    model_request_info_for_catalog(model, catalog).supports_image_detail_original
+}
+
+pub fn model_supports_personality(model: &str) -> bool {
+    model_supports_personality_for_catalog(model, None)
+}
+
+pub fn model_supports_personality_for_catalog(model: &str, catalog: Option<&ModelCatalog>) -> bool {
+    if let Some(catalog) = catalog {
+        if let Some(entry) = catalog.entry_for_model(model) {
+            return entry
+                .model_messages
+                .as_ref()
+                .is_some_and(ModelMessagesInfo::supports_personality);
+        }
+        return fallback_model_messages_for_slug(model)
+            .is_some_and(LocalModelMessages::supports_personality);
+    }
+    if let Some(entry) = bundled_model_catalog_entry(model) {
+        return entry
+            .model_messages
+            .as_ref()
+            .is_some_and(ModelMessagesInfo::supports_personality);
+    }
+    fallback_model_messages_for_slug(model).is_some_and(LocalModelMessages::supports_personality)
 }
 
 pub trait ModelProvider {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "unknown"
     }
 
     fn model_name(&self) -> &str {
         "unknown"
+    }
+
+    fn supports_namespace_tools(&self) -> bool {
+        true
     }
 
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>>;
@@ -42,6 +1279,399 @@ pub trait ModelProvider {
         }
         Ok(())
     }
+}
+
+#[derive(Clone, Debug, Default)]
+pub struct ProviderRequestOptions {
+    pub query_params: Vec<(String, String)>,
+    pub headers: HashMap<String, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ProviderCommandAuthConfig {
+    pub command: String,
+    pub args: Vec<String>,
+    pub timeout_ms: u64,
+    pub refresh_interval_ms: u64,
+    pub cwd: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+pub struct ProviderCommandAuth {
+    config: ProviderCommandAuthConfig,
+    cached: Arc<Mutex<Option<CachedProviderCommandToken>>>,
+}
+
+#[derive(Clone, Debug)]
+enum OpenAIResponsesRequestAuth {
+    AmazonBedrockSigV4(AmazonBedrockSigV4Auth),
+}
+
+impl OpenAIResponsesRequestAuth {
+    fn apply(
+        &self,
+        request: reqwest::blocking::Request,
+    ) -> Result<reqwest::blocking::Request, ProviderError> {
+        match self {
+            Self::AmazonBedrockSigV4(auth) => auth.apply(request),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct AmazonBedrockSigV4Auth {
+    credentials_provider: SharedCredentialsProvider,
+    region: String,
+    service: String,
+    runtime: Arc<tokio::runtime::Runtime>,
+}
+
+impl std::fmt::Debug for AmazonBedrockSigV4Auth {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("AmazonBedrockSigV4Auth")
+            .field("region", &self.region)
+            .field("service", &self.service)
+            .finish_non_exhaustive()
+    }
+}
+
+impl AmazonBedrockSigV4Auth {
+    fn load(config: AmazonBedrockAwsAuthConfig) -> Result<Self, ProviderError> {
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .map_err(|error| {
+                amazon_bedrock_auth_error(format!(
+                    "failed to resolve Amazon Bedrock auth: failed to create AWS auth runtime: {error}"
+                ))
+            })?;
+        let runtime = Arc::new(runtime);
+        let sdk_config = runtime.block_on(async {
+            let mut loader = aws_config::defaults(BehaviorVersion::latest());
+            if let Some(profile) = config
+                .profile
+                .as_deref()
+                .map(str::trim)
+                .filter(|profile| !profile.is_empty())
+            {
+                loader = loader.profile_name(profile);
+            }
+            if let Some(region) = config
+                .region
+                .as_deref()
+                .map(str::trim)
+                .filter(|region| !region.is_empty())
+            {
+                loader = loader.region(Region::new(region.to_string()));
+            }
+            loader.load().await
+        });
+        let credentials_provider = sdk_config.credentials_provider().ok_or_else(|| {
+            amazon_bedrock_auth_error(
+                "failed to resolve Amazon Bedrock auth: AWS SDK config did not resolve a credentials provider",
+            )
+        })?;
+        let region = sdk_config
+            .region()
+            .map(ToString::to_string)
+            .ok_or_else(|| {
+                amazon_bedrock_auth_error(
+                    "failed to resolve Amazon Bedrock auth: AWS SDK config did not resolve a region",
+                )
+            })?;
+        let service = BEDROCK_MANTLE_SERVICE_NAME.to_string();
+        if service.trim().is_empty() {
+            return Err(amazon_bedrock_auth_error(
+                "failed to resolve Amazon Bedrock auth: AWS service name must not be empty",
+            ));
+        }
+        Ok(Self {
+            credentials_provider,
+            region,
+            service,
+            runtime,
+        })
+    }
+
+    fn region(&self) -> &str {
+        &self.region
+    }
+
+    fn apply(
+        &self,
+        mut request: reqwest::blocking::Request,
+    ) -> Result<reqwest::blocking::Request, ProviderError> {
+        remove_headers_not_preserved_by_bedrock_mantle(request.headers_mut());
+        let body = request
+            .body()
+            .and_then(reqwest::blocking::Body::as_bytes)
+            .map(<[u8]>::to_vec)
+            .unwrap_or_default();
+        let (signed_url, signed_headers) = self.sign_request(
+            request.method().clone(),
+            request.url().as_str(),
+            request.headers(),
+            &body,
+        )?;
+        *request.url_mut() = reqwest::Url::parse(&signed_url).map_err(|error| {
+            amazon_bedrock_auth_error(format!(
+                "failed to sign Amazon Bedrock request: signed request URL is not valid: {error}"
+            ))
+        })?;
+        *request.headers_mut() = signed_headers;
+        Ok(request)
+    }
+
+    fn sign_request(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        headers: &reqwest::header::HeaderMap,
+        body: &[u8],
+    ) -> Result<(String, reqwest::header::HeaderMap), ProviderError> {
+        let credentials = self
+            .runtime
+            .block_on(self.credentials_provider.provide_credentials())
+            .map_err(amazon_bedrock_credentials_error)?;
+        let signable_headers = headers
+            .iter()
+            .map(|(name, value)| {
+                Ok::<_, ProviderError>((
+                    name.as_str(),
+                    value.to_str().map_err(|error| {
+                        amazon_bedrock_auth_error(format!(
+                            "failed to sign Amazon Bedrock request: request contains a non-UTF8 header value: {error}"
+                        ))
+                    })?,
+                ))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let signable_request = SignableRequest::new(
+            method.as_str(),
+            url,
+            signable_headers.into_iter(),
+            SignableBody::Bytes(body),
+        )
+        .map_err(|error| {
+            amazon_bedrock_auth_error(format!(
+                "failed to sign Amazon Bedrock request: failed to build signable request: {error}"
+            ))
+        })?;
+        let identity = credentials.clone().into();
+        let signing_params = v4::SigningParams::builder()
+            .identity(&identity)
+            .region(&self.region)
+            .name(&self.service)
+            .time(SystemTime::now())
+            .settings(SigningSettings::default())
+            .build()
+            .map_err(|error| {
+                amazon_bedrock_auth_error(format!(
+                    "failed to sign Amazon Bedrock request: failed to build SigV4 signing params: {error}"
+                ))
+            })?;
+        let (instructions, _signature) = sign(signable_request, &signing_params.into())
+            .map_err(|error| {
+                amazon_bedrock_auth_error(format!(
+                    "failed to sign Amazon Bedrock request: SigV4 signing failed: {error}"
+                ))
+            })?
+            .into_parts();
+        let uri = Uri::from_str(url).map_err(|error| {
+            amazon_bedrock_auth_error(format!(
+                "failed to sign Amazon Bedrock request: request URL is not a valid URI: {error}"
+            ))
+        })?;
+        let mut http_request = HttpRequest::builder()
+            .method(method)
+            .uri(uri)
+            .body(())
+            .map_err(|error| {
+                amazon_bedrock_auth_error(format!(
+                    "failed to sign Amazon Bedrock request: failed to construct HTTP request for signing: {error}"
+                ))
+            })?;
+        *http_request.headers_mut() = headers.clone();
+        instructions.apply_to_request_http1x(&mut http_request);
+        Ok((
+            http_request.uri().to_string(),
+            http_request.headers().clone(),
+        ))
+    }
+}
+
+fn amazon_bedrock_credentials_error(error: CredentialsError) -> ProviderError {
+    let message =
+        format!("failed to sign Amazon Bedrock request: failed to load AWS credentials: {error}");
+    if matches!(
+        error,
+        CredentialsError::ProviderTimedOut(_) | CredentialsError::ProviderError(_)
+    ) {
+        ProviderError::retryable(message, None)
+    } else {
+        amazon_bedrock_auth_error(message)
+    }
+}
+
+fn amazon_bedrock_auth_error(message: impl Into<String>) -> ProviderError {
+    ProviderError::non_retryable(ProviderErrorKind::InvalidRequest, message)
+}
+
+pub fn amazon_bedrock_mantle_base_url(region: &str) -> Result<String> {
+    let region = region.trim();
+    if BEDROCK_MANTLE_SUPPORTED_REGIONS.contains(&region) {
+        Ok(format!("https://bedrock-mantle.{region}.api.aws/openai/v1"))
+    } else {
+        bail!("Amazon Bedrock Mantle does not support region `{region}`");
+    }
+}
+
+fn remove_headers_not_preserved_by_bedrock_mantle(headers: &mut reqwest::header::HeaderMap) {
+    let headers_to_remove = headers
+        .keys()
+        .filter(|name| name.as_str().contains('_'))
+        .cloned()
+        .collect::<Vec<_>>();
+    for name in headers_to_remove {
+        headers.remove(name);
+    }
+}
+
+#[derive(Clone, Debug)]
+struct CachedProviderCommandToken {
+    access_token: String,
+    fetched_at: Instant,
+}
+
+impl ProviderCommandAuth {
+    pub fn new(config: ProviderCommandAuthConfig) -> Self {
+        Self {
+            config,
+            cached: Arc::new(Mutex::new(None)),
+        }
+    }
+
+    pub fn access_token(&self) -> Result<String> {
+        let mut cached = self
+            .cached
+            .lock()
+            .map_err(|_| anyhow!("provider auth token cache is poisoned"))?;
+        if let Some(cached_token) = cached.as_ref() {
+            let should_use_cached_token = self.config.refresh_interval_ms == 0
+                || cached_token.fetched_at.elapsed()
+                    < Duration::from_millis(self.config.refresh_interval_ms);
+            if should_use_cached_token {
+                return Ok(cached_token.access_token.clone());
+            }
+        }
+
+        let access_token = run_provider_auth_command(&self.config)?;
+        *cached = Some(CachedProviderCommandToken {
+            access_token: access_token.clone(),
+            fetched_at: Instant::now(),
+        });
+        Ok(access_token)
+    }
+
+    pub fn refresh_access_token(&self) -> Result<String> {
+        let access_token = run_provider_auth_command(&self.config)?;
+        let mut cached = self
+            .cached
+            .lock()
+            .map_err(|_| anyhow!("provider auth token cache is poisoned"))?;
+        *cached = Some(CachedProviderCommandToken {
+            access_token: access_token.clone(),
+            fetched_at: Instant::now(),
+        });
+        Ok(access_token)
+    }
+}
+
+fn run_provider_auth_command(config: &ProviderCommandAuthConfig) -> Result<String> {
+    if config.timeout_ms == 0 {
+        bail!(
+            "provider auth command `{}` timeout_ms must be non-zero",
+            config.command
+        );
+    }
+    let program = resolve_provider_auth_program(&config.command, &config.cwd);
+    let mut child = Command::new(&program)
+        .args(&config.args)
+        .current_dir(&config.cwd)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .with_context(|| format!("provider auth command `{}` failed to start", config.command))?;
+
+    let timeout = Duration::from_millis(config.timeout_ms);
+    let started = Instant::now();
+    loop {
+        if child
+            .try_wait()
+            .with_context(|| format!("provider auth command `{}` wait failed", config.command))?
+            .is_some()
+        {
+            break;
+        }
+        if started.elapsed() >= timeout {
+            let _ = child.kill();
+            let _ = child.wait();
+            bail!(
+                "provider auth command `{}` timed out after {} ms",
+                config.command,
+                config.timeout_ms
+            );
+        }
+        thread::sleep(Duration::from_millis(10));
+    }
+
+    let output = child
+        .wait_with_output()
+        .with_context(|| format!("provider auth command `{}` wait failed", config.command))?;
+    if !output.status.success() {
+        let stderr = String::from_utf8_lossy(&output.stderr).trim().to_string();
+        let stderr_suffix = if stderr.is_empty() {
+            String::new()
+        } else {
+            format!(": {stderr}")
+        };
+        bail!(
+            "provider auth command `{}` exited with status {}{}",
+            config.command,
+            output.status,
+            stderr_suffix
+        );
+    }
+    let stdout = String::from_utf8(output.stdout).map_err(|_| {
+        anyhow!(
+            "provider auth command `{}` wrote non-UTF-8 data to stdout",
+            config.command
+        )
+    })?;
+    let access_token = stdout.trim().to_string();
+    if access_token.is_empty() {
+        bail!(
+            "provider auth command `{}` produced an empty token",
+            config.command
+        );
+    }
+    Ok(access_token)
+}
+
+fn resolve_provider_auth_program(command: &str, cwd: &Path) -> PathBuf {
+    let path = Path::new(command);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    if path.components().count() > 1 {
+        return cwd.join(path);
+    }
+    PathBuf::from(command)
+}
+
+fn provider_command_auth_error(error: anyhow::Error) -> ProviderError {
+    ProviderError::non_retryable(ProviderErrorKind::InvalidRequest, format!("{error:#}"))
 }
 
 #[derive(Clone, Debug)]
@@ -71,7 +1701,7 @@ impl Default for FakeProvider {
 }
 
 impl ModelProvider for FakeProvider {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "fake"
     }
 
@@ -98,7 +1728,7 @@ impl ScriptedProvider {
 }
 
 impl ModelProvider for ScriptedProvider {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "scripted"
     }
 
@@ -118,11 +1748,17 @@ impl ModelProvider for ScriptedProvider {
 
 #[derive(Clone, Debug)]
 pub struct OpenAIResponsesProvider {
-    api_key: String,
+    api_key: Option<String>,
+    command_auth: Option<ProviderCommandAuth>,
+    request_auth: Option<OpenAIResponsesRequestAuth>,
     model: String,
     base_url: String,
+    provider_name: String,
     instructions: String,
     client: reqwest::blocking::Client,
+    previous_response_state: SharedPreviousResponsesState,
+    request_retry: ProviderRequestRetryConfig,
+    request_options: ProviderRequestOptions,
 }
 
 impl OpenAIResponsesProvider {
@@ -135,12 +1771,26 @@ impl OpenAIResponsesProvider {
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        Self::with_optional_api_key(Some(api_key.into()), model, base_url)
+    }
+
+    pub fn with_optional_api_key(
+        api_key: Option<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
-            api_key: api_key.into(),
+            api_key,
+            command_auth: None,
+            request_auth: None,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            provider_name: "openai".to_string(),
             instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
+            previous_response_state: Arc::new(Mutex::new(None)),
+            request_retry: ProviderRequestRetryConfig::default(),
+            request_options: ProviderRequestOptions::default(),
         }
     }
 
@@ -157,48 +1807,275 @@ impl OpenAIResponsesProvider {
         self.instructions = instructions.into();
         self
     }
+
+    pub fn with_provider_name(mut self, provider_name: impl Into<String>) -> Self {
+        let provider_name = provider_name.into();
+        if !provider_name.trim().is_empty() {
+            self.provider_name = provider_name;
+        }
+        self
+    }
+
+    pub fn with_request_options(mut self, request_options: ProviderRequestOptions) -> Self {
+        self.request_options = request_options;
+        self
+    }
+
+    pub fn with_command_auth_config(mut self, auth: ProviderCommandAuthConfig) -> Self {
+        self.command_auth = Some(ProviderCommandAuth::new(auth));
+        self
+    }
+
+    pub fn with_amazon_bedrock_sigv4_auth(
+        model: impl Into<String>,
+        aws: AmazonBedrockAwsAuthConfig,
+        request_options: ProviderRequestOptions,
+    ) -> Result<Self> {
+        let auth = AmazonBedrockSigV4Auth::load(aws)?;
+        let base_url = amazon_bedrock_mantle_base_url(auth.region())?;
+        Ok(Self::with_optional_api_key(None, model, base_url)
+            .with_provider_name(AMAZON_BEDROCK_PROVIDER_ID)
+            .with_request_options(request_options)
+            .with_request_auth(OpenAIResponsesRequestAuth::AmazonBedrockSigV4(auth)))
+    }
+
+    fn with_request_auth(mut self, request_auth: OpenAIResponsesRequestAuth) -> Self {
+        self.request_auth = Some(request_auth);
+        self
+    }
+
+    #[cfg(test)]
+    fn with_amazon_bedrock_sigv4_auth_for_test(
+        mut self,
+        aws: AmazonBedrockAwsAuthConfig,
+    ) -> Result<Self> {
+        let auth = AmazonBedrockSigV4Auth::load(aws)?;
+        self.request_auth = Some(OpenAIResponsesRequestAuth::AmazonBedrockSigV4(auth));
+        Ok(self)
+    }
 }
 
 impl ModelProvider for OpenAIResponsesProvider {
-    fn provider_name(&self) -> &'static str {
-        "openai"
+    fn provider_name(&self) -> &str {
+        &self.provider_name
     }
 
     fn model_name(&self) -> &str {
         &self.model
     }
 
+    fn supports_namespace_tools(&self) -> bool {
+        self.provider_name != AMAZON_BEDROCK_PROVIDER_ID
+    }
+
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
-        let input = messages_to_responses_input(&turn.messages)?;
+        let stream_idle_timeout = stream_idle_timeout_for_turn(&turn);
+        let turn_state = turn.turn_state.clone();
+        let (response, baseline, model_info) = self.send_turn_request(turn)?;
+        record_turn_state_from_headers(response.headers(), turn_state.as_ref())?;
+        match parse_responses_sse(response, &self.model, stream_idle_timeout) {
+            Ok(events) => {
+                let (response_id, response_items) = previous_response_result_from_events(&events);
+                let response_items =
+                    previous_response_prefix_items_for_model(response_items, model_info);
+                update_previous_response_state(
+                    &self.previous_response_state,
+                    baseline,
+                    response_id,
+                    response_items,
+                )?;
+                Ok(events)
+            }
+            Err(error) => {
+                clear_previous_response_state(&self.previous_response_state)?;
+                Err(error)
+            }
+        }
+    }
+
+    fn stream_turn(
+        &self,
+        turn: ProviderTurn,
+        on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+    ) -> Result<()> {
+        let stream_idle_timeout = stream_idle_timeout_for_turn(&turn);
+        let turn_state = turn.turn_state.clone();
+        let (response, baseline, model_info) = self.send_turn_request(turn)?;
+        record_turn_state_from_headers(response.headers(), turn_state.as_ref())?;
+        let mut response_items = Vec::new();
+        let mut response_id = None;
+        let result =
+            parse_responses_sse_stream(response, &self.model, stream_idle_timeout, &mut |event| {
+                match &event {
+                    ModelEvent::ResponseOutputItem { item } => response_items.push(item.clone()),
+                    ModelEvent::ResponseCompleted {
+                        response_id: completed_response_id,
+                        ..
+                    } => {
+                        if let Some(completed_response_id) =
+                            completed_response_id.as_deref().filter(|id| !id.is_empty())
+                        {
+                            response_id = Some(completed_response_id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                on_event(event)
+            });
+        match result {
+            Ok(()) => {
+                let response_items =
+                    previous_response_prefix_items_for_model(response_items, model_info);
+                update_previous_response_state(
+                    &self.previous_response_state,
+                    baseline,
+                    response_id,
+                    response_items,
+                )
+            }
+            Err(error) => {
+                clear_previous_response_state(&self.previous_response_state)?;
+                Err(error)
+            }
+        }
+    }
+}
+
+impl OpenAIResponsesProvider {
+    fn send_turn_request(
+        &self,
+        turn: ProviderTurn,
+    ) -> Result<(
+        reqwest::blocking::Response,
+        ResponsesRequestBaseline,
+        ModelRequestInfo,
+    )> {
+        let request_retry = self.request_retry.for_turn(&turn);
+        let extra_headers =
+            extra_headers_with_turn_state(turn.extra_headers.clone(), turn.turn_state.as_ref())?;
+        let instructions = turn.instructions_or_default(&self.instructions).to_string();
+        let model_info = model_request_info_for_turn(&self.model, &turn);
+        let input = messages_to_responses_input_for_model(&turn.messages, &model_info)?;
         let tools = tool_specs_to_responses_tools(&turn.tools);
         let mut body = json!({
             "model": self.model,
             "input": input,
-            "instructions": self.instructions,
-            "store": false,
-            "parallel_tool_calls": true,
+            "instructions": instructions,
+            "store": is_azure_responses_base_url(&self.base_url),
+            "stream": true,
+            "tool_choice": "auto",
+            "include": [],
+            "parallel_tool_calls": model_info.supports_parallel_tool_calls,
         });
-        apply_reasoning_summary_request(&mut body);
+        apply_model_request_settings(
+            &mut body,
+            &turn.model_settings,
+            &model_info,
+            turn.output_schema.as_ref(),
+            turn.output_schema_strict,
+        );
+        if let Some(prompt_cache_key) = turn
+            .prompt_cache_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+        {
+            body["prompt_cache_key"] = Value::String(prompt_cache_key.to_string());
+        }
+        if let Some(client_metadata) = non_empty_client_metadata(turn.client_metadata) {
+            body["client_metadata"] = Value::Object(client_metadata);
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
+        let baseline = prepare_previous_response_request_body(
+            &mut body,
+            &self.previous_response_state,
+            turn.previous_response_id.as_deref(),
+            /*auto_previous_response_reuse*/ false,
+        )?;
 
-        let response = self
-            .client
-            .post(format!("{}/responses", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .context("send OpenAI Responses request")?;
-        let status = response.status();
-        let body: Value = response.json().context("parse OpenAI Responses JSON")?;
-        if !status.is_success() {
-            bail!(
-                "OpenAI Responses request failed ({status}): {}",
-                openai_error_message(&body)
-            );
+        let command_auth = if self.request_auth.is_none() {
+            self.command_auth.clone()
+        } else {
+            None
+        };
+        let command_auth_token = command_auth
+            .as_ref()
+            .map(ProviderCommandAuth::access_token)
+            .transpose()
+            .map_err(provider_command_auth_error)?;
+        let build_request = |auth_token: Option<&str>| {
+            let mut request = self
+                .client
+                .post(format!("{}/responses", self.base_url))
+                .header("Accept", "text/event-stream");
+            request = apply_query_params(request, &self.request_options.query_params);
+            request = apply_extra_headers(request, Some(&self.request_options.headers));
+            if self.request_auth.is_none() {
+                if let Some(api_key) = auth_token
+                    .or(self.api_key.as_deref())
+                    .filter(|key| !key.is_empty())
+                {
+                    request = request.bearer_auth(api_key);
+                }
+            }
+            apply_extra_headers(request, extra_headers.as_ref()).json(&body)
+        };
+        let send_with_auth = |auth_token: Option<&str>| {
+            if let Some(request_auth) = self.request_auth.as_ref() {
+                send_provider_prepared_request(
+                    "send OpenAI Responses request",
+                    request_retry,
+                    &self.client,
+                    || {
+                        let request = build_request(auth_token).build().map_err(|error| {
+                            provider_send_error("send OpenAI Responses request", &error)
+                        })?;
+                        request_auth.apply(request)
+                    },
+                )
+            } else {
+                send_provider_request("send OpenAI Responses request", request_retry, || {
+                    build_request(auth_token)
+                })
+            }
+        };
+
+        let mut response = match send_with_auth(command_auth_token.as_deref()) {
+            Ok(response) => response,
+            Err(error) => {
+                clear_previous_response_state(&self.previous_response_state)?;
+                return Err(error.into());
+            }
+        };
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(command_auth) = command_auth.as_ref() {
+                let refreshed = command_auth
+                    .refresh_access_token()
+                    .map_err(provider_command_auth_error)?;
+                response = match send_with_auth(Some(&refreshed)) {
+                    Ok(response) => response,
+                    Err(error) => {
+                        clear_previous_response_state(&self.previous_response_state)?;
+                        return Err(error.into());
+                    }
+                };
+            }
         }
-        parse_responses_output(&body, &self.model)
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body = response.text().unwrap_or_default();
+            clear_previous_response_state(&self.previous_response_state)?;
+            return Err(provider_http_status_error(
+                "OpenAI Responses",
+                status,
+                &body,
+                Some(&headers),
+            )
+            .into());
+        }
+        Ok((response, baseline, model_info))
     }
 }
 
@@ -207,8 +2084,11 @@ pub struct OpenAICompatibleChatProvider {
     api_key: String,
     model: String,
     base_url: String,
+    provider_name: String,
     instructions: String,
     client: reqwest::blocking::Client,
+    request_retry: ProviderRequestRetryConfig,
+    request_options: ProviderRequestOptions,
 }
 
 impl OpenAICompatibleChatProvider {
@@ -225,8 +2105,11 @@ impl OpenAICompatibleChatProvider {
             api_key: api_key.into(),
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
+            provider_name: "openai-compatible".to_string(),
             instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
+            request_retry: ProviderRequestRetryConfig::default(),
+            request_options: ProviderRequestOptions::default(),
         }
     }
 
@@ -244,28 +2127,48 @@ impl OpenAICompatibleChatProvider {
         self.instructions = instructions.into();
         self
     }
+
+    pub fn with_provider_name(mut self, provider_name: impl Into<String>) -> Self {
+        let provider_name = provider_name.into();
+        if !provider_name.trim().is_empty() {
+            self.provider_name = provider_name;
+        }
+        self
+    }
+
+    pub fn with_request_options(mut self, request_options: ProviderRequestOptions) -> Self {
+        self.request_options = request_options;
+        self
+    }
 }
 
 impl ModelProvider for OpenAICompatibleChatProvider {
-    fn provider_name(&self) -> &'static str {
-        "openai-compatible"
+    fn provider_name(&self) -> &str {
+        &self.provider_name
     }
 
     fn model_name(&self) -> &str {
         &self.model
     }
 
+    fn supports_namespace_tools(&self) -> bool {
+        false
+    }
+
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+        let request_retry = self.request_retry.for_turn(&turn);
+        let instructions = turn.instructions_or_default(&self.instructions).to_string();
         let mut messages = vec![json!({
             "role": "system",
-            "content": self.instructions,
+            "content": instructions,
         })];
         messages.extend(messages_to_chat_messages(&turn.messages)?);
         let tools = tool_specs_to_chat_tools(&turn.tools);
+        let model_info = model_request_info_for_turn(&self.model, &turn);
         let mut body = json!({
             "model": self.model,
             "messages": messages,
-            "parallel_tool_calls": true,
+            "parallel_tool_calls": model_info.supports_parallel_tool_calls,
         });
         if self.base_url.contains("openrouter.ai") || include_openai_compatible_usage() {
             body["usage"] = json!({ "include": true });
@@ -274,40 +2177,111 @@ impl ModelProvider for OpenAICompatibleChatProvider {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = json!("auto");
         }
-        let response = self
-            .client
-            .post(format!("{}/chat/completions", self.base_url))
-            .bearer_auth(&self.api_key)
-            .json(&body)
-            .send()
-            .context("send OpenAI-compatible chat request")?;
-        let status = response.status();
-        let body: Value = response
-            .json()
-            .context("parse OpenAI-compatible chat JSON")?;
+        let (status, headers, body_text) = send_provider_text_request(
+            "send OpenAI-compatible chat request",
+            "read OpenAI-compatible chat response body",
+            request_retry,
+            || {
+                let request = self
+                    .client
+                    .post(format!("{}/chat/completions", self.base_url))
+                    .bearer_auth(&self.api_key);
+                let request = apply_query_params(request, &self.request_options.query_params);
+                apply_extra_headers(request, Some(&self.request_options.headers)).json(&body)
+            },
+        )?;
         if !status.is_success() {
-            bail!(
-                "OpenAI-compatible chat request failed ({status}): {}",
-                openai_error_message(&body)
-            );
+            return Err(provider_http_status_error(
+                "OpenAI-compatible chat",
+                status,
+                &body_text,
+                Some(&headers),
+            )
+            .into());
         }
+        let body: Value = serde_json::from_str(&body_text).map_err(|error| {
+            ProviderError::retryable(format!("parse OpenAI-compatible chat JSON: {error}"), None)
+        })?;
         parse_chat_completion_output(&body, &self.model)
     }
 }
 
-#[derive(Clone, Debug)]
+type ClaudeCodeOAuthRefreshFn =
+    Arc<dyn Fn(&str) -> Result<ClaudeCodeOAuthCredential> + Send + Sync>;
+type ClaudeCodeOAuthPersistFn = Arc<dyn Fn(&ClaudeCodeOAuthCredential) -> Result<()> + Send + Sync>;
+
+#[derive(Clone)]
 pub struct AnthropicMessagesProvider {
-    credential: AnthropicCredential,
+    credential: Arc<Mutex<AnthropicCredential>>,
+    oauth_refresh: Option<ClaudeCodeOAuthRefresh>,
     model: String,
     base_url: String,
     instructions: String,
     client: reqwest::blocking::Client,
+    request_retry: ProviderRequestRetryConfig,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
+#[derive(Clone, Debug)]
 enum AnthropicCredential {
     ApiKey(String),
     AuthToken(String),
+}
+
+impl AnthropicCredential {
+    fn is_oauth(&self) -> bool {
+        match self {
+            AnthropicCredential::AuthToken(_) => true,
+            AnthropicCredential::ApiKey(value) => is_claude_code_oauth_token(value),
+        }
+    }
+}
+
+#[derive(Clone)]
+struct ClaudeCodeOAuthRefresh {
+    refresh_token: Arc<Mutex<String>>,
+    refresh_fn: ClaudeCodeOAuthRefreshFn,
+    on_refresh: Option<ClaudeCodeOAuthPersistFn>,
+}
+
+impl std::fmt::Debug for ClaudeCodeOAuthRefresh {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ClaudeCodeOAuthRefresh")
+            .field("refresh_token", &"<redacted>")
+            .field("on_refresh", &self.on_refresh.is_some())
+            .finish()
+    }
+}
+
+impl ClaudeCodeOAuthRefresh {
+    fn new(
+        refresh_token: impl Into<String>,
+        refresh_fn: ClaudeCodeOAuthRefreshFn,
+        on_refresh: Option<ClaudeCodeOAuthPersistFn>,
+    ) -> Self {
+        Self {
+            refresh_token: Arc::new(Mutex::new(refresh_token.into())),
+            refresh_fn,
+            on_refresh,
+        }
+    }
+
+    fn refresh(&self) -> Result<ClaudeCodeOAuthCredential> {
+        let refresh_token = self
+            .refresh_token
+            .lock()
+            .map_err(|_| anyhow!("Claude Code OAuth refresh token cache is poisoned"))?
+            .clone();
+        let credential = (self.refresh_fn)(refresh_token.trim())?;
+        if let Some(on_refresh) = &self.on_refresh {
+            on_refresh(&credential)?;
+        }
+        *self
+            .refresh_token
+            .lock()
+            .map_err(|_| anyhow!("Claude Code OAuth refresh token cache is poisoned"))? =
+            credential.refresh_token.trim().to_string();
+        Ok(credential)
+    }
 }
 
 const CLAUDE_CODE_CLIENT_ID: &str = "9d1c250a-e61b-44d9-88ed-5944d1962f5e";
@@ -370,17 +2344,82 @@ impl AnthropicMessagesProvider {
         )
     }
 
+    pub fn with_claude_code_oauth_credential(
+        credential: ClaudeCodeOAuthCredential,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        Self::with_claude_code_oauth_refresh_handler(
+            credential,
+            model,
+            base_url,
+            Arc::new(refresh_claude_code_oauth),
+            None,
+        )
+    }
+
+    pub fn with_claude_code_oauth_persistence(
+        credential: ClaudeCodeOAuthCredential,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        on_refresh: impl Fn(&ClaudeCodeOAuthCredential) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_claude_code_oauth_refresh_handler(
+            credential,
+            model,
+            base_url,
+            Arc::new(refresh_claude_code_oauth),
+            Some(Arc::new(on_refresh)),
+        )
+    }
+
+    fn with_claude_code_oauth_refresh_handler(
+        credential: ClaudeCodeOAuthCredential,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        refresh_fn: ClaudeCodeOAuthRefreshFn,
+        on_refresh: Option<ClaudeCodeOAuthPersistFn>,
+    ) -> Self {
+        let refresh =
+            ClaudeCodeOAuthRefresh::new(credential.refresh_token.clone(), refresh_fn, on_refresh);
+        let mut provider = Self::with_credential(
+            AnthropicCredential::AuthToken(credential.access_token),
+            model,
+            base_url,
+        );
+        provider.oauth_refresh = Some(refresh);
+        provider
+    }
+
+    #[cfg(test)]
+    fn with_claude_code_oauth_refresh_for_test(
+        credential: ClaudeCodeOAuthCredential,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+        refresh_fn: impl Fn(&str) -> Result<ClaudeCodeOAuthCredential> + Send + Sync + 'static,
+    ) -> Self {
+        Self::with_claude_code_oauth_refresh_handler(
+            credential,
+            model,
+            base_url,
+            Arc::new(refresh_fn),
+            None,
+        )
+    }
+
     fn with_credential(
         credential: AnthropicCredential,
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
         Self {
-            credential,
+            credential: Arc::new(Mutex::new(credential)),
+            oauth_refresh: None,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
+            request_retry: ProviderRequestRetryConfig::default(),
         }
     }
 
@@ -412,16 +2451,65 @@ impl AnthropicMessagesProvider {
         self
     }
 
-    fn is_oauth(&self) -> bool {
-        match &self.credential {
-            AnthropicCredential::AuthToken(_) => true,
-            AnthropicCredential::ApiKey(value) => is_claude_code_oauth_token(value),
-        }
+    fn current_credential(&self) -> Result<AnthropicCredential> {
+        self.credential
+            .lock()
+            .map_err(|_| anyhow!("Anthropic credential cache is poisoned"))
+            .map(|credential| credential.clone())
+    }
+
+    fn replace_oauth_access_token(&self, access_token: impl Into<String>) -> Result<()> {
+        *self
+            .credential
+            .lock()
+            .map_err(|_| anyhow!("Anthropic credential cache is poisoned"))? =
+            AnthropicCredential::AuthToken(access_token.into());
+        Ok(())
+    }
+
+    fn send_messages_request(
+        &self,
+        body: &Value,
+        credential: &AnthropicCredential,
+        request_retry: ProviderRequestRetryConfig,
+    ) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, String), ProviderError> {
+        let is_oauth = credential.is_oauth();
+        send_provider_text_request(
+            "send Anthropic Messages request",
+            "read Anthropic Messages response body",
+            request_retry,
+            || {
+                let request = self
+                    .client
+                    .post(format!("{}/messages", self.base_url))
+                    .header("accept", "application/json")
+                    .header("content-type", "application/json")
+                    .header("anthropic-version", "2023-06-01")
+                    .header("anthropic-dangerous-direct-browser-access", "true");
+                match credential {
+                    AnthropicCredential::ApiKey(api_key) if !is_oauth => request
+                        .header("x-api-key", api_key)
+                        .header("anthropic-beta", ANTHROPIC_BETA_FEATURES.join(","))
+                        .json(body),
+                    AnthropicCredential::ApiKey(auth_token)
+                    | AnthropicCredential::AuthToken(auth_token) => {
+                        let mut beta = vec!["claude-code-20250219", "oauth-2025-04-20"];
+                        beta.extend_from_slice(ANTHROPIC_BETA_FEATURES);
+                        request
+                            .bearer_auth(auth_token)
+                            .header("anthropic-beta", beta.join(","))
+                            .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
+                            .header("x-app", "cli")
+                            .json(body)
+                    }
+                }
+            },
+        )
     }
 }
 
 impl ModelProvider for AnthropicMessagesProvider {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "anthropic"
     }
 
@@ -429,53 +2517,54 @@ impl ModelProvider for AnthropicMessagesProvider {
         &self.model
     }
 
+    fn supports_namespace_tools(&self) -> bool {
+        false
+    }
+
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
-        let is_oauth = self.is_oauth();
+        let request_retry = self.request_retry.for_turn(&turn);
+        let mut credential = self.current_credential()?;
+        let is_oauth = credential.is_oauth();
         let tools = tool_specs_to_anthropic_tools(&turn.tools, is_oauth);
+        let instructions = turn.instructions_or_default(&self.instructions).to_string();
         let mut body = json!({
             "model": self.model,
             "max_tokens": 16000,
-            "system": anthropic_system_blocks(&self.instructions, is_oauth),
+            "system": anthropic_system_blocks_with_developer_context(&instructions, &turn.messages, is_oauth),
             "messages": messages_to_anthropic_messages(&turn.messages, is_oauth)?,
         });
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = json!({"type": "auto"});
         }
-        let mut request = self
-            .client
-            .post(format!("{}/messages", self.base_url))
-            .header("accept", "application/json")
-            .header("content-type", "application/json")
-            .header("anthropic-version", "2023-06-01")
-            .header("anthropic-dangerous-direct-browser-access", "true");
-        request = match &self.credential {
-            AnthropicCredential::ApiKey(api_key) if !is_oauth => request
-                .header("x-api-key", api_key)
-                .header("anthropic-beta", ANTHROPIC_BETA_FEATURES.join(",")),
-            AnthropicCredential::ApiKey(auth_token)
-            | AnthropicCredential::AuthToken(auth_token) => {
-                let mut beta = vec!["claude-code-20250219", "oauth-2025-04-20"];
-                beta.extend_from_slice(ANTHROPIC_BETA_FEATURES);
-                request
-                    .bearer_auth(auth_token)
-                    .header("anthropic-beta", beta.join(","))
-                    .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
-                    .header("x-app", "cli")
+        let (mut status, mut headers, mut body_text) =
+            self.send_messages_request(&body, &credential, request_retry)?;
+        if status == reqwest::StatusCode::UNAUTHORIZED && is_oauth {
+            if let Some(refresh) = self.oauth_refresh.as_ref() {
+                let refreshed = refresh.refresh().map_err(|error| {
+                    ProviderError::non_retryable(
+                        ProviderErrorKind::Unauthorized,
+                        format!("refresh Claude Code OAuth token after 401: {error:#}"),
+                    )
+                })?;
+                self.replace_oauth_access_token(refreshed.access_token.clone())?;
+                credential = AnthropicCredential::AuthToken(refreshed.access_token);
+                (status, headers, body_text) =
+                    self.send_messages_request(&body, &credential, request_retry)?;
             }
-        };
-        let response = request
-            .json(&body)
-            .send()
-            .context("send Anthropic Messages request")?;
-        let status = response.status();
-        let body: Value = response.json().context("parse Anthropic Messages JSON")?;
-        if !status.is_success() {
-            bail!(
-                "Anthropic Messages request failed ({status}): {}",
-                anthropic_error_message(&body)
-            );
         }
+        if !status.is_success() {
+            return Err(provider_http_status_error(
+                "Anthropic Messages",
+                status,
+                &body_text,
+                Some(&headers),
+            )
+            .into());
+        }
+        let body: Value = serde_json::from_str(&body_text).map_err(|error| {
+            ProviderError::retryable(format!("parse Anthropic Messages JSON: {error}"), None)
+        })?;
         parse_anthropic_messages_output(&body, &self.model, &turn.tools, is_oauth)
     }
 }
@@ -674,19 +2763,571 @@ fn truncate_error_body(value: &str) -> String {
     out
 }
 
+const CYBER_POLICY_FALLBACK_MESSAGE: &str =
+    "This request has been flagged for possible cybersecurity risk.";
+
+#[derive(Default)]
+struct ParsedProviderHttpError {
+    code: Option<String>,
+    error_type: Option<String>,
+    message: Option<String>,
+    plan_type: Option<String>,
+    resets_at: Option<i64>,
+}
+
+fn provider_send_error(operation: &str, error: &reqwest::Error) -> ProviderError {
+    let message = format!("{operation}: {error}");
+    if error.is_timeout() {
+        ProviderError {
+            kind: ProviderErrorKind::RequestTimeout,
+            message,
+            retry_delay: None,
+            http_status_code: None,
+            rate_limits: None,
+        }
+    } else {
+        ProviderError::stream(message)
+    }
+}
+
+fn provider_http_status_error(
+    operation: &str,
+    status: reqwest::StatusCode,
+    body: &str,
+    headers: Option<&reqwest::header::HeaderMap>,
+) -> ProviderError {
+    let parsed = parse_provider_http_error_body(body);
+    let message = format!(
+        "{operation} request failed ({status}): {}",
+        truncate_error_body(body)
+    );
+    let code = parsed.code.as_deref();
+    let error_type = parsed.error_type.as_deref();
+
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        return ProviderError::non_retryable(ProviderErrorKind::Unauthorized, message)
+            .with_http_status_code(status);
+    }
+
+    if status == reqwest::StatusCode::SERVICE_UNAVAILABLE
+        && matches!(code, Some("server_is_overloaded" | "slow_down"))
+    {
+        return ProviderError::non_retryable(ProviderErrorKind::ServerOverloaded, message)
+            .with_http_status_code(status);
+    }
+
+    if status == reqwest::StatusCode::BAD_REQUEST {
+        if code == Some("cyber_policy") {
+            return ProviderError::non_retryable(
+                ProviderErrorKind::CyberPolicy,
+                parsed
+                    .message
+                    .filter(|message| !message.trim().is_empty())
+                    .unwrap_or_else(|| CYBER_POLICY_FALLBACK_MESSAGE.to_string()),
+            )
+            .with_http_status_code(status);
+        }
+        return ProviderError::non_retryable(ProviderErrorKind::InvalidRequest, message)
+            .with_http_status_code(status);
+    }
+
+    if status == reqwest::StatusCode::TOO_MANY_REQUESTS {
+        let error = match error_type {
+            Some("usage_limit_reached") => ProviderError::non_retryable(
+                ProviderErrorKind::UsageLimitReached,
+                usage_limit_message(&parsed, headers),
+            )
+            .with_rate_limits(headers.and_then(|headers| {
+                let active_limit = parse_header_str(headers, "x-codex-active-limit");
+                parse_rate_limit_for_limit(headers, active_limit.as_deref())
+            })),
+            Some("usage_not_included") => {
+                ProviderError::non_retryable(ProviderErrorKind::UsageNotIncluded, message)
+            }
+            _ => ProviderError::non_retryable(ProviderErrorKind::RetryLimit, message),
+        };
+        return error.with_http_status_code(status);
+    }
+
+    if status == reqwest::StatusCode::INTERNAL_SERVER_ERROR {
+        return ProviderError {
+            kind: ProviderErrorKind::InternalServerError,
+            message,
+            retry_delay: None,
+            http_status_code: Some(status.as_u16()),
+            rate_limits: None,
+        };
+    }
+
+    ProviderError {
+        kind: ProviderErrorKind::UnexpectedStatus,
+        message,
+        retry_delay: None,
+        http_status_code: Some(status.as_u16()),
+        rate_limits: None,
+    }
+}
+
+fn parse_provider_http_error_body(body: &str) -> ParsedProviderHttpError {
+    let Ok(value) = serde_json::from_str::<Value>(body) else {
+        return ParsedProviderHttpError::default();
+    };
+    let Some(error) = value.get("error") else {
+        return ParsedProviderHttpError::default();
+    };
+    ParsedProviderHttpError {
+        code: error
+            .get("code")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        error_type: error
+            .get("type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        message: error
+            .get("message")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        plan_type: error
+            .get("plan_type")
+            .and_then(Value::as_str)
+            .map(ToOwned::to_owned),
+        resets_at: error.get("resets_at").and_then(Value::as_i64),
+    }
+}
+
+fn usage_limit_message(
+    parsed: &ParsedProviderHttpError,
+    headers: Option<&reqwest::header::HeaderMap>,
+) -> String {
+    let rate_limit_snapshot = headers.and_then(|headers| {
+        let active_limit = parse_header_str(headers, "x-codex-active-limit");
+        parse_rate_limit_for_limit(headers, active_limit.as_deref())
+    });
+    if let Some(limit_name) = rate_limit_snapshot
+        .as_ref()
+        .and_then(|snapshot| snapshot.limit_name.as_deref())
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+    {
+        if !limit_name.eq_ignore_ascii_case("codex") {
+            return format!(
+                "You've hit your usage limit for {limit_name}. Switch to another model now,{}",
+                retry_suffix_after_or(parsed.resets_at)
+            );
+        }
+    }
+
+    if let Some(rate_limit_reached_type) =
+        headers.and_then(|headers| parse_header_str(headers, "x-codex-rate-limit-reached-type"))
+    {
+        match rate_limit_reached_type.trim() {
+            "workspace_owner_credits_depleted" => {
+                return "Your workspace is out of credits. Add credits to continue.".to_string();
+            }
+            "workspace_member_credits_depleted" => {
+                return "Your workspace is out of credits. Ask your workspace owner to refill in order to continue.".to_string();
+            }
+            "workspace_owner_usage_limit_reached" => {
+                return "You hit your spend cap set in your workspace. Increase your spend cap to continue.".to_string();
+            }
+            "workspace_member_usage_limit_reached" => {
+                return "You hit your spend cap set by the owner of your workspace. Ask an owner to increase your spend cap to continue.".to_string();
+            }
+            "rate_limit_reached" => {}
+            _ => {}
+        }
+    }
+
+    let promo = headers
+        .and_then(|headers| parse_header_str(headers, "x-codex-promo-message"))
+        .filter(|message| !message.trim().is_empty());
+    if let Some(promo) = promo.as_deref() {
+        return format!(
+            "You've hit your usage limit. {promo},{}",
+            retry_suffix_after_or(parsed.resets_at)
+        );
+    }
+
+    match parsed
+        .plan_type
+        .as_deref()
+        .map(|plan| plan.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("plus") => format!(
+            "You've hit your usage limit. Upgrade to Pro (https://chatgpt.com/explore/pro), visit https://chatgpt.com/codex/settings/usage to purchase more credits{}",
+            retry_suffix_after_or(parsed.resets_at)
+        ),
+        Some("team")
+        | Some("self_serve_business_usage_based")
+        | Some("business")
+        | Some("enterprise_cbp_usage_based") => format!(
+            "You've hit your usage limit. To get more access now, send a request to your admin{}",
+            retry_suffix_after_or(parsed.resets_at)
+        ),
+        Some("free") | Some("go") => format!(
+            "You've hit your usage limit. Upgrade to Plus to continue using Codex (https://chatgpt.com/explore/plus),{}",
+            retry_suffix_after_or(parsed.resets_at)
+        ),
+        Some("pro") | Some("prolite") => format!(
+            "You've hit your usage limit. Visit https://chatgpt.com/codex/settings/usage to purchase more credits{}",
+            retry_suffix_after_or(parsed.resets_at)
+        ),
+        Some("enterprise") | Some("hc") | Some("education") | Some("edu") => {
+            format!("You've hit your usage limit.{}", retry_suffix(parsed.resets_at))
+        }
+        Some(_) | None => {
+            format!("You've hit your usage limit.{}", retry_suffix(parsed.resets_at))
+        }
+    }
+}
+
+fn retry_suffix(resets_at: Option<i64>) -> String {
+    if let Some(resets_at) = resets_at.and_then(|seconds| Local.timestamp_opt(seconds, 0).single())
+    {
+        let formatted = format_retry_timestamp(&resets_at);
+        format!(" Try again at {formatted}.")
+    } else {
+        " Try again later.".to_string()
+    }
+}
+
+fn retry_suffix_after_or(resets_at: Option<i64>) -> String {
+    if let Some(resets_at) = resets_at.and_then(|seconds| Local.timestamp_opt(seconds, 0).single())
+    {
+        let formatted = format_retry_timestamp(&resets_at);
+        format!(" or try again at {formatted}.")
+    } else {
+        " or try again later.".to_string()
+    }
+}
+
+fn format_retry_timestamp(resets_at: &DateTime<Local>) -> String {
+    let local_now = Local::now();
+    if resets_at.date_naive() == local_now.date_naive() {
+        resets_at.format("%-I:%M %p").to_string()
+    } else {
+        let suffix = day_suffix(resets_at.day());
+        resets_at
+            .format(&format!("%b %-d{suffix}, %Y %-I:%M %p"))
+            .to_string()
+    }
+}
+
+fn day_suffix(day: u32) -> &'static str {
+    match day {
+        11..=13 => "th",
+        _ => match day % 10 {
+            1 => "st",
+            2 => "nd",
+            3 => "rd",
+            _ => "th",
+        },
+    }
+}
+
+fn parse_all_rate_limits(headers: &reqwest::header::HeaderMap) -> Vec<RateLimitSnapshot> {
+    let mut snapshots = Vec::new();
+    if let Some(snapshot) = parse_rate_limit_for_limit(headers, None) {
+        snapshots.push(snapshot);
+    }
+
+    let mut limit_ids = BTreeSet::new();
+    for name in headers.keys() {
+        if let Some(limit_id) = header_name_to_limit_id(name.as_str()) {
+            if limit_id != "codex" {
+                limit_ids.insert(limit_id);
+            }
+        }
+    }
+    snapshots.extend(limit_ids.into_iter().filter_map(|limit_id| {
+        let snapshot = parse_rate_limit_for_limit(headers, Some(&limit_id))?;
+        has_rate_limit_data(&snapshot).then_some(snapshot)
+    }));
+    snapshots
+}
+
+fn parse_rate_limit_for_limit(
+    headers: &reqwest::header::HeaderMap,
+    limit_id: Option<&str>,
+) -> Option<RateLimitSnapshot> {
+    let normalized_limit = limit_id
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .unwrap_or("codex")
+        .to_ascii_lowercase()
+        .replace('_', "-");
+    let prefix = format!("x-{normalized_limit}");
+    let primary = parse_rate_limit_window(
+        headers,
+        &format!("{prefix}-primary-used-percent"),
+        &format!("{prefix}-primary-window-minutes"),
+        &format!("{prefix}-primary-reset-at"),
+    );
+    let secondary = parse_rate_limit_window(
+        headers,
+        &format!("{prefix}-secondary-used-percent"),
+        &format!("{prefix}-secondary-window-minutes"),
+        &format!("{prefix}-secondary-reset-at"),
+    );
+    let limit_name = parse_header_str(headers, &format!("{prefix}-limit-name"))
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    Some(RateLimitSnapshot {
+        limit_id: Some(normalize_limit_id(normalized_limit)),
+        limit_name,
+        primary,
+        secondary,
+        credits: parse_credits_snapshot(headers),
+        plan_type: None,
+        rate_limit_reached_type: None,
+    })
+}
+
+fn parse_rate_limit_window(
+    headers: &reqwest::header::HeaderMap,
+    used_percent_header: &str,
+    window_minutes_header: &str,
+    resets_at_header: &str,
+) -> Option<RateLimitWindow> {
+    let used_percent = parse_header_f64(headers, used_percent_header)?;
+    let window_minutes = parse_header_i64(headers, window_minutes_header);
+    let resets_at = parse_header_i64(headers, resets_at_header);
+    let has_data = used_percent != 0.0
+        || window_minutes.is_some_and(|minutes| minutes != 0)
+        || resets_at.is_some();
+    has_data.then_some(RateLimitWindow {
+        used_percent,
+        window_minutes,
+        resets_at,
+    })
+}
+
+fn parse_credits_snapshot(headers: &reqwest::header::HeaderMap) -> Option<CreditsSnapshot> {
+    Some(CreditsSnapshot {
+        has_credits: parse_header_bool(headers, "x-codex-credits-has-credits")?,
+        unlimited: parse_header_bool(headers, "x-codex-credits-unlimited")?,
+        balance: parse_header_str(headers, "x-codex-credits-balance")
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty()),
+    })
+}
+
+fn parse_header_f64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<f64> {
+    parse_header_str(headers, name)?
+        .parse::<f64>()
+        .ok()
+        .filter(|value| value.is_finite())
+}
+
+fn parse_header_i64(headers: &reqwest::header::HeaderMap, name: &str) -> Option<i64> {
+    parse_header_str(headers, name)?.parse::<i64>().ok()
+}
+
+fn parse_header_bool(headers: &reqwest::header::HeaderMap, name: &str) -> Option<bool> {
+    let raw = parse_header_str(headers, name)?;
+    if raw.eq_ignore_ascii_case("true") || raw == "1" {
+        Some(true)
+    } else if raw.eq_ignore_ascii_case("false") || raw == "0" {
+        Some(false)
+    } else {
+        None
+    }
+}
+
+fn parse_header_str(headers: &reqwest::header::HeaderMap, name: &str) -> Option<String> {
+    headers
+        .get(name)
+        .and_then(|value| value.to_str().ok())
+        .map(str::to_string)
+}
+
+fn header_name_to_limit_id(header_name: &str) -> Option<String> {
+    let suffix = "-primary-used-percent";
+    let prefix = header_name.to_ascii_lowercase();
+    let prefix = prefix.strip_suffix(suffix)?;
+    let limit = prefix.strip_prefix("x-")?;
+    Some(normalize_limit_id(limit))
+}
+
+fn normalize_limit_id(name: impl Into<String>) -> String {
+    name.into().trim().to_ascii_lowercase().replace('-', "_")
+}
+
+fn has_rate_limit_data(snapshot: &RateLimitSnapshot) -> bool {
+    snapshot.primary.is_some() || snapshot.secondary.is_some() || snapshot.credits.is_some()
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct CodexAuth {
     pub access_token: String,
     pub account_id: String,
 }
 
+impl CodexAuth {
+    pub fn new(access_token: impl Into<String>, account_id: impl Into<String>) -> Self {
+        Self {
+            access_token: access_token.into(),
+            account_id: account_id.into(),
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CodexManagedAuthSnapshot {
+    pub access_token: String,
+    pub account_id: String,
+    pub id_token: Option<String>,
+    pub refresh_token: Option<String>,
+    pub source_path: Option<PathBuf>,
+    pub last_refresh: Option<DateTime<Utc>>,
+}
+
+impl CodexManagedAuthSnapshot {
+    pub fn current_auth(&self) -> CodexAuth {
+        CodexAuth::new(self.access_token.clone(), self.account_id.clone())
+    }
+
+    fn has_refresh_token(&self) -> bool {
+        self.refresh_token
+            .as_deref()
+            .is_some_and(|token| !token.trim().is_empty())
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct CodexManagedAuth {
+    snapshot: Arc<Mutex<CodexManagedAuthSnapshot>>,
+    client: reqwest::blocking::Client,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CodexManagedReloadOutcome {
+    ReloadedChanged,
+    ReloadedNoChange,
+}
+
+impl CodexManagedAuth {
+    pub fn new(snapshot: CodexManagedAuthSnapshot) -> Self {
+        Self {
+            snapshot: Arc::new(Mutex::new(snapshot)),
+            client: reqwest::blocking::Client::new(),
+        }
+    }
+
+    pub fn from_stored_parts(
+        access_token: impl Into<String>,
+        account_id: impl Into<String>,
+        id_token: Option<String>,
+        refresh_token: Option<String>,
+        source_path: Option<PathBuf>,
+        last_refresh: Option<String>,
+    ) -> Self {
+        Self::new(CodexManagedAuthSnapshot {
+            access_token: access_token.into(),
+            account_id: account_id.into(),
+            id_token,
+            refresh_token,
+            source_path,
+            last_refresh: last_refresh
+                .as_deref()
+                .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+                .map(|value| value.with_timezone(&Utc)),
+        })
+    }
+
+    pub fn current_snapshot(&self) -> Result<CodexManagedAuthSnapshot> {
+        self.snapshot
+            .lock()
+            .map_err(|_| anyhow!("Codex managed auth cache is poisoned"))
+            .map(|guard| guard.clone())
+    }
+
+    pub fn current_auth(&self) -> Result<CodexAuth> {
+        Ok(self.current_snapshot()?.current_auth())
+    }
+
+    pub fn reload_if_account_id_matches(
+        &self,
+        expected_account_id: &str,
+    ) -> Result<CodexManagedReloadOutcome> {
+        let source_path = self
+            .current_snapshot()?
+            .source_path
+            .context("Codex managed auth has no source path to reload")?;
+        let next = load_codex_managed_auth_snapshot_from_file(&source_path)?;
+        if next.account_id.trim() != expected_account_id.trim() {
+            bail!(
+                "Codex auth reload skipped because account id changed from {} to {}",
+                expected_account_id,
+                next.account_id
+            );
+        }
+        let mut guard = self
+            .snapshot
+            .lock()
+            .map_err(|_| anyhow!("Codex managed auth cache is poisoned"))?;
+        let changed = *guard != next;
+        *guard = next;
+        Ok(if changed {
+            CodexManagedReloadOutcome::ReloadedChanged
+        } else {
+            CodexManagedReloadOutcome::ReloadedNoChange
+        })
+    }
+
+    pub fn refresh_from_authority(&self) -> Result<CodexManagedAuthSnapshot> {
+        let current = self.current_snapshot()?;
+        let refresh_token = current
+            .refresh_token
+            .as_deref()
+            .filter(|token| !token.trim().is_empty())
+            .context("Codex managed auth has no refresh token")?
+            .trim()
+            .to_string();
+        let refreshed = request_codex_token_refresh(&self.client, refresh_token)?;
+        let mut next = current.clone();
+        if let Some(id_token) = refreshed.id_token {
+            next.id_token = Some(id_token);
+        }
+        if let Some(access_token) = refreshed.access_token {
+            next.access_token = access_token;
+        }
+        if let Some(refresh_token) = refreshed.refresh_token {
+            next.refresh_token = Some(refresh_token);
+        }
+        next.last_refresh = Some(Utc::now());
+        if let Some(path) = next.source_path.as_ref() {
+            persist_codex_managed_auth_snapshot(path, &next)?;
+            next = load_codex_managed_auth_snapshot_from_file(path)?;
+        }
+        let mut guard = self
+            .snapshot
+            .lock()
+            .map_err(|_| anyhow!("Codex managed auth cache is poisoned"))?;
+        *guard = next.clone();
+        Ok(next)
+    }
+
+    pub fn refresh_if_stale(&self) -> Result<Option<CodexManagedAuthSnapshot>> {
+        if !codex_managed_auth_is_stale(&self.current_snapshot()?) {
+            return Ok(None);
+        }
+        self.refresh_from_authority().map(Some)
+    }
+}
+
 #[derive(Clone, Debug)]
 pub struct CodexResponsesProvider {
-    auth: CodexAuth,
+    auth: Arc<Mutex<CodexAuth>>,
+    managed_auth: Option<CodexManagedAuth>,
     model: String,
     base_url: String,
     instructions: String,
     client: reqwest::blocking::Client,
+    previous_response_state: SharedPreviousResponsesState,
+    request_retry: ProviderRequestRetryConfig,
 }
 
 impl CodexResponsesProvider {
@@ -700,18 +3341,45 @@ impl CodexResponsesProvider {
         base_url: impl Into<String>,
     ) -> Self {
         Self {
-            auth,
+            auth: Arc::new(Mutex::new(auth)),
+            managed_auth: None,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             instructions: default_instructions(),
             client: reqwest::blocking::Client::new(),
+            previous_response_state: Arc::new(Mutex::new(None)),
+            request_retry: ProviderRequestRetryConfig::default(),
         }
     }
 
+    pub fn with_managed_base_url(
+        auth: CodexManagedAuth,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Result<Self> {
+        let current_auth = auth.current_auth()?;
+        Ok(Self {
+            auth: Arc::new(Mutex::new(current_auth)),
+            managed_auth: Some(auth),
+            model: model.into(),
+            base_url: base_url.into().trim_end_matches('/').to_string(),
+            instructions: default_instructions(),
+            client: reqwest::blocking::Client::new(),
+            previous_response_state: Arc::new(Mutex::new(None)),
+            request_retry: ProviderRequestRetryConfig::default(),
+        })
+    }
+
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
-        let auth = load_codex_auth()?;
+        let model = model.into();
         let base_url = std::env::var("LLM_BROWSER_CODEX_BASE_URL")
             .unwrap_or_else(|_| "https://chatgpt.com/backend-api".to_string());
+        if std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").is_err() {
+            if let Ok(managed_auth) = load_codex_managed_auth() {
+                return Self::with_managed_base_url(managed_auth, model, base_url);
+            }
+        }
+        let auth = load_codex_auth()?;
         Ok(Self::with_base_url(auth, model, base_url))
     }
 
@@ -722,7 +3390,7 @@ impl CodexResponsesProvider {
 }
 
 impl ModelProvider for CodexResponsesProvider {
-    fn provider_name(&self) -> &'static str {
+    fn provider_name(&self) -> &str {
         "codex"
     }
 
@@ -731,7 +3399,28 @@ impl ModelProvider for CodexResponsesProvider {
     }
 
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
-        parse_codex_sse(self.send_turn_request(turn)?, &self.model)
+        let stream_idle_timeout = stream_idle_timeout_for_turn(&turn);
+        let turn_state = turn.turn_state.clone();
+        let (response, baseline, model_info) = self.send_turn_request(turn)?;
+        record_turn_state_from_headers(response.headers(), turn_state.as_ref())?;
+        match parse_responses_sse(response, &self.model, stream_idle_timeout) {
+            Ok(events) => {
+                let (response_id, response_items) = previous_response_result_from_events(&events);
+                let response_items =
+                    previous_response_prefix_items_for_model(response_items, model_info);
+                update_previous_response_state(
+                    &self.previous_response_state,
+                    baseline,
+                    response_id,
+                    response_items,
+                )?;
+                Ok(events)
+            }
+            Err(error) => {
+                clear_previous_response_state(&self.previous_response_state)?;
+                Err(error)
+            }
+        }
     }
 
     fn stream_turn(
@@ -739,49 +3428,199 @@ impl ModelProvider for CodexResponsesProvider {
         turn: ProviderTurn,
         on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
     ) -> Result<()> {
-        parse_codex_sse_stream(self.send_turn_request(turn)?, &self.model, on_event)
+        let stream_idle_timeout = stream_idle_timeout_for_turn(&turn);
+        let turn_state = turn.turn_state.clone();
+        let (response, baseline, model_info) = self.send_turn_request(turn)?;
+        record_turn_state_from_headers(response.headers(), turn_state.as_ref())?;
+        let mut response_items = Vec::new();
+        let mut response_id = None;
+        let result =
+            parse_responses_sse_stream(response, &self.model, stream_idle_timeout, &mut |event| {
+                match &event {
+                    ModelEvent::ResponseOutputItem { item } => response_items.push(item.clone()),
+                    ModelEvent::ResponseCompleted {
+                        response_id: completed_response_id,
+                        ..
+                    } => {
+                        if let Some(completed_response_id) =
+                            completed_response_id.as_deref().filter(|id| !id.is_empty())
+                        {
+                            response_id = Some(completed_response_id.to_string());
+                        }
+                    }
+                    _ => {}
+                }
+                on_event(event)
+            });
+        match result {
+            Ok(()) => {
+                let response_items =
+                    previous_response_prefix_items_for_model(response_items, model_info);
+                update_previous_response_state(
+                    &self.previous_response_state,
+                    baseline,
+                    response_id,
+                    response_items,
+                )
+            }
+            Err(error) => {
+                clear_previous_response_state(&self.previous_response_state)?;
+                Err(error)
+            }
+        }
     }
 }
 
 impl CodexResponsesProvider {
-    fn send_turn_request(&self, turn: ProviderTurn) -> Result<reqwest::blocking::Response> {
-        let input = messages_to_responses_input(&turn.messages)?;
+    fn current_auth(&self) -> Result<CodexAuth> {
+        self.auth
+            .lock()
+            .map_err(|_| anyhow!("Codex auth cache is poisoned"))
+            .map(|guard| guard.clone())
+    }
+
+    fn replace_auth(&self, auth: CodexAuth) -> Result<()> {
+        *self
+            .auth
+            .lock()
+            .map_err(|_| anyhow!("Codex auth cache is poisoned"))? = auth;
+        Ok(())
+    }
+
+    fn send_turn_request(
+        &self,
+        turn: ProviderTurn,
+    ) -> Result<(
+        reqwest::blocking::Response,
+        ResponsesRequestBaseline,
+        ModelRequestInfo,
+    )> {
+        let request_retry = self.request_retry.for_turn(&turn);
+        let extra_headers =
+            extra_headers_with_turn_state(turn.extra_headers.clone(), turn.turn_state.as_ref())?;
+        let instructions = turn.instructions_or_default(&self.instructions).to_string();
+        let model_info = model_request_info_for_turn(&self.model, &turn);
+        let input = messages_to_responses_input_for_model(&turn.messages, &model_info)?;
         let tools = tool_specs_to_responses_tools(&turn.tools);
         let mut body = json!({
             "model": self.model,
             "input": input,
-            "instructions": self.instructions,
+            "instructions": instructions,
             "store": false,
             "stream": true,
-            "text": { "verbosity": "low" },
             "tool_choice": "auto",
-            "parallel_tool_calls": true,
+            "include": [],
+            "parallel_tool_calls": model_info.supports_parallel_tool_calls,
         });
-        apply_reasoning_summary_request(&mut body);
+        apply_model_request_settings(
+            &mut body,
+            &turn.model_settings,
+            &model_info,
+            turn.output_schema.as_ref(),
+            turn.output_schema_strict,
+        );
+        if let Some(prompt_cache_key) = turn
+            .prompt_cache_key
+            .as_deref()
+            .filter(|key| !key.is_empty())
+        {
+            body["prompt_cache_key"] = Value::String(prompt_cache_key.to_string());
+        }
+        if let Some(client_metadata) = non_empty_client_metadata(turn.client_metadata) {
+            body["client_metadata"] = Value::Object(client_metadata);
+        }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
         }
+        let baseline = prepare_previous_response_request_body(
+            &mut body,
+            &self.previous_response_state,
+            turn.previous_response_id.as_deref(),
+            /*auto_previous_response_reuse*/ false,
+        )?;
 
-        let response = self
-            .client
-            .post(codex_responses_url(&self.base_url))
-            .bearer_auth(&self.auth.access_token)
-            .header("chatgpt-account-id", &self.auth.account_id)
-            .header("originator", "browser-use-terminal")
-            .header("OpenAI-Beta", "responses=experimental")
-            .header("Accept", "text/event-stream")
-            .json(&body)
-            .send()
-            .context("send Codex Responses request")?;
+        let expected_account_id = self.current_auth()?.account_id;
+        let mut response = self.send_codex_request(&body, extra_headers.as_ref(), request_retry)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(managed_auth) = self.managed_auth.as_ref() {
+                drop(response);
+                match managed_auth.reload_if_account_id_matches(&expected_account_id) {
+                    Ok(_) => {
+                        self.replace_auth(managed_auth.current_auth()?)?;
+                        response =
+                            self.send_codex_request(&body, extra_headers.as_ref(), request_retry)?;
+                    }
+                    Err(error) => {
+                        clear_previous_response_state(&self.previous_response_state)?;
+                        return Err(ProviderError::non_retryable(
+                            ProviderErrorKind::Unauthorized,
+                            format!("reload Codex auth after 401: {error:#}"),
+                        )
+                        .into());
+                    }
+                }
+                if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+                    drop(response);
+                    match managed_auth.refresh_from_authority() {
+                        Ok(snapshot) => {
+                            self.replace_auth(snapshot.current_auth())?;
+                            response = self.send_codex_request(
+                                &body,
+                                extra_headers.as_ref(),
+                                request_retry,
+                            )?;
+                        }
+                        Err(error) => {
+                            clear_previous_response_state(&self.previous_response_state)?;
+                            return Err(ProviderError::non_retryable(
+                                ProviderErrorKind::Unauthorized,
+                                format!("refresh Codex auth after 401: {error:#}"),
+                            )
+                            .into());
+                        }
+                    }
+                }
+            }
+        }
         let status = response.status();
         if !status.is_success() {
+            let headers = response.headers().clone();
             let body = response.text().unwrap_or_default();
-            bail!(
-                "Codex Responses request failed ({status}): {}",
-                body.chars().take(1000).collect::<String>()
-            );
+            clear_previous_response_state(&self.previous_response_state)?;
+            return Err(provider_http_status_error(
+                "Codex Responses",
+                status,
+                &body,
+                Some(&headers),
+            )
+            .into());
         }
-        Ok(response)
+        Ok((response, baseline, model_info))
+    }
+
+    fn send_codex_request(
+        &self,
+        body: &Value,
+        extra_headers: Option<&HashMap<String, String>>,
+        request_retry: ProviderRequestRetryConfig,
+    ) -> Result<reqwest::blocking::Response> {
+        let auth = self.current_auth()?;
+        match send_provider_request("send Codex Responses request", request_retry, || {
+            let request = self
+                .client
+                .post(codex_responses_url(&self.base_url))
+                .bearer_auth(&auth.access_token)
+                .header("chatgpt-account-id", &auth.account_id)
+                .header("originator", "browser-use-terminal")
+                .header("Accept", "text/event-stream");
+            apply_extra_headers(request, extra_headers).json(body)
+        }) {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                clear_previous_response_state(&self.previous_response_state)?;
+                Err(error.into())
+            }
+        }
     }
 }
 
@@ -796,40 +3635,299 @@ fn codex_responses_url(base_url: &str) -> String {
     }
 }
 
-fn apply_reasoning_summary_request(body: &mut Value) {
-    let Some(summary) = reasoning_summary_setting() else {
-        return;
-    };
-    body["reasoning"] = json!({ "summary": summary });
+fn is_azure_responses_base_url(base_url: &str) -> bool {
+    let base_url = base_url.to_ascii_lowercase();
+    const AZURE_MARKERS: [&str; 6] = [
+        "openai.azure.",
+        "cognitiveservices.azure.",
+        "aoai.azure.",
+        "azure-api.",
+        "azurefd.",
+        "windows.net/openai",
+    ];
+    AZURE_MARKERS.iter().any(|marker| base_url.contains(marker))
 }
 
-fn reasoning_summary_setting() -> Option<String> {
-    match std::env::var("LLM_BROWSER_REASONING_SUMMARY") {
-        Ok(raw) => {
-            let value = raw.trim();
-            if value.is_empty()
-                || matches!(
-                    value.to_ascii_lowercase().as_str(),
-                    "0" | "false" | "off" | "none" | "no"
-                )
-            {
-                None
-            } else {
-                Some(value.to_string())
-            }
+fn non_empty_client_metadata(
+    client_metadata: Option<HashMap<String, String>>,
+) -> Option<serde_json::Map<String, Value>> {
+    let metadata = client_metadata?;
+    let mut out = serde_json::Map::new();
+    for (key, value) in metadata {
+        if !key.is_empty() && !value.is_empty() {
+            out.insert(key, Value::String(value));
         }
-        Err(_) => Some("auto".to_string()),
     }
+    (!out.is_empty()).then_some(out)
+}
+
+fn apply_extra_headers(
+    mut request: reqwest::blocking::RequestBuilder,
+    extra_headers: Option<&HashMap<String, String>>,
+) -> reqwest::blocking::RequestBuilder {
+    let Some(extra_headers) = extra_headers else {
+        return request;
+    };
+    let mut headers = extra_headers.iter().collect::<Vec<_>>();
+    headers.sort_by(|(left, _), (right, _)| left.cmp(right));
+    for (name, value) in headers {
+        if name.is_empty() || value.is_empty() {
+            continue;
+        }
+        let Ok(name) = reqwest::header::HeaderName::from_bytes(name.as_bytes()) else {
+            continue;
+        };
+        let Ok(value) = reqwest::header::HeaderValue::from_str(value) else {
+            continue;
+        };
+        request = request.header(name, value);
+    }
+    request
+}
+
+fn apply_query_params(
+    request: reqwest::blocking::RequestBuilder,
+    query_params: &[(String, String)],
+) -> reqwest::blocking::RequestBuilder {
+    if query_params.is_empty() {
+        request
+    } else {
+        request.query(query_params)
+    }
+}
+
+fn extra_headers_with_turn_state(
+    mut extra_headers: Option<HashMap<String, String>>,
+    turn_state: Option<&Arc<Mutex<Option<String>>>>,
+) -> Result<Option<HashMap<String, String>>> {
+    let Some(turn_state) = turn_state else {
+        return Ok(extra_headers);
+    };
+    let state = turn_state
+        .lock()
+        .map_err(|_| anyhow!("turn state lock poisoned"))?
+        .clone();
+    let Some(state) = state.filter(|state| !state.is_empty()) else {
+        return Ok(extra_headers);
+    };
+    extra_headers
+        .get_or_insert_with(HashMap::new)
+        .entry(X_CODEX_TURN_STATE_HEADER.to_string())
+        .or_insert(state);
+    Ok(extra_headers)
+}
+
+fn record_turn_state_from_headers(
+    headers: &reqwest::header::HeaderMap,
+    turn_state: Option<&Arc<Mutex<Option<String>>>>,
+) -> Result<()> {
+    let Some(turn_state) = turn_state else {
+        return Ok(());
+    };
+    let Some(header_value) = headers
+        .get(X_CODEX_TURN_STATE_HEADER)
+        .and_then(|value| value.to_str().ok())
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let mut guard = turn_state
+        .lock()
+        .map_err(|_| anyhow!("turn state lock poisoned"))?;
+    if guard.is_none() {
+        *guard = Some(header_value.to_string());
+    }
+    Ok(())
+}
+
+fn apply_model_request_settings(
+    body: &mut Value,
+    settings: &ModelRequestSettings,
+    model_info: &ModelRequestInfo,
+    output_schema: Option<&Value>,
+    output_schema_strict: bool,
+) {
+    apply_reasoning_request(body, settings, model_info);
+    apply_service_tier_request(body, settings, model_info);
+    apply_text_format(body, output_schema, output_schema_strict);
+    if model_info.support_verbosity {
+        apply_text_verbosity(
+            body,
+            settings
+                .text_verbosity
+                .as_deref()
+                .or(model_info.default_verbosity.as_deref()),
+        );
+    }
+}
+
+fn apply_reasoning_request(
+    body: &mut Value,
+    settings: &ModelRequestSettings,
+    model_info: &ModelRequestInfo,
+) {
+    let supports_reasoning_summaries = if settings.model_supports_reasoning_summaries == Some(true)
+    {
+        true
+    } else {
+        model_info.supports_reasoning_summaries
+    };
+    if !supports_reasoning_summaries {
+        return;
+    }
+
+    let effort = settings
+        .reasoning_effort
+        .as_deref()
+        .or(model_info.default_reasoning_effort.as_deref());
+    let summary = settings
+        .reasoning_summary
+        .as_deref()
+        .unwrap_or(model_info.default_reasoning_summary.as_str());
+    let mut reasoning = serde_json::Map::new();
+    if let Some(effort) = effort {
+        reasoning.insert("effort".to_string(), Value::String(effort.to_string()));
+    }
+    if summary != "none" {
+        reasoning.insert("summary".to_string(), Value::String(summary.to_string()));
+    }
+    if !reasoning.is_empty() {
+        body["reasoning"] = Value::Object(reasoning);
+        body["include"] = json!(["reasoning.encrypted_content"]);
+    }
+}
+
+fn apply_service_tier_request(
+    body: &mut Value,
+    settings: &ModelRequestSettings,
+    model_info: &ModelRequestInfo,
+) {
+    if let Some(service_tier) = service_tier_for_model(settings.service_tier.as_deref(), model_info)
+    {
+        body["service_tier"] = Value::String(service_tier);
+    }
+}
+
+fn reasoning_effort_for_model_switch(
+    current_effort: Option<&str>,
+    model_info: &ModelRequestInfo,
+) -> Option<String> {
+    if let Some(current_effort) = current_effort {
+        if model_info
+            .supported_reasoning_efforts
+            .iter()
+            .any(|effort| effort == current_effort)
+        {
+            return Some(current_effort.to_string());
+        }
+    }
+    model_info
+        .supported_reasoning_efforts
+        .get(
+            model_info
+                .supported_reasoning_efforts
+                .len()
+                .saturating_sub(1)
+                / 2,
+        )
+        .map(String::as_str)
+        .or(model_info.default_reasoning_effort.as_deref())
+        .map(ToString::to_string)
+}
+
+fn service_tier_for_model(
+    service_tier: Option<&str>,
+    model_info: &ModelRequestInfo,
+) -> Option<String> {
+    service_tier
+        .filter(|service_tier| *service_tier != "default")
+        .filter(|service_tier| {
+            model_info
+                .supported_service_tiers
+                .iter()
+                .any(|supported| supported == service_tier)
+        })
+        .map(ToString::to_string)
+}
+
+fn apply_text_verbosity(body: &mut Value, verbosity: Option<&str>) {
+    let Some(verbosity) = verbosity else {
+        return;
+    };
+    if !body.get("text").is_some_and(Value::is_object) {
+        body["text"] = json!({});
+    }
+    body["text"]["verbosity"] = Value::String(verbosity.to_string());
+}
+
+fn apply_text_format(body: &mut Value, output_schema: Option<&Value>, strict: bool) {
+    let Some(schema) = output_schema else {
+        return;
+    };
+    if !body.get("text").is_some_and(Value::is_object) {
+        body["text"] = json!({});
+    }
+    body["text"]["format"] = json!({
+        "type": "json_schema",
+        "strict": strict,
+        "schema": schema,
+        "name": "codex_output_schema",
+    });
+}
+
+fn model_request_info(model: &str) -> ModelRequestInfo {
+    model_request_info_for_catalog(model, None)
+}
+
+fn model_request_info_for_turn(model: &str, turn: &ProviderTurn) -> ModelRequestInfo {
+    turn.model_request_info
+        .clone()
+        .unwrap_or_else(|| model_request_info(model))
+}
+
+pub fn model_request_info_for_catalog(
+    model: &str,
+    catalog: Option<&ModelCatalog>,
+) -> ModelRequestInfo {
+    if let Some(catalog) = catalog {
+        return catalog.request_info_for_model(model);
+    }
+    codex_bundled_model_catalog().request_info_for_model(model)
+}
+
+fn catalog_entry_by_namespaced_suffix<'a>(
+    model: &str,
+    entries: &'a [ModelCatalogEntryInfo],
+) -> Option<&'a ModelCatalogEntryInfo> {
+    let (namespace, suffix) = model.split_once('/')?;
+    if suffix.contains('/') {
+        return None;
+    }
+    if namespace.is_empty()
+        || !namespace
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+    {
+        return None;
+    }
+    catalog_entry_by_longest_prefix(suffix, entries)
+}
+
+fn catalog_entry_by_longest_prefix<'a>(
+    model: &str,
+    entries: &'a [ModelCatalogEntryInfo],
+) -> Option<&'a ModelCatalogEntryInfo> {
+    entries
+        .iter()
+        .filter(|entry| model.starts_with(&entry.slug))
+        .max_by_key(|entry| entry.slug.len())
 }
 
 pub fn load_codex_auth() -> Result<CodexAuth> {
     if let Ok(access_token) = std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN") {
         let account_id = std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID")
             .context("set LLM_BROWSER_CODEX_ACCOUNT_ID with LLM_BROWSER_CODEX_ACCESS_TOKEN")?;
-        return Ok(CodexAuth {
-            access_token,
-            account_id,
-        });
+        return Ok(CodexAuth::new(access_token, account_id));
     }
     let path = codex_auth_path().context("could not resolve Codex auth path")?;
     load_codex_auth_file(path)
@@ -848,7 +3946,21 @@ fn codex_auth_path() -> Option<PathBuf> {
 }
 
 pub fn load_codex_auth_file(path: impl AsRef<Path>) -> Result<CodexAuth> {
-    let path = path.as_ref();
+    Ok(load_codex_managed_auth_file(path)?.current_auth()?)
+}
+
+pub fn load_codex_managed_auth() -> Result<CodexManagedAuth> {
+    let path = codex_auth_path().context("could not resolve Codex auth path")?;
+    load_codex_managed_auth_file(path)
+}
+
+pub fn load_codex_managed_auth_file(path: impl AsRef<Path>) -> Result<CodexManagedAuth> {
+    Ok(CodexManagedAuth::new(
+        load_codex_managed_auth_snapshot_from_file(path.as_ref())?,
+    ))
+}
+
+fn load_codex_managed_auth_snapshot_from_file(path: &Path) -> Result<CodexManagedAuthSnapshot> {
     let raw = std::fs::read_to_string(path)
         .with_context(|| format!("read Codex auth file {}", path.display()))?;
     let file: CodexAuthFile =
@@ -872,25 +3984,179 @@ pub fn load_codex_auth_file(path: impl AsRef<Path>) -> Result<CodexAuth> {
                 .and_then(account_id_from_id_token)
         })
         .context("Codex auth missing account id")?;
-    Ok(CodexAuth {
+    Ok(CodexManagedAuthSnapshot {
         access_token,
         account_id,
+        id_token: file
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.id_token.clone()),
+        refresh_token: file
+            .tokens
+            .as_ref()
+            .and_then(|tokens| tokens.refresh_token.clone()),
+        source_path: Some(path.to_path_buf()),
+        last_refresh: file
+            .last_refresh
+            .as_deref()
+            .and_then(|value| DateTime::parse_from_rfc3339(value.trim()).ok())
+            .map(|value| value.with_timezone(&Utc)),
     })
 }
 
-#[derive(Debug, Deserialize)]
-struct CodexAuthFile {
-    tokens: Option<CodexAuthTokens>,
-    access_token: Option<String>,
-    account_id: Option<String>,
-    chatgpt_account_id: Option<String>,
+fn persist_codex_managed_auth_snapshot(
+    path: &Path,
+    snapshot: &CodexManagedAuthSnapshot,
+) -> Result<()> {
+    let raw = std::fs::read_to_string(path)
+        .with_context(|| format!("read Codex auth file {}", path.display()))?;
+    let mut file: CodexAuthFile =
+        serde_json::from_str(&raw).with_context(|| format!("parse {}", path.display()))?;
+    let tokens = file.tokens.get_or_insert_with(CodexAuthTokens::default);
+    if let Some(id_token) = snapshot.id_token.as_ref() {
+        tokens.id_token = Some(id_token.clone());
+    }
+    tokens.access_token = Some(snapshot.access_token.clone());
+    if let Some(refresh_token) = snapshot.refresh_token.as_ref() {
+        tokens.refresh_token = Some(refresh_token.clone());
+    }
+    if !snapshot.account_id.trim().is_empty() {
+        tokens.account_id = Some(snapshot.account_id.clone());
+    }
+    file.last_refresh = snapshot.last_refresh.map(|value| value.to_rfc3339());
+    let json = serde_json::to_string_pretty(&file)?;
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let mut options = OpenOptions::new();
+    options.truncate(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options.open(path)?;
+    file.write_all(json.as_bytes())?;
+    file.flush()?;
+    Ok(())
+}
+
+fn codex_managed_auth_is_stale(snapshot: &CodexManagedAuthSnapshot) -> bool {
+    if !snapshot.has_refresh_token() {
+        return false;
+    }
+    if jwt_expiration_timestamp(&snapshot.access_token)
+        .is_some_and(|expires_at| expires_at <= Utc::now().timestamp())
+    {
+        return true;
+    }
+    snapshot
+        .last_refresh
+        .is_some_and(|last_refresh| last_refresh < Utc::now() - chrono::Duration::days(8))
+}
+
+fn request_codex_token_refresh(
+    client: &reqwest::blocking::Client,
+    refresh_token: String,
+) -> Result<CodexRefreshResponse> {
+    let endpoint = std::env::var(CODEX_REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR)
+        .unwrap_or_else(|_| CODEX_REFRESH_TOKEN_URL.to_string());
+    let response = client
+        .post(endpoint)
+        .header("Content-Type", "application/json")
+        .json(&CodexRefreshRequest {
+            client_id: CODEX_OAUTH_CLIENT_ID,
+            grant_type: "refresh_token",
+            refresh_token,
+        })
+        .send()
+        .context("send Codex OAuth refresh request")?;
+    let status = response.status();
+    let body = response.text().unwrap_or_default();
+    if status.is_success() {
+        return serde_json::from_str(&body).context("parse Codex OAuth refresh response");
+    }
+    if status == reqwest::StatusCode::UNAUTHORIZED {
+        bail!(
+            "Codex OAuth refresh token rejected: {}",
+            codex_refresh_failure_message(&body)
+        );
+    }
+    bail!("Codex OAuth refresh failed ({status}): {body}");
+}
+
+fn codex_refresh_failure_message(body: &str) -> String {
+    let code = extract_codex_refresh_error_code(body)
+        .unwrap_or_else(|| "unknown_refresh_error".to_string())
+        .to_ascii_lowercase();
+    match code.as_str() {
+        "refresh_token_expired" => "refresh token expired".to_string(),
+        "refresh_token_reused" => "refresh token was already used".to_string(),
+        "refresh_token_invalidated" => "refresh token was revoked".to_string(),
+        _ => format!("unrecognized refresh error `{code}`"),
+    }
+}
+
+fn extract_codex_refresh_error_code(body: &str) -> Option<String> {
+    let Value::Object(map) = serde_json::from_str::<Value>(body).ok()? else {
+        return None;
+    };
+    if let Some(error) = map.get("error") {
+        match error {
+            Value::Object(object) => {
+                if let Some(code) = object.get("code").and_then(Value::as_str) {
+                    return Some(code.to_string());
+                }
+            }
+            Value::String(code) => return Some(code.to_string()),
+            _ => {}
+        }
+    }
+    map.get("code")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned)
+}
+
+#[derive(Serialize)]
+struct CodexRefreshRequest {
+    client_id: &'static str,
+    grant_type: &'static str,
+    refresh_token: String,
 }
 
 #[derive(Debug, Deserialize)]
+struct CodexRefreshResponse {
+    id_token: Option<String>,
+    access_token: Option<String>,
+    refresh_token: Option<String>,
+}
+
+#[derive(Debug, Deserialize, Serialize)]
+struct CodexAuthFile {
+    tokens: Option<CodexAuthTokens>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    auth_mode: Option<String>,
+    #[serde(
+        rename = "OPENAI_API_KEY",
+        default,
+        skip_serializing_if = "Option::is_none"
+    )]
+    openai_api_key: Option<String>,
+    access_token: Option<String>,
+    account_id: Option<String>,
+    chatgpt_account_id: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    last_refresh: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    agent_identity: Option<String>,
+}
+
+#[derive(Default, Debug, Deserialize, Serialize)]
 struct CodexAuthTokens {
     access_token: Option<String>,
     account_id: Option<String>,
     id_token: Option<String>,
+    refresh_token: Option<String>,
 }
 
 fn account_id_from_id_token(id_token: &str) -> Option<String> {
@@ -904,29 +4170,79 @@ fn account_id_from_id_token(id_token: &str) -> Option<String> {
         .map(ToOwned::to_owned)
 }
 
-fn parse_codex_sse(response: reqwest::blocking::Response, model: &str) -> Result<Vec<ModelEvent>> {
+fn jwt_expiration_timestamp(jwt: &str) -> Option<i64> {
+    let payload = jwt.split('.').nth(1)?;
+    let decoded = general_purpose::URL_SAFE_NO_PAD.decode(payload).ok()?;
+    let value: Value = serde_json::from_slice(&decoded).ok()?;
+    value.get("exp").and_then(Value::as_i64)
+}
+
+fn parse_responses_sse(
+    response: reqwest::blocking::Response,
+    model: &str,
+    stream_idle_timeout: Duration,
+) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
-    parse_codex_sse_stream(response, model, &mut |event| {
+    parse_responses_sse_stream(response, model, stream_idle_timeout, &mut |event| {
         events.push(event);
         Ok(())
     })?;
     Ok(events)
 }
 
-fn parse_codex_sse_stream(
+fn parse_responses_sse_stream(
     response: reqwest::blocking::Response,
     model: &str,
+    stream_idle_timeout: Duration,
     on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
 ) -> Result<()> {
+    let mut stream_state = CodexSseStreamState::default();
+    emit_responses_header_events(response.headers(), &mut stream_state, on_event)?;
+    let is_event_stream = response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| content_type.contains("text/event-stream"));
+    if !is_event_stream {
+        let body_text = response.text().context("read Responses JSON body")?;
+        let body: Value = serde_json::from_str(&body_text).map_err(|error| {
+            ProviderError::retryable(format!("parse Responses JSON: {error}"), None)
+        })?;
+        for event in parse_responses_output(&body, model)? {
+            on_event(event)?;
+        }
+        return Ok(());
+    }
+
     let mut data_lines = Vec::new();
-    let mut seen_tool_calls = std::collections::HashSet::new();
     let mut emitted_done = false;
-    for line in BufReader::new(response).lines() {
-        let line = line.context("read Codex SSE line")?;
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(response).lines() {
+            if line_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    loop {
+        let line = match line_rx.recv_timeout(stream_idle_timeout) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(ProviderError::stream("idle timeout waiting for SSE").into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let line = match line {
+            Ok(line) => line,
+            Err(error) if is_sse_idle_timeout_error(&error) => {
+                return Err(ProviderError::stream("idle timeout waiting for SSE").into());
+            }
+            Err(error) => return Err(error).context("read Codex SSE line"),
+        };
         if line.is_empty() {
             flush_sse_event(
                 &mut data_lines,
-                &mut seen_tool_calls,
+                &mut stream_state,
                 model,
                 on_event,
                 &mut emitted_done,
@@ -937,20 +4253,132 @@ fn parse_codex_sse_stream(
     }
     flush_sse_event(
         &mut data_lines,
-        &mut seen_tool_calls,
+        &mut stream_state,
         model,
         on_event,
         &mut emitted_done,
     )?;
     if !emitted_done {
-        emit_codex_model_event(ModelEvent::Done, on_event, &mut emitted_done)?;
+        return Err(ProviderError::stream("stream closed before response.completed").into());
     }
     Ok(())
 }
 
+fn stream_idle_timeout_for_turn(turn: &ProviderTurn) -> Duration {
+    Duration::from_millis(
+        turn.stream_idle_timeout_ms
+            .unwrap_or(DEFAULT_STREAM_IDLE_TIMEOUT_MS),
+    )
+}
+
+fn is_sse_idle_timeout_error(error: &std::io::Error) -> bool {
+    if error.kind() == std::io::ErrorKind::TimedOut {
+        return true;
+    }
+    let message = error.to_string().to_ascii_lowercase();
+    message.contains("timed out") || message.contains("operation timed out")
+}
+
+fn emit_responses_header_events(
+    headers: &reqwest::header::HeaderMap,
+    stream_state: &mut CodexSseStreamState,
+    on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+) -> Result<()> {
+    if let Some(model) = parse_header_str(headers, "openai-model") {
+        emit_server_model(model, stream_state, on_event)?;
+    }
+    for snapshot in parse_all_rate_limits(headers) {
+        on_event(ModelEvent::ModelRateLimits { snapshot })?;
+    }
+    if let Some(etag) = parse_header_str(headers, "x-models-etag") {
+        on_event(ModelEvent::ModelsEtag { etag })?;
+    }
+    if headers.get("x-reasoning-included").is_some() {
+        on_event(ModelEvent::ServerReasoningIncluded { included: true })?;
+    }
+    Ok(())
+}
+
+fn emit_server_model(
+    model: String,
+    stream_state: &mut CodexSseStreamState,
+    on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+) -> Result<()> {
+    if stream_state.last_server_model.as_deref() != Some(model.as_str()) {
+        stream_state.last_server_model = Some(model.clone());
+        on_event(ModelEvent::ServerModel { model })?;
+    }
+    Ok(())
+}
+
+fn response_model_from_event(event: &Value) -> Option<String> {
+    event
+        .get("response")
+        .and_then(|response| response.get("headers"))
+        .and_then(header_openai_model_value_from_json)
+        .or_else(|| {
+            event
+                .get("headers")
+                .and_then(header_openai_model_value_from_json)
+        })
+}
+
+fn header_openai_model_value_from_json(value: &Value) -> Option<String> {
+    let headers = value.as_object()?;
+    headers.iter().find_map(|(name, value)| {
+        if name.eq_ignore_ascii_case("openai-model") || name.eq_ignore_ascii_case("x-openai-model")
+        {
+            json_value_as_string(value)
+        } else {
+            None
+        }
+    })
+}
+
+fn json_value_as_string(value: &Value) -> Option<String> {
+    match value {
+        Value::String(value) => Some(value.clone()),
+        Value::Array(values) => values.first().and_then(json_value_as_string),
+        _ => None,
+    }
+}
+
+fn model_verifications_from_event(event: &Value) -> Option<Vec<ModelVerification>> {
+    if event.get("type").and_then(Value::as_str) != Some("response.metadata") {
+        return None;
+    }
+    let recommendations = event
+        .get("metadata")
+        .and_then(|metadata| metadata.get("openai_verification_recommendation"))?;
+    let verifications = recommendations
+        .as_array()
+        .map(|items| {
+            let mut verifications = Vec::new();
+            for verification in items
+                .iter()
+                .filter_map(Value::as_str)
+                .filter_map(parse_model_verification)
+            {
+                if !verifications.contains(&verification) {
+                    verifications.push(verification);
+                }
+            }
+            verifications
+        })
+        .unwrap_or_default();
+    (!verifications.is_empty()).then_some(verifications)
+}
+
+fn parse_model_verification(value: &str) -> Option<ModelVerification> {
+    match value {
+        "trusted_access_for_cyber" => Some(ModelVerification::TrustedAccessForCyber),
+        _ => None,
+    }
+}
+
 fn flush_sse_event(
     data_lines: &mut Vec<String>,
-    seen_tool_calls: &mut std::collections::HashSet<String>,
+    stream_state: &mut CodexSseStreamState,
     model: &str,
     on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
     emitted_done: &mut bool,
@@ -963,7 +4391,20 @@ fn flush_sse_event(
     if data.trim().is_empty() || data.trim() == "[DONE]" {
         return Ok(());
     }
-    let event: Value = serde_json::from_str(&data).context("parse Codex SSE JSON")?;
+    let event: Value = match serde_json::from_str(&data) {
+        Ok(event) => event,
+        Err(_) => return Ok(()),
+    };
+    if let Some(model) = response_model_from_event(&event) {
+        emit_server_model(model, stream_state, on_event)?;
+    }
+    if let Some(verifications) = model_verifications_from_event(&event) {
+        emit_codex_model_event(
+            ModelEvent::ModelVerifications { verifications },
+            on_event,
+            emitted_done,
+        )?;
+    }
     match event.get("type").and_then(Value::as_str) {
         Some("response.output_text.delta") => {
             if let Some(delta) = event.get("delta").and_then(Value::as_str) {
@@ -991,26 +4432,60 @@ fn flush_sse_event(
         Some("response.output_item.done") => {
             if let Some(item) = event.get("item") {
                 let mut item_events = Vec::new();
-                maybe_push_codex_output_item(item, seen_tool_calls, &mut item_events)?;
+                maybe_push_codex_output_item(item, stream_state, &mut item_events)?;
                 for item_event in item_events {
                     emit_codex_model_event(item_event, on_event, emitted_done)?;
                 }
             }
         }
-        Some("response.completed") | Some("response.done") | Some("response.incomplete") => {
+        Some("response.created")
+        | Some("response.output_item.added")
+        | Some("response.custom_tool_call_input.delta")
+        | Some("response.reasoning_summary_part.added")
+        | Some("response.metadata") => {}
+        Some("response.reasoning_text.delta") => {
+            if let Some(delta) = event.get("delta").and_then(Value::as_str) {
+                emit_codex_model_event(
+                    ModelEvent::ThinkingDelta {
+                        text: delta.to_string(),
+                        label: Some("reasoning".to_string()),
+                    },
+                    on_event,
+                    emitted_done,
+                )?;
+            }
+        }
+        Some("response.failed") => return Err(response_failed_error(&event).into()),
+        Some("response.incomplete") => {
+            let reason = event
+                .get("response")
+                .and_then(|response| response.get("incomplete_details"))
+                .and_then(|details| details.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("unknown");
+            bail!("Incomplete response returned, reason: {reason}");
+        }
+        Some("response.completed") => {
             if let Some(response) = event.get("response") {
                 if let Some(items) = response.get("output").and_then(Value::as_array) {
                     for item in items {
                         let mut item_events = Vec::new();
-                        maybe_push_codex_output_item(item, seen_tool_calls, &mut item_events)?;
+                        maybe_push_codex_output_item(item, stream_state, &mut item_events)?;
                         for item_event in item_events {
                             emit_codex_model_event(item_event, on_event, emitted_done)?;
                         }
                     }
                 }
+                emit_codex_model_event(
+                    response_completed_event(response)?,
+                    on_event,
+                    emitted_done,
+                )?;
                 if let Some(usage) = parse_usage(response.get("usage"), model) {
                     emit_codex_model_event(ModelEvent::Usage { usage }, on_event, emitted_done)?;
                 }
+            } else {
+                bail!("response.completed missing response");
             }
             emit_codex_model_event(ModelEvent::Done, on_event, emitted_done)?;
         }
@@ -1031,19 +4506,146 @@ fn emit_codex_model_event(
     on_event(event)
 }
 
+fn response_failed_error_message(event: &Value) -> String {
+    let error = event
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| event.get("error"));
+    let message = error
+        .and_then(|error| error.get("message"))
+        .and_then(Value::as_str)
+        .filter(|message| !message.trim().is_empty());
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .filter(|code| !code.trim().is_empty());
+
+    match (code, message) {
+        (Some(code), Some(message)) => format!("response.failed ({code}): {message}"),
+        (None, Some(message)) => format!("response.failed: {message}"),
+        (Some(code), None) => format!("response.failed ({code})"),
+        (None, None) => "response.failed event received".to_string(),
+    }
+}
+
+fn response_failed_error(event: &Value) -> ProviderError {
+    let message = response_failed_error_message(event);
+    let error = event
+        .get("response")
+        .and_then(|response| response.get("error"))
+        .or_else(|| event.get("error"));
+    let code = error
+        .and_then(|error| error.get("code"))
+        .and_then(Value::as_str)
+        .filter(|code| !code.trim().is_empty());
+    match code {
+        Some("context_length_exceeded") => {
+            ProviderError::non_retryable(ProviderErrorKind::ContextWindowExceeded, message)
+        }
+        Some("insufficient_quota") => {
+            ProviderError::non_retryable(ProviderErrorKind::QuotaExceeded, message)
+        }
+        Some("usage_not_included") => {
+            ProviderError::non_retryable(ProviderErrorKind::UsageNotIncluded, message)
+        }
+        Some("invalid_prompt") => {
+            ProviderError::non_retryable(ProviderErrorKind::InvalidRequest, message)
+        }
+        Some("cyber_policy") => {
+            ProviderError::non_retryable(ProviderErrorKind::CyberPolicy, message)
+        }
+        Some("server_is_overloaded") | Some("slow_down") => {
+            ProviderError::non_retryable(ProviderErrorKind::ServerOverloaded, message)
+        }
+        Some("rate_limit_exceeded") => {
+            let retry_delay = error.and_then(try_parse_retry_after);
+            ProviderError::retryable(message, retry_delay)
+        }
+        Some(_) => ProviderError::retryable(message, None),
+        None => ProviderError::stream(message),
+    }
+}
+
+fn response_completed_event(response: &Value) -> Result<ModelEvent> {
+    let response_id = response
+        .get("id")
+        .and_then(Value::as_str)
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| anyhow!("failed to parse ResponseCompleted: missing field `id`"))?;
+    Ok(ModelEvent::ResponseCompleted {
+        response_id: Some(response_id.to_string()),
+        end_turn: response.get("end_turn").and_then(Value::as_bool),
+    })
+}
+
+fn try_parse_retry_after(error: &Value) -> Option<Duration> {
+    if error.get("code").and_then(Value::as_str) != Some("rate_limit_exceeded") {
+        return None;
+    }
+    let message = error.get("message").and_then(Value::as_str)?;
+    let lower = message.to_ascii_lowercase();
+    let marker = "try again in ";
+    let start = lower.find(marker)? + marker.len();
+    let remainder = &message[start..];
+    let mut chars = remainder.char_indices().peekable();
+    let mut end = 0;
+    let mut saw_digit = false;
+    while let Some((idx, ch)) = chars.peek().copied() {
+        if ch.is_ascii_digit() || ch == '.' {
+            saw_digit |= ch.is_ascii_digit();
+            end = idx + ch.len_utf8();
+            chars.next();
+        } else {
+            break;
+        }
+    }
+    if !saw_digit {
+        return None;
+    }
+    let value = remainder[..end].parse::<f64>().ok()?;
+    let unit_start = end;
+    let unit_remainder = remainder[unit_start..].trim_start();
+    let unit: String = unit_remainder
+        .chars()
+        .take_while(|ch| ch.is_ascii_alphabetic())
+        .collect::<String>()
+        .to_ascii_lowercase();
+    if unit == "ms" {
+        Some(Duration::from_millis(value as u64))
+    } else if unit == "s" || unit.starts_with("second") {
+        Some(Duration::from_secs_f64(value))
+    } else {
+        None
+    }
+}
+
+#[derive(Default)]
+struct CodexSseStreamState {
+    seen_tool_calls: HashSet<String>,
+    seen_output_items: HashSet<String>,
+    last_server_model: Option<String>,
+}
+
 fn maybe_push_codex_output_item(
     item: &Value,
-    seen_tool_calls: &mut std::collections::HashSet<String>,
+    stream_state: &mut CodexSseStreamState,
     events: &mut Vec<ModelEvent>,
 ) -> Result<()> {
-    if item.get("type").and_then(Value::as_str) == Some("function_call") {
+    let output_item_key = response_output_item_key(item);
+    if stream_state.seen_output_items.insert(output_item_key) {
+        events.push(ModelEvent::ResponseOutputItem { item: item.clone() });
+    }
+    if matches!(
+        item.get("type").and_then(Value::as_str),
+        Some("function_call") | Some("custom_tool_call")
+    ) {
         let call_id = item
             .get("call_id")
             .or_else(|| item.get("id"))
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        if seen_tool_calls.insert(call_id) {
+        if stream_state.seen_tool_calls.insert(call_id) {
             parse_response_output_item(item, events)?;
         }
     } else {
@@ -1052,10 +4654,45 @@ fn maybe_push_codex_output_item(
     Ok(())
 }
 
-fn default_instructions() -> String {
-    let mut instructions = include_str!("../../../prompts/browser-agent-system.md")
-        .trim()
-        .to_string();
+fn response_output_item_key(item: &Value) -> String {
+    item.get("id")
+        .or_else(|| item.get("call_id"))
+        .and_then(Value::as_str)
+        .map(|id| format!("id:{id}"))
+        .unwrap_or_else(|| {
+            serde_json::to_string(item)
+                .map(|serialized| format!("value:{serialized}"))
+                .unwrap_or_else(|_| format!("ptr:{:p}", item))
+        })
+}
+
+pub fn default_agent_instructions() -> String {
+    default_agent_instructions_for_model_and_personality("gpt-5.4", ModelPersonality::Pragmatic)
+}
+
+pub fn default_agent_instructions_for_personality(personality: ModelPersonality) -> String {
+    default_agent_instructions_for_model_and_personality("gpt-5.4", personality)
+}
+
+pub fn default_agent_instructions_for_model_and_personality(
+    model: &str,
+    personality: ModelPersonality,
+) -> String {
+    default_agent_instructions_for_model_and_personality_with_catalog(model, personality, None)
+}
+
+pub fn default_agent_instructions_for_model_and_personality_with_catalog(
+    model: &str,
+    personality: ModelPersonality,
+    catalog: Option<&ModelCatalog>,
+) -> String {
+    let mut instructions = codex_model_instructions_for_model_and_personality_with_catalog(
+        model,
+        Some(personality),
+        catalog,
+    );
+    instructions.push_str("\n\n## Browser Agent Contract\n\n");
+    instructions.push_str(include_str!("../../../prompts/browser-agent-system.md").trim());
     instructions.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
     instructions.push_str(
         "\n\nThese are the same interaction-skill playbooks from browser-harness. Apply the relevant section when the page mechanic appears.",
@@ -1067,6 +4704,184 @@ fn default_instructions() -> String {
         instructions.push_str(content.trim());
     }
     instructions
+}
+
+pub fn default_personality_message_for_personality(personality: ModelPersonality) -> &'static str {
+    codex_personality_message(personality)
+}
+
+pub fn default_personality_message_for_model_and_personality(
+    model: &str,
+    personality: ModelPersonality,
+) -> Option<String> {
+    default_personality_message_for_model_and_personality_with_catalog(model, personality, None)
+}
+
+pub fn default_personality_message_for_model_and_personality_with_catalog(
+    model: &str,
+    personality: ModelPersonality,
+    catalog: Option<&ModelCatalog>,
+) -> Option<String> {
+    if let Some(catalog) = catalog {
+        if let Some(entry) = catalog.entry_for_model(model) {
+            return entry
+                .model_messages
+                .as_ref()?
+                .get_personality_message(Some(personality));
+        }
+        return fallback_model_messages_for_slug(model)?.get_personality_message(Some(personality));
+    }
+    if let Some(entry) = bundled_model_catalog_entry(model) {
+        return entry
+            .model_messages
+            .as_ref()?
+            .get_personality_message(Some(personality));
+    }
+    fallback_model_messages_for_slug(model)?.get_personality_message(Some(personality))
+}
+
+fn codex_model_instructions_for_model_and_personality_with_catalog(
+    model: &str,
+    personality: Option<ModelPersonality>,
+    catalog: Option<&ModelCatalog>,
+) -> String {
+    if let Some(catalog) = catalog {
+        if let Some(entry) = catalog.entry_for_model(model) {
+            return entry.get_model_instructions(personality);
+        }
+        return fallback_model_instructions_for_model_and_personality(model, personality);
+    }
+    if let Some(entry) = bundled_model_catalog_entry(model) {
+        return entry.get_model_instructions(personality);
+    }
+    fallback_model_instructions_for_model_and_personality(model, personality)
+}
+
+fn fallback_model_instructions_for_model_and_personality(
+    model: &str,
+    personality: Option<ModelPersonality>,
+) -> String {
+    fallback_model_messages_for_slug(model)
+        .map(|messages| {
+            messages.get_model_instructions(personality, CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS)
+        })
+        .unwrap_or_else(|| CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS.to_string())
+}
+
+fn fallback_model_messages_for_slug(slug: &str) -> Option<LocalModelMessages> {
+    match slug {
+        "gpt-5.2-codex" | "exp-codex-personality" => Some(LOCAL_PERSONALITY_MODEL_MESSAGES),
+        _ => None,
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalModelMessages {
+    instructions_template: Option<&'static str>,
+    instructions_variables: Option<LocalModelInstructionsVariables>,
+}
+
+impl LocalModelMessages {
+    fn supports_personality(self) -> bool {
+        self.has_personality_placeholder()
+            && self
+                .instructions_variables
+                .is_some_and(LocalModelInstructionsVariables::is_complete)
+    }
+
+    fn has_personality_placeholder(self) -> bool {
+        self.instructions_template
+            .is_some_and(|template| template.contains(PERSONALITY_PLACEHOLDER))
+    }
+
+    fn get_personality_message(self, personality: Option<ModelPersonality>) -> Option<String> {
+        self.instructions_variables
+            .and_then(|variables| variables.get_personality_message(personality))
+            .map(ToString::to_string)
+    }
+
+    fn get_model_instructions(
+        self,
+        personality: Option<ModelPersonality>,
+        base_instructions: &str,
+    ) -> String {
+        if let Some(template) = self.instructions_template {
+            let personality_message = self
+                .get_personality_message(personality)
+                .unwrap_or_default();
+            template
+                .replace(PERSONALITY_PLACEHOLDER, personality_message.as_str())
+                .replace(BASE_INSTRUCTIONS_PLACEHOLDER, base_instructions)
+        } else {
+            base_instructions.to_string()
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct LocalModelInstructionsVariables {
+    personality_default: Option<&'static str>,
+    personality_friendly: Option<&'static str>,
+    personality_pragmatic: Option<&'static str>,
+}
+
+impl LocalModelInstructionsVariables {
+    fn is_complete(self) -> bool {
+        self.personality_default.is_some()
+            && self.personality_friendly.is_some()
+            && self.personality_pragmatic.is_some()
+    }
+
+    fn get_personality_message(
+        self,
+        personality: Option<ModelPersonality>,
+    ) -> Option<&'static str> {
+        match personality {
+            Some(ModelPersonality::None) => Some(""),
+            Some(ModelPersonality::Friendly) => self.personality_friendly,
+            Some(ModelPersonality::Pragmatic) => self.personality_pragmatic,
+            None => self.personality_default,
+        }
+    }
+}
+
+const PERSONALITY_PLACEHOLDER: &str = "{{ personality }}";
+const BASE_INSTRUCTIONS_PLACEHOLDER: &str = "{{ base_instructions }}";
+const LOCAL_MODEL_MESSAGES_TEMPLATE: &str = concat!(
+    "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace and collaborate to achieve the user's goals.\n\n",
+    "{{ personality }}\n\n",
+    "{{ base_instructions }}"
+);
+const LOCAL_PERSONALITY_MODEL_MESSAGES: LocalModelMessages = LocalModelMessages {
+    instructions_template: Some(LOCAL_MODEL_MESSAGES_TEMPLATE),
+    instructions_variables: Some(LocalModelInstructionsVariables {
+        personality_default: Some(""),
+        personality_friendly: Some(CODEX_FRIENDLY_PERSONALITY_MESSAGE),
+        personality_pragmatic: Some(CODEX_PRAGMATIC_PERSONALITY_MESSAGE),
+    }),
+};
+
+fn codex_personality_message(personality: ModelPersonality) -> &'static str {
+    match personality {
+        ModelPersonality::None => "",
+        ModelPersonality::Friendly => CODEX_FRIENDLY_PERSONALITY_MESSAGE,
+        ModelPersonality::Pragmatic => CODEX_PRAGMATIC_PERSONALITY_MESSAGE,
+    }
+}
+
+pub fn default_permissions_instructions() -> &'static str {
+    concat!(
+        "<permissions instructions>",
+        "Filesystem sandboxing defines which files can be read or written. ",
+        "`sandbox_mode` is `danger-full-access`: No filesystem sandboxing - all commands are permitted. ",
+        "Network access is enabled.\n\n",
+        "Approval policy is currently never. Do not provide the `sandbox_permissions` for any reason, commands will be rejected.\n",
+        "</permissions instructions>"
+    )
+}
+
+fn default_instructions() -> String {
+    default_agent_instructions()
 }
 
 fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str)] {
@@ -1143,17 +4958,68 @@ fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str
 }
 
 fn tool_specs_to_responses_tools(tools: &[ToolSpec]) -> Vec<Value> {
-    tools
-        .iter()
-        .map(|tool| {
+    let mut output = Vec::new();
+    let mut namespace_indices = HashMap::<String, usize>::new();
+    for tool in tools {
+        let function_tool = if let Some(format) = &tool.freeform {
+            json!({
+                "type": "custom",
+                "name": tool.name,
+                "description": tool.description,
+                "format": {
+                    "type": format.kind,
+                    "syntax": format.syntax,
+                    "definition": format.definition,
+                },
+            })
+        } else {
             json!({
                 "type": "function",
                 "name": tool.name,
                 "description": tool.description,
+                "strict": false,
                 "parameters": tool.input_schema,
             })
-        })
-        .collect()
+        };
+        let Some(namespace) = tool.namespace.as_deref() else {
+            output.push(function_tool);
+            continue;
+        };
+        if let Some(index) = namespace_indices.get(namespace).copied() {
+            if let Some(tools) = output[index].get_mut("tools").and_then(Value::as_array_mut) {
+                tools.push(function_tool);
+            }
+            continue;
+        }
+        namespace_indices.insert(namespace.to_string(), output.len());
+        output.push(json!({
+            "type": "namespace",
+            "name": namespace,
+            "description": tool
+                .namespace_description
+                .clone()
+                .unwrap_or_else(|| format!("Tools in the {namespace} namespace.")),
+            "tools": [function_tool],
+        }));
+    }
+    for tool in &mut output {
+        if tool.get("type").and_then(Value::as_str) == Some("namespace") {
+            if let Some(tools) = tool.get_mut("tools").and_then(Value::as_array_mut) {
+                tools.sort_by(|left, right| {
+                    left.get("name")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .cmp(
+                            right
+                                .get("name")
+                                .and_then(Value::as_str)
+                                .unwrap_or_default(),
+                        )
+                });
+            }
+        }
+    }
+    output
 }
 
 fn tool_specs_to_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
@@ -1185,10 +5051,30 @@ fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Valu
         .collect()
 }
 
+const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
+    "image content omitted because you do not support image input";
+
+#[cfg(test)]
 fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
+    messages_to_responses_input_for_model(messages, &ModelRequestInfo::unknown())
+}
+
+fn messages_to_responses_input_for_model(
+    messages: &[Value],
+    model_info: &ModelRequestInfo,
+) -> Result<Vec<Value>> {
     let mut input = Vec::new();
-    let mut seen_tool_calls = HashSet::new();
+    let mut seen_tool_calls = HashMap::<String, ResponsesToolCallKind>::new();
     for message in messages {
+        if let Some(response_item) = raw_response_item_for_responses_input(message) {
+            if let Some(call_id) = response_item_call_id(&response_item) {
+                seen_tool_calls
+                    .insert(call_id.to_string(), response_tool_call_kind(&response_item));
+            }
+            input.push(response_item);
+            continue;
+        }
+
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -1199,15 +5085,14 @@ fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
                     .get("tool_call_id")
                     .and_then(Value::as_str)
                     .context("tool message missing tool_call_id")?;
-                if seen_tool_calls.contains(call_id) {
-                    input.push(json!({
-                        "type": "function_call_output",
-                        "call_id": call_id,
-                        "output": tool_output_text(message),
-                    }));
-                    if let Some(visual_context) = responses_visual_context_message(message, call_id)
-                    {
-                        input.push(visual_context);
+                if let Some(kind) = seen_tool_calls.get(call_id).copied() {
+                    input.push(tool_output_to_responses_input(message, call_id, kind));
+                    if tool_name(message) != "view_image" {
+                        if let Some(visual_context) =
+                            responses_visual_context_message(message, call_id)
+                        {
+                            input.push(visual_context);
+                        }
                     }
                 } else if let Some(orphan_context) =
                     responses_orphan_tool_context_message(message, call_id)
@@ -1244,20 +5129,306 @@ fn messages_to_responses_input(messages: &[Value]) -> Result<Vec<Value>> {
                         .into_iter()
                         .flatten()
                     {
+                        let response_item = tool_call_to_responses_input(call)?;
                         if let Some(call_id) = call
                             .get("id")
                             .or_else(|| call.get("call_id"))
                             .and_then(Value::as_str)
                         {
-                            seen_tool_calls.insert(call_id.to_string());
+                            seen_tool_calls.insert(
+                                call_id.to_string(),
+                                response_tool_call_kind(&response_item),
+                            );
                         }
-                        input.push(tool_call_to_responses_input(call)?);
+                        input.push(response_item);
                     }
                 }
             }
         }
     }
+    normalize_responses_input_items(&mut input, model_info.supports_image_input);
     Ok(input)
+}
+
+fn raw_response_item_for_responses_input(message: &Value) -> Option<Value> {
+    let item_type = message.get("type").and_then(Value::as_str)?;
+    if !response_item_type_is_responses_input_item(item_type, message) {
+        return None;
+    }
+
+    let mut item = message.clone();
+    strip_codex_skipped_response_item_fields(&mut item, item_type);
+    Some(item)
+}
+
+fn response_item_type_is_responses_input_item(item_type: &str, item: &Value) -> bool {
+    match item_type {
+        "message" => item.get("role").and_then(Value::as_str) != Some("system"),
+        "function_call_output"
+        | "function_call"
+        | "tool_search_call"
+        | "tool_search_output"
+        | "custom_tool_call"
+        | "custom_tool_call_output"
+        | "local_shell_call"
+        | "reasoning"
+        | "web_search_call"
+        | "image_generation_call"
+        | "compaction"
+        | "compaction_summary"
+        | "context_compaction" => true,
+        "compaction_trigger" | "other" => false,
+        _ => false,
+    }
+}
+
+fn strip_codex_skipped_response_item_fields(item: &mut Value, item_type: &str) {
+    if item_type != "image_generation_call" {
+        if let Some(object) = item.as_object_mut() {
+            object.remove("id");
+        }
+    }
+
+    if item_type == "reasoning"
+        && item
+            .get("content")
+            .and_then(Value::as_array)
+            .is_some_and(|content| {
+                content
+                    .iter()
+                    .any(|part| part.get("type").and_then(Value::as_str) == Some("reasoning_text"))
+            })
+    {
+        if let Some(object) = item.as_object_mut() {
+            object.remove("content");
+        }
+    }
+}
+
+fn response_item_call_id(item: &Value) -> Option<&str> {
+    match item.get("type").and_then(Value::as_str) {
+        Some("function_call")
+        | Some("custom_tool_call")
+        | Some("local_shell_call")
+        | Some("tool_search_call") => item.get("call_id").and_then(Value::as_str),
+        _ => None,
+    }
+}
+
+fn normalize_responses_input_items(items: &mut Vec<Value>, supports_image_input: bool) {
+    ensure_raw_call_outputs_present(items);
+    remove_orphan_raw_outputs(items);
+    strip_images_when_unsupported(items, supports_image_input);
+}
+
+fn ensure_raw_call_outputs_present(items: &mut Vec<Value>) {
+    let mut missing_outputs = Vec::<(usize, Value)>::new();
+    for (index, item) in items.iter().enumerate() {
+        match item.get("type").and_then(Value::as_str) {
+            Some("function_call") => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !items.iter().any(|existing| {
+                    existing.get("type").and_then(Value::as_str) == Some("function_call_output")
+                        && existing.get("call_id").and_then(Value::as_str) == Some(call_id)
+                }) {
+                    missing_outputs.push((
+                        index,
+                        json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": "aborted",
+                        }),
+                    ));
+                }
+            }
+            Some("local_shell_call") => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !items.iter().any(|existing| {
+                    existing.get("type").and_then(Value::as_str) == Some("function_call_output")
+                        && existing.get("call_id").and_then(Value::as_str) == Some(call_id)
+                }) {
+                    missing_outputs.push((
+                        index,
+                        json!({
+                            "type": "function_call_output",
+                            "call_id": call_id,
+                            "output": "aborted",
+                        }),
+                    ));
+                }
+            }
+            Some("custom_tool_call") => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !items.iter().any(|existing| {
+                    existing.get("type").and_then(Value::as_str) == Some("custom_tool_call_output")
+                        && existing.get("call_id").and_then(Value::as_str) == Some(call_id)
+                }) {
+                    missing_outputs.push((
+                        index,
+                        json!({
+                            "type": "custom_tool_call_output",
+                            "call_id": call_id,
+                            "output": "aborted",
+                        }),
+                    ));
+                }
+            }
+            Some("tool_search_call") => {
+                let Some(call_id) = item.get("call_id").and_then(Value::as_str) else {
+                    continue;
+                };
+                if !items.iter().any(|existing| {
+                    existing.get("type").and_then(Value::as_str) == Some("tool_search_output")
+                        && existing.get("call_id").and_then(Value::as_str) == Some(call_id)
+                }) {
+                    missing_outputs.push((
+                        index,
+                        json!({
+                            "type": "tool_search_output",
+                            "call_id": call_id,
+                            "status": "completed",
+                            "execution": "client",
+                            "tools": [],
+                        }),
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    for (index, output) in missing_outputs.into_iter().rev() {
+        items.insert(index + 1, output);
+    }
+}
+
+fn remove_orphan_raw_outputs(items: &mut Vec<Value>) {
+    let function_call_ids = response_item_call_ids_for_type(items, "function_call");
+    let local_shell_call_ids = response_item_call_ids_for_type(items, "local_shell_call");
+    let custom_tool_call_ids = response_item_call_ids_for_type(items, "custom_tool_call");
+    let tool_search_call_ids = response_item_call_ids_for_type(items, "tool_search_call");
+
+    items.retain(|item| match item.get("type").and_then(Value::as_str) {
+        Some("function_call_output") => {
+            item.get("call_id")
+                .and_then(Value::as_str)
+                .is_some_and(|call_id| {
+                    function_call_ids.contains(call_id) || local_shell_call_ids.contains(call_id)
+                })
+        }
+        Some("custom_tool_call_output") => item
+            .get("call_id")
+            .and_then(Value::as_str)
+            .is_some_and(|call_id| custom_tool_call_ids.contains(call_id)),
+        Some("tool_search_output") => {
+            if item.get("execution").and_then(Value::as_str) == Some("server") {
+                true
+            } else if let Some(call_id) = item.get("call_id").and_then(Value::as_str) {
+                tool_search_call_ids.contains(call_id)
+            } else {
+                true
+            }
+        }
+        _ => true,
+    });
+}
+
+fn response_item_call_ids_for_type(items: &[Value], item_type: &str) -> HashSet<String> {
+    items
+        .iter()
+        .filter(|item| item.get("type").and_then(Value::as_str) == Some(item_type))
+        .filter_map(|item| item.get("call_id").and_then(Value::as_str))
+        .map(ToString::to_string)
+        .collect()
+}
+
+fn strip_images_when_unsupported(items: &mut [Value], supports_image_input: bool) {
+    if supports_image_input {
+        return;
+    }
+
+    for item in items {
+        match item.get("type").and_then(Value::as_str) {
+            Some("message") => {
+                if let Some(content) = item.get_mut("content").and_then(Value::as_array_mut) {
+                    replace_input_image_parts_with_placeholder(content);
+                }
+            }
+            Some("function_call_output") | Some("custom_tool_call_output") => {
+                if let Some(output) = item.get_mut("output").and_then(Value::as_array_mut) {
+                    replace_input_image_parts_with_placeholder(output);
+                }
+            }
+            Some("image_generation_call") => {
+                if let Some(object) = item.as_object_mut() {
+                    object.insert("result".to_string(), Value::String(String::new()));
+                }
+            }
+            _ => {}
+        }
+    }
+}
+
+fn replace_input_image_parts_with_placeholder(parts: &mut [Value]) {
+    for part in parts {
+        if part.get("type").and_then(Value::as_str) == Some("input_image") {
+            *part = json!({
+                "type": "input_text",
+                "text": IMAGE_CONTENT_OMITTED_PLACEHOLDER,
+            });
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ResponsesToolCallKind {
+    Function,
+    Custom,
+}
+
+fn response_tool_call_kind(item: &Value) -> ResponsesToolCallKind {
+    if item.get("type").and_then(Value::as_str) == Some("custom_tool_call") {
+        ResponsesToolCallKind::Custom
+    } else {
+        ResponsesToolCallKind::Function
+    }
+}
+
+fn tool_output_to_responses_input(
+    message: &Value,
+    call_id: &str,
+    kind: ResponsesToolCallKind,
+) -> Value {
+    match kind {
+        ResponsesToolCallKind::Function => {
+            let output = if tool_name(message) == "view_image" {
+                let images = tool_output_images(message);
+                if images.is_empty() {
+                    Value::String(tool_output_text(message))
+                } else {
+                    Value::Array(images)
+                }
+            } else {
+                Value::String(tool_output_text(message))
+            };
+            json!({
+                "type": "function_call_output",
+                "call_id": call_id,
+                "output": output,
+            })
+        }
+        ResponsesToolCallKind::Custom => json!({
+            "type": "custom_tool_call_output",
+            "call_id": call_id,
+            "output": tool_output_text(message),
+        }),
+    }
 }
 
 fn responses_orphan_tool_context_message(message: &Value, call_id: &str) -> Option<Value> {
@@ -1285,6 +5456,9 @@ fn responses_orphan_tool_context_message(message: &Value, call_id: &str) -> Opti
 fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for message in messages {
+        if should_skip_raw_response_item_for_fallback_provider(message) {
+            continue;
+        }
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -1324,6 +5498,10 @@ fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
             "system" => out.push(json!({
                 "role": "system",
                 "content": message_content_as_text(message),
+            })),
+            "developer" => out.push(json!({
+                "role": "system",
+                "content": format!("Developer context:\n{}", message_content_as_text(message)),
             })),
             _ => out.push(json!({
                 "role": "user",
@@ -1384,6 +5562,9 @@ fn chat_tool_call(call: &Value) -> Result<Value> {
 fn messages_to_anthropic_messages(messages: &[Value], is_oauth: bool) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for message in messages {
+        if should_skip_raw_response_item_for_fallback_provider(message) {
+            continue;
+        }
         let role = message
             .get("role")
             .and_then(Value::as_str)
@@ -1417,6 +5598,7 @@ fn messages_to_anthropic_messages(messages: &[Value], is_oauth: bool) -> Result<
                     "text": format!("System context:\n{}", message_content_as_text(message)),
                 }],
             })),
+            "developer" => {}
             _ => out.push(json!({
                 "role": "user",
                 "content": anthropic_user_content(message),
@@ -1424,6 +5606,13 @@ fn messages_to_anthropic_messages(messages: &[Value], is_oauth: bool) -> Result<
         }
     }
     Ok(out)
+}
+
+fn should_skip_raw_response_item_for_fallback_provider(message: &Value) -> bool {
+    let Some(item_type) = message.get("type").and_then(Value::as_str) else {
+        return false;
+    };
+    item_type != "message" && response_item_type_is_responses_input_item(item_type, message)
 }
 
 fn anthropic_user_content(message: &Value) -> Vec<Value> {
@@ -1509,6 +5698,31 @@ fn anthropic_system_blocks(instructions: &str, is_oauth: bool) -> Value {
         "text": instructions,
         "cache_control": { "type": "ephemeral" },
     }));
+    Value::Array(blocks)
+}
+
+fn anthropic_system_blocks_with_developer_context(
+    instructions: &str,
+    messages: &[Value],
+    is_oauth: bool,
+) -> Value {
+    let Value::Array(mut blocks) = anthropic_system_blocks(instructions, is_oauth) else {
+        return anthropic_system_blocks(instructions, is_oauth);
+    };
+    for message in messages {
+        if message.get("role").and_then(Value::as_str) != Some("developer") {
+            continue;
+        }
+        let text = message_content_as_text(message);
+        if text.is_empty() {
+            continue;
+        }
+        blocks.push(json!({
+            "type": "text",
+            "text": format!("Developer context:\n{text}"),
+            "cache_control": { "type": "ephemeral" },
+        }));
+    }
     Value::Array(blocks)
 }
 
@@ -1745,6 +5959,14 @@ fn tool_call_to_responses_input(call: &Value) -> Result<Value> {
         .and_then(Value::as_str)
         .context("assistant tool call missing name")?;
     let arguments = call.get("arguments").cloned().unwrap_or_else(|| json!({}));
+    if let Some(input) = arguments.as_str() {
+        return Ok(json!({
+            "type": "custom_tool_call",
+            "call_id": call_id,
+            "name": name,
+            "input": input,
+        }));
+    }
     Ok(json!({
         "type": "function_call",
         "call_id": call_id,
@@ -1762,9 +5984,10 @@ fn json_string(value: Value) -> Result<String> {
 
 fn parse_responses_output(body: &Value, model: &str) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
+    let mut stream_state = CodexSseStreamState::default();
     if let Some(items) = body.get("output").and_then(Value::as_array) {
         for item in items {
-            parse_response_output_item(item, &mut events)?;
+            maybe_push_codex_output_item(item, &mut stream_state, &mut events)?;
         }
     }
     if events
@@ -1780,7 +6003,10 @@ fn parse_responses_output(body: &Value, model: &str) -> Result<Vec<ModelEvent>> 
         }
     }
     if let Some(usage) = parse_usage(body.get("usage"), model) {
+        events.push(response_completed_event(body)?);
         events.push(ModelEvent::Usage { usage });
+    } else {
+        events.push(response_completed_event(body)?);
     }
     events.push(ModelEvent::Done);
     Ok(events)
@@ -1829,6 +6055,7 @@ fn parse_chat_completion_output(body: &Value, model: &str) -> Result<Vec<ModelEv
             call: ToolCall {
                 id: call_id.to_string(),
                 name: name.to_string(),
+                namespace: None,
                 arguments,
             },
         });
@@ -1887,6 +6114,7 @@ fn parse_anthropic_messages_output(
                     call: ToolCall {
                         id: call_id.to_string(),
                         name: anthropic_response_tool_name(name, tools, is_oauth),
+                        namespace: None,
                         arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
                     },
                 });
@@ -1957,7 +6185,37 @@ fn parse_response_output_item(item: &Value, events: &mut Vec<ModelEvent>) -> Res
                 call: ToolCall {
                     id: call_id.to_string(),
                     name: name.to_string(),
+                    namespace: item
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
                     arguments,
+                },
+            });
+        }
+        Some("custom_tool_call") => {
+            let name = item
+                .get("name")
+                .and_then(Value::as_str)
+                .context("custom_tool_call missing name")?;
+            let call_id = item
+                .get("call_id")
+                .or_else(|| item.get("id"))
+                .and_then(Value::as_str)
+                .context("custom_tool_call missing call_id")?;
+            let input = item
+                .get("input")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            events.push(ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: call_id.to_string(),
+                    name: name.to_string(),
+                    namespace: item
+                        .get("namespace")
+                        .and_then(Value::as_str)
+                        .map(str::to_string),
+                    arguments: Value::String(input.to_string()),
                 },
             });
         }
@@ -1981,6 +6239,15 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
         .get("output_tokens")
         .or_else(|| usage.get("completion_tokens"))
         .and_then(Value::as_i64);
+    let reasoning_output_tokens = usage
+        .get("output_tokens_details")
+        .and_then(|details| details.get("reasoning_tokens"))
+        .or_else(|| {
+            usage
+                .get("completion_tokens_details")
+                .and_then(|details| details.get("reasoning_tokens"))
+        })
+        .and_then(Value::as_i64);
     let total_tokens = usage
         .get("total_tokens")
         .and_then(Value::as_i64)
@@ -2002,6 +6269,7 @@ fn parse_usage(usage: Option<&Value>, model: &str) -> Option<ModelUsage> {
             .or_else(|| usage.get("prompt_cache_creation_tokens"))
             .and_then(Value::as_i64),
         output_tokens,
+        reasoning_output_tokens,
         total_tokens,
         input_cost_usd: None,
         input_cached_cost_usd: None,
@@ -2251,28 +6519,45 @@ fn cache_file_fresh(path: &Path) -> bool {
         < Duration::from_secs(24 * 60 * 60)
 }
 
-fn openai_error_message(body: &Value) -> String {
-    body.get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| body.to_string())
-}
-
-fn anthropic_error_message(body: &Value) -> String {
-    body.get("error")
-        .and_then(|error| error.get("message"))
-        .and_then(Value::as_str)
-        .map(ToOwned::to_owned)
-        .unwrap_or_else(|| body.to_string())
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::io::{Read, Write};
-    use std::net::TcpListener;
+    use std::net::{TcpListener, TcpStream};
+    use std::sync::mpsc;
     use std::thread;
+    use std::time::Instant;
+
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct EnvVarGuard {
+        key: &'static str,
+        old_value: Option<std::ffi::OsString>,
+    }
+
+    impl EnvVarGuard {
+        fn set_str(key: &'static str, value: &str) -> Self {
+            let old_value = std::env::var_os(key);
+            std::env::set_var(key, value);
+            Self { key, old_value }
+        }
+
+        fn remove(key: &'static str) -> Self {
+            let old_value = std::env::var_os(key);
+            std::env::remove_var(key);
+            Self { key, old_value }
+        }
+    }
+
+    impl Drop for EnvVarGuard {
+        fn drop(&mut self) {
+            if let Some(value) = &self.old_value {
+                std::env::set_var(self.key, value);
+            } else {
+                std::env::remove_var(self.key);
+            }
+        }
+    }
 
     #[test]
     fn fake_provider_returns_scripted_events() -> Result<()> {
@@ -2335,6 +6620,81 @@ mod tests {
     }
 
     #[test]
+    fn responses_input_strips_images_when_model_does_not_support_images_like_codex() -> Result<()> {
+        let text_only_model = ModelRequestInfo {
+            supports_image_input: false,
+            ..ModelRequestInfo::unknown()
+        };
+        let input = messages_to_responses_input_for_model(
+            &[
+                json!({
+                    "role": "user",
+                    "content": [
+                        {"type": "input_text", "text": "look"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "high"},
+                        {"type": "input_text", "text": "caption"}
+                    ]
+                }),
+                json!({
+                    "type": "function_call",
+                    "call_id": "call_image",
+                    "name": "view_image",
+                    "arguments": "{}"
+                }),
+                json!({
+                    "type": "function_call_output",
+                    "call_id": "call_image",
+                    "output": [
+                        {"type": "input_text", "text": "image result"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,result", "detail": "auto"}
+                    ]
+                }),
+                json!({
+                    "type": "custom_tool_call",
+                    "call_id": "call_custom",
+                    "name": "apply_patch",
+                    "input": "*** Begin Patch\n*** End Patch"
+                }),
+                json!({
+                    "type": "custom_tool_call_output",
+                    "call_id": "call_custom",
+                    "output": [
+                        {"type": "input_text", "text": "custom result"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,custom", "detail": "high"}
+                    ]
+                }),
+                json!({
+                    "type": "image_generation_call",
+                    "id": "ig_123",
+                    "status": "completed",
+                    "result": "Zm9v"
+                }),
+            ],
+            &text_only_model,
+        )?;
+
+        assert_eq!(input[0]["content"][1]["type"], "input_text");
+        assert_eq!(
+            input[0]["content"][1]["text"],
+            IMAGE_CONTENT_OMITTED_PLACEHOLDER
+        );
+        assert!(input[0]["content"][1].get("image_url").is_none());
+        assert_eq!(input[2]["output"][1]["type"], "input_text");
+        assert_eq!(
+            input[2]["output"][1]["text"],
+            IMAGE_CONTENT_OMITTED_PLACEHOLDER
+        );
+        assert_eq!(input[4]["output"][1]["type"], "input_text");
+        assert_eq!(
+            input[4]["output"][1]["text"],
+            IMAGE_CONTENT_OMITTED_PLACEHOLDER
+        );
+        assert_eq!(input[5]["type"], "image_generation_call");
+        assert_eq!(input[5]["result"], "");
+        Ok(())
+    }
+
+    #[test]
     fn responses_input_moves_tool_output_images_to_visual_context_message() -> Result<()> {
         let input = messages_to_responses_input(&[
             json!({
@@ -2375,6 +6735,71 @@ mod tests {
     }
 
     #[test]
+    fn responses_input_returns_view_image_as_function_call_output_content_like_codex() -> Result<()>
+    {
+        let input = messages_to_responses_input(&[
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_view",
+                    "name": "view_image",
+                    "arguments": {"path": "shot.png"}
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_view",
+                "name": "view_image",
+                "content": [
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "high"}
+                ]
+            }),
+        ])?;
+        assert_eq!(input.len(), 2);
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_view");
+        assert_eq!(input[1]["output"][0]["type"], "input_image");
+        assert_eq!(input[1]["output"][0]["detail"], "high");
+        Ok(())
+    }
+
+    #[test]
+    fn responses_input_round_trips_custom_apply_patch_calls() -> Result<()> {
+        let input = messages_to_responses_input(&[
+            json!({
+                "role": "assistant",
+                "tool_calls": [{
+                    "id": "call_patch",
+                    "name": "apply_patch",
+                    "arguments": "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch"
+                }]
+            }),
+            json!({
+                "role": "tool",
+                "tool_call_id": "call_patch",
+                "name": "apply_patch",
+                "content": "Success. Updated the following files:\nA hello.txt\n"
+            }),
+        ])?;
+
+        assert_eq!(input[0]["type"], "custom_tool_call");
+        assert_eq!(input[0]["call_id"], "call_patch");
+        assert_eq!(input[0]["name"], "apply_patch");
+        assert!(input[0]["input"]
+            .as_str()
+            .unwrap_or_default()
+            .starts_with("*** Begin Patch"));
+        assert_eq!(input[1]["type"], "custom_tool_call_output");
+        assert_eq!(input[1]["call_id"], "call_patch");
+        assert_eq!(
+            input[1]["output"],
+            "Success. Updated the following files:\nA hello.txt\n"
+        );
+        assert!(input[1].get("success").is_none());
+        Ok(())
+    }
+
+    #[test]
     fn responses_input_converts_orphan_tool_output_to_context_message() -> Result<()> {
         let input = messages_to_responses_input(&[
             json!({
@@ -2408,6 +6833,158 @@ mod tests {
     }
 
     #[test]
+    fn responses_tools_encode_freeform_apply_patch_as_custom() {
+        let tools = tool_specs_to_responses_tools(&[ToolSpec {
+            name: "apply_patch".to_string(),
+            namespace: None,
+            namespace_description: None,
+            description: "Use the `apply_patch` tool to edit files.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "patch": { "type": "string" } },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            freeform: Some(browser_use_protocol::FreeformToolFormat {
+                kind: "grammar".to_string(),
+                syntax: "lark".to_string(),
+                definition: "start: begin_patch hunk+ end_patch".to_string(),
+            }),
+        }]);
+
+        assert_eq!(tools[0]["type"], "custom");
+        assert_eq!(tools[0]["name"], "apply_patch");
+        assert_eq!(tools[0]["format"]["type"], "grammar");
+        assert_eq!(tools[0]["format"]["syntax"], "lark");
+        assert!(tools[0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn responses_tools_include_strict_false_for_function_tools_like_codex() {
+        let tools = tool_specs_to_responses_tools(&[ToolSpec {
+            name: "done".to_string(),
+            namespace: None,
+            namespace_description: None,
+            description: "finish".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false,
+            }),
+            output_schema: Some(json!({
+                "type": "object",
+                "properties": {"ok": {"type": "boolean"}},
+                "additionalProperties": false,
+            })),
+            freeform: None,
+        }]);
+
+        assert_eq!(tools[0]["type"], "function");
+        assert_eq!(tools[0]["strict"], false);
+        assert!(tools[0].get("output_schema").is_none());
+    }
+
+    #[test]
+    fn responses_tools_coalesce_namespaced_function_tools_like_codex() {
+        let tools = tool_specs_to_responses_tools(&[
+            ToolSpec {
+                name: "wait_agent".to_string(),
+                namespace: Some("agents".to_string()),
+                namespace_description: Some(
+                    "Tools for spawning and managing sub-agents.".to_string(),
+                ),
+                description: "Wait for agents.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                output_schema: None,
+                freeform: None,
+            },
+            ToolSpec {
+                name: "spawn_agent".to_string(),
+                namespace: Some("agents".to_string()),
+                namespace_description: Some(
+                    "Tools for spawning and managing sub-agents.".to_string(),
+                ),
+                description: "Create a new agent.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                output_schema: Some(json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                })),
+                freeform: None,
+            },
+            ToolSpec {
+                name: "done".to_string(),
+                namespace: None,
+                namespace_description: None,
+                description: "Finish.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {},
+                    "additionalProperties": false,
+                }),
+                output_schema: None,
+                freeform: None,
+            },
+        ]);
+
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0]["type"], "namespace");
+        assert_eq!(tools[0]["name"], "agents");
+        assert_eq!(
+            tools[0]["description"],
+            "Tools for spawning and managing sub-agents."
+        );
+        let namespace_tools = tools[0]["tools"].as_array().expect("namespace tools");
+        assert_eq!(namespace_tools.len(), 2);
+        assert_eq!(namespace_tools[0]["type"], "function");
+        assert_eq!(namespace_tools[0]["name"], "spawn_agent");
+        assert_eq!(namespace_tools[0]["strict"], false);
+        assert!(namespace_tools[0].get("output_schema").is_none());
+        assert_eq!(namespace_tools[1]["type"], "function");
+        assert_eq!(namespace_tools[1]["name"], "wait_agent");
+        assert_eq!(tools[1]["type"], "function");
+        assert_eq!(tools[1]["name"], "done");
+    }
+
+    #[test]
+    fn responses_output_item_parses_tool_namespace_like_codex() -> Result<()> {
+        let mut events = Vec::new();
+        parse_response_output_item(
+            &json!({
+                "type": "function_call",
+                "call_id": "call_spawn",
+                "name": "spawn_agent",
+                "namespace": "agents",
+                "arguments": "{\"message\":\"inspect\"}",
+            }),
+            &mut events,
+        )?;
+
+        assert_eq!(
+            events,
+            vec![ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: "call_spawn".to_string(),
+                    name: "spawn_agent".to_string(),
+                    namespace: Some("agents".to_string()),
+                    arguments: json!({"message": "inspect"}),
+                },
+            }]
+        );
+        Ok(())
+    }
+
+    #[test]
     fn responses_input_converts_system_messages_to_user_context() -> Result<()> {
         let input = messages_to_responses_input(&[json!({
             "role": "system",
@@ -2423,6 +7000,232 @@ mod tests {
     }
 
     #[test]
+    fn responses_input_preserves_developer_context_role() -> Result<()> {
+        let input = messages_to_responses_input(&[json!({
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": "<permissions instructions>Approval policy is currently never.</permissions instructions>"
+            }]
+        })])?;
+        assert_eq!(input[0]["role"], "developer");
+        assert_eq!(input[0]["content"][0]["type"], "input_text");
+        assert!(input[0]["content"][0]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Approval policy is currently never"));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_input_passes_raw_response_items_through_like_codex() -> Result<()> {
+        let input = messages_to_responses_input(&[
+            json!({
+                "type": "reasoning",
+                "id": "rs_123",
+                "summary": [{"type": "summary_text", "text": "checked context"}],
+                "content": [{"type": "reasoning_text", "text": "hidden chain"}],
+                "encrypted_content": "encrypted-reasoning"
+            }),
+            json!({
+                "type": "web_search_call",
+                "id": "ws_123",
+                "status": "completed",
+                "action": {"type": "search", "query": "Codex parity"}
+            }),
+            json!({
+                "type": "image_generation_call",
+                "id": "ig_123",
+                "status": "completed",
+                "result": "image-bytes"
+            }),
+            json!({
+                "type": "compaction_trigger"
+            }),
+        ])?;
+
+        assert_eq!(input.len(), 3);
+        assert_eq!(input[0]["type"], "reasoning");
+        assert!(input[0].get("id").is_none());
+        assert!(input[0].get("content").is_none());
+        assert_eq!(input[0]["encrypted_content"], "encrypted-reasoning");
+        assert_eq!(input[1]["type"], "web_search_call");
+        assert!(input[1].get("id").is_none());
+        assert_eq!(input[1]["status"], "completed");
+        assert_eq!(input[2]["type"], "image_generation_call");
+        assert_eq!(input[2]["id"], "ig_123");
+        Ok(())
+    }
+
+    #[test]
+    fn responses_input_synthesizes_missing_raw_call_outputs_like_codex() -> Result<()> {
+        let input = messages_to_responses_input(&[
+            json!({
+                "type": "function_call",
+                "call_id": "call_fn",
+                "name": "exec_command",
+                "arguments": "{\"cmd\":\"true\"}"
+            }),
+            json!({
+                "type": "local_shell_call",
+                "call_id": "call_shell",
+                "status": "completed",
+                "action": {"type": "exec", "command": "true"}
+            }),
+            json!({
+                "type": "custom_tool_call",
+                "call_id": "call_custom",
+                "name": "apply_patch",
+                "input": "*** Begin Patch\n*** End Patch"
+            }),
+            json!({
+                "type": "tool_search_call",
+                "call_id": "call_search",
+                "status": "completed",
+                "execution": "client",
+                "arguments": {"query": "tools"}
+            }),
+        ])?;
+
+        assert_eq!(input[1]["type"], "function_call_output");
+        assert_eq!(input[1]["call_id"], "call_fn");
+        assert_eq!(input[1]["output"], "aborted");
+        assert_eq!(input[3]["type"], "function_call_output");
+        assert_eq!(input[3]["call_id"], "call_shell");
+        assert_eq!(input[3]["output"], "aborted");
+        assert_eq!(input[5]["type"], "custom_tool_call_output");
+        assert_eq!(input[5]["call_id"], "call_custom");
+        assert_eq!(input[5]["output"], "aborted");
+        assert_eq!(input[7]["type"], "tool_search_output");
+        assert_eq!(input[7]["call_id"], "call_search");
+        assert_eq!(input[7]["status"], "completed");
+        assert_eq!(input[7]["execution"], "client");
+        assert_eq!(input[7]["tools"], json!([]));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_input_removes_orphan_raw_outputs_like_codex() -> Result<()> {
+        let input = messages_to_responses_input(&[
+            json!({
+                "type": "function_call_output",
+                "call_id": "orphan_fn",
+                "output": "stale"
+            }),
+            json!({
+                "type": "custom_tool_call_output",
+                "call_id": "orphan_custom",
+                "output": "stale"
+            }),
+            json!({
+                "type": "tool_search_output",
+                "call_id": "orphan_search",
+                "status": "completed",
+                "execution": "client",
+                "tools": []
+            }),
+            json!({
+                "type": "tool_search_output",
+                "call_id": "server_search",
+                "status": "completed",
+                "execution": "server",
+                "tools": [{"name": "search"}]
+            }),
+            json!({
+                "type": "tool_search_output",
+                "status": "completed",
+                "execution": "client",
+                "tools": [{"name": "no_call_id"}]
+            }),
+        ])?;
+
+        assert_eq!(input.len(), 2);
+        assert!(input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("tool_search_output")
+                && item.get("call_id").and_then(Value::as_str) == Some("server_search")
+        }));
+        assert!(input.iter().any(|item| {
+            item.get("type").and_then(Value::as_str) == Some("tool_search_output")
+                && item.get("call_id").is_none()
+        }));
+        assert!(!input.iter().any(|item| {
+            item.get("call_id").and_then(Value::as_str) == Some("orphan_fn")
+                || item.get("call_id").and_then(Value::as_str) == Some("orphan_custom")
+                || item.get("call_id").and_then(Value::as_str) == Some("orphan_search")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn fallback_providers_skip_raw_response_items_they_cannot_express() -> Result<()> {
+        let messages = [
+            json!({
+                "type": "reasoning",
+                "summary": [],
+                "encrypted_content": "encrypted-reasoning"
+            }),
+            json!({
+                "role": "user",
+                "content": "next prompt"
+            }),
+        ];
+
+        let chat = messages_to_chat_messages(&messages)?;
+        assert_eq!(chat.len(), 1);
+        assert_eq!(chat[0]["role"], "user");
+        assert_eq!(chat[0]["content"], "next prompt");
+
+        let anthropic = messages_to_anthropic_messages(&messages, false)?;
+        assert_eq!(anthropic.len(), 1);
+        assert_eq!(anthropic[0]["role"], "user");
+        assert_eq!(anthropic[0]["content"][0]["text"], "next prompt");
+        Ok(())
+    }
+
+    #[test]
+    fn chat_messages_map_developer_context_to_system_priority() -> Result<()> {
+        let messages = messages_to_chat_messages(&[json!({
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": "<permissions instructions>Do not provide sandbox permissions.</permissions instructions>"
+            }]
+        })])?;
+
+        assert_eq!(messages[0]["role"], "system");
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Developer context:\n<permissions instructions>"));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_move_developer_context_to_system_blocks() -> Result<()> {
+        let developer = json!({
+            "role": "developer",
+            "content": [{
+                "type": "input_text",
+                "text": "<permissions instructions>Do not provide sandbox permissions.</permissions instructions>"
+            }]
+        });
+        let system = anthropic_system_blocks_with_developer_context(
+            "base instructions",
+            &[developer.clone()],
+            false,
+        );
+        let blocks = system.as_array().expect("system blocks");
+
+        assert_eq!(blocks.len(), 2);
+        assert!(blocks[1]["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Developer context:\n<permissions instructions>"));
+        assert!(messages_to_anthropic_messages(&[developer], false)?.is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn loads_codex_auth_file_with_nested_tokens() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let path = temp.path().join("auth.json");
@@ -2431,10 +7234,12 @@ mod tests {
             json!({
                 "auth_mode": "chatgpt",
                 "tokens": {
+                    "id_token": "header.payload.signature",
                     "access_token": "access-123",
                     "account_id": "account-123",
                     "refresh_token": "refresh-123"
-                }
+                },
+                "last_refresh": "2026-05-25T00:00:00Z"
             })
             .to_string(),
         )?;
@@ -2445,6 +7250,21 @@ mod tests {
                 account_id: "account-123".to_string(),
             }
         );
+        let managed = load_codex_managed_auth_file(temp.path().join("auth.json"))?;
+        let snapshot = managed.current_snapshot()?;
+        assert_eq!(snapshot.access_token, "access-123");
+        assert_eq!(snapshot.account_id, "account-123");
+        assert_eq!(
+            snapshot.id_token.as_deref(),
+            Some("header.payload.signature")
+        );
+        assert_eq!(snapshot.refresh_token.as_deref(), Some("refresh-123"));
+        let expected_path = temp.path().join("auth.json");
+        assert_eq!(
+            snapshot.source_path.as_deref(),
+            Some(expected_path.as_path())
+        );
+        assert!(snapshot.last_refresh.is_some());
         Ok(())
     }
 
@@ -2454,10 +7274,10 @@ mod tests {
             "data: {\"type\":\"response.reasoning_summary_text.delta\",\"delta\":\"Checking context.\"}\n\n",
             "data: {\"type\":\"response.output_text.delta\",\"delta\":\"Working\\n\"}\n\n",
             "data: {\"type\":\"response.output_item.done\",\"item\":{\"type\":\"function_call\",\"call_id\":\"call_123\",\"name\":\"done\",\"arguments\":\"{\\\"result\\\":\\\"ok\\\"}\"}}\n\n",
-            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"end_turn\":false,\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":4,\"total_tokens\":7}}}\n\n",
         );
         let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
-        let provider = CodexResponsesProvider::with_base_url(
+        let mut provider = CodexResponsesProvider::with_base_url(
             CodexAuth {
                 access_token: "chatgpt-token".to_string(),
                 account_id: "account-123".to_string(),
@@ -2465,10 +7285,15 @@ mod tests {
             "gpt-test",
             format!("{}/backend-api", base_url.trim_end_matches("/v1")),
         );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
         let events = provider.start_turn(ProviderTurn {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
             messages: vec![json!({"role": "user", "content": "finish"})],
             tools: vec![ToolSpec {
                 name: "done".to_string(),
+                namespace: None,
+                namespace_description: None,
                 description: "finish".to_string(),
                 input_schema: json!({
                     "type": "object",
@@ -2476,7 +7301,10 @@ mod tests {
                     "required": ["result"],
                     "additionalProperties": false
                 }),
+                output_schema: None,
+                freeform: None,
             }],
+            ..ProviderTurn::default()
         })?;
         handle.join().expect("mock server thread");
         assert!(events.contains(&ModelEvent::ThinkingDelta {
@@ -2490,8 +7318,17 @@ mod tests {
             call: ToolCall {
                 id: "call_123".to_string(),
                 name: "done".to_string(),
+                namespace: None,
                 arguments: json!({"result": "ok"}),
             },
+        }));
+        assert!(events.contains(&ModelEvent::ResponseOutputItem {
+            item: json!({
+                "type": "function_call",
+                "call_id": "call_123",
+                "name": "done",
+                "arguments": "{\"result\":\"ok\"}"
+            }),
         }));
         assert!(events.contains(&ModelEvent::Usage {
             usage: ModelUsage {
@@ -2502,7 +7339,319 @@ mod tests {
                 ..Default::default()
             },
         }));
+        assert!(events.contains(&ModelEvent::ResponseCompleted {
+            response_id: Some("resp_123".to_string()),
+            end_turn: Some(false),
+        }));
         assert!(events.contains(&ModelEvent::Done));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_managed_auth_reloads_same_account_after_401_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let auth_path = temp.path().join("auth.json");
+        write_codex_auth_file(
+            &auth_path,
+            "stale-chatgpt-token",
+            "account-123",
+            "refresh-token",
+        )?;
+        let managed_auth = load_codex_managed_auth_file(&auth_path)?;
+        write_codex_auth_file(
+            &auth_path,
+            "reloaded-chatgpt-token",
+            "account-123",
+            "refresh-token",
+        )?;
+        let (base_url, headers_rx, handle) = spawn_request_header_capture_server_sequence(vec![
+            MockHttpResponse::new(401, "Unauthorized", "unauthorized", "text/plain"),
+            MockHttpResponse::new(
+                200,
+                "OK",
+                codex_completed_sse("resp_reloaded"),
+                "text/event-stream",
+            ),
+        ])?;
+        let provider = CodexResponsesProvider::with_managed_base_url(
+            managed_auth,
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        )?;
+
+        provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let first = headers_rx.recv().expect("first request headers");
+        let second = headers_rx.recv().expect("second request headers");
+
+        assert!(first
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer stale-chatgpt-token\r\n"));
+        assert!(second
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer reloaded-chatgpt-token\r\n"));
+        assert!(second
+            .to_ascii_lowercase()
+            .contains("\r\nchatgpt-account-id: account-123\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_managed_auth_refreshes_after_reload_nochange_401_like_codex() -> Result<()> {
+        let _env_lock = ENV_LOCK.lock().expect("env lock");
+        let temp = tempfile::tempdir()?;
+        let auth_path = temp.path().join("auth.json");
+        write_codex_auth_file(
+            &auth_path,
+            "stale-chatgpt-token",
+            "account-123",
+            "refresh-token",
+        )?;
+        let managed_auth = load_codex_managed_auth_file(&auth_path)?;
+        let (base_url, headers_rx, handle) = spawn_request_header_capture_server_sequence(vec![
+            MockHttpResponse::new(401, "Unauthorized", "unauthorized", "text/plain"),
+            MockHttpResponse::new(401, "Unauthorized", "still unauthorized", "text/plain"),
+            MockHttpResponse::new(
+                200,
+                "OK",
+                codex_completed_sse("resp_refreshed"),
+                "text/event-stream",
+            ),
+        ])?;
+        let (refresh_url, refresh_rx, refresh_handle) = spawn_codex_refresh_capture_server(
+            json!({
+                "access_token": "fresh-chatgpt-token",
+                "refresh_token": "fresh-refresh-token"
+            })
+            .to_string(),
+            200,
+        )?;
+        let _refresh_guard =
+            EnvVarGuard::set_str(CODEX_REFRESH_TOKEN_URL_OVERRIDE_ENV_VAR, &refresh_url);
+        let provider = CodexResponsesProvider::with_managed_base_url(
+            managed_auth,
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        )?;
+
+        provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        refresh_handle.join().expect("refresh server thread");
+        let refresh_request = refresh_rx.recv().expect("refresh request body");
+        let first = headers_rx.recv().expect("first request headers");
+        let second = headers_rx.recv().expect("second request headers");
+        let third = headers_rx.recv().expect("third request headers");
+
+        assert_eq!(refresh_request["client_id"], CODEX_OAUTH_CLIENT_ID);
+        assert_eq!(refresh_request["grant_type"], "refresh_token");
+        assert_eq!(refresh_request["refresh_token"], "refresh-token");
+        assert!(first
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer stale-chatgpt-token\r\n"));
+        assert!(second
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer stale-chatgpt-token\r\n"));
+        assert!(third
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer fresh-chatgpt-token\r\n"));
+        let persisted: Value = serde_json::from_str(&std::fs::read_to_string(auth_path)?)?;
+        assert_eq!(persisted["tokens"]["access_token"], "fresh-chatgpt-token");
+        assert_eq!(persisted["tokens"]["refresh_token"], "fresh-refresh-token");
+        assert!(persisted["last_refresh"].as_str().is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn codex_managed_auth_account_mismatch_does_not_refresh_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let auth_path = temp.path().join("auth.json");
+        write_codex_auth_file(
+            &auth_path,
+            "stale-chatgpt-token",
+            "account-123",
+            "refresh-token",
+        )?;
+        let managed_auth = load_codex_managed_auth_file(&auth_path)?;
+        write_codex_auth_file(
+            &auth_path,
+            "other-chatgpt-token",
+            "other-account",
+            "other-refresh-token",
+        )?;
+        let (base_url, handle) = spawn_timed_status_sequence_server(vec![
+            MockHttpResponse::new(401, "Unauthorized", "unauthorized", "text/plain"),
+            MockHttpResponse::new(
+                200,
+                "OK",
+                codex_completed_sse("unexpected"),
+                "text/event-stream",
+            ),
+        ])?;
+        let provider = CodexResponsesProvider::with_managed_base_url(
+            managed_auth,
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        )?;
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("account mismatch should make 401 terminal");
+        let served = handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+
+        assert_eq!(served, 1);
+        assert_eq!(provider_error.kind(), ProviderErrorKind::Unauthorized);
+        Ok(())
+    }
+
+    #[test]
+    fn codex_responses_provider_parses_sse_custom_apply_patch_call() -> Result<()> {
+        let patch = "*** Begin Patch\\n*** Add File: hello.txt\\n+hello\\n*** End Patch";
+        let sse = format!(
+            "data: {{\"type\":\"response.output_item.done\",\"item\":{{\"type\":\"custom_tool_call\",\"call_id\":\"call_patch\",\"name\":\"apply_patch\",\"input\":\"{patch}\"}}}}\n\n\
+             data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"resp_patch\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}\n\n"
+        );
+        let (base_url, handle) = spawn_mock_server(sse, "text/event-stream")?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+        let events = provider.start_turn(ProviderTurn {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
+            messages: vec![json!({"role": "user", "content": "patch"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        assert!(events.contains(&ModelEvent::ToolCall {
+            call: ToolCall {
+                id: "call_patch".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: Value::String(
+                    "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch".to_string(),
+                ),
+            },
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_responses_provider_ignores_custom_input_delta_for_payload_and_dedupes() -> Result<()> {
+        let patch = "*** Begin Patch\n*** Add File: streamed.txt\n+hello\n+world\n*** End Patch";
+        let sse = [
+            json!({
+                "type": "response.output_item.added",
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "call_patch",
+                    "name": "apply_patch",
+                    "input": "",
+                }
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": "ctc_1",
+                "delta": "live progress only",
+            }),
+            json!({
+                "type": "response.custom_tool_call_input.delta",
+                "item_id": "ctc_1",
+                "delta": " and not executable payload",
+            }),
+            json!({
+                "type": "response.output_item.done",
+                "item": {
+                    "type": "custom_tool_call",
+                    "id": "ctc_1",
+                    "call_id": "call_patch",
+                    "name": "apply_patch",
+                    "input": patch,
+                }
+            }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_patch",
+                    "output": [{
+                        "type": "custom_tool_call",
+                        "id": "ctc_1",
+                        "call_id": "call_patch",
+                        "name": "apply_patch",
+                        "input": patch,
+                    }],
+                    "usage": {
+                        "input_tokens": 1,
+                        "output_tokens": 1,
+                        "total_tokens": 2,
+                    }
+                }
+            }),
+        ]
+        .into_iter()
+        .map(|event| format!("data: {event}\n\n"))
+        .collect::<String>();
+        let (base_url, handle) = spawn_mock_server(sse, "text/event-stream")?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+        let events = provider.start_turn(ProviderTurn {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
+            messages: vec![json!({"role": "user", "content": "patch"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        let tool_calls = events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::ToolCall { .. }))
+            .count();
+        let response_output_items = events
+            .iter()
+            .filter(|event| matches!(event, ModelEvent::ResponseOutputItem { .. }))
+            .count();
+        assert_eq!(
+            tool_calls, 1,
+            "custom tool call repeated in response.completed should be deduped"
+        );
+        assert_eq!(
+            response_output_items, 1,
+            "raw response item repeated in response.completed should be deduped"
+        );
+        assert!(events.contains(&ModelEvent::ToolCall {
+            call: ToolCall {
+                id: "call_patch".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: Value::String(patch.to_string()),
+            },
+        }));
         Ok(())
     }
 
@@ -2549,14 +7698,18 @@ mod tests {
             .to_string(),
             "application/json",
         )?;
-        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.5", base_url);
         let events = provider.start_turn(ProviderTurn {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
             messages: vec![json!({
                 "role": "user",
                 "content": "finish"
             })],
             tools: vec![ToolSpec {
                 name: "done".to_string(),
+                namespace: None,
+                namespace_description: None,
                 description: "finish".to_string(),
                 input_schema: json!({
                     "type": "object",
@@ -2566,7 +7719,10 @@ mod tests {
                     "required": ["result"],
                     "additionalProperties": false
                 }),
+                output_schema: None,
+                freeform: None,
             }],
+            ..ProviderTurn::default()
         })?;
         handle.join().expect("mock server thread");
         assert!(events.contains(&ModelEvent::ThinkingDelta {
@@ -2580,8 +7736,18 @@ mod tests {
             call: ToolCall {
                 id: "call_123".to_string(),
                 name: "done".to_string(),
+                namespace: None,
                 arguments: json!({"result": "ok"}),
             }
+        }));
+        assert!(events.contains(&ModelEvent::ResponseOutputItem {
+            item: json!({
+                "type": "function_call",
+                "call_id": "call_123",
+                "name": "done",
+                "arguments": "{\"result\":\"ok\"}",
+                "status": "completed"
+            }),
         }));
         assert!(events.contains(&ModelEvent::Usage {
             usage: ModelUsage {
@@ -2591,6 +7757,10 @@ mod tests {
                 cost_usd: None,
                 ..Default::default()
             }
+        }));
+        assert!(events.contains(&ModelEvent::ResponseCompleted {
+            response_id: Some("resp_123".to_string()),
+            end_turn: None,
         }));
         assert!(events.contains(&ModelEvent::Done));
         Ok(())
@@ -2628,9 +7798,13 @@ mod tests {
         let provider =
             OpenAICompatibleChatProvider::with_base_url("test-key", "openrouter/test", base_url);
         let events = provider.start_turn(ProviderTurn {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
             messages: vec![json!({"role": "user", "content": "finish"})],
             tools: vec![ToolSpec {
                 name: "done".to_string(),
+                namespace: None,
+                namespace_description: None,
                 description: "finish".to_string(),
                 input_schema: json!({
                     "type": "object",
@@ -2638,7 +7812,10 @@ mod tests {
                     "required": ["result"],
                     "additionalProperties": false
                 }),
+                output_schema: None,
+                freeform: None,
             }],
+            ..ProviderTurn::default()
         })?;
         handle.join().expect("mock server thread");
         assert!(events.contains(&ModelEvent::TextDelta {
@@ -2648,6 +7825,7 @@ mod tests {
             call: ToolCall {
                 id: "call_123".to_string(),
                 name: "done".to_string(),
+                namespace: None,
                 arguments: json!({"result": "ok"}),
             }
         }));
@@ -2691,9 +7869,13 @@ mod tests {
         let provider =
             AnthropicMessagesProvider::with_base_url("anthropic-key", "claude-test", base_url);
         let events = provider.start_turn(ProviderTurn {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
             messages: vec![json!({"role": "user", "content": "finish"})],
             tools: vec![ToolSpec {
                 name: "done".to_string(),
+                namespace: None,
+                namespace_description: None,
                 description: "finish".to_string(),
                 input_schema: json!({
                     "type": "object",
@@ -2701,7 +7883,10 @@ mod tests {
                     "required": ["result"],
                     "additionalProperties": false
                 }),
+                output_schema: None,
+                freeform: None,
             }],
+            ..ProviderTurn::default()
         })?;
         handle.join().expect("mock server thread");
         assert!(events.contains(&ModelEvent::TextDelta {
@@ -2711,6 +7896,7 @@ mod tests {
             call: ToolCall {
                 id: "toolu_123".to_string(),
                 name: "done".to_string(),
+                namespace: None,
                 arguments: json!({"result": "ok"}),
             }
         }));
@@ -2722,6 +7908,290 @@ mod tests {
                 cost_usd: None,
                 ..Default::default()
             }
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_compatible_chat_retries_5xx_inside_provider_like_codex_request_layer() -> Result<()> {
+        let success = json!({
+            "id": "chatcmpl_retry",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Recovered.\n"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "total_tokens": 3
+            }
+        })
+        .to_string();
+        let (base_url, handle) = spawn_mock_status_sequence_server(vec![
+            MockHttpResponse::new(502, "Bad Gateway", "temporary gateway", "text/plain"),
+            MockHttpResponse::new(200, "OK", success, "application/json"),
+        ])?;
+        let mut provider =
+            OpenAICompatibleChatProvider::with_base_url("test-key", "openrouter/test", base_url);
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Recovered.\n".to_string()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_compatible_chat_turn_request_max_retries_zero_disables_hidden_retry_like_codex_config(
+    ) -> Result<()> {
+        let success = json!({
+            "id": "chatcmpl_no_retry",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Should not be reached.\n"
+                }
+            }]
+        })
+        .to_string();
+        let (base_url, handle) = spawn_timed_status_sequence_server(vec![
+            MockHttpResponse::new(
+                500,
+                "Internal Server Error",
+                "temporary failure",
+                "text/plain",
+            ),
+            MockHttpResponse::new(200, "OK", success, "application/json"),
+        ])?;
+        let provider =
+            OpenAICompatibleChatProvider::with_base_url("test-key", "openrouter/test", base_url);
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                request_max_retries: Some(0),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("request_max_retries=0 should disable hidden retry");
+        let served = handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+
+        assert_eq!(served, 1);
+        assert_eq!(
+            provider_error.kind(),
+            ProviderErrorKind::InternalServerError
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_compatible_chat_turn_request_max_retries_one_serves_two_attempts_like_codex_config(
+    ) -> Result<()> {
+        let (base_url, handle) = spawn_timed_status_sequence_server(vec![
+            MockHttpResponse::new(
+                500,
+                "Internal Server Error",
+                "temporary failure one",
+                "text/plain",
+            ),
+            MockHttpResponse::new(
+                500,
+                "Internal Server Error",
+                "temporary failure two",
+                "text/plain",
+            ),
+        ])?;
+        let mut provider =
+            OpenAICompatibleChatProvider::with_base_url("test-key", "openrouter/test", base_url);
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                request_max_retries: Some(1),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("request_max_retries=1 should allow exactly one hidden retry");
+        let served = handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+
+        assert_eq!(served, 2);
+        assert_eq!(
+            provider_error.kind(),
+            ProviderErrorKind::InternalServerError
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_compatible_chat_turn_request_max_retries_caps_at_100_like_codex_config() -> Result<()>
+    {
+        let responses = (0..101)
+            .map(|_| {
+                MockHttpResponse::new(
+                    500,
+                    "Internal Server Error",
+                    "temporary failure",
+                    "text/plain",
+                )
+            })
+            .collect();
+        let (base_url, handle) = spawn_timed_status_sequence_server(responses)?;
+        let mut provider =
+            OpenAICompatibleChatProvider::with_base_url("test-key", "openrouter/test", base_url);
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                request_max_retries: Some(150),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("request_max_retries above cap should exhaust at Codex cap");
+        let served = handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+
+        assert_eq!(served, 101);
+        assert_eq!(
+            provider_error.kind(),
+            ProviderErrorKind::InternalServerError
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn hidden_request_retry_does_not_retry_reqwest_builder_errors_like_codex() {
+        let error = reqwest::blocking::Client::new()
+            .get("http://[::1")
+            .send()
+            .expect_err("invalid URL should produce a builder error");
+
+        assert!(error.is_builder(), "{error}");
+        assert!(!ProviderRequestRetryConfig::default().should_retry_send_error(&error, 0));
+    }
+
+    #[test]
+    fn anthropic_messages_retries_5xx_inside_provider_like_codex_request_layer() -> Result<()> {
+        let success = json!({
+            "id": "msg_retry",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "Recovered." }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 2
+            }
+        })
+        .to_string();
+        let (base_url, handle) = spawn_mock_status_sequence_server(vec![
+            MockHttpResponse::new(
+                500,
+                "Internal Server Error",
+                "temporary failure",
+                "text/plain",
+            ),
+            MockHttpResponse::new(200, "OK", success, "application/json"),
+        ])?;
+        let mut provider =
+            AnthropicMessagesProvider::with_base_url("anthropic-key", "claude-test", base_url);
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Recovered.".to_string()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_compatible_chat_retries_body_read_error_like_codex_request_layer() -> Result<()> {
+        let success = json!({
+            "id": "chatcmpl_body_retry",
+            "choices": [{
+                "message": {
+                    "role": "assistant",
+                    "content": "Recovered after body read.\n"
+                }
+            }],
+            "usage": {
+                "prompt_tokens": 1,
+                "completion_tokens": 2,
+                "total_tokens": 3
+            }
+        })
+        .to_string();
+        let (base_url, handle) = spawn_incomplete_body_then_status_server(MockHttpResponse::new(
+            200,
+            "OK",
+            success,
+            "application/json",
+        ))?;
+        let mut provider =
+            OpenAICompatibleChatProvider::with_base_url("test-key", "openrouter/test", base_url);
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Recovered after body read.\n".to_string()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_retries_body_read_error_like_codex_request_layer() -> Result<()> {
+        let success = json!({
+            "id": "msg_body_retry",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "Recovered after body read." }],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 2
+            }
+        })
+        .to_string();
+        let (base_url, handle) = spawn_incomplete_body_then_status_server(MockHttpResponse::new(
+            200,
+            "OK",
+            success,
+            "application/json",
+        ))?;
+        let mut provider =
+            AnthropicMessagesProvider::with_base_url("anthropic-key", "claude-test", base_url);
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Recovered after body read.".to_string()
         }));
         Ok(())
     }
@@ -2753,9 +8223,13 @@ mod tests {
             base_url,
         );
         let events = provider.start_turn(ProviderTurn {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
             messages: vec![json!({"role": "user", "content": "finish"})],
             tools: vec![ToolSpec {
                 name: "shell".to_string(),
+                namespace: None,
+                namespace_description: None,
                 description: "run shell".to_string(),
                 input_schema: json!({
                     "type": "object",
@@ -2763,7 +8237,10 @@ mod tests {
                     "required": ["cmd"],
                     "additionalProperties": false
                 }),
+                output_schema: None,
+                freeform: None,
             }],
+            ..ProviderTurn::default()
         })?;
         handle.join().expect("mock server thread");
         assert!(events.contains(&ModelEvent::TextDelta {
@@ -2773,6 +8250,7 @@ mod tests {
             call: ToolCall {
                 id: "toolu_bash".to_string(),
                 name: "shell".to_string(),
+                namespace: None,
                 arguments: json!({"cmd": "pwd"}),
             }
         }));
@@ -2785,6 +8263,105 @@ mod tests {
                 ..Default::default()
             }
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_oauth_refreshes_once_after_401_like_codex_auth_recovery() -> Result<()> {
+        let success = json!({
+            "id": "msg_refresh",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "text", "text": "Recovered." }],
+            "usage": { "input_tokens": 1, "output_tokens": 2 }
+        })
+        .to_string();
+        let (base_url, headers_rx, handle) = spawn_request_header_capture_server_sequence(vec![
+            MockHttpResponse::new(
+                401,
+                "Unauthorized",
+                r#"{"error":{"message":"stale oauth token"}}"#,
+                "application/json",
+            ),
+            MockHttpResponse::new(200, "OK", success, "application/json"),
+        ])?;
+        let refresh_count = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let refresh_count_for_fn = refresh_count.clone();
+        let provider = AnthropicMessagesProvider::with_claude_code_oauth_refresh_for_test(
+            ClaudeCodeOAuthCredential {
+                access_token: "stale-claude-token".to_string(),
+                refresh_token: "refresh-token".to_string(),
+                expires_ms: 9_999_999_999_999,
+            },
+            "claude-test",
+            base_url,
+            move |refresh_token| {
+                assert_eq!(refresh_token, "refresh-token");
+                refresh_count_for_fn.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ClaudeCodeOAuthCredential {
+                    access_token: "fresh-claude-token".to_string(),
+                    refresh_token: "fresh-refresh-token".to_string(),
+                    expires_ms: 9_999_999_999_999,
+                })
+            },
+        );
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let first = headers_rx.recv().expect("first request headers");
+        let second = headers_rx.recv().expect("second request headers");
+
+        assert_eq!(refresh_count.load(std::sync::atomic::Ordering::SeqCst), 1);
+        assert!(first
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer stale-claude-token\r\n"));
+        assert!(second
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer fresh-claude-token\r\n"));
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Recovered.".to_string()
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_static_oauth_401_stays_terminal_like_codex_without_recovery() -> Result<()> {
+        let (base_url, handle) = spawn_timed_status_sequence_server(vec![
+            MockHttpResponse::new(
+                401,
+                "Unauthorized",
+                r#"{"error":{"message":"stale static token"}}"#,
+                "application/json",
+            ),
+            MockHttpResponse::new(
+                200,
+                "OK",
+                r#"{"content":[{"type":"text","text":"unexpected"}],"usage":{"input_tokens":1,"output_tokens":1}}"#,
+                "application/json",
+            ),
+        ])?;
+        let provider = AnthropicMessagesProvider::with_auth_token(
+            "claude-oauth-token",
+            "claude-test",
+            base_url,
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("static OAuth 401 should be terminal");
+        let served = handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+
+        assert_eq!(served, 1);
+        assert_eq!(provider_error.kind(), ProviderErrorKind::Unauthorized);
         Ok(())
     }
 
@@ -2808,9 +8385,2072 @@ mod tests {
     }
 
     #[test]
+    fn amazon_bedrock_model_catalog_uses_codex_static_models() {
+        let catalog = amazon_bedrock_model_catalog();
+        let slugs = catalog
+            .models
+            .iter()
+            .map(|entry| entry.slug.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            slugs,
+            vec![
+                "openai.gpt-5.4",
+                "openai.gpt-oss-120b",
+                "openai.gpt-oss-20b"
+            ]
+        );
+
+        let gpt = &catalog.models[0];
+        assert_eq!(gpt.display_name, "gpt-5.4");
+        assert_eq!(
+            gpt.description.as_deref(),
+            Some("Strong model for everyday coding.")
+        );
+        assert_eq!(gpt.default_reasoning_level.as_deref(), Some("medium"));
+        assert_eq!(
+            gpt.supported_reasoning_levels
+                .iter()
+                .map(|level| level.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["minimal", "low", "medium", "high"]
+        );
+        assert_eq!(gpt.service_tiers[0].id, "priority");
+        assert_eq!(gpt.service_tiers[0].name, "fast");
+        assert_eq!(gpt.default_verbosity.as_deref(), Some("medium"));
+        assert!(gpt.support_verbosity);
+        assert!(gpt.supports_parallel_tool_calls);
+        assert!(gpt.supports_image_detail_original);
+        assert_eq!(gpt.input_modalities, vec!["text", "image"]);
+        assert_eq!(gpt.context_window, Some(272_000));
+        assert_eq!(gpt.max_context_window, Some(1_000_000));
+        assert_eq!(
+            gpt.truncation_policy.mode,
+            ModelTruncationPolicyMode::Tokens
+        );
+        assert_eq!(gpt.truncation_policy.limit, 10_000);
+
+        let oss = &catalog.models[1];
+        assert_eq!(oss.display_name, "GPT OSS 120B on Bedrock");
+        assert_eq!(oss.default_reasoning_level.as_deref(), Some("medium"));
+        assert_eq!(
+            oss.supported_reasoning_levels
+                .iter()
+                .map(|level| level.effort.as_str())
+                .collect::<Vec<_>>(),
+            vec!["low", "medium", "high"]
+        );
+        assert!(oss.service_tiers.is_empty());
+        assert!(!oss.support_verbosity);
+        assert_eq!(oss.default_verbosity, None);
+        assert!(oss.supports_parallel_tool_calls);
+        assert!(!oss.supports_image_detail_original);
+        assert_eq!(oss.input_modalities, vec!["text"]);
+        assert_eq!(oss.context_window, Some(128_000));
+        assert_eq!(oss.max_context_window, Some(128_000));
+    }
+
+    #[test]
+    fn amazon_bedrock_mantle_base_url_matches_codex_supported_regions() -> Result<()> {
+        assert_eq!(
+            amazon_bedrock_mantle_base_url(" ap-northeast-1 ")?,
+            "https://bedrock-mantle.ap-northeast-1.api.aws/openai/v1"
+        );
+        assert_eq!(
+            amazon_bedrock_mantle_base_url("us-gov-west-1")?,
+            "https://bedrock-mantle.us-gov-west-1.api.aws/openai/v1"
+        );
+        let error = amazon_bedrock_mantle_base_url("us-west-1")
+            .expect_err("unsupported Bedrock region should fail");
+        assert!(
+            format!("{error:#}")
+                .contains("Amazon Bedrock Mantle does not support region `us-west-1`"),
+            "{error:#}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_amazon_bedrock_sigv4_signs_request_and_strips_mantle_headers(
+    ) -> Result<()> {
+        let _lock = ENV_LOCK.lock().expect("env lock");
+        let _access_key = EnvVarGuard::set_str("AWS_ACCESS_KEY_ID", "AKIDEXAMPLE");
+        let _secret_key = EnvVarGuard::set_str(
+            "AWS_SECRET_ACCESS_KEY",
+            "wJalrXUtnFEMI/K7MDENG+bPxRfiCYEXAMPLEKEY",
+        );
+        let _session_token = EnvVarGuard::set_str("AWS_SESSION_TOKEN", "session-token");
+        let _metadata_disabled = EnvVarGuard::set_str("AWS_EC2_METADATA_DISABLED", "true");
+        let _profile = EnvVarGuard::remove("AWS_PROFILE");
+        let _region = EnvVarGuard::remove("AWS_REGION");
+        let _default_region = EnvVarGuard::remove("AWS_DEFAULT_REGION");
+        let _config_file =
+            EnvVarGuard::set_str("AWS_CONFIG_FILE", "/tmp/browser-use-empty-aws-config");
+        let _credentials_file = EnvVarGuard::set_str(
+            "AWS_SHARED_CREDENTIALS_FILE",
+            "/tmp/browser-use-empty-aws-credentials",
+        );
+
+        let (base_url, headers_rx, handle) =
+            spawn_request_header_capture_server(MockHttpResponse::new(
+                200,
+                "OK",
+                codex_completed_sse("bedrock_resp"),
+                "text/event-stream",
+            ))?;
+        let provider =
+            OpenAIResponsesProvider::with_optional_api_key(None, "openai.gpt-5.4", base_url)
+                .with_provider_name(AMAZON_BEDROCK_PROVIDER_ID)
+                .with_request_options(ProviderRequestOptions {
+                    query_params: Vec::new(),
+                    headers: HashMap::from([(
+                        "x-amzn-mantle-client-agent".to_string(),
+                        "codex".to_string(),
+                    )]),
+                })
+                .with_amazon_bedrock_sigv4_auth_for_test(AmazonBedrockAwsAuthConfig {
+                    profile: None,
+                    region: Some("us-west-2".to_string()),
+                })?;
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            extra_headers: Some(HashMap::from([
+                (
+                    "future_identity_header".to_string(),
+                    "019dae79-15c3-70c3-8736-3219b8602b37".to_string(),
+                ),
+                ("session_id".to_string(), "session".to_string()),
+                ("thread_id".to_string(), "thread".to_string()),
+                ("x-client-request-id".to_string(), "request-id".to_string()),
+            ])),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let headers = headers_rx.recv().expect("request headers");
+        let headers_lower = headers.to_ascii_lowercase();
+
+        assert!(events.contains(&ModelEvent::Done));
+        assert!(headers_lower.contains("\r\nauthorization: aws4-hmac-sha256 "));
+        assert!(headers_lower.contains("credential=akidexample/"));
+        assert!(headers_lower.contains("/us-west-2/bedrock-mantle/aws4_request"));
+        assert!(headers_lower.contains("\r\nx-amz-date: "));
+        assert!(headers_lower.contains("\r\nx-amz-security-token: session-token\r\n"));
+        assert!(headers_lower.contains("\r\nx-amzn-mantle-client-agent: codex\r\n"));
+        assert!(headers_lower.contains("\r\nx-client-request-id: request-id\r\n"));
+        assert!(!headers_lower.contains("\r\nauthorization: bearer "));
+        assert!(!headers_lower.contains("\r\nfuture_identity_header:"));
+        assert!(!headers_lower.contains("\r\nsession_id:"));
+        assert!(!headers_lower.contains("\r\nthread_id:"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_serializes_model_request_settings() -> Result<()> {
+        let response_body = json!({
+            "id": "resp_123",
+            "output": [],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2
+            }
+        })
+        .to_string();
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body, "application/json")?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.5", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings {
+                reasoning_effort: Some("high".to_string()),
+                reasoning_summary: Some("detailed".to_string()),
+                model_supports_reasoning_summaries: None,
+                text_verbosity: Some("high".to_string()),
+                service_tier: None,
+            },
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            output_schema: Some(json!({
+                "type": "object",
+                "properties": {
+                    "ok": { "type": "boolean" }
+                },
+                "required": ["ok"],
+                "additionalProperties": false
+            })),
+            output_schema_strict: false,
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["reasoning"]["summary"], "detailed");
+        assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(request["text"]["verbosity"], "high");
+        assert_eq!(request["text"]["format"]["type"], "json_schema");
+        assert_eq!(request["text"]["format"]["strict"], false);
+        assert_eq!(request["text"]["format"]["name"], "codex_output_schema");
+        assert_eq!(
+            request["text"]["format"]["schema"]["required"],
+            json!(["ok"])
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_serializes_supported_service_tier_like_codex() -> Result<()> {
+        let response_body = json!({
+            "id": "resp_123",
+            "output": [],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2
+            }
+        })
+        .to_string();
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body, "application/json")?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.4", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings {
+                service_tier: Some("priority".to_string()),
+                ..Default::default()
+            },
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert_eq!(request["service_tier"], "priority");
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_omits_unsupported_mini_service_tier_like_codex() -> Result<()> {
+        let response_body = json!({
+            "id": "resp_123",
+            "output": [],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2
+            }
+        })
+        .to_string();
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body, "application/json")?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.4-mini", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings {
+                service_tier: Some("priority".to_string()),
+                ..Default::default()
+            },
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert!(request.get("service_tier").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn spawn_agent_model_overrides_description_matches_codex_catalog_slice() {
+        let description = spawn_agent_model_overrides_description();
+        assert!(description.contains(
+            "Available model overrides (optional; inherited parent model is preferred):"
+        ));
+        assert!(description.contains(
+            "- `gpt-5.5`: Frontier model for complex coding, research, and real-world work. Reasoning efforts: low, medium (default), high, xhigh. Service tiers: priority."
+        ));
+        assert!(description.contains(
+            "- `gpt-5.4`: Strong model for everyday coding. Reasoning efforts: low, medium (default), high, xhigh. Service tiers: priority."
+        ));
+        assert!(description.contains(
+            "- `gpt-5.4-mini`: Small, fast, and cost-efficient model for simpler coding tasks. Reasoning efforts: low, medium (default), high, xhigh."
+        ));
+        assert!(description.contains(
+            "- `gpt-5.3-codex`: Coding-optimized model. Reasoning efforts: low, medium (default), high, xhigh."
+        ));
+        assert!(description.contains(
+            "- `gpt-5.2`: Optimized for professional work and long-running agents. Reasoning efforts: low, medium (default), high, xhigh."
+        ));
+        assert!(!description.contains("codex-auto-review"));
+    }
+
+    #[test]
+    fn bundled_model_catalog_uses_codex_models_json_prompt_shapes() {
+        let catalog = bundled_model_catalog();
+        assert_eq!(
+            catalog
+                .models
+                .iter()
+                .map(|entry| entry.slug.as_str())
+                .collect::<Vec<_>>(),
+            vec![
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gpt-5.2",
+                "codex-auto-review"
+            ]
+        );
+
+        let gpt_5_4 = catalog.entry_for_model("gpt-5.4").expect("gpt-5.4");
+        assert_eq!(gpt_5_4.base_instructions.chars().count(), 14731);
+        let model_messages = gpt_5_4.model_messages.as_ref().expect("model messages");
+        assert_eq!(
+            model_messages
+                .instructions_template
+                .as_deref()
+                .unwrap_or_default()
+                .chars()
+                .count(),
+            12896
+        );
+
+        let rendered = gpt_5_4.get_model_instructions(Some(ModelPersonality::Pragmatic));
+        assert!(rendered.starts_with(
+            "You are Codex, a coding agent based on GPT-5. You and the user share the same workspace"
+        ));
+        assert!(rendered.contains("# Personality\n\nYou are a deeply pragmatic"));
+        assert!(!rendered.contains("{{ base_instructions }}"));
+        assert!(catalog
+            .entry_for_model("gpt-5.2")
+            .expect("gpt-5.2")
+            .model_messages
+            .is_none());
+    }
+
+    #[test]
+    fn bundled_model_presets_are_catalog_derived_like_codex() {
+        let presets = bundled_model_presets();
+        let picker_ids = presets
+            .iter()
+            .filter(|preset| preset.show_in_picker)
+            .map(|preset| preset.id.as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(
+            picker_ids,
+            vec![
+                "gpt-5.5",
+                "gpt-5.4",
+                "gpt-5.4-mini",
+                "gpt-5.3-codex",
+                "gpt-5.2"
+            ]
+        );
+        assert_eq!(
+            presets
+                .iter()
+                .filter(|preset| preset.is_default)
+                .map(|preset| preset.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["gpt-5.5"]
+        );
+        let auto_review = presets
+            .iter()
+            .find(|preset| preset.id == "codex-auto-review")
+            .expect("auto review preset");
+        assert!(!auto_review.show_in_picker);
+        assert!(auto_review.supports_personality);
+    }
+
+    #[test]
+    fn dynamic_model_catalog_drives_presets_requests_and_instructions_like_codex() {
+        let catalog: ModelCatalog = serde_json::from_value(json!({
+            "models": [
+                {
+                    "slug": "catalog-hidden",
+                    "display_name": "Catalog Hidden",
+                    "description": "Hidden but request-capable.",
+                    "default_reasoning_level": "low",
+                    "supported_reasoning_levels": [{"effort": "low"}],
+                    "visibility": "hide",
+                    "supported_in_api": true,
+                    "priority": 0,
+                    "base_instructions": "Hidden base",
+                    "supports_reasoning_summaries": true,
+                    "default_reasoning_summary": "none",
+                    "supports_parallel_tool_calls": false,
+                    "input_modalities": ["text"]
+                },
+                {
+                    "slug": "catalog-model",
+                    "display_name": "Catalog Model",
+                    "description": "Catalog-defined picker model.",
+                    "default_reasoning_level": "high",
+                    "supported_reasoning_levels": [{"effort": "low"}, {"effort": "high"}],
+                    "visibility": "list",
+                    "supported_in_api": true,
+                    "priority": 2,
+                    "service_tiers": [{"id": "priority", "name": "", "description": ""}],
+                    "base_instructions": "Catalog base",
+                    "model_messages": {
+                        "instructions_template": "Catalog template {{ personality }} :: {{ base_instructions }}",
+                        "instructions_variables": {
+                            "personality_default": "default personality",
+                            "personality_friendly": "friendly personality",
+                            "personality_pragmatic": "pragmatic personality"
+                        }
+                    },
+                    "supports_reasoning_summaries": true,
+                    "default_reasoning_summary": "detailed",
+                    "support_verbosity": true,
+                    "default_verbosity": "high",
+                    "supports_parallel_tool_calls": true,
+                    "supports_image_detail_original": true,
+                    "context_window": 1000,
+                    "max_context_window": 2000,
+                    "auto_compact_token_limit": 800,
+                    "truncation_policy": {"mode": "tokens", "limit": 123}
+                }
+            ]
+        }))
+        .expect("catalog json");
+
+        let presets = catalog.presets(true);
+        assert_eq!(
+            presets
+                .iter()
+                .filter(|preset| preset.is_default)
+                .map(|preset| preset.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["catalog-model"]
+        );
+        let info = model_request_info_for_catalog("catalog-model-2026", Some(&catalog));
+        assert_eq!(info.default_reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(info.default_verbosity.as_deref(), Some("high"));
+        assert!(info.supports_parallel_tool_calls);
+        assert!(info.supports_image_detail_original);
+        assert_eq!(info.resolved_context_window(), Some(1000));
+        assert_eq!(info.auto_compact_token_limit(), Some(800));
+        assert_eq!(info.tool_output_token_budget(), 123);
+
+        let hidden = model_request_info_for_catalog("catalog-hidden", Some(&catalog));
+        assert!(!hidden.supports_image_input);
+        assert!(!hidden.supports_parallel_tool_calls);
+        assert_eq!(hidden.tool_output_token_budget(), 2500);
+
+        let description = spawn_agent_model_overrides_description_for_catalog(&catalog, true);
+        assert!(description.contains("- `catalog-model`: Catalog-defined picker model."));
+        assert!(!description.contains("catalog-hidden"));
+
+        let instructions = default_agent_instructions_for_model_and_personality_with_catalog(
+            "catalog-model",
+            ModelPersonality::Pragmatic,
+            Some(&catalog),
+        );
+        assert!(instructions
+            .starts_with("Catalog template pragmatic personality :: {{ base_instructions }}"));
+    }
+
+    #[test]
+    fn openai_responses_provider_uses_model_defaults_for_known_models() -> Result<()> {
+        let response_body = json!({
+            "id": "resp_123",
+            "output": [],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2
+            }
+        })
+        .to_string();
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body, "application/json")?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.5", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings::default(),
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert_eq!(request["reasoning"]["effort"], "medium");
+        assert!(request["reasoning"].get("summary").is_none());
+        assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(request["text"]["verbosity"], "low");
+        assert_eq!(request["parallel_tool_calls"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_uses_codex_streaming_request_fields() -> Result<()> {
+        let response_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body.to_string(), "text/event-stream")?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.5", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings::default(),
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            prompt_cache_key: Some("thread-123".to_string()),
+            previous_response_id: Some("resp_previous".to_string()),
+            client_metadata: Some(HashMap::from([(
+                "x-codex-installation-id".to_string(),
+                "install-123".to_string(),
+            )])),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert_eq!(request["stream"], true);
+        assert_eq!(request["tool_choice"], "auto");
+        assert_eq!(request["store"], false);
+        assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(request["prompt_cache_key"], "thread-123");
+        assert_eq!(request["previous_response_id"], "resp_previous");
+        assert_eq!(
+            request["client_metadata"]["x-codex-installation-id"],
+            "install-123"
+        );
+        assert_eq!(request["parallel_tool_calls"], true);
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_sends_codex_identity_headers() -> Result<()> {
+        let response_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, headers_rx, handle) = spawn_request_header_capture_server(
+            MockHttpResponse::new(200, "OK", response_body, "text/event-stream"),
+        )?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.5", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings::default(),
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            extra_headers: Some(HashMap::from([
+                ("session-id".to_string(), "session-123".to_string()),
+                ("thread-id".to_string(), "session-123".to_string()),
+                ("x-client-request-id".to_string(), "session-123".to_string()),
+                ("x-codex-window-id".to_string(), "window-123".to_string()),
+                (
+                    "x-codex-beta-features".to_string(),
+                    "remote_compaction_v2".to_string(),
+                ),
+                ("x-openai-subagent".to_string(), "collab_spawn".to_string()),
+                (
+                    "x-codex-parent-thread-id".to_string(),
+                    "parent-123".to_string(),
+                ),
+            ])),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let headers = headers_rx.recv().expect("request headers");
+        let headers = headers.to_ascii_lowercase();
+
+        assert!(headers.contains("\r\nsession-id: session-123\r\n"));
+        assert!(headers.contains("\r\nthread-id: session-123\r\n"));
+        assert!(headers.contains("\r\nx-client-request-id: session-123\r\n"));
+        assert!(headers.contains("\r\nx-codex-window-id: window-123\r\n"));
+        assert!(headers.contains("\r\nx-codex-beta-features: remote_compaction_v2\r\n"));
+        assert!(headers.contains("\r\nx-openai-subagent: collab_spawn\r\n"));
+        assert!(headers.contains("\r\nx-codex-parent-thread-id: parent-123\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_applies_provider_registry_headers_and_query_params() -> Result<()>
+    {
+        let response_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, headers_rx, handle) = spawn_request_header_capture_server(
+            MockHttpResponse::new(200, "OK", response_body, "text/event-stream"),
+        )?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.5", base_url)
+            .with_provider_name("openai-custom")
+            .with_request_options(ProviderRequestOptions {
+                query_params: vec![("api-version".to_string(), "2026-05-25".to_string())],
+                headers: HashMap::from([("x-provider-test".to_string(), "yes".to_string())]),
+            });
+
+        assert_eq!(provider.provider_name(), "openai-custom");
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let headers = headers_rx.recv().expect("request headers");
+
+        assert!(headers.starts_with("POST /v1/responses?api-version=2026-05-25 "));
+        assert!(headers
+            .to_ascii_lowercase()
+            .contains("\r\nx-provider-test: yes\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_command_auth_refreshes_after_401_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let response_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, headers_rx, handle) = spawn_request_header_capture_server_sequence(vec![
+            MockHttpResponse::new(
+                401,
+                "Unauthorized",
+                r#"{"error":{"message":"stale token"}}"#,
+                "application/json",
+            ),
+            MockHttpResponse::new(200, "OK", response_body, "text/event-stream"),
+        ])?;
+        let provider = OpenAIResponsesProvider::with_optional_api_key(None, "gpt-5.5", base_url)
+            .with_command_auth_config(ProviderCommandAuthConfig {
+                command: "sh".to_string(),
+                args: vec![
+                    "-c".to_string(),
+                    "if [ -f token_counter ]; then echo ' fresh-token '; else touch token_counter; echo stale-token; fi".to_string(),
+                ],
+                timeout_ms: 5_000,
+                refresh_interval_ms: 300_000,
+                cwd: temp.path().to_path_buf(),
+            });
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let first = headers_rx.recv().expect("first request headers");
+        let second = headers_rx.recv().expect("second request headers");
+
+        assert!(first
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer stale-token\r\n"));
+        assert!(second
+            .to_ascii_lowercase()
+            .contains("\r\nauthorization: bearer fresh-token\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn codex_responses_http_omits_websocket_beta_header_like_codex() -> Result<()> {
+        let response_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, headers_rx, handle) = spawn_request_header_capture_server(
+            MockHttpResponse::new(200, "OK", response_body, "text/event-stream"),
+        )?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let headers = headers_rx
+            .recv()
+            .expect("request headers")
+            .to_ascii_lowercase();
+
+        assert!(!headers.contains("\r\nopenai-beta: responses=experimental\r\n"));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_replays_sticky_turn_state_like_codex() -> Result<()> {
+        let response_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, headers_rx, handle) = spawn_request_header_capture_server_sequence(vec![
+            MockHttpResponse::new(200, "OK", response_body, "text/event-stream")
+                .with_header("x-codex-turn-state", "sticky-a"),
+            MockHttpResponse::new(200, "OK", response_body, "text/event-stream")
+                .with_header("x-codex-turn-state", "sticky-b"),
+            MockHttpResponse::new(200, "OK", response_body, "text/event-stream"),
+        ])?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-5.5", base_url);
+        let turn_state = Arc::new(Mutex::new(None));
+
+        for _ in 0..3 {
+            provider.start_turn(ProviderTurn {
+                instructions: Some("base".to_string()),
+                model_settings: ModelRequestSettings::default(),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                tools: Vec::new(),
+                turn_state: Some(Arc::clone(&turn_state)),
+                ..ProviderTurn::default()
+            })?;
+        }
+        handle.join().expect("mock server thread");
+        let first_headers = headers_rx
+            .recv()
+            .expect("first request headers")
+            .to_ascii_lowercase();
+        let second_headers = headers_rx
+            .recv()
+            .expect("second request headers")
+            .to_ascii_lowercase();
+        let third_headers = headers_rx
+            .recv()
+            .expect("third request headers")
+            .to_ascii_lowercase();
+
+        assert!(!first_headers.contains("\r\nx-codex-turn-state:"));
+        assert!(second_headers.contains("\r\nx-codex-turn-state: sticky-a\r\n"));
+        assert!(third_headers.contains("\r\nx-codex-turn-state: sticky-a\r\n"));
+        assert_eq!(
+            turn_state.lock().expect("turn state lock").as_deref(),
+            Some("sticky-a")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_does_not_auto_reuse_previous_response_over_http_like_codex(
+    ) -> Result<()> {
+        let assistant_item = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "first answer" }]
+        });
+        let first_response = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "output": [assistant_item.clone()],
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            })
+        );
+        let second_response = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n".to_string();
+        let (base_url, body_rx, handle) = spawn_request_capture_server_sequence(
+            vec![first_response, second_response],
+            "text/event-stream",
+        )?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            messages: vec![json!({"role": "user", "content": "first"})],
+            prompt_cache_key: Some("thread-123".to_string()),
+            ..ProviderTurn::default()
+        })?;
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            messages: vec![
+                json!({"role": "user", "content": "first"}),
+                assistant_item,
+                json!({"role": "user", "content": "second"}),
+            ],
+            prompt_cache_key: Some("thread-123".to_string()),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let first_request = body_rx.recv().expect("first request body");
+        let second_request = body_rx.recv().expect("second request body");
+
+        assert!(first_request.get("previous_response_id").is_none());
+        assert!(second_request.get("previous_response_id").is_none());
+        let second_input = second_request["input"].as_array().expect("input array");
+        assert_eq!(second_input.len(), 3);
+        assert_eq!(second_input[0]["role"], "user");
+        assert_eq!(second_input[0]["content"][0]["text"], "first");
+        assert_eq!(second_input[2]["role"], "user");
+        assert_eq!(second_input[2]["content"][0]["text"], "second");
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_sends_full_http_body_when_non_input_differs() -> Result<()> {
+        let first_response = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_1\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n".to_string();
+        let second_response = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n".to_string();
+        let (base_url, body_rx, handle) = spawn_request_capture_server_sequence(
+            vec![first_response, second_response],
+            "text/event-stream",
+        )?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base-a".to_string()),
+            messages: vec![json!({"role": "user", "content": "first"})],
+            ..ProviderTurn::default()
+        })?;
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base-b".to_string()),
+            messages: vec![
+                json!({"role": "user", "content": "first"}),
+                json!({"role": "user", "content": "second"}),
+            ],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let _first_request = body_rx.recv().expect("first request body");
+        let second_request = body_rx.recv().expect("second request body");
+
+        assert!(second_request.get("previous_response_id").is_none());
+        assert_eq!(
+            second_request["input"]
+                .as_array()
+                .expect("input array")
+                .len(),
+            2
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_clears_previous_response_after_stream_error() -> Result<()> {
+        let assistant_item = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "first answer" }]
+        });
+        let first_response = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "output": [assistant_item.clone()],
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            })
+        );
+        let failed_response =
+            "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n"
+                .to_string();
+        let third_response = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_3\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n".to_string();
+        let (base_url, body_rx, handle) = spawn_request_capture_server_sequence(
+            vec![first_response, failed_response, third_response],
+            "text/event-stream",
+        )?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+        let full_history = vec![
+            json!({"role": "user", "content": "first"}),
+            assistant_item,
+            json!({"role": "user", "content": "second"}),
+        ];
+
+        provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "first"})],
+            ..ProviderTurn::default()
+        })?;
+        let error = provider
+            .start_turn(ProviderTurn {
+                messages: full_history.clone(),
+                ..ProviderTurn::default()
+            })
+            .expect_err("second turn should fail");
+        assert!(format!("{error:#}").contains("Incomplete response returned"));
+        provider.start_turn(ProviderTurn {
+            messages: full_history,
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let _first_request = body_rx.recv().expect("first request body");
+        let second_request = body_rx.recv().expect("second request body");
+        let third_request = body_rx.recv().expect("third request body");
+
+        assert!(second_request.get("previous_response_id").is_none());
+        assert_eq!(
+            second_request["input"]
+                .as_array()
+                .expect("input array")
+                .len(),
+            3
+        );
+        assert!(third_request.get("previous_response_id").is_none());
+        assert_eq!(
+            third_request["input"]
+                .as_array()
+                .expect("input array")
+                .len(),
+            3
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_hidden_request_retry_preserves_full_http_body_like_codex() -> Result<()> {
+        let assistant_item = json!({
+            "id": "msg_1",
+            "type": "message",
+            "role": "assistant",
+            "content": [{ "type": "output_text", "text": "first answer" }]
+        });
+        let first_response = format!(
+            "data: {}\n\n",
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_1",
+                    "output": [assistant_item.clone()],
+                    "usage": { "input_tokens": 1, "output_tokens": 1, "total_tokens": 2 }
+                }
+            })
+        );
+        let retry_success = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_2\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, body_rx, handle) = spawn_request_capture_http_sequence(vec![
+            MockHttpResponse::new(200, "OK", first_response, "text/event-stream"),
+            MockHttpResponse::new(
+                500,
+                "Internal Server Error",
+                "temporary failure",
+                "text/plain",
+            ),
+            MockHttpResponse::new(200, "OK", retry_success, "text/event-stream"),
+        ])?;
+        let mut provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+        let full_history = vec![
+            json!({"role": "user", "content": "first"}),
+            assistant_item,
+            json!({"role": "user", "content": "second"}),
+        ];
+
+        provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "first"})],
+            ..ProviderTurn::default()
+        })?;
+        provider.start_turn(ProviderTurn {
+            messages: full_history,
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let first_request = body_rx.recv().expect("first request body");
+        let first_attempt = body_rx.recv().expect("first retrying request body");
+        let second_attempt = body_rx.recv().expect("second retrying request body");
+
+        assert!(first_request.get("previous_response_id").is_none());
+        for request in [first_attempt, second_attempt] {
+            assert!(request.get("previous_response_id").is_none());
+            let input = request["input"].as_array().expect("input array");
+            assert_eq!(input.len(), 3);
+            assert_eq!(input[0]["role"], "user");
+            assert_eq!(input[0]["content"][0]["text"], "first");
+            assert_eq!(input[2]["role"], "user");
+            assert_eq!(input[2]["content"][0]["text"], "second");
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn codex_responses_provider_serializes_previous_response_id() -> Result<()> {
+        let response_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body.to_string(), "text/event-stream")?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "delta only"})],
+            previous_response_id: Some("resp_previous".to_string()),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert_eq!(request["previous_response_id"], "resp_previous");
+        assert_eq!(request["store"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn azure_responses_base_url_sets_store_like_codex() {
+        assert!(is_azure_responses_base_url(
+            "https://foo.openai.azure.com/openai"
+        ));
+        assert!(is_azure_responses_base_url(
+            "https://foo.openai.azure.us/openai/deployments/bar"
+        ));
+        assert!(is_azure_responses_base_url(
+            "https://foo.cognitiveservices.azure.cn/openai"
+        ));
+        assert!(!is_azure_responses_base_url(
+            "https://myproxy.azurewebsites.net/openai"
+        ));
+    }
+
+    #[test]
+    fn openai_responses_provider_omits_unsupported_model_settings_for_unknown_models() -> Result<()>
+    {
+        let response_body = json!({
+            "id": "resp_123",
+            "output": [],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2
+            }
+        })
+        .to_string();
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body, "application/json")?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings {
+                reasoning_effort: Some("high".to_string()),
+                reasoning_summary: Some("detailed".to_string()),
+                model_supports_reasoning_summaries: None,
+                text_verbosity: Some("high".to_string()),
+                service_tier: None,
+            },
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert!(request.get("reasoning").is_none());
+        assert_eq!(request["include"], json!([]));
+        assert!(request.get("text").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_sse_errors_before_done_like_codex() -> Result<()> {
+        for (sse, expected) in [
+            (
+                "data: {\"type\":\"response.failed\",\"response\":{\"error\":{\"code\":\"context_length_exceeded\",\"message\":\"Your input exceeds the context window.\"}}}\n\n",
+                "response.failed (context_length_exceeded): Your input exceeds the context window.",
+            ),
+            (
+                "data: {\"type\":\"response.incomplete\",\"response\":{\"incomplete_details\":{\"reason\":\"max_output_tokens\"}}}\n\n",
+                "Incomplete response returned, reason: max_output_tokens",
+            ),
+            (
+                "data: {\"type\":\"response.output_text.delta\",\"delta\":\"partial\"}\n\n",
+                "stream closed before response.completed",
+            ),
+            (
+                "data: {\"type\":\"response.done\",\"response\":{\"output\":[]}}\n\n",
+                "stream closed before response.completed",
+            ),
+        ] {
+            let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
+            let provider = CodexResponsesProvider::with_base_url(
+                CodexAuth {
+                    access_token: "chatgpt-token".to_string(),
+                    account_id: "account-123".to_string(),
+                },
+                "gpt-test",
+                format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+            );
+            let err = provider
+                .start_turn(ProviderTurn {
+                    instructions: None,
+                    model_settings: ModelRequestSettings::default(),
+                    messages: vec![json!({"role": "user", "content": "finish"})],
+                    tools: Vec::new(),
+                    ..ProviderTurn::default()
+                })
+                .expect_err("stream should fail before completion");
+            handle.join().expect("mock server thread");
+            assert!(
+                format!("{err:#}").contains(expected),
+                "expected {expected:?}, got {err:#}"
+            );
+            if expected == "stream closed before response.completed" {
+                let provider_error = err
+                    .downcast_ref::<ProviderError>()
+                    .expect("EOF before response.completed should be a typed stream error");
+                assert_eq!(provider_error.kind(), ProviderErrorKind::Stream);
+                assert!(provider_error.is_retryable());
+            }
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_sse_malformed_event_does_not_mask_later_completion_like_codex() -> Result<()> {
+        let sse = concat!(
+            "data: {not json}\n\n",
+            "data: {\"type\":\"response.output_text.delta\",\"delta\":\"ok\"}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_ok\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        assert!(events
+            .iter()
+            .any(|event| { matches!(event, ModelEvent::TextDelta { text } if text == "ok") }));
+        assert!(events.iter().any(|event| matches!(event, ModelEvent::Done)));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_sse_header_metadata_events_match_codex() -> Result<()> {
+        let sse = concat!(
+            "data: {\"type\":\"response.created\",\"response\":{\"headers\":{\"x-openai-model\":[\"gpt-event-routed\"]}}}\n\n",
+            "data: {\"type\":\"response.metadata\",\"metadata\":{\"openai_verification_recommendation\":[\"trusted_access_for_cyber\",\"unknown\",\"trusted_access_for_cyber\"]}}\n\n",
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_header_metadata\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_status_sequence_server(vec![MockHttpResponse::new(
+            200,
+            "OK",
+            sse,
+            "text/event-stream",
+        )
+        .with_header("openai-model", "gpt-server-routed")
+        .with_header("x-codex-primary-used-percent", "12.5")
+        .with_header("x-codex-primary-window-minutes", "300")
+        .with_header("x-codex-primary-reset-at", "1770000000")
+        .with_header("x-codex-credits-has-credits", "true")
+        .with_header("x-codex-credits-unlimited", "false")
+        .with_header("x-codex-credits-balance", "42")
+        .with_header("x-models-etag", "models-etag-1")
+        .with_header("x-reasoning-included", "true")])?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.contains(&ModelEvent::ServerModel {
+            model: "gpt-server-routed".to_string(),
+        }));
+        assert!(events.contains(&ModelEvent::ServerModel {
+            model: "gpt-event-routed".to_string(),
+        }));
+        assert!(events.contains(&ModelEvent::ModelVerifications {
+            verifications: vec![ModelVerification::TrustedAccessForCyber],
+        }));
+        let snapshot = events
+            .iter()
+            .find_map(|event| match event {
+                ModelEvent::ModelRateLimits { snapshot }
+                    if snapshot.limit_id.as_deref() == Some("codex") =>
+                {
+                    Some(snapshot)
+                }
+                _ => None,
+            })
+            .context("missing Codex rate-limit header event")?;
+        let primary = snapshot.primary.as_ref().context("primary rate limit")?;
+        assert_eq!(primary.used_percent, 12.5);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.resets_at, Some(1770000000));
+        let credits = snapshot.credits.as_ref().context("credits snapshot")?;
+        assert!(credits.has_credits);
+        assert!(!credits.unlimited);
+        assert_eq!(credits.balance.as_deref(), Some("42"));
+        assert!(events.contains(&ModelEvent::ModelsEtag {
+            etag: "models-etag-1".to_string(),
+        }));
+        assert!(events.contains(&ModelEvent::ServerReasoningIncluded { included: true }));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_json_body_decode_error_is_retryable_like_codex() -> Result<()> {
+        let (base_url, handle) = spawn_mock_server("{not json}".to_string(), "application/json")?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("malformed JSON body should fail this attempt");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::Retryable);
+        assert!(provider_error.is_retryable());
+        assert!(provider_error.to_string().contains("parse Responses JSON"));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_failed_rate_limit_carries_requested_retry_delay_like_codex() -> Result<()> {
+        for (message, expected_delay) in [
+            (
+                "Rate limit reached. Please try again in 28ms.",
+                Duration::from_millis(28),
+            ),
+            (
+                "Rate limit reached. Please try again in 11.054s.",
+                Duration::from_secs_f64(11.054),
+            ),
+            (
+                "Rate limit reached. Please try again in 35 seconds.",
+                Duration::from_secs(35),
+            ),
+        ] {
+            let sse = format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": "rate_limit_exceeded",
+                            "message": message
+                        }
+                    }
+                })
+            );
+            let (base_url, handle) = spawn_mock_server(sse, "text/event-stream")?;
+            let provider = CodexResponsesProvider::with_base_url(
+                CodexAuth {
+                    access_token: "chatgpt-token".to_string(),
+                    account_id: "account-123".to_string(),
+                },
+                "gpt-test",
+                format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+            );
+            let err = provider
+                .start_turn(ProviderTurn {
+                    messages: vec![json!({"role": "user", "content": "finish"})],
+                    ..ProviderTurn::default()
+                })
+                .expect_err("rate limit should fail this turn");
+            handle.join().expect("mock server thread");
+            let provider_error = err
+                .downcast_ref::<ProviderError>()
+                .expect("typed provider error");
+            assert_eq!(provider_error.kind(), ProviderErrorKind::Retryable);
+            assert!(provider_error.is_retryable());
+            assert_eq!(provider_error.retry_delay(), Some(expected_delay));
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_failed_terminal_codes_are_not_retryable_like_codex() {
+        for (code, expected_kind) in [
+            (
+                "context_length_exceeded",
+                ProviderErrorKind::ContextWindowExceeded,
+            ),
+            ("insufficient_quota", ProviderErrorKind::QuotaExceeded),
+            ("usage_not_included", ProviderErrorKind::UsageNotIncluded),
+            ("invalid_prompt", ProviderErrorKind::InvalidRequest),
+            ("cyber_policy", ProviderErrorKind::CyberPolicy),
+            ("server_is_overloaded", ProviderErrorKind::ServerOverloaded),
+            ("slow_down", ProviderErrorKind::ServerOverloaded),
+        ] {
+            let error = response_failed_error(&json!({
+                "type": "response.failed",
+                "response": {
+                    "error": {
+                        "code": code,
+                        "message": "terminal"
+                    }
+                }
+            }));
+            assert_eq!(error.kind(), expected_kind);
+            assert!(!error.is_retryable(), "expected {code} to be terminal");
+        }
+    }
+
+    #[test]
+    fn responses_failed_server_overloaded_is_not_retryable_like_codex() -> Result<()> {
+        for code in ["server_is_overloaded", "slow_down"] {
+            let sse = format!(
+                "data: {}\n\n",
+                json!({
+                    "type": "response.failed",
+                    "response": {
+                        "error": {
+                            "code": code,
+                            "message": "Server is overloaded."
+                        }
+                    }
+                })
+            );
+            let (base_url, handle) = spawn_mock_server(sse, "text/event-stream")?;
+            let provider = CodexResponsesProvider::with_base_url(
+                CodexAuth {
+                    access_token: "chatgpt-token".to_string(),
+                    account_id: "account-123".to_string(),
+                },
+                "gpt-test",
+                format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+            );
+            let err = provider
+                .start_turn(ProviderTurn {
+                    messages: vec![json!({"role": "user", "content": "finish"})],
+                    ..ProviderTurn::default()
+                })
+                .expect_err("server overloaded should fail this turn");
+            handle.join().expect("mock server thread");
+            let provider_error = err
+                .downcast_ref::<ProviderError>()
+                .expect("typed provider error");
+            assert_eq!(provider_error.kind(), ProviderErrorKind::ServerOverloaded);
+            assert!(!provider_error.is_retryable());
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_503_server_overloaded_is_not_retryable_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "code": "server_is_overloaded",
+                "message": "Server is overloaded."
+            }
+        })
+        .to_string();
+        let (base_url, handle) =
+            spawn_mock_status_server(503, "Service Unavailable", body, "application/json")?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("server overloaded HTTP response should fail this turn");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::ServerOverloaded);
+        assert!(!provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_401_is_terminal_unauthorized_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "message": "Unauthorized"
+            }
+        })
+        .to_string();
+        let (base_url, handle) = spawn_timed_status_sequence_server(vec![
+            MockHttpResponse::new(401, "Unauthorized", body, "application/json"),
+            MockHttpResponse::new(
+                200,
+                "OK",
+                "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[]}}\n\n",
+                "text/event-stream",
+            ),
+        ])?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("401 should fail without generic retry");
+        let served = handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::Unauthorized);
+        assert_eq!(provider_error.http_status_code(), Some(401));
+        assert!(!provider_error.is_retryable());
+        assert_eq!(served, 1, "401 must not use hidden generic request retry");
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_400_cyber_policy_uses_typed_fallback_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "code": "cyber_policy"
+            }
+        })
+        .to_string();
+        let (base_url, handle) =
+            spawn_mock_status_server(400, "Bad Request", body, "application/json")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("cyber policy HTTP response should fail this turn");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::CyberPolicy);
+        assert_eq!(
+            provider_error.to_string(),
+            "This request has been flagged for possible cybersecurity risk."
+        );
+        assert!(!provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_429_rate_limit_is_retry_limit_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "type": "rate_limit_exceeded",
+                "message": "Too many requests."
+            }
+        })
+        .to_string();
+        let (base_url, handle) =
+            spawn_mock_status_server(429, "Too Many Requests", body, "application/json")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("HTTP 429 should be terminal after request-level retry handling");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::RetryLimit);
+        assert!(!provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_429_usage_limit_reached_carries_rate_limits_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "type": "usage_limit_reached",
+                "message": "server body message should not override Codex display",
+                "plan_type": "plus"
+            }
+        })
+        .to_string();
+        let (base_url, handle) = spawn_mock_status_sequence_server(vec![MockHttpResponse::new(
+            429,
+            "Too Many Requests",
+            body,
+            "application/json",
+        )
+        .with_header("x-codex-active-limit", "gpt-5")
+        .with_header("x-gpt-5-limit-name", "gpt-5")
+        .with_header("x-gpt-5-primary-used-percent", "100")
+        .with_header("x-gpt-5-primary-window-minutes", "300")
+        .with_header("x-gpt-5-primary-reset-at", "1770000000")
+        .with_header("x-codex-credits-has-credits", "false")
+        .with_header("x-codex-credits-unlimited", "false")])?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("usage_limit_reached HTTP response should fail this turn");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::UsageLimitReached);
+        assert_eq!(
+            provider_error.to_string(),
+            "You've hit your usage limit for gpt-5. Switch to another model now, or try again later."
+        );
+        let snapshot = provider_error
+            .rate_limits()
+            .context("usage limit rate limits")?;
+        assert_eq!(snapshot.limit_id.as_deref(), Some("gpt_5"));
+        assert_eq!(snapshot.limit_name.as_deref(), Some("gpt-5"));
+        let primary = snapshot.primary.as_ref().context("primary rate limit")?;
+        assert_eq!(primary.used_percent, 100.0);
+        assert_eq!(primary.window_minutes, Some(300));
+        assert_eq!(primary.resets_at, Some(1770000000));
+        let credits = snapshot.credits.as_ref().context("credits snapshot")?;
+        assert!(!credits.has_credits);
+        assert!(!credits.unlimited);
+        assert!(!provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_429_usage_not_included_is_terminal_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "type": "usage_not_included"
+            }
+        })
+        .to_string();
+        let (base_url, handle) =
+            spawn_mock_status_server(429, "Too Many Requests", body, "application/json")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("usage_not_included HTTP response should fail this turn");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::UsageNotIncluded);
+        assert!(!provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_500_is_retryable_internal_server_error_like_codex() -> Result<()> {
+        let (base_url, handle) = spawn_mock_status_server(
+            500,
+            "Internal Server Error",
+            "temporary failure".to_string(),
+            "text/plain",
+        )?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_retries();
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("HTTP 500 should fail this attempt");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(
+            provider_error.kind(),
+            ProviderErrorKind::InternalServerError
+        );
+        assert!(provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_5xx_retries_inside_provider_like_codex_request_layer() -> Result<()> {
+        let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_after_retry\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, handle) = spawn_mock_status_sequence_server(vec![
+            MockHttpResponse::new(
+                500,
+                "Internal Server Error",
+                "temporary failure",
+                "text/plain",
+            ),
+            MockHttpResponse::new(200, "OK", completed, "text/event-stream"),
+        ])?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.iter().any(|event| matches!(event, ModelEvent::Done)));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_transport_error_retries_inside_provider_like_codex_request_layer() -> Result<()> {
+        let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_after_transport_retry\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, handle) = spawn_drop_then_status_server(MockHttpResponse::new(
+            200,
+            "OK",
+            completed,
+            "text/event-stream",
+        ))?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+
+        assert!(events.iter().any(|event| matches!(event, ModelEvent::Done)));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_5xx_exhaustion_returns_final_http_error_like_codex() -> Result<()> {
+        let (base_url, handle) = spawn_timed_status_sequence_server(
+            (0..5)
+                .map(|_| {
+                    MockHttpResponse::new(
+                        500,
+                        "Internal Server Error",
+                        "temporary failure",
+                        "text/plain",
+                    )
+                })
+                .collect(),
+        )?;
+        let mut provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        provider.request_retry = ProviderRequestRetryConfig::without_delay();
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("exhausted HTTP 500 retries should return final HTTP error");
+        let served = handle.join().expect("mock server thread");
+        assert_eq!(served, 5);
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(
+            provider_error.kind(),
+            ProviderErrorKind::InternalServerError
+        );
+        assert!(provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_sse_idle_timeout_matches_codex_error() -> Result<()> {
+        let (base_url, handle) = spawn_sse_delayed_body_server(Duration::from_millis(200))?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                stream_idle_timeout_ms: Some(50),
+                request_max_retries: Some(0),
+                ..ProviderTurn::default()
+            })
+            .expect_err("idle SSE stream should fail like Codex");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::Stream);
+        assert_eq!(provider_error.to_string(), "idle timeout waiting for SSE");
+        Ok(())
+    }
+
+    #[test]
+    fn responses_turn_request_max_retries_zero_disables_hidden_retry_like_codex_config(
+    ) -> Result<()> {
+        let completed = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_no_retry\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+        let (base_url, handle) = spawn_timed_status_sequence_server(vec![
+            MockHttpResponse::new(
+                500,
+                "Internal Server Error",
+                "temporary failure",
+                "text/plain",
+            ),
+            MockHttpResponse::new(200, "OK", completed, "text/event-stream"),
+        ])?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                request_max_retries: Some(0),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("request_max_retries=0 should disable hidden retry");
+        let served = handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+
+        assert_eq!(served, 1);
+        assert_eq!(
+            provider_error.kind(),
+            ProviderErrorKind::InternalServerError
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_400_context_length_stays_invalid_request_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "code": "context_length_exceeded",
+                "message": "Too many tokens."
+            }
+        })
+        .to_string();
+        let (base_url, handle) =
+            spawn_mock_status_server(400, "Bad Request", body, "application/json")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("HTTP 400 context body maps through invalid request in Codex");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(!provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn response_completed_requires_id_like_codex() -> Result<()> {
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("missing completed response id should fail");
+        handle.join().expect("mock server thread");
+        assert!(format!("{err:#}").contains("missing field `id`"));
+        Ok(())
+    }
+
+    #[test]
+    fn responses_usage_parses_reasoning_output_tokens_like_codex() -> Result<()> {
+        let sse = concat!(
+            "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":3,\"output_tokens\":9,\"output_tokens_details\":{\"reasoning_tokens\":5},\"total_tokens\":12}}}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+        let events = provider.start_turn(ProviderTurn {
+            instructions: None,
+            model_settings: ModelRequestSettings::default(),
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        assert!(events.contains(&ModelEvent::Usage {
+            usage: ModelUsage {
+                input_tokens: Some(3),
+                output_tokens: Some(9),
+                reasoning_output_tokens: Some(5),
+                total_tokens: Some(12),
+                cost_usd: None,
+                ..Default::default()
+            },
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_responses_provider_force_enables_reasoning_summaries_like_codex() -> Result<()> {
+        let response_body = json!({
+            "id": "resp_123",
+            "output": [],
+            "usage": {
+                "input_tokens": 1,
+                "output_tokens": 1,
+                "total_tokens": 2
+            }
+        })
+        .to_string();
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body, "application/json")?;
+        let provider = OpenAIResponsesProvider::with_base_url("test-key", "gpt-test", base_url);
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings {
+                reasoning_effort: Some("high".to_string()),
+                reasoning_summary: None,
+                model_supports_reasoning_summaries: Some(true),
+                text_verbosity: Some("high".to_string()),
+                service_tier: None,
+            },
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert_eq!(request["reasoning"]["effort"], "high");
+        assert_eq!(request["reasoning"]["summary"], "auto");
+        assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+        assert!(request.get("text").is_none());
+        Ok(())
+    }
+
+    #[test]
+    fn model_request_info_matches_codex_longest_prefix_and_namespaced_suffix() {
+        assert_eq!(
+            model_request_info("gpt-5.4-mini-latest").default_verbosity,
+            Some("medium".to_string())
+        );
+        assert_eq!(
+            model_request_info("gpt-5.4-custom").default_verbosity,
+            Some("low".to_string())
+        );
+        assert_eq!(
+            model_request_info("openai/gpt-5.3-codex").default_reasoning_effort,
+            Some("medium".to_string())
+        );
+        for model in [
+            "gpt-5.5",
+            "gpt-5.4",
+            "gpt-5.4-mini",
+            "gpt-5.3-codex",
+            "gpt-5.2",
+            "codex-auto-review",
+        ] {
+            assert!(
+                model_request_info(model).supports_parallel_tool_calls,
+                "{model} should match Codex bundled catalog"
+            );
+        }
+        assert!(!model_request_info("openai/nested/gpt-5.5").supports_reasoning_summaries);
+        assert!(model_request_info("gpt-5.2-codex").supports_reasoning_summaries);
+        assert!(!model_supports_personality("gpt-5.2-codex"));
+        assert!(model_supports_personality("exp-codex-personality"));
+    }
+
+    #[test]
+    fn model_switch_request_settings_clamp_reasoning_effort_like_codex() {
+        let unsupported = ModelRequestSettings {
+            reasoning_effort: Some("minimal".to_string()),
+            reasoning_summary: Some("none".to_string()),
+            model_supports_reasoning_summaries: None,
+            text_verbosity: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
+        };
+        let clamped = model_switch_request_settings_for_model("gpt-5.4", &unsupported);
+        assert_eq!(clamped.reasoning_effort.as_deref(), Some("medium"));
+        assert_eq!(clamped.reasoning_summary.as_deref(), Some("none"));
+        assert_eq!(clamped.text_verbosity.as_deref(), Some("high"));
+        assert_eq!(clamped.service_tier.as_deref(), Some("priority"));
+
+        let supported = ModelRequestSettings {
+            reasoning_effort: Some("xhigh".to_string()),
+            ..ModelRequestSettings::default()
+        };
+        let preserved = model_switch_request_settings_for_model("gpt-5.4", &supported);
+        assert_eq!(preserved.reasoning_effort.as_deref(), Some("xhigh"));
+
+        let defaulted =
+            model_switch_request_settings_for_model("openai/gpt-5.3-codex", &Default::default());
+        assert_eq!(defaulted.reasoning_effort.as_deref(), Some("medium"));
+
+        let unsupported_service_tier = ModelRequestSettings {
+            service_tier: Some("priority".to_string()),
+            ..ModelRequestSettings::default()
+        };
+        let cleared =
+            model_switch_request_settings_for_model("gpt-5.3-codex", &unsupported_service_tier);
+        assert_eq!(cleared.service_tier, None);
+
+        let unknown = ModelRequestSettings {
+            reasoning_effort: Some("high".to_string()),
+            ..ModelRequestSettings::default()
+        };
+        let unsupported_unknown = model_switch_request_settings_for_model("custom-model", &unknown);
+        assert_eq!(unsupported_unknown.reasoning_effort, None);
+        assert_eq!(unsupported_unknown.service_tier, None);
+    }
+
+    #[test]
+    fn codex_responses_provider_keeps_default_low_verbosity_and_can_disable_summary() -> Result<()>
+    {
+        let response_body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_123\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n".to_string();
+        let (base_url, body_rx, handle) =
+            spawn_request_capture_server(response_body, "text/event-stream")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-5.5",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        provider.start_turn(ProviderTurn {
+            instructions: Some("base".to_string()),
+            model_settings: ModelRequestSettings {
+                reasoning_effort: Some("minimal".to_string()),
+                reasoning_summary: Some("none".to_string()),
+                model_supports_reasoning_summaries: None,
+                text_verbosity: None,
+                service_tier: None,
+            },
+            messages: vec![json!({"role": "user", "content": "finish"})],
+            tools: Vec::new(),
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        let request = body_rx.recv().expect("request body");
+
+        assert_eq!(request["reasoning"]["effort"], "minimal");
+        assert!(request["reasoning"].get("summary").is_none());
+        assert_eq!(request["include"], json!(["reasoning.encrypted_content"]));
+        assert_eq!(request["text"]["verbosity"], "low");
+        assert_eq!(request["parallel_tool_calls"], true);
+        Ok(())
+    }
+
+    #[test]
     fn default_instructions_preserve_bitter_cdp_browser_harness_contract() {
         let instructions = default_instructions();
         for expected in [
+            "You are Codex, a coding agent based on GPT-5",
+            "deeply pragmatic, effective software engineer",
+            "As an expert coding agent",
+            "Persist until the task is fully handled end-to-end",
+            "Always use apply_patch for manual code edits",
+            "NEVER revert existing changes you did not make",
+            "**NEVER** use destructive commands like `git reset --hard`",
+            "If the user asks for a \"review\", default to a code review mindset",
             "bitter lesson",
             "Raw CDP is the center",
             "source of truth",
@@ -2823,6 +10463,8 @@ mod tests {
             "agent_helpers.py",
             "Browser interaction tool",
             "Loaded Browser-Harness Interaction Skills",
+            "Use helper agents only when the user explicitly asks",
+            "detailed codebase analysis do not by themselves authorize spawning",
             "interaction-skills/screenshots.md",
             "interaction-skills/tabs.md",
             "interaction-skills/dialogs.md",
@@ -2834,51 +10476,546 @@ mod tests {
                 "missing {expected:?} from default instructions:\n{instructions}"
             );
         }
+        let permissions = default_permissions_instructions();
+        assert!(permissions.contains("<permissions instructions>"));
+        assert!(permissions.contains("`sandbox_mode` is `danger-full-access`"));
+        assert!(permissions.contains("Approval policy is currently never"));
+        assert!(permissions.contains("Do not provide the `sandbox_permissions` for any reason"));
+        assert!(!instructions.contains("spawn a read-only helper with role `explorer` unless"));
+    }
+
+    #[test]
+    fn default_instructions_render_codex_personality_variants() {
+        let pragmatic = default_agent_instructions_for_personality(ModelPersonality::Pragmatic);
+        assert!(pragmatic.contains("deeply pragmatic, effective software engineer"));
+        assert!(!pragmatic.contains("supportive teammate as much as code quality"));
+
+        let friendly = default_agent_instructions_for_personality(ModelPersonality::Friendly);
+        assert!(friendly.contains("supportive teammate as much as code quality"));
+        assert!(!friendly.contains("deeply pragmatic, effective software engineer"));
+
+        let none = default_agent_instructions_for_personality(ModelPersonality::None);
+        assert!(none.contains("You are Codex, a coding agent based on GPT-5"));
+        assert!(!none.contains("supportive teammate as much as code quality"));
+        assert!(!none.contains("deeply pragmatic, effective software engineer"));
+        assert!(none.contains("Browser Agent Contract"));
+
+        let unsupported = default_agent_instructions_for_model_and_personality(
+            "gpt-5.2",
+            ModelPersonality::Friendly,
+        );
+        assert!(unsupported.contains("You are GPT-5.2 running in the Codex CLI"));
+        assert!(!unsupported.contains("supportive teammate as much as code quality"));
+
+        let namespaced = default_agent_instructions_for_model_and_personality(
+            "openai/gpt-5.4",
+            ModelPersonality::Friendly,
+        );
+        assert!(namespaced.contains("supportive teammate as much as code quality"));
+        assert!(model_supports_personality("gpt-5.4"));
+        assert!(model_supports_personality("openai/gpt-5.4"));
+        assert!(!model_supports_personality("gpt-5.2"));
+        assert!(!model_supports_personality("gpt-5.2-codex"));
+        assert!(model_supports_personality("exp-codex-personality"));
+    }
+
+    #[test]
+    fn local_model_messages_follow_codex_template_semantics() {
+        let messages = LocalModelMessages {
+            instructions_template: Some("Hello {{ personality }} {{ base_instructions }}"),
+            instructions_variables: Some(LocalModelInstructionsVariables {
+                personality_default: Some("default"),
+                personality_friendly: Some("friendly"),
+                personality_pragmatic: None,
+            }),
+        };
+
+        assert!(!messages.supports_personality());
+        assert_eq!(
+            messages.get_model_instructions(Some(ModelPersonality::Friendly), "base"),
+            "Hello friendly base"
+        );
+        assert_eq!(
+            messages.get_model_instructions(Some(ModelPersonality::Pragmatic), "base"),
+            "Hello  base"
+        );
+        assert_eq!(
+            messages.get_model_instructions(Some(ModelPersonality::None), "base"),
+            "Hello  base"
+        );
+        assert_eq!(
+            messages.get_model_instructions(None, "base"),
+            "Hello default base"
+        );
+
+        let no_template = LocalModelMessages {
+            instructions_template: None,
+            instructions_variables: Some(LocalModelInstructionsVariables {
+                personality_default: Some("default"),
+                personality_friendly: Some("friendly"),
+                personality_pragmatic: Some("pragmatic"),
+            }),
+        };
+        assert_eq!(
+            no_template.get_model_instructions(Some(ModelPersonality::Friendly), "base"),
+            "base"
+        );
     }
 
     fn spawn_mock_server(
         body: String,
         content_type: &'static str,
     ) -> Result<(String, thread::JoinHandle<()>)> {
+        spawn_mock_status_server(200, "OK", body, content_type)
+    }
+
+    fn spawn_mock_status_server(
+        status: u16,
+        reason: &'static str,
+        body: String,
+        content_type: &'static str,
+    ) -> Result<(String, thread::JoinHandle<()>)> {
+        spawn_mock_status_sequence_server(vec![MockHttpResponse::new(
+            status,
+            reason,
+            body,
+            content_type,
+        )])
+    }
+
+    struct MockHttpResponse {
+        status: u16,
+        reason: &'static str,
+        body: String,
+        content_type: &'static str,
+        headers: Vec<(&'static str, &'static str)>,
+    }
+
+    impl MockHttpResponse {
+        fn new(
+            status: u16,
+            reason: &'static str,
+            body: impl Into<String>,
+            content_type: &'static str,
+        ) -> Self {
+            Self {
+                status,
+                reason,
+                body: body.into(),
+                content_type,
+                headers: Vec::new(),
+            }
+        }
+
+        fn with_header(mut self, name: &'static str, value: &'static str) -> Self {
+            self.headers.push((name, value));
+            self
+        }
+    }
+
+    fn mock_http_response_bytes(response: &MockHttpResponse) -> String {
+        let extra_headers = response
+            .headers
+            .iter()
+            .map(|(name, value)| format!("{name}: {value}\r\n"))
+            .collect::<String>();
+        format!(
+            "HTTP/1.1 {} {}\r\nContent-Type: {}\r\n{}Content-Length: {}\r\nConnection: close\r\n\r\n{}",
+            response.status,
+            response.reason,
+            response.content_type,
+            extra_headers,
+            response.body.len(),
+            response.body
+        )
+    }
+
+    fn spawn_mock_status_sequence_server(
+        responses: Vec<MockHttpResponse>,
+    ) -> Result<(String, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                loop {
+                    let read = stream.read(&mut buf).expect("read request");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                let request_text = String::from_utf8_lossy(&request);
+                let request_text_lower = request_text.to_ascii_lowercase();
+                assert!(
+                    request_text.starts_with("POST /v1/responses")
+                        || request_text.starts_with("POST /backend-api/codex/responses")
+                        || request_text.starts_with("POST /v1/chat/completions")
+                        || request_text.starts_with("POST /v1/messages")
+                );
+                assert!(
+                    request_text_lower.contains("authorization: bearer test-key")
+                        || request_text_lower.contains("authorization: bearer chatgpt-token")
+                        || request_text_lower.contains("authorization: bearer claude-oauth-token")
+                        || request_text_lower.contains("x-api-key: anthropic-key")
+                );
+                let wire_response = mock_http_response_bytes(&response);
+                stream
+                    .write_all(wire_response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        Ok((format!("http://{addr}/v1"), handle))
+    }
+
+    fn spawn_timed_status_sequence_server(
+        responses: Vec<MockHttpResponse>,
+    ) -> Result<(String, thread::JoinHandle<usize>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        listener.set_nonblocking(true)?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            let mut served = 0;
+            for response in responses {
+                let start = Instant::now();
+                let (mut stream, _) = loop {
+                    match listener.accept() {
+                        Ok(accepted) => break accepted,
+                        Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
+                            if start.elapsed() > Duration::from_secs(2) {
+                                return served;
+                            }
+                            thread::sleep(Duration::from_millis(5));
+                        }
+                        Err(error) => panic!("accept request: {error}"),
+                    }
+                };
+                read_request_headers(&mut stream);
+                let wire_response = mock_http_response_bytes(&response);
+                stream
+                    .write_all(wire_response.as_bytes())
+                    .expect("write response");
+                served += 1;
+            }
+            served
+        });
+        Ok((format!("http://{addr}/v1"), handle))
+    }
+
+    fn spawn_drop_then_status_server(
+        response: MockHttpResponse,
+    ) -> Result<(String, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().expect("accept dropped request");
+            read_request_headers(&mut first_stream);
+            drop(first_stream);
+
+            let (mut stream, _) = listener.accept().expect("accept retry request");
+            read_request_headers(&mut stream);
+            let wire_response = mock_http_response_bytes(&response);
+            stream
+                .write_all(wire_response.as_bytes())
+                .expect("write response");
+        });
+        Ok((format!("http://{addr}/v1"), handle))
+    }
+
+    fn spawn_incomplete_body_then_status_server(
+        response: MockHttpResponse,
+    ) -> Result<(String, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let handle = thread::spawn(move || {
+            let (mut first_stream, _) = listener.accept().expect("accept incomplete-body request");
+            read_request_headers(&mut first_stream);
+            let incomplete_response = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: application/json\r\n",
+                "Content-Length: 64\r\n",
+                "Connection: close\r\n\r\n",
+                "{"
+            );
+            first_stream
+                .write_all(incomplete_response.as_bytes())
+                .expect("write incomplete response");
+            drop(first_stream);
+
+            let (mut stream, _) = listener.accept().expect("accept retry request");
+            read_request_headers(&mut stream);
+            let wire_response = mock_http_response_bytes(&response);
+            stream
+                .write_all(wire_response.as_bytes())
+                .expect("write response");
+        });
+        Ok((format!("http://{addr}/v1"), handle))
+    }
+
+    fn spawn_sse_delayed_body_server(delay: Duration) -> Result<(String, thread::JoinHandle<()>)> {
         let listener = TcpListener::bind("127.0.0.1:0")?;
         let addr = listener.local_addr()?;
         let handle = thread::spawn(move || {
             let (mut stream, _) = listener.accept().expect("accept request");
+            read_request_headers(&mut stream);
+            let headers = concat!(
+                "HTTP/1.1 200 OK\r\n",
+                "Content-Type: text/event-stream\r\n",
+                "Connection: close\r\n\r\n"
+            );
+            stream
+                .write_all(headers.as_bytes())
+                .expect("write response headers");
+            thread::sleep(delay);
+            let body = "data: {\"type\":\"response.completed\",\"response\":{\"id\":\"resp_late\",\"output\":[],\"usage\":{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}\n\n";
+            let _ = stream.write_all(body.as_bytes());
+        });
+        Ok((format!("http://{addr}/v1"), handle))
+    }
+
+    fn read_request_headers(stream: &mut TcpStream) {
+        let mut request = Vec::new();
+        let mut buf = [0_u8; 1024];
+        loop {
+            let read = stream.read(&mut buf).expect("read request");
+            if read == 0 {
+                break;
+            }
+            request.extend_from_slice(&buf[..read]);
+            if request.windows(4).any(|window| window == b"\r\n\r\n") {
+                break;
+            }
+        }
+        let request_text = String::from_utf8_lossy(&request);
+        assert!(
+            request_text.starts_with("POST /v1/responses")
+                || request_text.starts_with("POST /backend-api/codex/responses")
+                || request_text.starts_with("POST /v1/chat/completions")
+                || request_text.starts_with("POST /v1/messages")
+        );
+    }
+
+    fn spawn_request_capture_server(
+        body: String,
+        content_type: &'static str,
+    ) -> Result<(String, mpsc::Receiver<Value>, thread::JoinHandle<()>)> {
+        spawn_request_capture_server_sequence(vec![body], content_type)
+    }
+
+    fn spawn_request_capture_server_sequence(
+        bodies: Vec<String>,
+        content_type: &'static str,
+    ) -> Result<(String, mpsc::Receiver<Value>, thread::JoinHandle<()>)> {
+        spawn_request_capture_http_sequence(
+            bodies
+                .into_iter()
+                .map(|body| MockHttpResponse::new(200, "OK", body, content_type))
+                .collect(),
+        )
+    }
+
+    fn spawn_request_header_capture_server(
+        response: MockHttpResponse,
+    ) -> Result<(String, mpsc::Receiver<String>, thread::JoinHandle<()>)> {
+        spawn_request_header_capture_server_sequence(vec![response])
+    }
+
+    fn spawn_request_header_capture_server_sequence(
+        responses: Vec<MockHttpResponse>,
+    ) -> Result<(String, mpsc::Receiver<String>, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                let header_end = loop {
+                    let read = stream.read(&mut buf).expect("read request");
+                    if read == 0 {
+                        panic!("request ended before headers");
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if let Some(pos) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|pos| pos + 4)
+                    {
+                        break pos;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]).to_string();
+                assert!(
+                    headers.starts_with("POST /v1/responses")
+                        || headers.starts_with("POST /backend-api/codex/responses")
+                        || headers.starts_with("POST /v1/messages")
+                );
+                let request_text_lower = headers.to_ascii_lowercase();
+                let content_length = request_text_lower
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .expect("content-length header");
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut buf).expect("read body");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+                tx.send(headers).expect("send request headers");
+                let wire_response = mock_http_response_bytes(&response);
+                stream
+                    .write_all(wire_response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        Ok((format!("http://{addr}/v1"), rx, handle))
+    }
+
+    fn codex_completed_sse(response_id: &str) -> String {
+        format!(
+            "data: {{\"type\":\"response.completed\",\"response\":{{\"id\":\"{response_id}\",\"output\":[],\"usage\":{{\"input_tokens\":1,\"output_tokens\":1,\"total_tokens\":2}}}}}}\n\n"
+        )
+    }
+
+    fn write_codex_auth_file(
+        path: &Path,
+        access_token: &str,
+        account_id: &str,
+        refresh_token: &str,
+    ) -> Result<()> {
+        std::fs::write(
+            path,
+            serde_json::to_string_pretty(&json!({
+                "auth_mode": "chatgpt",
+                "tokens": {
+                    "id_token": "header.payload.signature",
+                    "access_token": access_token,
+                    "refresh_token": refresh_token,
+                    "account_id": account_id
+                },
+                "last_refresh": "2026-05-25T00:00:00Z"
+            }))?,
+        )?;
+        Ok(())
+    }
+
+    fn spawn_codex_refresh_capture_server(
+        body: String,
+        status: u16,
+    ) -> Result<(String, mpsc::Receiver<Value>, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            let (mut stream, _) = listener.accept().expect("accept refresh request");
             let mut request = Vec::new();
             let mut buf = [0_u8; 1024];
-            loop {
-                let read = stream.read(&mut buf).expect("read request");
+            let header_end = loop {
+                let read = stream.read(&mut buf).expect("read refresh request");
+                if read == 0 {
+                    panic!("refresh request ended before headers");
+                }
+                request.extend_from_slice(&buf[..read]);
+                if let Some(pos) = request
+                    .windows(4)
+                    .position(|window| window == b"\r\n\r\n")
+                    .map(|pos| pos + 4)
+                {
+                    break pos;
+                }
+            };
+            let headers = String::from_utf8_lossy(&request[..header_end]);
+            assert!(headers.starts_with("POST /oauth/token"));
+            assert!(headers
+                .to_ascii_lowercase()
+                .contains("\r\ncontent-type: application/json"));
+            let content_length = headers
+                .to_ascii_lowercase()
+                .lines()
+                .find_map(|line| line.strip_prefix("content-length: "))
+                .and_then(|value| value.trim().parse::<usize>().ok())
+                .expect("content-length header");
+            while request.len() < header_end + content_length {
+                let read = stream.read(&mut buf).expect("read refresh body");
                 if read == 0 {
                     break;
                 }
                 request.extend_from_slice(&buf[..read]);
-                if request.windows(4).any(|window| window == b"\r\n\r\n") {
-                    break;
-                }
             }
-            let request_text = String::from_utf8_lossy(&request);
-            let request_text_lower = request_text.to_ascii_lowercase();
-            assert!(
-                request_text.starts_with("POST /v1/responses ")
-                    || request_text.starts_with("POST /backend-api/codex/responses ")
-                    || request_text.starts_with("POST /v1/chat/completions ")
-                    || request_text.starts_with("POST /v1/messages ")
-            );
-            assert!(
-                request_text_lower.contains("authorization: bearer test-key")
-                    || request_text_lower.contains("authorization: bearer chatgpt-token")
-                    || request_text_lower.contains("authorization: bearer claude-oauth-token")
-                    || request_text_lower.contains("x-api-key: anthropic-key")
-            );
+            let request_body: Value =
+                serde_json::from_slice(&request[header_end..header_end + content_length])
+                    .expect("refresh json request body");
+            tx.send(request_body).expect("send refresh body");
             let response = format!(
-                "HTTP/1.1 200 OK\r\nContent-Type: {content_type}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                "HTTP/1.1 {status} OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
                 body.len(),
                 body
             );
             stream
                 .write_all(response.as_bytes())
-                .expect("write response");
+                .expect("write refresh response");
         });
-        Ok((format!("http://{addr}/v1"), handle))
+        Ok((format!("http://{addr}/oauth/token"), rx, handle))
+    }
+
+    fn spawn_request_capture_http_sequence(
+        responses: Vec<MockHttpResponse>,
+    ) -> Result<(String, mpsc::Receiver<Value>, thread::JoinHandle<()>)> {
+        let listener = TcpListener::bind("127.0.0.1:0")?;
+        let addr = listener.local_addr()?;
+        let (tx, rx) = mpsc::channel();
+        let handle = thread::spawn(move || {
+            for response in responses {
+                let (mut stream, _) = listener.accept().expect("accept request");
+                let mut request = Vec::new();
+                let mut buf = [0_u8; 1024];
+                let header_end = loop {
+                    let read = stream.read(&mut buf).expect("read request");
+                    if read == 0 {
+                        panic!("request ended before headers");
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                    if let Some(pos) = request
+                        .windows(4)
+                        .position(|window| window == b"\r\n\r\n")
+                        .map(|pos| pos + 4)
+                    {
+                        break pos;
+                    }
+                };
+                let headers = String::from_utf8_lossy(&request[..header_end]);
+                let request_text_lower = headers.to_ascii_lowercase();
+                let content_length = request_text_lower
+                    .lines()
+                    .find_map(|line| line.strip_prefix("content-length: "))
+                    .and_then(|value| value.trim().parse::<usize>().ok())
+                    .expect("content-length header");
+                while request.len() < header_end + content_length {
+                    let read = stream.read(&mut buf).expect("read body");
+                    if read == 0 {
+                        break;
+                    }
+                    request.extend_from_slice(&buf[..read]);
+                }
+                let body_start = header_end;
+                let body_end = header_end + content_length;
+                let request_body: Value = serde_json::from_slice(&request[body_start..body_end])
+                    .expect("json request body");
+                tx.send(request_body).expect("send request body");
+                let wire_response = mock_http_response_bytes(&response);
+                stream
+                    .write_all(wire_response.as_bytes())
+                    .expect("write response");
+            }
+        });
+        Ok((format!("http://{addr}/v1"), rx, handle))
     }
 }

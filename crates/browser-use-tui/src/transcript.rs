@@ -1,6 +1,9 @@
+use browser_use_core::CollaborationModeKind;
 use browser_use_protocol::{normalize_result_text, EventRecord, SessionMeta, WorkbenchState};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use serde::Deserialize;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthChar;
 
@@ -11,7 +14,10 @@ use crate::theme::{
     user_prompt_accent, user_prompt_muted, user_prompt_text,
 };
 
-use super::App;
+use super::{
+    App, PendingRequestUserInput, RequestUserInputFocus, RequestUserInputQuestion,
+    RequestUserInputState, REQUEST_USER_INPUT_OTHER_LABEL,
+};
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
 const GROUP_VALUE_LAST_PREFIX: &str = "  └ ";
@@ -66,6 +72,13 @@ enum TranscriptKind {
     },
     StreamingAssistant {
         markdown: String,
+    },
+    ProposedPlan {
+        markdown: String,
+    },
+    RequestUserInput {
+        request: PendingRequestUserInput,
+        state: RequestUserInputState,
     },
     ResultFile {
         file_path: String,
@@ -130,6 +143,10 @@ impl TranscriptNode {
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown_cell_lines(markdown, width, mode)
             }
+            TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
+            TranscriptKind::RequestUserInput { request, state } => {
+                request_user_input_lines(request, state, width)
+            }
             TranscriptKind::ResultFile {
                 file_path,
                 bytes,
@@ -185,6 +202,14 @@ impl TranscriptNode {
             }
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown.lines().map(str::to_string).collect()
+            }
+            TranscriptKind::ProposedPlan { markdown } => {
+                let mut out = vec!["Proposed Plan".to_string()];
+                out.extend(markdown.lines().map(str::to_string));
+                out
+            }
+            TranscriptKind::RequestUserInput { request, state } => {
+                request_user_input_plain_lines(request, state)
             }
             TranscriptKind::ResultFile {
                 file_path,
@@ -346,6 +371,10 @@ impl TranscriptNode {
                 }
                 lines
             }
+            TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
+            TranscriptKind::RequestUserInput { request, state } => {
+                request_user_input_lines(request, state, width)
+            }
             _ => self.display_lines(width, DisplayMode::Active),
         }
     }
@@ -360,6 +389,7 @@ impl TranscriptNode {
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown_cell_lines(markdown, width, DisplayMode::Active)
             }
+            TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
             _ => Vec::new(),
         }
     }
@@ -576,6 +606,8 @@ fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize 
         (
             TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. },
             TranscriptKind::Assistant { .. }
+            | TranscriptKind::ProposedPlan { .. }
+            | TranscriptKind::RequestUserInput { .. }
             | TranscriptKind::ResultFile { .. }
             | TranscriptKind::StreamingAssistant { .. }
             | TranscriptKind::Timeline { .. }
@@ -626,6 +658,9 @@ fn committed_node_for_event(
                 });
             }
             let result = session_done_result_text(event)?;
+            if result.trim().is_empty() {
+                return None;
+            }
             Some(TranscriptNode {
                 id,
                 seq: event.seq,
@@ -634,6 +669,15 @@ fn committed_node_for_event(
                     markdown: result,
                     source: source_for_state(state),
                 },
+            })
+        }
+        "plan.proposed" => {
+            let text = payload_string(event, "text")?;
+            Some(TranscriptNode {
+                id,
+                seq: event.seq,
+                revision: event.seq.max(0) as u64,
+                kind: TranscriptKind::ProposedPlan { markdown: text },
             })
         }
         "session.failed" => {
@@ -847,10 +891,18 @@ fn committed_node_for_event(
             vec!["updated plan".to_string()],
             NodeStyle::Normal,
         )),
+        "request_user_input.requested" => None,
+        "request_user_input.response" => Some(request_user_input_response_node(event)),
         "session.deadline_warning" => Some(timeline_node(
             event,
             "warning",
             vec!["turn budget is nearly exhausted".to_string()],
+            NodeStyle::Muted,
+        )),
+        "session.startup_warning" => Some(timeline_node(
+            event,
+            "warning",
+            vec![payload_string(event, "message").unwrap_or_else(|| "startup warning".to_string())],
             NodeStyle::Muted,
         )),
         "session.final_answer_not_ready_at_max_turns" => Some(timeline_node(
@@ -1019,16 +1071,41 @@ fn active_node_for_session(
     let live_status = live_status_for_session(active_child_count, live_thinking_text, live_events);
 
     if let Some(text) = live_streaming_text {
+        let seq = events.last().map(|event| event.seq).unwrap_or_default();
+        let mode = collaboration_mode_from_events(events);
+        let (visible_text, proposed_plan) = if mode == CollaborationModeKind::Plan {
+            split_proposed_plan_blocks(text)
+        } else {
+            (text.to_string(), None)
+        };
+        if !visible_text.trim().is_empty() {
+            active_nodes.push(TranscriptNode {
+                id: format!("{}:active-stream", root.id),
+                seq,
+                revision: seq.max(0) as u64,
+                kind: TranscriptKind::StreamingAssistant {
+                    markdown: visible_text,
+                },
+            });
+        }
+        if let Some(plan) = proposed_plan.filter(|plan| !plan.trim().is_empty()) {
+            active_nodes.push(TranscriptNode {
+                id: format!("{}:active-plan", root.id),
+                seq,
+                revision: seq.max(0) as u64,
+                kind: TranscriptKind::ProposedPlan { markdown: plan },
+            });
+        }
+    }
+
+    if let Some(request) = app.pending_request_user_input(&root.id) {
+        let seq = events.last().map(|event| event.seq).unwrap_or_default();
+        let state = app.request_input_display_state(&root.id, &request);
         active_nodes.push(TranscriptNode {
-            id: format!("{}:active-stream", root.id),
-            seq: events.last().map(|event| event.seq).unwrap_or_default(),
-            revision: events
-                .last()
-                .map(|event| event.seq.max(0) as u64)
-                .unwrap_or_default(),
-            kind: TranscriptKind::StreamingAssistant {
-                markdown: text.to_string(),
-            },
+            id: format!("{}:active-request-user-input:{}", root.id, request.call_id),
+            seq,
+            revision: seq.max(0) as u64,
+            kind: TranscriptKind::RequestUserInput { request, state },
         });
     }
 
@@ -1047,6 +1124,7 @@ fn active_node_for_session(
                     | "browser.page"
                     | "browser.state"
                     | "plan.updated"
+                    | "request_user_input.requested"
             )
         }) {
             if let Some(node) = active_node_for_event(root, events, event) {
@@ -1264,9 +1342,12 @@ fn is_live_output_event(event: &EventRecord) -> bool {
             .get("text")
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| !text.trim().is_empty()),
-        "command.waiting" | "tool.started" | "browser.page" | "browser.state" | "plan.updated" => {
-            true
-        }
+        "command.waiting"
+        | "tool.started"
+        | "browser.page"
+        | "browser.state"
+        | "plan.updated"
+        | "request_user_input.requested" => true,
         _ => false,
     }
 }
@@ -1356,6 +1437,7 @@ fn active_node_for_event(
             vec!["updated plan".to_string()],
             NodeStyle::Muted,
         )),
+        "request_user_input.requested" => None,
         _ => None,
     }
 }
@@ -1400,7 +1482,7 @@ fn pending_status_node(
 
 fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
     let name = payload_string(event, "name").unwrap_or_else(|| "tool".to_string());
-    if is_subagent_management_tool(&name) {
+    if is_subagent_management_tool(&name) || name == "request_user_input" {
         return None;
     }
     let mut lines = Vec::new();
@@ -1461,6 +1543,100 @@ fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
     ))
 }
 
+#[derive(Debug, Deserialize)]
+struct TranscriptRequestUserInputAnswer {
+    answers: Vec<String>,
+}
+
+fn request_user_input_response_node(event: &EventRecord) -> TranscriptNode {
+    let mut lines = Vec::new();
+    let answers = event
+        .payload
+        .get("answers")
+        .cloned()
+        .and_then(|value| {
+            serde_json::from_value::<HashMap<String, TranscriptRequestUserInputAnswer>>(value).ok()
+        })
+        .unwrap_or_default();
+    let questions = event
+        .payload
+        .get("questions")
+        .cloned()
+        .and_then(|value| serde_json::from_value::<Vec<RequestUserInputQuestion>>(value).ok())
+        .unwrap_or_default();
+    if !questions.is_empty() {
+        let answered = questions
+            .iter()
+            .filter(|question| {
+                answers
+                    .get(&question.id)
+                    .is_some_and(|answer| !answer.answers.is_empty())
+            })
+            .count();
+        lines.push(format!("Questions {answered}/{} answered", questions.len()));
+        for question in questions {
+            let label = request_user_input_question_label(&question);
+            lines.push(format!("{label}: {}", question.question));
+            let values = answers
+                .get(&question.id)
+                .map(|answer| answer.answers.clone())
+                .unwrap_or_default();
+            if values.is_empty() {
+                lines.push("  unanswered".to_string());
+                continue;
+            }
+            if question.is_secret {
+                lines.push("  answer: ******".to_string());
+                continue;
+            }
+            let (choices, note) = split_request_user_input_values(&values);
+            for choice in choices {
+                lines.push(format!("  answer: {choice}"));
+            }
+            if let Some(note) = note {
+                let label = if question.options.is_some() {
+                    "note"
+                } else {
+                    "answer"
+                };
+                lines.push(format!("  {label}: {note}"));
+            }
+        }
+    } else {
+        for (id, answer) in answers {
+            let values = answer
+                .answers
+                .into_iter()
+                .filter(|value| !value.trim().is_empty())
+                .collect::<Vec<_>>();
+            if values.is_empty() {
+                lines.push(format!("{id}: unanswered"));
+            } else if values.len() == 1 {
+                lines.push(format!("{id}: {}", values[0]));
+            } else {
+                lines.push(format!("{id}: {}", values.join("; ")));
+            }
+        }
+    }
+    if lines.is_empty() {
+        lines.push("answered request".to_string());
+    }
+    timeline_node(event, "questions", lines, NodeStyle::Muted)
+}
+
+fn split_request_user_input_values(values: &[String]) -> (Vec<String>, Option<String>) {
+    let mut choices = Vec::new();
+    let mut note = None;
+    for value in values {
+        if let Some(rest) = value.strip_prefix("user_note: ") {
+            note = Some(rest.to_string());
+        } else {
+            choices.push(value.clone());
+        }
+    }
+    (choices, note)
+}
+
 fn artifact_created_node(event: &EventRecord, _state: &WorkbenchState) -> Option<TranscriptNode> {
     let artifact = event.payload.get("artifact")?;
     let path = artifact
@@ -1487,6 +1663,7 @@ fn active_tool_status(name: &str) -> Option<(&'static str, &'static str)> {
         "apply_patch" => Some(("edit", "applying patch")),
         "view_image" => Some(("image", "inspecting image")),
         "update_plan" => Some(("plan", "updating plan")),
+        "request_user_input" => Some(("questions", "waiting for your answer")),
         _ => None,
     }
 }
@@ -1681,6 +1858,343 @@ fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Lin
         lines.push(Line::from(""));
     }
     lines
+}
+
+fn proposed_plan_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
+    let plan_lines = markdown_cell_lines(
+        markdown,
+        width.saturating_sub(2).max(1),
+        DisplayMode::Active,
+    )
+    .into_iter()
+    .map(|line| {
+        let mut spans = vec![Span::styled("  ".to_string(), muted())];
+        spans.extend(line.spans);
+        Line::from(spans)
+    })
+    .collect::<Vec<_>>();
+    let mut out = vec![Line::from(Span::styled("Proposed Plan", accent()))];
+    out.extend(plan_lines);
+    out
+}
+
+fn wrap_with_prefix(
+    text: &str,
+    width: usize,
+    initial_prefix: Span<'static>,
+    subsequent_prefix: Span<'static>,
+    style: Style,
+) -> Vec<Line<'static>> {
+    let initial_width = display_width(initial_prefix.content.as_ref());
+    let subsequent_width = display_width(subsequent_prefix.content.as_ref());
+    let first_width = (width.saturating_sub(initial_width)).max(1) as u16;
+    let next_width = (width.saturating_sub(subsequent_width)).max(1) as u16;
+    let mut out = Vec::new();
+    for (idx, wrapped) in wrap_plain(text, first_width) {
+        let prefix = if idx == 0 {
+            initial_prefix.clone()
+        } else {
+            subsequent_prefix.clone()
+        };
+        let available = if idx == 0 { first_width } else { next_width };
+        for (nested_idx, nested) in wrap_plain(&wrapped, available) {
+            let prefix = if nested_idx == 0 {
+                prefix.clone()
+            } else {
+                subsequent_prefix.clone()
+            };
+            out.push(Line::from(vec![prefix, Span::styled(nested, style)]));
+        }
+    }
+    if out.is_empty() {
+        out.push(Line::from(vec![
+            initial_prefix,
+            Span::styled(String::new(), style),
+        ]));
+    }
+    out
+}
+
+fn request_user_input_lines(
+    request: &PendingRequestUserInput,
+    state: &RequestUserInputState,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let answered = request_user_input_answered_count(request, state);
+    let mut out = vec![Line::from(Span::styled(
+        format!("Questions {answered}/{} answered", request.questions.len()),
+        accent(),
+    ))];
+    for (idx, question) in request.questions.iter().enumerate() {
+        let current = idx == state.current_idx;
+        let question_marker = if current { ">" } else { " " };
+        let label = request_user_input_question_label(question);
+        let unanswered = if request_user_input_answered(question, state, idx) {
+            ""
+        } else {
+            " (unanswered)"
+        };
+        let prefix = format!("{question_marker} {}. ", idx + 1);
+        out.extend(wrap_with_prefix(
+            &format!("{label}: {}{unanswered}", question.question),
+            width as usize,
+            Span::styled(prefix, user_prompt_accent()),
+            Span::styled("   ".to_string(), muted()),
+            text_style(),
+        ));
+        if let Some(options) = question.options.as_ref() {
+            for (option_idx, option) in options.iter().enumerate() {
+                let marker = request_user_input_option_marker(state, idx, option_idx, current);
+                out.extend(wrap_with_prefix(
+                    &format!(
+                        "{marker} {}. {} - {}",
+                        option_idx + 1,
+                        option.label,
+                        option.description
+                    ),
+                    width as usize,
+                    Span::styled("   ".to_string(), muted()),
+                    Span::styled("     ".to_string(), muted()),
+                    muted(),
+                ));
+            }
+            if question.is_other {
+                let other_idx = options.len();
+                let marker = request_user_input_option_marker(state, idx, other_idx, current);
+                out.extend(wrap_with_prefix(
+                    &format!(
+                        "{marker} {}. {REQUEST_USER_INPUT_OTHER_LABEL}",
+                        other_idx + 1
+                    ),
+                    width as usize,
+                    Span::styled("   ".to_string(), muted()),
+                    Span::styled("     ".to_string(), muted()),
+                    muted(),
+                ));
+            }
+        }
+        if let Some(note) = request_user_input_note_for_display(question, state, idx) {
+            out.extend(wrap_with_prefix(
+                &format!("note: {note}"),
+                width as usize,
+                Span::styled("   ".to_string(), muted()),
+                Span::styled("     ".to_string(), muted()),
+                muted(),
+            ));
+        }
+    }
+    if state.confirm_unanswered {
+        out.push(Line::from(""));
+        out.push(Line::from(Span::styled(
+            "Submit with unanswered questions?",
+            accent(),
+        )));
+        for (idx, (label, description)) in [
+            ("Proceed", "Submit with empty answers."),
+            ("Go back", "Return to the first unanswered question."),
+        ]
+        .iter()
+        .enumerate()
+        {
+            let marker = if state.confirm_selected == idx {
+                ">"
+            } else {
+                " "
+            };
+            out.extend(wrap_with_prefix(
+                &format!("{marker} {}. {label} - {description}", idx + 1),
+                width as usize,
+                Span::styled("   ".to_string(), muted()),
+                Span::styled("     ".to_string(), muted()),
+                muted(),
+            ));
+        }
+    }
+    out.push(Line::from(Span::styled(
+        request_user_input_footer_hint(state),
+        muted(),
+    )));
+    out
+}
+
+fn request_user_input_plain_lines(
+    request: &PendingRequestUserInput,
+    state: &RequestUserInputState,
+) -> Vec<String> {
+    let answered = request_user_input_answered_count(request, state);
+    let mut out = vec![format!(
+        "Questions {answered}/{} answered",
+        request.questions.len()
+    )];
+    for (idx, question) in request.questions.iter().enumerate() {
+        let label = request_user_input_question_label(question);
+        out.push(format!("{label}: {}", question.question));
+        if let Some(options) = question.options.as_ref() {
+            for (idx, option) in options.iter().enumerate() {
+                out.push(format!(
+                    "{}. {} - {}",
+                    idx + 1,
+                    option.label,
+                    option.description
+                ));
+            }
+            if question.is_other {
+                out.push(format!(
+                    "{}. {REQUEST_USER_INPUT_OTHER_LABEL}",
+                    options.len() + 1
+                ));
+            }
+        }
+        if let Some(note) = request_user_input_note_for_display(question, state, idx) {
+            out.push(format!("note: {note}"));
+        }
+    }
+    out
+}
+
+fn request_user_input_question_label(question: &RequestUserInputQuestion) -> String {
+    if question.header.trim().is_empty() {
+        format!("[{}]", question.id)
+    } else {
+        format!("{} [{}]", question.header, question.id)
+    }
+}
+
+fn request_user_input_answered_count(
+    request: &PendingRequestUserInput,
+    state: &RequestUserInputState,
+) -> usize {
+    request
+        .questions
+        .iter()
+        .enumerate()
+        .filter(|(idx, question)| request_user_input_answered(question, state, *idx))
+        .count()
+}
+
+fn request_user_input_answered(
+    question: &RequestUserInputQuestion,
+    state: &RequestUserInputState,
+    idx: usize,
+) -> bool {
+    let Some(answer) = state.answers.get(idx) else {
+        return false;
+    };
+    if !answer.answer_committed {
+        return false;
+    }
+    let has_options = question
+        .options
+        .as_ref()
+        .is_some_and(|options| !options.is_empty());
+    if has_options {
+        answer.committed_option.is_some()
+    } else {
+        !answer.notes.trim().is_empty()
+    }
+}
+
+fn request_user_input_option_marker(
+    state: &RequestUserInputState,
+    question_idx: usize,
+    option_idx: usize,
+    current: bool,
+) -> &'static str {
+    let Some(answer) = state.answers.get(question_idx) else {
+        return " ";
+    };
+    if current
+        && state.focus == RequestUserInputFocus::Options
+        && answer.option_cursor == Some(option_idx)
+    {
+        ">"
+    } else if answer.answer_committed && answer.committed_option == Some(option_idx) {
+        "*"
+    } else {
+        " "
+    }
+}
+
+fn request_user_input_note_for_display(
+    question: &RequestUserInputQuestion,
+    state: &RequestUserInputState,
+    idx: usize,
+) -> Option<String> {
+    let answer = state.answers.get(idx)?;
+    let note = answer.notes.trim();
+    if note.is_empty() {
+        return None;
+    }
+    if question.is_secret {
+        Some("******".to_string())
+    } else {
+        Some(note.to_string())
+    }
+}
+
+fn request_user_input_footer_hint(state: &RequestUserInputState) -> &'static str {
+    if state.confirm_unanswered {
+        "Enter:confirm | Up/Down:choose | Esc:go back"
+    } else if state.focus == RequestUserInputFocus::Notes {
+        "Enter:save notes | Tab/Esc:options | Ctrl+C:interrupt"
+    } else {
+        "Enter:select | Tab:notes | 1-9:select | Backspace:clear | Esc:interrupt"
+    }
+}
+
+fn split_proposed_plan_blocks(text: &str) -> (String, Option<String>) {
+    let mut visible = String::new();
+    let mut latest_plan = None;
+    let mut current_plan = String::new();
+    let mut in_plan = false;
+    let mut saw_plan = false;
+
+    for line in text.split_inclusive('\n') {
+        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
+        let slug = line_without_newline.trim_start().trim_end();
+        if !in_plan && slug == "<proposed_plan>" {
+            in_plan = true;
+            saw_plan = true;
+            current_plan.clear();
+            continue;
+        }
+        if in_plan && slug == "</proposed_plan>" {
+            in_plan = false;
+            latest_plan = Some(current_plan.clone());
+            continue;
+        }
+        if in_plan {
+            current_plan.push_str(line);
+        } else {
+            visible.push_str(line);
+        }
+    }
+
+    if in_plan && saw_plan {
+        latest_plan = Some(current_plan);
+    }
+    (visible, latest_plan)
+}
+
+fn collaboration_mode_from_events(events: &[EventRecord]) -> CollaborationModeKind {
+    events
+        .iter()
+        .rev()
+        .find_map(|event| {
+            if event.event_type != "session.collaboration_mode" {
+                return None;
+            }
+            match event
+                .payload
+                .get("mode")
+                .and_then(serde_json::Value::as_str)
+            {
+                Some("plan") => Some(CollaborationModeKind::Plan),
+                Some("default") => Some(CollaborationModeKind::Default),
+                _ => None,
+            }
+        })
+        .unwrap_or(CollaborationModeKind::Default)
 }
 
 fn source_display_lines(source: &str, width: u16) -> Vec<Line<'static>> {
