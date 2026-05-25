@@ -9,12 +9,15 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
+    append_workspace_context_event, canonical_agent_path_from_task_name, collect_agent_tree,
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
-    install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
+    display_agent_path_for_session, install_process_crypto_provider, last_task_message_for_agent,
+    local_agent_status_value, model_catalog_for_cwd_with_options, parse_config_overrides,
     product_analytics, record_python_response_final_event, record_python_worker_event,
-    run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
-    run_fake_agent, AgentRunOptions, CollaborationModeKind, ConfigOverrides, FakeAgentOptions,
-    ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    resolve_agent_reference_in_tree, root_session_id, run_agent_from_config,
+    run_existing_session_from_config, run_existing_session_with_provider, run_fake_agent,
+    update_parent_from_child_run, AgentRunOptions, CollaborationModeKind, ConfigOverrides,
+    FakeAgentOptions, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
 };
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, result_from_events,
@@ -183,6 +186,8 @@ enum Command {
         parent_id: String,
         message: String,
         #[arg(long)]
+        task_name: Option<String>,
+        #[arg(long)]
         path: Option<String>,
         #[arg(long)]
         nickname: Option<String>,
@@ -191,6 +196,8 @@ enum Command {
     },
     ListAgents {
         parent_id: String,
+        #[arg(long)]
+        json: bool,
     },
     CloseAgent {
         child_id: String,
@@ -206,6 +213,8 @@ enum Command {
     },
     WaitAgent {
         target_id: String,
+        #[arg(long, default_value_t = 30000)]
+        timeout_ms: u64,
     },
     Update {
         #[arg(long, default_value = "latest")]
@@ -518,7 +527,7 @@ impl DatasetRunner for ConfigDatasetRunner {
         merged_options.model_provider_id = config.options.model_provider_id.clone();
         merged_options.collaboration_mode = config.options.collaboration_mode;
         config.options = merged_options;
-        run_existing_session_from_config(store, session_id, config)?;
+        run_existing_session_from_config_and_notify(store, session_id, config)?;
         Ok(())
     }
 }
@@ -641,11 +650,12 @@ fn main() -> Result<()> {
         Command::SpawnAgent {
             parent_id,
             message,
+            task_name,
             path,
             nickname,
             role,
-        } => spawn_agent(&store, &parent_id, message, path, nickname, role),
-        Command::ListAgents { parent_id } => list_agents(&store, &parent_id),
+        } => spawn_agent(&store, &parent_id, message, task_name, path, nickname, role),
+        Command::ListAgents { parent_id, json } => list_agents(&store, &parent_id, json),
         Command::CloseAgent { child_id, reason } => close_agent(&store, &child_id, &reason),
         Command::SendAgentMessage {
             author_id,
@@ -653,7 +663,10 @@ fn main() -> Result<()> {
             message,
             trigger_turn,
         } => send_agent_message(&store, &author_id, &target_id, &message, trigger_turn),
-        Command::WaitAgent { target_id } => wait_agent(&store, &target_id),
+        Command::WaitAgent {
+            target_id,
+            timeout_ms,
+        } => wait_agent(&store, &target_id, timeout_ms),
         Command::Update {
             release,
             check,
@@ -1345,7 +1358,7 @@ fn run_openai_session(
             raw_config_overrides,
             collaboration_mode,
         )?);
-    let session_id = run_existing_session_from_config(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1372,7 +1385,7 @@ fn run_codex_session(
             raw_config_overrides,
             collaboration_mode,
         )?);
-    let session_id = run_existing_session_from_config(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1389,7 +1402,7 @@ fn run_anthropic_session(
     let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
         cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
     );
-    let session_id = run_existing_session_from_config(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1406,8 +1419,35 @@ fn run_openrouter_session(
     let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
         cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
     );
-    let session_id = run_existing_session_from_config(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
+    Ok(())
+}
+
+fn run_existing_session_from_config_and_notify(
+    store: &Store,
+    task_id: &str,
+    config: ProviderRunConfig,
+) -> Result<String> {
+    let result = run_existing_session_from_config(store, task_id, config);
+    let run_error = result.as_ref().err().map(|error| format!("{error:#}"));
+    let child_id = result.as_deref().unwrap_or(task_id);
+    notify_parent_after_cli_child_run(store, child_id, run_error)?;
+    result
+}
+
+fn notify_parent_after_cli_child_run(
+    store: &Store,
+    child_id: &str,
+    run_error: Option<String>,
+) -> Result<()> {
+    let Some(child) = store.load_session(child_id)? else {
+        return Ok(());
+    };
+    let Some(parent_id) = child.parent_id.as_deref() else {
+        return Ok(());
+    };
+    update_parent_from_child_run(store, parent_id, child_id, run_error)?;
     Ok(())
 }
 
@@ -1429,12 +1469,7 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
         "session.done",
         serde_json::json!({ "result": result.clone() }),
     )?;
-    notify_parent_agent_done(
-        store,
-        &task,
-        "done",
-        serde_json::json!({ "result": result }),
-    )?;
+    notify_parent_agent_done(store, &task)?;
     println!("done {task_id}");
     Ok(())
 }
@@ -1442,12 +1477,7 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
 fn cancel(store: &Store, task_id: &str, reason: &str) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     store.request_cancel(task_id, reason)?;
-    notify_parent_agent_done(
-        store,
-        &task,
-        "cancelled",
-        serde_json::json!({ "reason": reason }),
-    )?;
+    notify_parent_agent_done(store, &task)?;
     println!("cancelled {task_id}");
     Ok(())
 }
@@ -1459,12 +1489,7 @@ fn fail(store: &Store, task_id: &str, error: String) -> Result<()> {
         "session.failed",
         serde_json::json!({ "error": error.clone() }),
     )?;
-    notify_parent_agent_done(
-        store,
-        &task,
-        "failed",
-        serde_json::json!({ "error": error }),
-    )?;
+    notify_parent_agent_done(store, &task)?;
     println!("failed {task_id}");
     Ok(())
 }
@@ -2431,16 +2456,33 @@ fn spawn_agent(
     store: &Store,
     parent_id: &str,
     message: String,
+    task_name: Option<String>,
     path: Option<String>,
     nickname: Option<String>,
     role: Option<String>,
 ) -> Result<()> {
+    let parent = ensure_task_exists(store, parent_id)?;
+    if task_name.is_some() && path.is_some() {
+        bail!("spawn-agent accepts either --task-name or --path, not both");
+    }
+    let agent_path = match (task_name.as_deref(), path.as_deref()) {
+        (Some(task_name), None) => {
+            let parent_agent_path = display_agent_path_for_session(store, parent_id)?;
+            Some(
+                canonical_agent_path_from_task_name(task_name, &parent_agent_path)
+                    .map_err(anyhow::Error::msg)?,
+            )
+        }
+        (None, Some(path)) => Some(path.to_string()),
+        (None, None) => None,
+        (Some(_), Some(_)) => unreachable!("checked above"),
+    };
     let parent_events = store.events_for_session(parent_id)?;
     let inherited_context = sanitized_agent_context_from_events(&parent_events);
     let child = store.create_child_session(
         parent_id,
-        std::env::current_dir()?,
-        path.as_deref(),
+        Path::new(&parent.cwd),
+        agent_path.as_deref(),
         nickname.as_deref(),
         role.as_deref(),
     )?;
@@ -2449,9 +2491,15 @@ fn spawn_agent(
         "agent.context",
         serde_json::json!({
             "from_session_id": parent_id,
+            "fork_mode": "none",
+            "history_mode": "compact_context",
+            "agent_path": agent_path.clone(),
+            "nickname": nickname.clone(),
+            "role": role.clone(),
             "context": inherited_context,
         }),
     )?;
+    append_workspace_context_event(store, &child)?;
     store.append_event(
         &child.id,
         "session.input",
@@ -2462,7 +2510,7 @@ fn spawn_agent(
         "agent.spawned",
         serde_json::json!({
             "child_session_id": child.id,
-            "agent_path": path,
+            "agent_path": agent_path,
             "nickname": nickname,
             "role": role,
         }),
@@ -2471,27 +2519,98 @@ fn spawn_agent(
     Ok(())
 }
 
-fn list_agents(store: &Store, parent_id: &str) -> Result<()> {
-    let agents = store.list_child_agents(parent_id)?;
-    if agents.is_empty() {
-        println!("No child agents.");
+fn list_agents(store: &Store, parent_id: &str, json_output: bool) -> Result<()> {
+    ensure_task_exists(store, parent_id)?;
+    let root_id = root_session_id(store, parent_id)?;
+    let root = store
+        .load_session(&root_id)?
+        .with_context(|| format!("unknown root session id: {root_id}"))?;
+    let mut agents = vec![serde_json::json!({
+        "session_id": root.id,
+        "parent_session_id": Value::Null,
+        "agent_name": "/root",
+        "agent_status": local_agent_status_value(store, &root, None)?,
+        "last_task_message": "Main thread",
+        "nickname": Value::Null,
+        "role": Value::Null,
+    })];
+    for agent in collect_agent_tree(store, &root_id)?
+        .into_iter()
+        .filter(|agent| agent.status != "closed")
+    {
+        let child = store
+            .load_session(&agent.child_session_id)?
+            .with_context(|| format!("unknown child session id: {}", agent.child_session_id))?;
+        let agent_name = agent.agent_path.clone().unwrap_or_else(|| {
+            display_agent_path_for_session(store, &agent.child_session_id)
+                .unwrap_or_else(|_| agent.child_session_id.clone())
+        });
+        agents.push(serde_json::json!({
+            "session_id": agent.child_session_id,
+            "parent_session_id": agent.parent_session_id,
+            "agent_name": agent_name,
+            "agent_status": local_agent_status_value(store, &child, Some(&agent))?,
+            "last_task_message": last_task_message_for_agent(store, &child.id)?,
+            "nickname": agent.agent_nickname,
+            "role": agent.agent_role,
+        }));
+    }
+    agents.sort_by(|left, right| {
+        left.get("agent_name")
+            .and_then(Value::as_str)
+            .cmp(&right.get("agent_name").and_then(Value::as_str))
+    });
+    if json_output {
+        println!(
+            "{}",
+            serde_json::to_string_pretty(&serde_json::json!({ "agents": agents }))?
+        );
         return Ok(());
     }
     for agent in agents {
+        let status = serde_json::to_string(&agent["agent_status"])?;
+        let task = agent
+            .get("last_task_message")
+            .and_then(Value::as_str)
+            .unwrap_or("");
         println!(
-            "{}  {:<7}  {}  {}",
-            agent.child_session_id,
-            agent.status,
-            agent.agent_path.unwrap_or_else(|| "-".to_string()),
-            agent.agent_role.unwrap_or_else(|| "-".to_string())
+            "{}  {:<32}  {:<24}  {}",
+            agent["session_id"].as_str().unwrap_or("-"),
+            agent["agent_name"].as_str().unwrap_or("-"),
+            status,
+            task
         );
     }
     Ok(())
 }
 
 fn close_agent(store: &Store, child_id: &str, reason: &str) -> Result<()> {
+    let child = store
+        .load_session(child_id)?
+        .with_context(|| format!("unknown child session id: {child_id}"))?;
+    if child.parent_id.is_none() {
+        bail!("root is not a spawned agent");
+    }
+    let summary = store
+        .agent_summary_for_child(child_id)?
+        .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
+    let previous_status = local_agent_status_value(store, &child, Some(&summary))?;
     store.close_child_agent(child_id, reason)?;
-    println!("closed {child_id}");
+    store.append_event(
+        &summary.parent_session_id,
+        "agent.cancelled",
+        serde_json::json!({
+            "child_session_id": child_id,
+            "status": "cancelled",
+            "payload": { "reason": reason },
+        }),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "previous_status": previous_status,
+        }))?
+    );
     Ok(())
 }
 
@@ -2502,7 +2621,17 @@ fn send_agent_message(
     message: &str,
     trigger_turn: bool,
 ) -> Result<()> {
-    let msg = store.send_agent_message(author_id, target_id, message, trigger_turn)?;
+    let message = message.trim();
+    if message.is_empty() {
+        bail!("Empty message can't be sent to an agent");
+    }
+    let target = resolve_agent_reference_in_tree(store, author_id, target_id)?
+        .with_context(|| format!("live agent path `{target_id}` not found"))?;
+    if trigger_turn && target.is_root {
+        bail!("Tasks can't be assigned to the root agent");
+    }
+    let msg = store.send_agent_message(author_id, &target.session_id, message, trigger_turn)?;
+    let author_path = display_agent_path_for_session(store, author_id)?;
     store.append_event(
         author_id,
         "agent.message",
@@ -2510,6 +2639,9 @@ fn send_agent_message(
             "id": msg.id,
             "author_session_id": msg.author_session_id,
             "target_session_id": msg.target_session_id,
+            "author_path": author_path,
+            "recipient_path": target.agent_path,
+            "child_session_id": target.session_id,
             "content": msg.content,
             "trigger_turn": msg.trigger_turn,
         }),
@@ -2518,15 +2650,44 @@ fn send_agent_message(
     Ok(())
 }
 
-fn wait_agent(store: &Store, target_id: &str) -> Result<()> {
+fn wait_agent(store: &Store, target_id: &str, timeout_ms: u64) -> Result<()> {
     let session = ensure_task_exists(store, target_id)?;
-    println!("{}  {}", session.id, session.status.as_str());
-    for message in store.messages_for_agent(target_id)? {
-        println!(
-            "message {} from {} trigger={} {}",
-            message.id, message.author_session_id, message.trigger_turn, message.content
+    store.append_event(
+        &session.id,
+        "agent.wait.started",
+        serde_json::json!({
+            "timeout_ms": timeout_ms,
+        }),
+    )?;
+    let started = Instant::now();
+    let timeout = Duration::from_millis(timeout_ms);
+    let timed_out = loop {
+        if !store.messages_for_agent(target_id)?.is_empty() {
+            break false;
+        }
+        if started.elapsed() >= timeout {
+            break true;
+        }
+        std::thread::sleep(
+            Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())),
         );
-    }
+    };
+    let waited_ms = started.elapsed().as_millis() as u64;
+    store.append_event(
+        &session.id,
+        "agent.wait.finished",
+        serde_json::json!({
+            "timed_out": timed_out,
+            "waited_ms": waited_ms,
+        }),
+    )?;
+    println!(
+        "{}",
+        serde_json::to_string_pretty(&serde_json::json!({
+            "message": if timed_out { "Wait timed out." } else { "Wait completed." },
+            "timed_out": timed_out,
+        }))?
+    );
     Ok(())
 }
 
@@ -3991,31 +4152,11 @@ fn ensure_task_exists(store: &Store, task_id: &str) -> Result<browser_use_protoc
         .with_context(|| format!("unknown task id: {task_id}"))
 }
 
-fn notify_parent_agent_done(
-    store: &Store,
-    task: &browser_use_protocol::SessionMeta,
-    status: &str,
-    payload: serde_json::Value,
-) -> Result<()> {
+fn notify_parent_agent_done(store: &Store, task: &browser_use_protocol::SessionMeta) -> Result<()> {
     let Some(parent_id) = task.parent_id.as_deref() else {
         return Ok(());
     };
-    store.set_child_agent_status(&task.id, status)?;
-    let event_type = match status {
-        "done" => "agent.completed",
-        "failed" => "agent.failed",
-        "cancelled" => "agent.cancelled",
-        _ => "agent.updated",
-    };
-    store.append_event(
-        parent_id,
-        event_type,
-        serde_json::json!({
-            "child_session_id": task.id,
-            "status": status,
-            "payload": payload,
-        }),
-    )?;
+    update_parent_from_child_run(store, parent_id, &task.id, None)?;
     Ok(())
 }
 
@@ -4059,6 +4200,221 @@ mod tests {
         let options = cli_agent_options(None, &[], CollaborationModeKind::Plan)?;
 
         assert_eq!(options.collaboration_mode, CollaborationModeKind::Plan);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_spawn_agent_uses_parent_cwd_and_core_context_metadata() -> Result<()> {
+        let temp = unique_cli_test_dir("spawn-agent-context")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+
+        spawn_agent(
+            &store,
+            &parent.id,
+            "inspect from cli".to_string(),
+            Some("cli_child".to_string()),
+            None,
+            Some("CliNick".to_string()),
+            Some("explorer".to_string()),
+        )?;
+
+        let child = store
+            .list_child_agents(&parent.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        assert_eq!(child.agent_path.as_deref(), Some("/root/cli_child"));
+        assert_eq!(child.agent_nickname.as_deref(), Some("CliNick"));
+        assert_eq!(child.agent_role.as_deref(), Some("explorer"));
+        let child_session = store
+            .load_session(&child.child_session_id)?
+            .context("child session")?;
+        assert_eq!(child_session.cwd, parent_cwd.display().to_string());
+        let child_events = store.events_for_session(&child.child_session_id)?;
+        let context = child_events
+            .iter()
+            .find(|event| event.event_type == "agent.context")
+            .context("agent.context")?;
+        assert_eq!(context.payload["from_session_id"], parent.id);
+        assert_eq!(context.payload["agent_path"], "/root/cli_child");
+        assert_eq!(context.payload["nickname"], "CliNick");
+        assert_eq!(context.payload["role"], "explorer");
+        assert_eq!(context.payload["history_mode"], "compact_context");
+        let err = spawn_agent(
+            &store,
+            &parent.id,
+            "bad path shape".to_string(),
+            Some("other_child".to_string()),
+            Some("/root/other_child".to_string()),
+            None,
+            None,
+        )
+        .expect_err("task-name and path should be mutually exclusive");
+        assert!(err
+            .to_string()
+            .contains("either --task-name or --path, not both"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_agent_message_resolves_paths_and_rejects_empty_or_root_task() -> Result<()> {
+        let temp = unique_cli_test_dir("agent-message-paths")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+
+        let err = send_agent_message(&store, &parent.id, "cli_child", "  ", false)
+            .expect_err("empty messages should fail");
+        assert!(err
+            .to_string()
+            .contains("Empty message can't be sent to an agent"));
+        send_agent_message(&store, &parent.id, "cli_child", "inspect this", false)?;
+
+        let mail = store.messages_for_agent(&child.id)?;
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].content, "inspect this");
+        let parent_events = store.events_for_session(&parent.id)?;
+        let message_event = parent_events
+            .iter()
+            .find(|event| event.event_type == "agent.message")
+            .context("agent.message")?;
+        assert_eq!(message_event.payload["author_path"], "/root");
+        assert_eq!(message_event.payload["recipient_path"], "/root/cli_child");
+        assert_eq!(message_event.payload["child_session_id"], child.id);
+
+        let err = send_agent_message(&store, &child.id, "root", "new task", true)
+            .expect_err("root trigger turns should fail");
+        assert!(err
+            .to_string()
+            .contains("Tasks can't be assigned to the root agent"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_wait_agent_records_wait_events_without_dumping_mail() -> Result<()> {
+        let temp = unique_cli_test_dir("wait-agent-events")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+
+        wait_agent(&store, &parent.id, 0)?;
+        let events = store.events_for_session(&parent.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "agent.wait.started"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "agent.wait.finished"
+                && event.payload["timed_out"].as_bool() == Some(true)
+        }));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_close_agent_rejects_root_and_records_parent_cancellation() -> Result<()> {
+        let temp = unique_cli_test_dir("close-agent")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+
+        let err = close_agent(&store, &parent.id, "not valid")
+            .expect_err("root sessions should not close as spawned agents");
+        assert!(err.to_string().contains("root is not a spawned agent"));
+        close_agent(&store, &child.id, "done with child")?;
+
+        assert_eq!(
+            store.agent_summary_for_child(&child.id)?.unwrap().status,
+            "closed"
+        );
+        let parent_events = store.events_for_session(&parent.id)?;
+        let cancelled = parent_events
+            .iter()
+            .find(|event| event.event_type == "agent.cancelled")
+            .context("agent.cancelled")?;
+        assert_eq!(cancelled.payload["child_session_id"], child.id);
+        assert_eq!(cancelled.payload["payload"]["reason"], "done with child");
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_terminal_status_queues_parent_subagent_notification_like_core() -> Result<()> {
+        let temp = unique_cli_test_dir("child-notification")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+        let child = store.load_session(&child.id)?.context("child session")?;
+
+        notify_parent_agent_done(&store, &child)?;
+
+        assert_eq!(
+            store.agent_summary_for_child(&child.id)?.unwrap().status,
+            "done"
+        );
+        let parent_events = store.events_for_session(&parent.id)?;
+        let completed = parent_events
+            .iter()
+            .find(|event| event.event_type == "agent.completed")
+            .context("agent.completed")?;
+        assert_eq!(completed.payload["payload"]["child_session_id"], child.id);
+        assert_eq!(completed.payload["payload"]["status"], "done");
+        assert_eq!(completed.payload["payload"]["result"], "done");
+        let mail = store.messages_for_agent(&parent.id)?;
+        assert_eq!(mail.len(), 1);
+        assert_eq!(mail[0].author_session_id, child.id);
+        assert_eq!(mail[0].target_session_id, parent.id);
+        assert!(!mail[0].trigger_turn);
+        assert!(mail[0].content.contains("<subagent_notification>"));
+        assert!(mail[0]
+            .content
+            .contains("\"agent_path\":\"/root/cli_child\""));
+        assert!(mail[0].content.contains("\"completed\":\"done\""));
+
+        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 

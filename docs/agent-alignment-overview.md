@@ -164,37 +164,62 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch closed the represented MultiAgentV1 skill/reference/resume
-cluster in G-033.
+The latest batch closed the represented MultiAgentV1 mention/skill ordinary
+user-content suppression slice and the CLI-created child-agent command slice in
+G-033.
 
-- V1 spawned agents are now id-only like Codex. Local no longer fabricates a
-  task path for `multi_agent_v1.spawn_agent`, and completion notifications use
-  the child `agent_id` as the `agent_path` field Codex exposes for legacy v1.
-- Structured `skill` items now behave like Codex for the represented path:
-  they stay in the saved typed input for UI/state, are removed from ordinary
-  user content, and replay as separate user-role `<skill>` context by loading
-  the referenced `SKILL.md`.
-- V1 child-completion mail now enters the parent model as a direct user-role
-  `<subagent_notification>` contextual fragment instead of an assistant
-  inter-agent envelope.
-- V1 `resume_agent` now rejects invalid or missing ids as tool errors, reopens
-  cancelled targets, and restores descendants whose own edge remained open.
-  `close_agent` now marks only the target edge closed while cancelling active
-  descendants, so parent traversal hides the closed subtree but target resume
-  can reopen still-open descendants.
-- The `non_code_mode_only`/`DirectModelOnly` audit found no current local
-  code-mode runtime. A guard test records that these tools remain visible in
-  normal model mode, and the runtime split stays deferred until this repo
-  actually has code mode.
-- Remaining multi-agent gaps are mention/plugin/app context injection, exact
-  app-server collaboration/input-queue events, CLI legacy spawn/resume/wait
-  commands, full rollout persistence semantics, arbitrary role config keys such
-  as sandbox/skills/tools, and code-mode-only runtime behavior if code mode is
-  added.
+- Structured `mention` items now match Codex's ordinary user-content behavior
+  for the represented v1 path: they stay in saved typed `items` and UI preview
+  text, but no longer replay as `[mention:$Name](app://...)` user text.
+- The generic typed-item fallback no longer leaks skill-only inputs as
+  `[skill:$Name](...)` user text. Skill-only turns now replay only through the
+  Codex-shaped `<skill>` contextual user message when a valid `SKILL.md` body
+  can be loaded.
+- Skill bodies are now materialized into the persisted `session.input` or
+  `session.followup` payload when the typed input is created, so replay uses
+  the same captured skill content even if the `SKILL.md` file later changes or
+  disappears.
+- Mixed typed turns keep text/images/local-image placeholders model-visible,
+  while `skill` and `mention` remain metadata/context sources rather than
+  ordinary prompt text.
+- Full `app://` connector selection and `plugin://` developer-instruction
+  injection remain open because this repo does not yet have Codex's plugin
+  capability registry, app connector inventory, or app-server selection path.
+- CLI-created child agents now use the parent session cwd, store the same
+  core-facing `agent.context` metadata for path/nickname/role/compact inherited
+  context, and append normal workspace context before the child input.
+- When a CLI-run or manually finished child reaches `done`, `failed`, or
+  `cancelled`, the parent now receives the same Codex-shaped
+  `<subagent_notification>` mailbox message and parent lifecycle event that
+  core-created children already send, so the next parent model turn can see
+  child completion instead of only a UI event.
+- CLI `spawn-agent --task-name` now uses the same task-name validation and
+  canonical path derivation as the core v2 tool, while still allowing legacy
+  `--path` for compatibility and rejecting ambiguous combinations.
+- CLI `send-agent-message` now resolves live agent paths relative to the author
+  like the core tool, rejects empty content, rejects `--trigger-turn` tasks aimed
+  at `/root`, and stores author/recipient path metadata on the `agent.message`
+  event.
+- CLI `wait-agent` now waits for mailbox delivery up to a timeout and records
+  wait start/finish events without dumping queued message bodies to stdout.
+- CLI `list-agents` now reports the root plus live descendant tree with
+  Codex-shaped `agent_name`, `agent_status`, and `last_task_message` fields, with
+  a structured JSON output option for tool-facing inspection.
+- CLI `close-agent` now rejects root/non-edge sessions, returns the previous
+  Codex-shaped local status, closes the child edge, cancels active descendants,
+  and records the parent cancellation event.
+- Remaining multi-agent gaps are app/plugin connector context injection, exact
+  app-server collaboration/input-queue events, CLI resume/reopen breadth and
+  exact product output shape, full rollout persistence semantics, arbitrary role
+  config keys such as sandbox/skills/tools, and code-mode-only runtime behavior
+  if code mode is added.
 - Remaining large non-multi-agent gaps are websocket transport/fallback/
   `response.processed`, richer effective-config provenance and doctor/status
   displays, full app-server thread-config protocol surfaces beyond the
   represented core event, and broader config-layer stack behavior.
+
+The previous batch closed the represented MultiAgentV1 skill/reference/resume
+cluster in G-033.
 
 The previous batch closed the represented MultiAgentV1 typed-input and deferred
 tool-discovery cluster in G-033.
