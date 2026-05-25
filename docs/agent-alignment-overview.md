@@ -164,34 +164,40 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch closed the represented MultiAgentV1 typed-input and deferred
-tool-discovery cluster in G-033.
+The latest batch closed the represented MultiAgentV1 skill/reference/resume
+cluster in G-033.
 
-- The model catalog now carries Codex's `supports_search_tool` capability into
-  request planning, and default `multi_agent_v1` tools defer behind `tool_search`
-  when the selected model and provider support search plus namespace tools.
-- `tool_search` serializes with Codex's Responses wire shape, `tool_search_call`
-  parses into a dispatchable local tool call, and the dispatcher returns
-  `tool_search_output` raw response items containing loadable namespace/function
-  specs marked `defer_loading: true`.
-- V1 `spawn_agent` and `send_input` now enforce Codex's `message` versus
-  `items` validation: both, neither, empty message, and empty items are rejected
-  with Codex-shaped model-facing errors.
-- V1 typed `items` no longer collapse to preview text. Text, remote image, local
-  image, skill, and mention inputs persist with the session event, replay into
-  provider messages as typed content parts where possible, and keep deterministic
-  preview text for local product surfaces.
-- V1 `send_input` now writes typed follow-up events directly to the target
-  session instead of going through the string-only inter-agent mailbox.
-- Remaining multi-agent gaps are full skill/mention/plugin/app context
-  injection, CLI legacy spawn/resume/wait parity, exact app-server
-  collaboration events, v1 reference/resume/close tree persistence nuances,
-  code-mode-only/direct-model-only runtime separation, and deeper typed
-  rollout/input-queue persistence beyond this event-store adaptation.
+- V1 spawned agents are now id-only like Codex. Local no longer fabricates a
+  task path for `multi_agent_v1.spawn_agent`, and completion notifications use
+  the child `agent_id` as the `agent_path` field Codex exposes for legacy v1.
+- Structured `skill` items now behave like Codex for the represented path:
+  they stay in the saved typed input for UI/state, are removed from ordinary
+  user content, and replay as separate user-role `<skill>` context by loading
+  the referenced `SKILL.md`.
+- V1 child-completion mail now enters the parent model as a direct user-role
+  `<subagent_notification>` contextual fragment instead of an assistant
+  inter-agent envelope.
+- V1 `resume_agent` now rejects invalid or missing ids as tool errors, reopens
+  cancelled targets, and restores descendants whose own edge remained open.
+  `close_agent` now marks only the target edge closed while cancelling active
+  descendants, so parent traversal hides the closed subtree but target resume
+  can reopen still-open descendants.
+- The `non_code_mode_only`/`DirectModelOnly` audit found no current local
+  code-mode runtime. A guard test records that these tools remain visible in
+  normal model mode, and the runtime split stays deferred until this repo
+  actually has code mode.
+- Remaining multi-agent gaps are mention/plugin/app context injection, exact
+  app-server collaboration/input-queue events, CLI legacy spawn/resume/wait
+  commands, full rollout persistence semantics, arbitrary role config keys such
+  as sandbox/skills/tools, and code-mode-only runtime behavior if code mode is
+  added.
 - Remaining large non-multi-agent gaps are websocket transport/fallback/
   `response.processed`, richer effective-config provenance and doctor/status
   displays, full app-server thread-config protocol surfaces beyond the
   represented core event, and broader config-layer stack behavior.
+
+The previous batch closed the represented MultiAgentV1 typed-input and deferred
+tool-discovery cluster in G-033.
 
 The previous batch closed the represented multi-agent v2 config, mailbox,
 completion, concurrency, and usage-hint cluster in G-033.
@@ -958,18 +964,22 @@ The biggest remaining categories are:
   preserves typed v1 `items` for child context: Codex-style `message`/`items`
   validation is enforced, text/image/local_image/skill/mention inputs persist
   alongside preview text on `session.input` and `session.followup`, provider
-  replay uses typed content parts, and v1 `send_input` bypasses the string-only
-  mailbox for model-visible input. Local now also parses model
-  `supports_search_tool`, exposes Codex-shaped `tool_search`, parses
-  `tool_search_call`, and defers default `multi_agent_v1` tools behind BM25
-  discovery when the selected model and provider support search plus namespace
-  tools.
-- Full multi-agent parity: full skill/mention/plugin/app context injection,
-  CLI legacy spawn/resume/wait parity, arbitrary role config keys such as
+  replay uses typed content parts, `skill` items inject Codex-shaped `<skill>`
+  context from `SKILL.md`, and v1 `send_input` bypasses the string-only mailbox
+  for model-visible input. Local now also parses model `supports_search_tool`,
+  exposes Codex-shaped `tool_search`, parses `tool_search_call`, and defers
+  default `multi_agent_v1` tools behind BM25 discovery when the selected model
+  and provider support search plus namespace tools. V1 spawn/resume/close now
+  use id-only references, direct user-role completion notifications, missing-id
+  resume errors, and target-edge-only close semantics for the represented local
+  tree.
+- Full multi-agent parity: mention/plugin/app context injection, CLI legacy
+  spawn/resume/wait commands, arbitrary role config keys such as
   sandbox/skills/tools, exact non-file config layer semantics, exact app-server
-  collaboration/input-queue event bridge semantics, v1 reference/resume/close
-  tree persistence nuances, code-mode-only/direct-model-only runtime separation,
-  and deeper typed rollout persistence beyond the local event-store adaptation.
+  collaboration/input-queue event bridge semantics, full rollout persistence
+  for resume/reopen beyond this local store adaptation, code-mode-only runtime
+  separation if local adds code mode, and deeper typed rollout persistence
+  beyond the local event-store adaptation.
 - Codex turn lifecycle parity: fully typed `TurnComplete`/`TurnAborted` events,
   websocket-only previous-response transport placement, `response.processed`
   ack and sticky fallback, TTFT/duration/app-server notification exactness,

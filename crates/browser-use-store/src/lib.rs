@@ -551,21 +551,93 @@ impl Store {
             .map_err(Into::into)
     }
 
+    pub fn agent_summary_for_child(&self, child_session_id: &str) -> Result<Option<AgentSummary>> {
+        self.conn
+            .query_row(
+                r#"
+                SELECT
+                    e.parent_session_id,
+                    e.child_session_id,
+                    e.status,
+                    s.agent_path,
+                    s.agent_nickname,
+                    s.agent_role,
+                    e.updated_ms
+                FROM agent_edges e
+                JOIN sessions s ON s.id = e.child_session_id
+                WHERE e.child_session_id = ?1
+                "#,
+                params![child_session_id],
+                row_to_agent_summary,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
     pub fn close_child_agent(&self, child_session_id: &str, reason: &str) -> Result<()> {
         self.load_session(child_session_id)?
             .with_context(|| format!("unknown child session id: {child_session_id}"))?;
-        let mut to_close = vec![child_session_id.to_string()];
-        self.collect_descendant_agent_ids(child_session_id, &mut to_close)?;
-        for id in to_close.into_iter().rev() {
-            let now = now_ms();
-            self.conn.execute(
-                "UPDATE agent_edges SET status = 'closed', updated_ms = ?1 WHERE child_session_id = ?2",
-                params![now, id],
-            )?;
+        let now = now_ms();
+        self.conn.execute(
+            "UPDATE agent_edges SET status = 'closed', updated_ms = ?1 WHERE child_session_id = ?2",
+            params![now, child_session_id],
+        )?;
+        self.notify(StoreNotification::SessionChanged {
+            session_id: child_session_id.to_string(),
+        });
+
+        let mut to_cancel = vec![child_session_id.to_string()];
+        self.collect_descendant_agent_ids(child_session_id, &mut to_cancel)?;
+        for id in to_cancel {
+            let is_active = self
+                .load_session(&id)?
+                .is_some_and(|session| session.status.is_active());
+            if is_active {
+                self.request_cancel(&id, reason)?;
+            }
+            self.notify(StoreNotification::SessionChanged { session_id: id });
+        }
+        Ok(())
+    }
+
+    pub fn reopen_child_agent_subtree(&self, child_session_id: &str) -> Result<()> {
+        self.load_session(child_session_id)?
+            .with_context(|| format!("unknown child session id: {child_session_id}"))?;
+        self.reopen_child_agent_subtree_inner(child_session_id, true)
+    }
+
+    fn reopen_child_agent_subtree_inner(
+        &self,
+        child_session_id: &str,
+        is_target: bool,
+    ) -> Result<()> {
+        let summary = self
+            .agent_summary_for_child(child_session_id)?
+            .with_context(|| {
+                format!("unknown child agent edge for session id: {child_session_id}")
+            })?;
+        if !is_target && summary.status != "open" {
+            return Ok(());
+        }
+        let now = now_ms();
+        self.conn.execute(
+            "UPDATE agent_edges SET status = 'open', updated_ms = ?1 WHERE child_session_id = ?2",
+            params![now, child_session_id],
+        )?;
+        if self
+            .load_session(child_session_id)?
+            .is_some_and(|session| session.status == SessionStatus::Cancelled)
+        {
+            self.set_status(child_session_id, SessionStatus::Created)?;
+        } else {
             self.notify(StoreNotification::SessionChanged {
-                session_id: id.clone(),
+                session_id: child_session_id.to_string(),
             });
-            self.request_cancel(&id, reason)?;
+        }
+        for child in self.list_child_agents(child_session_id)? {
+            if child.status == "open" {
+                self.reopen_child_agent_subtree_inner(&child.child_session_id, false)?;
+            }
         }
         Ok(())
     }
@@ -1338,7 +1410,7 @@ mod tests {
         let grandchild = store.load_session(&grandchild.id)?.expect("grandchild");
         assert_eq!(grandchild.status, SessionStatus::Cancelled);
         let descendants = store.list_child_agents(&child.id)?;
-        assert_eq!(descendants[0].status, "closed");
+        assert_eq!(descendants[0].status, "open");
         Ok(())
     }
 

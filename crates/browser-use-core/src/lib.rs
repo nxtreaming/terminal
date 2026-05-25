@@ -5842,17 +5842,16 @@ fn append_new_external_session_messages(
     events.sort_by_key(|event| event.seq);
     for event in events {
         *last_seq = (*last_seq).max(event.seq);
-        let Some(content) = session_event_user_content(&event.payload) else {
-            continue;
-        };
-        messages.push(serde_json::json!({
-            "role": "user",
-            "content": content,
-        }));
+        messages.extend(session_event_user_messages(&event.payload));
     }
     for mail in store.drain_agent_messages_for_agent(session_id)? {
         let author_path = display_agent_path_for_session(store, &mail.author_session_id)?;
         let recipient_path = display_agent_path_for_session(store, &mail.target_session_id)?;
+        let author_has_agent_path = store
+            .agent_path_for_session(&mail.author_session_id)?
+            .is_some_and(|path| !path.trim().is_empty());
+        let v1_subagent_notification =
+            !author_has_agent_path && is_subagent_notification_text(&mail.content);
         let event = store.append_event(
             session_id,
             "agent.mailbox_input",
@@ -5864,6 +5863,7 @@ fn append_new_external_session_messages(
                 "recipient_path": recipient_path,
                 "content": mail.content,
                 "trigger_turn": mail.trigger_turn,
+                "v1_subagent_notification": v1_subagent_notification,
             }),
         )?;
         if let Some(message) = inter_agent_provider_message_from_event(&event) {
@@ -6105,6 +6105,8 @@ fn is_real_user_message(message: &Value) -> bool {
     message.get("role").and_then(Value::as_str) == Some("user")
         && message.get("name").is_none()
         && !is_turn_aborted_message(message)
+        && !is_skill_context_message(message)
+        && !is_subagent_notification_context_message(message)
 }
 
 fn is_contextual_provider_message(message: &Value) -> bool {
@@ -6133,6 +6135,12 @@ fn provider_history_has_open_turn(messages: &[Value]) -> bool {
 
 fn inter_agent_provider_message_from_event(event: &EventRecord) -> Option<Value> {
     let content = event.payload.get("content").and_then(Value::as_str)?;
+    if is_v1_subagent_notification_event(event, content) {
+        return Some(serde_json::json!({
+            "role": "user",
+            "content": content,
+        }));
+    }
     let author = event
         .payload
         .get("author_path")
@@ -6425,12 +6433,7 @@ fn provider_messages_from_event_slice(
                     &mut assistant_phase,
                     &mut assistant_tool_calls,
                 );
-                if let Some(content) = session_event_user_content(&event.payload) {
-                    messages.push(serde_json::json!({
-                        "role": "user",
-                        "content": content,
-                    }));
-                }
+                messages.extend(session_event_user_messages(&event.payload));
                 turn_open = true;
             }
             MODEL_SWITCH_CONTEXT_EVENT
@@ -7274,7 +7277,9 @@ fn task_text_from_provider_messages(messages: &[Value]) -> Option<String> {
         (message.get("role").and_then(Value::as_str) == Some("user")
             && !is_workspace_context_message(message)
             && !is_turn_aborted_message(message)
-            && !is_compaction_summary_message(message))
+            && !is_compaction_summary_message(message)
+            && !is_skill_context_message(message)
+            && !is_subagent_notification_context_message(message))
         .then(|| message_content_text(message))
         .filter(|text| !text.trim().is_empty())
     })
@@ -7304,6 +7309,7 @@ fn session_event_user_content(payload: &Value) -> Option<Value> {
                 return Some(Value::String(text.clone()));
             }
             Value::Array(parts) if !parts.is_empty() => return Some(Value::Array(parts.clone())),
+            Value::Array(_) => return None,
             other if !other.is_null() => return Some(other.clone()),
             _ => {}
         }
@@ -7314,6 +7320,95 @@ fn session_event_user_content(payload: &Value) -> Option<Value> {
         .map(str::trim)
         .filter(|text| !text.is_empty())
         .map(|text| Value::String(text.to_string()))
+}
+
+fn session_event_user_messages(payload: &Value) -> Vec<Value> {
+    let mut messages = Vec::new();
+    if let Some(content) = session_event_user_content(payload) {
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": content,
+        }));
+    }
+    messages.extend(skill_context_messages_from_payload(payload));
+    messages
+}
+
+fn skill_context_messages_from_payload(payload: &Value) -> Vec<Value> {
+    let Some(items) = payload.get("items").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut seen_paths = HashSet::new();
+    let mut messages = Vec::new();
+    for item in items {
+        if item.get("type").and_then(Value::as_str) != Some("skill") {
+            continue;
+        }
+        let name = item
+            .get("name")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        let path = item
+            .get("path")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim();
+        if path.is_empty() || !seen_paths.insert(path.to_string()) {
+            continue;
+        }
+        if !Path::new(path)
+            .file_name()
+            .and_then(|name| name.to_str())
+            .is_some_and(|name| name == "SKILL.md")
+        {
+            continue;
+        }
+        let Ok(contents) = std::fs::read_to_string(path) else {
+            continue;
+        };
+        messages.push(serde_json::json!({
+            "role": "user",
+            "content": format!(
+                "<skill>\n<name>{}</name>\n<path>{}</path>\n{}\n</skill>",
+                name,
+                path,
+                contents,
+            ),
+        }));
+    }
+    messages
+}
+
+fn is_skill_context_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && message_content_text(message)
+            .trim_start()
+            .starts_with("<skill>")
+}
+
+fn is_subagent_notification_context_message(message: &Value) -> bool {
+    message.get("role").and_then(Value::as_str) == Some("user")
+        && is_subagent_notification_text(&message_content_text(message))
+}
+
+fn is_subagent_notification_text(text: &str) -> bool {
+    text.trim_start().starts_with("<subagent_notification>")
+}
+
+fn is_v1_subagent_notification_event(event: &EventRecord, content: &str) -> bool {
+    event
+        .payload
+        .get("v1_subagent_notification")
+        .and_then(Value::as_bool)
+        .unwrap_or_else(|| {
+            is_subagent_notification_text(content)
+                && event
+                    .payload
+                    .get("author_path")
+                    .and_then(Value::as_str)
+                    .is_some_and(|path| !path.starts_with("/root"))
+        })
 }
 
 struct ToolDispatchOutcome {
@@ -7883,7 +7978,7 @@ fn dispatch_tool_call<P: ModelProvider>(
         ),
         ToolHandlerKind::ListAgents => dispatch_list_agents_tool(store, session, call),
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
-        ToolHandlerKind::CloseAgentV1 => dispatch_close_agent_tool(store, session, call),
+        ToolHandlerKind::CloseAgentV1 => dispatch_close_agent_v1_tool(store, session, call),
         ToolHandlerKind::ToolSearch => dispatch_tool_search_tool(store, session, call, &registry),
     }
 }
@@ -11777,13 +11872,18 @@ fn collect_active_descendant_agents(
         if child_is_active && agent.status != "closed" {
             active.push(agent.clone());
         }
-        collect_active_descendant_agents(store, &agent.child_session_id, active)?;
+        if agent.status != "closed" {
+            collect_active_descendant_agents(store, &agent.child_session_id, active)?;
+        }
     }
     Ok(())
 }
 
 fn close_direct_active_child_subtrees(store: &Store, session_id: &str) -> Result<()> {
     for agent in store.list_child_agents(session_id)? {
+        if agent.status == "closed" {
+            continue;
+        }
         let mut subtree_active = Vec::new();
         collect_active_descendant_agents(store, &agent.child_session_id, &mut subtree_active)?;
         let child_is_active = store
@@ -12072,10 +12172,14 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
     } else {
         "fork_response_items"
     };
-    let parent_agent_path = display_agent_path_for_session(store, &session.id)?;
-    let agent_path = match spawn_agent_task_name(call, &parent_agent_path, legacy_v1) {
-        Ok(agent_path) => agent_path,
-        Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+    let agent_path = if legacy_v1 {
+        None
+    } else {
+        let parent_agent_path = display_agent_path_for_session(store, &session.id)?;
+        match spawn_agent_task_name(call, &parent_agent_path) {
+            Ok(agent_path) => Some(agent_path),
+            Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+        }
     };
     let nickname = reserve_spawn_agent_nickname(
         store,
@@ -12085,7 +12189,7 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
     let child = store.create_child_session(
         &session.id,
         &session.cwd,
-        Some(agent_path.as_str()),
+        agent_path.as_deref(),
         Some(nickname.as_str()),
         agent_role,
     )?;
@@ -12185,7 +12289,7 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
         })
     } else {
         serde_json::json!({
-            "task_name": agent_path,
+            "task_name": agent_path.expect("v2 spawn has agent path"),
         })
     };
     if !legacy_v1 && !hide_spawn_agent_metadata {
@@ -12609,7 +12713,8 @@ fn collab_item_content_parts(item: &Value, parts: &mut Vec<Value>) {
             let detail = item.get("detail").and_then(Value::as_str).unwrap_or("high");
             push_collab_local_image_parts(parts, path, detail);
         }
-        Some("skill") | Some("mention") => {
+        Some("skill") => {}
+        Some("mention") => {
             let preview = collab_item_preview(item);
             if !preview.trim().is_empty() {
                 parts.push(serde_json::json!({
@@ -13196,55 +13301,11 @@ fn keep_forked_response_item(item: &Value) -> bool {
     }
 }
 
-fn spawn_agent_task_name(
-    call: &ToolCall,
-    parent_agent_path: &str,
-    legacy_v1: bool,
-) -> Result<String, String> {
+fn spawn_agent_task_name(call: &ToolCall, parent_agent_path: &str) -> Result<String, String> {
     if let Some(task_name) = call.arguments.get("task_name").and_then(Value::as_str) {
         return canonical_agent_path_from_task_name(task_name, parent_agent_path);
     }
-    if legacy_v1 {
-        return canonical_agent_path_from_task_name(
-            &generated_v1_task_name(&call.id, call.arguments.get("agent_type")),
-            parent_agent_path,
-        );
-    }
     Err("spawn_agent requires task_name".to_string())
-}
-
-fn generated_v1_task_name(call_id: &str, agent_type: Option<&Value>) -> String {
-    let prefix = agent_type
-        .and_then(Value::as_str)
-        .map(str::trim)
-        .filter(|role| !role.is_empty())
-        .unwrap_or("agent");
-    let prefix = prefix
-        .chars()
-        .map(|ch| {
-            if ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_' {
-                ch
-            } else if ch.is_ascii_uppercase() {
-                ch.to_ascii_lowercase()
-            } else {
-                '_'
-            }
-        })
-        .collect::<String>()
-        .trim_matches('_')
-        .to_string();
-    let prefix = if prefix.is_empty() { "agent" } else { &prefix };
-    let suffix = call_id
-        .chars()
-        .filter(|ch| ch.is_ascii_alphanumeric())
-        .take(8)
-        .collect::<String>()
-        .to_ascii_lowercase();
-    if suffix.is_empty() {
-        prefix.to_string()
-    } else {
-        format!("{prefix}_{suffix}")
-    }
 }
 
 fn canonical_agent_path_from_task_name(
@@ -13364,7 +13425,9 @@ fn collect_agent_tree_into(
 ) -> Result<()> {
     for child in store.list_child_agents(parent_session_id)? {
         out.push(child.clone());
-        collect_agent_tree_into(store, &child.child_session_id, out)?;
+        if child.status != "closed" {
+            collect_agent_tree_into(store, &child.child_session_id, out)?;
+        }
     }
     Ok(())
 }
@@ -13391,6 +13454,7 @@ fn resolve_agent_reference_in_tree(
     }
     Ok(collect_agent_tree(store, &root_id)?
         .into_iter()
+        .filter(|agent| agent.status != "closed")
         .find_map(|agent| {
             let path = agent.agent_path.clone().unwrap_or_else(|| {
                 display_agent_path_for_session(store, &agent.child_session_id)
@@ -13577,6 +13641,25 @@ fn dispatch_resume_agent_v1_tool(
     let Some(target_session_id) = call.arguments.get("id").and_then(Value::as_str) else {
         return dispatch_tool_validation_error(store, session, call, "resume_agent requires id");
     };
+    if !is_local_agent_id(target_session_id) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("invalid agent id `{target_session_id}`"),
+        );
+    }
+    let Some(target_session) = store.load_session(target_session_id)? else {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("agent with id `{target_session_id}` not found"),
+        );
+    };
+    if target_session.parent_id.is_none() {
+        return dispatch_tool_validation_error(store, session, call, "root is not a spawned agent");
+    }
     store.append_event(
         &session.id,
         "tool.started",
@@ -13586,16 +13669,18 @@ fn dispatch_resume_agent_v1_tool(
             "arguments": call.arguments,
         }),
     )?;
-    let status = if let Some(target_session) = store.load_session(target_session_id)? {
-        if target_session.status == SessionStatus::Cancelled {
-            store.set_status(target_session_id, SessionStatus::Created)?;
-            store.set_child_agent_status(target_session_id, "open")?;
-            Value::String("pending_init".to_string())
-        } else {
-            local_agent_status_value(store, &target_session, None)?
-        }
+    let needs_reopen = target_session.status == SessionStatus::Cancelled
+        || store
+            .agent_summary_for_child(target_session_id)?
+            .is_some_and(|agent| agent.status == "closed");
+    let status = if needs_reopen {
+        store.reopen_child_agent_subtree(target_session_id)?;
+        let reopened = store
+            .load_session(target_session_id)?
+            .with_context(|| format!("unknown session id after resume: {target_session_id}"))?;
+        local_agent_status_value(store, &reopened, None)?
     } else {
-        Value::String("not_found".to_string())
+        local_agent_status_value(store, &target_session, None)?
     };
     store.append_event(
         &session.id,
@@ -13638,6 +13723,14 @@ fn dispatch_wait_agent_v1_tool(
         .unwrap_or_default();
     if targets.is_empty() {
         return dispatch_tool_validation_error(store, session, call, "wait_agent requires targets");
+    }
+    if let Some(invalid) = targets.iter().find(|target| !is_local_agent_id(target)) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("invalid agent id `{invalid}`"),
+        );
     }
     let timeout_ms = call
         .arguments
@@ -13699,6 +13792,10 @@ fn dispatch_wait_agent_v1_tool(
             }),
         )?],
     })
+}
+
+fn is_local_agent_id(value: &str) -> bool {
+    value.len() == 12 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
 }
 
 fn final_statuses_for_v1_wait(
@@ -14173,6 +14270,92 @@ fn dispatch_close_agent_tool(
         .with_context(|| format!("unknown child session id: {child_session_id}"))?;
     let previous_status = local_agent_status_value(store, &child, target_agent.summary.as_ref())?;
     store.close_child_agent(&child_session_id, "closed by parent agent")?;
+    store.append_event(
+        &session.id,
+        "agent.cancelled",
+        serde_json::json!({
+            "child_session_id": child_session_id,
+            "status": "cancelled",
+            "payload": { "reason": "closed by parent agent" },
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "close_agent",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_json_message(
+            store,
+            session,
+            call,
+            "close_agent",
+            serde_json::json!({
+                "previous_status": previous_status,
+            }),
+        )?],
+    })
+}
+
+fn dispatch_close_agent_v1_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+) -> Result<ToolDispatchOutcome> {
+    if let Some(invalid) = unexpected_tool_arguments(&call.arguments, &["target"]) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("unexpected argument `{invalid}` for close_agent"),
+        );
+    }
+    let Some(child_session_id) = call.arguments.get("target").and_then(Value::as_str) else {
+        return dispatch_tool_validation_error(store, session, call, "close_agent requires target");
+    };
+    if !is_local_agent_id(child_session_id) {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            &format!("invalid agent id `{child_session_id}`"),
+        );
+    }
+    let child = match store.load_session(child_session_id)? {
+        Some(child) if child.parent_id.is_some() => child,
+        Some(_) => {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                "root is not a spawned agent",
+            )
+        }
+        None => {
+            return dispatch_tool_validation_error(
+                store,
+                session,
+                call,
+                &format!("agent id `{child_session_id}` not found"),
+            )
+        }
+    };
+    let agent_summary = store.agent_summary_for_child(child_session_id)?;
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "close_agent",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let previous_status = local_agent_status_value(store, &child, agent_summary.as_ref())?;
+    store.close_child_agent(child_session_id, "closed by parent agent")?;
     store.append_event(
         &session.id,
         "agent.cancelled",
@@ -24473,6 +24656,30 @@ non_code_mode_only = true
     }
 
     #[test]
+    fn multi_agent_v2_non_code_mode_only_stays_visible_without_local_code_mode() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\nnon_code_mode_only = true\n",
+        )?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        let specs = with_codex_home(&codex_home, || {
+            browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
+        })?;
+
+        assert!(specs
+            .iter()
+            .any(|spec| spec.name == "spawn_agent" && spec.namespace.is_none()));
+        assert!(specs
+            .iter()
+            .any(|spec| spec.name == "wait_agent" && spec.namespace.is_none()));
+        Ok(())
+    }
+
+    #[test]
     fn multi_agent_v2_config_drives_tool_specs_and_wait_validation() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -25398,6 +25605,9 @@ description = "Missing developer instructions"
         let session = store.create_session(None, temp.path())?;
         let provider = FakeProvider::default();
         let missing_image_path = temp.path().join("missing.png");
+        let skill_path = temp.path().join("skills").join("Docs").join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().context("skill parent")?)?;
+        std::fs::write(&skill_path, "Use the internal docs workflow.")?;
         let call = ToolCall {
             id: "spawn_v1_items".to_string(),
             name: "spawn_agent".to_string(),
@@ -25408,7 +25618,7 @@ description = "Missing developer instructions"
                     {"type": "text", "text": "inspect the screenshot"},
                     {"type": "image", "image_url": "data:image/png;base64,abc", "detail": "high"},
                     {"type": "local_image", "path": missing_image_path.display().to_string()},
-                    {"type": "skill", "name": "Docs", "path": "/tmp/SKILL.md"},
+                    {"type": "skill", "name": "Docs", "path": skill_path.display().to_string()},
                     {"type": "mention", "name": "Calendar", "path": "app://calendar"}
                 ]
             }),
@@ -25430,6 +25640,7 @@ description = "Missing developer instructions"
             .into_iter()
             .next()
             .context("child agent")?;
+        assert!(child.agent_path.is_none());
         let child_events = store.events_for_session(&child.child_session_id)?;
         let input = child_events
             .iter()
@@ -25443,7 +25654,7 @@ description = "Missing developer instructions"
         assert!(input.payload["text"]
             .as_str()
             .unwrap_or_default()
-            .contains("[skill:$Docs](/tmp/SKILL.md)"));
+            .contains("[skill:$Docs]"));
         let content = input.payload["content"].as_array().context("content")?;
         assert!(content.iter().any(|part| {
             part["type"] == "input_image" && part["image_url"] == "data:image/png;base64,abc"
@@ -25454,6 +25665,13 @@ description = "Missing developer instructions"
                     .as_str()
                     .unwrap_or_default()
                     .contains("Codex could not read the local image")
+        }));
+        assert!(!content.iter().any(|part| {
+            part["type"] == "input_text"
+                && part["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("[skill:$Docs]")
         }));
 
         let messages = provider_messages_from_events(&child_events);
@@ -25468,6 +25686,11 @@ description = "Missing developer instructions"
                                 && part["image_url"] == "data:image/png;base64,abc"
                         })
                     })
+        }));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_content_text(message).contains("<skill>\n<name>Docs</name>")
+                && message_content_text(message).contains("Use the internal docs workflow.")
         }));
         Ok(())
     }
@@ -25485,6 +25708,9 @@ description = "Missing developer instructions"
             Some("explorer"),
         )?;
         let provider = FakeProvider::default();
+        let skill_path = temp.path().join("skills").join("Review").join("SKILL.md");
+        std::fs::create_dir_all(skill_path.parent().context("skill parent")?)?;
+        std::fs::write(&skill_path, "Always check the review checklist.")?;
         let call = ToolCall {
             id: "send_v1_items".to_string(),
             name: "send_input".to_string(),
@@ -25493,7 +25719,8 @@ description = "Missing developer instructions"
                 "target": child.id,
                 "items": [
                     {"type": "text", "text": "look at this"},
-                    {"type": "image", "image_url": "data:image/png;base64,abc"}
+                    {"type": "image", "image_url": "data:image/png;base64,abc"},
+                    {"type": "skill", "name": "Review", "path": skill_path.display().to_string()}
                 ]
             }),
         };
@@ -25527,6 +25754,168 @@ description = "Missing developer instructions"
                     .and_then(Value::as_array)
                     .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_image"))
         }));
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_content_text(message).contains("<skill>\n<name>Review</name>")
+                && message_content_text(message).contains("Always check the review checklist.")
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v1_completion_notification_uses_id_contextual_user_message_like_codex(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let provider = FakeProvider::default();
+        let call = ToolCall {
+            id: "spawn_v1_notify".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: Some("multi_agent_v1".to_string()),
+            arguments: serde_json::json!({
+                "message": "finish quickly",
+            }),
+        };
+
+        with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &parent,
+                &call,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+        let child = store
+            .list_child_agents(&parent.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        assert!(child.agent_path.is_none());
+        let parent_mail = store.messages_for_agent(&parent.id)?;
+        assert_eq!(parent_mail.len(), 1);
+        assert!(parent_mail[0].content.contains("<subagent_notification>"));
+        assert!(parent_mail[0]
+            .content
+            .contains(&format!("\"agent_path\":\"{}\"", child.child_session_id)));
+
+        let parent_provider = ModelSwitchCapturingProvider::new("gpt-5.4");
+        with_codex_home(&codex_home, || {
+            run_existing_session_with_provider(
+                &store,
+                &parent_provider,
+                &parent.id,
+                AgentRunOptions::default(),
+            )
+        })?;
+        let captured = parent_provider
+            .captured_messages()
+            .into_iter()
+            .next()
+            .context("captured parent turn")?;
+        assert!(captured.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message_content_text(message).contains("<subagent_notification>")
+                && message_content_text(message).contains(&child.child_session_id)
+        }));
+        assert!(!captured
+            .iter()
+            .map(message_content_text)
+            .collect::<Vec<_>>()
+            .join("\n")
+            .contains("\"author\""));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v1_resume_and_close_use_id_tree_edges_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(&parent.id, temp.path(), None, None, None)?;
+        let grandchild = store.create_child_session(&child.id, temp.path(), None, None, None)?;
+
+        let close = dispatch_close_agent_v1_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "close_v1_child".to_string(),
+                name: "close_agent".to_string(),
+                namespace: Some("multi_agent_v1".to_string()),
+                arguments: serde_json::json!({ "target": child.id }),
+            },
+        )?;
+        let close_payload =
+            serde_json::from_str::<Value>(&message_content_text(&close.messages[0]))?;
+        assert_eq!(close_payload["previous_status"], "pending_init");
+        assert_eq!(
+            store.agent_summary_for_child(&child.id)?.unwrap().status,
+            "closed"
+        );
+        assert_eq!(
+            store
+                .agent_summary_for_child(&grandchild.id)?
+                .unwrap()
+                .status,
+            "open"
+        );
+        assert_eq!(
+            store.load_session(&child.id)?.unwrap().status,
+            SessionStatus::Cancelled
+        );
+        assert_eq!(
+            store.load_session(&grandchild.id)?.unwrap().status,
+            SessionStatus::Cancelled
+        );
+
+        let resume = dispatch_resume_agent_v1_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "resume_v1_child".to_string(),
+                name: "resume_agent".to_string(),
+                namespace: Some("multi_agent_v1".to_string()),
+                arguments: serde_json::json!({ "id": child.id }),
+            },
+        )?;
+        let resume_payload =
+            serde_json::from_str::<Value>(&message_content_text(&resume.messages[0]))?;
+        assert_eq!(resume_payload["status"], "pending_init");
+        assert_eq!(
+            store.agent_summary_for_child(&child.id)?.unwrap().status,
+            "open"
+        );
+        assert_eq!(
+            store
+                .agent_summary_for_child(&grandchild.id)?
+                .unwrap()
+                .status,
+            "open"
+        );
+        assert_eq!(
+            store.load_session(&child.id)?.unwrap().status,
+            SessionStatus::Created
+        );
+        assert_eq!(
+            store.load_session(&grandchild.id)?.unwrap().status,
+            SessionStatus::Created
+        );
+
+        let missing = dispatch_resume_agent_v1_tool(
+            &store,
+            &parent,
+            &ToolCall {
+                id: "resume_v1_missing".to_string(),
+                name: "resume_agent".to_string(),
+                namespace: Some("multi_agent_v1".to_string()),
+                arguments: serde_json::json!({ "id": "abcdefabcdef" }),
+            },
+        )?;
+        assert!(message_content_text(&missing.messages[0])
+            .contains("agent with id `abcdefabcdef` not found"));
         Ok(())
     }
 
@@ -26190,7 +26579,7 @@ description = "Missing developer instructions"
         );
         assert_eq!(
             store.load_session(&child.id)?.expect("child").status,
-            SessionStatus::Cancelled
+            SessionStatus::Done
         );
         Ok(())
     }
