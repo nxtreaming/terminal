@@ -12,6 +12,8 @@ use browser_use_protocol::{SessionMeta, ToolCall};
 use browser_use_store::{Store, StoreNotifier};
 use portable_pty::{native_pty_system, CommandBuilder, MasterPty, PtySize};
 use serde_json::{json, Value};
+use tree_sitter::{Node, Parser, Tree};
+use tree_sitter_bash::LANGUAGE as BASH;
 
 const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_TIME_MS: u64 = 250;
@@ -778,6 +780,7 @@ fn json_type_name(value: &Value) -> &'static str {
     }
 }
 
+#[allow(dead_code)]
 pub(crate) fn cleanup_session_commands(session_id: &str) -> usize {
     let mut pending = Vec::new();
     {
@@ -1388,134 +1391,150 @@ fn shell_lc_plain_commands(command: &[String]) -> Option<Vec<Vec<String>>> {
 }
 
 fn rough_shell_word_commands(cmd: &str) -> Option<Vec<Vec<String>>> {
-    let mut commands = Vec::new();
-    let mut words = Vec::new();
-    let mut current = String::new();
-    let mut word_started = false;
-    let mut quote = ShellQuote::None;
-    let mut escaped = false;
-    let mut just_finished_separator = false;
-    let mut iter = cmd.chars().peekable();
+    let tree = try_parse_shell(cmd)?;
+    try_parse_word_only_commands_sequence(&tree, cmd)
+}
 
-    while let Some(ch) = iter.next() {
-        if escaped {
-            current.push(ch);
-            word_started = true;
-            just_finished_separator = false;
-            escaped = false;
-            continue;
-        }
-        match quote {
-            ShellQuote::Single if ch == '\'' => quote = ShellQuote::None,
-            ShellQuote::Single => {
-                current.push(ch);
-                word_started = true;
-                just_finished_separator = false;
-            }
-            ShellQuote::Double if ch == '"' => quote = ShellQuote::None,
-            ShellQuote::Double if ch == '$' || ch == '`' => return None,
-            ShellQuote::Double if ch == '\\' => {
-                escaped = true;
-                word_started = true;
-                just_finished_separator = false;
-            }
-            ShellQuote::Double => {
-                current.push(ch);
-                word_started = true;
-                just_finished_separator = false;
-            }
-            ShellQuote::None if ch == '\\' => {
-                escaped = true;
-                word_started = true;
-                just_finished_separator = false;
-            }
-            ShellQuote::None if ch == '\'' => {
-                quote = ShellQuote::Single;
-                word_started = true;
-                just_finished_separator = false;
-            }
-            ShellQuote::None if ch == '"' => {
-                quote = ShellQuote::Double;
-                word_started = true;
-                just_finished_separator = false;
-            }
-            ShellQuote::None if ch.is_whitespace() => {
-                if word_started {
-                    words.push(std::mem::take(&mut current));
-                    word_started = false;
-                }
-            }
-            ShellQuote::None if ch == '&' => {
-                if iter.peek() != Some(&'&') {
-                    return None;
-                }
-                iter.next();
-                finish_command(&mut commands, &mut words, &mut current, &mut word_started)?;
-                just_finished_separator = true;
-            }
-            ShellQuote::None if ch == '|' => {
-                if iter.peek() == Some(&'|') {
-                    iter.next();
-                }
-                finish_command(&mut commands, &mut words, &mut current, &mut word_started)?;
-                just_finished_separator = true;
-            }
-            ShellQuote::None if ch == ';' => {
-                finish_command(&mut commands, &mut words, &mut current, &mut word_started)?;
-                just_finished_separator = true;
-            }
-            ShellQuote::None if ch == '#' => {
-                return None;
-            }
-            ShellQuote::None
-                if matches!(
-                    ch,
-                    '\n' | '\r' | '<' | '>' | '`' | '$' | '(' | ')' | '{' | '}'
-                ) =>
-            {
-                return None;
-            }
-            ShellQuote::None => {
-                current.push(ch);
-                word_started = true;
-                just_finished_separator = false;
-            }
-        }
-    }
-    if escaped || quote != ShellQuote::None || just_finished_separator {
+fn try_parse_shell(shell_lc_arg: &str) -> Option<Tree> {
+    let lang = BASH.into();
+    let mut parser = Parser::new();
+    parser.set_language(&lang).expect("load bash grammar");
+    parser.parse(shell_lc_arg, None)
+}
+
+fn try_parse_word_only_commands_sequence(tree: &Tree, src: &str) -> Option<Vec<Vec<String>>> {
+    if tree.root_node().has_error() {
         return None;
     }
-    if word_started {
-        words.push(current);
+
+    const ALLOWED_KINDS: &[&str] = &[
+        "program",
+        "list",
+        "pipeline",
+        "command",
+        "command_name",
+        "word",
+        "string",
+        "string_content",
+        "raw_string",
+        "number",
+        "concatenation",
+    ];
+    const ALLOWED_PUNCT_TOKENS: &[&str] = &["&&", "||", ";", "|", "\"", "'"];
+
+    let root = tree.root_node();
+    let mut cursor = root.walk();
+    let mut stack = vec![root];
+    let mut command_nodes = Vec::new();
+    while let Some(node) = stack.pop() {
+        let kind = node.kind();
+        if node.is_named() {
+            if !ALLOWED_KINDS.contains(&kind) {
+                return None;
+            }
+            if kind == "command" {
+                command_nodes.push(node);
+            }
+        } else {
+            if kind.chars().any(|ch| "&;|".contains(ch)) && !ALLOWED_PUNCT_TOKENS.contains(&kind) {
+                return None;
+            }
+            if !(ALLOWED_PUNCT_TOKENS.contains(&kind) || kind.trim().is_empty()) {
+                return None;
+            }
+        }
+        for child in node.children(&mut cursor) {
+            stack.push(child);
+        }
     }
-    if !words.is_empty() {
+
+    command_nodes.sort_by_key(Node::start_byte);
+
+    let mut commands = Vec::new();
+    for node in command_nodes {
+        let words = parse_plain_command_from_node(node, src)?;
         commands.push(words);
     }
-    (!commands.is_empty()).then_some(commands)
+    Some(commands)
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum ShellQuote {
-    None,
-    Single,
-    Double,
-}
-
-fn finish_command(
-    commands: &mut Vec<Vec<String>>,
-    words: &mut Vec<String>,
-    current: &mut String,
-    word_started: &mut bool,
-) -> Option<()> {
-    if *word_started {
-        words.push(std::mem::take(current));
-        *word_started = false;
-    }
-    if words.is_empty() {
+fn parse_plain_command_from_node(cmd: Node<'_>, src: &str) -> Option<Vec<String>> {
+    if cmd.kind() != "command" {
         return None;
     }
-    commands.push(std::mem::take(words));
-    Some(())
+    let mut words = Vec::new();
+    let mut cursor = cmd.walk();
+    for child in cmd.named_children(&mut cursor) {
+        match child.kind() {
+            "command_name" => {
+                let word_node = child.named_child(0)?;
+                if word_node.kind() != "word" {
+                    return None;
+                }
+                words.push(word_node.utf8_text(src.as_bytes()).ok()?.to_owned());
+            }
+            "word" | "number" => {
+                words.push(child.utf8_text(src.as_bytes()).ok()?.to_owned());
+            }
+            "string" => {
+                words.push(parse_double_quoted_string(child, src)?);
+            }
+            "raw_string" => {
+                words.push(parse_raw_string(child, src)?);
+            }
+            "concatenation" => {
+                let mut concatenated = String::new();
+                let mut concat_cursor = child.walk();
+                for part in child.named_children(&mut concat_cursor) {
+                    match part.kind() {
+                        "word" | "number" => {
+                            concatenated.push_str(part.utf8_text(src.as_bytes()).ok()?);
+                        }
+                        "string" => {
+                            concatenated.push_str(&parse_double_quoted_string(part, src)?);
+                        }
+                        "raw_string" => {
+                            concatenated.push_str(&parse_raw_string(part, src)?);
+                        }
+                        _ => return None,
+                    }
+                }
+                if concatenated.is_empty() {
+                    return None;
+                }
+                words.push(concatenated);
+            }
+            _ => return None,
+        }
+    }
+    Some(words)
+}
+
+fn parse_double_quoted_string(node: Node<'_>, src: &str) -> Option<String> {
+    if node.kind() != "string" {
+        return None;
+    }
+    let mut cursor = node.walk();
+    for part in node.named_children(&mut cursor) {
+        if part.kind() != "string_content" {
+            return None;
+        }
+    }
+    let raw = node.utf8_text(src.as_bytes()).ok()?;
+    let stripped = raw
+        .strip_prefix('"')
+        .and_then(|text| text.strip_suffix('"'))?;
+    Some(stripped.to_string())
+}
+
+fn parse_raw_string(node: Node<'_>, src: &str) -> Option<String> {
+    if node.kind() != "raw_string" {
+        return None;
+    }
+    let raw = node.utf8_text(src.as_bytes()).ok()?;
+    raw.strip_prefix('\'')
+        .and_then(|text| text.strip_suffix('\''))
+        .map(str::to_owned)
 }
 
 fn command_words_are_known_read_only(words: &[String]) -> bool {
@@ -2837,12 +2856,19 @@ mod tests {
         for cmd in [
             "bash -lc 'git status --short && rg -n foo src | wc -l'",
             "zsh -lc 'ls'",
+            "bash -lc 'ls\npwd'",
+            "bash -lc 'rg -n \"foo\" -g\"*.rs\" src'",
         ] {
             assert!(
                 exec_command_is_known_read_only(&json!({"cmd": cmd})),
                 "{cmd:?} should be read-only"
             );
         }
+
+        assert_eq!(
+            rough_shell_word_commands(r#"echo "/usr"'/'"local"/bin"#),
+            Some(vec![vec!["echo".to_string(), "/usr/local/bin".to_string()]])
+        );
 
         for cmd in [
             "bash -lc 'git branch -d feature'",

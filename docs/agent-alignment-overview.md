@@ -96,7 +96,12 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   transcript buffer preserves whole-process completion output for background
   `command.finished` events. Command readers now stream no-newline output
   chunks, so prompts and progress text are visible before EOF, and stdin write
-  failures are included in model-visible recovery text.
+  failures are included in model-visible recovery text. Running unified-exec
+  sessions now survive normal turn completion and can be reused by follow-up
+  `write_stdin` calls like Codex, while read-only shell classification uses
+  Codex's tree-sitter-bash word-only parser shape for nested `bash -lc` and
+  `zsh -lc` sequences, safe command separators, quoted strings, and
+  concatenated literal words.
   Compaction now preserves the canonical
   startup context instead of replacing it with only a summary. AGENTS discovery
   now reads Codex's project-doc config knobs from Codex-home `config.toml` and
@@ -169,39 +174,42 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch closed a high-impact G-028/G-029 tool-runtime parity slice:
+The latest batch closed the next high-impact G-028 unified-exec slice:
+Codex-style process lifetime across completed turns plus the represented
+tree-sitter shell parser path for safe read-only command classification.
+
+- Normal run completion no longer calls unified-exec cleanup. Background
+  `exec_command` sessions stay session-scoped, matching Codex's process manager
+  behavior for follow-up turns.
+- A provider-level regression now starts a TTY-backed background command,
+  completes the turn, appends a follow-up, and verifies `write_stdin` can reuse
+  the same numeric `session_id` and receive output from the same process.
+- The old hand-written rough shell parser was replaced with the Codex
+  tree-sitter-bash word-only sequence parser shape for the represented Unix
+  path. It accepts plain commands joined by `&&`, `||`, `;`, and `|`, quoted
+  literal strings, numbers, and literal concatenations such as `-g"*.rs"`.
+- The parser now rejects the same high-value unsafe/malformed constructs as the
+  Codex parser for this path: comments, redirection, substitutions, variable
+  assignments, trailing operators, leading operators, double separators, and
+  empty pipeline segments.
+- Read-only shell-wrapper detection now benefits from that parser for nested
+  `bash -lc`, `zsh -lc`, and `sh -c` command sequences before applying the
+  existing Codex-shaped read-only/dangerous-command classification.
+- Three read-only subagents also re-audited related G-026/G-031 WebSocket,
+  G-028 process/parser, and G-032 config-stack gaps. WebSocket transport,
+  `response.processed`, sticky HTTP fallback, and full effective-config
+  provenance remain open follow-up clusters rather than this turn's runtime
+  slice.
+- Remaining G-028 gaps are shell-mode breadth including PowerShell/cmd and
+  optional zsh-fork behavior, pause-aware deadline extension, notification-based
+  output waiting/post-exit drain exactness, here-doc command-prefix metadata,
+  code-mode JSON output if this harness adds code mode, and explicit
+  shutdown/stop wiring for background command cleanup. Approval logic stays
+  intentionally out of scope for this experiment.
+
+The previous batch closed a high-impact G-028/G-029 tool-runtime parity slice:
 command output fidelity for interactive processes and Codex-shaped patch
 progress/final lifecycle reporting.
-
-- Unified exec readers now stream partial chunks instead of waiting for newline
-  boundaries. Model-visible output can now include prompts such as `Password: `,
-  REPL prompts, progress text, and server startup lines before EOF or a newline.
-- Running commands keep a separate final transcript buffer in addition to the
-  per-poll drain buffer. Background `command.finished` events now include
-  `stdout`, `stderr`, `aggregated_output`, and `timed_out` without consuming
-  output that a later `write_stdin` poll should still return.
-- `write_stdin` failures are now included in the command result text, giving the
-  model Codex-like recovery context when a PTY or process has already exited.
-- Responses streaming now exposes `CustomToolCallInputDelta` events for custom
-  tools. `apply_patch` consumes those deltas only for progress and still executes
-  solely from the final custom-tool payload.
-- Streaming `apply_patch` input deltas now emit best-effort `patch.updated`
-  snapshots, so UI/state observers can see patch progress before the final tool
-  call arrives.
-- `apply_patch` now emits `patch.finished` for parse, verification, runtime
-  apply, and success paths. The payload includes status/success, stdout/stderr,
-  planned changes, committed changes, committed files, and a
-  `committed_delta_exact` flag.
-- Runtime patch failures after earlier files were written now report the
-  committed prefix in both the tool error text and the structured
-  `patch.finished` payload.
-- Remaining G-028 gaps are shell-mode breadth, pause-aware deadline extension,
-  parser breadth, code-mode JSON output if this harness adds code mode, and
-  exact cross-turn process persistence.
-- Remaining G-029 gaps are exact app-server v2 patch notification surfaces,
-  fuller Codex streaming parser/throttle behavior, and sandbox-dependent
-  hardlink/path protections. Approval logic stays intentionally out of scope for
-  this experiment.
 
 The previous batch closed the represented MultiAgentV1 skill/reference/resume
 cluster in G-033.
@@ -847,10 +855,12 @@ The biggest remaining categories are:
   model-visible, and legacy hidden spawn fields reject like Codex v2.
 - Unified exec internals: env defaults, default login behavior, explicit-shell
   fallback, process id allocation/pruning, background completion, per-call
-  output buffering, final transcript events, no-newline partial output, and
-  stdin write-error model text are now partially aligned. Still open:
-  shell-mode breadth, pause-aware waits, full parser parity, code-mode JSON,
-  and exact cross-turn process persistence.
+  output buffering, final transcript events, no-newline partial output,
+  stdin write-error model text, cross-turn background process lifetime, and the
+  represented Unix tree-sitter shell parser path are now partially aligned.
+  Still open: shell-mode breadth, pause-aware waits, notification/post-exit
+  drain exactness, here-doc metadata, code-mode JSON, and explicit product stop
+  cleanup wiring.
 - Patch semantics: contextual/parser semantics, preverification/runtime
   sequencing, streaming custom-tool progress snapshots, success/failure
   lifecycle events, and committed-delta reporting after runtime failures are
@@ -913,9 +923,11 @@ The biggest remaining categories are:
   prefix-rule approvals, feature-enabled additional-permission normalization
   and approval, network denial handling, full tree-sitter parser parity beyond
   the tested Unix plain-command edge cases, Codex shell-mode breadth including
-  PowerShell/Windows heuristics, pause-aware wait deadline extension, code-mode
-  JSON if this terminal adds code-mode, exact cross-turn process persistence,
-  and exact prompt-vs-allow behavior for non-dangerous unmatched commands.
+  PowerShell/Windows heuristics and optional zsh-fork behavior, pause-aware wait
+  deadline extension, notification/post-exit drain exactness, here-doc metadata,
+  code-mode JSON if this terminal adds code-mode, explicit product stop cleanup
+  wiring, and exact prompt-vs-allow behavior for non-dangerous unmatched
+  commands.
 - Full patch sandbox execution, protected-path approval prompts, and approval
   decision logic are intentionally out of scope for this experiment unless the
   product later needs them. Still open for patch quality: hardlink-escape

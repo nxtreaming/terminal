@@ -3179,18 +3179,10 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             )?;
             bail!("agent exceeded maximum provider turns");
         })();
-        // Browser state is session-level, not run-level. Keep local, managed, and
-        // remote browser ownership alive across normal task completion so follow-ups
-        // can inspect/recover the same browser. Explicit close/stop actions own
-        // teardown.
-        let cleaned_commands = tools::command::cleanup_session_commands(&session.id);
-        if cleaned_commands > 0 {
-            store.append_event(
-                &session.id,
-                "command.cleaned_up",
-                serde_json::json!({ "count": cleaned_commands }),
-            )?;
-        }
+        // Browser and unified-exec process state are session-level, not run-level.
+        // Keep them alive across normal task completion so follow-ups can inspect
+        // or recover the same browser and background terminals. Explicit close/stop
+        // actions own teardown.
         run_result
     })();
     let cancelled = is_cancelled(store, &session.id)?;
@@ -15292,6 +15284,14 @@ mod tests {
         }
     }
 
+    struct SessionCommandCleanup(String);
+
+    impl Drop for SessionCommandCleanup {
+        fn drop(&mut self) {
+            tools::command::cleanup_session_commands(&self.0);
+        }
+    }
+
     #[test]
     fn codex_responses_extra_headers_match_root_and_child_sessions() -> Result<()> {
         let temp = tempfile::tempdir()?;
@@ -22956,6 +22956,51 @@ command = "print-token"
         Ok(())
     }
 
+    #[test]
+    fn background_exec_command_survives_completed_turn_for_followup_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = CrossTurnBackgroundExecProvider::default();
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "start a background command",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let _cleanup = SessionCommandCleanup(session_id.clone());
+
+        store.append_event(
+            &session_id,
+            "session.followup",
+            serde_json::json!({ "text": "poll the existing background command" }),
+        )?;
+        run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session_id,
+            AgentRunOptions::default(),
+        )?;
+
+        let events = store.events_for_session(&session_id)?;
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == "command.cleaned_up"),
+            "normal completion should not clean up unified exec sessions"
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.finished"
+                && event.payload["name"] == "write_stdin"
+                && event.payload["output"]["running"] == true
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done"
+                && event.payload["result"] == "background command survived"
+        }));
+        Ok(())
+    }
+
     #[derive(Default)]
     struct ExecToolOutputInspectingProvider {
         step: std::sync::Mutex<usize>,
@@ -23088,6 +23133,108 @@ command = "print-token"
                                 name: "done".to_string(),
                                 namespace: None,
                                 arguments: serde_json::json!({"result": "stdin gate matched"}),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]
+                }
+            };
+            *step += 1;
+            Ok(events)
+        }
+    }
+
+    #[derive(Default)]
+    struct CrossTurnBackgroundExecProvider {
+        step: std::sync::Mutex<usize>,
+        process_id: std::sync::Mutex<Option<i64>>,
+    }
+
+    impl ModelProvider for CrossTurnBackgroundExecProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let events = match *step {
+                0 => vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "exec_cross_turn".to_string(),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({
+                                "cmd": "python3 -u -c \"import sys; print('ready', flush=True); [print('echo:' + line.strip(), flush=True) for line in sys.stdin]\"",
+                                "tty": true,
+                                "yield_time_ms": 100,
+                            }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ],
+                1 => {
+                    let content = latest_tool_content(&turn, "exec_command")
+                        .context("exec command tool response")?;
+                    assert!(
+                        content.contains("Output:\nready"),
+                        "background command should return initial output: {content}"
+                    );
+                    let marker = "Process running with session ID ";
+                    let session_id = content
+                        .lines()
+                        .find_map(|line| line.strip_prefix(marker))
+                        .context("running session id line")?
+                        .parse::<i64>()?;
+                    *self.process_id.lock().expect("process id lock") = Some(session_id);
+                    vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "done_after_background_exec".to_string(),
+                                name: "done".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({
+                                    "result": "background command started",
+                                }),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]
+                }
+                2 => {
+                    let session_id = self
+                        .process_id
+                        .lock()
+                        .expect("process id lock")
+                        .context("process id from first turn")?;
+                    vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "write_cross_turn".to_string(),
+                                name: "write_stdin".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({
+                                    "session_id": session_id,
+                                    "chars": "after-turn\n",
+                                    "yield_time_ms": 1000,
+                                }),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]
+                }
+                _ => {
+                    let content = latest_tool_content(&turn, "write_stdin")
+                        .context("write_stdin tool response")?;
+                    assert!(
+                        content.contains("echo:after-turn"),
+                        "follow-up should reach the same background session: {content}"
+                    );
+                    vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "done_after_cross_turn_stdin".to_string(),
+                                name: "done".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({
+                                    "result": "background command survived",
+                                }),
                             },
                         },
                         ModelEvent::Done,
