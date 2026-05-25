@@ -5094,9 +5094,9 @@ fn response_item_output_from_tool_content(content: &Value) -> Value {
 
 fn response_input_item_call_id(item: &Value) -> Option<&str> {
     match item.get("type").and_then(Value::as_str) {
-        Some("function_call_output") | Some("custom_tool_call_output") => {
-            item.get("call_id").and_then(Value::as_str)
-        }
+        Some("function_call_output")
+        | Some("custom_tool_call_output")
+        | Some("tool_search_output") => item.get("call_id").and_then(Value::as_str),
         _ => None,
     }
 }
@@ -5842,18 +5842,12 @@ fn append_new_external_session_messages(
     events.sort_by_key(|event| event.seq);
     for event in events {
         *last_seq = (*last_seq).max(event.seq);
-        let Some(text) = event
-            .payload
-            .get("text")
-            .and_then(Value::as_str)
-            .map(str::trim)
-            .filter(|text| !text.is_empty())
-        else {
+        let Some(content) = session_event_user_content(&event.payload) else {
             continue;
         };
         messages.push(serde_json::json!({
             "role": "user",
-            "content": text,
+            "content": content,
         }));
     }
     for mail in store.drain_agent_messages_for_agent(session_id)? {
@@ -6431,10 +6425,10 @@ fn provider_messages_from_event_slice(
                     &mut assistant_phase,
                     &mut assistant_tool_calls,
                 );
-                if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
+                if let Some(content) = session_event_user_content(&event.payload) {
                     messages.push(serde_json::json!({
                         "role": "user",
-                        "content": text,
+                        "content": content,
                     }));
                 }
                 turn_open = true;
@@ -7303,6 +7297,25 @@ fn message_content_text(message: &Value) -> String {
     }
 }
 
+fn session_event_user_content(payload: &Value) -> Option<Value> {
+    if let Some(content) = payload.get("content") {
+        match content {
+            Value::String(text) if !text.trim().is_empty() => {
+                return Some(Value::String(text.clone()));
+            }
+            Value::Array(parts) if !parts.is_empty() => return Some(Value::Array(parts.clone())),
+            other if !other.is_null() => return Some(other.clone()),
+            _ => {}
+        }
+    }
+    payload
+        .get("text")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|text| !text.is_empty())
+        .map(|text| Value::String(text.to_string()))
+}
+
 struct ToolDispatchOutcome {
     finished: bool,
     messages: Vec<Value>,
@@ -7314,9 +7327,11 @@ fn browser_tool_specs_for_session(
     model_name: &str,
     namespace_tools_supported: bool,
 ) -> Result<Vec<ToolSpec>> {
+    let tool_search_supported =
+        resolved_model_request_info_for_session(session, options, model_name)?.supports_search_tool;
     Ok(
         browser_tool_registry_for_session(session, options, model_name, namespace_tools_supported)?
-            .specs()
+            .specs_for_model(tool_search_supported, namespace_tools_supported)
             .into_iter()
             .filter(|spec| namespace_tools_supported || spec.namespace.is_none())
             .collect(),
@@ -7869,6 +7884,7 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::ListAgents => dispatch_list_agents_tool(store, session, call),
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
         ToolHandlerKind::CloseAgentV1 => dispatch_close_agent_tool(store, session, call),
+        ToolHandlerKind::ToolSearch => dispatch_tool_search_tool(store, session, call, &registry),
     }
 }
 
@@ -7890,6 +7906,75 @@ fn dispatch_exec_command_tool(
             &result.model_text,
             usize::MAX,
         )?],
+    })
+}
+
+fn dispatch_tool_search_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    registry: &ToolRegistry,
+) -> Result<ToolDispatchOutcome> {
+    let query = call
+        .arguments
+        .get("query")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
+        .trim();
+    if query.is_empty() {
+        return dispatch_tool_validation_error(store, session, call, "query must not be empty");
+    }
+    let limit = call
+        .arguments
+        .get("limit")
+        .and_then(Value::as_u64)
+        .unwrap_or(8);
+    if limit == 0 {
+        return dispatch_tool_validation_error(
+            store,
+            session,
+            call,
+            "limit must be greater than zero",
+        );
+    }
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "tool_search",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+    let tools = registry.search_deferred_tools(query, limit as usize);
+    let item = serde_json::json!({
+        "type": "tool_search_output",
+        "call_id": call.id,
+        "status": "completed",
+        "execution": "client",
+        "tools": tools,
+    });
+    store.append_event(
+        &session.id,
+        MODEL_RESPONSE_INPUT_ITEM_EVENT,
+        serde_json::json!({
+            "source": "tool_search",
+            "name": "tool_search",
+            "call_id": call.id,
+            "item": item,
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": "tool_search",
+            "tool_call_id": call.id,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![item],
     })
 }
 
@@ -8726,6 +8811,7 @@ impl MultiAgentV2Config {
             usage_hint_text: self.usage_hint_text.clone(),
             max_concurrent_threads_per_session: self.max_concurrent_threads_per_session,
             tool_namespace: self.tool_namespace.clone(),
+            non_code_mode_only: self.non_code_mode_only,
         }
     }
 }
@@ -11815,9 +11901,19 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
     if let Err(error) = validate_spawn_agent_arguments(&call.arguments, legacy_v1) {
         return dispatch_tool_validation_error(store, session, call, &error);
     }
-    let message = spawn_agent_message_from_call(call, legacy_v1);
-    let message = message.trim();
-    if message.is_empty() {
+    let legacy_input = if legacy_v1 {
+        match collab_input_from_call(call) {
+            Ok(input) => Some(input),
+            Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+        }
+    } else {
+        None
+    };
+    let message = legacy_input
+        .as_ref()
+        .map(|input| input.preview.clone())
+        .unwrap_or_else(|| spawn_agent_message_from_call(call, legacy_v1));
+    if message.trim().is_empty() {
         return dispatch_tool_validation_error(
             store,
             session,
@@ -12022,11 +12118,14 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
     if fork_mode != "all" {
         append_workspace_context_event_with_options(store, &child, &child_options)?;
     }
-    store.append_event(
-        &child.id,
-        "session.input",
-        serde_json::json!({ "text": message }),
-    )?;
+    let mut input_payload = serde_json::json!({ "text": message.trim() });
+    if let Some(input) = legacy_input.as_ref() {
+        input_payload["content"] = input.content.clone();
+        if let Some(items) = input.items.as_ref() {
+            input_payload["items"] = Value::Array(items.clone());
+        }
+    }
+    store.append_event(&child.id, "session.input", input_payload)?;
     store.append_event(
         &session.id,
         "agent.spawned",
@@ -12367,6 +12466,13 @@ fn validate_spawn_agent_arguments(arguments: &Value, legacy_v1: bool) -> Result<
     Ok(())
 }
 
+#[derive(Clone, Debug)]
+struct CollabInput {
+    preview: String,
+    content: Value,
+    items: Option<Vec<Value>>,
+}
+
 fn spawn_agent_message_from_call(call: &ToolCall, legacy_v1: bool) -> String {
     if let Some(message) = call.arguments.get("message").and_then(Value::as_str) {
         if !message.trim().is_empty() {
@@ -12374,29 +12480,216 @@ fn spawn_agent_message_from_call(call: &ToolCall, legacy_v1: bool) -> String {
         }
     }
     if legacy_v1 {
-        return collab_items_preview(call.arguments.get("items"));
+        return collab_input_from_call(call)
+            .map(|input| input.preview)
+            .unwrap_or_default();
     }
     String::new()
 }
 
-fn collab_items_preview(items: Option<&Value>) -> String {
-    let Some(items) = items.and_then(Value::as_array) else {
-        return String::new();
+fn collab_input_from_call(call: &ToolCall) -> Result<CollabInput, String> {
+    parse_collab_input(
+        call.arguments
+            .get("message")
+            .filter(|value| !value.is_null()),
+        call.arguments.get("items").filter(|value| !value.is_null()),
+    )
+}
+
+fn parse_collab_input(
+    message: Option<&Value>,
+    items: Option<&Value>,
+) -> Result<CollabInput, String> {
+    match (message, items) {
+        (Some(_), Some(_)) => Err("Provide either message or items, but not both".to_string()),
+        (None, None) => Err("Provide one of: message or items".to_string()),
+        (Some(message), None) => {
+            let Some(message) = message.as_str() else {
+                return Err("message must be a string".to_string());
+            };
+            if message.trim().is_empty() {
+                return Err("Empty message can't be sent to an agent".to_string());
+            }
+            Ok(CollabInput {
+                preview: message.to_string(),
+                content: Value::String(message.to_string()),
+                items: None,
+            })
+        }
+        (None, Some(items)) => collab_input_from_items(items),
+    }
+}
+
+fn collab_input_from_items(items: &Value) -> Result<CollabInput, String> {
+    let Some(items) = items.as_array() else {
+        return Err("items must be an array".to_string());
     };
-    items
+    if items.is_empty() {
+        return Err("Items can't be empty".to_string());
+    }
+    let preview = items
         .iter()
-        .filter_map(|item| {
-            item.get("text")
-                .and_then(Value::as_str)
-                .or_else(|| item.as_str())
-                .map(str::to_string)
-                .or_else(|| {
-                    (!item.is_null())
-                        .then(|| serde_json::to_string(item).unwrap_or_else(|_| item.to_string()))
-                })
-        })
+        .map(collab_item_preview)
+        .filter(|preview| !preview.is_empty())
         .collect::<Vec<_>>()
-        .join("\n")
+        .join("\n");
+    let mut parts = Vec::new();
+    for item in items {
+        collab_item_content_parts(item, &mut parts);
+    }
+    if parts.is_empty() && !preview.trim().is_empty() {
+        parts.push(serde_json::json!({
+            "type": "input_text",
+            "text": preview,
+        }));
+    }
+    Ok(CollabInput {
+        preview,
+        content: Value::Array(parts),
+        items: Some(items.clone()),
+    })
+}
+
+fn collab_item_preview(item: &Value) -> String {
+    match item.get("type").and_then(Value::as_str) {
+        Some("text") => item
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .to_string(),
+        Some("image") => "[image]".to_string(),
+        Some("local_image") => format!(
+            "[local_image:{}]",
+            item.get("path").and_then(Value::as_str).unwrap_or_default()
+        ),
+        Some("skill") => format!(
+            "[skill:${}]({})",
+            item.get("name").and_then(Value::as_str).unwrap_or_default(),
+            item.get("path").and_then(Value::as_str).unwrap_or_default()
+        ),
+        Some("mention") => format!(
+            "[mention:${}]({})",
+            item.get("name").and_then(Value::as_str).unwrap_or_default(),
+            item.get("path").and_then(Value::as_str).unwrap_or_default()
+        ),
+        _ => "[input]".to_string(),
+    }
+}
+
+fn collab_item_content_parts(item: &Value, parts: &mut Vec<Value>) {
+    match item.get("type").and_then(Value::as_str) {
+        Some("text") => {
+            if let Some(text) = item
+                .get("text")
+                .and_then(Value::as_str)
+                .filter(|text| !text.is_empty())
+            {
+                parts.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": text,
+                }));
+            }
+        }
+        Some("image") => {
+            if let Some(image_url) = item
+                .get("image_url")
+                .and_then(Value::as_str)
+                .filter(|url| !url.is_empty())
+            {
+                push_collab_image_parts(
+                    parts,
+                    None,
+                    image_url.to_string(),
+                    item.get("detail").and_then(Value::as_str).unwrap_or("high"),
+                );
+            }
+        }
+        Some("local_image") => {
+            let path = item.get("path").and_then(Value::as_str).unwrap_or_default();
+            let detail = item.get("detail").and_then(Value::as_str).unwrap_or("high");
+            push_collab_local_image_parts(parts, path, detail);
+        }
+        Some("skill") | Some("mention") => {
+            let preview = collab_item_preview(item);
+            if !preview.trim().is_empty() {
+                parts.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": preview,
+                }));
+            }
+        }
+        _ => {
+            parts.push(serde_json::json!({
+                "type": "input_text",
+                "text": collab_item_preview(item),
+            }));
+        }
+    }
+}
+
+fn push_collab_image_parts(
+    parts: &mut Vec<Value>,
+    label: Option<String>,
+    image_url: String,
+    detail: &str,
+) {
+    parts.push(serde_json::json!({
+        "type": "input_text",
+        "text": label
+            .map(|label| format!("<image name={label}>"))
+            .unwrap_or_else(|| "<image>".to_string()),
+    }));
+    parts.push(serde_json::json!({
+        "type": "input_image",
+        "image_url": image_url,
+        "detail": detail,
+    }));
+    parts.push(serde_json::json!({
+        "type": "input_text",
+        "text": "</image>",
+    }));
+}
+
+fn push_collab_local_image_parts(parts: &mut Vec<Value>, path: &str, detail: &str) {
+    if path.trim().is_empty() {
+        parts.push(serde_json::json!({
+            "type": "input_text",
+            "text": "Codex could not read the local image at ``: empty path",
+        }));
+        return;
+    }
+    match std::fs::read(path) {
+        Ok(bytes) => {
+            let mime = mime_type_for_image_path(path);
+            let encoded = general_purpose::STANDARD.encode(bytes);
+            push_collab_image_parts(
+                parts,
+                Some("[Image]".to_string()),
+                format!("data:{mime};base64,{encoded}"),
+                detail,
+            );
+        }
+        Err(error) => {
+            parts.push(serde_json::json!({
+                "type": "input_text",
+                "text": format!("Codex could not read the local image at `{path}`: {error}"),
+            }));
+        }
+    }
+}
+
+fn mime_type_for_image_path(path: &str) -> &'static str {
+    match Path::new(path)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .map(|extension| extension.to_ascii_lowercase())
+        .as_deref()
+    {
+        Some("jpg" | "jpeg") => "image/jpeg",
+        Some("webp") => "image/webp",
+        Some("gif") => "image/gif",
+        _ => "image/png",
+    }
 }
 
 fn spawn_agent_fork_mode(
@@ -13186,21 +13479,10 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
             )
         }
     };
-    let message = call
-        .arguments
-        .get("message")
-        .and_then(Value::as_str)
-        .map(str::to_string)
-        .filter(|message| !message.trim().is_empty())
-        .unwrap_or_else(|| collab_items_preview(call.arguments.get("items")));
-    if message.trim().is_empty() {
-        return dispatch_tool_validation_error(
-            store,
-            session,
-            call,
-            "Empty message can't be sent to an agent",
-        );
-    }
+    let input = match collab_input_from_call(call) {
+        Ok(input) => input,
+        Err(error) => return dispatch_tool_validation_error(store, session, call, &error),
+    };
     store.append_event(
         &session.id,
         "tool.started",
@@ -13218,16 +13500,24 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
     {
         store.request_cancel(target_session_id, "interrupted by parent agent")?;
     }
-    let mail = store.send_agent_message(&session.id, target_session_id, &message, true)?;
+    let mut followup_payload = serde_json::json!({
+        "text": input.preview.trim(),
+        "content": input.content.clone(),
+    });
+    if let Some(items) = input.items.as_ref() {
+        followup_payload["items"] = Value::Array(items.clone());
+    }
+    let followup = store.append_event(target_session_id, "session.followup", followup_payload)?;
     store.append_event(
         &session.id,
         "agent.message",
         serde_json::json!({
-            "id": mail.id,
+            "id": followup.id,
             "author_session_id": session.id,
             "target_session_id": target_session_id,
             "child_session_id": target_session_id,
-            "content": message,
+            "content": input.preview.clone(),
+            "items": input.items.clone(),
             "trigger_turn": true,
         }),
     )?;
@@ -13266,7 +13556,7 @@ fn dispatch_send_input_v1_tool<P: ModelProvider>(
             session,
             call,
             "send_input",
-            serde_json::json!({ "submission_id": mail.id }),
+            serde_json::json!({ "submission_id": followup.id }),
         )?],
     })
 }
@@ -16441,6 +16731,7 @@ x-env = "CORP_HEADER"
                 support_verbosity: false,
                 default_verbosity: None,
                 supports_parallel_tool_calls: false,
+                supports_search_tool: false,
                 supports_image_detail_original: false,
                 input_modalities: vec!["text".to_string()],
                 context_window: None,
@@ -23945,7 +24236,7 @@ developer_instructions = "Research carefully"
         )?;
         std::fs::write(
             codex_home.join(CODEX_CONFIG_FILENAME),
-            "[agents.archivist]\ndescription = \"Inline archivist role\"\nconfig_file = \"./agents/archivist.toml\"\nnickname_candidates = [\"Inline\"]\n",
+            "[features.multi_agent_v2]\nenabled = true\n[agents.archivist]\ndescription = \"Inline archivist role\"\nconfig_file = \"./agents/archivist.toml\"\nnickname_candidates = [\"Inline\"]\n",
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
@@ -24004,7 +24295,10 @@ developer_instructions = "Research carefully"
     ) -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(codex_home.join(CODEX_CONFIG_FILENAME), "")?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[features.multi_agent_v2]\nenabled = true\n",
+        )?;
         let role_dir = codex_home.join("agents");
         std::fs::create_dir_all(&role_dir)?;
         std::fs::write(
@@ -24047,7 +24341,7 @@ developer_instructions = "Research carefully"
         )?;
         std::fs::write(
             codex_home.join(CODEX_CONFIG_FILENAME),
-            "[agents.locked]\ndescription = \"Locked role\"\nconfig_file = \"./agents/locked.toml\"\n",
+            "[features.multi_agent_v2]\nenabled = true\n[agents.locked]\ndescription = \"Locked role\"\nconfig_file = \"./agents/locked.toml\"\n",
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
@@ -25073,6 +25367,166 @@ description = "Missing developer instructions"
         assert!(!model_text.contains("Inherited compact context"));
         assert!(!model_text.contains("parent scratchpad"));
         assert!(!model_text.contains("raw parent tool output"));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v1_collab_input_validation_matches_codex() {
+        assert_eq!(
+            parse_collab_input(Some(&json!("hello")), Some(&json!([]))).unwrap_err(),
+            "Provide either message or items, but not both"
+        );
+        assert_eq!(
+            parse_collab_input(None, None).unwrap_err(),
+            "Provide one of: message or items"
+        );
+        assert_eq!(
+            parse_collab_input(Some(&json!("   ")), None).unwrap_err(),
+            "Empty message can't be sent to an agent"
+        );
+        assert_eq!(
+            parse_collab_input(None, Some(&json!([]))).unwrap_err(),
+            "Items can't be empty"
+        );
+    }
+
+    #[test]
+    fn multi_agent_v1_spawn_preserves_typed_items_for_child_replay_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = FakeProvider::default();
+        let missing_image_path = temp.path().join("missing.png");
+        let call = ToolCall {
+            id: "spawn_v1_items".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: Some("multi_agent_v1".to_string()),
+            arguments: serde_json::json!({
+                "agent_type": "explorer",
+                "items": [
+                    {"type": "text", "text": "inspect the screenshot"},
+                    {"type": "image", "image_url": "data:image/png;base64,abc", "detail": "high"},
+                    {"type": "local_image", "path": missing_image_path.display().to_string()},
+                    {"type": "skill", "name": "Docs", "path": "/tmp/SKILL.md"},
+                    {"type": "mention", "name": "Calendar", "path": "app://calendar"}
+                ]
+            }),
+        };
+
+        with_codex_home(&codex_home, || {
+            dispatch_spawn_agent_tool(
+                &store,
+                &provider,
+                &session,
+                &call,
+                &AgentRunOptions::default(),
+                &None,
+            )
+        })?;
+
+        let child = store
+            .list_child_agents(&session.id)?
+            .into_iter()
+            .next()
+            .context("child agent")?;
+        let child_events = store.events_for_session(&child.child_session_id)?;
+        let input = child_events
+            .iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert_eq!(input.payload["items"][0]["type"], "text");
+        assert!(input.payload["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[image]"));
+        assert!(input.payload["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("[skill:$Docs](/tmp/SKILL.md)"));
+        let content = input.payload["content"].as_array().context("content")?;
+        assert!(content.iter().any(|part| {
+            part["type"] == "input_image" && part["image_url"] == "data:image/png;base64,abc"
+        }));
+        assert!(content.iter().any(|part| {
+            part["type"] == "input_text"
+                && part["text"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .contains("Codex could not read the local image")
+        }));
+
+        let messages = provider_messages_from_events(&child_events);
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| {
+                        parts.iter().any(|part| {
+                            part["type"] == "input_image"
+                                && part["image_url"] == "data:image/png;base64,abc"
+                        })
+                    })
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn multi_agent_v1_send_input_persists_typed_followup_without_string_mailbox() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/typed_child"),
+            Some("typed_child"),
+            Some("explorer"),
+        )?;
+        let provider = FakeProvider::default();
+        let call = ToolCall {
+            id: "send_v1_items".to_string(),
+            name: "send_input".to_string(),
+            namespace: Some("multi_agent_v1".to_string()),
+            arguments: serde_json::json!({
+                "target": child.id,
+                "items": [
+                    {"type": "text", "text": "look at this"},
+                    {"type": "image", "image_url": "data:image/png;base64,abc"}
+                ]
+            }),
+        };
+
+        dispatch_send_input_v1_tool(
+            &store,
+            &provider,
+            &parent,
+            &call,
+            &AgentRunOptions::default(),
+        )?;
+
+        assert!(store.messages_for_agent(&child.id)?.is_empty());
+        let child_events = store.events_for_session(&child.id)?;
+        let followup = child_events
+            .iter()
+            .find(|event| event.event_type == "session.followup")
+            .context("session.followup")?;
+        assert_eq!(followup.payload["items"][1]["type"], "image");
+        assert!(followup.payload["content"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .any(|part| part["type"] == "input_image"
+                && part["image_url"] == "data:image/png;base64,abc"));
+        let messages = provider_messages_from_events(&child_events);
+        assert!(messages.iter().any(|message| {
+            message.get("role").and_then(Value::as_str) == Some("user")
+                && message
+                    .get("content")
+                    .and_then(Value::as_array)
+                    .is_some_and(|parts| parts.iter().any(|part| part["type"] == "input_image"))
+        }));
         Ok(())
     }
 
