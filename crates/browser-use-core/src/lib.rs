@@ -15021,6 +15021,7 @@ fn load_agents_md_config_with_thread_config(
             warnings,
         )?;
     }
+    apply_enabled_plugin_hooks_config_layer(&mut config, warnings)?;
     if config.model_catalog.is_none() {
         if let Some(snapshot) = load_fresh_models_cache(&base) {
             config.model_catalog = Some(snapshot.catalog);
@@ -15787,7 +15788,17 @@ fn apply_hooks_config_layer(
     path: &Path,
     layer_kind: ConfigLayerKind,
 ) -> Result<()> {
-    apply_hooks_config_events(config, value, path, layer_kind)?;
+    let source = hook_source_metadata_for_config_layer(path, layer_kind);
+    apply_hooks_config_value_with_source(config, value, path, source)
+}
+
+fn apply_hooks_config_value_with_source(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+    source: HookSourceMetadata,
+) -> Result<()> {
+    apply_hooks_config_events_with_source(config, value, path, source.clone())?;
     if let Some(hooks_value) = value.get("hooks") {
         let Some(_) = hooks_value.as_table() else {
             bail!(
@@ -15795,19 +15806,18 @@ fn apply_hooks_config_layer(
                 path.display()
             );
         };
-        apply_hooks_config_events(config, hooks_value, path, layer_kind)?;
+        apply_hooks_config_events_with_source(config, hooks_value, path, source)?;
     }
     Ok(())
 }
 
-fn apply_hooks_config_events(
+fn apply_hooks_config_events_with_source(
     config: &mut AgentsMdConfig,
     value: &toml::Value,
     path: &Path,
-    layer_kind: ConfigLayerKind,
+    source: HookSourceMetadata,
 ) -> Result<()> {
     let hook_states = parse_hook_state_configs(value, path)?;
-    let source = hook_source_metadata_for_config_layer(path, layer_kind);
     for event in HookEventName::all() {
         let Some(groups_value) = value.get(event.as_str()) else {
             continue;
@@ -15939,6 +15949,69 @@ fn apply_hooks_config_events(
                         hooks: commands,
                     });
             }
+        }
+    }
+    Ok(())
+}
+
+fn apply_enabled_plugin_hooks_config_layer(
+    config: &mut AgentsMdConfig,
+    warnings: &mut Vec<String>,
+) -> Result<()> {
+    if !config.plugins_enabled || config.plugins.is_empty() {
+        return Ok(());
+    }
+    let Some(codex_home) = codex_home_dir() else {
+        return Ok(());
+    };
+    let plugins = config.plugins.clone();
+    for (config_name, plugin_config) in plugins {
+        if !plugin_config.enabled {
+            continue;
+        }
+        let Some(plugin_root) = local_plugin_root_for_config_name(&codex_home, &config_name) else {
+            continue;
+        };
+        let Some(manifest_path) = plugin_manifest_path(&plugin_root) else {
+            continue;
+        };
+        let manifest_contents = match std::fs::read_to_string(&manifest_path) {
+            Ok(contents) => contents,
+            Err(error) => {
+                warnings.push(format!(
+                    "failed to read plugin manifest {} for hooks: {error}",
+                    manifest_path.display()
+                ));
+                continue;
+            }
+        };
+        let manifest = match serde_json::from_str::<LocalPluginManifest>(&manifest_contents) {
+            Ok(manifest) => manifest,
+            Err(error) => {
+                warnings.push(format!(
+                    "failed to parse plugin manifest {} for hooks: {error}",
+                    manifest_path.display()
+                ));
+                continue;
+            }
+        };
+        for source in plugin_hook_sources_for_manifest(
+            &plugin_root,
+            &manifest_path,
+            manifest.hooks.as_ref(),
+            warnings,
+        ) {
+            let source_metadata = HookSourceMetadata {
+                source: HookSourceKind::Plugin,
+                path: source.display_path.clone(),
+                managed: false,
+            };
+            apply_hooks_config_value_with_source(
+                config,
+                &source.value,
+                &source.state_path,
+                source_metadata,
+            )?;
         }
     }
     Ok(())
@@ -16140,6 +16213,14 @@ struct LocalPluginManifest {
     mcp_servers: Option<String>,
     #[serde(default)]
     apps: Option<String>,
+    #[serde(default)]
+    hooks: Option<Value>,
+}
+
+struct LocalPluginHookConfigSource {
+    state_path: PathBuf,
+    display_path: String,
+    value: toml::Value,
 }
 
 #[derive(Deserialize)]
@@ -16194,6 +16275,7 @@ fn local_plugin_summary_for_config_name(
             skills: None,
             mcp_servers: None,
             apps: None,
+            hooks: None,
         });
     let plugin_slug = plugin_name_from_config_name(config_name);
     let display_name = manifest
@@ -16281,6 +16363,163 @@ fn plugin_manifest_path(plugin_root: &Path) -> Option<PathBuf> {
     ]
     .into_iter()
     .find(|path| path.is_file())
+}
+
+fn plugin_hook_sources_for_manifest(
+    plugin_root: &Path,
+    manifest_path: &Path,
+    hooks_value: Option<&Value>,
+    warnings: &mut Vec<String>,
+) -> Vec<LocalPluginHookConfigSource> {
+    let mut sources = Vec::new();
+    match hooks_value {
+        None => {
+            let default_path = plugin_root.join("hooks").join("hooks.json");
+            push_plugin_hook_file_source(plugin_root, &default_path, warnings, &mut sources);
+        }
+        Some(Value::String(path)) => {
+            let path = plugin_relative_path(plugin_root, Some(path), "hooks/hooks.json");
+            push_plugin_hook_file_source(plugin_root, &path, warnings, &mut sources);
+        }
+        Some(Value::Array(items)) => {
+            for (index, item) in items.iter().enumerate() {
+                match item {
+                    Value::String(path) => {
+                        let path =
+                            plugin_relative_path(plugin_root, Some(path), "hooks/hooks.json");
+                        push_plugin_hook_file_source(plugin_root, &path, warnings, &mut sources);
+                    }
+                    Value::Object(_) => {
+                        push_inline_plugin_hook_source(
+                            manifest_path,
+                            index,
+                            item,
+                            warnings,
+                            &mut sources,
+                        );
+                    }
+                    _ => warnings.push(format!(
+                        "ignoring unsupported plugin hooks entry {} in {}",
+                        index,
+                        manifest_path.display()
+                    )),
+                }
+            }
+        }
+        Some(Value::Object(_)) => {
+            push_inline_plugin_hook_source(
+                manifest_path,
+                0,
+                hooks_value.unwrap(),
+                warnings,
+                &mut sources,
+            );
+        }
+        Some(_) => warnings.push(format!(
+            "ignoring unsupported plugin hooks config in {}",
+            manifest_path.display()
+        )),
+    }
+    sources
+}
+
+fn push_plugin_hook_file_source(
+    plugin_root: &Path,
+    path: &Path,
+    warnings: &mut Vec<String>,
+    sources: &mut Vec<LocalPluginHookConfigSource>,
+) {
+    if !path.is_file() {
+        return;
+    }
+    let contents = match std::fs::read_to_string(path) {
+        Ok(contents) => contents,
+        Err(error) => {
+            warnings.push(format!(
+                "failed to read plugin hooks config {}: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    let value = match serde_json::from_str::<Value>(&contents)
+        .ok()
+        .and_then(|value| json_value_to_toml_value(&value))
+    {
+        Some(value) => value,
+        None => {
+            let error = serde_json::from_str::<Value>(&contents)
+                .map(|_| "unsupported JSON value".to_string())
+                .unwrap_or_else(|error| error.to_string());
+            warnings.push(format!(
+                "failed to parse plugin hooks config {}: {error}",
+                path.display()
+            ));
+            return;
+        }
+    };
+    sources.push(LocalPluginHookConfigSource {
+        state_path: path.to_path_buf(),
+        display_path: plugin_hook_display_path(plugin_root, path),
+        value,
+    });
+}
+
+fn push_inline_plugin_hook_source(
+    manifest_path: &Path,
+    index: usize,
+    value: &Value,
+    warnings: &mut Vec<String>,
+    sources: &mut Vec<LocalPluginHookConfigSource>,
+) {
+    let Some(value) = json_value_to_toml_value(value) else {
+        warnings.push(format!(
+            "ignoring unsupported inline plugin hooks entry {} in {}",
+            index,
+            manifest_path.display()
+        ));
+        return;
+    };
+    let display_path = format!("{}#hooks[{index}]", manifest_path.display());
+    sources.push(LocalPluginHookConfigSource {
+        state_path: PathBuf::from(&display_path),
+        display_path,
+        value,
+    });
+}
+
+fn plugin_hook_display_path(plugin_root: &Path, path: &Path) -> String {
+    path.strip_prefix(plugin_root)
+        .ok()
+        .map(|relative| normalized_prompt_path(relative))
+        .unwrap_or_else(|| path.display().to_string())
+}
+
+fn json_value_to_toml_value(value: &Value) -> Option<toml::Value> {
+    match value {
+        Value::Null => None,
+        Value::Bool(value) => Some(toml::Value::Boolean(*value)),
+        Value::Number(value) => {
+            if let Some(integer) = value.as_i64() {
+                Some(toml::Value::Integer(integer))
+            } else {
+                value.as_f64().map(toml::Value::Float)
+            }
+        }
+        Value::String(value) => Some(toml::Value::String(value.clone())),
+        Value::Array(items) => items
+            .iter()
+            .map(json_value_to_toml_value)
+            .collect::<Option<Vec<_>>>()
+            .map(toml::Value::Array),
+        Value::Object(map) => {
+            let mut table = toml::map::Map::new();
+            for (key, value) in map {
+                table.insert(key.clone(), json_value_to_toml_value(value)?);
+            }
+            Some(toml::Value::Table(table))
+        }
+    }
 }
 
 fn plugin_relative_path(plugin_root: &Path, configured: Option<&str>, fallback: &str) -> PathBuf {
@@ -37910,6 +38149,161 @@ enabled = false
         assert!(joined.contains("Use for plugin assistance."));
         assert!(joined.contains("<plugins_instructions>"));
         assert!(joined.contains("`DemoPlugin`"));
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_plugin_default_hooks_file_contributes_runtime_hooks() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[plugins.demo]\nenabled = true\n",
+        )?;
+        let plugin_root = codex_home.join(CODEX_CURATED_PLUGINS_DIR).join("demo");
+        std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+        std::fs::create_dir_all(plugin_root.join("hooks"))?;
+        std::fs::write(
+            plugin_root.join(".codex-plugin").join("plugin.json"),
+            r#"{"name":"DemoPlugin","description":"Demo plugin"}"#,
+        )?;
+        std::fs::write(
+            plugin_root.join("hooks").join("hooks.json"),
+            r#"{
+  "hooks": {
+    "SessionStart": [
+      {
+        "matcher": "^startup$",
+        "hooks": [
+          { "type": "command", "command": "printf plugin-start", "status_message": "plugin hook" }
+        ]
+      }
+    ]
+  }
+}"#,
+        )?;
+
+        let mut warnings = Vec::new();
+        let config = with_codex_home(&codex_home, || {
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })?;
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.hooks.session_start.len(), 1);
+        assert_eq!(
+            config.hooks.session_start[0].hooks[0].source.source,
+            HookSourceKind::Plugin
+        );
+        assert_eq!(
+            config.hooks.session_start[0].hooks[0].source.path,
+            "hooks/hooks.json"
+        );
+
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let messages = run_session_start_hooks(&store, &session, &config.hooks, "gpt-5.4")?;
+        assert_eq!(messages.len(), 1);
+        assert!(message_content_text(&messages[0]).contains("plugin-start"));
+        let events = store.events_for_session(&session.id)?;
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "hook.started")
+            .context("hook started")?;
+        assert_eq!(started.payload["source"], "plugin");
+        assert_eq!(started.payload["source_path"], "hooks/hooks.json");
+        assert_eq!(started.payload["run"]["status_message"], "plugin hook");
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_plugin_manifest_hooks_replace_default_hooks_file() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[plugins.demo]\nenabled = true\n",
+        )?;
+        let plugin_root = codex_home.join(CODEX_CURATED_PLUGINS_DIR).join("demo");
+        std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+        std::fs::create_dir_all(plugin_root.join("hooks"))?;
+        std::fs::write(
+            plugin_root.join(".codex-plugin").join("plugin.json"),
+            r#"{"name":"DemoPlugin","hooks":["./hooks/one.json","./hooks/two.json"]}"#,
+        )?;
+        std::fs::write(
+            plugin_root.join("hooks").join("hooks.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"printf ignored"}]}]}}"#,
+        )?;
+        std::fs::write(
+            plugin_root.join("hooks").join("one.json"),
+            r#"{"hooks":{"SessionStart":[{"hooks":[{"type":"command","command":"printf one"}]}]}}"#,
+        )?;
+        std::fs::write(
+            plugin_root.join("hooks").join("two.json"),
+            r#"{"hooks":{"Stop":[{"hooks":[{"type":"command","command":"printf two"}]}]}}"#,
+        )?;
+
+        let mut warnings = Vec::new();
+        let config = with_codex_home(&codex_home, || {
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })?;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.hooks.session_start.len(), 1);
+        assert_eq!(config.hooks.stop.len(), 1);
+        assert_eq!(
+            config.hooks.session_start[0].hooks[0].source.path,
+            "hooks/one.json"
+        );
+        assert_eq!(config.hooks.stop[0].hooks[0].source.path, "hooks/two.json");
+        assert_ne!(
+            config.hooks.session_start[0].hooks[0].command,
+            "printf ignored"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn enabled_plugin_manifest_inline_hooks_are_loaded() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = temp.path().join("codex-home");
+        std::fs::create_dir_all(&codex_home)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            "[plugins.demo]\nenabled = true\n",
+        )?;
+        let plugin_root = codex_home.join(CODEX_CURATED_PLUGINS_DIR).join("demo");
+        std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+        std::fs::write(
+            plugin_root.join(".codex-plugin").join("plugin.json"),
+            r#"{
+  "name": "DemoPlugin",
+  "hooks": {
+    "hooks": {
+      "SessionStart": [
+        { "hooks": [{ "type": "command", "command": "printf inline" }] }
+      ]
+    }
+  }
+}"#,
+        )?;
+
+        let mut warnings = Vec::new();
+        let config = with_codex_home(&codex_home, || {
+            load_agents_md_config(temp.path(), &mut warnings, None, &[])
+        })?;
+
+        assert!(warnings.is_empty(), "{warnings:?}");
+        assert_eq!(config.hooks.session_start.len(), 1);
+        assert_eq!(
+            config.hooks.session_start[0].hooks[0].source.source,
+            HookSourceKind::Plugin
+        );
+        assert!(config.hooks.session_start[0].hooks[0]
+            .source
+            .path
+            .contains("plugin.json#hooks[0]"));
         Ok(())
     }
 

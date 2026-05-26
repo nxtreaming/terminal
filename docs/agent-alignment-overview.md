@@ -1752,6 +1752,31 @@ The biggest remaining categories are:
   precision, persistent goal state and external mutation callbacks, richer
   subagent lifecycle ownership, richer review flow, and skill/plugin manager
   depth beyond prompt rendering.
+- The current plugin-hook slice closes a concrete extension/runtime gap.
+  Enabled local Codex plugin bundles can now contribute command hooks through
+  the same hook runtime used by workspace/user config. The loader supports the
+  default plugin `hooks/hooks.json`, manifest-provided hook file paths, arrays
+  of hook files, and inline manifest hook objects, while preserving plugin
+  source metadata for lifecycle events. This is deliberately local and
+  provider-neutral; it does not add Codex cloud/plugin marketplace behavior.
+- Verification for the plugin-hook slice passed the full local gate:
+  formatting, whitespace, Python tests, and full Rust workspace tests. The
+  full workspace run passed with browser-use-browser 16 passed plus 2 ignored
+  browser smokes, CLI 18, core 442, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 140, and doc-tests. The live Codex-auth
+  smoke used root session `64e05d17d794` and child session `8e56ce2d38da`;
+  the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- Ten broad real child-agent audits after this slice treated plugin-hook
+  ingestion as the only branch-local behavior change. Nine reports completed;
+  one child hit the provider turn cap and was recorded as errored. The
+  consensus was that plugin hooks are a parity gain, with the expected caution
+  that enabled plugin hooks can now affect runtime behavior and must keep
+  source/load-order coverage. The remaining material gaps are now concentrated
+  in active-turn/thread lifecycle and replay, dynamic MCP/app/plugin callable
+  contributors, public event-router style turn buffering, deeper local
+  compaction/token lifecycle, cancellable async tool futures with read/write
+  gates, richer subagent lifecycle ownership, and review/task lifecycle depth.
 
 ## Definition of Done
 
