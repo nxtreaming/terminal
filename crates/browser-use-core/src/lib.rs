@@ -5359,12 +5359,69 @@ fn drop_oldest_model_compaction_summary_message(messages: &mut Vec<Value>) -> Op
     let remove_index = (0..last_index)
         .find(|index| !is_compaction_summary_message(&messages[*index]))
         .unwrap_or(0);
-    let removed = messages.remove(remove_index);
-    Some(
-        serde_json::to_string(&removed)
+    let remove_indices =
+        paired_history_indices_for_model_compaction_drop(messages, remove_index, last_index);
+    let mut removed_chars = 0;
+    for index in remove_indices.into_iter().rev() {
+        let removed = messages.remove(index);
+        removed_chars += serde_json::to_string(&removed)
             .map(|text| text.chars().count())
-            .unwrap_or(0),
-    )
+            .unwrap_or(0);
+    }
+    Some(removed_chars)
+}
+
+fn paired_history_indices_for_model_compaction_drop(
+    messages: &[Value],
+    index: usize,
+    protected_last_index: usize,
+) -> Vec<usize> {
+    let mut indices = BTreeSet::from([index]);
+    if let Some(call_id) = tool_output_message_call_id(&messages[index]) {
+        if index > 0 && assistant_message_has_tool_call_id(&messages[index - 1], &call_id) {
+            indices.insert(index - 1);
+        }
+    } else {
+        let call_ids = assistant_message_tool_call_ids(&messages[index]);
+        for following_index in (index + 1)..protected_last_index {
+            let Some(call_id) = tool_output_message_call_id(&messages[following_index]) else {
+                break;
+            };
+            if call_ids.contains(&call_id) {
+                indices.insert(following_index);
+            }
+        }
+    }
+    indices.into_iter().collect()
+}
+
+fn tool_output_message_call_id(message: &Value) -> Option<String> {
+    match message.get("type").and_then(Value::as_str) {
+        Some("function_call_output" | "custom_tool_call_output") => message
+            .get("call_id")
+            .or_else(|| message.get("id"))
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        _ if message.get("role").and_then(Value::as_str) == Some("tool") => message
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .map(ToString::to_string),
+        _ => None,
+    }
+}
+
+fn assistant_message_tool_call_ids(message: &Value) -> BTreeSet<String> {
+    if message.get("role").and_then(Value::as_str) != Some("assistant") {
+        return BTreeSet::new();
+    }
+    normalized_assistant_tool_calls(message)
+        .into_iter()
+        .filter_map(|call| tool_call_id_from_value(&call).map(ToString::to_string))
+        .collect()
+}
+
+fn assistant_message_has_tool_call_id(message: &Value, call_id: &str) -> bool {
+    assistant_message_tool_call_ids(message).contains(call_id)
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8339,13 +8396,14 @@ fn run_hooks_for_event(
     if hooks.is_empty() {
         return Ok(HookRunOutcome::default());
     }
-    let mut outcome = HookRunOutcome::default();
+    let mut invocations = Vec::new();
     for group in hooks.groups_for_event(event) {
         if !hook_group_matches(group, call, matcher_target) {
             continue;
         }
         for hook in &group.hooks {
-            let hook_outcome = run_command_hook(
+            let configured_order = invocations.len();
+            invocations.push(prepare_command_hook_run(
                 store,
                 session,
                 event,
@@ -8354,25 +8412,218 @@ fn run_hooks_for_event(
                 model,
                 extra.clone(),
                 hook,
-            )?;
-            if let Some(updated_input) = hook_outcome.updated_input {
-                outcome.updated_input = Some(updated_input);
-            }
-            outcome
-                .additional_contexts
-                .extend(hook_outcome.additional_contexts);
-            outcome
-                .feedback_messages
-                .extend(hook_outcome.feedback_messages);
-            if outcome.block_reason.is_none() {
-                outcome.block_reason = hook_outcome.block_reason;
-            }
-            if outcome.stop_reason.is_none() {
-                outcome.stop_reason = hook_outcome.stop_reason;
-            }
+                configured_order,
+            )?);
         }
     }
+    let outcome = run_prepared_command_hooks(store, session, event, call, invocations)?;
     Ok(outcome)
+}
+
+#[derive(Debug)]
+struct PreparedCommandHookRun {
+    configured_order: usize,
+    hook_id: String,
+    command: String,
+    cwd: String,
+    input: Value,
+    timeout: Option<Duration>,
+    async_run: bool,
+}
+
+struct CompletedCommandHookRun {
+    configured_order: usize,
+    completion_order: usize,
+    hook_id: String,
+    command: String,
+    async_run: bool,
+    result: std::result::Result<HookProcessOutput, String>,
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_command_hook_run(
+    store: &Store,
+    session: &SessionMeta,
+    event: HookEventName,
+    call: Option<&ToolCall>,
+    tool_input: Option<&Value>,
+    model: &str,
+    extra: Value,
+    hook: &HookCommandConfig,
+    configured_order: usize,
+) -> Result<PreparedCommandHookRun> {
+    let command = if cfg!(windows) {
+        hook.command_windows
+            .as_deref()
+            .unwrap_or(&hook.command)
+            .to_string()
+    } else {
+        hook.command.clone()
+    };
+    let hook_input = hook_command_input(store, session, event, call, tool_input, model, extra);
+    let hook_id = store
+        .append_event(
+            &session.id,
+            "hook.started",
+            serde_json::json!({
+                "hook_event_name": event.as_str(),
+                "tool_name": call.map(|call| call.name.as_str()),
+                "tool_call_id": call.map(|call| call.id.as_str()),
+                "command": command,
+                "async": hook.async_run,
+                "status_message": hook.status_message,
+                "configured_order": configured_order,
+            }),
+        )?
+        .id;
+    Ok(PreparedCommandHookRun {
+        configured_order,
+        hook_id,
+        command,
+        cwd: session.cwd.clone(),
+        input: hook_input,
+        timeout: hook.timeout_sec.map(Duration::from_secs),
+        async_run: hook.async_run,
+    })
+}
+
+fn run_prepared_command_hooks(
+    store: &Store,
+    session: &SessionMeta,
+    event: HookEventName,
+    call: Option<&ToolCall>,
+    invocations: Vec<PreparedCommandHookRun>,
+) -> Result<HookRunOutcome> {
+    if invocations.is_empty() {
+        return Ok(HookRunOutcome::default());
+    }
+
+    let expected = invocations.len();
+    let (tx, rx) = std::sync::mpsc::channel::<CompletedCommandHookRun>();
+    let mut handles = Vec::with_capacity(expected);
+    for invocation in invocations {
+        let tx = tx.clone();
+        handles.push(thread::spawn(move || {
+            let result = run_hook_command_process(
+                &invocation.cwd,
+                &invocation.command,
+                &invocation.input,
+                invocation.timeout,
+            )
+            .map_err(|error| format!("{error:#}"));
+            let _ = tx.send(CompletedCommandHookRun {
+                configured_order: invocation.configured_order,
+                completion_order: 0,
+                hook_id: invocation.hook_id,
+                command: invocation.command,
+                async_run: invocation.async_run,
+                result,
+            });
+        }));
+    }
+    drop(tx);
+
+    let mut completed = Vec::with_capacity(expected);
+    for completion_order in 0..expected {
+        let mut run = rx
+            .recv()
+            .context("hook command worker exited without reporting a result")?;
+        run.completion_order = completion_order;
+        completed.push(run);
+    }
+    for handle in handles {
+        handle
+            .join()
+            .map_err(|_| anyhow!("hook command worker panicked"))?;
+    }
+
+    let mut parsed = Vec::with_capacity(completed.len());
+    for run in completed {
+        let outcome = finish_command_hook_run(store, session, event, call, &run)?;
+        parsed.push((run.configured_order, run.completion_order, outcome));
+    }
+    parsed.sort_by_key(|(configured_order, _, _)| *configured_order);
+
+    let mut outcome = HookRunOutcome::default();
+    let mut latest_updated_input = None::<(usize, Value)>;
+    for (_, completion_order, hook_outcome) in parsed {
+        if let Some(updated_input) = hook_outcome.updated_input {
+            let should_replace = match latest_updated_input.as_ref() {
+                Some((latest_completion_order, _)) => completion_order >= *latest_completion_order,
+                None => true,
+            };
+            if should_replace {
+                latest_updated_input = Some((completion_order, updated_input));
+            }
+        }
+        outcome
+            .additional_contexts
+            .extend(hook_outcome.additional_contexts);
+        outcome
+            .feedback_messages
+            .extend(hook_outcome.feedback_messages);
+        if outcome.block_reason.is_none() {
+            outcome.block_reason = hook_outcome.block_reason;
+        }
+        if outcome.stop_reason.is_none() {
+            outcome.stop_reason = hook_outcome.stop_reason;
+        }
+    }
+    outcome.updated_input = latest_updated_input.map(|(_, updated_input)| updated_input);
+    Ok(outcome)
+}
+
+fn finish_command_hook_run(
+    store: &Store,
+    session: &SessionMeta,
+    event: HookEventName,
+    call: Option<&ToolCall>,
+    run: &CompletedCommandHookRun,
+) -> Result<HookRunOutcome> {
+    let output = match &run.result {
+        Ok(output) => output,
+        Err(error) => {
+            store.append_event(
+                &session.id,
+                "hook.failed",
+                serde_json::json!({
+                    "hook_id": run.hook_id,
+                    "hook_event_name": event.as_str(),
+                    "tool_name": call.map(|call| call.name.as_str()),
+                    "tool_call_id": call.map(|call| call.id.as_str()),
+                    "command": run.command,
+                    "configured_order": run.configured_order,
+                    "completion_order": run.completion_order,
+                    "async": run.async_run,
+                    "error": error,
+                }),
+            )?;
+            return Ok(HookRunOutcome::default());
+        }
+    };
+    store.append_event(
+        &session.id,
+        "hook.completed",
+        serde_json::json!({
+            "hook_id": run.hook_id,
+            "hook_event_name": event.as_str(),
+            "tool_name": call.map(|call| call.name.as_str()),
+            "tool_call_id": call.map(|call| call.id.as_str()),
+            "command": run.command,
+            "configured_order": run.configured_order,
+            "completion_order": run.completion_order,
+            "status": output.status,
+            "stdout": truncate_text_for_event(&output.stdout, 4000),
+            "stderr": truncate_text_for_event(&output.stderr, 4000),
+            "async": run.async_run,
+        }),
+    )?;
+    Ok(parse_hook_command_output(
+        event,
+        &output.stdout,
+        &output.stderr,
+        output.status,
+    ))
 }
 
 fn hook_group_matches(
@@ -8436,84 +8687,6 @@ fn hook_matcher_is_exact(matcher: &str) -> bool {
     matcher
         .chars()
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '|')
-}
-
-#[allow(clippy::too_many_arguments)]
-fn run_command_hook(
-    store: &Store,
-    session: &SessionMeta,
-    event: HookEventName,
-    call: Option<&ToolCall>,
-    tool_input: Option<&Value>,
-    model: &str,
-    extra: Value,
-    hook: &HookCommandConfig,
-) -> Result<HookRunOutcome> {
-    let command = if cfg!(windows) {
-        hook.command_windows
-            .as_deref()
-            .unwrap_or(&hook.command)
-            .to_string()
-    } else {
-        hook.command.clone()
-    };
-    let hook_input = hook_command_input(store, session, event, call, tool_input, model, extra);
-    let hook_id = store
-        .append_event(
-            &session.id,
-            "hook.started",
-            serde_json::json!({
-                "hook_event_name": event.as_str(),
-                "tool_name": call.map(|call| call.name.as_str()),
-                "tool_call_id": call.map(|call| call.id.as_str()),
-                "command": command,
-                "async": hook.async_run,
-                "status_message": hook.status_message,
-            }),
-        )?
-        .id;
-    let output = match run_hook_command_process(
-        &session.cwd,
-        &command,
-        &hook_input,
-        hook.timeout_sec.map(Duration::from_secs),
-    ) {
-        Ok(output) => output,
-        Err(error) => {
-            store.append_event(
-                &session.id,
-                "hook.failed",
-                serde_json::json!({
-                    "hook_id": hook_id,
-                    "hook_event_name": event.as_str(),
-                    "tool_name": call.map(|call| call.name.as_str()),
-                    "tool_call_id": call.map(|call| call.id.as_str()),
-                    "error": format!("{error:#}"),
-                }),
-            )?;
-            return Ok(HookRunOutcome::default());
-        }
-    };
-    store.append_event(
-        &session.id,
-        "hook.completed",
-        serde_json::json!({
-            "hook_id": hook_id,
-            "hook_event_name": event.as_str(),
-            "tool_name": call.map(|call| call.name.as_str()),
-            "tool_call_id": call.map(|call| call.id.as_str()),
-            "status": output.status,
-            "stdout": truncate_text_for_event(&output.stdout, 4000),
-            "stderr": truncate_text_for_event(&output.stderr, 4000),
-            "async": hook.async_run,
-        }),
-    )?;
-    Ok(parse_hook_command_output(
-        event,
-        &output.stdout,
-        &output.stderr,
-        output.status,
-    ))
 }
 
 fn hook_command_input(
@@ -32232,6 +32405,64 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\
     }
 
     #[test]
+    fn pre_tool_use_latest_completed_updated_input_wins_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "sleep 0.2; printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"printf hook-updated\"},\"additionalContext\":\"pre context\"}}}'"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"command\":\"printf hook-fast\"},\"additionalContext\":\"fast context\"}}}'"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = HookUpdatingProvider::default();
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "run hook-updated command",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
+        let events = store.events_for_session(&session_id)?;
+        let fast_completed = events
+            .iter()
+            .find(|event| {
+                event.event_type == "hook.completed"
+                    && event.payload["stdout"]
+                        .as_str()
+                        .is_some_and(|stdout| stdout.contains("hook-fast"))
+            })
+            .context("fast hook completed")?;
+        let slow_completed = events
+            .iter()
+            .find(|event| {
+                event.event_type == "hook.completed"
+                    && event.payload["stdout"]
+                        .as_str()
+                        .is_some_and(|stdout| stdout.contains("hook-updated"))
+            })
+            .context("slow hook completed")?;
+        assert_eq!(fast_completed.payload["configured_order"], 1);
+        assert_eq!(fast_completed.payload["completion_order"], 0);
+        assert_eq!(slow_completed.payload["configured_order"], 0);
+        assert_eq!(slow_completed.payload["completion_order"], 1);
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "hook updated"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn pre_tool_use_exit_code_two_blocks_tool_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -32816,6 +33047,36 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             event.event_type == "session.compaction_model_summary"
                 && event.payload["summary"] == "summary after overflow retry"
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn model_compaction_overflow_drop_preserves_tool_call_pairing() -> Result<()> {
+        let mut messages = vec![
+            serde_json::json!({
+                "role": "assistant",
+                "content": "",
+                "tool_calls": [{
+                    "id": "call_old",
+                    "name": "exec_command",
+                    "arguments": { "cmd": "printf old" }
+                }],
+            }),
+            serde_json::json!({
+                "role": "tool",
+                "tool_call_id": "call_old",
+                "name": "exec_command",
+                "content": "old output",
+            }),
+            user_text_message("recent user message".to_string()),
+        ];
+
+        let removed_chars =
+            drop_oldest_model_compaction_summary_message(&mut messages).context("drop")?;
+
+        assert!(removed_chars > 0);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(message_content_text(&messages[0]), "recent user message");
         Ok(())
     }
 
