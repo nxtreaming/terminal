@@ -1,3 +1,4 @@
+use crate::mcp::McpToolDefinition;
 use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
 use browser_use_protocol::{FreeformToolFormat, ToolSpec};
 use browser_use_providers::ModelShellType;
@@ -61,6 +62,7 @@ pub(crate) enum ToolHandlerKind {
     CloseAgent,
     CloseAgentV1,
     ToolSearch,
+    McpTool,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -76,6 +78,7 @@ pub(crate) struct RegisteredTool {
     spec: ToolSpec,
     handler: ToolHandlerKind,
     exposure: ToolExposure,
+    mcp_tool: Option<McpToolDefinition>,
 }
 
 #[derive(Clone, Debug)]
@@ -229,21 +232,28 @@ impl ToolRouter {
         });
         let tool_search_enabled =
             tool_search_supported && namespace_tools_supported && !search_entries.is_empty();
-        let mut model_visible_specs = registry
-            .tools
-            .iter()
-            .filter(|tool| match tool.exposure {
+        let mut model_visible_specs = Vec::new();
+        for tool in &registry.tools {
+            let visible = match tool.exposure {
                 ToolExposure::Hidden => false,
                 ToolExposure::Deferred => !tool_search_enabled,
                 ToolExposure::Direct | ToolExposure::DirectModelOnly => true,
-            })
-            .map(|tool| tool.spec.clone())
-            .collect::<Vec<_>>();
+            };
+            if !visible {
+                continue;
+            }
+            if !namespace_tools_supported {
+                if let Some(mcp_tool) = &tool.mcp_tool {
+                    model_visible_specs.push(mcp_tool.flat_tool_spec());
+                } else if tool.spec.namespace.is_none() {
+                    model_visible_specs.push(tool.spec.clone());
+                }
+                continue;
+            }
+            model_visible_specs.push(tool.spec.clone());
+        }
         if tool_search_enabled {
             model_visible_specs.push(tool_search_tool_spec(&search_sources));
-        }
-        if !namespace_tools_supported {
-            model_visible_specs.retain(|spec| spec.namespace.is_none());
         }
         Self {
             registry,
@@ -285,6 +295,19 @@ impl ToolRouter {
                     })
                     .flatten()
             })
+    }
+
+    pub(crate) fn mcp_tool_for_call(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<McpToolDefinition> {
+        self.registry
+            .tools
+            .iter()
+            .filter_map(|tool| tool.mcp_tool.as_ref())
+            .find(|tool| tool.matches_call(namespace, name))
+            .cloned()
     }
 
     pub(crate) fn tool_supports_parallel(
@@ -542,7 +565,19 @@ impl ToolRegistry {
             spec,
             handler,
             exposure,
+            mcp_tool: None,
         });
+    }
+
+    pub(crate) fn register_mcp_tools(&mut self, tools: Vec<McpToolDefinition>) {
+        for tool in tools {
+            self.tools.push(RegisteredTool {
+                spec: tool.namespaced_tool_spec(),
+                handler: ToolHandlerKind::McpTool,
+                exposure: ToolExposure::Deferred,
+                mcp_tool: Some(tool),
+            });
+        }
     }
 
     pub(crate) fn allow_login_shell(&self) -> bool {
@@ -592,7 +627,16 @@ impl ToolRegistry {
                     tool.spec.name == name && tool.spec.namespace.as_deref() == Some(namespace)
                 })
                 .map(|tool| tool.handler),
-            None => self.handler_for(name),
+            None => self.handler_for(name).or_else(|| {
+                self.tools
+                    .iter()
+                    .find(|tool| {
+                        tool.mcp_tool
+                            .as_ref()
+                            .is_some_and(|mcp_tool| mcp_tool.flat_tool_name() == name)
+                    })
+                    .map(|tool| tool.handler)
+            }),
         }
     }
 
@@ -605,8 +649,12 @@ impl ToolRegistry {
             .iter()
             .find(|tool| {
                 tool.exposure != ToolExposure::Hidden
-                    && tool.spec.name == name
-                    && tool.spec.namespace.as_deref() == namespace
+                    && ((tool.spec.name == name && tool.spec.namespace.as_deref() == namespace)
+                        || (namespace.is_none()
+                            && tool
+                                .mcp_tool
+                                .as_ref()
+                                .is_some_and(|mcp_tool| mcp_tool.flat_tool_name() == name)))
             })
             .map(|tool| tool.handler)
     }
@@ -621,9 +669,15 @@ impl ToolRegistry {
             .iter()
             .filter(|tool| tool.exposure == ToolExposure::Deferred)
             .map(|tool| ToolSearchEntry {
-                search_text: multi_agent_v1_tool_search_text(tool.handler)
-                    .unwrap_or_else(|| tool.spec.name.as_str())
-                    .to_string(),
+                search_text: tool
+                    .mcp_tool
+                    .as_ref()
+                    .map(McpToolDefinition::search_text)
+                    .unwrap_or_else(|| {
+                        multi_agent_v1_tool_search_text(tool.handler)
+                            .unwrap_or_else(|| tool.spec.name.as_str())
+                            .to_string()
+                    }),
                 spec: tool.spec.clone(),
                 source: tool_search_source_for_tool(tool),
             })
@@ -640,6 +694,15 @@ fn tool_search_source_for_tool(tool: &RegisteredTool) -> ToolSearchSourceInfo {
         | ToolHandlerKind::CloseAgentV1 => (
             TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
             Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
+        ),
+        ToolHandlerKind::McpTool => (
+            tool.mcp_tool
+                .as_ref()
+                .map(|tool| tool.server.server_name.as_str())
+                .unwrap_or("MCP tools"),
+            tool.mcp_tool
+                .as_ref()
+                .map(|tool| tool.namespace_description.as_str()),
         ),
         _ => ("Deferred tools", None),
     };
@@ -2437,6 +2500,68 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tool| { tool["name"] == "spawn_agent" && tool["defer_loading"] == true }));
+    }
+
+    #[test]
+    fn mcp_tools_defer_behind_tool_search_and_flatten_without_namespaces() {
+        let server = crate::mcp::McpServerConfig {
+            server_name: "docs".to_string(),
+            command: "python3".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            startup_timeout_ms: 1,
+            tool_timeout_ms: 1,
+            enabled_tools: None,
+            disabled_tools: std::collections::BTreeSet::new(),
+        };
+        let tool = McpToolDefinition {
+            server,
+            raw_tool_name: "lookup".to_string(),
+            callable_namespace: "mcp__docs__".to_string(),
+            callable_name: "lookup".to_string(),
+            namespace_description: "Tools from the docs MCP server.".to_string(),
+            description: "Lookup docs.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                }
+            }),
+            output_schema: None,
+        };
+        let mut registry = ToolRegistry::default();
+        registry.register_mcp_tools(vec![tool]);
+
+        let router = ToolRouter::new(registry.clone(), true, true);
+        assert!(router
+            .model_visible_specs()
+            .iter()
+            .any(|spec| spec.name == "tool_search"));
+        assert!(!router
+            .model_visible_specs()
+            .iter()
+            .any(|spec| spec.namespace.as_deref() == Some("mcp__docs__")));
+        let loaded = router.search_deferred_tools("lookup docs query", 8);
+        assert_eq!(loaded[0]["type"], "namespace");
+        assert_eq!(loaded[0]["name"], "mcp__docs__");
+        assert_eq!(loaded[0]["tools"][0]["name"], "lookup");
+        assert_eq!(loaded[0]["tools"][0]["defer_loading"], true);
+
+        let fallback = ToolRouter::new(registry, false, false);
+        let specs = fallback.model_visible_specs();
+        assert!(specs.iter().any(|spec| {
+            spec.namespace.is_none()
+                && spec.name == "mcp__docs__lookup"
+                && spec.description.contains("Raw MCP tool: lookup")
+        }));
+        assert_eq!(
+            fallback.handler_for_dispatch(None, "mcp__docs__lookup"),
+            Some(ToolHandlerKind::McpTool)
+        );
+        assert!(fallback
+            .mcp_tool_for_call(None, "mcp__docs__lookup")
+            .is_some());
     }
 
     #[test]

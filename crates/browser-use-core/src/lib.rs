@@ -9,6 +9,7 @@ use std::sync::Arc;
 use std::thread;
 use std::time::{Duration, Instant};
 
+mod mcp;
 pub mod product_analytics;
 mod prompt_image;
 mod telemetry;
@@ -53,6 +54,7 @@ use tools::{
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DEFAULT_MAX_CONTEXT_CHARS: usize = 240_000;
 const DEFAULT_TOOL_OUTPUT_TEXT_TOKENS: usize = 2_500;
+const MCP_EVENT_RESULT_MAX_CHARS: usize = 20_000;
 const INVALID_IMAGE_REPLACEMENT_TEXT: &str = "Invalid image";
 const IMAGE_CONTEXT_BUDGET_TOKENS: usize = 2_000;
 const RESIZED_IMAGE_CONTEXT_BYTES_ESTIMATE: usize = 7_373;
@@ -11676,7 +11678,7 @@ fn browser_tool_registry_for_session(
         .as_ref()
         .map(|catalog| spawn_agent_model_overrides_description_for_catalog(catalog, true))
         .unwrap_or_else(browser_use_providers::spawn_agent_model_overrides_description);
-    Ok(ToolRegistry::browser_agent_with_agent_type_description_and_model_description_and_multi_agent_config(
+    let mut registry = ToolRegistry::browser_agent_with_agent_type_description_and_model_description_and_multi_agent_config(
         tools::spawn_agent_type_description_for_roles(role_descriptions),
         multi_agent_tool_config,
         ShellToolSpecConfig {
@@ -11687,7 +11689,9 @@ fn browser_tool_registry_for_session(
         },
         model_supports_original_image_detail_for_catalog(model_name, config.model_catalog.as_ref()),
         model_overrides_description,
-    ))
+    );
+    registry.register_mcp_tools(mcp::discover_tool_definitions(&config.mcp_servers));
+    Ok(registry)
 }
 
 fn hosted_tool_specs_for_session(
@@ -12818,7 +12822,174 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
         ToolHandlerKind::CloseAgentV1 => dispatch_close_agent_v1_tool(store, session, call),
         ToolHandlerKind::ToolSearch => dispatch_tool_search_tool(store, session, call, tool_router),
+        ToolHandlerKind::McpTool => {
+            dispatch_mcp_tool(store, session, call, tool_output_token_budget, tool_router)
+        }
     }
+}
+
+fn dispatch_mcp_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+    tool_router: &ToolRouter,
+) -> Result<ToolDispatchOutcome> {
+    let Some(definition) = tool_router.mcp_tool_for_call(call.namespace.as_deref(), &call.name)
+    else {
+        return dispatch_unknown_tool(store, session, call);
+    };
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": call.name,
+            "namespace": call.namespace,
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+            "mcp_server": definition.server.server_name,
+            "mcp_tool": definition.raw_tool_name,
+        }),
+    )?;
+    let started = Instant::now();
+    let result = mcp::call_tool(&definition, &call.arguments)?;
+    let wall_time = started.elapsed();
+    let is_error = result
+        .get("isError")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    let (event_result, event_result_truncated, event_result_char_count) =
+        mcp_event_result_payload(&result);
+    store.append_event(
+        &session.id,
+        "mcp.tool_result",
+        serde_json::json!({
+            "tool_call_id": call.id,
+            "name": call.name,
+            "namespace": call.namespace,
+            "mcp_server": definition.server.server_name,
+            "mcp_tool": definition.raw_tool_name,
+            "is_error": is_error,
+            "result": event_result,
+            "result_truncated": event_result_truncated,
+            "result_char_count": event_result_char_count,
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        serde_json::json!({
+            "name": call.name,
+            "namespace": call.namespace,
+            "tool_call_id": call.id,
+            "mcp_server": definition.server.server_name,
+            "mcp_tool": definition.raw_tool_name,
+            "is_error": is_error,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            &call.name,
+            mcp_result_tool_content(&result, wall_time),
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn mcp_event_result_payload(result: &Value) -> (Value, bool, usize) {
+    let serialized = serde_json::to_string(result).unwrap_or_else(|_| result.to_string());
+    let char_count = serialized.chars().count();
+    if char_count <= MCP_EVENT_RESULT_MAX_CHARS {
+        return (result.clone(), false, char_count);
+    }
+    (
+        json!({
+            "content": [{
+                "type": "text",
+                "text": format!(
+                    "<MCP result truncated in event log: {char_count} chars; model-facing output is stored separately.>"
+                ),
+            }],
+            "isError": result
+                .get("isError")
+                .cloned()
+                .unwrap_or(Value::Bool(false)),
+            "_truncated": true,
+        }),
+        true,
+        char_count,
+    )
+}
+
+fn mcp_result_tool_content(result: &Value, wall_time: Duration) -> Value {
+    let header = format!("Wall time: {:.4} seconds\nOutput:", wall_time.as_secs_f64());
+    let structured_content = result
+        .get("structuredContent")
+        .or_else(|| result.get("structured_content"))
+        .filter(|value| !value.is_null());
+    if let Some(structured_content) = structured_content {
+        return Value::String(format!("{header}\n{structured_content}"));
+    }
+
+    let Some(content) = result.get("content").and_then(Value::as_array) else {
+        return Value::String(format!("{header}\n{result}"));
+    };
+    if let Some(mut items) = mcp_content_items_for_model(content) {
+        items.insert(0, json!({ "type": "output_text", "text": header }));
+        return Value::Array(items);
+    }
+    Value::String(format!("{header}\n{}", Value::Array(content.clone())))
+}
+
+fn mcp_content_items_for_model(content: &[Value]) -> Option<Vec<Value>> {
+    let mut saw_image = false;
+    let mut items = Vec::with_capacity(content.len());
+    for item in content {
+        match item.get("type").and_then(Value::as_str) {
+            Some("text") => items.push(json!({
+                "type": "output_text",
+                "text": item.get("text").and_then(Value::as_str).unwrap_or_default(),
+            })),
+            Some("image") => {
+                saw_image = true;
+                let data = item.get("data").and_then(Value::as_str).unwrap_or_default();
+                let image_url = if data.starts_with("data:") {
+                    data.to_string()
+                } else {
+                    let mime_type = item
+                        .get("mimeType")
+                        .or_else(|| item.get("mime_type"))
+                        .and_then(Value::as_str)
+                        .unwrap_or("application/octet-stream");
+                    format!("data:{mime_type};base64,{data}")
+                };
+                let mut image = json!({
+                    "type": "input_image",
+                    "image_url": image_url,
+                    "detail": "high",
+                });
+                if let Some(detail) = item
+                    .get("_meta")
+                    .and_then(Value::as_object)
+                    .and_then(|meta| meta.get("codex/imageDetail"))
+                    .and_then(Value::as_str)
+                    .filter(|detail| matches!(*detail, "high" | "original"))
+                {
+                    image["detail"] = Value::String(detail.to_string());
+                }
+                items.push(image);
+            }
+            _ => items.push(json!({
+                "type": "output_text",
+                "text": item.to_string(),
+            })),
+        }
+    }
+    saw_image.then_some(items)
 }
 
 fn dispatch_exec_command_tool(
@@ -14578,6 +14749,7 @@ struct AgentsMdConfig {
     provider_request_max_retries: BTreeMap<String, usize>,
     provider_stream_max_retries: BTreeMap<String, usize>,
     provider_stream_idle_timeout_ms: BTreeMap<String, u64>,
+    mcp_servers: BTreeMap<String, mcp::McpServerConfig>,
     hooks: RuntimeHookConfig,
 }
 
@@ -14630,6 +14802,7 @@ impl Default for AgentsMdConfig {
             provider_request_max_retries: BTreeMap::new(),
             provider_stream_max_retries: BTreeMap::new(),
             provider_stream_idle_timeout_ms: BTreeMap::new(),
+            mcp_servers: BTreeMap::new(),
             hooks: RuntimeHookConfig::default(),
         }
     }
@@ -15652,6 +15825,7 @@ fn apply_agents_md_config_layer(
     apply_hooks_config_layer(config, value, path, layer_kind)?;
     apply_codex_features_config_layer(config, value, path)?;
     apply_codex_plugins_config_layer(config, value, path)?;
+    mcp::apply_mcp_servers_config_layer(&mut config.mcp_servers, value, path, relative_base)?;
     apply_multi_agent_v2_config_layer(config, value, path)?;
     if let Some(reasoning_effort) = toml_optional_enum_string(
         value,
@@ -31857,6 +32031,185 @@ name = "Thread"
         assert_eq!(runs.len(), 1);
         assert_eq!(runs[0].status, "done");
         assert!(runs[0].ended_ms.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_dispatches_configured_stdio_mcp_tool_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let mcp_script = temp.path().join("mcp_echo.py");
+        write_test_mcp_echo_server(&mcp_script)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                r#"
+[mcp_servers.docs]
+command = "python3"
+args = [{}]
+startup_timeout_ms = 2000
+tool_timeout_ms = 2000
+"#,
+                toml_basic_string(mcp_script.to_string_lossy().as_ref())
+            ),
+        )?;
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let store = Store::open(temp.path().join("state"))?;
+            let provider = ScriptedProvider::new(vec![
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "mcp_1".to_string(),
+                            name: "echo_tool".to_string(),
+                            namespace: Some("mcp__docs__".to_string()),
+                            arguments: serde_json::json!({"text": "hello"}),
+                        },
+                    },
+                    ModelEvent::Done,
+                ],
+                vec![
+                    ModelEvent::TextDelta {
+                        text: "final".to_string(),
+                    },
+                    ModelEvent::Done,
+                ],
+            ]);
+
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "Use the configured docs MCP echo tool.",
+                temp.path(),
+                AgentRunOptions::default(),
+            )?;
+            let events = store.events_for_session(&session_id)?;
+            assert!(events.iter().any(|event| {
+                event.event_type == "mcp.tool_result"
+                    && event.payload["mcp_server"] == "docs"
+                    && event.payload["mcp_tool"] == "echo.tool"
+                    && event.payload["result"]["content"][0]["text"] == "echo:hello"
+            }));
+            assert!(events.iter().any(|event| {
+                event.event_type == MODEL_RESPONSE_INPUT_ITEM_EVENT
+                    && event.payload["call_id"] == "mcp_1"
+                    && event.payload["item"]["output"]
+                        .as_str()
+                        .is_some_and(|output| {
+                            output.starts_with("Wall time: ")
+                                && output.contains("\"text\":\"hello\"")
+                                && !output.contains("structuredContent")
+                                && !output.contains("isError")
+                        })
+            }));
+            assert!(events.iter().any(|event| {
+                event.event_type == "session.done" && event.payload["result"] == "final"
+            }));
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn mcp_result_tool_content_preserves_image_content_like_codex() {
+        let content = mcp_result_tool_content(
+            &serde_json::json!({
+                "content": [
+                    {"type": "text", "text": "caption"},
+                    {
+                        "type": "image",
+                        "data": "abcd",
+                        "mimeType": "image/png",
+                        "_meta": {"codex/imageDetail": "original"}
+                    }
+                ],
+                "isError": false,
+            }),
+            Duration::from_millis(12),
+        );
+        let parts = content
+            .as_array()
+            .expect("image MCP result uses content parts");
+        assert_eq!(parts[0]["type"], "output_text");
+        assert_eq!(parts[0]["text"], "Wall time: 0.0120 seconds\nOutput:");
+        assert_eq!(parts[1]["type"], "output_text");
+        assert_eq!(parts[1]["text"], "caption");
+        assert_eq!(parts[2]["type"], "input_image");
+        assert_eq!(parts[2]["image_url"], "data:image/png;base64,abcd");
+        assert_eq!(parts[2]["detail"], "original");
+    }
+
+    #[test]
+    fn mcp_event_result_payload_bounds_large_results() {
+        let (payload, truncated, char_count) = mcp_event_result_payload(&serde_json::json!({
+            "content": [{"type": "text", "text": "x".repeat(MCP_EVENT_RESULT_MAX_CHARS + 1)}],
+            "isError": false,
+        }));
+        assert!(truncated);
+        assert!(char_count > MCP_EVENT_RESULT_MAX_CHARS);
+        assert_eq!(payload["_truncated"], true);
+        assert_eq!(payload["isError"], false);
+        assert!(payload["content"][0]["text"]
+            .as_str()
+            .is_some_and(|text| text.contains("MCP result truncated in event log")));
+    }
+
+    fn toml_basic_string(value: &str) -> String {
+        format!("{value:?}")
+    }
+
+    fn write_test_mcp_echo_server(path: &Path) -> Result<()> {
+        std::fs::write(
+            path,
+            r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "test", "version": "1.0"},
+            },
+        }
+    elif method == "tools/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "tools": [{
+                    "name": "echo.tool",
+                    "description": "Echo text.",
+                    "inputSchema": {
+                        "type": "object",
+                        "properties": {"text": {"type": "string"}},
+                        "required": ["text"],
+                    },
+                }]
+            },
+        }
+    elif method == "tools/call":
+        text = request.get("params", {}).get("arguments", {}).get("text", "")
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "content": [{"type": "text", "text": "echo:" + text}],
+                "structuredContent": {"text": text},
+                "isError": False,
+            },
+        }
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )?;
         Ok(())
     }
 

@@ -1799,6 +1799,30 @@ The biggest remaining categories are:
   `AgentControl` semantics, plus typed history/replay/rollout ownership,
   dynamic callable contributors, compaction/token precision, richer hooks,
   persistent goal state, and subagent control-plane depth.
+- The current stdio MCP slice closes the first concrete dynamic callable-tool
+  contributor gap. User-configured `[mcp_servers]` entries now discover tools
+  through MCP JSON-RPC, register them as namespaced/deferred model tools,
+  provide flat fallback tool names for models without namespace support, and
+  dispatch `tools/call` through the existing provider-neutral tool loop. The
+  model-facing output shape now follows Codex's wall-time/header convention
+  for structured/text/image MCP results, while event logs are bounded and MCP
+  server stderr is included in error context.
+- Verification for the stdio MCP slice passed formatting, whitespace, Python
+  tests, full Rust workspace tests, and live Codex-auth root plus child smokes.
+  The full workspace run passed with browser-use-browser 16 passed plus 2
+  ignored browser smokes, CLI 18, core 452, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 140, and doc-tests. The live smoke used root
+  session `2a492df679fe` and child session `993caa0d8ff5`; the root returned
+  `Paris`, and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten real Codex-auth child audits were run after the stdio MCP slice. Five
+  completed with final reports and five hit the provider-turn guard, which is
+  recorded as part of the audit result. The completed reports agreed that
+  stdio MCP is a real parity gain and that the remaining MCP work is
+  architectural: persistent per-session/server connection management,
+  discovery diagnostics, remote/OAuth/elicitation/resources, app/plugin
+  connector exposure, collision policy, read-only parallel hints, and richer
+  raw-vs-model output separation for future hooks/code-mode consumers.
 
 ## Definition of Done
 
