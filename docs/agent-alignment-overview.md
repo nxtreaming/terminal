@@ -1777,6 +1777,28 @@ The biggest remaining categories are:
   contributors, public event-router style turn buffering, deeper local
   compaction/token lifecycle, cancellable async tool futures with read/write
   gates, richer subagent lifecycle ownership, and review/task lifecycle depth.
+- The current mailbox-boundary slice closes a concrete active-turn input queue
+  edge. Mailbox-only input that appears after the model has effectively reached
+  the answer boundary is no longer appended to the current final response.
+  Queue-only mailbox stays pending while the current answer completes; trigger
+  mailbox defers the final answer and continues into the next provider turn so
+  the mail is handled as its own turn input.
+- Verification for the mailbox-boundary slice passed formatting, whitespace,
+  Python tests, full Rust workspace tests, and live Codex-auth root plus child
+  smokes. The full workspace run passed with browser-use-browser 16 passed plus
+  2 ignored browser smokes, CLI 18, core 444, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 140, and doc-tests. The live smoke used root
+  session `73bbb0b0ca59` and child session `42eaa033ef78`; the root returned
+  `Paris`, and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad real child-agent audits after this slice treated the mailbox
+  answer-boundary behavior as the only branch-local runtime change. The
+  consensus was that the focused queue-only and trigger-turn tests cover the
+  concrete edge now implemented. The remaining material gap is the larger
+  active-turn architecture: generalized `InputQueue`, `TurnState`, and
+  `AgentControl` semantics, plus typed history/replay/rollout ownership,
+  dynamic callable contributors, compaction/token precision, richer hooks,
+  persistent goal state, and subagent control-plane depth.
 
 ## Definition of Done
 
