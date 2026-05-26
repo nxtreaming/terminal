@@ -1579,6 +1579,16 @@ The biggest remaining categories are:
   goal `updated_at_ms` preservation for imported/created goal events. What
   remains is real dynamic callable contribution from MCP/app/plugin/extension
   sources plus Codex's async tool-future lifecycle.
+- The current streaming-runtime slice uses that router to start every
+  parallel-safe direct tool during provider streaming, not only read-only file
+  tools. Read-only calls still carry the old `read_only_predispatch` event
+  label; visible terminal tools such as `exec_command` now carry
+  `parallel_predispatch` and can run before the provider stream completes when
+  hooks and queued user input do not block them. This closes the represented
+  latency gap for Codex-parallel-safe local tools while keeping model-visible
+  tool outputs ordered by the model's call order. It does not pretend to close
+  the deeper async runtime: cancellation, read/write gates for non-parallel
+  calls, and dynamic contributed tool executors still need larger substrates.
 - Ten real Codex-auth child-agent audits after the router slice found no new
   easy client-side correctness blocker. Their consensus was that the remaining
   agent-quality gaps are architectural: dynamic tool contributors, cancellable
@@ -1586,6 +1596,22 @@ The biggest remaining categories are:
   typed history/rollout/context ownership, exact turn diffs, goal runtime
   accounting, local compaction/token-window fidelity, and deeper skills/plugins
   and review-task lifecycle.
+- Verification for the streaming-runtime slice passed after isolating
+  `CODEX_HOME` in the new default-unified-exec regression test. The full local
+  gate passed (`cargo fmt --check`, `git diff --check`, Python tests, and full
+  `cargo test`), and the live Codex-auth smoke used root session
+  `84c40f19c627` plus child session `9c649acf6e21`; the root returned `Paris`,
+  and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- A fresh ten-agent broad audit after this slice found no new correctness
+  regression. The auditors agreed the new `parallel_predispatch` path is a
+  useful latency improvement with an expected ordering risk surface, and that
+  the strict active-input and hook gates are the right guardrails for now. The
+  remaining provider-neutral gaps are still architectural: dynamic tool
+  contributors, cancellable async tool futures with read/write gates,
+  first-class active-turn state, typed history/replay ownership, exact turn
+  diffs, local compaction/token precision, subagent lifecycle depth, and
+  skills/plugins/review runtime depth.
 
 ## Definition of Done
 

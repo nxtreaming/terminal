@@ -309,6 +309,12 @@ struct StreamingToolScheduler {
     handles: HashMap<String, StreamedToolHandle>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum StreamingPredispatchKind {
+    ReadOnly,
+    ParallelSafe,
+}
+
 pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
 }
@@ -8152,57 +8158,67 @@ impl StreamingToolScheduler {
         if self.handles.contains_key(&call.id) {
             return Ok(());
         }
-        if active_turn_pending_queue_input(
+        let Some(predispatch_kind) = tool_call_streaming_predispatch_kind(&self.router, call)
+        else {
+            return Ok(());
+        };
+        if !active_turn_pending_queue_input(
             store,
             &self.session.id,
             self.active_queue_last_session_message_seq,
         )?
         .is_empty()
-            && tool_call_supports_streaming_predispatch(&self.router, call)
-            && !tool_call_has_matching_hooks(runtime_hooks, call)
+            || tool_call_has_matching_hooks(runtime_hooks, call)
         {
-            let state_dir = self.state_dir.clone();
-            let notifier = self.notifier.clone();
-            let session = self.session.clone();
-            let router = self.router.clone();
-            let tool_output_token_budget = self.tool_output_token_budget;
-            let supports_original_image_detail = self.supports_original_image_detail;
-            let dispatched_call = call.clone();
-            store.append_event(
-                &self.session.id,
-                "model.tool_call",
-                serde_json::to_value(call)?,
-            )?;
-            store.append_event(
-                &self.session.id,
-                "tool.streaming_started",
-                serde_json::json!({
-                    "turn_attempt": attempt,
-                    "tool_call_id": call.id,
-                    "name": call.name,
-                    "mode": "read_only_predispatch",
-                }),
-            )?;
-            let handle = thread::spawn(move || {
-                let store = Store::open_with_optional_notifier(state_dir, notifier)?;
-                dispatch_parallel_tool_call_recoverably(
-                    &store,
-                    &session,
-                    &router,
-                    &dispatched_call,
-                    tool_output_token_budget,
-                    supports_original_image_detail,
-                )
-            });
-            self.handles.insert(
-                call.id.clone(),
-                StreamedToolHandle {
-                    attempt,
-                    call: call.clone(),
-                    handle,
-                },
-            );
+            return Ok(());
         }
+
+        let state_dir = self.state_dir.clone();
+        let notifier = self.notifier.clone();
+        let session = self.session.clone();
+        let router = self.router.clone();
+        let tool_output_token_budget = self.tool_output_token_budget;
+        let supports_original_image_detail = self.supports_original_image_detail;
+        let dispatched_call = call.clone();
+        store.append_event(
+            &self.session.id,
+            "model.tool_call",
+            serde_json::to_value(call)?,
+        )?;
+        store.append_event(
+            &self.session.id,
+            "tool.streaming_started",
+            serde_json::json!({
+                "turn_attempt": attempt,
+                "tool_call_id": call.id,
+                "name": call.name,
+                "mode": match predispatch_kind {
+                    StreamingPredispatchKind::ReadOnly => "read_only_predispatch",
+                    StreamingPredispatchKind::ParallelSafe => "parallel_predispatch",
+                },
+                "parallel_safe": true,
+                "read_only": predispatch_kind == StreamingPredispatchKind::ReadOnly,
+            }),
+        )?;
+        let handle = thread::spawn(move || {
+            let store = Store::open_with_optional_notifier(state_dir, notifier)?;
+            dispatch_parallel_tool_call_recoverably(
+                &store,
+                &session,
+                &router,
+                &dispatched_call,
+                tool_output_token_budget,
+                supports_original_image_detail,
+            )
+        });
+        self.handles.insert(
+            call.id.clone(),
+            StreamedToolHandle {
+                attempt,
+                call: call.clone(),
+                handle,
+            },
+        );
         Ok(())
     }
 
@@ -12401,22 +12417,33 @@ fn tool_call_supports_parallel(tool_router: &ToolRouter, call: &ToolCall) -> boo
             .unwrap_or(false)
 }
 
-fn tool_call_supports_streaming_predispatch(tool_router: &ToolRouter, call: &ToolCall) -> bool {
-    tool_router.tool_supports_streaming_predispatch(call.namespace.as_deref(), &call.name)
-        || call
-            .namespace
-            .is_none()
-            .then(|| {
-                matches!(
-                    hidden_legacy_file_tool_handler(&call.name),
-                    Some(
-                        ToolHandlerKind::ReadFile
-                            | ToolHandlerKind::SearchFiles
-                            | ToolHandlerKind::ListFiles
+fn tool_call_streaming_predispatch_kind(
+    tool_router: &ToolRouter,
+    call: &ToolCall,
+) -> Option<StreamingPredispatchKind> {
+    if !tool_call_supports_parallel(tool_router, call) {
+        return None;
+    }
+    tool_router
+        .tool_supports_streaming_predispatch(call.namespace.as_deref(), &call.name)
+        .then_some(StreamingPredispatchKind::ReadOnly)
+        .or_else(|| {
+            call.namespace
+                .is_none()
+                .then(|| {
+                    matches!(
+                        hidden_legacy_file_tool_handler(&call.name),
+                        Some(
+                            ToolHandlerKind::ReadFile
+                                | ToolHandlerKind::SearchFiles
+                                | ToolHandlerKind::ListFiles
+                        )
                     )
-                )
-            })
-            .unwrap_or(false)
+                    .then_some(StreamingPredispatchKind::ReadOnly)
+                })
+                .flatten()
+        })
+        .or(Some(StreamingPredispatchKind::ParallelSafe))
 }
 
 fn panic_payload_text(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
@@ -29973,6 +30000,10 @@ request_max_retries = 7
             browser_tool_router_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
         assert!(tool_call_supports_parallel(&default_router, &exec_call));
+        assert_eq!(
+            tool_call_streaming_predispatch_kind(&default_router, &exec_call),
+            Some(StreamingPredispatchKind::ParallelSafe)
+        );
         assert!(
             !tool_call_supports_parallel(&default_router, &shell_call),
             "hidden legacy shell_command dispatch remains serial like Codex"
@@ -29980,6 +30011,10 @@ request_max_retries = 7
         assert!(
             tool_call_supports_parallel(&default_router, &tool_search_call),
             "Codex lets tool_search run in parallel with other parallel-safe calls"
+        );
+        assert_eq!(
+            tool_call_streaming_predispatch_kind(&default_router, &tool_search_call),
+            Some(StreamingPredispatchKind::ReadOnly)
         );
 
         let legacy = AgentRunOptions::default().with_config_overrides(vec![(
@@ -29990,6 +30025,10 @@ request_max_retries = 7
             browser_tool_router_for_session(&session, &legacy, "gpt-5.5", true)
         })?;
         assert!(tool_call_supports_parallel(&legacy_router, &shell_call));
+        assert_eq!(
+            tool_call_streaming_predispatch_kind(&legacy_router, &shell_call),
+            Some(StreamingPredispatchKind::ParallelSafe)
+        );
         Ok(())
     }
 
@@ -31698,6 +31737,13 @@ name = "Thread"
             .find(|event| event.event_type == "tool.streaming_started")
             .map(|event| event.seq)
             .context("missing streaming start event")?;
+        let streaming_started = events
+            .iter()
+            .find(|event| event.event_type == "tool.streaming_started")
+            .context("missing streaming start payload")?;
+        assert_eq!(streaming_started.payload["mode"], "read_only_predispatch");
+        assert_eq!(streaming_started.payload["read_only"], true);
+        assert_eq!(streaming_started.payload["parallel_safe"], true);
         let file_read_seq = events
             .iter()
             .find(|event| event.event_type == "file.read")
@@ -31716,6 +31762,146 @@ name = "Thread"
         }));
         assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "used streamed read"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_predispatches_parallel_exec_tool_during_stream() -> Result<()> {
+        struct StreamingExecProvider {
+            state_dir: std::path::PathBuf,
+            session_id: String,
+            marker_path: std::path::PathBuf,
+            attempts: std::sync::Mutex<usize>,
+        }
+
+        impl ModelProvider for StreamingExecProvider {
+            fn provider_name(&self) -> &str {
+                "streaming-exec"
+            }
+
+            fn model_name(&self) -> &str {
+                "streaming-exec"
+            }
+
+            fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                let mut events = Vec::new();
+                self.stream_turn(turn, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })?;
+                Ok(events)
+            }
+
+            fn stream_turn(
+                &self,
+                _turn: ProviderTurn,
+                on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+            ) -> Result<()> {
+                let mut attempts = self.attempts.lock().expect("attempts lock");
+                *attempts += 1;
+                if *attempts == 1 {
+                    on_event(ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "stream_exec".to_string(),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({
+                                "cmd": "printf streamed-exec > streamed-exec-marker.txt",
+                                "yield_time_ms": 5000,
+                            }),
+                        },
+                    })?;
+                    let store = Store::open(&self.state_dir)?;
+                    let deadline = Instant::now() + Duration::from_secs(15);
+                    loop {
+                        if self.marker_path.exists()
+                            && store
+                                .events_for_session(&self.session_id)?
+                                .iter()
+                                .any(|event| {
+                                    event.event_type == "command.started"
+                                        && event.payload["tool_call_id"] == "stream_exec"
+                                })
+                        {
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            bail!("exec_command was not pre-dispatched before stream completion");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    on_event(ModelEvent::Done)?;
+                    return Ok(());
+                }
+                on_event(ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_streamed_exec".to_string(),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({
+                            "result": "used streamed exec",
+                        }),
+                    },
+                })?;
+                on_event(ModelEvent::Done)?;
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run a tiny command"}),
+        )?;
+        let marker_path = temp.path().join("streamed-exec-marker.txt");
+        let provider = StreamingExecProvider {
+            state_dir: store.state_dir().to_path_buf(),
+            session_id: session.id.clone(),
+            marker_path: marker_path.clone(),
+            attempts: std::sync::Mutex::new(0),
+        };
+
+        with_codex_home(&codex_home, || {
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session.id,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        assert_eq!(std::fs::read_to_string(marker_path)?, "streamed-exec");
+        let events = store.events_for_session(&session.id)?;
+        let streaming_started = events
+            .iter()
+            .find(|event| event.event_type == "tool.streaming_started")
+            .context("missing streaming start event")?;
+        assert_eq!(streaming_started.payload["tool_call_id"], "stream_exec");
+        assert_eq!(streaming_started.payload["mode"], "parallel_predispatch");
+        assert_eq!(streaming_started.payload["read_only"], false);
+        assert_eq!(streaming_started.payload["parallel_safe"], true);
+        let command_started_seq = events
+            .iter()
+            .find(|event| event.event_type == "command.started")
+            .map(|event| event.seq)
+            .context("missing command started event")?;
+        let turn_response_seq = events
+            .iter()
+            .find(|event| event.event_type == "model.turn.response")
+            .map(|event| event.seq)
+            .context("missing model turn response event")?;
+        assert!(command_started_seq < turn_response_seq);
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.streaming_result"
+                && event.payload["tool_call_id"] == "stream_exec"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "used streamed exec"
         }));
         Ok(())
     }
