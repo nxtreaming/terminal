@@ -30261,15 +30261,18 @@ name = "Thread"
     #[test]
     fn provider_can_use_exec_command_tool() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let provider = ExecToolOutputInspectingProvider::default();
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "run a command",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "run a command",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
         let events = store.events_for_session(&session_id)?;
         assert!(events
             .iter()
