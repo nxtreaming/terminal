@@ -192,9 +192,32 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   runtime accounting, local compaction/token-window lifecycle, and deeper
   skill/plugin/review task semantics. The pass also produced smaller next-slice
   candidates: stream-safe hidden-markup filtering, structured memory citation
-  accounting, real child transcript paths for `SubagentStop`, and updating the
-  uncataloged model fallback prompt to match Codex's latest GPT-5.1 autonomy
-  guidance.
+  accounting, real child transcript paths for `SubagentStop`, and a prompt
+  drift check for uncataloged model fallbacks.
+- The current slice closes those concrete candidates. Streaming assistant text
+  is filtered before `model.stream_delta` and live `model.delta`, including
+  split partial hidden-tag openings. Final assistant text and `done.result`
+  parse Codex-shaped memory citation blocks into `memory.citation` sidecars
+  with entries plus deduped `rollout_ids`/legacy `thread_ids`. `SubagentStop`
+  hook input now carries real child and parent transcript snapshot paths.
+  Source inspection showed the local uncataloged Codex fallback prompt is
+  already byte-identical to Codex `codex-rs/models-manager/prompt.md`, so the
+  GPT-5.1-specific prompt item is not a current fallback-prompt gap.
+- Verification for this slice passed with full Rust workspace tests, Python
+  tests, formatting, whitespace, and real Codex-auth root/child smokes. Root
+  session `fa75168e01bf` returned `Paris`; child session `abdafe765c1b` read
+  `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`.
+- The follow-up ten-auditor pass agreed this slice closed the previous
+  lower-scope targets and did not find a new small blocker. The remaining work
+  is architectural: dynamic router/inventory, stream-integrated mutating tool
+  futures, active-turn input/control state, typed context/history/rollout
+  reconstruction, exact turn diffs, full goal accounting, local
+  compaction/token-window precision, skills/plugins manager depth, and
+  review-task lifecycle. Two caveats remain: memory citation accounting is
+  still sidecar/event-based rather than Codex's typed agent-message/state-db
+  path, and truly unknown non-Codex models intentionally use the neutral
+  fallback prompt for provider portability.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming
@@ -1507,8 +1530,11 @@ The biggest remaining categories are:
   forms. Invalid-image recovery, compaction overflow retry, execution of
   `async_run` hook effects, concurrent command-hook execution, completion-order
   `updatedInput`, and inexact dirty-baseline git diff reporting are now
-  represented. Still open: exact hook run summaries/sources/trust/transcript
-  metadata, exact streaming futures for mutating tools, and a full Codex
+  represented. Hook run summaries, source/trust metadata, transcript snapshots,
+  and `SubagentStop` child/parent transcript paths are represented for command
+  hooks. Still open: prompt/agent hook handler variants, exact trust
+  enforcement/listing UX, plugin/cloud hook discovery, stricter output
+  validation, exact streaming futures for mutating tools, and a full Codex
   `TurnDiffTracker` lifecycle across every tool runtime.
 - Multi-agent family routing now follows Codex's feature gate for represented
   sessions: `features.multi_agent_v2.enabled = true` selects the v2 task-path

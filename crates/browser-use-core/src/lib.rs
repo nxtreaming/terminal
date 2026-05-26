@@ -817,6 +817,192 @@ fn strip_memory_citations(text: &str) -> String {
     visible
 }
 
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemoryCitationEntry {
+    path: String,
+    line_start: usize,
+    line_end: usize,
+    note: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MemoryCitation {
+    entries: Vec<MemoryCitationEntry>,
+    rollout_ids: Vec<String>,
+}
+
+fn memory_citation_blocks(text: &str) -> Vec<String> {
+    let mut blocks = Vec::new();
+    let mut rest = text;
+    while let Some(open_idx) = rest.find(OAI_MEMORY_CITATION_OPEN_TAG) {
+        let after_open = &rest[open_idx + OAI_MEMORY_CITATION_OPEN_TAG.len()..];
+        let Some(close_idx) = after_open.find(OAI_MEMORY_CITATION_CLOSE_TAG) else {
+            break;
+        };
+        blocks.push(after_open[..close_idx].to_string());
+        rest = &after_open[close_idx + OAI_MEMORY_CITATION_CLOSE_TAG.len()..];
+    }
+    blocks
+}
+
+fn parse_memory_citation_blocks(citations: Vec<String>) -> Option<MemoryCitation> {
+    let mut entries = Vec::new();
+    let mut rollout_ids = Vec::new();
+    let mut seen_rollout_ids = HashSet::new();
+
+    for citation in citations {
+        if let Some(entries_block) =
+            extract_memory_citation_block(&citation, "<citation_entries>", "</citation_entries>")
+        {
+            entries.extend(
+                entries_block
+                    .lines()
+                    .filter_map(parse_memory_citation_entry),
+            );
+        }
+
+        if let Some(ids_block) = extract_memory_citation_ids_block(&citation) {
+            for id in ids_block
+                .lines()
+                .map(str::trim)
+                .filter(|line| !line.is_empty())
+            {
+                if seen_rollout_ids.insert(id.to_string()) {
+                    rollout_ids.push(id.to_string());
+                }
+            }
+        }
+    }
+
+    if entries.is_empty() && rollout_ids.is_empty() {
+        None
+    } else {
+        Some(MemoryCitation {
+            entries,
+            rollout_ids,
+        })
+    }
+}
+
+fn parse_memory_citation_entry(line: &str) -> Option<MemoryCitationEntry> {
+    let line = line.trim();
+    if line.is_empty() {
+        return None;
+    }
+    let (location, note) = line.rsplit_once("|note=[")?;
+    let note = note.strip_suffix(']')?.trim().to_string();
+    let (path, line_range) = location.rsplit_once(':')?;
+    let (line_start, line_end) = line_range.split_once('-')?;
+
+    Some(MemoryCitationEntry {
+        path: path.trim().to_string(),
+        line_start: line_start.trim().parse().ok()?,
+        line_end: line_end.trim().parse().ok()?,
+        note,
+    })
+}
+
+fn extract_memory_citation_block<'a>(text: &'a str, open: &str, close: &str) -> Option<&'a str> {
+    let (_, rest) = text.split_once(open)?;
+    let (body, _) = rest.split_once(close)?;
+    Some(body)
+}
+
+fn extract_memory_citation_ids_block(text: &str) -> Option<&str> {
+    extract_memory_citation_block(text, "<rollout_ids>", "</rollout_ids>")
+        .or_else(|| extract_memory_citation_block(text, "<thread_ids>", "</thread_ids>"))
+}
+
+fn memory_citation_to_json(citation: &MemoryCitation) -> Value {
+    serde_json::json!({
+        "entries": citation
+            .entries
+            .iter()
+            .map(|entry| {
+                serde_json::json!({
+                    "path": entry.path.as_str(),
+                    "line_start": entry.line_start,
+                    "line_end": entry.line_end,
+                    "note": entry.note.as_str(),
+                })
+            })
+            .collect::<Vec<_>>(),
+        "rollout_ids": &citation.rollout_ids,
+    })
+}
+
+fn append_memory_citation_events(
+    store: &Store,
+    session_id: &str,
+    source: &str,
+    text: &str,
+) -> Result<()> {
+    let Some(citation) = parse_memory_citation_blocks(memory_citation_blocks(text)) else {
+        return Ok(());
+    };
+    let mut payload = memory_citation_to_json(&citation);
+    payload["source"] = Value::String(source.to_string());
+    store.append_event(session_id, "memory.citation", payload)?;
+    Ok(())
+}
+
+fn strip_hidden_assistant_markup_for_stream(
+    text: &str,
+    mode: CollaborationModeKind,
+) -> (String, Option<String>) {
+    let (visible, proposed_plan) = strip_hidden_assistant_markup(text, mode);
+    (
+        trim_partial_hidden_assistant_tag_suffix(&visible, mode),
+        proposed_plan,
+    )
+}
+
+fn trim_partial_hidden_assistant_tag_suffix(text: &str, mode: CollaborationModeKind) -> String {
+    let tags: &[&str] = if mode == CollaborationModeKind::Plan {
+        &[OAI_MEMORY_CITATION_OPEN_TAG, PROPOSED_PLAN_OPEN_TAG]
+    } else {
+        &[OAI_MEMORY_CITATION_OPEN_TAG]
+    };
+    for (idx, _) in text.char_indices() {
+        let suffix = &text[idx..];
+        if tags
+            .iter()
+            .any(|tag| suffix.len() < tag.len() && tag.starts_with(suffix))
+        {
+            return text[..idx].to_string();
+        }
+    }
+    text.to_string()
+}
+
+#[derive(Clone, Debug)]
+struct HiddenAssistantMarkupStreamFilter {
+    mode: CollaborationModeKind,
+    raw_text: String,
+    visible_text: String,
+}
+
+impl HiddenAssistantMarkupStreamFilter {
+    fn new(mode: CollaborationModeKind) -> Self {
+        Self {
+            mode,
+            raw_text: String::new(),
+            visible_text: String::new(),
+        }
+    }
+
+    fn push_provider_text(&mut self, incoming: &str) -> Option<(String, Option<String>)> {
+        let raw_delta = assistant_delta_to_append(&self.raw_text, incoming)?;
+        self.raw_text.push_str(&raw_delta);
+        let visible = strip_hidden_assistant_markup_for_stream(&self.raw_text, self.mode).0;
+        let visible_delta = assistant_delta_to_append(&self.visible_text, &visible);
+        if let Some(delta) = visible_delta.as_deref() {
+            self.visible_text.push_str(delta);
+        }
+        Some((raw_delta, visible_delta))
+    }
+}
+
 fn strip_hidden_assistant_markup(
     text: &str,
     mode: CollaborationModeKind,
@@ -3313,6 +3499,8 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 normalize_provider_messages(&mut messages);
                 let mut assistant_text = String::new();
                 let mut assistant_full_text = String::new();
+                let mut assistant_stream_filter =
+                    HiddenAssistantMarkupStreamFilter::new(options.collaboration_mode);
                 let mut tool_calls = Vec::new();
                 let mut assistant_message_tool_calls = Vec::new();
                 let step_span = telemetry.start_step_span(
@@ -3420,6 +3608,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         }
                     },
                     turn_idx,
+                    options.collaboration_mode,
                     |attempt, event| {
                         streaming_tool_scheduler.borrow_mut().maybe_schedule(
                             store,
@@ -3462,21 +3651,25 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 let mut response_end_turn = None;
                 let mut response_id = None::<String>;
                 let mut response_final_answer_text = None::<String>;
+                let mut response_final_answer_raw_text = None::<String>;
                 let mut response_assistant_text = None::<String>;
+                let mut response_assistant_raw_text = None::<String>;
                 let mut model_verification_emitted = false;
                 for event in provider_turn_result.events {
                     match event {
                         ModelEvent::TextDelta { text } => {
-                            if let Some(delta) =
-                                assistant_delta_to_append(&assistant_full_text, &text)
+                            if let Some((raw_delta, visible_delta)) =
+                                assistant_stream_filter.push_provider_text(&text)
                             {
-                                store.append_event(
-                                    &session.id,
-                                    "model.delta",
-                                    serde_json::json!({ "text": delta }),
-                                )?;
-                                assistant_text.push_str(&delta);
-                                assistant_full_text.push_str(&delta);
+                                assistant_full_text.push_str(&raw_delta);
+                                if let Some(delta) = visible_delta {
+                                    store.append_event(
+                                        &session.id,
+                                        "model.delta",
+                                        serde_json::json!({ "text": delta }),
+                                    )?;
+                                    assistant_text.push_str(&delta);
+                                }
                             }
                         }
                         ModelEvent::ThinkingDelta { .. } => {}
@@ -3505,18 +3698,24 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 provider_turn_result.attempts,
                                 &item,
                             )?;
+                            let response_item_raw_text = response_message_item_text(&item);
+                            let response_item_phase = item.get("phase").and_then(Value::as_str);
                             if let Some(text) = assistant_message_text_from_response_item(
                                 &item,
                                 options.collaboration_mode,
                                 true,
                             ) {
                                 response_final_answer_text = Some(text);
+                                response_final_answer_raw_text = response_item_raw_text.clone();
                             } else if let Some(text) = assistant_message_text_from_response_item(
                                 &item,
                                 options.collaboration_mode,
                                 false,
                             ) {
                                 response_assistant_text = Some(text);
+                                if response_item_phase != Some("final_answer") {
+                                    response_assistant_raw_text = response_item_raw_text.clone();
+                                }
                             }
                             if raw_response_item_survives_live_turn_history(&item) {
                                 push_live_assistant_turn_message(
@@ -3731,6 +3930,10 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         .as_deref()
                         .or(response_assistant_text.as_deref())
                         .unwrap_or(&assistant_full_text);
+                    let assistant_finalization_raw_text = response_final_answer_raw_text
+                        .as_deref()
+                        .or(response_assistant_raw_text.as_deref())
+                        .unwrap_or(&assistant_full_text);
                     let (visible_assistant_text, proposed_plan) =
                         visible_assistant_text_and_proposed_plan(
                             assistant_finalization_text,
@@ -3872,6 +4075,12 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             step_span.set_ok();
                             continue;
                         }
+                        append_memory_citation_events(
+                            store,
+                            &session.id,
+                            "assistant.final",
+                            assistant_finalization_raw_text,
+                        )?;
                         store.append_event(
                             &session.id,
                             "session.done",
@@ -4091,6 +4300,7 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
     provider: &P,
     mut turn: ProviderTurn,
     turn_idx: usize,
+    collaboration_mode: CollaborationModeKind,
     mut on_stream_event: impl FnMut(usize, &ModelEvent) -> Result<()>,
     mut on_stream_attempt_retry: impl FnMut(usize) -> Result<()>,
 ) -> Result<ProviderTurnResult> {
@@ -4108,7 +4318,7 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
     let mut invalid_image_recovered = false;
     loop {
         let mut events = Vec::new();
-        let mut streamed_text = String::new();
+        let mut streamed_text_filter = HiddenAssistantMarkupStreamFilter::new(collaboration_mode);
         let mut streamed_thinking_text = String::new();
         let mut custom_tool_input_buffers = HashMap::<String, String>::new();
         let mut custom_tool_progress_snapshots = HashMap::<String, String>::new();
@@ -4118,16 +4328,19 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
             }
             match &event {
                 ModelEvent::TextDelta { text } => {
-                    if let Some(delta) = assistant_delta_to_append(&streamed_text, text) {
-                        record_model_stream_delta(
-                            store,
-                            session_id,
-                            provider,
-                            turn_idx,
-                            attempt + 1,
-                            &delta,
-                        )?;
-                        streamed_text.push_str(&delta);
+                    if let Some((_raw_delta, visible_delta)) =
+                        streamed_text_filter.push_provider_text(text)
+                    {
+                        if let Some(delta) = visible_delta {
+                            record_model_stream_delta(
+                                store,
+                                session_id,
+                                provider,
+                                turn_idx,
+                                attempt + 1,
+                                &delta,
+                            )?;
+                        }
                     }
                 }
                 ModelEvent::ThinkingDelta { text, label } => {
@@ -8874,21 +9087,43 @@ fn write_hook_transcript_snapshot(
         configured_order,
         hook_id
     ));
-    Some((|| {
-        std::fs::create_dir_all(&dir)?;
-        let events = store.events_for_session(&session.id)?;
-        let artifacts = store.artifacts_for_session(&session.id)?;
-        let payload = serde_json::json!({
-            "session": session,
-            "events": events,
-            "artifacts": artifacts,
-        });
-        std::fs::write(
-            &path,
-            format!("{}\n", serde_json::to_string_pretty(&payload)?),
-        )?;
-        Ok(path)
-    })())
+    Some(write_session_transcript_snapshot(store, session, path))
+}
+
+fn write_session_transcript_snapshot(
+    store: &Store,
+    session: &SessionMeta,
+    path: PathBuf,
+) -> Result<PathBuf> {
+    if let Some(dir) = path.parent() {
+        std::fs::create_dir_all(dir)?;
+    }
+    let events = store.events_for_session(&session.id)?;
+    let artifacts = store.artifacts_for_session(&session.id)?;
+    let payload = serde_json::json!({
+        "session": session,
+        "events": events,
+        "artifacts": artifacts,
+    });
+    std::fs::write(
+        &path,
+        format!("{}\n", serde_json::to_string_pretty(&payload)?),
+    )?;
+    Ok(path)
+}
+
+fn write_subagent_stop_transcript_snapshot(
+    store: &Store,
+    session: &SessionMeta,
+    kind: &str,
+) -> Result<PathBuf> {
+    let dir = store.state_dir().join("hook-transcripts").join(&session.id);
+    let path = dir.join(format!(
+        "SubagentStop-{}-{}.json",
+        kind,
+        uuid::Uuid::new_v4()
+    ));
+    write_session_transcript_snapshot(store, session, path)
 }
 
 fn hook_group_matches(
@@ -18351,6 +18586,7 @@ fn dispatch_done_tool(
         .or_else(|| call.arguments.get("text").and_then(Value::as_str))
         .unwrap_or("")
         .trim();
+    let requested_result_raw = requested_result.to_string();
     let requested_result = strip_memory_citations(requested_result).trim().to_string();
     let requested_result_file = call
         .arguments
@@ -18433,6 +18669,9 @@ fn dispatch_done_tool(
         done_payload["result_file_directory_url"] = Value::String(file_url(&directory));
         done_payload["result_file_bytes"] = Value::from(result_file.bytes);
         done_payload["result_file_mime"] = Value::String(result_file.mime.to_string());
+    }
+    if !result_uses_file {
+        append_memory_citation_events(store, &session.id, "done.result", &requested_result_raw)?;
     }
     store.append_event(&session.id, "session.done", done_payload)?;
     Ok(ToolDispatchOutcome {
@@ -19322,6 +19561,14 @@ fn run_subagent_stop_hooks_for_child(
     let result = payload.get("result").cloned().unwrap_or(Value::Null);
     let failure = payload.get("failure").cloned().unwrap_or(Value::Null);
     let last_assistant_message = result.as_str().map(str::to_string);
+    let agent_transcript_path = write_subagent_stop_transcript_snapshot(store, child, "agent")?
+        .display()
+        .to_string();
+    let parent_transcript_path = store
+        .load_session(parent_id)?
+        .map(|parent| write_subagent_stop_transcript_snapshot(store, &parent, "parent"))
+        .transpose()?
+        .map(|path| path.display().to_string());
     let outcome = run_hooks_for_event(
         store,
         child,
@@ -19340,7 +19587,8 @@ fn run_subagent_stop_hooks_for_child(
             "failure": failure,
             "stop_hook_active": false,
             "last_assistant_message": last_assistant_message,
-            "agent_transcript_path": Value::Null,
+            "agent_transcript_path": agent_transcript_path,
+            "parent_transcript_path": parent_transcript_path,
         }),
     )?;
     for context in outcome.additional_contexts {
@@ -31308,6 +31556,64 @@ name = "Thread"
     }
 
     #[test]
+    fn provider_loop_filters_hidden_markup_during_stream_and_records_memory_citation() -> Result<()>
+    {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::TextDelta {
+                text: "Visible <oai".to_string(),
+            },
+            ModelEvent::TextDelta {
+                text: "-mem-citation>\n<citation_entries>\nmemories/MEMORY.md:1-2|note=[Remembered preference]\n</citation_entries>\n<rollout_ids>\nrollout-a\nrollout-a\nrollout-b\n</rollout_ids>\n</oai-mem-citation>answer".to_string(),
+            },
+            ModelEvent::Done,
+        ]]);
+
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "finish with streamed hidden markup",
+            temp.path(),
+            AgentRunOptions::default(),
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        let stream_text = events
+            .iter()
+            .filter(|event| event.event_type == "model.stream_delta")
+            .filter_map(|event| event.payload.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        let live_delta_text = events
+            .iter()
+            .filter(|event| event.event_type == "model.delta")
+            .filter_map(|event| event.payload.get("text").and_then(Value::as_str))
+            .collect::<String>();
+        assert_eq!(stream_text, "Visible answer");
+        assert_eq!(live_delta_text, "Visible answer");
+        assert!(!stream_text.contains("oai-mem-citation"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "Visible answer"
+        }));
+        let citation = events
+            .iter()
+            .find(|event| event.event_type == "memory.citation")
+            .context("missing memory.citation")?;
+        assert_eq!(citation.payload["source"], "assistant.final");
+        assert_eq!(citation.payload["entries"][0]["path"], "memories/MEMORY.md");
+        assert_eq!(citation.payload["entries"][0]["line_start"], 1);
+        assert_eq!(citation.payload["entries"][0]["line_end"], 2);
+        assert_eq!(
+            citation.payload["entries"][0]["note"],
+            "Remembered preference"
+        );
+        assert_eq!(
+            citation.payload["rollout_ids"],
+            serde_json::json!(["rollout-a", "rollout-b"])
+        );
+        Ok(())
+    }
+
+    #[test]
     fn provider_loop_predispatches_read_only_tool_during_stream() -> Result<()> {
         struct StreamingReadFileProvider {
             state_dir: std::path::PathBuf,
@@ -32038,6 +32344,7 @@ name = "Thread"
                 ..ProviderTurn::default()
             },
             0,
+            CollaborationModeKind::Default,
             |_attempt, _event| Ok(()),
             |_attempt| Ok(()),
         )?;
@@ -33343,6 +33650,22 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
             Some("Researcher"),
             Some("explorer"),
         )?;
+        let stop_hook_script = temp.path().join("subagent_stop_hook.py");
+        std::fs::write(
+            &stop_hook_script,
+            r#"import json
+import os
+import sys
+
+payload = json.load(sys.stdin)
+assert payload.get("agent_transcript_path")
+assert os.path.exists(payload["agent_transcript_path"])
+assert payload.get("parent_transcript_path")
+assert os.path.exists(payload["parent_transcript_path"])
+print("subagent-stop-feedback", file=sys.stderr)
+sys.exit(2)
+"#,
+        )?;
         let hooks = RuntimeHookConfig {
             subagent_start: vec![HookMatcherGroup {
                 matcher: Some("explorer".to_string()),
@@ -33352,9 +33675,10 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
             }],
             subagent_stop: vec![HookMatcherGroup {
                 matcher: Some("^explorer$".to_string()),
-                hooks: vec![test_hook_command_config(
-                    "printf subagent-stop-feedback >&2; exit 2",
-                )],
+                hooks: vec![test_hook_command_config(&format!(
+                    "python3 {}",
+                    stop_hook_script.display()
+                ))],
             }],
             ..RuntimeHookConfig::default()
         };
@@ -34791,7 +35115,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
                 name: "done".to_string(),
                 namespace: None,
                 arguments: serde_json::json!({
-                    "result": "Answer<oai-mem-citation>hidden</oai-mem-citation>."
+                    "result": "Answer<oai-mem-citation><citation_entries>\nmemories/MEMORY.md:4-5|note=[Done note]\n</citation_entries>\n<thread_ids>\nthread-a\nthread-a\nthread-b\n</thread_ids></oai-mem-citation>."
                 }),
             },
         )?;
@@ -34802,6 +35126,16 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             .find(|event| event.event_type == "session.done")
             .context("missing session.done")?;
         assert_eq!(done.payload["result"], "Answer.");
+        let citation = events
+            .iter()
+            .find(|event| event.event_type == "memory.citation")
+            .context("missing memory.citation")?;
+        assert_eq!(citation.payload["source"], "done.result");
+        assert_eq!(citation.payload["entries"][0]["path"], "memories/MEMORY.md");
+        assert_eq!(
+            citation.payload["rollout_ids"],
+            serde_json::json!(["thread-a", "thread-b"])
+        );
         Ok(())
     }
 
