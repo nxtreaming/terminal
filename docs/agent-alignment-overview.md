@@ -75,21 +75,30 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 - Branch: `agent-gap-zero`
 - Gap log: `docs/agent-gap-log.md`
-- Latest local-runtime batch: non-browser runs now use the Codex terminal-agent
-  prompt without the browser-harness overlay, while CLI/browser runs keep the
-  browser contract. CLI compaction can use the active model for a handoff
-  summary with deterministic local fallback, and TUI runs enable the same local
-  compaction path. Command hooks now cover the first non-approval slice for
-  `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-  assistant-text `Stop`, `done`-tool `Stop`, and local `PreCompact` /
-  `PostCompact`; exit-code-2 blocking is represented for the main blocking
-  hooks. Read-only file/image tools can batch through parallel dispatch without
-  unrelated hooks disabling batching; shell-originated file changes now emit a
-  `git_worktree` `turn.diff`; and active-turn prompt/mailbox drains are
-  recorded. Remaining runtime gaps are exact hook handler/matcher parity,
-  SubagentStart/SubagentStop hooks, dynamic MCP/app inventory, websocket
-  ack/fallback, streaming-time tool scheduling, app-server lifecycle/input-queue
-  events, exact turn-diff tracking, and deeper goal budget steering.
+- Latest local-runtime batch: the first active-turn queue slice now notices
+  same-turn follow-ups/mail before finalizing assistant text, pauses stale tool
+  calls when queued input appears, drains that input into model history with
+  prompt-hook processing, and records the phase of each drain/pause. Local
+  deterministic compaction now runs the same `PreCompact` / `PostCompact`
+  command-hook lifecycle as model-assisted compaction. Hook command input uses
+  the active turn id when available and includes child-agent identity/type for
+  subagent hooks. OpenAI-compatible chat and Anthropic providers now use SSE
+  streaming paths for text, thinking, tool-call, usage, and done events, while
+  retaining JSON fallback for non-streaming responses. Read-only tool calls
+  can now be pre-dispatched while the provider stream is still open, and stale
+  preempted tool calls receive model-visible skipped outputs so follow-up turns
+  do not inherit orphaned tool calls. Tool failures now carry an explicit
+  recovery classification and unknown runtime failures default to fatal rather
+  than being fed back to the model. Remaining high-impact runtime gaps are full
+  streaming-time futures for mutating/interactive tools, full dynamic
+  MCP/app/plugin tool inventory, exact `AgentControl`/mailbox semantics,
+  event/item-graph history reconstruction, exact `TurnDiffTracker`, websocket
+  ack/fallback, and deeper local compaction/token lifecycle parity.
+- Latest verification: full Rust/Python/whitespace checks and Codex-auth root
+  plus child smokes passed for this batch. A fallback attempt to run ten broad
+  audits through the local harness was stopped because one child was already at
+  turn 8 with very large context; the hidden platform subagent tool is still the
+  practical route for repeated broad closure audits.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming

@@ -293,6 +293,23 @@ struct ProviderTurnResult {
     attempts: usize,
 }
 
+struct StreamedToolHandle {
+    attempt: usize,
+    call: ToolCall,
+    handle: thread::JoinHandle<Result<ToolDispatchOutcome>>,
+}
+
+struct StreamingToolScheduler {
+    session: SessionMeta,
+    registry: ToolRegistry,
+    tool_output_token_budget: usize,
+    supports_original_image_detail: bool,
+    active_queue_last_session_message_seq: i64,
+    state_dir: PathBuf,
+    notifier: Option<browser_use_store::StoreNotifier>,
+    handles: HashMap<String, StreamedToolHandle>,
+}
+
 pub struct FakeAgentOptions<'a> {
     pub python_code: Option<&'a str>,
 }
@@ -3240,11 +3257,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 latest_session_message_seq(store, &session.id)?;
             for turn_idx in 0..options.max_turns {
                 ensure_not_cancelled(store, &session.id)?;
-                append_new_external_session_messages(
+                append_new_external_session_messages_with_phase(
                     store,
                     &session.id,
                     &mut messages,
                     &mut last_external_session_message_seq,
+                    "turn_start",
+                    Some(turn_idx),
                 )?;
                 let prompt_hook_outcome = run_user_prompt_submit_hooks_since(
                     store,
@@ -3311,6 +3330,28 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     provider.model_name(),
                     provider.supports_namespace_tools(),
                 )?;
+                let streaming_tool_registry = browser_tool_registry_for_session(
+                    &session,
+                    &options,
+                    provider.model_name(),
+                    provider.supports_namespace_tools(),
+                )?;
+                let streaming_supports_original_image_detail =
+                    resolved_model_request_info_for_session(
+                        &session,
+                        &options,
+                        provider.model_name(),
+                    )?
+                    .supports_image_detail_original;
+                let streaming_tool_scheduler =
+                    std::cell::RefCell::new(StreamingToolScheduler::new(
+                        store,
+                        &session,
+                        streaming_tool_registry,
+                        model_request_info.tool_output_token_budget(),
+                        streaming_supports_original_image_detail,
+                        last_external_session_message_seq,
+                    ));
                 let turn_hosted_tools = hosted_tool_specs_for_session(
                     &session,
                     &options,
@@ -3327,7 +3368,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     messages: &turn_messages,
                     tools: &turn_tools,
                 });
-                let provider_turn_result = match start_provider_turn_with_retries(
+                let provider_turn_result = start_provider_turn_with_retries(
                     store,
                     &session.id,
                     provider,
@@ -3380,7 +3421,24 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         }
                     },
                     turn_idx,
-                ) {
+                    |attempt, event| {
+                        streaming_tool_scheduler.borrow_mut().maybe_schedule(
+                            store,
+                            &runtime_hooks,
+                            attempt,
+                            event,
+                        )
+                    },
+                    |attempt| {
+                        streaming_tool_scheduler.borrow_mut().discard_attempt(
+                            store,
+                            attempt,
+                            "stream_retry",
+                        )
+                    },
+                );
+                let mut streaming_tool_scheduler = streaming_tool_scheduler.into_inner();
+                let provider_turn_result = match provider_turn_result {
                     Ok(result) => {
                         telemetry.record_model_events(
                             &model_span,
@@ -3391,6 +3449,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         result
                     }
                     Err(error) => {
+                        let _ = streaming_tool_scheduler.discard_all(store, "stream_failed");
                         model_span.record_error(error.as_ref());
                         step_span.record_error(error.as_ref());
                         return Err(error);
@@ -3473,11 +3532,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             }
                         }
                         ModelEvent::ToolCall { call } => {
-                            store.append_event(
-                                &session.id,
-                                "model.tool_call",
-                                serde_json::to_value(&call)?,
-                            )?;
+                            if !streaming_tool_scheduler.is_scheduled(&call.id) {
+                                store.append_event(
+                                    &session.id,
+                                    "model.tool_call",
+                                    serde_json::to_value(&call)?,
+                                )?;
+                            }
                             assistant_message_tool_calls.push(call.clone());
                             tool_calls.push(call);
                         }
@@ -3637,6 +3698,36 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 )?;
 
                 if tool_calls.is_empty() {
+                    let active_queue_drain = drain_active_turn_queue_into_messages(
+                        store,
+                        &session,
+                        &mut messages,
+                        &mut last_external_session_message_seq,
+                        &mut last_user_prompt_hook_seq,
+                        &runtime_hooks,
+                        provider.model_name(),
+                        "before_finalization",
+                        turn_idx,
+                    )?;
+                    if !active_queue_drain.is_empty() {
+                        maybe_compact_messages_with_model(
+                            store,
+                            &session,
+                            provider,
+                            &mut messages,
+                            compaction_max_context_chars,
+                            turn_instructions.as_deref(),
+                            &model_settings,
+                            &model_request_info,
+                            model_context_window,
+                            Some(turn_idx),
+                            compact_prompt.as_deref(),
+                            &options,
+                            &runtime_hooks,
+                        )?;
+                        step_span.set_ok();
+                        continue;
+                    }
                     let assistant_finalization_text = response_final_answer_text
                         .as_deref()
                         .or(response_assistant_text.as_deref())
@@ -3826,7 +3917,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 }
 
                 let turn_diff_before = git_worktree_snapshot(&session.cwd);
-                let dispatched_outcomes = dispatch_tool_calls_for_turn(
+                let dispatched_outcomes = dispatch_tool_calls_for_turn_with_streaming(
                     store,
                     provider,
                     &session,
@@ -3839,6 +3930,8 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &telemetry,
                     &step_span,
                     turn_idx,
+                    last_external_session_message_seq,
+                    &mut streaming_tool_scheduler,
                 )?;
                 append_turn_git_diff_if_changed(
                     store,
@@ -3846,7 +3939,9 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     turn_diff_before.as_ref(),
                     turn_idx,
                 )?;
+                let mut finished_after_tools = false;
                 for outcome in dispatched_outcomes {
+                    finished_after_tools |= outcome.finished;
                     messages.extend(outcome.messages);
                     maybe_compact_messages_with_model(
                         store,
@@ -3863,10 +3958,40 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         &options,
                         &runtime_hooks,
                     )?;
-                    if outcome.finished {
-                        step_span.set_ok();
-                        return Ok(session.id.clone());
-                    }
+                }
+                if finished_after_tools {
+                    step_span.set_ok();
+                    return Ok(session.id.clone());
+                }
+                let active_queue_drain = drain_active_turn_queue_into_messages(
+                    store,
+                    &session,
+                    &mut messages,
+                    &mut last_external_session_message_seq,
+                    &mut last_user_prompt_hook_seq,
+                    &runtime_hooks,
+                    provider.model_name(),
+                    "after_tool_outputs",
+                    turn_idx,
+                )?;
+                if !active_queue_drain.is_empty() {
+                    maybe_compact_messages_with_model(
+                        store,
+                        &session,
+                        provider,
+                        &mut messages,
+                        compaction_max_context_chars,
+                        turn_instructions.as_deref(),
+                        &model_settings,
+                        &model_request_info,
+                        model_context_window,
+                        Some(turn_idx),
+                        compact_prompt.as_deref(),
+                        &options,
+                        &runtime_hooks,
+                    )?;
+                    step_span.set_ok();
+                    continue;
                 }
                 step_span.set_ok();
             }
@@ -3967,6 +4092,8 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
     provider: &P,
     mut turn: ProviderTurn,
     turn_idx: usize,
+    mut on_stream_event: impl FnMut(usize, &ModelEvent) -> Result<()>,
+    mut on_stream_attempt_retry: impl FnMut(usize) -> Result<()>,
 ) -> Result<ProviderTurnResult> {
     if turn.turn_state.is_none() {
         turn.turn_state = Some(Arc::new(std::sync::Mutex::new(None)));
@@ -4055,6 +4182,7 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                 | ModelEvent::ServerReasoningIncluded { .. }
                 | ModelEvent::Done => {}
             }
+            on_stream_event(attempt + 1, &event)?;
             events.push(event);
             Ok(())
         }) {
@@ -4129,6 +4257,7 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                 if !will_retry {
                     return Err(error);
                 }
+                on_stream_attempt_retry(attempt + 1)?;
                 attempt += 1;
                 let delay = requested_delay.unwrap_or_else(|| provider_retry_delay(attempt));
                 store.append_event(
@@ -4706,6 +4835,7 @@ fn maybe_compact_messages(
     )
 }
 
+#[cfg(test)]
 fn maybe_compact_messages_with_context(
     store: &Store,
     session_id: &str,
@@ -4759,16 +4889,59 @@ fn maybe_compact_messages_with_model<P: ModelProvider>(
 ) -> Result<()> {
     let session_id = &session.id;
     if !options.model_compaction_enabled {
-        return maybe_compact_messages_with_context(
+        if max_context_chars == 0 {
+            return Ok(());
+        }
+        let max_context_tokens = approx_token_count_from_chars(max_context_chars);
+        let before_chars = estimated_context_chars(messages)?;
+        let before_tokens =
+            estimated_context_tokens_with_instructions(messages, base_instructions)?;
+        if before_tokens <= max_context_tokens {
+            return Ok(());
+        }
+        let pre_compact =
+            run_pre_compact_hooks(store, session, runtime_hooks, provider.model_name(), "auto")?;
+        if let Some(reason) = pre_compact.block_reason.or(pre_compact.stop_reason) {
+            store.append_event(
+                session_id,
+                "session.compaction_skipped",
+                serde_json::json!({
+                    "reason": "pre_compact_hook_stopped",
+                    "hook_reason": reason,
+                }),
+            )?;
+            return Ok(());
+        }
+        compact_messages(
             store,
-            &session.id,
+            session_id,
             messages,
             max_context_chars,
+            max_context_tokens,
+            before_chars,
+            before_tokens,
             base_instructions,
             model_context_window,
             turn_idx,
             compact_prompt,
-        );
+            "estimated_budget_exceeded",
+        )?;
+        let post_compact =
+            run_post_compact_hooks(store, session, runtime_hooks, provider.model_name(), "auto")?;
+        for context in post_compact.additional_contexts {
+            messages.push(hook_context_message(HookEventName::PostCompact, &context));
+        }
+        if let Some(reason) = post_compact.block_reason.or(post_compact.stop_reason) {
+            store.append_event(
+                session_id,
+                "hook.blocked",
+                serde_json::json!({
+                    "hook_event_name": HookEventName::PostCompact.as_str(),
+                    "reason": reason,
+                }),
+            )?;
+        }
+        return Ok(());
     }
     if max_context_chars == 0 {
         return Ok(());
@@ -7304,12 +7477,27 @@ fn current_turn_user_message_seq(events: &[EventRecord]) -> Option<i64> {
         .max()
 }
 
-fn append_new_external_session_messages(
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ActiveTurnQueueDrain {
+    session_messages: usize,
+    mailbox_messages: usize,
+    last_seq: i64,
+}
+
+impl ActiveTurnQueueDrain {
+    fn is_empty(self) -> bool {
+        self.session_messages == 0 && self.mailbox_messages == 0
+    }
+}
+
+fn append_new_external_session_messages_with_phase(
     store: &Store,
     session_id: &str,
     messages: &mut Vec<Value>,
     last_seq: &mut i64,
-) -> Result<()> {
+    phase: &str,
+    turn_idx: Option<usize>,
+) -> Result<ActiveTurnQueueDrain> {
     let mut appended_user_events = 0_usize;
     let mut events = store
         .events_for_session(session_id)?
@@ -7361,12 +7549,272 @@ fn append_new_external_session_messages(
             session_id,
             "agent.turn_queue_drained",
             serde_json::json!({
+                "phase": phase,
+                "turn_idx": turn_idx,
                 "session_messages": appended_user_events,
                 "mailbox_messages": appended_mail,
                 "last_seq": *last_seq,
             }),
         )?;
     }
+    Ok(ActiveTurnQueueDrain {
+        session_messages: appended_user_events,
+        mailbox_messages: appended_mail,
+        last_seq: *last_seq,
+    })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn drain_active_turn_queue_into_messages(
+    store: &Store,
+    session: &SessionMeta,
+    messages: &mut Vec<Value>,
+    last_external_session_message_seq: &mut i64,
+    last_user_prompt_hook_seq: &mut i64,
+    runtime_hooks: &RuntimeHookConfig,
+    model: &str,
+    phase: &str,
+    turn_idx: usize,
+) -> Result<ActiveTurnQueueDrain> {
+    let drain = append_new_external_session_messages_with_phase(
+        store,
+        &session.id,
+        messages,
+        last_external_session_message_seq,
+        phase,
+        Some(turn_idx),
+    )?;
+    if drain.is_empty() {
+        return Ok(drain);
+    }
+    store.append_event(
+        &session.id,
+        "model.response.continued",
+        serde_json::json!({
+            "turn_idx": turn_idx,
+            "reason": "active_turn_queue_drained",
+            "phase": phase,
+            "session_messages": drain.session_messages,
+            "mailbox_messages": drain.mailbox_messages,
+        }),
+    )?;
+    let prompt_hook_outcome = run_user_prompt_submit_hooks_since(
+        store,
+        session,
+        runtime_hooks,
+        model,
+        last_user_prompt_hook_seq,
+    )?;
+    for context in prompt_hook_outcome.additional_contexts {
+        messages.push(hook_context_message(
+            HookEventName::UserPromptSubmit,
+            &context,
+        ));
+    }
+    if let Some(reason) = prompt_hook_outcome
+        .block_reason
+        .or(prompt_hook_outcome.stop_reason)
+    {
+        store.append_event(
+            &session.id,
+            "model.response.continued",
+            serde_json::json!({
+                "turn_idx": turn_idx,
+                "reason": "active_turn_queue_prompt_hook_blocked",
+                "phase": phase,
+            }),
+        )?;
+        messages.push(hook_context_message(
+            HookEventName::UserPromptSubmit,
+            &format!("UserPromptSubmit hook blocked prompt: {reason}"),
+        ));
+    }
+    Ok(drain)
+}
+
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+struct ActiveTurnQueuePending {
+    session_messages: usize,
+    mailbox_messages: usize,
+}
+
+impl ActiveTurnQueuePending {
+    fn is_empty(self) -> bool {
+        self.session_messages == 0 && self.mailbox_messages == 0
+    }
+}
+
+fn active_turn_pending_queue_input(
+    store: &Store,
+    session_id: &str,
+    last_external_session_message_seq: i64,
+) -> Result<ActiveTurnQueuePending> {
+    let session_messages = store
+        .events_for_session(session_id)?
+        .into_iter()
+        .filter(|event| {
+            event.seq > last_external_session_message_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+        })
+        .count();
+    let mailbox_messages = store.messages_for_agent(session_id)?.len();
+    Ok(ActiveTurnQueuePending {
+        session_messages,
+        mailbox_messages,
+    })
+}
+
+impl StreamingToolScheduler {
+    fn new(
+        store: &Store,
+        session: &SessionMeta,
+        registry: ToolRegistry,
+        tool_output_token_budget: usize,
+        supports_original_image_detail: bool,
+        active_queue_last_session_message_seq: i64,
+    ) -> Self {
+        Self {
+            session: session.clone(),
+            registry,
+            tool_output_token_budget,
+            supports_original_image_detail,
+            active_queue_last_session_message_seq,
+            state_dir: store.state_dir().to_path_buf(),
+            notifier: store.notifier(),
+            handles: HashMap::new(),
+        }
+    }
+
+    fn is_scheduled(&self, call_id: &str) -> bool {
+        self.handles.contains_key(call_id)
+    }
+
+    fn maybe_schedule(
+        &mut self,
+        store: &Store,
+        runtime_hooks: &RuntimeHookConfig,
+        attempt: usize,
+        event: &ModelEvent,
+    ) -> Result<()> {
+        let ModelEvent::ToolCall { call } = event else {
+            return Ok(());
+        };
+        if self.handles.contains_key(&call.id) {
+            return Ok(());
+        }
+        if active_turn_pending_queue_input(
+            store,
+            &self.session.id,
+            self.active_queue_last_session_message_seq,
+        )?
+        .is_empty()
+            && tool_call_supports_streaming_predispatch(&self.registry, call)
+            && !tool_call_has_matching_hooks(runtime_hooks, call)
+        {
+            let state_dir = self.state_dir.clone();
+            let notifier = self.notifier.clone();
+            let session = self.session.clone();
+            let registry = self.registry.clone();
+            let tool_output_token_budget = self.tool_output_token_budget;
+            let supports_original_image_detail = self.supports_original_image_detail;
+            let dispatched_call = call.clone();
+            store.append_event(
+                &self.session.id,
+                "model.tool_call",
+                serde_json::to_value(call)?,
+            )?;
+            store.append_event(
+                &self.session.id,
+                "tool.streaming_started",
+                serde_json::json!({
+                    "turn_attempt": attempt,
+                    "tool_call_id": call.id,
+                    "name": call.name,
+                    "mode": "read_only_predispatch",
+                }),
+            )?;
+            let handle = thread::spawn(move || {
+                let store = Store::open_with_optional_notifier(state_dir, notifier)?;
+                dispatch_parallel_tool_call_recoverably(
+                    &store,
+                    &session,
+                    &registry,
+                    &dispatched_call,
+                    tool_output_token_budget,
+                    supports_original_image_detail,
+                )
+            });
+            self.handles.insert(
+                call.id.clone(),
+                StreamedToolHandle {
+                    attempt,
+                    call: call.clone(),
+                    handle,
+                },
+            );
+        }
+        Ok(())
+    }
+
+    fn discard_attempt(&mut self, store: &Store, attempt: usize, reason: &str) -> Result<()> {
+        let discarded_call_ids = self
+            .handles
+            .iter()
+            .filter_map(|(call_id, handle)| (handle.attempt == attempt).then(|| call_id.clone()))
+            .collect::<Vec<_>>();
+        for call_id in discarded_call_ids {
+            if let Some(handle) = self.handles.remove(&call_id) {
+                join_streamed_tool_handle(handle, store, &self.session, reason)?;
+            }
+        }
+        Ok(())
+    }
+
+    fn discard_all(&mut self, store: &Store, reason: &str) -> Result<()> {
+        let handles = std::mem::take(&mut self.handles);
+        for (_, handle) in handles {
+            join_streamed_tool_handle(handle, store, &self.session, reason)?;
+        }
+        Ok(())
+    }
+
+    fn take(&mut self, call_id: &str) -> Option<StreamedToolHandle> {
+        self.handles.remove(call_id)
+    }
+}
+
+fn join_streamed_tool_handle(
+    handle: StreamedToolHandle,
+    store: &Store,
+    session: &SessionMeta,
+    reason: &str,
+) -> Result<()> {
+    let join_result = handle.handle.join();
+    let discarded = match join_result {
+        Ok(Ok(_)) => serde_json::json!({ "status": "completed" }),
+        Ok(Err(error)) => serde_json::json!({
+            "status": "failed",
+            "error": format!("{error:#}"),
+        }),
+        Err(payload) => serde_json::json!({
+            "status": "panicked",
+            "error": panic_payload_text(payload),
+        }),
+    };
+    store.append_event(
+        &session.id,
+        "tool.streaming_discarded",
+        serde_json::json!({
+            "turn_attempt": handle.attempt,
+            "tool_call_id": handle.call.id,
+            "name": handle.call.name,
+            "reason": reason,
+            "result": discarded,
+        }),
+    )?;
     Ok(())
 }
 
@@ -7550,6 +7998,7 @@ fn run_pre_tool_use_hooks(
     model: &str,
     call: &ToolCall,
     tool_output_token_budget: usize,
+    turn_idx: usize,
 ) -> Result<Option<PreToolUseHookDecision>> {
     let outcome = run_hooks_for_event(
         store,
@@ -7560,7 +8009,7 @@ fn run_pre_tool_use_hooks(
         None,
         Some(&call.arguments),
         model,
-        serde_json::json!({}),
+        serde_json::json!({ "turn_idx": turn_idx }),
     )?;
     if outcome.updated_input.is_none()
         && outcome.additional_contexts.is_empty()
@@ -7611,6 +8060,7 @@ fn run_post_tool_use_hooks(
     model: &str,
     call: &ToolCall,
     tool_output: &[Value],
+    turn_idx: usize,
 ) -> Result<PostToolUseHookResult> {
     let outcome = run_hooks_for_event(
         store,
@@ -7622,6 +8072,7 @@ fn run_post_tool_use_hooks(
         None,
         model,
         serde_json::json!({
+            "turn_idx": turn_idx,
             "tool_output": tool_output,
             "tool_response": tool_output,
         }),
@@ -7816,7 +8267,7 @@ fn run_command_hook(
     } else {
         hook.command.clone()
     };
-    let hook_input = hook_command_input(session, event, call, tool_input, model, extra);
+    let hook_input = hook_command_input(store, session, event, call, tool_input, model, extra);
     let hook_id = store
         .append_event(
             &session.id,
@@ -7887,6 +8338,7 @@ fn run_command_hook(
 }
 
 fn hook_command_input(
+    store: &Store,
     session: &SessionMeta,
     event: HookEventName,
     call: Option<&ToolCall>,
@@ -7894,11 +8346,28 @@ fn hook_command_input(
     model: &str,
     extra: Value,
 ) -> Value {
+    let events = store.events_for_session(&session.id).unwrap_or_default();
+    let turn_id = active_request_user_input_turn_id(&events, &session.id);
+    let (agent_id, agent_type) = if session.parent_id.is_some() {
+        store
+            .agent_summary_for_child(&session.id)
+            .ok()
+            .flatten()
+            .map(|summary| {
+                (
+                    Value::String(session.id.clone()),
+                    summary.agent_role.map(Value::String).unwrap_or(Value::Null),
+                )
+            })
+            .unwrap_or_else(|| (Value::String(session.id.clone()), Value::Null))
+    } else {
+        (Value::Null, Value::Null)
+    };
     let mut input = serde_json::json!({
         "session_id": session.id,
-        "turn_id": session.id,
-        "agent_id": Value::Null,
-        "agent_type": Value::Null,
+        "turn_id": turn_id,
+        "agent_id": agent_id,
+        "agent_type": agent_type,
         "transcript_path": Value::Null,
         "cwd": session.cwd.as_str(),
         "hook_event_name": event.as_str(),
@@ -10160,6 +10629,157 @@ fn raw_response_item_survives_live_turn_history(item: &Value) -> bool {
 }
 
 #[allow(clippy::too_many_arguments)]
+fn dispatch_tool_calls_for_turn_with_streaming<P: ModelProvider>(
+    store: &Store,
+    provider: &P,
+    session: &browser_use_protocol::SessionMeta,
+    worker: &mut PythonWorker,
+    tool_calls: Vec<ToolCall>,
+    options: &AgentRunOptions,
+    base_instructions: &Option<String>,
+    runtime_hooks: &RuntimeHookConfig,
+    tool_output_token_budget: usize,
+    telemetry: &AgentTelemetry,
+    step_span: &telemetry::ActiveSpan,
+    turn_idx: usize,
+    active_queue_last_session_message_seq: i64,
+    streaming_tool_scheduler: &mut StreamingToolScheduler,
+) -> Result<Vec<ToolDispatchOutcome>> {
+    let mut outcomes = Vec::new();
+    let mut buffered_calls = Vec::new();
+    let mut index = 0;
+    while index < tool_calls.len() {
+        let call = tool_calls[index].clone();
+        if streaming_tool_scheduler.is_scheduled(&call.id) {
+            if !buffered_calls.is_empty() {
+                outcomes.extend(dispatch_tool_calls_for_turn(
+                    store,
+                    provider,
+                    session,
+                    worker,
+                    std::mem::take(&mut buffered_calls),
+                    options,
+                    base_instructions,
+                    runtime_hooks,
+                    tool_output_token_budget,
+                    telemetry,
+                    step_span,
+                    turn_idx,
+                    active_queue_last_session_message_seq,
+                )?);
+                if outcomes.iter().any(|outcome| outcome.finished)
+                    || !active_turn_pending_queue_input(
+                        store,
+                        &session.id,
+                        active_queue_last_session_message_seq,
+                    )?
+                    .is_empty()
+                {
+                    streaming_tool_scheduler.discard_all(store, "active_turn_queue_pause")?;
+                    outcomes.extend(skipped_tool_call_outputs_for_remaining(
+                        store,
+                        session,
+                        &tool_calls[index..],
+                        "active_turn_queue_pending",
+                        tool_output_token_budget,
+                    )?);
+                    return Ok(outcomes);
+                }
+            }
+            if !active_turn_pending_queue_input(
+                store,
+                &session.id,
+                active_queue_last_session_message_seq,
+            )?
+            .is_empty()
+            {
+                streaming_tool_scheduler.discard_all(store, "active_turn_queue_pause")?;
+                store.append_event(
+                    &session.id,
+                    "agent.turn_queue_pause",
+                    serde_json::json!({
+                        "turn_idx": turn_idx,
+                        "phase": "before_streaming_tool_result",
+                        "remaining_tool_calls": tool_calls.len().saturating_sub(index),
+                    }),
+                )?;
+                outcomes.extend(skipped_tool_call_outputs_for_remaining(
+                    store,
+                    session,
+                    &tool_calls[index..],
+                    "active_turn_queue_pending",
+                    tool_output_token_budget,
+                )?);
+                return Ok(outcomes);
+            }
+            if let Some(handle) = streaming_tool_scheduler.take(&call.id) {
+                let tool_span = telemetry.start_tool_span(step_span, &session.id, turn_idx, &call);
+                let outcome = match handle.handle.join() {
+                    Ok(result) => match result {
+                        Ok(outcome) => {
+                            record_tool_success(telemetry, &tool_span, &outcome);
+                            outcome
+                        }
+                        Err(error) => {
+                            tool_span.record_error(error.as_ref());
+                            return Err(error);
+                        }
+                    },
+                    Err(payload) => {
+                        let error = anyhow!(
+                            "streaming tool task panicked: {}",
+                            panic_payload_text(payload)
+                        );
+                        tool_span.record_error(error.as_ref());
+                        return Err(error);
+                    }
+                };
+                drop(tool_span);
+                store.append_event(
+                    &session.id,
+                    "tool.streaming_result",
+                    serde_json::json!({
+                        "turn_attempt": handle.attempt,
+                        "tool_call_id": call.id,
+                        "name": call.name,
+                        "message_count": outcome.messages.len(),
+                    }),
+                )?;
+                let finished = outcome.finished;
+                outcomes.push(outcome);
+                if finished {
+                    streaming_tool_scheduler.discard_all(store, "session_finished")?;
+                    break;
+                }
+            }
+            index += 1;
+        } else {
+            buffered_calls.push(call);
+            index += 1;
+        }
+    }
+    if !buffered_calls.is_empty() && !outcomes.iter().any(|outcome| outcome.finished) {
+        outcomes.extend(dispatch_tool_calls_for_turn(
+            store,
+            provider,
+            session,
+            worker,
+            buffered_calls,
+            options,
+            base_instructions,
+            runtime_hooks,
+            tool_output_token_budget,
+            telemetry,
+            step_span,
+            turn_idx,
+            active_queue_last_session_message_seq,
+        )?);
+    }
+    streaming_tool_scheduler.discard_all(store, "not_used_by_final_response")?;
+    Ok(outcomes)
+}
+
+#[allow(clippy::too_many_arguments)]
 fn dispatch_tool_calls_for_turn<P: ModelProvider>(
     store: &Store,
     provider: &P,
@@ -10173,6 +10793,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
+    active_queue_last_session_message_seq: i64,
 ) -> Result<Vec<ToolDispatchOutcome>> {
     let registry = browser_tool_registry_for_session(
         session,
@@ -10187,6 +10808,32 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
     let mut index = 0;
     while index < tool_calls.len() {
         ensure_not_cancelled(store, &session.id)?;
+        let pending = active_turn_pending_queue_input(
+            store,
+            &session.id,
+            active_queue_last_session_message_seq,
+        )?;
+        if !pending.is_empty() {
+            store.append_event(
+                &session.id,
+                "agent.turn_queue_pause",
+                serde_json::json!({
+                    "turn_idx": turn_idx,
+                    "phase": "before_tool_call",
+                    "session_messages": pending.session_messages,
+                    "mailbox_messages": pending.mailbox_messages,
+                    "remaining_tool_calls": tool_calls.len().saturating_sub(index),
+                }),
+            )?;
+            outcomes.extend(skipped_tool_call_outputs_for_remaining(
+                store,
+                session,
+                &tool_calls[index..],
+                "active_turn_queue_pending",
+                tool_output_token_budget,
+            )?);
+            break;
+        }
         if tool_call_supports_parallel(&registry, &tool_calls[index])
             && !tool_call_has_matching_hooks(runtime_hooks, &tool_calls[index])
         {
@@ -10210,6 +10857,32 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
                 tool_output_token_budget,
                 supports_original_image_detail,
             )?);
+            let pending = active_turn_pending_queue_input(
+                store,
+                &session.id,
+                active_queue_last_session_message_seq,
+            )?;
+            if !pending.is_empty() {
+                store.append_event(
+                    &session.id,
+                    "agent.turn_queue_pause",
+                    serde_json::json!({
+                        "turn_idx": turn_idx,
+                        "phase": "after_parallel_tool_batch",
+                        "session_messages": pending.session_messages,
+                        "mailbox_messages": pending.mailbox_messages,
+                        "remaining_tool_calls": tool_calls.len().saturating_sub(index),
+                    }),
+                )?;
+                outcomes.extend(skipped_tool_call_outputs_for_remaining(
+                    store,
+                    session,
+                    &tool_calls[index..],
+                    "active_turn_queue_pending",
+                    tool_output_token_budget,
+                )?);
+                break;
+            }
             continue;
         }
 
@@ -10232,6 +10905,33 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
         let finished = outcome.finished;
         outcomes.push(outcome);
         if finished {
+            break;
+        }
+        let pending = active_turn_pending_queue_input(
+            store,
+            &session.id,
+            active_queue_last_session_message_seq,
+        )?;
+        if !pending.is_empty() {
+            store.append_event(
+                &session.id,
+                "agent.turn_queue_pause",
+                serde_json::json!({
+                    "turn_idx": turn_idx,
+                    "phase": "after_tool_call",
+                    "after_tool_call_id": call.id,
+                    "session_messages": pending.session_messages,
+                    "mailbox_messages": pending.mailbox_messages,
+                    "remaining_tool_calls": tool_calls.len().saturating_sub(index),
+                }),
+            )?;
+            outcomes.extend(skipped_tool_call_outputs_for_remaining(
+                store,
+                session,
+                &tool_calls[index..],
+                "active_turn_queue_pending",
+                tool_output_token_budget,
+            )?);
             break;
         }
     }
@@ -10358,6 +11058,53 @@ fn dispatch_parallel_tool_batch(
     Ok(outcomes)
 }
 
+fn skipped_tool_call_outputs_for_remaining(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    calls: &[ToolCall],
+    reason: &str,
+    tool_output_token_budget: usize,
+) -> Result<Vec<ToolDispatchOutcome>> {
+    calls
+        .iter()
+        .map(|call| {
+            skipped_tool_call_output(store, session, call, reason, tool_output_token_budget)
+        })
+        .collect()
+}
+
+fn skipped_tool_call_output(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    reason: &str,
+    tool_output_token_budget: usize,
+) -> Result<ToolDispatchOutcome> {
+    store.append_event(
+        &session.id,
+        "tool.skipped",
+        serde_json::json!({
+            "name": call.name,
+            "tool_call_id": call.id,
+            "reason": reason,
+        }),
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_text_message(
+            store,
+            session,
+            call,
+            &call.name,
+            &format!(
+                "{} skipped: newer input arrived during this turn; reconsider the latest user or subagent message before retrying.",
+                call.name
+            ),
+            tool_output_token_budget,
+        )?],
+    })
+}
+
 #[allow(clippy::too_many_arguments)]
 fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
     store: &Store,
@@ -10383,6 +11130,7 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
         provider.model_name(),
         &effective_call,
         tool_output_token_budget,
+        turn_idx,
     )? {
         match decision {
             PreToolUseHookDecision::Continue {
@@ -10433,6 +11181,7 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
         provider.model_name(),
         &effective_call,
         &outcome.messages,
+        turn_idx,
     )?;
     if let Some(replacement_text) = post_hook_result.replacement_text {
         outcome.messages = vec![tool_text_message(
@@ -10524,10 +11273,13 @@ fn dispatch_tool_call_recoverably<P: ModelProvider>(
         tool_output_token_budget,
     ) {
         Ok(outcome) => Ok(outcome),
-        Err(error) if tool_error_is_recoverable(&error) => {
-            dispatch_recovered_tool_error(store, session, call, error)
+        Err(error) => {
+            if let Some(recovery_reason) = tool_error_recovery_reason(&error) {
+                dispatch_recovered_tool_error(store, session, call, error, recovery_reason)
+            } else {
+                Err(error)
+            }
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -10548,10 +11300,13 @@ fn dispatch_parallel_tool_call_recoverably(
         supports_original_image_detail,
     ) {
         Ok(outcome) => Ok(outcome),
-        Err(error) if tool_error_is_recoverable(&error) => {
-            dispatch_recovered_tool_error(store, session, call, error)
+        Err(error) => {
+            if let Some(recovery_reason) = tool_error_recovery_reason(&error) {
+                dispatch_recovered_tool_error(store, session, call, error, recovery_reason)
+            } else {
+                Err(error)
+            }
         }
-        Err(error) => Err(error),
     }
 }
 
@@ -10560,6 +11315,7 @@ fn dispatch_recovered_tool_error(
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
     error: anyhow::Error,
+    recovery_reason: &'static str,
 ) -> Result<ToolDispatchOutcome> {
     let error = format!("{error:#}");
     store.append_event(
@@ -10570,6 +11326,7 @@ fn dispatch_recovered_tool_error(
             "tool_call_id": call.id,
             "error": error,
             "recovered": true,
+            "recovery_reason": recovery_reason,
         }),
     )?;
     Ok(ToolDispatchOutcome {
@@ -10585,8 +11342,44 @@ fn dispatch_recovered_tool_error(
     })
 }
 
-fn tool_error_is_recoverable(error: &anyhow::Error) -> bool {
-    !format!("{error:#}").contains("agent cancelled")
+fn tool_error_recovery_reason(error: &anyhow::Error) -> Option<&'static str> {
+    let text = format!("{error:#}");
+    let lower = text.to_ascii_lowercase();
+    if lower.contains("agent cancelled")
+        || lower.contains("parallel tool task panicked")
+        || lower.contains("database is locked")
+        || lower.contains("sqlite")
+        || lower.contains("schema_migrations")
+        || lower.contains("open state.db")
+        || lower.contains("create state dir")
+        || lower.contains("create artifact dir")
+    {
+        return None;
+    }
+    if lower.contains("requires ")
+        || lower.contains(" must ")
+        || lower.contains("invalid ")
+        || lower.contains("unknown ")
+        || lower.contains("not supported")
+        || lower.contains("not allowed")
+        || lower.contains("blocked")
+        || lower.contains("rejected")
+        || lower.contains("no such file")
+        || lower.contains("not found")
+        || lower.contains("does not exist")
+        || lower.contains("permission denied")
+        || lower.contains("is a directory")
+        || lower.contains("not a directory")
+        || lower.contains("failed to find context")
+        || lower.contains("no files were modified")
+        || lower.contains("timed out")
+        || lower.contains("stdin is closed")
+        || lower.contains("unknown command session id")
+        || lower.contains("command session belongs to another task")
+    {
+        return Some("model_visible_tool_error");
+    }
+    None
 }
 
 fn dispatch_parallel_tool_call(
@@ -10674,6 +11467,32 @@ fn tool_call_supports_parallel(registry: &ToolRegistry, call: &ToolCall) -> bool
         ) => true,
         _ => false,
     }
+}
+
+fn tool_call_supports_streaming_predispatch(registry: &ToolRegistry, call: &ToolCall) -> bool {
+    let handler = registry
+        .direct_handler_for_namespaced(call.namespace.as_deref(), &call.name)
+        .or_else(|| {
+            (call.namespace.is_none() && call.name == "tool_search")
+                .then(|| registry.handler_for_namespaced(None, "tool_search"))
+                .flatten()
+        })
+        .or_else(|| {
+            call.namespace
+                .is_none()
+                .then(|| hidden_legacy_file_tool_handler(&call.name))
+                .flatten()
+        });
+    matches!(
+        handler,
+        Some(
+            ToolHandlerKind::ReadFile
+                | ToolHandlerKind::SearchFiles
+                | ToolHandlerKind::ListFiles
+                | ToolHandlerKind::ViewImage
+                | ToolHandlerKind::ToolSearch
+        )
+    )
 }
 
 fn panic_payload_text(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
@@ -29421,6 +30240,136 @@ name = "Thread"
     }
 
     #[test]
+    fn provider_loop_predispatches_read_only_tool_during_stream() -> Result<()> {
+        struct StreamingReadFileProvider {
+            state_dir: std::path::PathBuf,
+            session_id: String,
+            attempts: std::sync::Mutex<usize>,
+        }
+
+        impl ModelProvider for StreamingReadFileProvider {
+            fn provider_name(&self) -> &str {
+                "streaming-read-file"
+            }
+
+            fn model_name(&self) -> &str {
+                "streaming-read-file"
+            }
+
+            fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                let mut events = Vec::new();
+                self.stream_turn(turn, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })?;
+                Ok(events)
+            }
+
+            fn stream_turn(
+                &self,
+                _turn: ProviderTurn,
+                on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+            ) -> Result<()> {
+                let mut attempts = self.attempts.lock().expect("attempts lock");
+                *attempts += 1;
+                if *attempts == 1 {
+                    on_event(ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "stream_read".to_string(),
+                            name: "read_file".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "path": "streamed.txt" }),
+                        },
+                    })?;
+                    let store = Store::open(&self.state_dir)?;
+                    let deadline = Instant::now() + Duration::from_secs(2);
+                    loop {
+                        if store
+                            .events_for_session(&self.session_id)?
+                            .iter()
+                            .any(|event| {
+                                event.event_type == "file.read"
+                                    && event.payload["path"]
+                                        .as_str()
+                                        .is_some_and(|path| path.ends_with("streamed.txt"))
+                            })
+                        {
+                            break;
+                        }
+                        if Instant::now() >= deadline {
+                            bail!("read_file was not pre-dispatched before stream completion");
+                        }
+                        thread::sleep(Duration::from_millis(10));
+                    }
+                    on_event(ModelEvent::Done)?;
+                    return Ok(());
+                }
+                on_event(ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_streamed_read".to_string(),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({
+                            "result": "used streamed read",
+                        }),
+                    },
+                })?;
+                on_event(ModelEvent::Done)?;
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("streamed.txt"), "streamed contents")?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "read streamed.txt"}),
+        )?;
+        let provider = StreamingReadFileProvider {
+            state_dir: store.state_dir().to_path_buf(),
+            session_id: session.id.clone(),
+            attempts: std::sync::Mutex::new(0),
+        };
+
+        run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let streaming_started_seq = events
+            .iter()
+            .find(|event| event.event_type == "tool.streaming_started")
+            .map(|event| event.seq)
+            .context("missing streaming start event")?;
+        let file_read_seq = events
+            .iter()
+            .find(|event| event.event_type == "file.read")
+            .map(|event| event.seq)
+            .context("missing file read event")?;
+        let turn_response_seq = events
+            .iter()
+            .find(|event| event.event_type == "model.turn.response")
+            .map(|event| event.seq)
+            .context("missing model turn response event")?;
+        assert!(streaming_started_seq < turn_response_seq);
+        assert!(file_read_seq < turn_response_seq);
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.streaming_result"
+                && event.payload["tool_call_id"] == "stream_read"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "used streamed read"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn provider_loop_records_live_thinking_deltas() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -29503,6 +30452,96 @@ name = "Thread"
         Ok(())
     }
 
+    #[test]
+    fn provider_loop_drains_followup_before_finalizing_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "answer the first prompt"}),
+        )?;
+        let provider = FollowupBeforeFinalizationProvider {
+            state_dir: temp.path().to_path_buf(),
+            session_id: session.id.clone(),
+            attempts: std::sync::Mutex::new(0),
+        };
+
+        let session_id = run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        )?;
+
+        assert_eq!(session_id, session.id);
+        assert_eq!(*provider.attempts.lock().expect("attempts"), 2);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "agent.turn_queue_drained"
+                && event.payload["phase"] == "before_finalization"
+                && event.payload["session_messages"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "handled followup"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "premature final"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_pauses_remaining_tool_calls_when_active_input_arrives() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("first.txt"), "first")?;
+        std::fs::write(temp.path().join("second.txt"), "second")?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "read files unless interrupted"}),
+        )?;
+        let provider = FollowupBeforeSecondToolProvider {
+            state_dir: store.state_dir().to_path_buf(),
+            session_id: session.id.clone(),
+            attempts: std::sync::Mutex::new(0),
+        };
+
+        let session_id = run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        )?;
+
+        assert_eq!(session_id, session.id);
+        let events = store.events_for_session(&session.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "file.read")
+                .count(),
+            0
+        );
+        assert!(events.iter().any(|event| {
+            event.event_type == "agent.turn_queue_pause"
+                && event.payload["phase"] == "before_tool_call"
+                && event.payload["remaining_tool_calls"] == 2
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "agent.turn_queue_drained"
+                && event.payload["phase"] == "after_tool_outputs"
+                && event.payload["session_messages"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "paused stale tools"
+        }));
+        Ok(())
+    }
+
     struct CancellingProvider {
         state_dir: std::path::PathBuf,
         session_id: String,
@@ -29522,6 +30561,109 @@ name = "Thread"
             Ok(vec![
                 ModelEvent::TextDelta {
                     text: "this should not become the final answer".to_string(),
+                },
+                ModelEvent::Done,
+            ])
+        }
+    }
+
+    struct FollowupBeforeFinalizationProvider {
+        state_dir: std::path::PathBuf,
+        session_id: String,
+        attempts: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for FollowupBeforeFinalizationProvider {
+        fn provider_name(&self) -> &str {
+            "followup-before-finalization"
+        }
+
+        fn model_name(&self) -> &str {
+            "followup-before-finalization"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut attempts = self.attempts.lock().expect("attempt lock");
+            *attempts += 1;
+            if *attempts == 1 {
+                Store::open(&self.state_dir)?.append_event(
+                    &self.session_id,
+                    "session.followup",
+                    serde_json::json!({"text": "replace the first prompt"}),
+                )?;
+                return Ok(vec![
+                    ModelEvent::TextDelta {
+                        text: "premature final".to_string(),
+                    },
+                    ModelEvent::Done,
+                ]);
+            }
+            Ok(vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_followup".to_string(),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({"result": "handled followup"}),
+                    },
+                },
+                ModelEvent::Done,
+            ])
+        }
+    }
+
+    struct FollowupBeforeSecondToolProvider {
+        state_dir: std::path::PathBuf,
+        session_id: String,
+        attempts: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for FollowupBeforeSecondToolProvider {
+        fn provider_name(&self) -> &str {
+            "followup-before-second-tool"
+        }
+
+        fn model_name(&self) -> &str {
+            "followup-before-second-tool"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut attempts = self.attempts.lock().expect("attempt lock");
+            *attempts += 1;
+            if *attempts == 1 {
+                Store::open(&self.state_dir)?.append_event(
+                    &self.session_id,
+                    "session.followup",
+                    serde_json::json!({"text": "stop after first read"}),
+                )?;
+                return Ok(vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "read_first_before_interrupt".to_string(),
+                            name: "read_file".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "path": "first.txt" }),
+                        },
+                    },
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "read_second_stale".to_string(),
+                            name: "read_file".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "path": "second.txt" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]);
+            }
+            Ok(vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_active_queue_pause".to_string(),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({"result": "paused stale tools"}),
+                    },
                 },
                 ModelEvent::Done,
             ])
@@ -29938,15 +31080,18 @@ name = "Thread"
     #[test]
     fn provider_can_use_exec_command_tool() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let provider = ExecToolOutputInspectingProvider::default();
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "run a command",
-            temp.path(),
-            AgentRunOptions::default(),
-        )?;
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "run a command",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
         let events = store.events_for_session(&session_id)?;
         assert!(events
             .iter()
@@ -30622,7 +31767,29 @@ name = "Thread"
     }
 
     #[test]
-    fn parallel_tool_batch_preserves_model_message_order() -> Result<()> {
+    fn tool_error_recovery_taxonomy_keeps_internal_errors_fatal() {
+        assert_eq!(
+            tool_error_recovery_reason(&anyhow::anyhow!("agent cancelled")),
+            None
+        );
+        assert_eq!(
+            tool_error_recovery_reason(&anyhow::anyhow!("database is locked")),
+            None
+        );
+        assert_eq!(
+            tool_error_recovery_reason(&anyhow::anyhow!(
+                "read missing.txt\n\nCaused by:\n    No such file or directory"
+            )),
+            Some("model_visible_tool_error")
+        );
+        assert_eq!(
+            tool_error_recovery_reason(&anyhow::anyhow!("tool runtime returned partial output")),
+            None
+        );
+    }
+
+    #[test]
+    fn read_only_streaming_predispatch_preserves_model_message_order() -> Result<()> {
         let temp = tempfile::tempdir()?;
         std::fs::write(temp.path().join("first.txt"), "first")?;
         std::fs::write(temp.path().join("second.txt"), "second")?;
@@ -30636,11 +31803,12 @@ name = "Thread"
             AgentRunOptions::default(),
         )?;
         let events = store.events_for_session(&session_id)?;
-        assert!(events.iter().any(|event| {
-            event.event_type == "tool.batch_started"
-                && event.payload["tool_call_ids"][0] == "read_second"
-                && event.payload["tool_call_ids"][1] == "read_first"
-        }));
+        let streamed_ids = events
+            .iter()
+            .filter(|event| event.event_type == "tool.streaming_started")
+            .filter_map(|event| event.payload["tool_call_id"].as_str())
+            .collect::<Vec<_>>();
+        assert_eq!(streamed_ids, ["read_second", "read_first"]);
         assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "parallel reads ok"
         }));
@@ -30838,6 +32006,40 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
     }
 
     #[test]
+    fn hook_command_input_uses_active_turn_and_child_identity() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/explorer"),
+            Some("Explorer"),
+            Some("explorer"),
+        )?;
+        store.append_event(
+            &child.id,
+            CODEX_TURN_STARTED_EVENT,
+            serde_json::json!({"turn_id": "turn-current"}),
+        )?;
+
+        let input = hook_command_input(
+            &store,
+            &child,
+            HookEventName::SessionStart,
+            None,
+            None,
+            "gpt-5.4",
+            serde_json::json!({}),
+        );
+
+        assert_eq!(input["turn_id"], "turn-current");
+        assert_eq!(input["agent_id"], child.id);
+        assert_eq!(input["agent_type"], "explorer");
+        Ok(())
+    }
+
+    #[test]
     fn compact_hooks_run_around_model_compaction() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -30870,6 +32072,59 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
                 &store,
                 &provider,
                 "This prompt is intentionally long enough to trigger compact hooks.",
+                temp.path(),
+                options,
+            )
+        })?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "hook.completed" && event.payload["hook_event_name"] == "PreCompact"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "hook.completed"
+                && event.payload["hook_event_name"] == "PostCompact"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_hooks_run_around_local_compaction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"[[hooks.PreCompact]]
+matcher = "^auto$"
+
+[[hooks.PreCompact.hooks]]
+type = "command"
+command = "printf '{}'"
+
+[[hooks.PostCompact]]
+matcher = "^auto$"
+
+[[hooks.PostCompact.hooks]]
+type = "command"
+command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact\",\"additionalContext\":\"local post compact context\"}}'"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = ScriptedProvider::new(vec![vec![
+            ModelEvent::TextDelta {
+                text: "x".repeat(900),
+            },
+            ModelEvent::Done,
+        ]]);
+        let options = AgentRunOptions {
+            max_context_chars: 40,
+            model_compaction_enabled: false,
+            ..AgentRunOptions::default()
+        };
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "Trigger local compact hooks.",
                 temp.path(),
                 options,
             )

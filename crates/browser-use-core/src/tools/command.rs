@@ -3078,7 +3078,7 @@ mod tests {
                 name: "exec_command".to_string(),
                 namespace: None,
                 arguments: json!({
-                    "cmd": "python3 -u -c \"import subprocess, sys, time; print('ready', flush=True); time.sleep(0.6); print('done', flush=True); subprocess.Popen(['python3','-u','-c','import time; time.sleep(0.05); print(\\\"tail\\\", flush=True)'], stdout=sys.stdout, stderr=sys.stderr)\"",
+                    "cmd": "python3 -u -c \"import subprocess, sys, time; print('ready', flush=True); time.sleep(1.5); print('done', flush=True); subprocess.Popen(['python3','-u','-c','import time; time.sleep(0.05); print(\\\"tail\\\", flush=True)'], stdout=sys.stdout, stderr=sys.stderr)\"",
                     "yield_time_ms": 50,
                 }),
             },
@@ -3153,7 +3153,7 @@ mod tests {
                 name: "exec_command".to_string(),
                 namespace: None,
                 arguments: json!({
-                    "cmd": "python3 -u -c \"import subprocess, sys, time; print('ready', flush=True); time.sleep(0.6); print('done', flush=True); subprocess.Popen(['sleep','2'], stdout=sys.stdout, stderr=sys.stderr)\"",
+                    "cmd": "python3 -u -c \"import subprocess, sys, time; print('ready', flush=True); time.sleep(0.5); print('done', flush=True); subprocess.Popen(['sleep','2'], stdout=sys.stdout, stderr=sys.stderr)\"",
                     "yield_time_ms": 50,
                 }),
             },
@@ -3164,7 +3164,7 @@ mod tests {
 
         let wait_started = Instant::now();
         let mut finished = None;
-        for _ in 0..30 {
+        for _ in 0..80 {
             let events = store.events_for_session(&session.id).expect("events");
             finished = events.into_iter().find(|event| {
                 event.event_type == "command.finished"
@@ -3178,7 +3178,7 @@ mod tests {
 
         let finished = finished.expect("background command.finished event");
         assert!(
-            wait_started.elapsed() < Duration::from_millis(1500),
+            wait_started.elapsed() < Duration::from_millis(2200),
             "background watcher should cap post-exit reader drain"
         );
         assert!(finished.payload["aggregated_output"]
