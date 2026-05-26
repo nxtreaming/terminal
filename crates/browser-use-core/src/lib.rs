@@ -1,7 +1,9 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
 use std::hash::{Hash, Hasher};
+use std::io::Write as IoWrite;
 use std::path::{Path, PathBuf};
+use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::thread;
@@ -19,10 +21,12 @@ use browser_use_protocol::{
     EventRecord, ModelEvent, SessionMeta, SessionStatus, ToolCall, ToolSpec,
 };
 use browser_use_providers::{
-    bundled_model_catalog, default_agent_instructions,
-    default_agent_instructions_for_model_and_personality_with_catalog,
-    default_agent_instructions_for_personality, default_permissions_instructions,
-    default_personality_message_for_model_and_personality_with_catalog, load_codex_auth,
+    browser_agent_instructions_for_model_and_personality_with_catalog, bundled_model_catalog,
+    default_permissions_instructions,
+    default_personality_message_for_model_and_personality_with_catalog,
+    default_terminal_agent_instructions,
+    default_terminal_agent_instructions_for_model_and_personality_with_catalog,
+    default_terminal_agent_instructions_for_personality, load_codex_auth,
     model_request_info_for_catalog, model_supported_service_tiers_for_catalog,
     model_supports_original_image_detail_for_catalog, model_supports_service_tier_for_catalog,
     model_switch_request_settings_for_model_with_catalog, refresh_claude_code_oauth,
@@ -74,6 +78,7 @@ const MULTI_AGENT_USAGE_HINT_CONTEXT_MESSAGE_NAME: &str = "multi_agent_usage_hin
 const MODEL_SWITCH_CONTEXT_MESSAGE_NAME: &str = "model_switch_context";
 const PERSONALITY_CONTEXT_MESSAGE_NAME: &str = "personality_context";
 const GOAL_CONTEXT_MESSAGE_NAME: &str = "goal_context";
+const HOOK_CONTEXT_MESSAGE_NAME: &str = "hook_context";
 const COLLABORATION_CONTEXT_MESSAGE_NAME: &str = "collaboration_context";
 const MENTION_CONTEXT_MESSAGE_NAME: &str = "typed_mention_context";
 const GENERATED_IMAGE_CONTEXT_MESSAGE_NAME: &str = "generated_image_context";
@@ -534,6 +539,7 @@ pub struct AgentRunOptions {
     pub child_agent_runner: Option<ChildAgentRunner>,
     pub final_output_json_schema: Option<Value>,
     pub final_output_json_schema_strict: bool,
+    pub model_compaction_enabled: bool,
     pub analytics_source: Option<String>,
     pub analytics_provider_kind: Option<String>,
     pub analytics_model: Option<String>,
@@ -562,6 +568,7 @@ impl Default for AgentRunOptions {
             child_agent_runner: None,
             final_output_json_schema: None,
             final_output_json_schema_strict: true,
+            model_compaction_enabled: false,
             analytics_source: None,
             analytics_provider_kind: None,
             analytics_model: None,
@@ -666,6 +673,11 @@ impl AgentRunOptions {
     pub fn with_final_output_json_schema(mut self, schema: Value, strict: bool) -> Self {
         self.final_output_json_schema = Some(schema);
         self.final_output_json_schema_strict = strict;
+        self
+    }
+
+    pub fn with_model_compaction(mut self, enabled: bool) -> Self {
+        self.model_compaction_enabled = enabled;
         self
     }
 
@@ -3132,6 +3144,37 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             {
                 insert_model_switch_context_message(&mut messages, goal_context_message);
             }
+            let runtime_hooks = turn_config.hooks.clone();
+            for hook_message in
+                run_session_start_hooks(store, &session, &runtime_hooks, provider.model_name())?
+            {
+                insert_model_switch_context_message(&mut messages, hook_message);
+            }
+            let mut last_user_prompt_hook_seq = 0_i64;
+            let initial_prompt_hook_outcome = run_user_prompt_submit_hooks_since(
+                store,
+                &session,
+                &runtime_hooks,
+                provider.model_name(),
+                &mut last_user_prompt_hook_seq,
+            )?;
+            for context in initial_prompt_hook_outcome.additional_contexts {
+                insert_model_switch_context_message(
+                    &mut messages,
+                    hook_context_message(HookEventName::UserPromptSubmit, &context),
+                );
+            }
+            if let Some(reason) = initial_prompt_hook_outcome
+                .block_reason
+                .or(initial_prompt_hook_outcome.stop_reason)
+            {
+                store.append_event(
+                    &session.id,
+                    "session.failed",
+                    serde_json::json!({ "error": format!("UserPromptSubmit hook blocked prompt: {reason}") }),
+                )?;
+                bail!("UserPromptSubmit hook blocked prompt: {reason}");
+            }
             if let Some(turn_seq) = model_switch_before_seq {
                 append_context_baseline_event(
                     store,
@@ -3203,16 +3246,51 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &mut messages,
                     &mut last_external_session_message_seq,
                 )?;
-                normalize_provider_messages(&mut messages);
-                maybe_compact_messages_with_context(
+                let prompt_hook_outcome = run_user_prompt_submit_hooks_since(
                     store,
-                    &session.id,
+                    &session,
+                    &runtime_hooks,
+                    provider.model_name(),
+                    &mut last_user_prompt_hook_seq,
+                )?;
+                for context in prompt_hook_outcome.additional_contexts {
+                    messages.push(hook_context_message(
+                        HookEventName::UserPromptSubmit,
+                        &context,
+                    ));
+                }
+                if let Some(reason) = prompt_hook_outcome
+                    .block_reason
+                    .or(prompt_hook_outcome.stop_reason)
+                {
+                    store.append_event(
+                        &session.id,
+                        "model.response.continued",
+                        serde_json::json!({
+                            "turn_idx": turn_idx,
+                            "reason": "user_prompt_submit_hook_blocked",
+                        }),
+                    )?;
+                    messages.push(hook_context_message(
+                        HookEventName::UserPromptSubmit,
+                        &format!("UserPromptSubmit hook blocked prompt: {reason}"),
+                    ));
+                }
+                normalize_provider_messages(&mut messages);
+                maybe_compact_messages_with_model(
+                    store,
+                    &session,
+                    provider,
                     &mut messages,
                     compaction_max_context_chars,
                     turn_instructions.as_deref(),
+                    &model_settings,
+                    &model_request_info,
                     model_context_window,
                     Some(turn_idx),
                     compact_prompt.as_deref(),
+                    &options,
+                    &runtime_hooks,
                 )?;
                 normalize_provider_messages(&mut messages);
                 let mut assistant_text = String::new();
@@ -3542,15 +3620,20 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &mut assistant_text,
                     &mut assistant_message_tool_calls,
                 );
-                maybe_compact_messages_with_context(
+                maybe_compact_messages_with_model(
                     store,
-                    &session.id,
+                    &session,
+                    provider,
                     &mut messages,
                     compaction_max_context_chars,
                     turn_instructions.as_deref(),
+                    &model_settings,
+                    &model_request_info,
                     model_context_window,
                     Some(turn_idx),
                     compact_prompt.as_deref(),
+                    &options,
+                    &runtime_hooks,
                 )?;
 
                 if tool_calls.is_empty() {
@@ -3605,15 +3688,20 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 "role": "user",
                                 "content": error,
                             }));
-                            maybe_compact_messages_with_context(
+                            maybe_compact_messages_with_model(
                                 store,
-                                &session.id,
+                                &session,
+                                provider,
                                 &mut messages,
                                 compaction_max_context_chars,
                                 turn_instructions.as_deref(),
+                                &model_settings,
+                                &model_request_info,
                                 model_context_window,
                                 Some(turn_idx),
                                 compact_prompt.as_deref(),
+                                &options,
+                                &runtime_hooks,
                             )?;
                             step_span.set_ok();
                             continue;
@@ -3632,15 +3720,64 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                                 }),
                             )?;
                             messages.push(goal_context);
-                            maybe_compact_messages_with_context(
+                            maybe_compact_messages_with_model(
                                 store,
-                                &session.id,
+                                &session,
+                                provider,
                                 &mut messages,
                                 compaction_max_context_chars,
                                 turn_instructions.as_deref(),
+                                &model_settings,
+                                &model_request_info,
                                 model_context_window,
                                 Some(turn_idx),
                                 compact_prompt.as_deref(),
+                                &options,
+                                &runtime_hooks,
+                            )?;
+                            step_span.set_ok();
+                            continue;
+                        }
+                        let stop_hook_outcome = run_stop_hooks(
+                            store,
+                            &session,
+                            &runtime_hooks,
+                            provider.model_name(),
+                            requested_result,
+                        )?;
+                        for context in stop_hook_outcome.additional_contexts {
+                            messages.push(hook_context_message(HookEventName::Stop, &context));
+                        }
+                        if let Some(reason) = stop_hook_outcome
+                            .block_reason
+                            .or(stop_hook_outcome.stop_reason)
+                        {
+                            store.append_event(
+                                &session.id,
+                                "model.response.continued",
+                                serde_json::json!({
+                                    "turn_idx": turn_idx,
+                                    "reason": "stop_hook_blocked",
+                                }),
+                            )?;
+                            messages.push(hook_context_message(
+                                HookEventName::Stop,
+                                &format!("Stop hook blocked finalization: {reason}"),
+                            ));
+                            maybe_compact_messages_with_model(
+                                store,
+                                &session,
+                                provider,
+                                &mut messages,
+                                compaction_max_context_chars,
+                                turn_instructions.as_deref(),
+                                &model_settings,
+                                &model_request_info,
+                                model_context_window,
+                                Some(turn_idx),
+                                compact_prompt.as_deref(),
+                                &options,
+                                &runtime_hooks,
                             )?;
                             step_span.set_ok();
                             continue;
@@ -3666,15 +3803,20 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             }),
                         )?;
                         messages.push(goal_context);
-                        maybe_compact_messages_with_context(
+                        maybe_compact_messages_with_model(
                             store,
-                            &session.id,
+                            &session,
+                            provider,
                             &mut messages,
                             compaction_max_context_chars,
                             turn_instructions.as_deref(),
+                            &model_settings,
+                            &model_request_info,
                             model_context_window,
                             Some(turn_idx),
                             compact_prompt.as_deref(),
+                            &options,
+                            &runtime_hooks,
                         )?;
                         step_span.set_ok();
                         continue;
@@ -3683,7 +3825,8 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     continue;
                 }
 
-                for outcome in dispatch_tool_calls_for_turn(
+                let turn_diff_before = git_worktree_snapshot(&session.cwd);
+                let dispatched_outcomes = dispatch_tool_calls_for_turn(
                     store,
                     provider,
                     &session,
@@ -3691,21 +3834,34 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     tool_calls,
                     &options,
                     &turn_instructions,
+                    &runtime_hooks,
                     model_request_info.tool_output_token_budget(),
                     &telemetry,
                     &step_span,
                     turn_idx,
-                )? {
+                )?;
+                append_turn_git_diff_if_changed(
+                    store,
+                    &session,
+                    turn_diff_before.as_ref(),
+                    turn_idx,
+                )?;
+                for outcome in dispatched_outcomes {
                     messages.extend(outcome.messages);
-                    maybe_compact_messages_with_context(
+                    maybe_compact_messages_with_model(
                         store,
-                        &session.id,
+                        &session,
+                        provider,
                         &mut messages,
                         compaction_max_context_chars,
                         turn_instructions.as_deref(),
+                        &model_settings,
+                        &model_request_info,
                         model_context_window,
                         Some(turn_idx),
                         compact_prompt.as_deref(),
+                        &options,
+                        &runtime_hooks,
                     )?;
                     if outcome.finished {
                         step_span.set_ok();
@@ -4586,6 +4742,276 @@ fn maybe_compact_messages_with_context(
 }
 
 #[allow(clippy::too_many_arguments)]
+fn maybe_compact_messages_with_model<P: ModelProvider>(
+    store: &Store,
+    session: &SessionMeta,
+    provider: &P,
+    messages: &mut Vec<Value>,
+    max_context_chars: usize,
+    base_instructions: Option<&str>,
+    model_settings: &ModelRequestSettings,
+    model_request_info: &browser_use_providers::ModelRequestInfo,
+    model_context_window: Option<i64>,
+    turn_idx: Option<usize>,
+    compact_prompt: Option<&str>,
+    options: &AgentRunOptions,
+    runtime_hooks: &RuntimeHookConfig,
+) -> Result<()> {
+    let session_id = &session.id;
+    if !options.model_compaction_enabled {
+        return maybe_compact_messages_with_context(
+            store,
+            &session.id,
+            messages,
+            max_context_chars,
+            base_instructions,
+            model_context_window,
+            turn_idx,
+            compact_prompt,
+        );
+    }
+    if max_context_chars == 0 {
+        return Ok(());
+    }
+    let max_context_tokens = approx_token_count_from_chars(max_context_chars);
+    let before_chars = estimated_context_chars(messages)?;
+    let before_tokens = estimated_context_tokens_with_instructions(messages, base_instructions)?;
+    if before_tokens <= max_context_tokens {
+        return Ok(());
+    }
+    let pre_compact =
+        run_pre_compact_hooks(store, session, runtime_hooks, provider.model_name(), "auto")?;
+    if let Some(reason) = pre_compact.block_reason.or(pre_compact.stop_reason) {
+        store.append_event(
+            session_id,
+            "session.compaction_skipped",
+            serde_json::json!({
+                "reason": "pre_compact_hook_stopped",
+                "hook_reason": reason,
+            }),
+        )?;
+        return Ok(());
+    }
+    let compact_result = match compact_messages_with_model_summary(
+        store,
+        session_id,
+        provider,
+        messages,
+        max_context_chars,
+        max_context_tokens,
+        before_chars,
+        before_tokens,
+        base_instructions,
+        model_settings,
+        model_request_info,
+        model_context_window,
+        turn_idx,
+        compact_prompt,
+    ) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            store.append_event(
+                session_id,
+                "session.compaction_model_failed",
+                serde_json::json!({ "error": format!("{error:#}") }),
+            )?;
+            compact_messages(
+                store,
+                session_id,
+                messages,
+                max_context_chars,
+                max_context_tokens,
+                before_chars,
+                before_tokens,
+                base_instructions,
+                model_context_window,
+                turn_idx,
+                compact_prompt,
+                "estimated_budget_exceeded_model_fallback",
+            )
+        }
+    };
+    compact_result?;
+    let post_compact =
+        run_post_compact_hooks(store, session, runtime_hooks, provider.model_name(), "auto")?;
+    for context in post_compact.additional_contexts {
+        messages.push(hook_context_message(HookEventName::PostCompact, &context));
+    }
+    if let Some(reason) = post_compact.block_reason.or(post_compact.stop_reason) {
+        store.append_event(
+            session_id,
+            "hook.blocked",
+            serde_json::json!({
+                "hook_event_name": HookEventName::PostCompact.as_str(),
+                "reason": reason,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+#[allow(clippy::too_many_arguments)]
+fn compact_messages_with_model_summary<P: ModelProvider>(
+    store: &Store,
+    session_id: &str,
+    provider: &P,
+    messages: &mut Vec<Value>,
+    max_context_chars: usize,
+    max_context_tokens: usize,
+    before_chars: usize,
+    before_tokens: usize,
+    base_instructions: Option<&str>,
+    model_settings: &ModelRequestSettings,
+    model_request_info: &browser_use_providers::ModelRequestInfo,
+    model_context_window: Option<i64>,
+    turn_idx: Option<usize>,
+    compact_prompt: Option<&str>,
+) -> Result<()> {
+    store.append_event(
+        session_id,
+        "session.compaction_started",
+        serde_json::json!({
+            "reason": "estimated_budget_exceeded",
+            "message_count": messages.len(),
+            "chars": before_chars,
+            "tokens": before_tokens,
+            "max_chars": max_context_chars,
+            "max_tokens": max_context_tokens,
+            "summary_mode": "model",
+        }),
+    )?;
+    let events = store.events_for_session(session_id)?;
+    let filtered_events = rollback_filtered_events(&events)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let context_baseline = latest_context_baseline_payload_from_events(&filtered_events);
+    let fallback_contract;
+    let compaction_contract = if let Some(compact_prompt) = compact_prompt {
+        compact_prompt
+    } else if let Some(base_instructions) = base_instructions {
+        base_instructions
+    } else {
+        fallback_contract = terminal_agent_contract();
+        fallback_contract.as_str()
+    };
+    let context = sanitized_agent_context_from_events(&filtered_events);
+    let summary = model_compaction_summary(
+        provider,
+        model_settings,
+        model_request_info,
+        compaction_contract,
+        &context,
+        messages,
+    )?;
+    store.append_event(
+        session_id,
+        "session.compaction_model_summary",
+        serde_json::json!({
+            "turn_idx": turn_idx,
+            "provider": provider.provider_name(),
+            "model": provider.model_name(),
+            "chars": summary.chars().count(),
+            "summary": summary.clone(),
+        }),
+    )?;
+    let initial_context = initial_context_messages_from_events(&filtered_events, None, true, true);
+    let mut compacted = compacted_user_history_messages(messages, max_context_tokens);
+    compacted.push(compacted_context_summary_message_from_text(&summary));
+    compacted = insert_initial_context_before_last_real_user_or_summary(compacted, initial_context);
+    *messages = compacted;
+    let after_tokens = estimated_context_tokens_with_instructions(messages, base_instructions)?;
+    let after_chars = estimated_context_chars(messages)?;
+    let mut payload = serde_json::json!({
+        "reason": "estimated_budget_exceeded",
+        "message_count": messages.len(),
+        "chars": after_chars,
+        "tokens": after_tokens,
+        "replacement_messages": messages.clone(),
+        "replacement_response_items": provider_messages_to_response_items(messages),
+        "summary_mode": "model",
+    });
+    if let Some(context_baseline) = context_baseline {
+        payload["context_baseline"] = context_baseline;
+    }
+    let compacted_event = store.append_event(session_id, "session.compacted", payload)?;
+    append_recomputed_codex_token_count_event(
+        store,
+        session_id,
+        messages,
+        base_instructions,
+        model_context_window,
+        turn_idx,
+        "estimated_budget_exceeded",
+        Some(compacted_event.seq),
+    )?;
+    Ok(())
+}
+
+fn compacted_context_summary_message_from_text(summary: &str) -> Value {
+    user_text_message(format!("{COMPACTION_SUMMARY_PREFIX}\n{}", summary.trim()))
+}
+
+fn model_compaction_summary<P: ModelProvider>(
+    provider: &P,
+    model_settings: &ModelRequestSettings,
+    model_request_info: &browser_use_providers::ModelRequestInfo,
+    compaction_contract: &str,
+    context: &Value,
+    messages: &[Value],
+) -> Result<String> {
+    let context_json = serde_json::to_string_pretty(context)?;
+    let messages_json = serde_json::to_string_pretty(messages)?;
+    let prompt = format!(
+        "Create a compact handoff summary for another agent continuing this task. Preserve the user objective, decisions, files changed, commands/tests run, failures, current state, and concrete next steps. Do not include hidden reasoning or speculation. Return only the summary.\n\nActive instructions:\n{}\n\nRuntime context:\n{}\n\nConversation/tool history:\n{}",
+        truncate_for_context(compaction_contract, 20_000),
+        truncate_for_context(&context_json, 30_000),
+        truncate_for_context(&messages_json, 80_000),
+    );
+    let mut summary = String::new();
+    provider.stream_turn(
+        ProviderTurn {
+            instructions: Some(
+                "You are compacting an agent conversation for local continuation. Return only a concise but complete handoff summary.".to_string(),
+            ),
+            model_settings: model_settings.clone(),
+            model_request_info: Some(model_request_info.clone()),
+            messages: vec![user_text_message(prompt)],
+            tools: Vec::new(),
+            hosted_tools: Vec::new(),
+            ..ProviderTurn::default()
+        },
+        &mut |event| {
+            match event {
+                ModelEvent::TextDelta { text } => {
+                    if let Some(delta) = assistant_delta_to_append(&summary, &text) {
+                        summary.push_str(&delta);
+                    }
+                }
+                ModelEvent::ResponseOutputItem { item } => {
+                    if let Some(text) = assistant_message_text_from_response_item(
+                        &item,
+                        CollaborationModeKind::Default,
+                        false,
+                    ) {
+                        if summary.trim().is_empty() {
+                            summary.push_str(&text);
+                        }
+                    }
+                }
+                _ => {}
+            }
+            Ok(())
+        },
+    )?;
+    let summary = summary.trim();
+    if summary.is_empty() {
+        bail!("model compaction returned an empty summary");
+    }
+    Ok(summary.to_string())
+}
+
+#[allow(clippy::too_many_arguments)]
 fn compact_messages(
     store: &Store,
     session_id: &str,
@@ -4624,7 +5050,7 @@ fn compact_messages(
     } else if let Some(base_instructions) = base_instructions {
         base_instructions
     } else {
-        fallback_contract = browser_agent_contract();
+        fallback_contract = terminal_agent_contract();
         fallback_contract.as_str()
     };
     let result = (|| -> Result<()> {
@@ -5043,6 +5469,13 @@ fn truncate_for_context(text: &str, max_chars: usize) -> String {
     )
 }
 
+fn truncate_text_for_event(text: &str, max_chars: usize) -> String {
+    if text.chars().count() <= max_chars {
+        return text.to_string();
+    }
+    truncate_for_context(text, max_chars)
+}
+
 fn compacted_context_system_message(
     context: &Value,
     browser_agent_contract: &str,
@@ -5057,8 +5490,13 @@ fn compacted_context_system_message(
     ))
 }
 
+#[cfg(test)]
 fn browser_agent_contract() -> String {
-    default_agent_instructions()
+    browser_use_providers::default_agent_instructions()
+}
+
+fn terminal_agent_contract() -> String {
+    default_terminal_agent_instructions()
 }
 
 fn provider_base_instructions_for_session(
@@ -5101,7 +5539,8 @@ fn provider_base_instructions_for_session(
         return Ok(Some(base_instructions));
     }
 
-    let base_instructions = config.default_base_instructions_for_model(model);
+    let base_instructions =
+        config.default_base_instructions_for_model(model, options.browser_mode.is_some());
     if let Some(text) = base_instructions.as_deref() {
         append_session_base_instructions_event(store, &session.id, text, "model_default")?;
     }
@@ -6615,7 +7054,9 @@ fn model_switch_context_for_session(
     let mut warnings = Vec::new();
     let config =
         load_agents_md_config_for_options(Path::new(&session.cwd), &mut warnings, options)?;
-    let Some(model_instructions) = config.default_base_instructions_for_model(next_model) else {
+    let Some(model_instructions) =
+        config.default_base_instructions_for_model(next_model, options.browser_mode.is_some())
+    else {
         return Ok(None);
     };
     if model_instructions.is_empty() {
@@ -6659,7 +7100,7 @@ fn personality_context_for_session(
 
     if turn_instructions
         == config
-            .default_base_instructions_for_model(next_model)
+            .default_base_instructions_for_model(next_model, options.browser_mode.is_some())
             .as_deref()
     {
         return Ok(None);
@@ -6869,6 +7310,7 @@ fn append_new_external_session_messages(
     messages: &mut Vec<Value>,
     last_seq: &mut i64,
 ) -> Result<()> {
+    let mut appended_user_events = 0_usize;
     let mut events = store
         .events_for_session(session_id)?
         .into_iter()
@@ -6884,8 +7326,11 @@ fn append_new_external_session_messages(
     for event in events {
         *last_seq = (*last_seq).max(event.seq);
         messages.extend(session_event_user_messages(&event.payload));
+        appended_user_events += 1;
     }
+    let mut appended_mail = 0_usize;
     for mail in store.drain_agent_messages_for_agent(session_id)? {
+        appended_mail += 1;
         let author_path = display_agent_path_for_session(store, &mail.author_session_id)?;
         let recipient_path = display_agent_path_for_session(store, &mail.target_session_id)?;
         let author_has_agent_path = store
@@ -6911,6 +7356,851 @@ fn append_new_external_session_messages(
             messages.push(message);
         }
     }
+    if appended_user_events > 0 || appended_mail > 0 {
+        store.append_event(
+            session_id,
+            "agent.turn_queue_drained",
+            serde_json::json!({
+                "session_messages": appended_user_events,
+                "mailbox_messages": appended_mail,
+                "last_seq": *last_seq,
+            }),
+        )?;
+    }
+    Ok(())
+}
+
+fn hook_context_message(event: HookEventName, content: &str) -> Value {
+    serde_json::json!({
+        "role": "developer",
+        "name": HOOK_CONTEXT_MESSAGE_NAME,
+        "content": content.trim(),
+        "hook_event_name": event.as_str(),
+    })
+}
+
+fn run_session_start_hooks(
+    store: &Store,
+    session: &SessionMeta,
+    hooks: &RuntimeHookConfig,
+    model: &str,
+) -> Result<Vec<Value>> {
+    let (event, matcher_target, extra) = if session.parent_id.is_some() {
+        let agent_type = store
+            .agent_summary_for_child(&session.id)?
+            .and_then(|summary| summary.agent_role)
+            .unwrap_or_else(|| "default".to_string());
+        (
+            HookEventName::SubagentStart,
+            Some(agent_type.clone()),
+            serde_json::json!({
+                "agent_id": session.id,
+                "agent_type": agent_type,
+            }),
+        )
+    } else {
+        (
+            HookEventName::SessionStart,
+            Some("startup".to_string()),
+            serde_json::json!({ "source": "startup" }),
+        )
+    };
+    let outcome = run_hooks_for_event(
+        store,
+        session,
+        hooks,
+        event,
+        None,
+        matcher_target.as_deref(),
+        None,
+        model,
+        extra,
+    )?;
+    Ok(outcome
+        .additional_contexts
+        .into_iter()
+        .map(|context| hook_context_message(event, &context))
+        .collect())
+}
+
+fn run_user_prompt_submit_hooks_since(
+    store: &Store,
+    session: &SessionMeta,
+    hooks: &RuntimeHookConfig,
+    model: &str,
+    last_seq: &mut i64,
+) -> Result<HookRunOutcome> {
+    let mut events = store
+        .events_for_session(&session.id)?
+        .into_iter()
+        .filter(|event| {
+            event.seq > *last_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+        })
+        .collect::<Vec<_>>();
+    events.sort_by_key(|event| event.seq);
+    let mut merged = HookRunOutcome::default();
+    for event_record in events {
+        *last_seq = (*last_seq).max(event_record.seq);
+        let prompt = event_record
+            .payload
+            .get("text")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
+            .trim()
+            .to_string();
+        if prompt.is_empty() {
+            continue;
+        }
+        let outcome = run_hooks_for_event(
+            store,
+            session,
+            hooks,
+            HookEventName::UserPromptSubmit,
+            None,
+            None,
+            None,
+            model,
+            serde_json::json!({
+                "prompt": prompt,
+                "event_seq": event_record.seq,
+            }),
+        )?;
+        merged
+            .additional_contexts
+            .extend(outcome.additional_contexts);
+        merged.feedback_messages.extend(outcome.feedback_messages);
+        if merged.block_reason.is_none() {
+            merged.block_reason = outcome.block_reason;
+        }
+        if merged.stop_reason.is_none() {
+            merged.stop_reason = outcome.stop_reason;
+        }
+    }
+    Ok(merged)
+}
+
+fn run_stop_hooks(
+    store: &Store,
+    session: &SessionMeta,
+    hooks: &RuntimeHookConfig,
+    model: &str,
+    result: &str,
+) -> Result<HookRunOutcome> {
+    run_hooks_for_event(
+        store,
+        session,
+        hooks,
+        HookEventName::Stop,
+        None,
+        None,
+        None,
+        model,
+        serde_json::json!({ "result": result }),
+    )
+}
+
+fn run_pre_compact_hooks(
+    store: &Store,
+    session: &SessionMeta,
+    hooks: &RuntimeHookConfig,
+    model: &str,
+    trigger: &str,
+) -> Result<HookRunOutcome> {
+    run_hooks_for_event(
+        store,
+        session,
+        hooks,
+        HookEventName::PreCompact,
+        None,
+        Some(trigger),
+        None,
+        model,
+        serde_json::json!({ "trigger": trigger }),
+    )
+}
+
+fn run_post_compact_hooks(
+    store: &Store,
+    session: &SessionMeta,
+    hooks: &RuntimeHookConfig,
+    model: &str,
+    trigger: &str,
+) -> Result<HookRunOutcome> {
+    run_hooks_for_event(
+        store,
+        session,
+        hooks,
+        HookEventName::PostCompact,
+        None,
+        Some(trigger),
+        None,
+        model,
+        serde_json::json!({ "trigger": trigger }),
+    )
+}
+
+fn run_pre_tool_use_hooks(
+    store: &Store,
+    session: &SessionMeta,
+    hooks: &RuntimeHookConfig,
+    model: &str,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+) -> Result<Option<PreToolUseHookDecision>> {
+    let outcome = run_hooks_for_event(
+        store,
+        session,
+        hooks,
+        HookEventName::PreToolUse,
+        Some(call),
+        None,
+        Some(&call.arguments),
+        model,
+        serde_json::json!({}),
+    )?;
+    if outcome.updated_input.is_none()
+        && outcome.additional_contexts.is_empty()
+        && outcome.block_reason.is_none()
+        && outcome.stop_reason.is_none()
+    {
+        return Ok(None);
+    }
+    let mut context_messages = outcome
+        .additional_contexts
+        .into_iter()
+        .map(|context| hook_context_message(HookEventName::PreToolUse, &context))
+        .collect::<Vec<_>>();
+    if let Some(reason) = outcome.block_reason.or(outcome.stop_reason) {
+        store.append_event(
+            &session.id,
+            "hook.blocked",
+            serde_json::json!({
+                "hook_event_name": HookEventName::PreToolUse.as_str(),
+                "tool_name": call.name,
+                "tool_call_id": call.id,
+                "reason": reason,
+            }),
+        )?;
+        context_messages.push(tool_text_message(
+            store,
+            session,
+            call,
+            &call.name,
+            &format!("{} blocked by PreToolUse hook: {reason}", call.name),
+            tool_output_token_budget,
+        )?);
+        return Ok(Some(PreToolUseHookDecision::Blocked(ToolDispatchOutcome {
+            finished: false,
+            messages: context_messages,
+        })));
+    }
+    Ok(Some(PreToolUseHookDecision::Continue {
+        updated_input: outcome.updated_input,
+        context_messages,
+    }))
+}
+
+fn run_post_tool_use_hooks(
+    store: &Store,
+    session: &SessionMeta,
+    hooks: &RuntimeHookConfig,
+    model: &str,
+    call: &ToolCall,
+    tool_output: &[Value],
+) -> Result<PostToolUseHookResult> {
+    let outcome = run_hooks_for_event(
+        store,
+        session,
+        hooks,
+        HookEventName::PostToolUse,
+        Some(call),
+        None,
+        None,
+        model,
+        serde_json::json!({
+            "tool_output": tool_output,
+            "tool_response": tool_output,
+        }),
+    )?;
+    let mut messages = outcome
+        .additional_contexts
+        .into_iter()
+        .map(|context| hook_context_message(HookEventName::PostToolUse, &context))
+        .collect::<Vec<_>>();
+    let replacement_text = if !outcome.feedback_messages.is_empty() {
+        Some(outcome.feedback_messages.join("\n"))
+    } else {
+        outcome
+            .block_reason
+            .clone()
+            .or_else(|| outcome.stop_reason.clone())
+    };
+    if let Some(reason) = outcome.block_reason.or(outcome.stop_reason) {
+        store.append_event(
+            &session.id,
+            "hook.blocked",
+            serde_json::json!({
+                "hook_event_name": HookEventName::PostToolUse.as_str(),
+                "tool_name": call.name,
+                "tool_call_id": call.id,
+                "reason": reason,
+            }),
+        )?;
+        messages.push(hook_context_message(
+            HookEventName::PostToolUse,
+            &format!("PostToolUse hook blocked continuation: {reason}"),
+        ));
+    }
+    if let Some(replacement_text) = replacement_text.as_deref() {
+        store.append_event(
+            &session.id,
+            "hook.feedback",
+            serde_json::json!({
+                "hook_event_name": HookEventName::PostToolUse.as_str(),
+                "tool_name": call.name,
+                "tool_call_id": call.id,
+                "feedback": replacement_text,
+            }),
+        )?;
+    }
+    Ok(PostToolUseHookResult {
+        context_messages: messages,
+        replacement_text,
+    })
+}
+
+struct PostToolUseHookResult {
+    context_messages: Vec<Value>,
+    replacement_text: Option<String>,
+}
+
+enum PreToolUseHookDecision {
+    Continue {
+        updated_input: Option<Value>,
+        context_messages: Vec<Value>,
+    },
+    Blocked(ToolDispatchOutcome),
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_hooks_for_event(
+    store: &Store,
+    session: &SessionMeta,
+    hooks: &RuntimeHookConfig,
+    event: HookEventName,
+    call: Option<&ToolCall>,
+    matcher_target: Option<&str>,
+    tool_input: Option<&Value>,
+    model: &str,
+    extra: Value,
+) -> Result<HookRunOutcome> {
+    if hooks.is_empty() {
+        return Ok(HookRunOutcome::default());
+    }
+    let mut outcome = HookRunOutcome::default();
+    for group in hooks.groups_for_event(event) {
+        if !hook_group_matches(group, call, matcher_target) {
+            continue;
+        }
+        for hook in &group.hooks {
+            let hook_outcome = run_command_hook(
+                store,
+                session,
+                event,
+                call,
+                tool_input,
+                model,
+                extra.clone(),
+                hook,
+            )?;
+            if let Some(updated_input) = hook_outcome.updated_input {
+                outcome.updated_input = Some(updated_input);
+            }
+            outcome
+                .additional_contexts
+                .extend(hook_outcome.additional_contexts);
+            outcome
+                .feedback_messages
+                .extend(hook_outcome.feedback_messages);
+            if outcome.block_reason.is_none() {
+                outcome.block_reason = hook_outcome.block_reason;
+            }
+            if outcome.stop_reason.is_none() {
+                outcome.stop_reason = hook_outcome.stop_reason;
+            }
+        }
+    }
+    Ok(outcome)
+}
+
+fn hook_group_matches(
+    group: &HookMatcherGroup,
+    call: Option<&ToolCall>,
+    matcher_target: Option<&str>,
+) -> bool {
+    let matcher = group.matcher.as_deref().map(str::trim);
+    if let Some(target) = matcher_target {
+        return hook_matcher_matches(matcher, target);
+    }
+    let Some(call) = call else {
+        return true;
+    };
+    hook_tool_name_candidates(call)
+        .iter()
+        .any(|candidate| hook_matcher_matches(matcher, candidate))
+}
+
+fn hook_tool_name_candidates(call: &ToolCall) -> Vec<String> {
+    let mut candidates = vec![call.name.clone()];
+    if let Some(namespace) = call.namespace.as_deref() {
+        candidates.push(format!("{namespace}.{}", call.name));
+    }
+    let codex_name = match call.name.as_str() {
+        "exec_command" | "shell_command" => Some("Bash"),
+        "apply_patch" => Some("ApplyPatch"),
+        "read_file" => Some("Read"),
+        "search_files" => Some("Grep"),
+        "list_files" => Some("Glob"),
+        "view_image" => Some("ViewImage"),
+        "spawn_agent" => Some("Task"),
+        "done" => Some("Done"),
+        _ => None,
+    };
+    if let Some(codex_name) = codex_name {
+        candidates.push(codex_name.to_string());
+    }
+    candidates
+}
+
+fn hook_matcher_matches(matcher: Option<&str>, candidate: &str) -> bool {
+    let Some(matcher) = matcher.map(str::trim) else {
+        return true;
+    };
+    if matcher.is_empty() || matcher == "*" {
+        return true;
+    }
+    if hook_matcher_is_exact(matcher) {
+        return matcher.split('|').any(|part| part == candidate);
+    }
+    regex::Regex::new(matcher)
+        .map(|regex| regex.is_match(candidate))
+        .unwrap_or(false)
+}
+
+fn hook_matcher_is_exact(matcher: &str) -> bool {
+    matcher
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '|')
+}
+
+#[allow(clippy::too_many_arguments)]
+fn run_command_hook(
+    store: &Store,
+    session: &SessionMeta,
+    event: HookEventName,
+    call: Option<&ToolCall>,
+    tool_input: Option<&Value>,
+    model: &str,
+    extra: Value,
+    hook: &HookCommandConfig,
+) -> Result<HookRunOutcome> {
+    let command = if cfg!(windows) {
+        hook.command_windows
+            .as_deref()
+            .unwrap_or(&hook.command)
+            .to_string()
+    } else {
+        hook.command.clone()
+    };
+    let hook_input = hook_command_input(session, event, call, tool_input, model, extra);
+    let hook_id = store
+        .append_event(
+            &session.id,
+            "hook.started",
+            serde_json::json!({
+                "hook_event_name": event.as_str(),
+                "tool_name": call.map(|call| call.name.as_str()),
+                "tool_call_id": call.map(|call| call.id.as_str()),
+                "command": command,
+                "async": hook.async_run,
+                "status_message": hook.status_message,
+            }),
+        )?
+        .id;
+    if hook.async_run {
+        store.append_event(
+            &session.id,
+            "hook.skipped",
+            serde_json::json!({
+                "hook_id": hook_id,
+                "hook_event_name": event.as_str(),
+                "reason": "async_command_hooks_are_not_run_inline",
+            }),
+        )?;
+        return Ok(HookRunOutcome::default());
+    }
+    let output = match run_hook_command_process(
+        &session.cwd,
+        &command,
+        &hook_input,
+        hook.timeout_sec.map(Duration::from_secs),
+    ) {
+        Ok(output) => output,
+        Err(error) => {
+            store.append_event(
+                &session.id,
+                "hook.failed",
+                serde_json::json!({
+                    "hook_id": hook_id,
+                    "hook_event_name": event.as_str(),
+                    "tool_name": call.map(|call| call.name.as_str()),
+                    "tool_call_id": call.map(|call| call.id.as_str()),
+                    "error": format!("{error:#}"),
+                }),
+            )?;
+            return Ok(HookRunOutcome::default());
+        }
+    };
+    store.append_event(
+        &session.id,
+        "hook.completed",
+        serde_json::json!({
+            "hook_id": hook_id,
+            "hook_event_name": event.as_str(),
+            "tool_name": call.map(|call| call.name.as_str()),
+            "tool_call_id": call.map(|call| call.id.as_str()),
+            "status": output.status,
+            "stdout": truncate_text_for_event(&output.stdout, 4000),
+            "stderr": truncate_text_for_event(&output.stderr, 4000),
+        }),
+    )?;
+    Ok(parse_hook_command_output(
+        event,
+        &output.stdout,
+        &output.stderr,
+        output.status,
+    ))
+}
+
+fn hook_command_input(
+    session: &SessionMeta,
+    event: HookEventName,
+    call: Option<&ToolCall>,
+    tool_input: Option<&Value>,
+    model: &str,
+    extra: Value,
+) -> Value {
+    let mut input = serde_json::json!({
+        "session_id": session.id,
+        "turn_id": session.id,
+        "agent_id": Value::Null,
+        "agent_type": Value::Null,
+        "transcript_path": Value::Null,
+        "cwd": session.cwd.as_str(),
+        "hook_event_name": event.as_str(),
+        "model": model,
+        "permission_mode": "never",
+    });
+    if let Some(call) = call {
+        input["tool_name"] = Value::String(hook_canonical_tool_name(call).to_string());
+        input["tool_use_id"] = Value::String(call.id.clone());
+        input["tool_input"] = tool_input
+            .cloned()
+            .unwrap_or_else(|| call.arguments.clone());
+    }
+    if let (Value::Object(input), Value::Object(extra)) = (&mut input, extra) {
+        input.extend(extra);
+    }
+    input
+}
+
+fn hook_canonical_tool_name(call: &ToolCall) -> &str {
+    match call.name.as_str() {
+        "exec_command" | "shell_command" => "Bash",
+        "apply_patch" => "ApplyPatch",
+        "read_file" => "Read",
+        "search_files" => "Grep",
+        "list_files" => "Glob",
+        "view_image" => "ViewImage",
+        "spawn_agent" => "Task",
+        "done" => "Done",
+        other => other,
+    }
+}
+
+struct HookProcessOutput {
+    status: i32,
+    stdout: String,
+    stderr: String,
+}
+
+fn run_hook_command_process(
+    cwd: &str,
+    command: &str,
+    input: &Value,
+    timeout: Option<Duration>,
+) -> Result<HookProcessOutput> {
+    let mut child = if cfg!(windows) {
+        ProcessCommand::new("cmd")
+            .args(["/C", command])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    } else {
+        ProcessCommand::new("sh")
+            .args(["-lc", command])
+            .current_dir(cwd)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()
+    }
+    .with_context(|| format!("spawn hook command `{command}`"))?;
+    if let Some(stdin) = child.stdin.as_mut() {
+        let input = serde_json::to_vec(input)?;
+        stdin.write_all(&input)?;
+    }
+    drop(child.stdin.take());
+    let started = Instant::now();
+    if let Some(timeout) = timeout {
+        loop {
+            if child.try_wait()?.is_some() {
+                break;
+            }
+            if started.elapsed() >= timeout {
+                let _ = child.kill();
+                let output = child.wait_with_output()?;
+                return Ok(HookProcessOutput {
+                    status: -1,
+                    stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+                    stderr: format!(
+                        "{}\nhook command timed out after {} ms",
+                        String::from_utf8_lossy(&output.stderr),
+                        timeout.as_millis()
+                    )
+                    .trim()
+                    .to_string(),
+                });
+            }
+            thread::sleep(Duration::from_millis(20));
+        }
+    }
+    let output = child.wait_with_output()?;
+    Ok(HookProcessOutput {
+        status: output.status.code().unwrap_or(-1),
+        stdout: String::from_utf8_lossy(&output.stdout).to_string(),
+        stderr: String::from_utf8_lossy(&output.stderr).to_string(),
+    })
+}
+
+fn parse_hook_command_output(
+    event: HookEventName,
+    stdout: &str,
+    stderr: &str,
+    status: i32,
+) -> HookRunOutcome {
+    let mut outcome = HookRunOutcome::default();
+    let trimmed = stdout.trim();
+    if !trimmed.is_empty() {
+        if let Ok(value) = serde_json::from_str::<Value>(trimmed) {
+            apply_json_hook_output(event, &mut outcome, &value);
+        } else if status == 0 {
+            outcome.additional_contexts.push(trimmed.to_string());
+        }
+    }
+    if status == 2 && outcome.block_reason.is_none() && outcome.stop_reason.is_none() {
+        if let Some(reason) = stderr
+            .trim()
+            .lines()
+            .find(|line| !line.trim().is_empty())
+            .map(str::to_string)
+        {
+            match event {
+                HookEventName::PreToolUse => outcome.block_reason = Some(reason),
+                HookEventName::UserPromptSubmit | HookEventName::Stop => {
+                    outcome.stop_reason = Some(reason)
+                }
+                HookEventName::PostToolUse | HookEventName::SubagentStop => {
+                    outcome.feedback_messages.push(reason)
+                }
+                HookEventName::PreCompact => outcome.stop_reason = Some(reason),
+                _ => outcome.additional_contexts.push(reason),
+            }
+        } else {
+            outcome.additional_contexts.push(format!(
+                "{} hook exited with code 2 without required stderr feedback",
+                event.as_str()
+            ));
+        }
+    } else if status != 0 && outcome.block_reason.is_none() && outcome.stop_reason.is_none() {
+        let reason = stderr
+            .trim()
+            .lines()
+            .next()
+            .filter(|line| !line.trim().is_empty())
+            .unwrap_or("hook command failed")
+            .to_string();
+        outcome.additional_contexts.push(format!(
+            "{} hook command exited with status {status}: {reason}",
+            event.as_str()
+        ));
+    }
+    outcome
+}
+
+fn apply_json_hook_output(event: HookEventName, outcome: &mut HookRunOutcome, value: &Value) {
+    if value
+        .get("continue")
+        .and_then(Value::as_bool)
+        .is_some_and(|continue_run| !continue_run)
+    {
+        outcome.stop_reason = Some(
+            value
+                .get("stopReason")
+                .or_else(|| value.get("reason"))
+                .and_then(Value::as_str)
+                .unwrap_or("hook requested stop")
+                .to_string(),
+        );
+    }
+    if let Some(system_message) = value.get("systemMessage").and_then(Value::as_str) {
+        if !system_message.trim().is_empty() {
+            outcome.additional_contexts.push(system_message.to_string());
+        }
+    }
+    if value.get("decision").and_then(Value::as_str) == Some("block") {
+        let reason = value
+            .get("reason")
+            .and_then(Value::as_str)
+            .unwrap_or("hook blocked the action")
+            .to_string();
+        if event == HookEventName::PostToolUse {
+            outcome.feedback_messages.push(reason);
+        } else {
+            outcome.block_reason = Some(reason);
+        }
+    } else if event == HookEventName::PostToolUse {
+        if let Some(reason) = value.get("reason").and_then(Value::as_str) {
+            if !reason.trim().is_empty() {
+                outcome.feedback_messages.push(reason.to_string());
+            }
+        }
+    }
+    let hook_specific = value
+        .get("hookSpecificOutput")
+        .or_else(|| value.get("hook_specific_output"));
+    if let Some(hook_specific) = hook_specific {
+        if let Some(additional_context) = hook_specific
+            .get("additionalContext")
+            .or_else(|| hook_specific.get("additional_context"))
+            .and_then(Value::as_str)
+        {
+            if !additional_context.trim().is_empty() {
+                outcome
+                    .additional_contexts
+                    .push(additional_context.to_string());
+            }
+        }
+        if event == HookEventName::PreToolUse {
+            if let Some(updated_input) = hook_specific
+                .get("updatedInput")
+                .or_else(|| hook_specific.get("updated_input"))
+            {
+                outcome.updated_input = Some(updated_input.clone());
+            }
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct WorktreeSnapshot {
+    status: String,
+    diff: String,
+    changed_files: Vec<String>,
+}
+
+fn git_worktree_snapshot(cwd: &str) -> Option<WorktreeSnapshot> {
+    let inside = run_git_for_snapshot(cwd, &["rev-parse", "--is-inside-work-tree"])?;
+    if inside.trim() != "true" {
+        return None;
+    }
+    let status = run_git_for_snapshot(cwd, &["status", "--short"])?;
+    let diff = run_git_for_snapshot(cwd, &["diff", "--no-ext-diff", "--no-color", "--"])?;
+    let names = run_git_for_snapshot(cwd, &["diff", "--name-only", "--"])?;
+    let mut seen = HashSet::new();
+    let mut changed_files = Vec::new();
+    for name in names
+        .lines()
+        .chain(status.lines().filter_map(status_changed_path))
+    {
+        let name = name.trim();
+        if !name.is_empty() && seen.insert(name.to_string()) {
+            changed_files.push(name.to_string());
+        }
+    }
+    Some(WorktreeSnapshot {
+        status,
+        diff,
+        changed_files,
+    })
+}
+
+fn run_git_for_snapshot(cwd: &str, args: &[&str]) -> Option<String> {
+    let output = ProcessCommand::new("git")
+        .arg("-C")
+        .arg(cwd)
+        .args(args)
+        .output()
+        .ok()?;
+    output
+        .status
+        .success()
+        .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn status_changed_path(line: &str) -> Option<&str> {
+    let text = line.get(3..)?.trim();
+    if text.is_empty() {
+        return None;
+    }
+    text.split(" -> ").last()
+}
+
+fn append_turn_git_diff_if_changed(
+    store: &Store,
+    session: &SessionMeta,
+    before: Option<&WorktreeSnapshot>,
+    turn_idx: usize,
+) -> Result<()> {
+    let Some(before) = before else {
+        return Ok(());
+    };
+    let Some(after) = git_worktree_snapshot(&session.cwd) else {
+        return Ok(());
+    };
+    if &after == before {
+        return Ok(());
+    }
+    let diff_truncated = after.diff.chars().count() > 60_000;
+    store.append_event(
+        &session.id,
+        "turn.diff",
+        serde_json::json!({
+            "source": "git_worktree",
+            "turn_idx": turn_idx,
+            "changed_files": after.changed_files.len(),
+            "files": after.changed_files,
+            "status": after.status,
+            "unified_diff": truncate_text_for_event(&after.diff, 60_000),
+            "diff_truncated": diff_truncated,
+        }),
+    )?;
     Ok(())
 }
 
@@ -8878,6 +10168,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
     tool_calls: Vec<ToolCall>,
     options: &AgentRunOptions,
     base_instructions: &Option<String>,
+    runtime_hooks: &RuntimeHookConfig,
     tool_output_token_budget: usize,
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
@@ -8889,15 +10180,21 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
         provider.model_name(),
         provider.supports_namespace_tools(),
     )?;
+    let supports_original_image_detail =
+        resolved_model_request_info_for_session(session, options, provider.model_name())?
+            .supports_image_detail_original;
     let mut outcomes = Vec::new();
     let mut index = 0;
     while index < tool_calls.len() {
         ensure_not_cancelled(store, &session.id)?;
-        if tool_call_supports_parallel(&registry, &tool_calls[index]) {
+        if tool_call_supports_parallel(&registry, &tool_calls[index])
+            && !tool_call_has_matching_hooks(runtime_hooks, &tool_calls[index])
+        {
             let batch_start = index;
             index += 1;
             while index < tool_calls.len()
                 && tool_call_supports_parallel(&registry, &tool_calls[index])
+                && !tool_call_has_matching_hooks(runtime_hooks, &tool_calls[index])
             {
                 index += 1;
             }
@@ -8911,6 +10208,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
                 step_span,
                 turn_idx,
                 tool_output_token_budget,
+                supports_original_image_detail,
             )?);
             continue;
         }
@@ -8925,6 +10223,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
             &call,
             options,
             base_instructions,
+            runtime_hooks,
             tool_output_token_budget,
             telemetry,
             step_span,
@@ -8939,6 +10238,14 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
     Ok(outcomes)
 }
 
+fn tool_call_has_matching_hooks(hooks: &RuntimeHookConfig, call: &ToolCall) -> bool {
+    hooks
+        .pre_tool_use
+        .iter()
+        .chain(hooks.post_tool_use.iter())
+        .any(|group| hook_group_matches(group, Some(call), None))
+}
+
 fn dispatch_parallel_tool_batch(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
@@ -8948,6 +10255,7 @@ fn dispatch_parallel_tool_batch(
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
     tool_output_token_budget: usize,
+    supports_original_image_detail: bool,
 ) -> Result<Vec<ToolDispatchOutcome>> {
     if batch.is_empty() {
         return Ok(Vec::new());
@@ -8963,6 +10271,7 @@ fn dispatch_parallel_tool_batch(
             step_span,
             turn_idx,
             tool_output_token_budget,
+            supports_original_image_detail,
         )?]);
     }
 
@@ -8997,6 +10306,7 @@ fn dispatch_parallel_tool_batch(
                     &registry,
                     &call,
                     tool_output_token_budget,
+                    supports_original_image_detail,
                 )
             })
         })
@@ -9057,20 +10367,49 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
     call: &ToolCall,
     options: &AgentRunOptions,
     base_instructions: &Option<String>,
+    runtime_hooks: &RuntimeHookConfig,
     tool_output_token_budget: usize,
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
 ) -> Result<ToolDispatchOutcome> {
     let tool_span = telemetry.start_tool_span(step_span, &session.id, turn_idx, call);
-    let outcome = match dispatch_tool_call_recoverably(
+    let mut effective_call = call.clone();
+    let mut prefix_messages = Vec::new();
+    if let Some(decision) = run_pre_tool_use_hooks(
+        store,
+        session,
+        runtime_hooks,
+        provider.model_name(),
+        &effective_call,
+        tool_output_token_budget,
+    )? {
+        match decision {
+            PreToolUseHookDecision::Continue {
+                updated_input,
+                context_messages,
+            } => {
+                prefix_messages.extend(context_messages);
+                if let Some(updated_input) = updated_input {
+                    effective_call.arguments = updated_input;
+                }
+            }
+            PreToolUseHookDecision::Blocked(outcome) => {
+                record_tool_success(telemetry, &tool_span, &outcome);
+                drop(tool_span);
+                return Ok(outcome);
+            }
+        }
+    }
+    let mut outcome = match dispatch_tool_call_recoverably(
         store,
         provider,
         session,
         worker,
-        call,
+        &effective_call,
         options,
         base_instructions,
+        runtime_hooks,
         tool_output_token_budget,
     ) {
         Ok(outcome) => {
@@ -9082,6 +10421,32 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
             return Err(error);
         }
     };
+    if !prefix_messages.is_empty() {
+        let mut messages = prefix_messages;
+        messages.extend(outcome.messages);
+        outcome.messages = messages;
+    }
+    let post_hook_result = run_post_tool_use_hooks(
+        store,
+        session,
+        runtime_hooks,
+        provider.model_name(),
+        &effective_call,
+        &outcome.messages,
+    )?;
+    if let Some(replacement_text) = post_hook_result.replacement_text {
+        outcome.messages = vec![tool_text_message(
+            store,
+            session,
+            &effective_call,
+            &effective_call.name,
+            &replacement_text,
+            tool_output_token_budget,
+        )?];
+    }
+    if !post_hook_result.context_messages.is_empty() {
+        outcome.messages.extend(post_hook_result.context_messages);
+    }
     drop(tool_span);
     Ok(outcome)
 }
@@ -9095,6 +10460,7 @@ fn dispatch_parallel_tool_call_for_turn(
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
     tool_output_token_budget: usize,
+    supports_original_image_detail: bool,
 ) -> Result<ToolDispatchOutcome> {
     let tool_span = telemetry.start_tool_span(step_span, &session.id, turn_idx, &call);
     let outcome = match dispatch_parallel_tool_call_recoverably(
@@ -9103,6 +10469,7 @@ fn dispatch_parallel_tool_call_for_turn(
         registry,
         &call,
         tool_output_token_budget,
+        supports_original_image_detail,
     ) {
         Ok(outcome) => {
             record_tool_success(telemetry, &tool_span, &outcome);
@@ -9142,6 +10509,7 @@ fn dispatch_tool_call_recoverably<P: ModelProvider>(
     call: &ToolCall,
     options: &AgentRunOptions,
     base_instructions: &Option<String>,
+    runtime_hooks: &RuntimeHookConfig,
     tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     match dispatch_tool_call(
@@ -9152,6 +10520,7 @@ fn dispatch_tool_call_recoverably<P: ModelProvider>(
         call,
         options,
         base_instructions,
+        runtime_hooks,
         tool_output_token_budget,
     ) {
         Ok(outcome) => Ok(outcome),
@@ -9168,8 +10537,16 @@ fn dispatch_parallel_tool_call_recoverably(
     registry: &ToolRegistry,
     call: &ToolCall,
     tool_output_token_budget: usize,
+    supports_original_image_detail: bool,
 ) -> Result<ToolDispatchOutcome> {
-    match dispatch_parallel_tool_call(store, session, registry, call, tool_output_token_budget) {
+    match dispatch_parallel_tool_call(
+        store,
+        session,
+        registry,
+        call,
+        tool_output_token_budget,
+        supports_original_image_detail,
+    ) {
         Ok(outcome) => Ok(outcome),
         Err(error) if tool_error_is_recoverable(&error) => {
             dispatch_recovered_tool_error(store, session, call, error)
@@ -9218,8 +10595,17 @@ fn dispatch_parallel_tool_call(
     registry: &ToolRegistry,
     call: &ToolCall,
     tool_output_token_budget: usize,
+    supports_original_image_detail: bool,
 ) -> Result<ToolDispatchOutcome> {
-    match registry.handler_for_namespaced(call.namespace.as_deref(), &call.name) {
+    let handler = registry
+        .handler_for_namespaced(call.namespace.as_deref(), &call.name)
+        .or_else(|| {
+            call.namespace
+                .is_none()
+                .then(|| hidden_legacy_file_tool_handler(&call.name))
+                .flatten()
+        });
+    match handler {
         Some(ToolHandlerKind::ExecCommand) => {
             dispatch_exec_command_tool(store, session, call, tool_output_token_budget)
         }
@@ -9239,9 +10625,13 @@ fn dispatch_parallel_tool_call(
         Some(ToolHandlerKind::ListFiles) => {
             dispatch_list_files_tool(store, session, call, tool_output_token_budget)
         }
-        Some(ToolHandlerKind::ViewImage) => {
-            dispatch_view_image_tool(store, session, call, false, tool_output_token_budget)
-        }
+        Some(ToolHandlerKind::ViewImage) => dispatch_view_image_tool(
+            store,
+            session,
+            call,
+            supports_original_image_detail,
+            tool_output_token_budget,
+        ),
         Some(ToolHandlerKind::ToolSearch) => {
             dispatch_tool_search_tool(store, session, call, registry)
         }
@@ -9265,11 +10655,21 @@ fn tool_call_supports_parallel(registry: &ToolRegistry, call: &ToolCall) -> bool
             (call.namespace.is_none() && call.name == "tool_search")
                 .then(|| registry.handler_for_namespaced(None, "tool_search"))
                 .flatten()
+        })
+        .or_else(|| {
+            call.namespace
+                .is_none()
+                .then(|| hidden_legacy_file_tool_handler(&call.name))
+                .flatten()
         });
     match handler {
         Some(
             ToolHandlerKind::ExecCommand
             | ToolHandlerKind::ShellCommand
+            | ToolHandlerKind::ReadFile
+            | ToolHandlerKind::SearchFiles
+            | ToolHandlerKind::ListFiles
+            | ToolHandlerKind::ViewImage
             | ToolHandlerKind::ToolSearch,
         ) => true,
         _ => false,
@@ -9294,6 +10694,7 @@ fn dispatch_tool_call<P: ModelProvider>(
     call: &ToolCall,
     options: &AgentRunOptions,
     base_instructions: &Option<String>,
+    runtime_hooks: &RuntimeHookConfig,
     tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let registry = browser_tool_registry_for_session(
@@ -9310,7 +10711,14 @@ fn dispatch_tool_call<P: ModelProvider>(
         return dispatch_unknown_tool(store, session, call);
     };
     match handler {
-        ToolHandlerKind::Done => dispatch_done_tool(store, session, call),
+        ToolHandlerKind::Done => dispatch_done_tool_for_turn(
+            store,
+            session,
+            call,
+            provider.model_name(),
+            runtime_hooks,
+            tool_output_token_budget,
+        ),
         ToolHandlerKind::Browser => {
             dispatch_browser_tool(store, session, call, tool_output_token_budget)
         }
@@ -9369,12 +10777,24 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::RequestUserInput => {
             dispatch_request_user_input_tool(store, session, call, options)
         }
-        ToolHandlerKind::SpawnAgent => {
-            dispatch_spawn_agent_tool(store, provider, session, call, options, base_instructions)
-        }
-        ToolHandlerKind::SpawnAgentV1 => {
-            dispatch_spawn_agent_tool(store, provider, session, call, options, base_instructions)
-        }
+        ToolHandlerKind::SpawnAgent => dispatch_spawn_agent_tool_with_hooks(
+            store,
+            provider,
+            session,
+            call,
+            options,
+            base_instructions,
+            runtime_hooks,
+        ),
+        ToolHandlerKind::SpawnAgentV1 => dispatch_spawn_agent_tool_with_hooks(
+            store,
+            provider,
+            session,
+            call,
+            options,
+            base_instructions,
+            runtime_hooks,
+        ),
         ToolHandlerKind::WaitAgent => dispatch_wait_agent_tool(store, session, call, options),
         ToolHandlerKind::WaitAgentV1 => dispatch_wait_agent_v1_tool(store, session, call),
         ToolHandlerKind::SendInputV1 => {
@@ -10897,6 +12317,7 @@ struct AgentsMdConfig {
     provider_request_max_retries: BTreeMap<String, usize>,
     provider_stream_max_retries: BTreeMap<String, usize>,
     provider_stream_idle_timeout_ms: BTreeMap<String, u64>,
+    hooks: RuntimeHookConfig,
 }
 
 impl Default for AgentsMdConfig {
@@ -10948,8 +12369,131 @@ impl Default for AgentsMdConfig {
             provider_request_max_retries: BTreeMap::new(),
             provider_stream_max_retries: BTreeMap::new(),
             provider_stream_idle_timeout_ms: BTreeMap::new(),
+            hooks: RuntimeHookConfig::default(),
         }
     }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct RuntimeHookConfig {
+    pre_tool_use: Vec<HookMatcherGroup>,
+    post_tool_use: Vec<HookMatcherGroup>,
+    pre_compact: Vec<HookMatcherGroup>,
+    post_compact: Vec<HookMatcherGroup>,
+    session_start: Vec<HookMatcherGroup>,
+    user_prompt_submit: Vec<HookMatcherGroup>,
+    subagent_start: Vec<HookMatcherGroup>,
+    subagent_stop: Vec<HookMatcherGroup>,
+    stop: Vec<HookMatcherGroup>,
+}
+
+impl RuntimeHookConfig {
+    fn is_empty(&self) -> bool {
+        self.pre_tool_use.is_empty()
+            && self.post_tool_use.is_empty()
+            && self.pre_compact.is_empty()
+            && self.post_compact.is_empty()
+            && self.session_start.is_empty()
+            && self.user_prompt_submit.is_empty()
+            && self.subagent_start.is_empty()
+            && self.subagent_stop.is_empty()
+            && self.stop.is_empty()
+    }
+
+    fn groups_for_event(&self, event: HookEventName) -> &[HookMatcherGroup] {
+        match event {
+            HookEventName::PreToolUse => &self.pre_tool_use,
+            HookEventName::PostToolUse => &self.post_tool_use,
+            HookEventName::PreCompact => &self.pre_compact,
+            HookEventName::PostCompact => &self.post_compact,
+            HookEventName::SessionStart => &self.session_start,
+            HookEventName::UserPromptSubmit => &self.user_prompt_submit,
+            HookEventName::SubagentStart => &self.subagent_start,
+            HookEventName::SubagentStop => &self.subagent_stop,
+            HookEventName::Stop => &self.stop,
+        }
+    }
+
+    fn groups_for_event_mut(&mut self, event: HookEventName) -> &mut Vec<HookMatcherGroup> {
+        match event {
+            HookEventName::PreToolUse => &mut self.pre_tool_use,
+            HookEventName::PostToolUse => &mut self.post_tool_use,
+            HookEventName::PreCompact => &mut self.pre_compact,
+            HookEventName::PostCompact => &mut self.post_compact,
+            HookEventName::SessionStart => &mut self.session_start,
+            HookEventName::UserPromptSubmit => &mut self.user_prompt_submit,
+            HookEventName::SubagentStart => &mut self.subagent_start,
+            HookEventName::SubagentStop => &mut self.subagent_stop,
+            HookEventName::Stop => &mut self.stop,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HookMatcherGroup {
+    matcher: Option<String>,
+    hooks: Vec<HookCommandConfig>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HookCommandConfig {
+    command: String,
+    command_windows: Option<String>,
+    timeout_sec: Option<u64>,
+    async_run: bool,
+    status_message: Option<String>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum HookEventName {
+    PreToolUse,
+    PostToolUse,
+    PreCompact,
+    PostCompact,
+    SessionStart,
+    UserPromptSubmit,
+    SubagentStart,
+    SubagentStop,
+    Stop,
+}
+
+impl HookEventName {
+    fn as_str(self) -> &'static str {
+        match self {
+            HookEventName::PreToolUse => "PreToolUse",
+            HookEventName::PostToolUse => "PostToolUse",
+            HookEventName::PreCompact => "PreCompact",
+            HookEventName::PostCompact => "PostCompact",
+            HookEventName::SessionStart => "SessionStart",
+            HookEventName::UserPromptSubmit => "UserPromptSubmit",
+            HookEventName::SubagentStart => "SubagentStart",
+            HookEventName::SubagentStop => "SubagentStop",
+            HookEventName::Stop => "Stop",
+        }
+    }
+
+    fn all() -> &'static [HookEventName] {
+        &[
+            HookEventName::PreToolUse,
+            HookEventName::PostToolUse,
+            HookEventName::PreCompact,
+            HookEventName::PostCompact,
+            HookEventName::SessionStart,
+            HookEventName::UserPromptSubmit,
+            HookEventName::SubagentStart,
+            HookEventName::SubagentStop,
+            HookEventName::Stop,
+        ]
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct HookRunOutcome {
+    updated_input: Option<Value>,
+    additional_contexts: Vec<String>,
+    feedback_messages: Vec<String>,
+    block_reason: Option<String>,
+    stop_reason: Option<String>,
 }
 
 impl AgentsMdConfig {
@@ -10964,17 +12508,29 @@ impl AgentsMdConfig {
     }
 
     fn default_base_instructions(&self) -> Option<String> {
-        Some(default_agent_instructions_for_personality(self.personality))
+        Some(default_terminal_agent_instructions_for_personality(
+            self.personality,
+        ))
     }
 
-    fn default_base_instructions_for_model(&self, model: &str) -> Option<String> {
-        Some(
-            default_agent_instructions_for_model_and_personality_with_catalog(
+    fn default_base_instructions_for_model(
+        &self,
+        model: &str,
+        include_browser: bool,
+    ) -> Option<String> {
+        Some(if include_browser {
+            browser_agent_instructions_for_model_and_personality_with_catalog(
                 model,
                 self.personality,
                 self.model_catalog.as_ref(),
-            ),
-        )
+            )
+        } else {
+            default_terminal_agent_instructions_for_model_and_personality_with_catalog(
+                model,
+                self.personality,
+                self.model_catalog.as_ref(),
+            )
+        })
     }
 
     fn base_instructions(&self) -> Result<Option<String>> {
@@ -11759,6 +13315,7 @@ fn apply_agents_md_config_layer(
     apply_web_search_tool_config_layer(config, value, path)?;
     apply_memories_config_layer(config, value, path)?;
     apply_skills_config_layer(config, value, path, relative_base)?;
+    apply_hooks_config_layer(config, value, path)?;
     apply_codex_features_config_layer(config, value, path)?;
     apply_codex_plugins_config_layer(config, value, path)?;
     apply_multi_agent_v2_config_layer(config, value, path)?;
@@ -11959,6 +13516,151 @@ fn apply_codex_plugins_config_layer(
             plugin_config.enabled = enabled;
         }
         config.plugins.insert(plugin_name.clone(), plugin_config);
+    }
+    Ok(())
+}
+
+fn apply_hooks_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+) -> Result<()> {
+    apply_hooks_config_events(config, value, path)?;
+    if let Some(hooks_value) = value.get("hooks") {
+        let Some(_) = hooks_value.as_table() else {
+            bail!(
+                "Invalid Codex config `hooks` from `{}`: expected a table.",
+                path.display()
+            );
+        };
+        apply_hooks_config_events(config, hooks_value, path)?;
+    }
+    Ok(())
+}
+
+fn apply_hooks_config_events(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+) -> Result<()> {
+    for event in HookEventName::all() {
+        let Some(groups_value) = value.get(event.as_str()) else {
+            continue;
+        };
+        let Some(groups) = groups_value.as_array() else {
+            bail!(
+                "Invalid Codex config `{}` from `{}`: expected an array of hook matcher groups.",
+                event.as_str(),
+                path.display()
+            );
+        };
+        for group_value in groups {
+            let Some(group_table) = group_value.as_table() else {
+                bail!(
+                    "Invalid Codex config `{}` from `{}`: expected hook matcher groups to be tables.",
+                    event.as_str(),
+                    path.display()
+                );
+            };
+            let matcher = match group_table.get("matcher") {
+                Some(value) => Some(
+                    value
+                        .as_str()
+                        .ok_or_else(|| {
+                            anyhow!(
+                                "Invalid Codex config `{}.matcher` from `{}`: expected a string.",
+                                event.as_str(),
+                                path.display()
+                            )
+                        })?
+                        .to_string(),
+                ),
+                None => None,
+            };
+            let hooks_value = group_table.get("hooks").ok_or_else(|| {
+                anyhow!(
+                    "Invalid Codex config `{}` from `{}`: expected `hooks` array.",
+                    event.as_str(),
+                    path.display()
+                )
+            })?;
+            let Some(hooks) = hooks_value.as_array() else {
+                bail!(
+                    "Invalid Codex config `{}.hooks` from `{}`: expected an array.",
+                    event.as_str(),
+                    path.display()
+                );
+            };
+            let mut commands = Vec::new();
+            for hook_value in hooks {
+                let Some(hook_table) = hook_value.as_table() else {
+                    bail!(
+                        "Invalid Codex config `{}.hooks` from `{}`: expected hook tables.",
+                        event.as_str(),
+                        path.display()
+                    );
+                };
+                let hook_type = hook_table
+                    .get("type")
+                    .and_then(toml::Value::as_str)
+                    .unwrap_or("command");
+                if hook_type != "command" {
+                    continue;
+                }
+                let command = hook_table
+                    .get("command")
+                    .and_then(toml::Value::as_str)
+                    .map(str::to_string)
+                    .ok_or_else(|| {
+                        anyhow!(
+                            "Invalid Codex config `{}.hooks.command` from `{}`: expected a string.",
+                            event.as_str(),
+                            path.display()
+                        )
+                    })?;
+                let timeout_sec = hook_table
+                    .get("timeout_sec")
+                    .or_else(|| hook_table.get("timeout"))
+                    .map(|value| {
+                        value.as_integer()
+                            .and_then(|integer| u64::try_from(integer).ok())
+                            .filter(|value| *value > 0)
+                            .ok_or_else(|| {
+                                anyhow!(
+                                    "Invalid Codex config `{}.hooks.timeout_sec` from `{}`: expected a positive integer.",
+                                    event.as_str(),
+                                    path.display()
+                                )
+                            })
+                    })
+                    .transpose()?;
+                commands.push(HookCommandConfig {
+                    command,
+                    command_windows: hook_table
+                        .get("command_windows")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string),
+                    timeout_sec,
+                    async_run: hook_table
+                        .get("async")
+                        .and_then(toml::Value::as_bool)
+                        .unwrap_or(false),
+                    status_message: hook_table
+                        .get("status_message")
+                        .and_then(toml::Value::as_str)
+                        .map(str::to_string),
+                });
+            }
+            if !commands.is_empty() {
+                config
+                    .hooks
+                    .groups_for_event_mut(*event)
+                    .push(HookMatcherGroup {
+                        matcher,
+                        hooks: commands,
+                    });
+            }
+        }
     }
     Ok(())
 }
@@ -15022,6 +16724,60 @@ fn dispatch_done_tool(
     })
 }
 
+fn dispatch_done_tool_for_turn(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    model: &str,
+    hooks: &RuntimeHookConfig,
+    tool_output_token_budget: usize,
+) -> Result<ToolDispatchOutcome> {
+    let result_for_hook = call
+        .arguments
+        .get("result")
+        .and_then(Value::as_str)
+        .or_else(|| call.arguments.get("text").and_then(Value::as_str))
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("done");
+    let outcome = run_stop_hooks(store, session, hooks, model, result_for_hook)?;
+    let mut messages = outcome
+        .additional_contexts
+        .into_iter()
+        .map(|context| hook_context_message(HookEventName::Stop, &context))
+        .collect::<Vec<_>>();
+    if let Some(reason) = outcome.block_reason.or(outcome.stop_reason) {
+        store.append_event(
+            &session.id,
+            "hook.blocked",
+            serde_json::json!({
+                "hook_event_name": HookEventName::Stop.as_str(),
+                "tool_name": "done",
+                "tool_call_id": call.id,
+                "reason": reason,
+            }),
+        )?;
+        messages.push(tool_text_message(
+            store,
+            session,
+            call,
+            "done",
+            &format!("done blocked by Stop hook: {reason}"),
+            tool_output_token_budget,
+        )?);
+        return Ok(ToolDispatchOutcome {
+            finished: false,
+            messages,
+        });
+    }
+    let mut done = dispatch_done_tool(store, session, call)?;
+    if !messages.is_empty() {
+        messages.extend(done.messages);
+        done.messages = messages;
+    }
+    Ok(done)
+}
+
 fn done_result_file_info(
     session: &browser_use_protocol::SessionMeta,
     requested_path: &str,
@@ -15279,6 +17035,7 @@ fn dispatch_python_tool(
     })
 }
 
+#[cfg(test)]
 fn dispatch_spawn_agent_tool<P: ModelProvider>(
     store: &Store,
     provider: &P,
@@ -15286,6 +17043,26 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
     call: &ToolCall,
     options: &AgentRunOptions,
     base_instructions: &Option<String>,
+) -> Result<ToolDispatchOutcome> {
+    dispatch_spawn_agent_tool_with_hooks(
+        store,
+        provider,
+        session,
+        call,
+        options,
+        base_instructions,
+        &RuntimeHookConfig::default(),
+    )
+}
+
+fn dispatch_spawn_agent_tool_with_hooks<P: ModelProvider>(
+    store: &Store,
+    provider: &P,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    options: &AgentRunOptions,
+    base_instructions: &Option<String>,
+    runtime_hooks: &RuntimeHookConfig,
 ) -> Result<ToolDispatchOutcome> {
     let legacy_v1 = call.namespace.as_deref() == Some("multi_agent_v1");
     if let Err(error) = validate_spawn_agent_arguments(&call.arguments, legacy_v1) {
@@ -15600,7 +17377,14 @@ fn dispatch_spawn_agent_tool<P: ModelProvider>(
             run_existing_session_with_provider(store, provider, &child.id, child_options)
                 .err()
                 .map(|error| format!("{error:#}"));
-        update_parent_from_child_run(store, &session.id, &child.id, run_error)?
+        update_parent_from_child_run_with_hooks(
+            store,
+            &session.id,
+            &child.id,
+            run_error,
+            Some(runtime_hooks),
+            effective_child_model_name,
+        )?
     };
     let mut result_payload = if legacy_v1 {
         serde_json::json!({
@@ -15736,6 +17520,17 @@ pub fn update_parent_from_child_run(
     child_id: &str,
     run_error: Option<String>,
 ) -> Result<Value> {
+    update_parent_from_child_run_with_hooks(store, parent_id, child_id, run_error, None, "unknown")
+}
+
+fn update_parent_from_child_run_with_hooks(
+    store: &Store,
+    parent_id: &str,
+    child_id: &str,
+    run_error: Option<String>,
+    hooks: Option<&RuntimeHookConfig>,
+    model: &str,
+) -> Result<Value> {
     let child = store
         .load_session(child_id)?
         .with_context(|| format!("unknown child session id: {child_id}"))?;
@@ -15769,6 +17564,9 @@ pub fn update_parent_from_child_run(
             "payload": payload,
         }),
     )?;
+    if matches!(status.as_str(), "done" | "failed" | "cancelled") {
+        run_subagent_stop_hooks_for_child(store, parent_id, &child, hooks, model, &payload)?;
+    }
     if matches!(status.as_str(), "done" | "failed" | "cancelled")
         && parent_can_receive_subagent_completion_mail(store, parent_id)?
     {
@@ -15778,6 +17576,97 @@ pub fn update_parent_from_child_run(
         store.send_agent_message(child_id, parent_id, &notification, false)?;
     }
     Ok(payload)
+}
+
+fn run_subagent_stop_hooks_for_child(
+    store: &Store,
+    parent_id: &str,
+    child: &SessionMeta,
+    hooks: Option<&RuntimeHookConfig>,
+    model: &str,
+    payload: &Value,
+) -> Result<()> {
+    let loaded_hooks;
+    let hooks = if let Some(hooks) = hooks {
+        hooks
+    } else {
+        let options = AgentRunOptions::default();
+        loaded_hooks = load_provider_config_for_session(child, &options)?.hooks;
+        &loaded_hooks
+    };
+    if hooks.subagent_stop.is_empty() {
+        return Ok(());
+    }
+    let summary = store.agent_summary_for_child(&child.id)?;
+    let agent_type = summary
+        .as_ref()
+        .and_then(|summary| summary.agent_role.clone())
+        .unwrap_or_else(|| "default".to_string());
+    let result = payload.get("result").cloned().unwrap_or(Value::Null);
+    let failure = payload.get("failure").cloned().unwrap_or(Value::Null);
+    let last_assistant_message = result.as_str().map(str::to_string);
+    let outcome = run_hooks_for_event(
+        store,
+        child,
+        hooks,
+        HookEventName::SubagentStop,
+        None,
+        Some(agent_type.as_str()),
+        None,
+        model,
+        serde_json::json!({
+            "agent_id": child.id,
+            "agent_type": agent_type,
+            "parent_session_id": parent_id,
+            "status": child.status.as_str(),
+            "result": result,
+            "failure": failure,
+            "stop_hook_active": false,
+            "last_assistant_message": last_assistant_message,
+            "agent_transcript_path": Value::Null,
+        }),
+    )?;
+    for context in outcome.additional_contexts {
+        store.append_event(
+            &child.id,
+            "hook.context",
+            serde_json::json!({
+                "hook_event_name": HookEventName::SubagentStop.as_str(),
+                "content": context,
+            }),
+        )?;
+    }
+    if let Some(reason) = outcome
+        .feedback_messages
+        .first()
+        .cloned()
+        .or(outcome.block_reason)
+        .or(outcome.stop_reason)
+    {
+        store.append_event(
+            &child.id,
+            "hook.blocked",
+            serde_json::json!({
+                "hook_event_name": HookEventName::SubagentStop.as_str(),
+                "reason": reason,
+            }),
+        )?;
+        if parent_can_receive_subagent_completion_mail(store, parent_id)? {
+            store.send_agent_message(
+                &child.id,
+                parent_id,
+                &format!(
+                    "<subagent_notification>\n{}\n</subagent_notification>",
+                    serde_json::json!({
+                        "agent_path": display_agent_path_for_session(store, &child.id)?,
+                        "status": { "blocked": reason },
+                    })
+                ),
+                true,
+            )?;
+        }
+    }
+    Ok(())
 }
 
 fn parent_can_receive_subagent_completion_mail(store: &Store, parent_id: &str) -> Result<bool> {
@@ -19807,6 +21696,34 @@ x-env = "CORP_HEADER"
             .expect("instructions");
         assert!(instructions.contains("supportive teammate as much as code quality"));
         assert!(!instructions.contains("deeply pragmatic, effective software engineer"));
+        assert!(!instructions.contains("Browser Agent Contract"));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_includes_browser_contract_only_for_browser_runs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let project = temp.path().join("project");
+        std::fs::create_dir_all(project.join(".git"))?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = InstructionCapturingProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "capture browser instructions",
+                &project,
+                AgentRunOptions::default().with_browser_mode("local"),
+            )
+        })?;
+
+        let captured = provider.captured_instructions();
+        let instructions = captured
+            .first()
+            .and_then(Option::as_deref)
+            .context("instructions")?;
         assert!(instructions.contains("Browser Agent Contract"));
         Ok(())
     }
@@ -29054,6 +30971,319 @@ name = "Thread"
     }
 
     #[test]
+    fn pre_tool_use_command_hook_can_update_input_and_add_context() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\",\"updatedInput\":{\"cmd\":\"printf hook-updated\"},\"additionalContext\":\"pre context\"}}}'"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = HookUpdatingProvider::default();
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "run hook-updated command",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "hook.completed"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "hook updated"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn pre_tool_use_exit_code_two_blocks_tool_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"[[hooks.PreToolUse]]
+matcher = "^Bash$"
+
+[[hooks.PreToolUse.hooks]]
+type = "command"
+command = "printf blocked-by-hook >&2; exit 2"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = HookBlockingProvider::default();
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "try a blocked command",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "hook.blocked"
+                && event.payload["hook_event_name"] == "PreToolUse"
+                && event.payload["reason"] == "blocked-by-hook"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "blocked ok"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn hook_matchers_use_codex_exact_and_regex_semantics() {
+        assert!(hook_matcher_matches(Some("Bash|Read"), "Bash"));
+        assert!(!hook_matcher_matches(Some("Bash"), "BashOutput"));
+        assert!(hook_matcher_matches(
+            Some("mcp__memory__.*"),
+            "mcp__memory__create_entities"
+        ));
+        assert!(!hook_matcher_matches(Some("["), "Bash"));
+        assert!(hook_matcher_matches(Some(""), "Bash"));
+        assert!(hook_matcher_matches(None, "Bash"));
+    }
+
+    #[test]
+    fn post_tool_use_feedback_replaces_model_visible_tool_output_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"[[hooks.PostToolUse]]
+matcher = "Bash"
+
+[[hooks.PostToolUse.hooks]]
+type = "command"
+command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replacement\"}'"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = PostToolFeedbackProvider::default();
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "run command with post feedback",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "hook.feedback"
+                && event.payload["hook_event_name"] == "PostToolUse"
+                && event.payload["feedback"] == "post hook replacement"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "post feedback ok"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn subagent_start_and_stop_hooks_use_agent_type_matcher() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/research"),
+            Some("Researcher"),
+            Some("explorer"),
+        )?;
+        let hooks = RuntimeHookConfig {
+            subagent_start: vec![HookMatcherGroup {
+                matcher: Some("explorer".to_string()),
+                hooks: vec![HookCommandConfig {
+                    command: "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\",\"additionalContext\":\"child start context\"}}'".to_string(),
+                    command_windows: None,
+                    timeout_sec: None,
+                    async_run: false,
+                    status_message: None,
+                }],
+            }],
+            subagent_stop: vec![HookMatcherGroup {
+                matcher: Some("^explorer$".to_string()),
+                hooks: vec![HookCommandConfig {
+                    command: "printf subagent-stop-feedback >&2; exit 2".to_string(),
+                    command_windows: None,
+                    timeout_sec: None,
+                    async_run: false,
+                    status_message: None,
+                }],
+            }],
+            ..RuntimeHookConfig::default()
+        };
+
+        let start_messages = run_session_start_hooks(&store, &child, &hooks, "gpt-5.4")?;
+        assert_eq!(start_messages.len(), 1);
+        assert_eq!(start_messages[0]["hook_event_name"], "SubagentStart");
+        assert!(message_content_text(&start_messages[0]).contains("child start context"));
+
+        store.set_status(&child.id, SessionStatus::Done)?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({ "result": "child finished" }),
+        )?;
+        update_parent_from_child_run_with_hooks(
+            &store,
+            &parent.id,
+            &child.id,
+            None,
+            Some(&hooks),
+            "gpt-5.4",
+        )?;
+        let child_events = store.events_for_session(&child.id)?;
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "hook.completed"
+                && event.payload["hook_event_name"] == "SubagentStop"
+        }));
+        assert!(child_events.iter().any(|event| {
+            event.event_type == "hook.blocked"
+                && event.payload["hook_event_name"] == "SubagentStop"
+                && event.payload["reason"] == "subagent-stop-feedback"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn compact_hooks_run_around_model_compaction() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"[[hooks.PreCompact]]
+matcher = "^auto$"
+
+[[hooks.PreCompact.hooks]]
+type = "command"
+command = "printf '{}'"
+
+[[hooks.PostCompact]]
+matcher = "^auto$"
+
+[[hooks.PostCompact.hooks]]
+type = "command"
+command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact\",\"additionalContext\":\"post compact context\"}}'"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = ModelCompactionProvider::default();
+        let options = AgentRunOptions {
+            max_context_chars: 40,
+            model_compaction_enabled: true,
+            ..AgentRunOptions::default()
+        };
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "This prompt is intentionally long enough to trigger compact hooks.",
+                temp.path(),
+                options,
+            )
+        })?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "hook.completed" && event.payload["hook_event_name"] == "PreCompact"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "hook.completed"
+                && event.payload["hook_event_name"] == "PostCompact"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn stop_hook_blocks_done_tool_finalization_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let hooks = RuntimeHookConfig {
+            stop: vec![HookMatcherGroup {
+                matcher: None,
+                hooks: vec![HookCommandConfig {
+                    command: "printf keep-going >&2; exit 2".to_string(),
+                    command_windows: None,
+                    timeout_sec: None,
+                    async_run: false,
+                    status_message: None,
+                }],
+            }],
+            ..RuntimeHookConfig::default()
+        };
+        let call = ToolCall {
+            id: "done_stop_hook".to_string(),
+            name: "done".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({ "result": "premature" }),
+        };
+
+        let outcome = dispatch_done_tool_for_turn(
+            &store,
+            &session,
+            &call,
+            "gpt-5.4",
+            &hooks,
+            DEFAULT_TOOL_OUTPUT_TEXT_TOKENS,
+        )?;
+
+        assert!(!outcome.finished);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "hook.blocked"
+                && event.payload["hook_event_name"] == "Stop"
+                && event.payload["reason"] == "keep-going"
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.done"));
+        Ok(())
+    }
+
+    #[test]
+    fn model_compaction_uses_provider_summary_when_enabled() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let provider = ModelCompactionProvider::default();
+        let options = AgentRunOptions {
+            max_context_chars: 40,
+            model_compaction_enabled: true,
+            ..AgentRunOptions::default()
+        };
+        let session_id = run_agent_with_provider(
+            &store,
+            &provider,
+            "This prompt is intentionally long enough to trigger local model compaction.",
+            temp.path(),
+            options,
+        )?;
+        let events = store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.compaction_model_summary"
+                && event.payload["summary"] == "summary from model"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.compacted" && event.payload["summary_mode"] == "model"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn provider_can_update_plan() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -34708,17 +36938,17 @@ enabled = true
                     ModelEvent::ToolCall {
                         call: ToolCall {
                             id: "read_second".to_string(),
-                            name: "exec_command".to_string(),
+                            name: "read_file".to_string(),
                             namespace: None,
-                            arguments: serde_json::json!({ "cmd": "cat second.txt" }),
+                            arguments: serde_json::json!({ "path": "second.txt" }),
                         },
                     },
                     ModelEvent::ToolCall {
                         call: ToolCall {
                             id: "read_first".to_string(),
-                            name: "exec_command".to_string(),
+                            name: "read_file".to_string(),
                             namespace: None,
-                            arguments: serde_json::json!({ "cmd": "cat first.txt" }),
+                            arguments: serde_json::json!({ "path": "first.txt" }),
                         },
                     },
                     ModelEvent::Done,
@@ -34751,6 +36981,179 @@ enabled = true
             };
             *step += 1;
             Ok(events)
+        }
+    }
+
+    #[derive(Default)]
+    struct HookUpdatingProvider {
+        step: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for HookUpdatingProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let events = if *step == 0 {
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "shell_1".to_string(),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "cmd": "printf original" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            } else {
+                let joined = turn
+                    .messages
+                    .iter()
+                    .map(message_content_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(joined.contains("hook-updated"));
+                assert!(joined.contains("pre context"));
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "done_hook".to_string(),
+                            name: "done".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "result": "hook updated" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            };
+            *step += 1;
+            Ok(events)
+        }
+    }
+
+    #[derive(Default)]
+    struct HookBlockingProvider {
+        step: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for HookBlockingProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let events = if *step == 0 {
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "blocked_shell".to_string(),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "cmd": "printf should-not-run" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            } else {
+                let joined = turn
+                    .messages
+                    .iter()
+                    .map(message_content_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(joined.contains("blocked-by-hook"));
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "done_after_blocked_hook".to_string(),
+                            name: "done".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "result": "blocked ok" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            };
+            *step += 1;
+            Ok(events)
+        }
+    }
+
+    #[derive(Default)]
+    struct PostToolFeedbackProvider {
+        step: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for PostToolFeedbackProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut step = self.step.lock().expect("step lock");
+            let events = if *step == 0 {
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "post_feedback_shell".to_string(),
+                            name: "exec_command".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "cmd": "printf original-output" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            } else {
+                let joined = turn
+                    .messages
+                    .iter()
+                    .map(message_content_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(joined.contains("post hook replacement"));
+                assert!(!joined.contains("original-output"));
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "done_after_post_feedback".to_string(),
+                            name: "done".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "result": "post feedback ok" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]
+            };
+            *step += 1;
+            Ok(events)
+        }
+    }
+
+    #[derive(Default)]
+    struct ModelCompactionProvider {
+        normal_turns: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for ModelCompactionProvider {
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            if turn.tools.is_empty()
+                && turn
+                    .messages
+                    .iter()
+                    .any(|message| message_content_text(message).contains("handoff summary"))
+            {
+                return Ok(vec![
+                    ModelEvent::TextDelta {
+                        text: "summary from model".to_string(),
+                    },
+                    ModelEvent::Done,
+                ]);
+            }
+            let mut normal_turns = self.normal_turns.lock().expect("normal turns lock");
+            *normal_turns += 1;
+            Ok(vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_model_compaction".to_string(),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({ "result": "model compaction ok" }),
+                    },
+                },
+                ModelEvent::Done,
+            ])
         }
     }
 

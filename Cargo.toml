@@ -28,6 +28,7 @@ iana-time-zone = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }
 reqwest = { version = "0.12", default-features = false, features = ["blocking", "json", "rustls-tls"] }
+regex = "1"
 rustls = { version = "0.23", default-features = false, features = ["std", "aws_lc_rs"] }
 rusqlite = { version = "0.39", features = ["bundled"] }
 serde = { version = "1", features = ["derive"] }

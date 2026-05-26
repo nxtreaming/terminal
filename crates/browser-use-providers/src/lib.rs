@@ -4523,6 +4523,50 @@ pub fn default_agent_instructions_for_model_and_personality_with_catalog(
     personality: ModelPersonality,
     catalog: Option<&ModelCatalog>,
 ) -> String {
+    browser_agent_instructions_for_model_and_personality_with_catalog(model, personality, catalog)
+}
+
+pub fn default_terminal_agent_instructions() -> String {
+    default_terminal_agent_instructions_for_model_and_personality(
+        "gpt-5.4",
+        ModelPersonality::Pragmatic,
+    )
+}
+
+pub fn default_terminal_agent_instructions_for_personality(
+    personality: ModelPersonality,
+) -> String {
+    default_terminal_agent_instructions_for_model_and_personality("gpt-5.4", personality)
+}
+
+pub fn default_terminal_agent_instructions_for_model_and_personality(
+    model: &str,
+    personality: ModelPersonality,
+) -> String {
+    default_terminal_agent_instructions_for_model_and_personality_with_catalog(
+        model,
+        personality,
+        None,
+    )
+}
+
+pub fn default_terminal_agent_instructions_for_model_and_personality_with_catalog(
+    model: &str,
+    personality: ModelPersonality,
+    catalog: Option<&ModelCatalog>,
+) -> String {
+    codex_model_instructions_for_model_and_personality_with_catalog(
+        model,
+        Some(personality),
+        catalog,
+    )
+}
+
+pub fn browser_agent_instructions_for_model_and_personality_with_catalog(
+    model: &str,
+    personality: ModelPersonality,
+    catalog: Option<&ModelCatalog>,
+) -> String {
     let mut instructions = codex_model_instructions_for_model_and_personality_with_catalog(
         model,
         Some(personality),

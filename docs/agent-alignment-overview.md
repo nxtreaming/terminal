@@ -76,6 +76,21 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 - Branch: `agent-gap-zero`
 - Gap log: `docs/agent-gap-log.md`
+- Latest local-runtime batch: non-browser runs now use the Codex terminal-agent
+  prompt without the browser-harness overlay, while CLI/browser runs keep the
+  browser contract. CLI compaction can use the active model for a handoff
+  summary with deterministic local fallback, and TUI runs enable the same local
+  compaction path. Command hooks now cover the first non-approval slice for
+  `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
+  assistant-text `Stop`, `done`-tool `Stop`, and local `PreCompact` /
+  `PostCompact`; exit-code-2 blocking is represented for the main blocking
+  hooks. Read-only file/image tools can batch through parallel dispatch without
+  unrelated hooks disabling batching; shell-originated file changes now emit a
+  `git_worktree` `turn.diff`; and active-turn prompt/mailbox drains are
+  recorded. Remaining runtime gaps are exact hook handler/matcher parity,
+  SubagentStart/SubagentStop hooks, dynamic MCP/app inventory, websocket
+  ack/fallback, streaming-time tool scheduling, app-server lifecycle/input-queue
+  events, exact turn-diff tracking, and deeper goal budget steering.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming
@@ -236,6 +251,14 @@ current gap list.
   names/metadata, `openai.yaml` short descriptions, `skills.include_instructions`,
   `skills.bundled.enabled`, `[[skills.config]]` disable rules, and
   `[memories] use_memories`.
+- The latest broad runtime slice then removed the browser-harness contract from
+  non-browser terminal prompts, added model-assisted local compaction behind a
+  portable provider path, added command hook support for `SessionStart`,
+  `UserPromptSubmit`, `PreToolUse`, `PostToolUse`, `PreCompact`,
+  `PostCompact`, `Stop`, `SubagentStart`, and `SubagentStop`, expanded
+  read-only parallel dispatch, records active-turn mailbox drain and git diff
+  sidecars, and tightened hook semantics with Codex-style exact/regex matchers
+  plus `PostToolUse` feedback replacing model-visible tool output.
 - Verification passed: `cargo fmt --check`, `cargo test`,
   `uv run --with pytest python -m pytest -q`, and `git diff --check`. The
   standing Codex-auth smoke passed again in
@@ -244,18 +267,26 @@ current gap list.
   `/tmp/but-codex-agent-parity-smoke.txt` and returned
   `agent-parity-smoke-ok`.
 - Ten read-only broad auditors then rechecked the current branch against Codex.
-  They agreed the remaining high-impact gaps are hooks, dynamic MCP/app/plugin
-  tool inventory, full goal runtime steering/continuation, full Codex skill
-  manager semantics, model-based local compaction, and input-queue/turn
-  orchestration. Medium gaps are WebSocket/processed-ack transport, memory
-  read-path retrieval/tools, effective-config/context-diff provenance, and
-  subagent control-plane exactness.
+  They agreed the remaining high-impact gaps are now architectural: active-turn
+  input queue semantics, streaming-time tool execution, Codex's full dynamic
+  tool router/inventory, exact local compaction lifecycle, exact subagent
+  control-plane semantics, exact history/turn-diff reconstruction, and sharper
+  tool-error taxonomy. Hook parity is no longer absent, but remains incomplete
+  around async/prompt/agent handlers, exact payload provenance, concurrent
+  execution, strict output validation, and plugin hook sources.
 - Remaining high-impact gaps are true websocket ack/fallback transport,
-  dynamic MCP/app/deferred inventory surfaces, hook runtime/context behavior,
-  deeper goal budget/accounting edge cases, remaining full skill-manager
-  semantics, local model-based compaction, input queue/active-turn steering,
-  memory read-path tools/policy, full effective-config provenance, and any
-  app-server lifecycle surfaces that materially affect local agent quality.
+  dynamic MCP/app/deferred inventory surfaces, deeper goal budget/accounting
+  edge cases, remaining full skill-manager semantics, exact local compaction
+  lifecycle, streaming tool scheduling, input queue/active-turn steering, memory
+  read-path tools/policy, full effective-config provenance, exact subagent
+  control-plane behavior, and any app-server lifecycle surfaces that materially
+  affect local agent quality.
+- Final verification for this slice passed: full Rust workspace, Python tests,
+  `git diff --check`, `scripts/verify-terminal-ui.sh`, artifact inspection under
+  `/tmp/but-design-loop`, and real Codex-auth root/child smokes. Root
+  `de3979b2a0c3` returned `Paris`; child `af40b1adc459` read
+  `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`.
 
 The previous batch extended the G-031/G-034 compaction/token lifecycle slice,
 removed remote-compaction advertising, and removed Codex-only AWS/Bedrock

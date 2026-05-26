@@ -3186,8 +3186,9 @@ impl App {
     }
 
     fn configured_agent_options(&self) -> Result<AgentRunOptions> {
-        let mut options =
-            AgentRunOptions::default().with_collaboration_mode(self.collaboration_mode);
+        let mut options = AgentRunOptions::default()
+            .with_collaboration_mode(self.collaboration_mode)
+            .with_model_compaction(true);
         if let Some(profile) = self.args.config_profile.as_ref() {
             options = options.with_config_profile(profile.clone());
         }

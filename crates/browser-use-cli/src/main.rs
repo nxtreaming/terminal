@@ -1199,6 +1199,7 @@ fn cli_agent_options(
     let mut options = AgentRunOptions::default()
         .with_collaboration_mode(collaboration_mode)
         .with_browser_mode(cli_browser_mode())
+        .with_model_compaction(true)
         .with_analytics_source("cli");
     if let Some(profile) = config_profile {
         options = options.with_config_profile(profile.to_string());
@@ -3493,6 +3494,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         child_agent_runner: None,
         final_output_json_schema: None,
         final_output_json_schema_strict: true,
+        model_compaction_enabled: true,
         analytics_source: Some("cli".to_string()),
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),
