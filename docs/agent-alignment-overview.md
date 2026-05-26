@@ -1658,6 +1658,36 @@ The biggest remaining categories are:
   subagent lifecycle ownership, hooks/skills/plugins/review integration,
   provider/model policy layering, extension/memory depth, and the full
   in-memory `TurnDiffTracker`.
+- The current goal-runtime slice closes several client-side accounting gaps
+  from Codex's goal extension. Goal usage now consumes uncached input plus
+  output tokens rather than raw total tokens; this prevents cached input and
+  reasoning-only deltas from falsely exhausting a goal budget. Goal tool
+  responses now include Codex-shaped `goal`, `remainingTokens`, and
+  `completionBudgetReport` fields while preserving the local response shape.
+  Active goals that cross their token budget are marked `budget_limited`, the
+  next tool finish injects a one-shot hidden wrap-up `<goal_context>`, and
+  non-retryable provider usage-limit failures mark active or budget-limited
+  goals `usage_limited`. This is still event-store based rather than Codex's
+  full state-db extension runtime, so exact wall-clock accounting, external
+  app/server mutations, and first-class active-turn `InputQueue` integration
+  remain open.
+- Verification for the goal-runtime slice passed the full local gate:
+  formatting, whitespace, Python tests, and full Rust workspace tests. The live
+  Codex-auth smoke used root session `a79c499dbbc5` and child session
+  `46c84d2bd649`; the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- A fresh ten-agent broad audit after the goal-runtime slice found no
+  non-goal regression. The auditors treated effective token accounting,
+  `completionBudgetReport`, `budget_limited` wrap-up steering, and
+  `usage_limited` provider-error handling as useful parity movement. Their
+  repeated caution is that this branch-new budget-limited state must stay
+  covered because it now steers model behavior. Remaining goal work is the
+  larger lifecycle layer: persistent goal state, exact wall-clock accounting,
+  external mutation callbacks, TUI/protocol rendering of budget-limited state,
+  and active-turn `InputQueue`/`AgentControl` integration. The broader
+  non-goal gaps remain typed history/replay, dynamic skill/plugin/tool
+  contributors, hook lifecycle depth, subagent lifecycle depth, and
+  provider/model policy layering.
 
 ## Definition of Done
 
