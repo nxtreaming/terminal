@@ -307,6 +307,7 @@ struct StreamingToolScheduler {
     state_dir: PathBuf,
     notifier: Option<browser_use_store::StoreNotifier>,
     handles: HashMap<String, StreamedToolHandle>,
+    predispatch_barrier_attempt: Option<usize>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -8138,6 +8139,7 @@ impl StreamingToolScheduler {
             state_dir: store.state_dir().to_path_buf(),
             notifier: store.notifier(),
             handles: HashMap::new(),
+            predispatch_barrier_attempt: None,
         }
     }
 
@@ -8158,8 +8160,12 @@ impl StreamingToolScheduler {
         if self.handles.contains_key(&call.id) {
             return Ok(());
         }
+        if self.predispatch_barrier_attempt == Some(attempt) {
+            return Ok(());
+        }
         let Some(predispatch_kind) = tool_call_streaming_predispatch_kind(&self.router, call)
         else {
+            self.predispatch_barrier_attempt = Some(attempt);
             return Ok(());
         };
         if !active_turn_pending_queue_input(
@@ -8170,6 +8176,7 @@ impl StreamingToolScheduler {
         .is_empty()
             || tool_call_has_matching_hooks(runtime_hooks, call)
         {
+            self.predispatch_barrier_attempt = Some(attempt);
             return Ok(());
         }
 
@@ -8233,6 +8240,9 @@ impl StreamingToolScheduler {
                 join_streamed_tool_handle(handle, store, &self.session, reason)?;
             }
         }
+        if self.predispatch_barrier_attempt == Some(attempt) {
+            self.predispatch_barrier_attempt = None;
+        }
         Ok(())
     }
 
@@ -8241,6 +8251,7 @@ impl StreamingToolScheduler {
         for (_, handle) in handles {
             join_streamed_tool_handle(handle, store, &self.session, reason)?;
         }
+        self.predispatch_barrier_attempt = None;
         Ok(())
     }
 
@@ -31902,6 +31913,138 @@ name = "Thread"
         }));
         assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "used streamed exec"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_keeps_parallel_predispatch_behind_prior_serial_tool() -> Result<()> {
+        #[derive(Default)]
+        struct SerialThenExecProvider {
+            step: std::sync::Mutex<usize>,
+        }
+
+        impl ModelProvider for SerialThenExecProvider {
+            fn provider_name(&self) -> &str {
+                "serial-then-exec"
+            }
+
+            fn model_name(&self) -> &str {
+                "serial-then-exec"
+            }
+
+            fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                let mut events = Vec::new();
+                self.stream_turn(turn, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })?;
+                Ok(events)
+            }
+
+            fn stream_turn(
+                &self,
+                _turn: ProviderTurn,
+                on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+            ) -> Result<()> {
+                let mut step = self.step.lock().expect("step lock");
+                let events = if *step == 0 {
+                    vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "serial_patch".to_string(),
+                                name: "apply_patch".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({
+                                    "patch": "*** Begin Patch\n*** Add File: serial.txt\n+serial\n*** End Patch\n",
+                                }),
+                            },
+                        },
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "after_serial_exec".to_string(),
+                                name: "exec_command".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({
+                                    "cmd": "test -f serial.txt && printf exec-after-serial > serial-exec-marker.txt",
+                                    "yield_time_ms": 5000,
+                                }),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]
+                } else {
+                    vec![
+                        ModelEvent::ToolCall {
+                            call: ToolCall {
+                                id: "done_after_serial_exec".to_string(),
+                                name: "done".to_string(),
+                                namespace: None,
+                                arguments: serde_json::json!({
+                                    "result": "serial barrier ok",
+                                }),
+                            },
+                        },
+                        ModelEvent::Done,
+                    ]
+                };
+                *step += 1;
+                for event in events {
+                    on_event(event)?;
+                }
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "patch then run command"}),
+        )?;
+        let provider = SerialThenExecProvider::default();
+
+        with_codex_home(&codex_home, || {
+            run_existing_session_with_provider(
+                &store,
+                &provider,
+                &session.id,
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("serial.txt"))?,
+            "serial\n"
+        );
+        assert_eq!(
+            std::fs::read_to_string(temp.path().join("serial-exec-marker.txt"))?,
+            "exec-after-serial"
+        );
+        let events = store.events_for_session(&session.id)?;
+        assert!(!events.iter().any(|event| {
+            event.event_type == "tool.streaming_started"
+                && event.payload["tool_call_id"] == "after_serial_exec"
+        }));
+        let turn_response_seq = events
+            .iter()
+            .find(|event| event.event_type == "model.turn.response")
+            .map(|event| event.seq)
+            .context("missing model turn response event")?;
+        let command_started_seq = events
+            .iter()
+            .find(|event| {
+                event.event_type == "command.started"
+                    && event.payload["tool_call_id"] == "after_serial_exec"
+            })
+            .map(|event| event.seq)
+            .context("missing command started event")?;
+        assert!(turn_response_seq < command_started_seq);
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "serial barrier ok"
         }));
         Ok(())
     }
