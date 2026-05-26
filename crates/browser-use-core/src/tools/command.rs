@@ -333,6 +333,11 @@ pub(crate) fn exec_command_with_budget(
         session,
         call.arguments.get("workdir").and_then(Value::as_str),
     )?;
+    if let Some(result) =
+        maybe_intercept_apply_patch_command(store, session, call, &cmd, &workdir, max_chars, false)?
+    {
+        return Ok(result);
+    }
     let shell = call
         .arguments
         .get("shell")
@@ -526,6 +531,17 @@ pub(crate) fn shell_command_with_budget(
         session,
         call.arguments.get("workdir").and_then(Value::as_str),
     )?;
+    if let Some(result) = maybe_intercept_apply_patch_command(
+        store,
+        session,
+        call,
+        raw_command,
+        &workdir,
+        max_chars,
+        true,
+    )? {
+        return Ok(result);
+    }
     let shell = default_user_shell();
 
     store.append_event(
@@ -650,6 +666,113 @@ fn shell_command_with_snapshot(
         command_text,
         snapshot = shell_single_quote(&snapshot.display().to_string())
     )
+}
+
+fn maybe_intercept_apply_patch_command(
+    store: &Store,
+    session: &SessionMeta,
+    call: &ToolCall,
+    command: &str,
+    workdir: &Path,
+    max_chars: usize,
+    legacy_shell_output: bool,
+) -> Result<Option<CommandToolResult>> {
+    let Some(patch) = extract_apply_patch_heredoc(command) else {
+        return Ok(None);
+    };
+    let mut patch_session = session.clone();
+    patch_session.cwd = workdir.display().to_string();
+    let patch_call = ToolCall {
+        id: call.id.clone(),
+        name: "apply_patch".to_string(),
+        namespace: None,
+        arguments: Value::String(patch),
+    };
+    let result = super::files::apply_patch_tool(store, &patch_session, &patch_call)?;
+    let output = match result.content {
+        Value::String(text) => text,
+        other => other.to_string(),
+    };
+    store.append_event(
+        &session.id,
+        "command.intercepted_apply_patch",
+        json!({
+            "tool_call_id": call.id,
+            "source_tool": call.name,
+            "workdir": workdir.display().to_string(),
+        }),
+    )?;
+    if legacy_shell_output {
+        #[cfg(test)]
+        let content = shell_command_output(0, true, Duration::ZERO, &output, false);
+        let model_text = shell_command_model_text(0, Duration::ZERO, &output, false, max_chars);
+        return Ok(Some(CommandToolResult {
+            #[cfg(test)]
+            content,
+            model_text,
+        }));
+    }
+    let payload = CommandOutputPayload {
+        chunk_id: generate_chunk_id(),
+        session_id: None,
+        running: false,
+        output: &output,
+        max_chars,
+        exit_code: Some(0),
+        duration: Duration::ZERO,
+        tty_requested: false,
+        tty_allocated: false,
+        write_error: None,
+    };
+    #[cfg(test)]
+    let content = command_output(&payload);
+    let model_text = command_model_text(&payload);
+    Ok(Some(CommandToolResult {
+        #[cfg(test)]
+        content,
+        model_text,
+    }))
+}
+
+fn extract_apply_patch_heredoc(command: &str) -> Option<String> {
+    let command = command.trim();
+    let (first_line, rest) = command.split_once('\n')?;
+    let delimiter = apply_patch_heredoc_delimiter(first_line.trim())?;
+    let lines = rest.lines().collect::<Vec<_>>();
+    let end_index = lines
+        .iter()
+        .position(|line| line.trim_end_matches('\r').trim() == delimiter)?;
+    if lines
+        .iter()
+        .skip(end_index + 1)
+        .any(|line| !line.trim().is_empty())
+    {
+        return None;
+    }
+    let mut patch = lines[..end_index].join("\n");
+    if !patch.ends_with('\n') {
+        patch.push('\n');
+    }
+    Some(patch)
+}
+
+fn apply_patch_heredoc_delimiter(first_line: &str) -> Option<String> {
+    let rest = first_line.strip_prefix("apply_patch")?.trim_start();
+    let rest = rest.strip_prefix("<<")?;
+    let rest = rest.strip_prefix('-').unwrap_or(rest).trim();
+    if rest.is_empty() || rest.split_whitespace().nth(1).is_some() {
+        return None;
+    }
+    let delimiter = rest
+        .strip_prefix('\'')
+        .and_then(|value| value.strip_suffix('\''))
+        .or_else(|| {
+            rest.strip_prefix('"')
+                .and_then(|value| value.strip_suffix('"'))
+        })
+        .unwrap_or(rest)
+        .trim();
+    (!delimiter.is_empty()).then(|| delimiter.to_string())
 }
 
 fn ensure_shell_snapshot(shell: &ShellSpec, workdir: &Path, thread_id: &str) -> Option<PathBuf> {
@@ -2728,6 +2851,108 @@ mod tests {
         assert_eq!(finished.payload["exit_code"], 0);
         assert_eq!(finished.payload["timed_out"], false);
         assert_eq!(finished.payload["aggregated_output"], "legacy");
+    }
+
+    #[test]
+    fn exec_command_intercepts_apply_patch_heredoc_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let patch = r#"*** Begin Patch
+*** Add File: intercepted.txt
++from exec intercept
+*** End Patch"#;
+        let command = format!("apply_patch <<'EOF'\n{patch}\nEOF");
+
+        let result = exec_command(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_exec_apply_patch".to_string(),
+                name: "exec_command".to_string(),
+                namespace: None,
+                arguments: json!({"cmd": command, "yield_time_ms": 5000}),
+            },
+        )
+        .expect("intercepted apply_patch");
+
+        assert_eq!(
+            std::fs::read_to_string(Path::new(&session.cwd).join("intercepted.txt"))
+                .expect("patched file"),
+            "from exec intercept\n"
+        );
+        assert_codex_chunk_id(&result.model_text);
+        assert!(result
+            .model_text
+            .contains("Success. Updated the following files:"));
+        assert!(result.model_text.contains("A intercepted.txt"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(events.iter().any(|event| {
+            event.event_type == "tool.started" && event.payload["name"] == "apply_patch"
+        }));
+        assert!(events.iter().any(
+            |event| event.event_type == "command.intercepted_apply_patch"
+                && event.payload["source_tool"] == "exec_command"
+        ));
+        assert!(
+            !events
+                .iter()
+                .any(|event| event.event_type == "command.started"),
+            "intercepted apply_patch should not spawn a shell command"
+        );
+        let turn_diff = events
+            .iter()
+            .find(|event| event.event_type == "turn.diff")
+            .expect("turn diff");
+        assert!(turn_diff.payload["unified_diff"]
+            .as_str()
+            .expect("unified diff")
+            .contains("diff --git a/intercepted.txt b/intercepted.txt"));
+    }
+
+    #[test]
+    fn shell_command_intercepts_apply_patch_heredoc_in_workdir() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let nested = Path::new(&session.cwd).join("nested");
+        std::fs::create_dir_all(&nested).expect("nested");
+        let patch = r#"*** Begin Patch
+*** Add File: nested-file.txt
++from shell intercept
+*** End Patch"#;
+        let command = format!("apply_patch <<'PATCH'\n{patch}\nPATCH");
+
+        let result = shell_command_with_budget(
+            &store,
+            &session,
+            &ToolCall {
+                id: "call_shell_apply_patch".to_string(),
+                name: "shell_command".to_string(),
+                namespace: None,
+                arguments: json!({
+                    "command": command,
+                    "workdir": nested.display().to_string(),
+                    "timeout_ms": 5000
+                }),
+            },
+            DEFAULT_MAX_OUTPUT_TOKENS,
+            true,
+        )
+        .expect("intercepted shell apply_patch");
+
+        assert_eq!(
+            std::fs::read_to_string(nested.join("nested-file.txt")).expect("patched file"),
+            "from shell intercept\n"
+        );
+        assert!(result.model_text.starts_with("Exit code: 0\nWall time: "));
+        assert!(result.model_text.contains("A nested-file.txt"));
+        let events = store.events_for_session(&session.id).expect("events");
+        assert!(events.iter().any(
+            |event| event.event_type == "command.intercepted_apply_patch"
+                && event.payload["source_tool"] == "shell_command"
+        ));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "command.started"));
     }
 
     #[test]

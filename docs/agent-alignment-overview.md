@@ -93,12 +93,17 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   streaming-time futures for mutating/interactive tools, full dynamic
   MCP/app/plugin tool inventory, exact `AgentControl`/mailbox semantics,
   event/item-graph history reconstruction, exact `TurnDiffTracker`, websocket
-  ack/fallback, and deeper local compaction/token lifecycle parity.
+  ack/fallback, deeper local compaction/token lifecycle parity, and
+  multi-environment tool routing.
 - Latest verification: full Rust/Python/whitespace checks and Codex-auth root
-  plus child smokes passed for this batch. A fallback attempt to run ten broad
-  audits through the local harness was stopped because one child was already at
-  turn 8 with very large context; the hidden platform subagent tool is still the
-  practical route for repeated broad closure audits.
+  plus child smokes passed for the latest batch. Platform subagent auditing is
+  available again; ten broad read-only auditors completed after the
+  apply-patch/diff/hook-alias slice and kept the same architectural gap set
+  open. The audit added concrete next slices: Codex-style hook `tool_input`
+  shape/update mapping for Bash/apply_patch, broader shell apply-patch rescue
+  forms (`applypatch`, direct invocation, and `cd ... && apply_patch`), goal
+  budget/usage-limit steering, memory read-path instructions, and resize-before-
+  reject handling for large local images.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming
@@ -1397,6 +1402,18 @@ The biggest remaining categories are:
   full app-server collaboration/request events, pending interactive
   replay/filtering, delegated/MCP compatibility paths, and broader feature-flag
   breadth.
+- Runtime tool parity now includes the portable apply-patch rescue path Codex
+  uses when a model sends `apply_patch <<EOF ... EOF` through `exec_command` or
+  the legacy shell command surface: the harness intercepts the script and routes
+  it through the apply-patch implementation without spawning a shell process.
+  Patch completion and `turn.diff` events now include bounded unified diffs
+  generated from committed patch deltas. Hook payload names also follow Codex's
+  canonical names for `apply_patch` and `spawn_agent`, while matcher aliases
+  cover `Write`/`Edit` and `Agent`. Still open: concurrent/async hook execution,
+  exact hook run summaries/sources/validation, Codex-style `tool_input.command`
+  payload/update mapping for Bash and apply_patch hooks, broader apply-patch
+  shell invocation detection, exact streaming futures for mutating tools, and a
+  full Codex `TurnDiffTracker` lifecycle across every tool runtime.
 - Multi-agent family routing now follows Codex's feature gate for represented
   sessions: `features.multi_agent_v2.enabled = true` selects the v2 task-path
   surface, while the default surface is the namespaced legacy

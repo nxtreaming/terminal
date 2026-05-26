@@ -11,6 +11,7 @@ use browser_use_protocol::{SessionMeta, ToolCall};
 use browser_use_store::Store;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
+use sha1::Digest;
 
 use crate::prompt_image::{load_for_prompt_bytes, PromptImageMode};
 
@@ -19,9 +20,13 @@ const DEFAULT_MAX_READ_BYTES: usize = 80_000;
 const DEFAULT_MAX_SEARCH_RESULTS: usize = 100;
 const DEFAULT_MAX_LIST_RESULTS: usize = 200;
 const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_TURN_DIFF_CHARS: usize = 60_000;
 const PATCH_REJECTED_OUTSIDE_PROJECT_REASON: &str =
     "patch rejected: writing outside of the project; rejected by user approval settings";
 const PROTECTED_PATCH_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+const DEV_NULL: &str = "/dev/null";
+const REGULAR_FILE_MODE: &str = "100644";
 
 #[derive(Debug)]
 pub(crate) struct FileToolResult {
@@ -636,9 +641,12 @@ fn fallback_search(
 #[derive(Clone, Debug)]
 struct AppliedChange {
     path: PathBuf,
+    old_display_path: PathBuf,
     display_path: PathBuf,
     kind: &'static str,
     move_path: Option<PathBuf>,
+    old_content: Option<String>,
+    new_content: Option<String>,
 }
 
 #[derive(Debug)]
@@ -702,6 +710,11 @@ fn emit_patch_finished(
     call: &ToolCall,
     finish: PatchFinish<'_>,
 ) -> Result<()> {
+    let unified_diff = render_applied_changes_unified_diff(finish.committed_changes);
+    let (unified_diff, diff_truncated) = unified_diff
+        .as_deref()
+        .map(|diff| truncate_chars(diff, MAX_TURN_DIFF_CHARS))
+        .unwrap_or_else(|| (String::new(), false));
     store.append_event(
         &session.id,
         "patch.finished",
@@ -716,6 +729,8 @@ fn emit_patch_finished(
             "committed_changes": applied_changes_payload(finish.committed_changes),
             "committed_files": applied_changes_payload(finish.committed_changes),
             "committed_delta_exact": finish.committed_delta_exact,
+            "unified_diff": unified_diff.clone(),
+            "diff_truncated": diff_truncated,
         }),
     )?;
     if !finish.committed_changes.is_empty() {
@@ -728,6 +743,8 @@ fn emit_patch_finished(
                 "changed_files": finish.committed_changes.len(),
                 "changes": applied_changes_payload(finish.committed_changes),
                 "committed_delta_exact": finish.committed_delta_exact,
+                "unified_diff": unified_diff,
+                "diff_truncated": diff_truncated,
             }),
         )?;
     }
@@ -1029,29 +1046,38 @@ fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange
         PatchOperation::Add { path, content } => {
             let display_path = PathBuf::from(&path);
             let path = resolve_patch_path(cwd, &path)?;
+            let old_content = fs::read_to_string(&path).ok();
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
-            fs::write(&path, content)
+            fs::write(&path, &content)
                 .with_context(|| format!("Failed to write file {}", path.display()))?;
             Ok(AppliedChange {
                 path,
+                old_display_path: display_path.clone(),
                 display_path,
                 kind: "added",
                 move_path: None,
+                old_content,
+                new_content: Some(content),
             })
         }
         PatchOperation::Delete { path } => {
             let display_path = PathBuf::from(&path);
             let path = resolve_patch_path(cwd, &path)?;
+            let old_content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
             fs::remove_file(&path)
                 .with_context(|| format!("Failed to delete file {}", path.display()))?;
             Ok(AppliedChange {
                 path,
+                old_display_path: display_path.clone(),
                 display_path,
                 kind: "deleted",
                 move_path: None,
+                old_content: Some(old_content),
+                new_content: None,
             })
         }
         PatchOperation::Update {
@@ -1060,6 +1086,7 @@ fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange
             hunks,
         } => {
             let display_path = PathBuf::from(move_path.as_deref().unwrap_or(&path));
+            let old_display_path = PathBuf::from(&path);
             let path = resolve_patch_path(cwd, &path)?;
             let move_path = move_path
                 .map(|target| resolve_patch_path(cwd, &target))
@@ -1088,6 +1115,7 @@ fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange
             }
             Ok(AppliedChange {
                 path,
+                old_display_path,
                 display_path,
                 kind: if move_path.is_some() {
                     "moved"
@@ -1095,9 +1123,98 @@ fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange
                     "modified"
                 },
                 move_path,
+                old_content: Some(original),
+                new_content: Some(new_content),
             })
         }
     }
+}
+
+fn render_applied_changes_unified_diff(changes: &[AppliedChange]) -> Option<String> {
+    let mut out = String::new();
+    for change in changes {
+        let left_path = change.display_old_path();
+        let right_path = change.display_new_path();
+        if let Some(diff) = render_unified_file_diff(
+            &left_path,
+            change.old_content.as_deref(),
+            &right_path,
+            change.new_content.as_deref(),
+        ) {
+            out.push_str(&diff);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+impl AppliedChange {
+    fn display_old_path(&self) -> String {
+        match self.kind {
+            "moved" => self.old_display_path.display().to_string(),
+            _ => self.display_path.display().to_string(),
+        }
+        .replace('\\', "/")
+    }
+
+    fn display_new_path(&self) -> String {
+        self.display_path.display().to_string().replace('\\', "/")
+    }
+}
+
+fn render_unified_file_diff(
+    left_path: &str,
+    left_content: Option<&str>,
+    right_path: &str,
+    right_content: Option<&str>,
+) -> Option<String> {
+    if left_content == right_content {
+        return None;
+    }
+    let left_oid = left_content.map_or_else(
+        || ZERO_OID.to_string(),
+        |content| git_blob_oid(content.as_bytes()),
+    );
+    let right_oid = right_content.map_or_else(
+        || ZERO_OID.to_string(),
+        |content| git_blob_oid(content.as_bytes()),
+    );
+    let mut diff = format!("diff --git a/{left_path} b/{right_path}\n");
+    match (left_content, right_content) {
+        (None, Some(_)) => diff.push_str(&format!("new file mode {REGULAR_FILE_MODE}\n")),
+        (Some(_), None) => diff.push_str(&format!("deleted file mode {REGULAR_FILE_MODE}\n")),
+        (Some(_), Some(_)) => {}
+        (None, None) => return None,
+    }
+    diff.push_str(&format!("index {left_oid}..{right_oid}\n"));
+    let old_header = if left_content.is_some() {
+        format!("a/{left_path}")
+    } else {
+        DEV_NULL.to_string()
+    };
+    let new_header = if right_content.is_some() {
+        format!("b/{right_path}")
+    } else {
+        DEV_NULL.to_string()
+    };
+    let unified =
+        similar::TextDiff::from_lines(left_content.unwrap_or(""), right_content.unwrap_or(""))
+            .unified_diff()
+            .context_radius(3)
+            .header(&old_header, &new_header)
+            .to_string();
+    diff.push_str(&unified);
+    Some(diff)
+}
+
+fn git_blob_oid(data: &[u8]) -> String {
+    let header = format!("blob {}\0", data.len());
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(header.as_bytes());
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
 }
 
 fn patch_arg(arguments: &Value) -> Result<&str> {
@@ -1530,12 +1647,27 @@ mod tests {
             4
         );
         assert_eq!(finished.payload["committed_delta_exact"], true);
+        let patch_diff = finished.payload["unified_diff"]
+            .as_str()
+            .expect("patch unified diff");
+        assert!(patch_diff.contains("diff --git a/a.txt b/a.txt"));
+        assert!(patch_diff.contains("new file mode 100644"));
+        assert!(patch_diff.contains("diff --git a/update.txt b/update.txt"));
+        assert!(patch_diff.contains("-world"));
+        assert!(patch_diff.contains("+rust"));
+        assert!(patch_diff.contains("diff --git a/move.txt b/"));
+        assert!(patch_diff.contains("b.txt"));
+        assert!(patch_diff.contains("deleted file mode 100644"));
         let turn_diff = events
             .iter()
             .find(|event| event.event_type == "turn.diff")
             .expect("turn diff");
         assert_eq!(turn_diff.payload["source"], "apply_patch");
         assert_eq!(turn_diff.payload["changed_files"], 4);
+        assert_eq!(
+            turn_diff.payload["unified_diff"],
+            finished.payload["unified_diff"]
+        );
     }
 
     #[test]

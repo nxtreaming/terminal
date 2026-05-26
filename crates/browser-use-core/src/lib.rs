@@ -8206,25 +8206,28 @@ fn hook_group_matches(
 }
 
 fn hook_tool_name_candidates(call: &ToolCall) -> Vec<String> {
-    let mut candidates = vec![call.name.clone()];
+    let canonical = hook_canonical_tool_name(call).to_string();
+    let mut candidates = vec![canonical.clone()];
+    if call.name != canonical {
+        candidates.push(call.name.clone());
+    }
     if let Some(namespace) = call.namespace.as_deref() {
         candidates.push(format!("{namespace}.{}", call.name));
     }
-    let codex_name = match call.name.as_str() {
-        "exec_command" | "shell_command" => Some("Bash"),
-        "apply_patch" => Some("ApplyPatch"),
-        "read_file" => Some("Read"),
-        "search_files" => Some("Grep"),
-        "list_files" => Some("Glob"),
-        "view_image" => Some("ViewImage"),
-        "spawn_agent" => Some("Task"),
-        "done" => Some("Done"),
-        _ => None,
-    };
-    if let Some(codex_name) = codex_name {
-        candidates.push(codex_name.to_string());
+    for alias in hook_tool_matcher_aliases(call) {
+        if !candidates.iter().any(|candidate| candidate == &alias) {
+            candidates.push(alias);
+        }
     }
     candidates
+}
+
+fn hook_tool_matcher_aliases(call: &ToolCall) -> Vec<String> {
+    match call.name.as_str() {
+        "apply_patch" => vec!["Write".to_string(), "Edit".to_string()],
+        "spawn_agent" => vec!["Agent".to_string()],
+        _ => Vec::new(),
+    }
 }
 
 fn hook_matcher_matches(matcher: Option<&str>, candidate: &str) -> bool {
@@ -8376,6 +8379,12 @@ fn hook_command_input(
     });
     if let Some(call) = call {
         input["tool_name"] = Value::String(hook_canonical_tool_name(call).to_string());
+        input["matcher_aliases"] = Value::Array(
+            hook_tool_matcher_aliases(call)
+                .into_iter()
+                .map(Value::String)
+                .collect(),
+        );
         input["tool_use_id"] = Value::String(call.id.clone());
         input["tool_input"] = tool_input
             .cloned()
@@ -8390,12 +8399,12 @@ fn hook_command_input(
 fn hook_canonical_tool_name(call: &ToolCall) -> &str {
     match call.name.as_str() {
         "exec_command" | "shell_command" => "Bash",
-        "apply_patch" => "ApplyPatch",
+        "apply_patch" => "apply_patch",
         "read_file" => "Read",
         "search_files" => "Grep",
         "list_files" => "Glob",
         "view_image" => "ViewImage",
-        "spawn_agent" => "Task",
+        "spawn_agent" => "spawn_agent",
         "done" => "Done",
         other => other,
     }
@@ -31901,6 +31910,38 @@ command = "printf blocked-by-hook >&2; exit 2"
     }
 
     #[test]
+    fn hook_tool_names_and_aliases_match_codex_payload_contract() {
+        let apply_patch = ToolCall {
+            id: "patch".to_string(),
+            name: "apply_patch".to_string(),
+            namespace: None,
+            arguments: serde_json::json!("*** Begin Patch\n*** End Patch"),
+        };
+        assert_eq!(hook_canonical_tool_name(&apply_patch), "apply_patch");
+        assert_eq!(
+            hook_tool_matcher_aliases(&apply_patch),
+            vec!["Write".to_string(), "Edit".to_string()]
+        );
+        let candidates = hook_tool_name_candidates(&apply_patch);
+        assert!(candidates.contains(&"apply_patch".to_string()));
+        assert!(candidates.contains(&"Write".to_string()));
+        assert!(candidates.contains(&"Edit".to_string()));
+
+        let spawn_agent = ToolCall {
+            id: "spawn".to_string(),
+            name: "spawn_agent".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({}),
+        };
+        assert_eq!(hook_canonical_tool_name(&spawn_agent), "spawn_agent");
+        assert_eq!(
+            hook_tool_matcher_aliases(&spawn_agent),
+            vec!["Agent".to_string()]
+        );
+        assert!(hook_tool_name_candidates(&spawn_agent).contains(&"Agent".to_string()));
+    }
+
+    #[test]
     fn post_tool_use_feedback_replaces_model_visible_tool_output_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -32036,6 +32077,26 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
         assert_eq!(input["turn_id"], "turn-current");
         assert_eq!(input["agent_id"], child.id);
         assert_eq!(input["agent_type"], "explorer");
+
+        let patch_input = hook_command_input(
+            &store,
+            &child,
+            HookEventName::PreToolUse,
+            Some(&ToolCall {
+                id: "patch-call".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: serde_json::json!("*** Begin Patch\n*** End Patch"),
+            }),
+            None,
+            "gpt-5.4",
+            serde_json::json!({}),
+        );
+        assert_eq!(patch_input["tool_name"], "apply_patch");
+        assert_eq!(
+            patch_input["matcher_aliases"],
+            serde_json::json!(["Write", "Edit"])
+        );
         Ok(())
     }
 
