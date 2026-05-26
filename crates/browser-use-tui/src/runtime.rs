@@ -96,11 +96,13 @@ fn tui_agent_options(
         "Headless Chromium" => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("managed-headless")
+            .with_model_compaction(true)
             .with_analytics_source("tui"),
         BROWSER_USE_CLOUD => {
             let mut options = AgentRunOptions::default()
                 .with_collaboration_mode(collaboration_mode)
                 .with_browser_mode("cloud")
+                .with_model_compaction(true)
                 .with_analytics_source("tui");
             if let Some(api_key) =
                 browser_use_cloud_api_key.filter(|value| !value.trim().is_empty())
@@ -115,6 +117,7 @@ fn tui_agent_options(
         _ => AgentRunOptions::default()
             .with_collaboration_mode(collaboration_mode)
             .with_browser_mode("local")
+            .with_model_compaction(true)
             .with_analytics_source("tui"),
     };
     if let Some(profile) = config_profile {
