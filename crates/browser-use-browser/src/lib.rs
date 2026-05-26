@@ -1589,8 +1589,10 @@ impl BrowserSession {
         ) && self.mode == BrowserMode::Local
         {
             Some("Open Chrome with the selected profile, then run browser connect local")
-        } else if self.last_error_kind.as_deref() == Some("permission-blocked")
-            && self.mode == BrowserMode::Local
+        } else if matches!(
+            self.last_error_kind.as_deref(),
+            Some("permission-blocked" | "cdp-disabled")
+        ) && self.mode == BrowserMode::Local
         {
             Some("browser local setup")
         } else if self.connection.is_none() {
@@ -1605,6 +1607,19 @@ impl BrowserSession {
     fn connect_local(&mut self, candidate_id: Option<String>) -> Result<Value> {
         let candidates = local_candidates();
         if candidates.is_empty() {
+            let disabled = local_debugging_disabled_statuses();
+            if !disabled.is_empty() {
+                self.last_error =
+                    Some("Chrome is open, but remote debugging is turned off".to_string());
+                self.last_error_kind = Some("cdp-disabled".to_string());
+                return Ok(json!({
+                    "status": "blocked",
+                    "state": "cdp-disabled",
+                    "reason": "Chrome is open, but remote debugging is turned off for this browser instance.",
+                    "local_browsers": disabled,
+                    "next_step": "browser local setup",
+                }));
+            }
             self.last_error =
                 Some("No local remote-debugging browser candidates found".to_string());
             self.last_error_kind = Some("browser-not-running".to_string());
@@ -1621,6 +1636,21 @@ impl BrowserSession {
             .cloned()
             .collect::<Vec<_>>();
         if reachable.is_empty() {
+            if candidates
+                .iter()
+                .any(|candidate| candidate.state == "cdp-disabled")
+            {
+                self.last_error =
+                    Some("Chrome is open, but remote debugging is turned off".to_string());
+                self.last_error_kind = Some("cdp-disabled".to_string());
+                return Ok(json!({
+                    "status": "blocked",
+                    "state": "cdp-disabled",
+                    "reason": "Chrome is open, but remote debugging is turned off for this browser instance.",
+                    "candidates": candidates,
+                    "next_step": "browser local setup",
+                }));
+            }
             self.last_error =
                 Some("Only stale local browser debug candidates were found".to_string());
             self.last_error_kind = Some("stale-port".to_string());
@@ -1647,7 +1677,7 @@ impl BrowserSession {
                     "state": candidate.state,
                     "reason": candidate.reason,
                     "candidate": candidate,
-                    "next_step": "Open Chrome with this profile, then run browser connect local",
+                    "next_step": candidate.next_step.as_deref().unwrap_or("Open Chrome with this profile, then run browser connect local"),
                 }));
             }
             candidate
@@ -1990,6 +2020,7 @@ impl BrowserSession {
 
     fn doctor(&mut self, cwd: &Path) -> Result<Value> {
         let candidates = local_candidates();
+        let debugging_disabled = local_debugging_disabled_statuses();
         let mut checks = Vec::new();
         checks.push(json!({
             "name": "runtime state",
@@ -2002,15 +2033,24 @@ impl BrowserSession {
             "count": candidates.len(),
             "connectable_count": candidates.iter().filter(|candidate| candidate.connectable).count(),
             "stale_count": candidates.iter().filter(|candidate| candidate.stale).count(),
+            "cdp_disabled_count": candidates.iter().filter(|candidate| candidate.state == "cdp-disabled").count(),
             "state": if candidates.iter().any(|candidate| candidate.connectable) {
                 "reachable"
+            } else if candidates.iter().any(|candidate| candidate.state == "cdp-disabled") {
+                "cdp-disabled"
             } else if candidates.iter().any(|candidate| candidate.stale) {
                 "stale-port"
+            } else if !debugging_disabled.is_empty() {
+                "cdp-disabled"
             } else {
                 "browser-not-running"
             },
             "detail": if candidates.iter().any(|candidate| candidate.connectable) {
                 "At least one local browser CDP endpoint is reachable."
+            } else if candidates.iter().any(|candidate| candidate.state == "cdp-disabled")
+                || !debugging_disabled.is_empty()
+            {
+                "Chrome is open, but remote debugging is turned off for this browser instance."
             } else if candidates.iter().any(|candidate| candidate.stale) {
                 "DevToolsActivePort files exist, but their ports are not reachable. Chrome was likely closed or restarted."
             } else {
@@ -2018,6 +2058,10 @@ impl BrowserSession {
             },
             "next_step": if candidates.iter().any(|candidate| candidate.connectable) {
                 "browser connect local"
+            } else if candidates.iter().any(|candidate| candidate.state == "cdp-disabled")
+                || !debugging_disabled.is_empty()
+            {
+                "browser local setup"
             } else if candidates.iter().any(|candidate| candidate.stale) {
                 "Open Chrome with the selected profile, then run browser connect local"
             } else {
@@ -2519,6 +2563,15 @@ fn browser_issue_diagnosis(
             false,
             false,
         ),
+        "cdp-disabled" => (
+            "Chrome is open, but remote debugging is turned off.",
+            "Chrome is running, but it is not exposing a local CDP endpoint because remote debugging is disabled for this browser instance.",
+            status_next_step
+                .unwrap_or("Run browser local setup, enable remote debugging, then reconnect.")
+                .to_string(),
+            false,
+            false,
+        ),
         "browser-closed" | "websocket-dropped" | "browser-not-running" | "stale-port" => (
             "Browser connection is not usable until it is recovered.",
             "The CDP websocket was closed, reset, refused, or pointed at a stale browser endpoint.",
@@ -2564,7 +2617,11 @@ fn is_stale_session_error(message: &str) -> bool {
 fn local_connect_error_reason(kind: &str, raw_error: &str) -> String {
     match kind {
         "permission-blocked" => {
-            "Chrome is running, but it rejected CDP control. Remote debugging permission is likely blocked for this browser instance.".to_string()
+            "A local Chrome DevTools endpoint is reachable, but Chrome rejected CDP control. Remote debugging permission is likely blocked for this browser instance.".to_string()
+        }
+        "cdp-disabled" => {
+            "Chrome is open, but remote debugging is turned off for this browser instance."
+                .to_string()
         }
         "browser-closed" => {
             "Chrome is not currently exposing the selected local CDP endpoint. It may have been closed, restarted, or stopped its debug server.".to_string()
@@ -2576,7 +2633,7 @@ fn local_connect_error_reason(kind: &str, raw_error: &str) -> String {
 
 fn local_connect_next_step(kind: &str) -> &'static str {
     match kind {
-        "permission-blocked" => "browser local setup",
+        "permission-blocked" | "cdp-disabled" => "browser local setup",
         "browser-closed" => "Open Chrome with the selected profile, then run browser connect local",
         "target-gone" => "Use browser_script list_tabs()/switch_tab(...) or open a new tab",
         _ => "browser doctor --json",
@@ -2647,6 +2704,8 @@ fn probe_endpoint(endpoint: &Endpoint) -> EndpointProbe {
 struct LocalCandidate {
     id: String,
     browser_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browser_path: Option<PathBuf>,
     profile_path: PathBuf,
     http_url: Option<String>,
     ws_url: String,
@@ -2654,22 +2713,86 @@ struct LocalCandidate {
     connectable: bool,
     state: String,
     stale: bool,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browser_running: Option<bool>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    remote_debugging_enabled: Option<bool>,
     reason: Option<String>,
     next_step: Option<String>,
 }
 
-fn local_candidates() -> Vec<LocalCandidate> {
-    local_candidates_from_roots(known_profile_roots(), &[9222_u16, 9223])
+#[derive(Debug, Clone)]
+struct LocalCandidateRoot {
+    browser_name: String,
+    browser_path: Option<PathBuf>,
+    user_data_dir: PathBuf,
 }
 
+#[derive(Debug, Clone, Serialize)]
+struct LocalBrowserDebuggingStatus {
+    browser_name: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    browser_path: Option<PathBuf>,
+    user_data_dir: PathBuf,
+    browser_running: bool,
+    remote_debugging_enabled: Option<bool>,
+}
+
+fn local_candidates() -> Vec<LocalCandidate> {
+    let mut roots = local_candidate_roots_from_installs(known_local_browser_installs());
+    let mut seen_roots = roots
+        .iter()
+        .map(|root| (root.browser_name.clone(), root.user_data_dir.clone()))
+        .collect::<HashSet<_>>();
+    for (browser_name, user_data_dir) in known_profile_roots() {
+        if seen_roots.insert((browser_name.to_string(), user_data_dir.clone())) {
+            roots.push(LocalCandidateRoot {
+                browser_name: browser_name.to_string(),
+                browser_path: None,
+                user_data_dir,
+            });
+        }
+    }
+    local_candidates_from_candidate_roots(roots, &[9222_u16, 9223])
+}
+
+fn local_candidate_roots_from_installs(
+    installs: Vec<LocalBrowserInstall>,
+) -> Vec<LocalCandidateRoot> {
+    installs
+        .into_iter()
+        .map(|install| LocalCandidateRoot {
+            browser_name: install.browser_name,
+            browser_path: Some(install.browser_path),
+            user_data_dir: install.user_data_dir,
+        })
+        .collect()
+}
+
+#[cfg(test)]
 fn local_candidates_from_roots(
     roots: Vec<(&'static str, PathBuf)>,
     probe_ports: &[u16],
 ) -> Vec<LocalCandidate> {
+    let roots = roots
+        .into_iter()
+        .map(|(browser_name, user_data_dir)| LocalCandidateRoot {
+            browser_name: browser_name.to_string(),
+            browser_path: None,
+            user_data_dir,
+        })
+        .collect();
+    local_candidates_from_candidate_roots(roots, probe_ports)
+}
+
+fn local_candidates_from_candidate_roots(
+    roots: Vec<LocalCandidateRoot>,
+    probe_ports: &[u16],
+) -> Vec<LocalCandidate> {
     let mut candidates = Vec::new();
     let mut seen = HashSet::new();
-    for (browser_name, root) in roots {
-        let active = root.join("DevToolsActivePort");
+    for root in roots {
+        let active = root.user_data_dir.join("DevToolsActivePort");
         let Ok(raw) = fs::read_to_string(&active) else {
             continue;
         };
@@ -2687,29 +2810,33 @@ fn local_candidates_from_roots(
         let id = format!("local-{}", candidates.len() + 1);
         let http_url = Some(format!("http://127.0.0.1:{port}"));
         let connectable = tcp_port_open("127.0.0.1", port.parse().unwrap_or(0));
-        let state = if connectable {
-            "reachable"
+        let browser_running = root
+            .browser_path
+            .as_deref()
+            .and_then(|path| browser_process_running(&root.browser_name, path));
+        let remote_debugging_enabled = remote_debugging_user_enabled(&root.user_data_dir);
+        let (state, reason, next_step) = if connectable {
+            ("reachable", None, "browser connect local --candidate <id>")
         } else {
-            "stale-port"
+            let (state, reason, next_step) =
+                local_disconnected_candidate_details(browser_running, remote_debugging_enabled);
+            (state, Some(reason), next_step)
         };
         candidates.push(LocalCandidate {
             id,
-            browser_name: browser_name.to_string(),
-            profile_path: root,
+            browser_name: root.browser_name,
+            browser_path: root.browser_path,
+            profile_path: root.user_data_dir,
             http_url,
             ws_url,
             source: active.display().to_string(),
             connectable,
             state: state.to_string(),
             stale: !connectable,
-            reason: (!connectable).then(|| {
-                "DevToolsActivePort exists, but the recorded CDP port is not reachable. Chrome was likely closed or the debug server stopped.".to_string()
-            }),
-            next_step: Some(if connectable {
-                "browser connect local --candidate <id>".to_string()
-            } else {
-                "Open Chrome with this profile, then run browser connect local".to_string()
-            }),
+            browser_running,
+            remote_debugging_enabled,
+            reason,
+            next_step: Some(next_step.to_string()),
         });
     }
     for port in probe_ports {
@@ -2723,6 +2850,7 @@ fn local_candidates_from_roots(
         candidates.push(LocalCandidate {
             id: format!("local-{}", candidates.len() + 1),
             browser_name: format!("CDP port {port}"),
+            browser_path: None,
             profile_path: PathBuf::new(),
             http_url: Some(http_url),
             ws_url,
@@ -2730,11 +2858,59 @@ fn local_candidates_from_roots(
             connectable: true,
             state: "reachable".to_string(),
             stale: false,
+            browser_running: None,
+            remote_debugging_enabled: None,
             reason: None,
             next_step: Some("browser connect local --candidate <id>".to_string()),
         });
     }
     candidates
+}
+
+fn local_debugging_disabled_statuses() -> Vec<LocalBrowserDebuggingStatus> {
+    known_local_browser_installs()
+        .into_iter()
+        .filter_map(|install| {
+            let browser_running =
+                browser_process_running(&install.browser_name, &install.browser_path)?;
+            let remote_debugging_enabled = remote_debugging_user_enabled(&install.user_data_dir);
+            (browser_running && remote_debugging_enabled == Some(false)).then_some(
+                LocalBrowserDebuggingStatus {
+                    browser_name: install.browser_name,
+                    browser_path: Some(install.browser_path),
+                    user_data_dir: install.user_data_dir,
+                    browser_running,
+                    remote_debugging_enabled,
+                },
+            )
+        })
+        .collect()
+}
+
+fn local_disconnected_candidate_details(
+    browser_running: Option<bool>,
+    remote_debugging_enabled: Option<bool>,
+) -> (&'static str, String, &'static str) {
+    if browser_running == Some(true) && remote_debugging_enabled == Some(false) {
+        return (
+            "cdp-disabled",
+            "Chrome is open, but remote debugging is turned off for this browser instance."
+                .to_string(),
+            "browser local setup",
+        );
+    }
+    if browser_running == Some(true) {
+        return (
+            "stale-port",
+            "DevToolsActivePort exists, but the recorded CDP port is not reachable. Chrome appears open, but it is not exposing that debug endpoint.".to_string(),
+            "Open Chrome with this profile, then run browser connect local",
+        );
+    }
+    (
+        "stale-port",
+        "DevToolsActivePort exists, but the recorded CDP port is not reachable. Chrome was likely closed or the debug server stopped.".to_string(),
+        "Open Chrome with this profile, then run browser connect local",
+    )
 }
 
 fn known_profile_roots() -> Vec<(&'static str, PathBuf)> {
@@ -3477,6 +3653,59 @@ fn load_profile_names_from_local_state(user_data_dir: &Path) -> HashMap<String, 
                 .map(|name| (profile_dir.clone(), name.to_string()))
         })
         .collect()
+}
+
+fn remote_debugging_user_enabled(user_data_dir: &Path) -> Option<bool> {
+    let raw = fs::read_to_string(user_data_dir.join("Local State")).ok()?;
+    let value = serde_json::from_str::<Value>(&raw).ok()?;
+    remote_debugging_user_enabled_from_local_state(&value)
+}
+
+fn remote_debugging_user_enabled_from_local_state(value: &Value) -> Option<bool> {
+    value
+        .pointer("/devtools/remote_debugging/user-enabled")
+        .and_then(Value::as_bool)
+}
+
+#[cfg(unix)]
+fn browser_process_running(_browser_name: &str, browser_path: &Path) -> Option<bool> {
+    let output = Command::new("ps")
+        .args(["-axo", "pid=,comm=,args="])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout);
+    let browser_path = browser_path.to_string_lossy();
+    Some(
+        !browser_path.is_empty()
+            && text
+                .lines()
+                .any(|line| line.contains(browser_path.as_ref())),
+    )
+}
+
+#[cfg(windows)]
+fn browser_process_running(_browser_name: &str, browser_path: &Path) -> Option<bool> {
+    let output = Command::new("tasklist")
+        .args(["/FO", "CSV"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        return None;
+    }
+    let text = String::from_utf8_lossy(&output.stdout).to_ascii_lowercase();
+    let executable = browser_path
+        .file_name()?
+        .to_string_lossy()
+        .to_ascii_lowercase();
+    Some(!executable.is_empty() && text.contains(&executable))
+}
+
+#[cfg(not(any(unix, windows)))]
+fn browser_process_running(_browser_name: &str, _browser_path: &Path) -> Option<bool> {
+    None
 }
 
 fn is_valid_local_profile_dir(path: &Path) -> bool {
@@ -5088,6 +5317,30 @@ print("large response ok", len(data["blob"]))
             .as_deref()
             .unwrap()
             .contains("DevToolsActivePort"));
+    }
+
+    #[test]
+    fn remote_debugging_flag_reads_chrome_local_state() {
+        let value = json!({
+            "devtools": {
+                "remote_debugging": {
+                    "user-enabled": false
+                }
+            }
+        });
+        assert_eq!(
+            remote_debugging_user_enabled_from_local_state(&value),
+            Some(false)
+        );
+    }
+
+    #[test]
+    fn running_browser_with_disabled_cdp_gets_specific_local_state() {
+        let (state, reason, next_step) =
+            local_disconnected_candidate_details(Some(true), Some(false));
+        assert_eq!(state, "cdp-disabled");
+        assert!(reason.contains("remote debugging is turned off"));
+        assert_eq!(next_step, "browser local setup");
     }
 
     #[test]

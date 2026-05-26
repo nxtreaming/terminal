@@ -46,10 +46,11 @@ Preferences:
 
 Local real browser:
 
-- `browser connect local` attaches to an already-running Chromium-family browser after the user enables remote debugging.
+- `browser connect local` checks for a local Chromium-family browser exposing CDP and attaches only after the user enables remote debugging.
 - Do not guess a browser family flag. The tool auto-detects Chrome, Chrome Canary, Chromium, Edge, Brave, Arc, Dia, Comet, and common forks through DevToolsActivePort.
 - If one candidate exists, it connects. If multiple candidates exist, ask the user which candidate to use, then run `browser connect local --candidate <id>`.
 - If Chrome blocks the connection with permission evidence such as 403, call `browser local setup` yourself. Ask the user only to enable the Chrome checkbox or accept the Chrome permission prompt in the browser window that opens. Then call `browser connect local` again.
+- If the tool reports `state: "cdp-disabled"`, Chrome is open but not exposing CDP because the remote debugging checkbox is off. Call `browser local setup`; tell the user to enable the checkbox in Chrome, then reconnect.
 - If the port is closed or `DevToolsActivePort` is stale, Chrome is not exposing CDP right now. Do not tell the user remote debugging is disabled. If a profile is known, call `browser local setup --profile <profile-id>` yourself; otherwise ask which local profile/browser to use.
 - Do not launch the user's real default Chrome profile with remote-debugging flags. Real logged-in profiles are attached while already open.
 

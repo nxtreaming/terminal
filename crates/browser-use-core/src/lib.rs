@@ -692,7 +692,7 @@ fn browser_mode_instruction(mode: &str) -> String {
     match normalized.as_str() {
         "local" | "local-chrome" => concat!(
             "Selected browser mode: Local Chrome. Use `browser connect local` before page work. ",
-            "This attaches to the user's already-open browser after remote debugging is enabled. ",
+            "This checks for a local Chromium-family browser exposing CDP and attaches only after remote debugging is enabled. ",
             "If connection is blocked, run `browser local setup` and wait for the user to approve remote debugging."
         )
         .to_string(),
