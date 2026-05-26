@@ -1568,6 +1568,24 @@ The biggest remaining categories are:
   timing/baseline nuances, exact resume/fork `TurnContextItem` persistence, full
   typed auth-refresh transport retry, exact typed token estimation, and full
   app-server compaction/token-window lifecycle.
+- The latest runtime slice adds a per-turn `ToolRouter` substrate. Tool
+  planning, model-visible specs, deferred `tool_search` indexing, search-source
+  descriptions, parallel/read-only streaming eligibility, serial dispatch, and
+  parallel dispatch now share one router object for the turn instead of
+  rebuilding independent registries. This closes the represented static-router
+  inconsistency and moves the local architecture closer to Codex's
+  `ToolRouter`; the router also caches its BM25 deferred-tool search engine for
+  the turn rather than rebuilding it per query. The same pass fixed explicit
+  goal `updated_at_ms` preservation for imported/created goal events. What
+  remains is real dynamic callable contribution from MCP/app/plugin/extension
+  sources plus Codex's async tool-future lifecycle.
+- Ten real Codex-auth child-agent audits after the router slice found no new
+  easy client-side correctness blocker. Their consensus was that the remaining
+  agent-quality gaps are architectural: dynamic tool contributors, cancellable
+  async tool futures with read/write gating, first-class active-turn state,
+  typed history/rollout/context ownership, exact turn diffs, goal runtime
+  accounting, local compaction/token-window fidelity, and deeper skills/plugins
+  and review-task lifecycle.
 
 ## Definition of Done
 

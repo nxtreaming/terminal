@@ -18,7 +18,7 @@ use anyhow::{anyhow, bail, Context, Result};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{
     failure_from_events, sanitized_agent_context_from_events, session_result_from_events,
-    EventRecord, ModelEvent, SessionMeta, SessionStatus, ToolCall, ToolSpec,
+    EventRecord, ModelEvent, SessionMeta, SessionStatus, ToolCall,
 };
 use browser_use_providers::{
     browser_agent_instructions_for_model_and_personality_with_catalog, bundled_model_catalog,
@@ -47,7 +47,7 @@ use serde_json::{json, Map, Value};
 use telemetry::{AgentTelemetry, ModelTurnSpanInput};
 use tools::{
     MultiAgentToolFamily, MultiAgentToolSpecConfig, ShellToolSpecConfig, SpawnAgentRoleDescription,
-    ToolHandlerKind, ToolRegistry,
+    ToolHandlerKind, ToolRegistry, ToolRouter,
 };
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
@@ -300,7 +300,7 @@ struct StreamedToolHandle {
 
 struct StreamingToolScheduler {
     session: SessionMeta,
-    registry: ToolRegistry,
+    router: ToolRouter,
     tool_output_token_budget: usize,
     supports_original_image_detail: bool,
     active_queue_last_session_message_seq: i64,
@@ -3511,18 +3511,13 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                 );
 
                 let turn_messages = messages.clone();
-                let turn_tools = browser_tool_specs_for_session(
+                let turn_tool_router = browser_tool_router_for_session(
                     &session,
                     &options,
                     provider.model_name(),
                     provider.supports_namespace_tools(),
                 )?;
-                let streaming_tool_registry = browser_tool_registry_for_session(
-                    &session,
-                    &options,
-                    provider.model_name(),
-                    provider.supports_namespace_tools(),
-                )?;
+                let turn_tools = turn_tool_router.model_visible_specs();
                 let streaming_supports_original_image_detail =
                     resolved_model_request_info_for_session(
                         &session,
@@ -3534,7 +3529,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     std::cell::RefCell::new(StreamingToolScheduler::new(
                         store,
                         &session,
-                        streaming_tool_registry,
+                        turn_tool_router.clone(),
                         model_request_info.tool_output_token_budget(),
                         streaming_supports_original_image_detail,
                         last_external_session_message_seq,
@@ -4139,6 +4134,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     &step_span,
                     turn_idx,
                     last_external_session_message_seq,
+                    &turn_tool_router,
                     &mut streaming_tool_scheduler,
                 )?;
                 append_turn_git_diff_if_changed(
@@ -8122,14 +8118,14 @@ impl StreamingToolScheduler {
     fn new(
         store: &Store,
         session: &SessionMeta,
-        registry: ToolRegistry,
+        router: ToolRouter,
         tool_output_token_budget: usize,
         supports_original_image_detail: bool,
         active_queue_last_session_message_seq: i64,
     ) -> Self {
         Self {
             session: session.clone(),
-            registry,
+            router,
             tool_output_token_budget,
             supports_original_image_detail,
             active_queue_last_session_message_seq,
@@ -8162,13 +8158,13 @@ impl StreamingToolScheduler {
             self.active_queue_last_session_message_seq,
         )?
         .is_empty()
-            && tool_call_supports_streaming_predispatch(&self.registry, call)
+            && tool_call_supports_streaming_predispatch(&self.router, call)
             && !tool_call_has_matching_hooks(runtime_hooks, call)
         {
             let state_dir = self.state_dir.clone();
             let notifier = self.notifier.clone();
             let session = self.session.clone();
-            let registry = self.registry.clone();
+            let router = self.router.clone();
             let tool_output_token_budget = self.tool_output_token_budget;
             let supports_original_image_detail = self.supports_original_image_detail;
             let dispatched_call = call.clone();
@@ -8192,7 +8188,7 @@ impl StreamingToolScheduler {
                 dispatch_parallel_tool_call_recoverably(
                     &store,
                     &session,
-                    &registry,
+                    &router,
                     &dispatched_call,
                     tool_output_token_budget,
                     supports_original_image_detail,
@@ -11378,21 +11374,32 @@ struct ToolDispatchOutcome {
     messages: Vec<Value>,
 }
 
+#[cfg(test)]
 fn browser_tool_specs_for_session(
     session: &browser_use_protocol::SessionMeta,
     options: &AgentRunOptions,
     model_name: &str,
     namespace_tools_supported: bool,
-) -> Result<Vec<ToolSpec>> {
+) -> Result<Vec<browser_use_protocol::ToolSpec>> {
+    Ok(
+        browser_tool_router_for_session(session, options, model_name, namespace_tools_supported)?
+            .model_visible_specs(),
+    )
+}
+
+fn browser_tool_router_for_session(
+    session: &browser_use_protocol::SessionMeta,
+    options: &AgentRunOptions,
+    model_name: &str,
+    namespace_tools_supported: bool,
+) -> Result<ToolRouter> {
     let tool_search_supported =
         resolved_model_request_info_for_session(session, options, model_name)?.supports_search_tool;
-    Ok(
-        browser_tool_registry_for_session(session, options, model_name, namespace_tools_supported)?
-            .specs_for_model(tool_search_supported, namespace_tools_supported)
-            .into_iter()
-            .filter(|spec| namespace_tools_supported || spec.namespace.is_none())
-            .collect(),
-    )
+    Ok(ToolRouter::new(
+        browser_tool_registry_for_session(session, options, model_name, namespace_tools_supported)?,
+        tool_search_supported,
+        namespace_tools_supported,
+    ))
 }
 
 fn browser_tool_registry_for_session(
@@ -11584,6 +11591,7 @@ fn dispatch_tool_calls_for_turn_with_streaming<P: ModelProvider>(
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
     active_queue_last_session_message_seq: i64,
+    tool_router: &ToolRouter,
     streaming_tool_scheduler: &mut StreamingToolScheduler,
 ) -> Result<Vec<ToolDispatchOutcome>> {
     let mut outcomes = Vec::new();
@@ -11607,6 +11615,7 @@ fn dispatch_tool_calls_for_turn_with_streaming<P: ModelProvider>(
                     step_span,
                     turn_idx,
                     active_queue_last_session_message_seq,
+                    tool_router,
                 )?);
                 if outcomes.iter().any(|outcome| outcome.finished)
                     || !active_turn_pending_queue_input(
@@ -11714,6 +11723,7 @@ fn dispatch_tool_calls_for_turn_with_streaming<P: ModelProvider>(
             step_span,
             turn_idx,
             active_queue_last_session_message_seq,
+            tool_router,
         )?);
     }
     streaming_tool_scheduler.discard_all(store, "not_used_by_final_response")?;
@@ -11735,13 +11745,8 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
     active_queue_last_session_message_seq: i64,
+    tool_router: &ToolRouter,
 ) -> Result<Vec<ToolDispatchOutcome>> {
-    let registry = browser_tool_registry_for_session(
-        session,
-        options,
-        provider.model_name(),
-        provider.supports_namespace_tools(),
-    )?;
     let supports_original_image_detail =
         resolved_model_request_info_for_session(session, options, provider.model_name())?
             .supports_image_detail_original;
@@ -11775,13 +11780,13 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
             )?);
             break;
         }
-        if tool_call_supports_parallel(&registry, &tool_calls[index])
+        if tool_call_supports_parallel(tool_router, &tool_calls[index])
             && !tool_call_has_matching_hooks(runtime_hooks, &tool_calls[index])
         {
             let batch_start = index;
             index += 1;
             while index < tool_calls.len()
-                && tool_call_supports_parallel(&registry, &tool_calls[index])
+                && tool_call_supports_parallel(tool_router, &tool_calls[index])
                 && !tool_call_has_matching_hooks(runtime_hooks, &tool_calls[index])
             {
                 index += 1;
@@ -11790,7 +11795,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
             outcomes.extend(dispatch_parallel_tool_batch(
                 store,
                 session,
-                &registry,
+                tool_router,
                 batch,
                 telemetry,
                 step_span,
@@ -11842,6 +11847,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
             telemetry,
             step_span,
             turn_idx,
+            tool_router,
         )?;
         let finished = outcome.finished;
         outcomes.push(outcome);
@@ -11890,7 +11896,7 @@ fn tool_call_has_matching_hooks(hooks: &RuntimeHookConfig, call: &ToolCall) -> b
 fn dispatch_parallel_tool_batch(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
-    registry: &ToolRegistry,
+    tool_router: &ToolRouter,
     batch: Vec<ToolCall>,
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
@@ -11906,7 +11912,7 @@ fn dispatch_parallel_tool_batch(
         return Ok(vec![dispatch_parallel_tool_call_for_turn(
             store,
             session,
-            registry,
+            tool_router,
             call,
             telemetry,
             step_span,
@@ -11938,13 +11944,13 @@ fn dispatch_parallel_tool_batch(
             let state_dir = state_dir.clone();
             let session = session.clone();
             let notifier = notifier.clone();
-            let registry = registry.clone();
+            let tool_router = tool_router.clone();
             thread::spawn(move || {
                 let store = Store::open_with_optional_notifier(state_dir, notifier)?;
                 dispatch_parallel_tool_call_recoverably(
                     &store,
                     &session,
-                    &registry,
+                    &tool_router,
                     &call,
                     tool_output_token_budget,
                     supports_original_image_detail,
@@ -12060,6 +12066,7 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
     turn_idx: usize,
+    tool_router: &ToolRouter,
 ) -> Result<ToolDispatchOutcome> {
     let tool_span = telemetry.start_tool_span(step_span, &session.id, turn_idx, call);
     let mut effective_call = call.clone();
@@ -12100,6 +12107,7 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
         base_instructions,
         runtime_hooks,
         tool_output_token_budget,
+        tool_router,
     ) {
         Ok(outcome) => {
             record_tool_success(telemetry, &tool_span, &outcome);
@@ -12144,7 +12152,7 @@ fn dispatch_serial_tool_call_for_turn<P: ModelProvider>(
 fn dispatch_parallel_tool_call_for_turn(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
-    registry: &ToolRegistry,
+    tool_router: &ToolRouter,
     call: ToolCall,
     telemetry: &AgentTelemetry,
     step_span: &telemetry::ActiveSpan,
@@ -12156,7 +12164,7 @@ fn dispatch_parallel_tool_call_for_turn(
     let outcome = match dispatch_parallel_tool_call_recoverably(
         store,
         session,
-        registry,
+        tool_router,
         &call,
         tool_output_token_budget,
         supports_original_image_detail,
@@ -12201,6 +12209,7 @@ fn dispatch_tool_call_recoverably<P: ModelProvider>(
     base_instructions: &Option<String>,
     runtime_hooks: &RuntimeHookConfig,
     tool_output_token_budget: usize,
+    tool_router: &ToolRouter,
 ) -> Result<ToolDispatchOutcome> {
     match dispatch_tool_call(
         store,
@@ -12212,6 +12221,7 @@ fn dispatch_tool_call_recoverably<P: ModelProvider>(
         base_instructions,
         runtime_hooks,
         tool_output_token_budget,
+        tool_router,
     ) {
         Ok(outcome) => Ok(outcome),
         Err(error) => {
@@ -12227,7 +12237,7 @@ fn dispatch_tool_call_recoverably<P: ModelProvider>(
 fn dispatch_parallel_tool_call_recoverably(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
-    registry: &ToolRegistry,
+    tool_router: &ToolRouter,
     call: &ToolCall,
     tool_output_token_budget: usize,
     supports_original_image_detail: bool,
@@ -12235,7 +12245,7 @@ fn dispatch_parallel_tool_call_recoverably(
     match dispatch_parallel_tool_call(
         store,
         session,
-        registry,
+        tool_router,
         call,
         tool_output_token_budget,
         supports_original_image_detail,
@@ -12326,13 +12336,13 @@ fn tool_error_recovery_reason(error: &anyhow::Error) -> Option<&'static str> {
 fn dispatch_parallel_tool_call(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
-    registry: &ToolRegistry,
+    tool_router: &ToolRouter,
     call: &ToolCall,
     tool_output_token_budget: usize,
     supports_original_image_detail: bool,
 ) -> Result<ToolDispatchOutcome> {
-    let handler = registry
-        .handler_for_namespaced(call.namespace.as_deref(), &call.name)
+    let handler = tool_router
+        .handler_for_dispatch(call.namespace.as_deref(), &call.name)
         .or_else(|| {
             call.namespace
                 .is_none()
@@ -12348,7 +12358,7 @@ fn dispatch_parallel_tool_call(
             session,
             call,
             tool_output_token_budget,
-            registry.allow_login_shell(),
+            tool_router.allow_login_shell(),
         ),
         Some(ToolHandlerKind::ReadFile) => {
             dispatch_read_file_tool(store, session, call, tool_output_token_budget)
@@ -12367,7 +12377,7 @@ fn dispatch_parallel_tool_call(
             tool_output_token_budget,
         ),
         Some(ToolHandlerKind::ToolSearch) => {
-            dispatch_tool_search_tool(store, session, call, registry)
+            dispatch_tool_search_tool(store, session, call, tool_router)
         }
         _ => dispatch_unknown_tool(store, session, call),
     }
@@ -12382,58 +12392,31 @@ fn hidden_legacy_file_tool_handler(name: &str) -> Option<ToolHandlerKind> {
     }
 }
 
-fn tool_call_supports_parallel(registry: &ToolRegistry, call: &ToolCall) -> bool {
-    let handler = registry
-        .direct_handler_for_namespaced(call.namespace.as_deref(), &call.name)
-        .or_else(|| {
-            (call.namespace.is_none() && call.name == "tool_search")
-                .then(|| registry.handler_for_namespaced(None, "tool_search"))
-                .flatten()
-        })
-        .or_else(|| {
-            call.namespace
-                .is_none()
-                .then(|| hidden_legacy_file_tool_handler(&call.name))
-                .flatten()
-        });
-    match handler {
-        Some(
-            ToolHandlerKind::ExecCommand
-            | ToolHandlerKind::ShellCommand
-            | ToolHandlerKind::ReadFile
-            | ToolHandlerKind::SearchFiles
-            | ToolHandlerKind::ListFiles
-            | ToolHandlerKind::ViewImage
-            | ToolHandlerKind::ToolSearch,
-        ) => true,
-        _ => false,
-    }
+fn tool_call_supports_parallel(tool_router: &ToolRouter, call: &ToolCall) -> bool {
+    tool_router.tool_supports_parallel(call.namespace.as_deref(), &call.name)
+        || call
+            .namespace
+            .is_none()
+            .then(|| hidden_legacy_file_tool_handler(&call.name).is_some())
+            .unwrap_or(false)
 }
 
-fn tool_call_supports_streaming_predispatch(registry: &ToolRegistry, call: &ToolCall) -> bool {
-    let handler = registry
-        .direct_handler_for_namespaced(call.namespace.as_deref(), &call.name)
-        .or_else(|| {
-            (call.namespace.is_none() && call.name == "tool_search")
-                .then(|| registry.handler_for_namespaced(None, "tool_search"))
-                .flatten()
-        })
-        .or_else(|| {
-            call.namespace
-                .is_none()
-                .then(|| hidden_legacy_file_tool_handler(&call.name))
-                .flatten()
-        });
-    matches!(
-        handler,
-        Some(
-            ToolHandlerKind::ReadFile
-                | ToolHandlerKind::SearchFiles
-                | ToolHandlerKind::ListFiles
-                | ToolHandlerKind::ViewImage
-                | ToolHandlerKind::ToolSearch
-        )
-    )
+fn tool_call_supports_streaming_predispatch(tool_router: &ToolRouter, call: &ToolCall) -> bool {
+    tool_router.tool_supports_streaming_predispatch(call.namespace.as_deref(), &call.name)
+        || call
+            .namespace
+            .is_none()
+            .then(|| {
+                matches!(
+                    hidden_legacy_file_tool_handler(&call.name),
+                    Some(
+                        ToolHandlerKind::ReadFile
+                            | ToolHandlerKind::SearchFiles
+                            | ToolHandlerKind::ListFiles
+                    )
+                )
+            })
+            .unwrap_or(false)
 }
 
 fn panic_payload_text(payload: Box<dyn std::any::Any + Send + 'static>) -> String {
@@ -12456,15 +12439,10 @@ fn dispatch_tool_call<P: ModelProvider>(
     base_instructions: &Option<String>,
     runtime_hooks: &RuntimeHookConfig,
     tool_output_token_budget: usize,
+    tool_router: &ToolRouter,
 ) -> Result<ToolDispatchOutcome> {
-    let registry = browser_tool_registry_for_session(
-        session,
-        options,
-        provider.model_name(),
-        provider.supports_namespace_tools(),
-    )?;
-    let Some(handler) = registry
-        .handler_for_namespaced(call.namespace.as_deref(), &call.name)
+    let Some(handler) = tool_router
+        .handler_for_dispatch(call.namespace.as_deref(), &call.name)
         .or_else(|| hidden_legacy_file_tool_handler(&call.name))
         .or_else(|| (call.name == "python").then_some(ToolHandlerKind::Python))
     else {
@@ -12505,7 +12483,7 @@ fn dispatch_tool_call<P: ModelProvider>(
             session,
             call,
             tool_output_token_budget,
-            registry.allow_login_shell(),
+            tool_router.allow_login_shell(),
         ),
         ToolHandlerKind::WriteStdin => {
             dispatch_write_stdin_tool(store, session, call, tool_output_token_budget)
@@ -12582,7 +12560,7 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::ListAgents => dispatch_list_agents_tool(store, session, call),
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
         ToolHandlerKind::CloseAgentV1 => dispatch_close_agent_v1_tool(store, session, call),
-        ToolHandlerKind::ToolSearch => dispatch_tool_search_tool(store, session, call, &registry),
+        ToolHandlerKind::ToolSearch => dispatch_tool_search_tool(store, session, call, tool_router),
     }
 }
 
@@ -12638,7 +12616,7 @@ fn dispatch_tool_search_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
-    registry: &ToolRegistry,
+    tool_router: &ToolRouter,
 ) -> Result<ToolDispatchOutcome> {
     let query = call
         .arguments
@@ -12671,7 +12649,7 @@ fn dispatch_tool_search_tool(
             "arguments": call.arguments,
         }),
     )?;
-    let tools = registry.search_deferred_tools(query, limit as usize);
+    let tools = tool_router.search_deferred_tools(query, limit as usize);
     let item = serde_json::json!({
         "type": "tool_search_output",
         "call_id": call.id,
@@ -12749,7 +12727,11 @@ fn latest_thread_goal_from_events(events: &[EventRecord]) -> Option<ThreadGoalSn
                         .cloned()
                         .unwrap_or_else(empty_codex_token_usage),
                     created_at_ms: event.payload.get("created_at_ms").and_then(Value::as_i64),
-                    updated_at_ms: event.payload.get("created_at_ms").and_then(Value::as_i64),
+                    updated_at_ms: event
+                        .payload
+                        .get("updated_at_ms")
+                        .and_then(Value::as_i64)
+                        .or_else(|| event.payload.get("created_at_ms").and_then(Value::as_i64)),
                 });
             }
             GOAL_UPDATED_EVENT => {
@@ -29987,21 +29969,16 @@ request_max_retries = 7
             arguments: serde_json::json!({"query": "subagent tools", "limit": 3}),
         };
 
-        let default_registry = with_codex_home(&codex_home, || {
-            browser_tool_registry_for_session(
-                &session,
-                &AgentRunOptions::default(),
-                "gpt-5.5",
-                true,
-            )
+        let default_router = with_codex_home(&codex_home, || {
+            browser_tool_router_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
-        assert!(tool_call_supports_parallel(&default_registry, &exec_call));
+        assert!(tool_call_supports_parallel(&default_router, &exec_call));
         assert!(
-            !tool_call_supports_parallel(&default_registry, &shell_call),
+            !tool_call_supports_parallel(&default_router, &shell_call),
             "hidden legacy shell_command dispatch remains serial like Codex"
         );
         assert!(
-            tool_call_supports_parallel(&default_registry, &tool_search_call),
+            tool_call_supports_parallel(&default_router, &tool_search_call),
             "Codex lets tool_search run in parallel with other parallel-safe calls"
         );
 
@@ -30009,10 +29986,10 @@ request_max_retries = 7
             "features.unified_exec".to_string(),
             toml::Value::Boolean(false),
         )]);
-        let legacy_registry = with_codex_home(&codex_home, || {
-            browser_tool_registry_for_session(&session, &legacy, "gpt-5.5", true)
+        let legacy_router = with_codex_home(&codex_home, || {
+            browser_tool_router_for_session(&session, &legacy, "gpt-5.5", true)
         })?;
-        assert!(tool_call_supports_parallel(&legacy_registry, &shell_call));
+        assert!(tool_call_supports_parallel(&legacy_router, &shell_call));
         Ok(())
     }
 
@@ -35280,6 +35257,39 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             },
         )?;
         assert!(message_content_text(&recreate.messages[0]).contains("goal already exists"));
+        Ok(())
+    }
+
+    #[test]
+    fn goal_created_snapshot_preserves_explicit_updated_at_ms() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            GOAL_CREATED_EVENT,
+            serde_json::json!({
+                "goal_id": "goal-1",
+                "objective": "preserve imported timestamps",
+                "status": "active",
+                "created_at_ms": 100,
+                "updated_at_ms": 250,
+            }),
+        )?;
+
+        let get = dispatch_get_goal_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "get_goal_timestamps".to_string(),
+                name: "get_goal".to_string(),
+                namespace: None,
+                arguments: serde_json::json!({}),
+            },
+        )?;
+        let current = serde_json::from_str::<Value>(&message_content_text(&get.messages[0]))?;
+        assert_eq!(current["created_at_ms"], 100);
+        assert_eq!(current["updated_at_ms"], 250);
         Ok(())
     }
 

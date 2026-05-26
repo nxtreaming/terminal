@@ -1,9 +1,10 @@
-use bm25::{Document, Language, SearchEngineBuilder};
+use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
 use browser_use_protocol::{FreeformToolFormat, ToolSpec};
 use browser_use_providers::ModelShellType;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) mod command;
 pub(crate) mod files;
@@ -182,6 +183,160 @@ const TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT: &str = "Spawn and manage sub-a
 struct ToolSearchEntry {
     search_text: String,
     spec: ToolSpec,
+    source: ToolSearchSourceInfo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToolSearchSourceInfo {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolRouter {
+    registry: ToolRegistry,
+    model_visible_specs: Vec<ToolSpec>,
+    search_entries: Vec<ToolSearchEntry>,
+    search_engine: Option<Arc<SearchEngine<usize>>>,
+    tool_search_enabled: bool,
+}
+
+impl ToolRouter {
+    pub(crate) fn new(
+        registry: ToolRegistry,
+        tool_search_supported: bool,
+        namespace_tools_supported: bool,
+    ) -> Self {
+        let search_entries = registry.deferred_tool_search_entries();
+        let search_sources = dedup_tool_search_sources(search_entries.iter().map(|entry| {
+            (
+                entry.source.name.as_str(),
+                entry.source.description.as_deref(),
+            )
+        }));
+        let search_engine = (!search_entries.is_empty()).then(|| {
+            Arc::new(
+                SearchEngineBuilder::<usize>::with_documents(
+                    Language::English,
+                    search_entries
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, entry)| Document::new(idx, entry.search_text.clone()))
+                        .collect::<Vec<_>>(),
+                )
+                .build(),
+            )
+        });
+        let tool_search_enabled =
+            tool_search_supported && namespace_tools_supported && !search_entries.is_empty();
+        let mut model_visible_specs = registry
+            .tools
+            .iter()
+            .filter(|tool| match tool.exposure {
+                ToolExposure::Hidden => false,
+                ToolExposure::Deferred => !tool_search_enabled,
+                ToolExposure::Direct | ToolExposure::DirectModelOnly => true,
+            })
+            .map(|tool| tool.spec.clone())
+            .collect::<Vec<_>>();
+        if tool_search_enabled {
+            model_visible_specs.push(tool_search_tool_spec(&search_sources));
+        }
+        if !namespace_tools_supported {
+            model_visible_specs.retain(|spec| spec.namespace.is_none());
+        }
+        Self {
+            registry,
+            model_visible_specs,
+            search_entries,
+            search_engine,
+            tool_search_enabled,
+        }
+    }
+
+    pub(crate) fn model_visible_specs(&self) -> Vec<ToolSpec> {
+        self.model_visible_specs.clone()
+    }
+
+    pub(crate) fn allow_login_shell(&self) -> bool {
+        self.registry.allow_login_shell()
+    }
+
+    pub(crate) fn handler_for_dispatch(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<ToolHandlerKind> {
+        self.registry.handler_for_namespaced(namespace, name)
+    }
+
+    pub(crate) fn visible_handler_for_call(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<ToolHandlerKind> {
+        self.registry
+            .direct_handler_for_namespaced(namespace, name)
+            .or_else(|| {
+                (namespace.is_none() && name == TOOL_SEARCH_TOOL_NAME && self.tool_search_enabled)
+                    .then(|| {
+                        self.registry
+                            .handler_for_namespaced(None, TOOL_SEARCH_TOOL_NAME)
+                    })
+                    .flatten()
+            })
+    }
+
+    pub(crate) fn tool_supports_parallel(
+        &self,
+        call_namespace: Option<&str>,
+        call_name: &str,
+    ) -> bool {
+        matches!(
+            self.visible_handler_for_call(call_namespace, call_name),
+            Some(
+                ToolHandlerKind::ExecCommand
+                    | ToolHandlerKind::ShellCommand
+                    | ToolHandlerKind::ReadFile
+                    | ToolHandlerKind::SearchFiles
+                    | ToolHandlerKind::ListFiles
+                    | ToolHandlerKind::ViewImage
+                    | ToolHandlerKind::ToolSearch
+            )
+        )
+    }
+
+    pub(crate) fn tool_supports_streaming_predispatch(
+        &self,
+        call_namespace: Option<&str>,
+        call_name: &str,
+    ) -> bool {
+        matches!(
+            self.visible_handler_for_call(call_namespace, call_name),
+            Some(
+                ToolHandlerKind::ReadFile
+                    | ToolHandlerKind::SearchFiles
+                    | ToolHandlerKind::ListFiles
+                    | ToolHandlerKind::ViewImage
+                    | ToolHandlerKind::ToolSearch
+            )
+        )
+    }
+
+    pub(crate) fn search_deferred_tools(&self, query: &str, limit: usize) -> Vec<Value> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 || self.search_entries.is_empty() {
+            return Vec::new();
+        }
+        let Some(search_engine) = self.search_engine.as_ref() else {
+            return Vec::new();
+        };
+        let matches = search_engine
+            .search(query, limit)
+            .into_iter()
+            .filter_map(|result| self.search_entries.get(result.document.id));
+        coalesce_loadable_tool_specs(matches.map(|entry| deferred_tool_json(&entry.spec)))
+    }
 }
 
 impl ToolRegistry {
@@ -311,10 +466,10 @@ impl ToolRegistry {
                     ToolExposure::Deferred,
                 );
                 registry.register_with_exposure(
-                    tool_search_tool_spec(&[(
-                        TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
-                        Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
-                    )]),
+                    tool_search_tool_spec(&[ToolSearchSourceInfo {
+                        name: TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT.to_string(),
+                        description: Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT.to_string()),
+                    }]),
                     ToolHandlerKind::ToolSearch,
                     ToolExposure::Hidden,
                 );
@@ -403,36 +558,18 @@ impl ToolRegistry {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn specs_for_model(
         &self,
         tool_search_supported: bool,
         namespace_tools_supported: bool,
     ) -> Vec<ToolSpec> {
-        let use_tool_search =
-            tool_search_supported && namespace_tools_supported && self.has_deferred_tools();
-        let mut specs = self
-            .tools
-            .iter()
-            .filter(|tool| match tool.exposure {
-                ToolExposure::Hidden => false,
-                ToolExposure::Deferred => !use_tool_search,
-                ToolExposure::Direct | ToolExposure::DirectModelOnly => true,
-            })
-            .map(|tool| tool.spec.clone())
-            .collect::<Vec<_>>();
-        if use_tool_search {
-            specs.push(tool_search_tool_spec(&[(
-                TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
-                Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
-            )]));
-        }
-        specs
-    }
-
-    fn has_deferred_tools(&self) -> bool {
-        self.tools
-            .iter()
-            .any(|tool| tool.exposure == ToolExposure::Deferred)
+        ToolRouter::new(
+            self.clone(),
+            tool_search_supported,
+            namespace_tools_supported,
+        )
+        .model_visible_specs()
     }
 
     pub(crate) fn handler_for(&self, name: &str) -> Option<ToolHandlerKind> {
@@ -474,27 +611,9 @@ impl ToolRegistry {
             .map(|tool| tool.handler)
     }
 
+    #[cfg(test)]
     pub(crate) fn search_deferred_tools(&self, query: &str, limit: usize) -> Vec<Value> {
-        let query = query.trim();
-        if query.is_empty() || limit == 0 {
-            return Vec::new();
-        }
-        let entries = self.deferred_tool_search_entries();
-        if entries.is_empty() {
-            return Vec::new();
-        }
-        let documents = entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| Document::new(idx, entry.search_text.clone()))
-            .collect::<Vec<_>>();
-        let search_engine =
-            SearchEngineBuilder::<usize>::with_documents(Language::English, documents).build();
-        let matches = search_engine
-            .search(query, limit)
-            .into_iter()
-            .filter_map(|result| entries.get(result.document.id));
-        coalesce_loadable_tool_specs(matches.map(|entry| deferred_tool_json(&entry.spec)))
+        ToolRouter::new(self.clone(), true, true).search_deferred_tools(query, limit)
     }
 
     fn deferred_tool_search_entries(&self) -> Vec<ToolSearchEntry> {
@@ -506,9 +625,48 @@ impl ToolRegistry {
                     .unwrap_or_else(|| tool.spec.name.as_str())
                     .to_string(),
                 spec: tool.spec.clone(),
+                source: tool_search_source_for_tool(tool),
             })
             .collect()
     }
+}
+
+fn tool_search_source_for_tool(tool: &RegisteredTool) -> ToolSearchSourceInfo {
+    let (name, description) = match tool.handler {
+        ToolHandlerKind::SpawnAgentV1
+        | ToolHandlerKind::SendInputV1
+        | ToolHandlerKind::ResumeAgentV1
+        | ToolHandlerKind::WaitAgentV1
+        | ToolHandlerKind::CloseAgentV1 => (
+            TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
+            Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
+        ),
+        _ => ("Deferred tools", None),
+    };
+    ToolSearchSourceInfo {
+        name: name.to_string(),
+        description: description.map(str::to_string),
+    }
+}
+
+fn dedup_tool_search_sources<'a>(
+    sources: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Vec<ToolSearchSourceInfo> {
+    let mut source_descriptions = BTreeMap::<String, Option<String>>::new();
+    for (name, description) in sources {
+        source_descriptions
+            .entry(name.to_string())
+            .and_modify(|existing| {
+                if existing.is_none() {
+                    *existing = description.map(str::to_string);
+                }
+            })
+            .or_insert_with(|| description.map(str::to_string));
+    }
+    source_descriptions
+        .into_iter()
+        .map(|(name, description)| ToolSearchSourceInfo { name, description })
+        .collect()
 }
 
 fn multi_agent_v1_tool_search_text(handler: ToolHandlerKind) -> Option<&'static str> {
@@ -532,26 +690,20 @@ fn multi_agent_v1_tool_search_text(handler: ToolHandlerKind) -> Option<&'static 
     }
 }
 
-fn tool_search_tool_spec(searchable_sources: &[(&str, Option<&str>)]) -> ToolSpec {
-    let mut source_descriptions = BTreeMap::<String, Option<String>>::new();
-    for (name, description) in searchable_sources {
-        source_descriptions
-            .entry((*name).to_string())
-            .and_modify(|existing| {
-                if existing.is_none() {
-                    *existing = description.map(str::to_string);
-                }
-            })
-            .or_insert_with(|| description.map(str::to_string));
-    }
-    let source_descriptions = if source_descriptions.is_empty() {
+fn tool_search_tool_spec(searchable_sources: &[ToolSearchSourceInfo]) -> ToolSpec {
+    let sources = dedup_tool_search_sources(
+        searchable_sources
+            .iter()
+            .map(|source| (source.name.as_str(), source.description.as_deref())),
+    );
+    let source_descriptions = if sources.is_empty() {
         "None currently enabled.".to_string()
     } else {
-        source_descriptions
+        sources
             .into_iter()
-            .map(|(name, description)| match description {
-                Some(description) => format!("- {name}: {description}"),
-                None => format!("- {name}"),
+            .map(|source| match source.description {
+                Some(description) => format!("- {}: {description}", source.name),
+                None => format!("- {}", source.name),
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -2255,10 +2407,17 @@ mod tests {
                 ShellToolSpecConfig::default(),
                 false,
                 browser_use_providers::spawn_agent_model_overrides_description(),
-            );
+        );
 
-        let direct_specs = registry.specs_for_model(true, true);
-        assert!(direct_specs.iter().any(|spec| spec.name == "tool_search"));
+        let router = ToolRouter::new(registry.clone(), true, true);
+        let direct_specs = router.model_visible_specs();
+        let tool_search = direct_specs
+            .iter()
+            .find(|spec| spec.name == "tool_search")
+            .expect("tool_search spec");
+        assert!(tool_search
+            .description
+            .contains("- Multi-agent tools: Spawn and manage sub-agents."));
         assert!(!direct_specs.iter().any(|spec| {
             spec.namespace.as_deref() == Some("multi_agent_v1") && spec.name == "spawn_agent"
         }));
