@@ -96,7 +96,9 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   ack/fallback, deeper local compaction/token lifecycle parity, and
   multi-environment tool routing.
 - Latest verification: full Rust/Python/whitespace checks and Codex-auth root
-  plus child smokes passed for the latest batch. Platform subagent auditing is
+  plus child smokes passed for the hook/compaction batch. The root smoke
+  returned `Paris`, and the child smoke read `/tmp/but-codex-agent-parity-smoke.txt`
+  and returned `agent-parity-smoke-ok`. Platform subagent auditing is
   available again; ten broad read-only auditors completed after the
   apply-patch/diff/hook-alias slice and kept the same architectural gap set
   open. The audit added concrete next slices: Codex-style hook `tool_input`
@@ -139,6 +141,25 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   history/rollout reconstruction, goal accounting, hook concurrency/source
   metadata, exact `TurnDiffTracker`, and deeper local compaction/token
   lifecycle precision.
+- The current hook/compaction slice closes a concrete part of that larger hook
+  runtime gap. Matching command hooks now execute concurrently, preserving
+  configured order for stable context/feedback while selecting
+  `PreToolUse.updatedInput` by completion order like Codex. Hook lifecycle
+  events record both configured and completion order. Model-compaction overflow
+  retry now removes an old assistant/tool-output pair together when trimming
+  summary-request history, reducing invalid call/output fragments in local
+  compaction prompts.
+- Verification for the hook/compaction slice passed with full Rust workspace
+  tests, Python tests, formatting, whitespace, and real Codex-auth root/child
+  smokes. Root session `e6e235f00a9e` returned `Paris`; child session
+  `e34b51f2b5a5` read `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`. Six broad second-wave auditors returned before this
+  checkpoint and agreed the remaining high-impact gaps are architectural:
+  dynamic tool routing/inventory, true streaming tool futures with cancellation
+  and read/write gating, active-turn `InputQueue`/`AgentControl` semantics,
+  typed history/rollout reconstruction, deeper local compaction/token
+  lifecycle parity, subagent control-plane depth, exact turn diff tracking, and
+  fuller hook source/trust/transcript metadata.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming
@@ -1448,12 +1469,12 @@ The biggest remaining categories are:
   `tool_input.command`, and hook `updatedInput.command` rewrites back into the
   local tool argument shape. The rescue path also covers `applypatch`, direct
   single-argument invocation, and strict `cd <path> && apply_patch <<EOF`
-  forms. Invalid-image recovery, compaction overflow retry, inline execution of
-  `async_run` hook effects, and inexact dirty-baseline git diff reporting are
-  now represented. Still open: true concurrent/background hook execution,
-  exact hook run summaries/sources/validation, exact streaming futures for
-  mutating tools, and a full Codex `TurnDiffTracker` lifecycle across every
-  tool runtime.
+  forms. Invalid-image recovery, compaction overflow retry, execution of
+  `async_run` hook effects, concurrent command-hook execution, completion-order
+  `updatedInput`, and inexact dirty-baseline git diff reporting are now
+  represented. Still open: exact hook run summaries/sources/trust/transcript
+  metadata, exact streaming futures for mutating tools, and a full Codex
+  `TurnDiffTracker` lifecycle across every tool runtime.
 - Multi-agent family routing now follows Codex's feature gate for represented
   sessions: `features.multi_agent_v2.enabled = true` selects the v2 task-path
   surface, while the default surface is the namespaced legacy
