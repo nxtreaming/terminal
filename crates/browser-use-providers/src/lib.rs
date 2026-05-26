@@ -650,6 +650,8 @@ pub enum ModelPersonality {
 
 const CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS: &str =
     include_str!("../../../prompts/codex-model-fallback-prompt.md");
+const NEUTRAL_FALLBACK_BASE_MODEL_INSTRUCTIONS: &str =
+    include_str!("../../../prompts/model-fallback-prompt.md");
 const CODEX_FRIENDLY_PERSONALITY_MESSAGE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
 const CODEX_PRAGMATIC_PERSONALITY_MESSAGE: &str =
@@ -685,7 +687,7 @@ impl StaticModelRequestInfo {
             supported_service_tiers: &[],
             supports_parallel_tool_calls: false,
             supports_search_tool: false,
-            supports_image_input: true,
+            supports_image_input: false,
             supports_image_detail_original: false,
             shell_type: ModelShellType::ShellCommand,
             web_search_tool_type: WebSearchToolType::Text,
@@ -789,8 +791,8 @@ impl From<StaticModelRequestInfo> for ModelRequestInfo {
             shell_type: info.shell_type,
             web_search_tool_type: info.web_search_tool_type,
             experimental_supported_tools: Vec::new(),
-            context_window: Some(272_000),
-            max_context_window: Some(272_000),
+            context_window: None,
+            max_context_window: None,
             auto_compact_token_limit: None,
             truncation_policy: info.truncation_policy,
         }
@@ -1812,7 +1814,8 @@ impl OpenAIResponsesProvider {
 
 #[derive(Clone, Debug)]
 pub struct OpenAICompatibleChatProvider {
-    api_key: String,
+    api_key: Option<String>,
+    command_auth: Option<ProviderCommandAuth>,
     model: String,
     base_url: String,
     provider_name: String,
@@ -1832,8 +1835,17 @@ impl OpenAICompatibleChatProvider {
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        Self::with_optional_api_key(Some(api_key.into()), model, base_url)
+    }
+
+    pub fn with_optional_api_key(
+        api_key: Option<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
         Self {
-            api_key: api_key.into(),
+            api_key,
+            command_auth: None,
             model: model.into(),
             base_url: base_url.into().trim_end_matches('/').to_string(),
             provider_name: "openai-compatible".to_string(),
@@ -1869,6 +1881,11 @@ impl OpenAICompatibleChatProvider {
 
     pub fn with_request_options(mut self, request_options: ProviderRequestOptions) -> Self {
         self.request_options = request_options;
+        self
+    }
+
+    pub fn with_command_auth_config(mut self, auth: ProviderCommandAuthConfig) -> Self {
+        self.command_auth = Some(ProviderCommandAuth::new(auth));
         self
     }
 }
@@ -1908,19 +1925,43 @@ impl ModelProvider for OpenAICompatibleChatProvider {
             body["tools"] = Value::Array(tools);
             body["tool_choice"] = json!("auto");
         }
-        let (status, headers, body_text) = send_provider_text_request(
-            "send OpenAI-compatible chat request",
-            "read OpenAI-compatible chat response body",
-            request_retry,
-            || {
-                let request = self
-                    .client
-                    .post(format!("{}/chat/completions", self.base_url))
-                    .bearer_auth(&self.api_key);
-                let request = apply_query_params(request, &self.request_options.query_params);
-                apply_extra_headers(request, Some(&self.request_options.headers)).json(&body)
-            },
-        )?;
+        let command_auth = self.command_auth.clone();
+        let command_auth_token = command_auth
+            .as_ref()
+            .map(ProviderCommandAuth::access_token)
+            .transpose()
+            .map_err(provider_command_auth_error)?;
+        let send_with_auth = |auth_token: Option<&str>| {
+            send_provider_text_request(
+                "send OpenAI-compatible chat request",
+                "read OpenAI-compatible chat response body",
+                request_retry,
+                || {
+                    let mut request = self
+                        .client
+                        .post(format!("{}/chat/completions", self.base_url));
+                    request = apply_query_params(request, &self.request_options.query_params);
+                    request = apply_extra_headers(request, Some(&self.request_options.headers));
+                    if let Some(api_key) = auth_token
+                        .or(self.api_key.as_deref())
+                        .filter(|key| !key.trim().is_empty())
+                    {
+                        request = request.bearer_auth(api_key);
+                    }
+                    request.json(&body)
+                },
+            )
+        };
+        let (mut status, mut headers, mut body_text) =
+            send_with_auth(command_auth_token.as_deref())?;
+        if status == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(command_auth) = command_auth.as_ref() {
+                let refreshed = command_auth
+                    .refresh_access_token()
+                    .map_err(provider_command_auth_error)?;
+                (status, headers, body_text) = send_with_auth(Some(&refreshed))?;
+            }
+        }
         if !status.is_success() {
             return Err(provider_http_status_error(
                 "OpenAI-compatible chat",
@@ -1933,7 +1974,7 @@ impl ModelProvider for OpenAICompatibleChatProvider {
         let body: Value = serde_json::from_str(&body_text).map_err(|error| {
             ProviderError::retryable(format!("parse OpenAI-compatible chat JSON: {error}"), None)
         })?;
-        parse_chat_completion_output(&body, &self.model)
+        parse_chat_completion_output(&body, &self.model, &turn.tools)
     }
 }
 
@@ -4561,7 +4602,7 @@ fn fallback_model_instructions_for_model_and_personality(
         .map(|messages| {
             messages.get_model_instructions(personality, CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS)
         })
-        .unwrap_or_else(|| CODEX_FALLBACK_BASE_MODEL_INSTRUCTIONS.to_string())
+        .unwrap_or_else(|| NEUTRAL_FALLBACK_BASE_MODEL_INSTRUCTIONS.to_string())
 }
 
 fn fallback_model_messages_for_slug(slug: &str) -> Option<LocalModelMessages> {
@@ -4879,12 +4920,16 @@ fn tool_specs_to_chat_tools(tools: &[ToolSpec]) -> Vec<Value> {
                 "type": "function",
                 "function": {
                     "name": tool.name,
-                    "description": tool.description,
+                    "description": chat_tool_description(tool),
                     "parameters": tool.input_schema,
                 }
             })
         })
         .collect()
+}
+
+fn chat_tool_description(tool: &ToolSpec) -> String {
+    downgraded_freeform_tool_description(tool).unwrap_or_else(|| tool.description.clone())
 }
 
 fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Value> {
@@ -4893,11 +4938,39 @@ fn tool_specs_to_anthropic_tools(tools: &[ToolSpec], is_oauth: bool) -> Vec<Valu
         .map(|tool| {
             json!({
                 "name": anthropic_request_tool_name(&tool.name, is_oauth),
-                "description": tool.description,
+                "description": anthropic_tool_description(tool),
                 "input_schema": tool.input_schema,
             })
         })
         .collect()
+}
+
+fn anthropic_tool_description(tool: &ToolSpec) -> String {
+    downgraded_freeform_tool_description(tool).unwrap_or_else(|| tool.description.clone())
+}
+
+fn downgraded_freeform_tool_description(tool: &ToolSpec) -> Option<String> {
+    let format = tool.freeform.as_ref()?;
+    let Some(field_name) = freeform_tool_payload_field(tool) else {
+        return Some(format!(
+            "{}\n\nThis provider requires JSON tool arguments. Encode the freeform {} payload in the JSON arguments accepted by this tool.",
+            tool.description, format.syntax
+        ));
+    };
+    Some(format!(
+        "{}\n\nThis provider requires JSON tool arguments. Put the raw {} payload in the `{field_name}` string property exactly as it should be passed to the tool.",
+        tool.description, format.syntax
+    ))
+}
+
+fn freeform_tool_payload_field(tool: &ToolSpec) -> Option<&str> {
+    let required = tool.input_schema.get("required")?.as_array()?;
+    if required.len() != 1 {
+        return None;
+    }
+    let field = required.first()?.as_str()?;
+    let field_schema = tool.input_schema.get("properties")?.get(field)?;
+    (field_schema.get("type").and_then(Value::as_str) == Some("string")).then_some(field)
 }
 
 const IMAGE_CONTENT_OMITTED_PLACEHOLDER: &str =
@@ -5870,7 +5943,11 @@ fn parse_responses_output(body: &Value, model: &str) -> Result<Vec<ModelEvent>> 
     Ok(events)
 }
 
-fn parse_chat_completion_output(body: &Value, model: &str) -> Result<Vec<ModelEvent>> {
+fn parse_chat_completion_output(
+    body: &Value,
+    model: &str,
+    tools: &[ToolSpec],
+) -> Result<Vec<ModelEvent>> {
     let mut events = Vec::new();
     let Some(message) = body
         .get("choices")
@@ -5904,11 +5981,7 @@ fn parse_chat_completion_output(body: &Value, model: &str) -> Result<Vec<ModelEv
             .get("id")
             .and_then(Value::as_str)
             .context("chat tool call missing id")?;
-        let arguments = function
-            .get("arguments")
-            .and_then(Value::as_str)
-            .and_then(|raw| serde_json::from_str::<Value>(raw).ok())
-            .unwrap_or_else(|| json!({}));
+        let arguments = chat_tool_call_arguments(name, function, tools);
         events.push(ModelEvent::ToolCall {
             call: ToolCall {
                 id: call_id.to_string(),
@@ -5923,6 +5996,29 @@ fn parse_chat_completion_output(body: &Value, model: &str) -> Result<Vec<ModelEv
     }
     events.push(ModelEvent::Done);
     Ok(events)
+}
+
+fn chat_tool_call_arguments(name: &str, function: &Value, tools: &[ToolSpec]) -> Value {
+    let raw = function
+        .get("arguments")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    serde_json::from_str::<Value>(raw)
+        .unwrap_or_else(|_| freeform_tool_arguments_from_raw(name, raw, tools))
+}
+
+fn freeform_tool_arguments_from_raw(name: &str, raw: &str, tools: &[ToolSpec]) -> Value {
+    let Some(tool) = tools
+        .iter()
+        .find(|tool| tool.name == name && tool.freeform.is_some())
+    else {
+        return json!({});
+    };
+    if let Some(field_name) = freeform_tool_payload_field(tool) {
+        json!({ field_name: raw })
+    } else {
+        Value::String(raw.to_string())
+    }
 }
 
 fn parse_anthropic_messages_output(
@@ -5973,7 +6069,11 @@ fn parse_anthropic_messages_output(
                         id: call_id.to_string(),
                         name: anthropic_response_tool_name(name, tools, is_oauth),
                         namespace: None,
-                        arguments: block.get("input").cloned().unwrap_or_else(|| json!({})),
+                        arguments: anthropic_tool_use_arguments(
+                            &anthropic_response_tool_name(name, tools, is_oauth),
+                            block.get("input"),
+                            tools,
+                        ),
                     },
                 });
             }
@@ -5985,6 +6085,14 @@ fn parse_anthropic_messages_output(
     }
     events.push(ModelEvent::Done);
     Ok(events)
+}
+
+fn anthropic_tool_use_arguments(name: &str, input: Option<&Value>, tools: &[ToolSpec]) -> Value {
+    match input {
+        Some(Value::String(raw)) => freeform_tool_arguments_from_raw(name, raw, tools),
+        Some(input) => input.clone(),
+        None => json!({}),
+    }
 }
 
 fn parse_response_output_item(item: &Value, events: &mut Vec<ModelEvent>) -> Result<()> {
@@ -6426,6 +6534,13 @@ mod tests {
         }
     }
 
+    fn image_capable_model_info() -> ModelRequestInfo {
+        ModelRequestInfo {
+            supports_image_input: true,
+            ..ModelRequestInfo::unknown()
+        }
+    }
+
     #[test]
     fn fake_provider_returns_scripted_events() -> Result<()> {
         let provider = FakeProvider::with_text("hello");
@@ -6469,13 +6584,20 @@ mod tests {
 
     #[test]
     fn responses_input_preserves_user_image_parts() -> Result<()> {
-        let input = messages_to_responses_input(&[json!({
-            "role": "user",
-            "content": [
-                {"type": "input_text", "text": "look"},
-                {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "high"}
-            ]
-        })])?;
+        let image_model = ModelRequestInfo {
+            supports_image_input: true,
+            ..ModelRequestInfo::unknown()
+        };
+        let input = messages_to_responses_input_for_model(
+            &[json!({
+                "role": "user",
+                "content": [
+                    {"type": "input_text", "text": "look"},
+                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "high"}
+                ]
+            })],
+            &image_model,
+        )?;
         assert_eq!(input[0]["content"][0]["type"], "input_text");
         assert_eq!(input[0]["content"][1]["type"], "input_image");
         assert_eq!(
@@ -6563,25 +6685,28 @@ mod tests {
 
     #[test]
     fn responses_input_moves_tool_output_images_to_visual_context_message() -> Result<()> {
-        let input = messages_to_responses_input(&[
-            json!({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": "call_1",
+        let input = messages_to_responses_input_for_model(
+            &[
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_1",
+                        "name": "python",
+                        "arguments": {"code": "screenshot('x')"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call_1",
                     "name": "python",
-                    "arguments": {"code": "screenshot('x')"}
-                }]
-            }),
-            json!({
-                "role": "tool",
-                "tool_call_id": "call_1",
-                "name": "python",
-                "content": [
-                    {"type": "output_text", "text": "screenshot"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
-                ]
-            }),
-        ])?;
+                    "content": [
+                        {"type": "output_text", "text": "screenshot"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
+                    ]
+                }),
+            ],
+            &image_capable_model_info(),
+        )?;
         assert_eq!(input[0]["type"], "function_call");
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_1");
@@ -6604,24 +6729,27 @@ mod tests {
     #[test]
     fn responses_input_returns_view_image_as_function_call_output_content_like_codex() -> Result<()>
     {
-        let input = messages_to_responses_input(&[
-            json!({
-                "role": "assistant",
-                "tool_calls": [{
-                    "id": "call_view",
+        let input = messages_to_responses_input_for_model(
+            &[
+                json!({
+                    "role": "assistant",
+                    "tool_calls": [{
+                        "id": "call_view",
+                        "name": "view_image",
+                        "arguments": {"path": "shot.png"}
+                    }]
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "call_view",
                     "name": "view_image",
-                    "arguments": {"path": "shot.png"}
-                }]
-            }),
-            json!({
-                "role": "tool",
-                "tool_call_id": "call_view",
-                "name": "view_image",
-                "content": [
-                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "high"}
-                ]
-            }),
-        ])?;
+                    "content": [
+                        {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "high"}
+                    ]
+                }),
+            ],
+            &image_capable_model_info(),
+        )?;
         assert_eq!(input.len(), 2);
         assert_eq!(input[1]["type"], "function_call_output");
         assert_eq!(input[1]["call_id"], "call_view");
@@ -6668,21 +6796,24 @@ mod tests {
 
     #[test]
     fn responses_input_converts_orphan_tool_output_to_context_message() -> Result<()> {
-        let input = messages_to_responses_input(&[
-            json!({
-                "role": "system",
-                "content": "compacted context"
-            }),
-            json!({
-                "role": "tool",
-                "tool_call_id": "missing_call",
-                "name": "python",
-                "content": [
-                    {"type": "output_text", "text": "screenshot"},
-                    {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
-                ]
-            }),
-        ])?;
+        let input = messages_to_responses_input_for_model(
+            &[
+                json!({
+                    "role": "system",
+                    "content": "compacted context"
+                }),
+                json!({
+                    "role": "tool",
+                    "tool_call_id": "missing_call",
+                    "name": "python",
+                    "content": [
+                        {"type": "output_text", "text": "screenshot"},
+                        {"type": "input_image", "image_url": "data:image/png;base64,abc", "detail": "auto"}
+                    ]
+                }),
+            ],
+            &image_capable_model_info(),
+        )?;
         assert_eq!(input.len(), 2);
         assert_eq!(input[1]["type"], "message");
         assert_eq!(input[1]["role"], "user");
@@ -6725,6 +6856,36 @@ mod tests {
         assert_eq!(tools[0]["format"]["type"], "grammar");
         assert_eq!(tools[0]["format"]["syntax"], "lark");
         assert!(tools[0].get("parameters").is_none());
+    }
+
+    #[test]
+    fn chat_tools_downgrade_freeform_apply_patch_to_json_wrapper() {
+        let tools = tool_specs_to_chat_tools(&[ToolSpec {
+            name: "apply_patch".to_string(),
+            namespace: None,
+            namespace_description: None,
+            description: "FREEFORM patch tool; do not wrap in JSON.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {"patch": {"type": "string"}},
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            freeform: Some(browser_use_protocol::FreeformToolFormat {
+                kind: "grammar".to_string(),
+                syntax: "lark".to_string(),
+                definition: "start: begin_patch hunk+ end_patch".to_string(),
+            }),
+        }]);
+
+        let function = &tools[0]["function"];
+        assert_eq!(function["name"], "apply_patch");
+        assert_eq!(function["parameters"]["required"][0], "patch");
+        assert!(function["description"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Put the raw lark payload in the `patch` string property"));
     }
 
     #[test]
@@ -7981,6 +8142,65 @@ mod tests {
                 cost_usd: Some(0.0123),
                 cost_source: Some("native".to_string()),
                 ..Default::default()
+            }
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn openai_compatible_chat_provider_wraps_raw_freeform_tool_arguments() -> Result<()> {
+        let raw_patch = "*** Begin Patch\n*** Add File: hello.txt\n+hello\n*** End Patch";
+        let (base_url, handle) = spawn_mock_server(
+            json!({
+                "id": "chatcmpl_freeform",
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "tool_calls": [{
+                            "id": "call_patch",
+                            "type": "function",
+                            "function": {
+                                "name": "apply_patch",
+                                "arguments": raw_patch
+                            }
+                        }]
+                    }
+                }]
+            })
+            .to_string(),
+            "application/json",
+        )?;
+        let provider =
+            OpenAICompatibleChatProvider::with_base_url("test-key", "openrouter/test", base_url);
+        let events = provider.start_turn(ProviderTurn {
+            messages: vec![json!({"role": "user", "content": "patch"})],
+            tools: vec![ToolSpec {
+                name: "apply_patch".to_string(),
+                namespace: None,
+                namespace_description: None,
+                description: "Use a patch.".to_string(),
+                input_schema: json!({
+                    "type": "object",
+                    "properties": {"patch": {"type": "string"}},
+                    "required": ["patch"],
+                    "additionalProperties": false
+                }),
+                output_schema: None,
+                freeform: Some(browser_use_protocol::FreeformToolFormat {
+                    kind: "grammar".to_string(),
+                    syntax: "lark".to_string(),
+                    definition: "start: begin_patch hunk+ end_patch".to_string(),
+                }),
+            }],
+            ..ProviderTurn::default()
+        })?;
+        handle.join().expect("mock server thread");
+        assert!(events.contains(&ModelEvent::ToolCall {
+            call: ToolCall {
+                id: "call_patch".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": raw_patch}),
             }
         }));
         Ok(())
@@ -10528,10 +10748,12 @@ mod tests {
         assert!(none.contains("Browser Agent Contract"));
 
         let unsupported = default_agent_instructions_for_model_and_personality(
-            "gpt-5.2",
+            "custom-model",
             ModelPersonality::Friendly,
         );
-        assert!(unsupported.contains("You are GPT-5.2 running in the Codex CLI"));
+        assert!(unsupported
+            .contains("You are a coding agent running in a terminal-based agent harness"));
+        assert!(!unsupported.contains("Codex CLI is an open source project led by OpenAI"));
         assert!(!unsupported.contains("supportive teammate as much as code quality"));
 
         let namespaced = default_agent_instructions_for_model_and_personality(

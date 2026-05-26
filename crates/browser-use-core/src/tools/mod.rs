@@ -43,6 +43,9 @@ pub(crate) enum ToolHandlerKind {
     SearchFiles,
     ListFiles,
     ViewImage,
+    GetGoal,
+    CreateGoal,
+    UpdateGoal,
     UpdatePlan,
     RequestUserInput,
     SpawnAgent,
@@ -92,6 +95,7 @@ impl Default for ToolRegistry {
 #[derive(Clone, Debug)]
 pub(crate) struct MultiAgentToolSpecConfig {
     pub(crate) family: MultiAgentToolFamily,
+    pub(crate) goals_enabled: bool,
     pub(crate) hide_spawn_agent_metadata: bool,
     pub(crate) wait_default_timeout_ms: i64,
     pub(crate) wait_min_timeout_ms: i64,
@@ -151,6 +155,7 @@ impl Default for MultiAgentToolSpecConfig {
     fn default() -> Self {
         Self {
             family: MultiAgentToolFamily::V2,
+            goals_enabled: true,
             hide_spawn_agent_metadata: false,
             wait_default_timeout_ms: 30_000,
             wait_min_timeout_ms: 10_000,
@@ -258,6 +263,11 @@ impl ToolRegistry {
             view_image_tool_spec(can_request_original_image_detail),
             ToolHandlerKind::ViewImage,
         );
+        if multi_agent_config.goals_enabled {
+            registry.register(get_goal_tool_spec(), ToolHandlerKind::GetGoal);
+            registry.register(create_goal_tool_spec(), ToolHandlerKind::CreateGoal);
+            registry.register(update_goal_tool_spec(), ToolHandlerKind::UpdateGoal);
+        }
         registry.register(update_plan_tool_spec(), ToolHandlerKind::UpdatePlan);
         registry.register(
             request_user_input_tool_spec(
@@ -551,7 +561,7 @@ fn tool_search_tool_spec(searchable_sources: &[(&str, Option<&str>)]) -> ToolSpe
         namespace: None,
         namespace_description: None,
         description: format!(
-            "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{source_descriptions}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`{TOOL_SEARCH_TOOL_NAME}`) to search for the required tools. For MCP tool discovery, always use `{TOOL_SEARCH_TOOL_NAME}` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
+            "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{source_descriptions}\nSome tools may not have been provided upfront. Use `{TOOL_SEARCH_TOOL_NAME}` to search this terminal's currently indexed deferred tools. MCP, app, or plugin tools are searchable here only when they are separately exposed in this tool registry."
         ),
         input_schema: serde_json::json!({
             "type": "object",
@@ -1362,6 +1372,89 @@ fn update_plan_tool_spec() -> ToolSpec {
                 }
             },
             "required": ["plan"],
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn get_goal_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "get_goal".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Get the current goal for this thread, including status, budgets, token and elapsed-time usage, and remaining token budget."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {},
+            "required": [],
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn create_goal_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "create_goal".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: concat!(
+            "Create a goal only when explicitly requested by the user or system/developer instructions; do not infer goals from ordinary tasks.\n",
+            "Set token_budget only when an explicit token budget is requested. Fails if a goal exists; use update_goal only for status."
+        )
+        .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "objective": {
+                    "type": "string",
+                    "description": "Required. The concrete objective to start pursuing. This starts a new active goal only when no goal is currently defined; if a goal already exists, this tool fails."
+                },
+                "token_budget": {
+                    "type": "integer",
+                    "description": "Optional positive token budget for the new active goal."
+                }
+            },
+            "required": ["objective"],
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn update_goal_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "update_goal".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: concat!(
+            "Update the existing goal.\n",
+            "Use this tool only to mark the goal achieved or genuinely blocked.\n",
+            "Set status to `complete` only when the objective has actually been achieved and no required work remains.\n",
+            "Set status to `blocked` only when the same blocking condition has repeated for at least three consecutive goal turns, counting the original/user-triggered turn and any automatic continuations, and the agent cannot make meaningful progress without user input or an external-state change.\n",
+            "If the user resumes a goal that was previously marked `blocked`, treat the resumed run as a fresh blocked audit. If the same blocking condition then repeats for at least three consecutive resumed goal turns, set status to `blocked` again.\n",
+            "Once the blocked threshold is satisfied, do not keep reporting that you are still blocked while leaving the goal active; set status to `blocked`.\n",
+            "Do not use `blocked` merely because the work is hard, slow, uncertain, incomplete, or would benefit from clarification.\n",
+            "Do not mark a goal complete merely because its budget is nearly exhausted or because you are stopping work.\n",
+            "You cannot use this tool to pause, resume, budget-limit, or usage-limit a goal; those status changes are controlled by the user or system.\n",
+            "When marking a budgeted goal achieved with status `complete`, report the final token usage from the tool result to the user."
+        )
+        .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "string",
+                    "enum": ["complete", "blocked"],
+                    "description": "Required. Set to `complete` only when the objective is achieved and no required work remains. Set to `blocked` only after the same blocking condition has recurred for at least three consecutive goal turns and the agent is at an impasse. After a previously blocked goal is resumed, the resumed run starts a fresh blocked audit."
+                }
+            },
+            "required": ["status"],
             "additionalProperties": false
         }),
         output_schema: None,

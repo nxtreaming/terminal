@@ -188,66 +188,78 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 ## Latest Batch
 
-The latest batch extended the G-031/G-034 compaction/token lifecycle slice and
-closed one TUI product-display mismatch after three follow-up audits compared
-Codex effective-config provenance, typed context estimation, local compaction
-policy, and dynamic/app/MCP deferred-tool inventory.
+The latest batch implemented a broad local-agent-quality slice from the
+current gap list.
 
-- Rate-limit snapshots now emit Codex-style `token_count` events even when a
-  turn has no usage payload. If prior usage info exists, the rate-limit-only
-  token-count event carries it forward; otherwise `info` stays `null`.
-- `token_count.info:null` events no longer reset consumed totals, and
-  rate-limit-only token-count events no longer suppress recomputation after
-  compaction or rollback rewrites.
-- Lossy or legacy `session.compacted` events without replacement history now
-  act as replay barriers like Codex. They clear pre-compaction replay, reinject
-  the current initial context, and prevent stale pre-compaction baselines from
-  hiding context that should be visible again.
-- The active-context estimator now uses more Codex-shaped opaque-payload
-  heuristics: only explicit base64 image data URLs are discounted, resized image
-  payloads use Codex's 7,373-byte estimate, `detail:"original"` images use
-  image-dimension patch counts where possible, and encrypted reasoning/function
-  output content uses Codex's encoded-length estimates instead of a tiny local
-  placeholder.
-- The TUI context bar now reads the latest non-null `token_count.info` for
-  active-context total and `model_context_window`. Legacy `model.usage` is only
-  the fallback for older sessions and remains the cost source; rate-limit-only
-  `info:null` token-count events no longer visually reset the bar.
-- `tool_search` is now parallel-safe, and explorer helper context now says the
-  explorer role applies only after spawning was otherwise authorized. This keeps
-  Codex's delegation gate separate from role-specific guidance.
-- Focused core tests passed for token-count/rate-limit behavior, lossy
-  compaction, context-budget discounting, `tool_search`, explorer context, and
-  the TUI `token_count` display path. Full terminal verification passed with
-  `scripts/verify-terminal-ui.sh` after clearing transient incremental build
-  cache from a full disk. I inspected `/tmp/but-design-loop` deterministic dumps
-  and tmux captures; ANSI and bracketed-paste scans had no matches.
-  The standing Codex-auth smoke passed in
-  `/tmp/but-codex-smoke-token-display.toZWgc`: root `39dfaafb17fb`
-  returned `Paris`, and child `aff7a859f001` returned
+- The model-visible tool surface now includes represented Codex-style goal
+  tools: `get_goal`, `create_goal`, and `update_goal`.
+- Workspace context now injects local skills discovered under
+  `CODEX_HOME/skills`, using a Codex-shaped `<skills_instructions>` block.
+- The CLI now has represented `review` prompt entry points for uncommitted
+  changes, base branches, commits, and custom review instructions.
+- The CLI now has `user-shell`, which runs a user shell command and records the
+  result as model-visible workspace context for later agent turns.
+- Successful and partial `apply_patch` runs now emit `turn.diff` sidecars with
+  changed files and committed delta metadata.
+- Follow-up turns for spawned children now recover spawn-time role config
+  overrides, reasoning effort, service tier, and model metadata where the local
+  runner can represent them.
+- Unified exec now bootstraps commands from a bounded per-thread shell snapshot
+  so aliases/functions/exports from the user shell can be available without
+  overriding Codex's command-environment contract.
+- The local synthetic near-deadline model warning was removed. The fallback
+  prompt was expanded for provider-neutral agent quality without Codex/OpenAI
+  branding.
+- A follow-up sweep after the ten-subagent audit tightened the low-risk misses:
+  goal usage now starts from a creation-time token baseline and `create_goal`
+  rejects any existing thread goal, `user-shell` now runs from the session cwd
+  with Codex-like command env defaults and truncated model-visible history, and
+  unambiguous `$SkillName` text mentions now materialize the matching
+  `SKILL.md` body.
+- The next local slice isolated review sessions with review-specific base
+  instructions and disabled goal/multi-agent/web/image tools, added
+  `features.goals` for represented goal-tool exposure, added local
+  `compact_prompt`/compact-prompt-file overrides, records server model reroutes
+  and unknown-model catalog fallback warnings, validates/caps local image
+  inlining, removed unsupported `prevent_idle_sleep` beta advertising, and
+  clarified plugin MCP wording so configured servers are not described as
+  callable unless their tools are separately exposed.
+- The latest local slices targeted model-input quality directly: project-scoped
+  `.agents/skills`/`.codex/skills` discovery plus frontmatter descriptions,
+  cwd-aware plain `$Skill` materialization, opt-in read-only memory summary
+  context, active-goal context injection before provider turns, Codex-like local
+  prompt-image resizing to 2048px bounds, and honest `tool_search` wording for
+  MCP/app/plugin tools that are not actually exposed. The follow-up extended
+  that into Codex-shaped hidden user `<goal_context>` continuation prompts,
+  provider-loop auto-continuation while an active goal has not been completed or
+  strictly blocked, `$CODEX_HOME/.agents/skills`, plugin skill roots, frontmatter
+  names/metadata, `openai.yaml` short descriptions, `skills.include_instructions`,
+  `skills.bundled.enabled`, `[[skills.config]]` disable rules, and
+  `[memories] use_memories`.
+- Verification passed: `cargo fmt --check`, `cargo test`,
+  `uv run --with pytest python -m pytest -q`, and `git diff --check`. The
+  standing Codex-auth smoke passed again in
+  `/tmp/but-codex-smoke-agent-quality6.qYruta`: root `30942471de10` returned
+  `Paris`, and child `7f840adea56e` read
+  `/tmp/but-codex-agent-parity-smoke.txt` and returned
   `agent-parity-smoke-ok`.
-- Remote/v2 compaction is intentionally not a local parity target for this
-  terminal. Codex's v2 path is a server-backed `/responses` compaction protocol;
-  this harness must support Codex, Claude, Gemini, Qwen, and other providers, so
-  local compaction remains the portable implementation. Local now suppresses the
-  `remote_compaction_v2` beta header even if a config layer sets that feature.
-- AWS/Bedrock/Mantle support is now treated as Codex product baggage rather
-  than agent-quality parity. The built-in Bedrock provider, static Bedrock
-  catalog, `AWS_BEARER_TOKEN_BEDROCK`, SigV4/Mantle signing path, AWS provider
-  dependencies, and Bedrock-specific tool-capability exceptions have been
-  removed. Users can still configure ordinary OpenAI-compatible providers
-  explicitly through `model_providers`.
-- Verification after this cleanup passed: focused provider/config tests, full
-  `scripts/verify-terminal-ui.sh`, artifact inspection under
-  `/tmp/but-design-loop`, ANSI/bracketed-paste scan, `git diff --check`, and the
-  standing Codex-auth smoke. Root session `158f2dbc85c0` returned `Paris`; child
-  session `076c3a889dab` read `/tmp/but-codex-agent-parity-smoke.txt` and
-  returned `agent-parity-smoke-ok`.
-- Remaining high-impact gaps from this audit are full `ConfigLayerStack` and
-  effective-config provenance, real websocket transport/ack/fallback semantics,
-  full dynamic/app/MCP deferred tool inventory, and the broader Codex-native
-  typed active-context estimator over `ResponseItem`s rather than the local
-  provider-message JSON projection.
+- Ten read-only broad auditors then rechecked the current branch against Codex.
+  They agreed the remaining high-impact gaps are hooks, dynamic MCP/app/plugin
+  tool inventory, full goal runtime steering/continuation, full Codex skill
+  manager semantics, model-based local compaction, and input-queue/turn
+  orchestration. Medium gaps are WebSocket/processed-ack transport, memory
+  read-path retrieval/tools, effective-config/context-diff provenance, and
+  subagent control-plane exactness.
+- Remaining high-impact gaps are true websocket ack/fallback transport,
+  dynamic MCP/app/deferred inventory surfaces, hook runtime/context behavior,
+  deeper goal budget/accounting edge cases, remaining full skill-manager
+  semantics, local model-based compaction, input queue/active-turn steering,
+  memory read-path tools/policy, full effective-config provenance, and any
+  app-server lifecycle surfaces that materially affect local agent quality.
+
+The previous batch extended the G-031/G-034 compaction/token lifecycle slice,
+removed remote-compaction advertising, and removed Codex-only AWS/Bedrock
+provider baggage.
 
 The previous batch closed the next represented G-033/G-032 plugin/app mention
 context slice after four read-only audits compared Codex plugin/app mention

@@ -1,4 +1,6 @@
+use std::collections::hash_map::DefaultHasher;
 use std::collections::{HashMap, VecDeque};
+use std::hash::{Hash, Hasher};
 use std::io::{Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, ChildStdin, Command, ExitStatus, Stdio};
@@ -32,6 +34,7 @@ const POST_EXIT_READER_DRAIN_TIMEOUT_MS: u64 = 50;
 const BACKGROUND_TRAILING_OUTPUT_GRACE_MS: u64 = 100;
 const SHELL_COMMAND_TIMEOUT_EXIT_CODE: i32 = 124;
 const SHELL_COMMAND_IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
+const SHELL_SNAPSHOT_CAPTURE_TIMEOUT_MS: u64 = 2_000;
 const STDIN_CLOSED_MESSAGE: &str =
     "stdin is closed for this session; rerun exec_command with tty=true to keep stdin open";
 const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
@@ -625,6 +628,113 @@ impl CappedOutput {
     }
 }
 
+fn shell_command_with_snapshot(
+    shell: &ShellSpec,
+    command_text: &str,
+    workdir: &Path,
+    thread_id: &str,
+) -> String {
+    if cfg!(windows)
+        || !matches!(
+            shell.shell_type,
+            ShellType::Bash | ShellType::Zsh | ShellType::Sh
+        )
+    {
+        return command_text.to_string();
+    }
+    let Some(snapshot) = ensure_shell_snapshot(shell, workdir, thread_id) else {
+        return command_text.to_string();
+    };
+    format!(
+        "if [ -r {snapshot} ]; then . {snapshot} >/dev/null 2>&1 || true; fi\n{}",
+        command_text,
+        snapshot = shell_single_quote(&snapshot.display().to_string())
+    )
+}
+
+fn ensure_shell_snapshot(shell: &ShellSpec, workdir: &Path, thread_id: &str) -> Option<PathBuf> {
+    let path = shell_snapshot_path(shell, workdir, thread_id);
+    if path.is_file() {
+        return Some(path);
+    }
+    if let Some(parent) = path.parent() {
+        let _ = std::fs::create_dir_all(parent);
+    }
+    let script = shell_snapshot_capture_script(shell.shell_type);
+    let mut child = Command::new(shell.path_string())
+        .args(shell.exec_args(&script, true))
+        .current_dir(workdir)
+        .stdin(Stdio::null())
+        .stdout(Stdio::piped())
+        .stderr(Stdio::piped())
+        .spawn()
+        .ok()?;
+    let stdout = child.stdout.take()?;
+    let stderr = child.stderr.take()?;
+    let stdout_rx = spawn_capped_reader(stdout);
+    let stderr_rx = spawn_capped_reader(stderr);
+    let (status, timed_out) = wait_for_shell_command(
+        &mut child,
+        Duration::from_millis(SHELL_SNAPSHOT_CAPTURE_TIMEOUT_MS),
+    )
+    .ok()?;
+    let snapshot = recv_capped_reader(stdout_rx);
+    let _ = recv_capped_reader(stderr_rx);
+    if timed_out || !status.success() {
+        return None;
+    }
+    if !snapshot.contains("# Snapshot file") {
+        return None;
+    }
+    if std::fs::write(&path, snapshot.as_bytes()).is_ok() {
+        Some(path)
+    } else {
+        None
+    }
+}
+
+fn shell_snapshot_path(shell: &ShellSpec, workdir: &Path, thread_id: &str) -> PathBuf {
+    let mut hasher = DefaultHasher::new();
+    shell.path_string().hash(&mut hasher);
+    workdir.display().to_string().hash(&mut hasher);
+    let digest = hasher.finish();
+    std::env::temp_dir()
+        .join("browser-use-terminal-shell-snapshots")
+        .join(format!("{thread_id}-{digest:016x}.sh"))
+}
+
+fn shell_snapshot_capture_script(shell_type: ShellType) -> String {
+    let rc_source = match shell_type {
+        ShellType::Bash => {
+            r#"if [ -z "$BASH_ENV" ] && [ -r "$HOME/.bashrc" ]; then . "$HOME/.bashrc"; fi"#
+        }
+        ShellType::Zsh => {
+            r#"if [ -n "$ZDOTDIR" ] && [ -r "$ZDOTDIR/.zshrc" ]; then . "$ZDOTDIR/.zshrc"; elif [ -r "$HOME/.zshrc" ]; then . "$HOME/.zshrc"; fi"#
+        }
+        ShellType::Sh => r#"if [ -n "$ENV" ] && [ -r "$ENV" ]; then . "$ENV"; fi"#,
+        ShellType::PowerShell | ShellType::Cmd => "",
+    };
+    format!(
+        r#"{rc_source}
+echo '# Snapshot file'
+echo '# Unset all aliases to avoid conflicts with functions'
+unalias -a 2>/dev/null || true
+echo '# Functions'
+if command -v declare >/dev/null 2>&1; then declare -f 2>/dev/null || true; elif command -v typeset >/dev/null 2>&1; then typeset -f 2>/dev/null || true; fi
+echo ''
+echo '# aliases'
+alias -p 2>/dev/null || alias 2>/dev/null || true
+echo ''
+echo '# exports'
+export -p 2>/dev/null | awk '/^(export|declare -x|typeset -x) / {{ line=$0; name=line; sub(/^(export|declare -x|typeset -x) /, "", name); sub(/=.*/, "", name); if (name !~ /^(PWD|OLDPWD|NO_COLOR|TERM|LANG|LC_CTYPE|LC_ALL|COLORTERM|PAGER|GIT_PAGER|GH_PAGER|CODEX_CI|CODEX_THREAD_ID|CODEX_UNIFIED_EXEC_THREAD)$/ && name ~ /^[A-Za-z_][A-Za-z0-9_]*$/) print line }}' || true
+"#
+    )
+}
+
+fn shell_single_quote(value: &str) -> String {
+    format!("'{}'", value.replace('\'', "'\\''"))
+}
+
 fn spawn_shell_command_process(
     shell: &ShellSpec,
     login: bool,
@@ -633,9 +743,10 @@ fn spawn_shell_command_process(
     thread_id: &str,
 ) -> Result<StdChild> {
     let shell_path = shell.path_string();
+    let command_text = shell_command_with_snapshot(shell, command_text, workdir, thread_id);
     let mut command = Command::new(&shell_path);
     command
-        .args(shell.exec_args(command_text, login))
+        .args(shell.exec_args(&command_text, login))
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1173,9 +1284,10 @@ fn spawn_pipe_process(
     thread_id: &str,
 ) -> Result<(ManagedProcess, Vec<JoinHandle<()>>, bool)> {
     let shell_path = shell.path_string();
+    let cmd = shell_command_with_snapshot(shell, cmd, workdir, thread_id);
     let mut command = Command::new(&shell_path);
     command
-        .args(shell.exec_args(cmd, login))
+        .args(shell.exec_args(&cmd, login))
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
@@ -1218,8 +1330,9 @@ fn spawn_pty_process(
     let reader = pair.master.try_clone_reader()?;
     let writer = pair.master.take_writer()?;
     let shell_path = shell.path_string();
+    let cmd = shell_command_with_snapshot(shell, cmd, workdir, thread_id);
     let mut command = CommandBuilder::new(&shell_path);
-    command.args(shell.exec_args(cmd, login));
+    command.args(shell.exec_args(&cmd, login));
     command.cwd(workdir.as_os_str());
     apply_unified_exec_env_to_pty_command(&mut command, thread_id);
     let child = pair.slave.spawn_command(command).with_context(|| {

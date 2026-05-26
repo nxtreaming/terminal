@@ -9,18 +9,21 @@ use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
-    append_workspace_context_event, canonical_agent_path_from_task_name, canonical_agent_reference,
+    append_user_shell_command_context_event, append_workspace_context_event,
+    canonical_agent_path_from_task_name, canonical_agent_reference,
     cleanup_unified_exec_commands_for_agent_subtree, collect_agent_tree,
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
     display_agent_path_for_session, final_statuses_for_v1_wait, install_process_crypto_provider,
     last_task_message_for_agent, local_agent_status_value, model_catalog_for_cwd_with_options,
     parse_config_overrides, product_analytics, record_browser_script_response_events,
     record_python_response_final_event, record_python_worker_event,
-    resolve_agent_reference_in_tree, root_session_id, run_agent_from_config,
-    run_existing_session_from_config, run_existing_session_with_provider, run_fake_agent,
-    typed_user_input_payload_from_text_for_cwd, update_parent_from_child_run, AgentRunOptions,
-    CollaborationModeKind, ConfigOverrides, FakeAgentOptions, ProviderBackend, ProviderRunConfig,
-    RunConfigValueSource, UnifiedExecShutdownCleanup,
+    resolve_agent_reference_in_tree, review_prompt_base_branch, review_prompt_commit,
+    review_prompt_custom, review_prompt_uncommitted_changes, root_session_id,
+    run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
+    run_fake_agent, start_review_session, typed_user_input_payload_from_text_for_cwd,
+    update_parent_from_child_run, AgentRunOptions, CollaborationModeKind, ConfigOverrides,
+    FakeAgentOptions, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    UnifiedExecShutdownCleanup,
 };
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, sanitized_agent_context_from_events,
@@ -169,6 +172,18 @@ enum Command {
     BrowserScript {
         task_id: String,
         code: String,
+    },
+    UserShell {
+        task_id: String,
+        command: String,
+    },
+    Review {
+        #[arg(long)]
+        base: Option<String>,
+        #[arg(long)]
+        commit: Option<String>,
+        #[arg(long)]
+        custom: Option<String>,
     },
     Export {
         task_id: String,
@@ -652,6 +667,12 @@ fn main() -> Result<()> {
         Command::Events { task_id } => events(&store, &task_id),
         Command::Python { task_id, code } => python(&store, &task_id, code),
         Command::BrowserScript { task_id, code } => browser_script(&store, &task_id, code),
+        Command::UserShell { task_id, command } => user_shell(&store, &task_id, command),
+        Command::Review {
+            base,
+            commit,
+            custom,
+        } => review(&store, base, commit, custom),
         Command::Export {
             task_id,
             output_dir,
@@ -902,6 +923,8 @@ fn command_name(command: &Command) -> &'static str {
         Command::Events { .. } => "events",
         Command::Python { .. } => "python",
         Command::BrowserScript { .. } => "browser_script",
+        Command::UserShell { .. } => "user_shell",
+        Command::Review { .. } => "review",
         Command::Export { .. } => "export",
         Command::Import { .. } => "import",
         Command::Config { .. } => "config",
@@ -1684,6 +1707,75 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
             .error
             .unwrap_or_else(|| "browser_script failed".to_string())
     )
+}
+
+fn user_shell(store: &Store, task_id: &str, command: String) -> Result<()> {
+    let task = ensure_task_exists(store, task_id)?;
+    let shell = std::env::var("SHELL")
+        .ok()
+        .filter(|shell| !shell.trim().is_empty())
+        .unwrap_or_else(|| "/bin/sh".to_string());
+    let started = Instant::now();
+    let mut process = std::process::Command::new(shell);
+    process
+        .arg("-lc")
+        .arg(&command)
+        .current_dir(&task.cwd)
+        .env("NO_COLOR", "1")
+        .env("TERM", "dumb")
+        .env("LANG", "C.UTF-8")
+        .env("LC_CTYPE", "C.UTF-8")
+        .env("LC_ALL", "C.UTF-8")
+        .env("COLORTERM", "")
+        .env("PAGER", "cat")
+        .env("GIT_PAGER", "cat")
+        .env("GH_PAGER", "cat")
+        .env("CODEX_CI", "1")
+        .env("CODEX_THREAD_ID", task_id);
+    let output = process
+        .output()
+        .with_context(|| format!("run user shell command for session {task_id}"))?;
+    let duration = started.elapsed();
+    let exit_code = output.status.code().unwrap_or(-1);
+    let combined = format!(
+        "{}{}",
+        String::from_utf8_lossy(&output.stdout),
+        String::from_utf8_lossy(&output.stderr)
+    );
+    append_user_shell_command_context_event(
+        store, task_id, &command, exit_code, duration, &combined,
+    )?;
+    print!("{combined}");
+    if output.status.success() {
+        Ok(())
+    } else {
+        bail!("user shell command exited with status {}", output.status)
+    }
+}
+
+fn review(
+    store: &Store,
+    base: Option<String>,
+    commit: Option<String>,
+    custom: Option<String>,
+) -> Result<()> {
+    let selected = base.is_some() as u8 + commit.is_some() as u8 + custom.is_some() as u8;
+    if selected > 1 {
+        bail!("review accepts only one of --base, --commit, or --custom");
+    }
+    let cwd = std::env::current_dir()?;
+    let prompt = if let Some(custom) = custom {
+        review_prompt_custom(&custom)?
+    } else if let Some(commit) = commit {
+        review_prompt_commit(&cwd, &commit)
+    } else if let Some(base) = base {
+        review_prompt_base_branch(&cwd, &base)
+    } else {
+        review_prompt_uncommitted_changes()
+    };
+    let session_id = start_review_session(store, &prompt, &cwd)?;
+    println!("{session_id}");
+    Ok(())
 }
 
 fn export(store: &Store, task_id: &str, output_dir: PathBuf) -> Result<()> {
