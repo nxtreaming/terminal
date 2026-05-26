@@ -224,9 +224,9 @@ const RESERVED_CUSTOM_MODEL_PROVIDER_IDS: &[&str] = &[
     OLLAMA_MODEL_PROVIDER_ID,
     LMSTUDIO_MODEL_PROVIDER_ID,
 ];
-#[cfg(any(test, not(unix)))]
 const CODEX_MANAGED_CONFIG_FILENAME: &str = "managed_config.toml";
-#[cfg(all(unix, not(test)))]
+#[cfg(unix)]
+#[allow(dead_code)]
 const CODEX_MANAGED_CONFIG_SYSTEM_PATH: &str = "/etc/codex/managed_config.toml";
 const CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE: &str = "com.openai.codex:config_toml_base64";
 #[cfg(target_os = "macos")]
@@ -8429,6 +8429,13 @@ struct PreparedCommandHookRun {
     input: Value,
     timeout: Option<Duration>,
     async_run: bool,
+    status_message: Option<String>,
+    source: HookSourceMetadata,
+    state_key: String,
+    display_order: i64,
+    trusted_hash: Option<String>,
+    started_at_ms: i64,
+    transcript_path: Option<String>,
 }
 
 struct CompletedCommandHookRun {
@@ -8437,6 +8444,14 @@ struct CompletedCommandHookRun {
     hook_id: String,
     command: String,
     async_run: bool,
+    status_message: Option<String>,
+    source: HookSourceMetadata,
+    state_key: String,
+    display_order: i64,
+    trusted_hash: Option<String>,
+    started_at_ms: i64,
+    completed_at_ms: i64,
+    transcript_path: Option<String>,
     result: std::result::Result<HookProcessOutput, String>,
 }
 
@@ -8460,22 +8475,57 @@ fn prepare_command_hook_run(
     } else {
         hook.command.clone()
     };
-    let hook_input = hook_command_input(store, session, event, call, tool_input, model, extra);
-    let hook_id = store
-        .append_event(
-            &session.id,
-            "hook.started",
-            serde_json::json!({
-                "hook_event_name": event.as_str(),
-                "tool_name": call.map(|call| call.name.as_str()),
-                "tool_call_id": call.map(|call| call.id.as_str()),
-                "command": command,
-                "async": hook.async_run,
-                "status_message": hook.status_message,
-                "configured_order": configured_order,
-            }),
-        )?
-        .id;
+    let hook_id = uuid::Uuid::new_v4().to_string();
+    let started_at_ms = now_ms();
+    let transcript_path =
+        write_hook_transcript_snapshot(store, session, event, &hook_id, configured_order)
+            .transpose()?
+            .map(|path| path.display().to_string());
+    let hook_input = hook_command_input_with_transcript(
+        store,
+        session,
+        event,
+        call,
+        tool_input,
+        model,
+        extra,
+        transcript_path.as_deref(),
+    );
+    let run = hook_run_summary_json(HookRunSummaryInput {
+        hook_id: &hook_id,
+        event,
+        hook,
+        command: &command,
+        status: "running",
+        started_at_ms,
+        completed_at_ms: None,
+        duration_ms: None,
+        entries: Vec::new(),
+    });
+    store.append_event(
+        &session.id,
+        "hook.started",
+        serde_json::json!({
+            "turn_id": hook_input.get("turn_id").cloned().unwrap_or(Value::Null),
+            "run": run,
+            "hook_id": hook_id.clone(),
+            "hook_event_name": event.as_str(),
+            "tool_name": call.map(|call| call.name.as_str()),
+            "tool_call_id": call.map(|call| call.id.as_str()),
+            "command": command,
+            "async": hook.async_run,
+            "status_message": hook.status_message,
+            "configured_order": configured_order,
+            "display_order": hook.display_order,
+            "source": hook.source.source.as_str(),
+            "source_path": hook.source.path.clone(),
+            "state_key": hook.state_key.clone(),
+            "trusted_hash": hook.trusted_hash.clone(),
+            "trust_status": hook_trust_status(&hook.source, hook.trusted_hash.as_deref()),
+            "started_at": started_at_ms,
+            "transcript_path": transcript_path.clone(),
+        }),
+    )?;
     Ok(PreparedCommandHookRun {
         configured_order,
         hook_id,
@@ -8484,6 +8534,13 @@ fn prepare_command_hook_run(
         input: hook_input,
         timeout: hook.timeout_sec.map(Duration::from_secs),
         async_run: hook.async_run,
+        status_message: hook.status_message.clone(),
+        source: hook.source.clone(),
+        state_key: hook.state_key.clone(),
+        display_order: hook.display_order,
+        trusted_hash: hook.trusted_hash.clone(),
+        started_at_ms,
+        transcript_path,
     })
 }
 
@@ -8517,6 +8574,14 @@ fn run_prepared_command_hooks(
                 hook_id: invocation.hook_id,
                 command: invocation.command,
                 async_run: invocation.async_run,
+                status_message: invocation.status_message,
+                source: invocation.source,
+                state_key: invocation.state_key,
+                display_order: invocation.display_order,
+                trusted_hash: invocation.trusted_hash,
+                started_at_ms: invocation.started_at_ms,
+                completed_at_ms: now_ms(),
+                transcript_path: invocation.transcript_path,
                 result,
             });
         }));
@@ -8580,20 +8645,45 @@ fn finish_command_hook_run(
     call: Option<&ToolCall>,
     run: &CompletedCommandHookRun,
 ) -> Result<HookRunOutcome> {
+    let duration_ms = run.completed_at_ms.saturating_sub(run.started_at_ms);
     let output = match &run.result {
         Ok(output) => output,
         Err(error) => {
+            let entries = vec![hook_output_entry("error", error)];
+            let run_summary = completed_hook_run_summary_json(
+                event,
+                run,
+                "failed",
+                Some(duration_ms),
+                entries.clone(),
+            );
             store.append_event(
                 &session.id,
                 "hook.failed",
                 serde_json::json!({
-                    "hook_id": run.hook_id,
+                    "turn_id": active_request_user_input_turn_id(
+                        &store.events_for_session(&session.id).unwrap_or_default(),
+                        &session.id
+                    ),
+                    "run": run_summary,
+                    "hook_id": run.hook_id.clone(),
                     "hook_event_name": event.as_str(),
                     "tool_name": call.map(|call| call.name.as_str()),
                     "tool_call_id": call.map(|call| call.id.as_str()),
-                    "command": run.command,
+                    "command": run.command.clone(),
                     "configured_order": run.configured_order,
                     "completion_order": run.completion_order,
+                    "display_order": run.display_order,
+                    "source": run.source.source.as_str(),
+                    "source_path": run.source.path.clone(),
+                    "state_key": run.state_key.clone(),
+                    "trusted_hash": run.trusted_hash.clone(),
+                    "trust_status": hook_trust_status(&run.source, run.trusted_hash.as_deref()),
+                    "started_at": run.started_at_ms,
+                    "completed_at": run.completed_at_ms,
+                    "duration_ms": duration_ms,
+                    "entries": entries,
+                    "transcript_path": run.transcript_path.clone(),
                     "async": run.async_run,
                     "error": error,
                 }),
@@ -8601,29 +8691,206 @@ fn finish_command_hook_run(
             return Ok(HookRunOutcome::default());
         }
     };
+    let outcome = parse_hook_command_output(event, &output.stdout, &output.stderr, output.status);
+    let status = hook_run_status_for_outcome(output.status, &outcome);
+    let entries = hook_output_entries(&outcome, &output.stderr, output.status);
+    let run_summary =
+        completed_hook_run_summary_json(event, run, status, Some(duration_ms), entries.clone());
     store.append_event(
         &session.id,
         "hook.completed",
         serde_json::json!({
-            "hook_id": run.hook_id,
+            "turn_id": active_request_user_input_turn_id(
+                &store.events_for_session(&session.id).unwrap_or_default(),
+                &session.id
+            ),
+            "run": run_summary,
+            "hook_id": run.hook_id.clone(),
             "hook_event_name": event.as_str(),
             "tool_name": call.map(|call| call.name.as_str()),
             "tool_call_id": call.map(|call| call.id.as_str()),
-            "command": run.command,
+            "command": run.command.clone(),
             "configured_order": run.configured_order,
             "completion_order": run.completion_order,
+            "display_order": run.display_order,
+            "source": run.source.source.as_str(),
+            "source_path": run.source.path.clone(),
+            "state_key": run.state_key.clone(),
+            "trusted_hash": run.trusted_hash.clone(),
+            "trust_status": hook_trust_status(&run.source, run.trusted_hash.as_deref()),
+            "started_at": run.started_at_ms,
+            "completed_at": run.completed_at_ms,
+            "duration_ms": duration_ms,
+            "entries": entries,
+            "transcript_path": run.transcript_path.clone(),
             "status": output.status,
             "stdout": truncate_text_for_event(&output.stdout, 4000),
             "stderr": truncate_text_for_event(&output.stderr, 4000),
             "async": run.async_run,
         }),
     )?;
-    Ok(parse_hook_command_output(
-        event,
-        &output.stdout,
-        &output.stderr,
-        output.status,
-    ))
+    Ok(outcome)
+}
+
+struct HookRunSummaryInput<'a> {
+    hook_id: &'a str,
+    event: HookEventName,
+    hook: &'a HookCommandConfig,
+    command: &'a str,
+    status: &'a str,
+    started_at_ms: i64,
+    completed_at_ms: Option<i64>,
+    duration_ms: Option<i64>,
+    entries: Vec<Value>,
+}
+
+fn hook_run_summary_json(input: HookRunSummaryInput<'_>) -> Value {
+    serde_json::json!({
+        "id": input.hook_id,
+        "event_name": input.event.as_str(),
+        "handler_type": "command",
+        "execution_mode": if input.hook.async_run { "async" } else { "sync" },
+        "scope": hook_scope_for_event(input.event),
+        "source_path": input.hook.source.path.clone(),
+        "source": input.hook.source.source.as_str(),
+        "display_order": input.hook.display_order,
+        "status": input.status,
+        "status_message": input.hook.status_message.clone(),
+        "started_at": input.started_at_ms,
+        "completed_at": input.completed_at_ms,
+        "duration_ms": input.duration_ms,
+        "entries": input.entries,
+        "command": input.command,
+        "state_key": input.hook.state_key.clone(),
+        "trusted_hash": input.hook.trusted_hash.clone(),
+        "trust_status": hook_trust_status(&input.hook.source, input.hook.trusted_hash.as_deref()),
+    })
+}
+
+fn completed_hook_run_summary_json(
+    event: HookEventName,
+    run: &CompletedCommandHookRun,
+    status: &str,
+    duration_ms: Option<i64>,
+    entries: Vec<Value>,
+) -> Value {
+    serde_json::json!({
+        "id": run.hook_id.clone(),
+        "event_name": event.as_str(),
+        "handler_type": "command",
+        "execution_mode": if run.async_run { "async" } else { "sync" },
+        "scope": hook_scope_for_event(event),
+        "source_path": run.source.path.clone(),
+        "source": run.source.source.as_str(),
+        "display_order": run.display_order,
+        "status": status,
+        "status_message": run.status_message.clone(),
+        "started_at": run.started_at_ms,
+        "completed_at": run.completed_at_ms,
+        "duration_ms": duration_ms,
+        "entries": entries,
+        "command": run.command.clone(),
+        "state_key": run.state_key.clone(),
+        "trusted_hash": run.trusted_hash.clone(),
+        "trust_status": hook_trust_status(&run.source, run.trusted_hash.as_deref()),
+    })
+}
+
+fn hook_scope_for_event(event: HookEventName) -> &'static str {
+    match event {
+        HookEventName::SessionStart | HookEventName::SubagentStart => "thread",
+        _ => "turn",
+    }
+}
+
+fn hook_trust_status(source: &HookSourceMetadata, trusted_hash: Option<&str>) -> &'static str {
+    if source.managed {
+        "managed"
+    } else if trusted_hash.is_some() {
+        "trusted"
+    } else {
+        "untrusted"
+    }
+}
+
+fn hook_run_status_for_outcome(status: i32, outcome: &HookRunOutcome) -> &'static str {
+    if outcome.block_reason.is_some() {
+        "blocked"
+    } else if outcome.stop_reason.is_some() {
+        "stopped"
+    } else if status == 0 {
+        "completed"
+    } else {
+        "failed"
+    }
+}
+
+fn hook_output_entries(outcome: &HookRunOutcome, stderr: &str, status: i32) -> Vec<Value> {
+    let mut entries = Vec::new();
+    for context in &outcome.additional_contexts {
+        entries.push(hook_output_entry("context", context));
+    }
+    for feedback in &outcome.feedback_messages {
+        entries.push(hook_output_entry("feedback", feedback));
+    }
+    if let Some(reason) = outcome.block_reason.as_deref() {
+        entries.push(hook_output_entry("stop", reason));
+    }
+    if let Some(reason) = outcome.stop_reason.as_deref() {
+        entries.push(hook_output_entry("stop", reason));
+    }
+    if status != 0
+        && outcome.block_reason.is_none()
+        && outcome.stop_reason.is_none()
+        && entries.is_empty()
+    {
+        let text = stderr
+            .trim()
+            .lines()
+            .next()
+            .filter(|line| !line.trim().is_empty())
+            .unwrap_or("hook command failed");
+        entries.push(hook_output_entry("error", text));
+    }
+    entries
+}
+
+fn hook_output_entry(kind: &str, text: &str) -> Value {
+    serde_json::json!({
+        "kind": kind,
+        "text": truncate_text_for_event(text, 4000),
+    })
+}
+
+fn write_hook_transcript_snapshot(
+    store: &Store,
+    session: &SessionMeta,
+    event: HookEventName,
+    hook_id: &str,
+    configured_order: usize,
+) -> Option<Result<PathBuf>> {
+    let dir = store.state_dir().join("hook-transcripts").join(&session.id);
+    let path = dir.join(format!(
+        "{}-{}-{}.json",
+        event.as_str(),
+        configured_order,
+        hook_id
+    ));
+    Some((|| {
+        std::fs::create_dir_all(&dir)?;
+        let events = store.events_for_session(&session.id)?;
+        let artifacts = store.artifacts_for_session(&session.id)?;
+        let payload = serde_json::json!({
+            "session": session,
+            "events": events,
+            "artifacts": artifacts,
+        });
+        std::fs::write(
+            &path,
+            format!("{}\n", serde_json::to_string_pretty(&payload)?),
+        )?;
+        Ok(path)
+    })())
 }
 
 fn hook_group_matches(
@@ -8689,6 +8956,7 @@ fn hook_matcher_is_exact(matcher: &str) -> bool {
         .all(|ch| ch.is_ascii_alphanumeric() || ch == '_' || ch == '|')
 }
 
+#[cfg(test)]
 fn hook_command_input(
     store: &Store,
     session: &SessionMeta,
@@ -8697,6 +8965,20 @@ fn hook_command_input(
     tool_input: Option<&Value>,
     model: &str,
     extra: Value,
+) -> Value {
+    hook_command_input_with_transcript(store, session, event, call, tool_input, model, extra, None)
+}
+
+#[allow(clippy::too_many_arguments)]
+fn hook_command_input_with_transcript(
+    store: &Store,
+    session: &SessionMeta,
+    event: HookEventName,
+    call: Option<&ToolCall>,
+    tool_input: Option<&Value>,
+    model: &str,
+    extra: Value,
+    transcript_path: Option<&str>,
 ) -> Value {
     let events = store.events_for_session(&session.id).unwrap_or_default();
     let turn_id = active_request_user_input_turn_id(&events, &session.id);
@@ -8720,7 +9002,9 @@ fn hook_command_input(
         "turn_id": turn_id,
         "agent_id": agent_id,
         "agent_type": agent_type,
-        "transcript_path": Value::Null,
+        "transcript_path": transcript_path
+            .map(|path| Value::String(path.to_string()))
+            .unwrap_or(Value::Null),
         "cwd": session.cwd.as_str(),
         "hook_event_name": event.as_str(),
         "model": model,
@@ -13578,6 +13862,18 @@ impl RuntimeHookConfig {
             HookEventName::Stop => &mut self.stop,
         }
     }
+
+    fn handler_count(&self) -> usize {
+        HookEventName::all()
+            .iter()
+            .map(|event| {
+                self.groups_for_event(*event)
+                    .iter()
+                    .map(|group| group.hooks.len())
+                    .sum::<usize>()
+            })
+            .sum()
+    }
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -13593,6 +13889,66 @@ struct HookCommandConfig {
     timeout_sec: Option<u64>,
     async_run: bool,
     status_message: Option<String>,
+    source: HookSourceMetadata,
+    state_key: String,
+    display_order: i64,
+    trusted_hash: Option<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct HookSourceMetadata {
+    source: HookSourceKind,
+    path: String,
+    managed: bool,
+}
+
+impl Default for HookSourceMetadata {
+    fn default() -> Self {
+        Self {
+            source: HookSourceKind::Unknown,
+            path: "unknown".to_string(),
+            managed: false,
+        }
+    }
+}
+
+#[allow(dead_code)]
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+enum HookSourceKind {
+    System,
+    User,
+    Project,
+    Mdm,
+    SessionFlags,
+    Plugin,
+    CloudRequirements,
+    LegacyManagedConfigFile,
+    LegacyManagedConfigMdm,
+    #[default]
+    Unknown,
+}
+
+impl HookSourceKind {
+    fn as_str(self) -> &'static str {
+        match self {
+            HookSourceKind::System => "system",
+            HookSourceKind::User => "user",
+            HookSourceKind::Project => "project",
+            HookSourceKind::Mdm => "mdm",
+            HookSourceKind::SessionFlags => "session_flags",
+            HookSourceKind::Plugin => "plugin",
+            HookSourceKind::CloudRequirements => "cloud_requirements",
+            HookSourceKind::LegacyManagedConfigFile => "legacy_managed_config_file",
+            HookSourceKind::LegacyManagedConfigMdm => "legacy_managed_config_mdm",
+            HookSourceKind::Unknown => "unknown",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct HookStateConfig {
+    enabled: Option<bool>,
+    trusted_hash: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -14466,7 +14822,7 @@ fn apply_agents_md_config_layer(
     apply_web_search_tool_config_layer(config, value, path)?;
     apply_memories_config_layer(config, value, path)?;
     apply_skills_config_layer(config, value, path, relative_base)?;
-    apply_hooks_config_layer(config, value, path)?;
+    apply_hooks_config_layer(config, value, path, layer_kind)?;
     apply_codex_features_config_layer(config, value, path)?;
     apply_codex_plugins_config_layer(config, value, path)?;
     apply_multi_agent_v2_config_layer(config, value, path)?;
@@ -14675,8 +15031,9 @@ fn apply_hooks_config_layer(
     config: &mut AgentsMdConfig,
     value: &toml::Value,
     path: &Path,
+    layer_kind: ConfigLayerKind,
 ) -> Result<()> {
-    apply_hooks_config_events(config, value, path)?;
+    apply_hooks_config_events(config, value, path, layer_kind)?;
     if let Some(hooks_value) = value.get("hooks") {
         let Some(_) = hooks_value.as_table() else {
             bail!(
@@ -14684,7 +15041,7 @@ fn apply_hooks_config_layer(
                 path.display()
             );
         };
-        apply_hooks_config_events(config, hooks_value, path)?;
+        apply_hooks_config_events(config, hooks_value, path, layer_kind)?;
     }
     Ok(())
 }
@@ -14693,7 +15050,10 @@ fn apply_hooks_config_events(
     config: &mut AgentsMdConfig,
     value: &toml::Value,
     path: &Path,
+    layer_kind: ConfigLayerKind,
 ) -> Result<()> {
+    let hook_states = parse_hook_state_configs(value, path)?;
+    let source = hook_source_metadata_for_config_layer(path, layer_kind);
     for event in HookEventName::all() {
         let Some(groups_value) = value.get(event.as_str()) else {
             continue;
@@ -14705,7 +15065,7 @@ fn apply_hooks_config_events(
                 path.display()
             );
         };
-        for group_value in groups {
+        for (group_index, group_value) in groups.iter().enumerate() {
             let Some(group_table) = group_value.as_table() else {
                 bail!(
                     "Invalid Codex config `{}` from `{}`: expected hook matcher groups to be tables.",
@@ -14743,7 +15103,7 @@ fn apply_hooks_config_events(
                 );
             };
             let mut commands = Vec::new();
-            for hook_value in hooks {
+            for (hook_index, hook_value) in hooks.iter().enumerate() {
                 let Some(hook_table) = hook_value.as_table() else {
                     bail!(
                         "Invalid Codex config `{}.hooks` from `{}`: expected hook tables.",
@@ -14769,6 +15129,13 @@ fn apply_hooks_config_events(
                             path.display()
                         )
                     })?;
+                let state_key = hook_state_key(path, *event, group_index, hook_index);
+                let state = hook_states
+                    .get(&state_key)
+                    .or_else(|| hook_states.get(&command));
+                if state.and_then(|state| state.enabled) == Some(false) {
+                    continue;
+                }
                 let timeout_sec = hook_table
                     .get("timeout_sec")
                     .or_else(|| hook_table.get("timeout"))
@@ -14800,6 +15167,13 @@ fn apply_hooks_config_events(
                         .get("status_message")
                         .and_then(toml::Value::as_str)
                         .map(str::to_string),
+                    source: source.clone(),
+                    state_key,
+                    display_order: i64::try_from(
+                        config.hooks.handler_count().saturating_add(commands.len()),
+                    )
+                    .unwrap_or(i64::MAX),
+                    trusted_hash: state.and_then(|state| state.trusted_hash.clone()),
                 });
             }
             if !commands.is_empty() {
@@ -14814,6 +15188,129 @@ fn apply_hooks_config_events(
         }
     }
     Ok(())
+}
+
+fn parse_hook_state_configs(
+    value: &toml::Value,
+    path: &Path,
+) -> Result<BTreeMap<String, HookStateConfig>> {
+    let Some(state_value) = value.get("state") else {
+        return Ok(BTreeMap::new());
+    };
+    let Some(state_table) = state_value.as_table() else {
+        bail!(
+            "Invalid Codex config `hooks.state` from `{}`: expected a table.",
+            path.display()
+        );
+    };
+    let mut states = BTreeMap::new();
+    for (key, value) in state_table {
+        let Some(table) = value.as_table() else {
+            bail!(
+                "Invalid Codex config `hooks.state.{key}` from `{}`: expected a table.",
+                path.display()
+            );
+        };
+        let enabled = table
+            .get("enabled")
+            .map(|value| {
+                value.as_bool().ok_or_else(|| {
+                    anyhow!(
+                        "Invalid Codex config `hooks.state.{key}.enabled` from `{}`: expected a boolean.",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()?;
+        let trusted_hash = table
+            .get("trusted_hash")
+            .map(|value| {
+                value.as_str().map(str::to_string).ok_or_else(|| {
+                    anyhow!(
+                        "Invalid Codex config `hooks.state.{key}.trusted_hash` from `{}`: expected a string.",
+                        path.display()
+                    )
+                })
+            })
+            .transpose()?;
+        states.insert(
+            key.clone(),
+            HookStateConfig {
+                enabled,
+                trusted_hash,
+            },
+        );
+    }
+    Ok(states)
+}
+
+fn hook_state_key(
+    path: &Path,
+    event: HookEventName,
+    group_index: usize,
+    hook_index: usize,
+) -> String {
+    format!(
+        "{}:{}:{}:{}",
+        path.display(),
+        event.as_str(),
+        group_index,
+        hook_index
+    )
+}
+
+fn hook_source_metadata_for_config_layer(
+    path: &Path,
+    layer_kind: ConfigLayerKind,
+) -> HookSourceMetadata {
+    let path_text = path.display().to_string();
+    if path_text == "session config overrides" {
+        return HookSourceMetadata {
+            source: HookSourceKind::SessionFlags,
+            path: path_text,
+            managed: false,
+        };
+    }
+    if path_text == CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE {
+        return HookSourceMetadata {
+            source: HookSourceKind::LegacyManagedConfigMdm,
+            path: path_text,
+            managed: true,
+        };
+    }
+    if matches!(layer_kind, ConfigLayerKind::Project) {
+        return HookSourceMetadata {
+            source: HookSourceKind::Project,
+            path: path_text,
+            managed: false,
+        };
+    }
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or("");
+    if file_name == CODEX_MANAGED_CONFIG_FILENAME {
+        return HookSourceMetadata {
+            source: HookSourceKind::LegacyManagedConfigFile,
+            path: path_text,
+            managed: true,
+        };
+    }
+    if system_codex_config_path()
+        .as_deref()
+        .is_some_and(|system_path| same_normalized_path(system_path, path))
+    {
+        return HookSourceMetadata {
+            source: HookSourceKind::System,
+            path: path_text,
+            managed: true,
+        };
+    }
+    HookSourceMetadata {
+        source: HookSourceKind::User,
+        path: path_text,
+        managed: false,
+    }
 }
 
 fn apply_allowed_web_search_modes_config_layer(
@@ -21969,6 +22466,20 @@ mod tests {
     use super::*;
 
     static CODEX_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn test_hook_command_config(command: &str) -> HookCommandConfig {
+        HookCommandConfig {
+            command: command.to_string(),
+            command_windows: None,
+            timeout_sec: None,
+            async_run: false,
+            status_message: None,
+            source: HookSourceMetadata::default(),
+            state_key: "test-hook".to_string(),
+            display_order: 0,
+            trusted_hash: None,
+        }
+    }
 
     struct EnvVarGuard {
         key: &'static str,
@@ -32463,6 +32974,113 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\
     }
 
     #[test]
+    fn hook_events_include_codex_run_summary_source_state_and_transcript() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let hook_script = temp.path().join("hook.py");
+        std::fs::write(
+            &hook_script,
+            r#"import json
+import sys
+
+payload = json.load(sys.stdin)
+print(json.dumps({
+    "hookSpecificOutput": {
+        "hookEventName": payload["hook_event_name"],
+        "additionalContext": "transcript=" + str(bool(payload.get("transcript_path"))).lower(),
+    }
+}))
+"#,
+        )?;
+        let enabled_command = format!("python3 {}", hook_script.display());
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                r#"[hooks.state."printf disabled"]
+enabled = false
+
+[hooks.state."{enabled_command}"]
+trusted_hash = "sha256:trusted"
+
+[[hooks.SessionStart]]
+matcher = "^startup$"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "printf disabled"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "{enabled_command}"
+status_message = "checking transcript"
+"#
+            ),
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "hook transcript seed"}),
+        )?;
+        let config = with_codex_home(&codex_home, || {
+            load_provider_config_for_session(&session, &AgentRunOptions::default())
+        })?;
+
+        let messages = run_session_start_hooks(&store, &session, &config.hooks, "gpt-5.4")?;
+
+        assert_eq!(messages.len(), 1);
+        assert!(message_content_text(&messages[0]).contains("transcript=true"));
+        let events = store.events_for_session(&session.id)?;
+        assert!(!events.iter().any(|event| {
+            event.event_type == "hook.completed"
+                && event.payload["stdout"]
+                    .as_str()
+                    .is_some_and(|stdout| stdout.contains("disabled"))
+        }));
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "hook.started")
+            .context("hook started")?;
+        assert_eq!(started.payload["run"]["source"], "user");
+        assert_eq!(started.payload["run"]["status"], "running");
+        assert_eq!(
+            started.payload["run"]["status_message"],
+            "checking transcript"
+        );
+        assert_eq!(started.payload["run"]["display_order"], 0);
+        assert_eq!(started.payload["trust_status"], "trusted");
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "hook.completed")
+            .context("hook completed")?;
+        assert_eq!(completed.payload["run"]["status"], "completed");
+        assert_eq!(completed.payload["run"]["source"], "user");
+        assert_eq!(completed.payload["run"]["trust_status"], "trusted");
+        assert_eq!(completed.payload["trusted_hash"], "sha256:trusted");
+        assert!(completed.payload["duration_ms"].as_i64().is_some());
+        assert!(completed.payload["entries"]
+            .as_array()
+            .is_some_and(|entries| {
+                entries.iter().any(|entry| {
+                    entry["kind"] == "context"
+                        && entry["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("transcript=true"))
+                })
+            }));
+        let transcript_path = completed
+            .payload
+            .get("transcript_path")
+            .and_then(Value::as_str)
+            .context("transcript path")?;
+        let transcript = std::fs::read_to_string(transcript_path)?;
+        assert!(transcript.contains("hook transcript seed"));
+        assert!(transcript.contains("\"events\""));
+        Ok(())
+    }
+
+    #[test]
     fn pre_tool_use_exit_code_two_blocks_tool_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -32596,23 +33214,15 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
         let hooks = RuntimeHookConfig {
             subagent_start: vec![HookMatcherGroup {
                 matcher: Some("explorer".to_string()),
-                hooks: vec![HookCommandConfig {
-                    command: "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\",\"additionalContext\":\"child start context\"}}'".to_string(),
-                    command_windows: None,
-                    timeout_sec: None,
-                    async_run: false,
-                    status_message: None,
-                }],
+                hooks: vec![test_hook_command_config(
+                    "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SubagentStart\",\"additionalContext\":\"child start context\"}}'",
+                )],
             }],
             subagent_stop: vec![HookMatcherGroup {
                 matcher: Some("^explorer$".to_string()),
-                hooks: vec![HookCommandConfig {
-                    command: "printf subagent-stop-feedback >&2; exit 2".to_string(),
-                    command_windows: None,
-                    timeout_sec: None,
-                    async_run: false,
-                    status_message: None,
-                }],
+                hooks: vec![test_hook_command_config(
+                    "printf subagent-stop-feedback >&2; exit 2",
+                )],
             }],
             ..RuntimeHookConfig::default()
         };
@@ -32758,11 +33368,11 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
             session_start: vec![HookMatcherGroup {
                 matcher: Some("^startup$".to_string()),
                 hooks: vec![HookCommandConfig {
-                    command: "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"async hook context\"}}'".to_string(),
-                    command_windows: None,
-                    timeout_sec: None,
                     async_run: true,
                     status_message: Some("async hook".to_string()),
+                    ..test_hook_command_config(
+                        "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"async hook context\"}}'",
+                    )
                 }],
             }],
             ..RuntimeHookConfig::default()
@@ -32780,6 +33390,105 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
         assert!(!events
             .iter()
             .any(|event| event.event_type == "hook.skipped"));
+        Ok(())
+    }
+
+    #[test]
+    fn hook_state_source_and_transcript_metadata_match_codex_shape() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            r#"[hooks.state."printf disabled-hook"]
+enabled = false
+
+[hooks.state."printf enabled-hook"]
+trusted_hash = "sha256:enabled"
+
+[[hooks.SessionStart]]
+matcher = "^startup$"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "printf disabled-hook"
+
+[[hooks.SessionStart.hooks]]
+type = "command"
+command = "printf enabled-hook"
+status_message = "enabled hook"
+"#,
+        )?;
+        let store = Store::open(temp.path().join("state"))?;
+        let provider = FakeProvider::new(vec![
+            ModelEvent::ToolCall {
+                call: ToolCall {
+                    id: "done_after_hook".to_string(),
+                    name: "done".to_string(),
+                    namespace: None,
+                    arguments: serde_json::json!({"result": "hook metadata ok"}),
+                },
+            },
+            ModelEvent::Done,
+        ]);
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "check hook metadata",
+                temp.path(),
+                AgentRunOptions::default(),
+            )
+        })?;
+
+        let events = store.events_for_session(&session_id)?;
+        assert!(!events.iter().any(|event| {
+            event.event_type.starts_with("hook.")
+                && event.payload["command"] == "printf disabled-hook"
+        }));
+
+        let started = events
+            .iter()
+            .find(|event| event.event_type == "hook.started")
+            .context("hook started")?;
+        assert_eq!(started.payload["command"], "printf enabled-hook");
+        assert_eq!(started.payload["hook_event_name"], "SessionStart");
+        assert_eq!(started.payload["source"], "user");
+        assert_eq!(started.payload["run"]["source"], "user");
+        assert_eq!(started.payload["run"]["handler_type"], "command");
+        assert_eq!(started.payload["run"]["execution_mode"], "sync");
+        assert_eq!(started.payload["run"]["scope"], "thread");
+        assert_eq!(started.payload["display_order"], 0);
+        assert_eq!(started.payload["run"]["display_order"], 0);
+        assert_eq!(started.payload["trusted_hash"], "sha256:enabled");
+        assert_eq!(started.payload["run"]["trusted_hash"], "sha256:enabled");
+        assert_eq!(started.payload["trust_status"], "trusted");
+        assert_eq!(started.payload["run"]["trust_status"], "trusted");
+        assert!(started.payload["source_path"]
+            .as_str()
+            .is_some_and(|path| path.ends_with("config.toml")));
+        assert!(started.payload["state_key"]
+            .as_str()
+            .is_some_and(|key| key.contains("SessionStart:0:1")));
+        let transcript_path = started.payload["transcript_path"]
+            .as_str()
+            .context("transcript path")?;
+        assert!(Path::new(transcript_path).exists());
+
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "hook.completed")
+            .context("hook completed")?;
+        assert_eq!(completed.payload["hook_id"], started.payload["hook_id"]);
+        assert_eq!(completed.payload["run"]["status"], "completed");
+        assert_eq!(completed.payload["run"]["source"], "user");
+        assert_eq!(completed.payload["run"]["trust_status"], "trusted");
+        assert_eq!(
+            completed.payload["transcript_path"].as_str(),
+            Some(transcript_path)
+        );
+        assert!(completed.payload["run"]["duration_ms"]
+            .as_i64()
+            .is_some_and(|duration| duration >= 0));
         Ok(())
     }
 
@@ -32892,13 +33601,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
         let hooks = RuntimeHookConfig {
             stop: vec![HookMatcherGroup {
                 matcher: None,
-                hooks: vec![HookCommandConfig {
-                    command: "printf keep-going >&2; exit 2".to_string(),
-                    command_windows: None,
-                    timeout_sec: None,
-                    async_run: false,
-                    status_message: None,
-                }],
+                hooks: vec![test_hook_command_config("printf keep-going >&2; exit 2")],
             }],
             ..RuntimeHookConfig::default()
         };
@@ -32934,6 +33637,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn model_compaction_uses_provider_summary_when_enabled() -> Result<()> {
         let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let provider = ModelCompactionProvider::default();
         let options = AgentRunOptions {
@@ -32941,13 +33645,15 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             model_compaction_enabled: true,
             ..AgentRunOptions::default()
         };
-        let session_id = run_agent_with_provider(
-            &store,
-            &provider,
-            "This prompt is intentionally long enough to trigger local model compaction.",
-            temp.path(),
-            options,
-        )?;
+        let session_id = with_codex_home(&codex_home, || {
+            run_agent_with_provider(
+                &store,
+                &provider,
+                "This prompt is intentionally long enough to trigger local model compaction.",
+                temp.path(),
+                options,
+            )
+        })?;
         let events = store.events_for_session(&session_id)?;
         assert!(events.iter().any(|event| {
             event.event_type == "session.compaction_model_summary"
