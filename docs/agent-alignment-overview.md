@@ -1612,6 +1612,30 @@ The biggest remaining categories are:
   first-class active-turn state, typed history/replay ownership, exact turn
   diffs, local compaction/token precision, subagent lifecycle depth, and
   skills/plugins/review runtime depth.
+- The next streaming-runtime guardrail closes the concrete ordering risk
+  surfaced by that audit. During a streamed provider attempt, the scheduler now
+  installs a predispatch barrier as soon as it sees a serial tool, queued
+  active-turn input, or matching runtime hooks. Later parallel-safe calls in the
+  same streamed attempt then wait for normal ordered dispatch instead of
+  overtaking the earlier call. This matches the observable behavior Codex gets
+  from its read/write-gated async tool runtime for the represented local tools,
+  while still leaving the full cancellable future lifecycle and dynamic
+  contributed executors as larger open work.
+- Verification for the guardrail passed the full local gate: formatting,
+  whitespace, Python tests, and full Rust workspace tests. The live Codex-auth
+  smoke used root session `a9c3a83248da` and child session `7bf7aaa46710`; the
+  root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- A second ten-agent broad audit after the guardrail found no new correctness
+  regression. The auditors' consensus was that the barrier closes one concrete
+  streamed-tool ordering hole, while the remaining gaps are still the large
+  provider-neutral runtime pillars: dynamic tool contributors, cancellable
+  async tool futures with read/write gates, first-class active-turn/thread
+  state, typed history/replay ownership, deeper local compaction/token
+  lifecycle, richer subagent lifecycle ownership, and deeper hooks,
+  skills/plugins, and review integration. Some individual reports used stale or
+  shallow wording about hook/skill absence, so those claims were not treated as
+  stronger evidence than the direct source/tests already in this log.
 
 ## Definition of Done
 
