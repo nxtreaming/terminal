@@ -53,6 +53,7 @@ use tools::{
 const APPROX_CHARS_PER_TOKEN: usize = 4;
 const DEFAULT_MAX_CONTEXT_CHARS: usize = 240_000;
 const DEFAULT_TOOL_OUTPUT_TEXT_TOKENS: usize = 2_500;
+const INVALID_IMAGE_REPLACEMENT_TEXT: &str = "Invalid image";
 const IMAGE_CONTEXT_BUDGET_TOKENS: usize = 2_000;
 const RESIZED_IMAGE_CONTEXT_BYTES_ESTIMATE: usize = 7_373;
 const ORIGINAL_IMAGE_PATCH_SIZE: usize = 32;
@@ -4106,6 +4107,7 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
     let mut attempt = 0_usize;
     let turn_started_at = Instant::now();
     let mut time_to_first_token_ms = None;
+    let mut invalid_image_recovered = false;
     loop {
         let mut events = Vec::new();
         let mut streamed_text = String::new();
@@ -4197,6 +4199,64 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
             Err(error) => {
                 let error_chain = format!("{error:#}");
                 let provider_error = provider_error_from_anyhow(&error);
+                if provider_error.is_some_and(|error| {
+                    error.kind() == browser_use_providers::ProviderErrorKind::InvalidImage
+                }) && !invalid_image_recovered
+                {
+                    let replaced = replace_last_tool_output_input_images(
+                        &mut turn.messages,
+                        INVALID_IMAGE_REPLACEMENT_TEXT,
+                    );
+                    if replaced > 0 {
+                        invalid_image_recovered = true;
+                        on_stream_attempt_retry(attempt + 1)?;
+                        store.append_event(
+                            session_id,
+                            CODEX_STREAM_ERROR_EVENT,
+                            serde_json::json!({
+                                "message": "Invalid model-visible image detected; retrying after sanitizing tool output.",
+                                "codex_error_info": "bad_request",
+                                "additional_details": error_chain.clone(),
+                                "turn_idx": turn_idx,
+                                "attempt": attempt + 1,
+                                "max_retries": max_retries,
+                                "will_retry": true,
+                                "requested_delay_ms": Value::Null,
+                                "provider": provider.provider_name(),
+                                "model": provider.model_name(),
+                            }),
+                        )?;
+                        store.append_event(
+                            session_id,
+                            "model.invalid_image_recovered",
+                            serde_json::json!({
+                                "turn_idx": turn_idx,
+                                "attempt": attempt + 1,
+                                "provider": provider.provider_name(),
+                                "model": provider.model_name(),
+                                "replaced_images": replaced,
+                                "replacement_text": INVALID_IMAGE_REPLACEMENT_TEXT,
+                            }),
+                        )?;
+                        store.append_event(
+                            session_id,
+                            "model.turn.error",
+                            serde_json::json!({
+                                "turn_idx": turn_idx,
+                                "attempt": attempt + 1,
+                                "provider": provider.provider_name(),
+                                "model": provider.model_name(),
+                                "transient": false,
+                                "will_retry": true,
+                                "recovered": true,
+                                "error": error_chain,
+                            }),
+                        )?;
+                        attempt += 1;
+                        record_model_turn_request(store, session_id, provider, turn_idx, &turn)?;
+                        continue;
+                    }
+                }
                 let transient = provider_error
                     .map(ProviderError::is_retryable)
                     .unwrap_or_else(|| is_transient_provider_error(&error_chain));
@@ -4415,6 +4475,7 @@ fn provider_error_codex_error_info(error: &ProviderError, will_retry: bool) -> V
         | ProviderErrorKind::UsageNotIncluded => json!("usage_limit_exceeded"),
         ProviderErrorKind::ServerOverloaded => json!("server_overloaded"),
         ProviderErrorKind::CyberPolicy => json!("cyber_policy"),
+        ProviderErrorKind::InvalidImage => json!("bad_request"),
         ProviderErrorKind::RetryLimit => json!({
             "response_too_many_failed_attempts": {
                 "http_status_code": error.http_status_code()
@@ -4775,6 +4836,54 @@ fn count_input_images(value: &Value) -> usize {
     }
 }
 
+fn replace_last_tool_output_input_images(messages: &mut [Value], placeholder: &str) -> usize {
+    for message in messages.iter_mut().rev() {
+        if !is_tool_output_or_retained_tool_context(message) {
+            continue;
+        }
+        let replaced = replace_input_images_in_value(message, placeholder);
+        if replaced > 0 {
+            return replaced;
+        }
+    }
+    0
+}
+
+fn is_tool_output_or_retained_tool_context(message: &Value) -> bool {
+    matches!(
+        message.get("type").and_then(Value::as_str),
+        Some("function_call_output" | "custom_tool_call_output")
+    ) || message.get("role").and_then(Value::as_str) == Some("tool")
+        || message_content_text(message).contains("Tool output retained as context after history")
+}
+
+fn replace_input_images_in_value(value: &mut Value, placeholder: &str) -> usize {
+    match value {
+        Value::Array(items) => items
+            .iter_mut()
+            .map(|item| replace_input_images_in_value(item, placeholder))
+            .sum(),
+        Value::Object(map) => {
+            let is_input_image = map.get("type").and_then(Value::as_str) == Some("input_image")
+                || map
+                    .get("image_url")
+                    .and_then(Value::as_str)
+                    .is_some_and(|url| url.starts_with("data:image/"));
+            if is_input_image {
+                *value = json!({
+                    "type": "input_text",
+                    "text": placeholder,
+                });
+                return 1;
+            }
+            map.values_mut()
+                .map(|item| replace_input_images_in_value(item, placeholder))
+                .sum()
+        }
+        _ => 0,
+    }
+}
+
 fn assistant_delta_to_append(current: &str, incoming: &str) -> Option<String> {
     if incoming.is_empty() {
         return None;
@@ -5070,7 +5179,10 @@ fn compact_messages_with_model_summary<P: ModelProvider>(
     };
     let context = sanitized_agent_context_from_events(&filtered_events);
     let summary = model_compaction_summary(
+        store,
+        session_id,
         provider,
+        turn_idx,
         model_settings,
         model_request_info,
         compaction_contract,
@@ -5126,6 +5238,61 @@ fn compacted_context_summary_message_from_text(summary: &str) -> Value {
 }
 
 fn model_compaction_summary<P: ModelProvider>(
+    store: &Store,
+    session_id: &str,
+    provider: &P,
+    turn_idx: Option<usize>,
+    model_settings: &ModelRequestSettings,
+    model_request_info: &browser_use_providers::ModelRequestInfo,
+    compaction_contract: &str,
+    context: &Value,
+    messages: &[Value],
+) -> Result<String> {
+    let mut summary_messages = messages.to_vec();
+    let mut dropped_messages = 0_usize;
+    let mut dropped_chars = 0_usize;
+    loop {
+        match model_compaction_summary_once(
+            provider,
+            model_settings,
+            model_request_info,
+            compaction_contract,
+            context,
+            &summary_messages,
+        ) {
+            Ok(summary) => return Ok(summary),
+            Err(error)
+                if provider_error_from_anyhow(&error).is_some_and(|provider_error| {
+                    provider_error.kind()
+                        == browser_use_providers::ProviderErrorKind::ContextWindowExceeded
+                }) =>
+            {
+                let Some(removed_chars) =
+                    drop_oldest_model_compaction_summary_message(&mut summary_messages)
+                else {
+                    return Err(error);
+                };
+                dropped_messages += 1;
+                dropped_chars += removed_chars;
+                store.append_event(
+                    session_id,
+                    "session.compaction_model_context_overflow_retry",
+                    serde_json::json!({
+                        "turn_idx": turn_idx,
+                        "provider": provider.provider_name(),
+                        "model": provider.model_name(),
+                        "dropped_messages": dropped_messages,
+                        "dropped_chars": dropped_chars,
+                        "remaining_messages": summary_messages.len(),
+                    }),
+                )?;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn model_compaction_summary_once<P: ModelProvider>(
     provider: &P,
     model_settings: &ModelRequestSettings,
     model_request_info: &browser_use_providers::ModelRequestInfo,
@@ -5182,6 +5349,22 @@ fn model_compaction_summary<P: ModelProvider>(
         bail!("model compaction returned an empty summary");
     }
     Ok(summary.to_string())
+}
+
+fn drop_oldest_model_compaction_summary_message(messages: &mut Vec<Value>) -> Option<usize> {
+    if messages.len() <= 1 {
+        return None;
+    }
+    let last_index = messages.len() - 1;
+    let remove_index = (0..last_index)
+        .find(|index| !is_compaction_summary_message(&messages[*index]))
+        .unwrap_or(0);
+    let removed = messages.remove(remove_index);
+    Some(
+        serde_json::to_string(&removed)
+            .map(|text| text.chars().count())
+            .unwrap_or(0),
+    )
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8289,18 +8472,6 @@ fn run_command_hook(
             }),
         )?
         .id;
-    if hook.async_run {
-        store.append_event(
-            &session.id,
-            "hook.skipped",
-            serde_json::json!({
-                "hook_id": hook_id,
-                "hook_event_name": event.as_str(),
-                "reason": "async_command_hooks_are_not_run_inline",
-            }),
-        )?;
-        return Ok(HookRunOutcome::default());
-    }
     let output = match run_hook_command_process(
         &session.cwd,
         &command,
@@ -8334,6 +8505,7 @@ fn run_command_hook(
             "status": output.status,
             "stdout": truncate_text_for_event(&output.stdout, 4000),
             "stderr": truncate_text_for_event(&output.stderr, 4000),
+            "async": hook.async_run,
         }),
     )?;
     Ok(parse_hook_command_output(
@@ -8728,20 +8900,27 @@ fn append_turn_git_diff_if_changed(
     if &after == before {
         return Ok(());
     }
-    let diff_truncated = after.diff.chars().count() > 60_000;
-    store.append_event(
-        &session.id,
-        "turn.diff",
-        serde_json::json!({
-            "source": "git_worktree",
-            "turn_idx": turn_idx,
-            "changed_files": after.changed_files.len(),
-            "files": after.changed_files,
-            "status": after.status,
-            "unified_diff": truncate_text_for_event(&after.diff, 60_000),
-            "diff_truncated": diff_truncated,
-        }),
-    )?;
+    let preexisting_dirty = !before.status.trim().is_empty() || !before.diff.trim().is_empty();
+    let diff_truncated = !preexisting_dirty && after.diff.chars().count() > 60_000;
+    let mut payload = serde_json::json!({
+        "source": "git_worktree",
+        "turn_idx": turn_idx,
+        "exact": !preexisting_dirty,
+        "preexisting_dirty_worktree": preexisting_dirty,
+        "changed_files": after.changed_files.len(),
+        "files": after.changed_files,
+        "status": after.status,
+        "before_status": before.status,
+        "diff_truncated": diff_truncated,
+    });
+    if preexisting_dirty {
+        payload["unified_diff"] = Value::Null;
+        payload["reason"] =
+            Value::String("worktree had preexisting changes before this tool batch".to_string());
+    } else {
+        payload["unified_diff"] = Value::String(truncate_text_for_event(&after.diff, 60_000));
+    }
+    store.append_event(&session.id, "turn.diff", payload)?;
     Ok(())
 }
 
@@ -22214,7 +22393,8 @@ x-env = "CORP_HEADER"
         )?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        let store = Store::open(temp.path().join("state"))?;
+        let state = tempfile::tempdir()?;
+        let store = Store::open(state.path())?;
         let provider = InstructionCapturingProvider::default();
 
         with_codex_home(&codex_home, || {
@@ -30932,6 +31112,7 @@ name = "Thread"
         for (kind, expected_info) in [
             (ProviderErrorKind::Unauthorized, json!("other")),
             (ProviderErrorKind::InvalidRequest, json!("other")),
+            (ProviderErrorKind::InvalidImage, json!("bad_request")),
             (
                 ProviderErrorKind::QuotaExceeded,
                 json!("usage_limit_exceeded"),
@@ -30975,6 +31156,134 @@ name = "Thread"
                     && event.payload["codex_error_info"] == expected_info
             }));
         }
+        Ok(())
+    }
+
+    #[test]
+    fn provider_turn_recovers_invalid_tool_image_like_codex() -> Result<()> {
+        #[derive(Default)]
+        struct InvalidImageRecoveringProvider {
+            calls: std::sync::Mutex<usize>,
+        }
+
+        impl ModelProvider for InvalidImageRecoveringProvider {
+            fn provider_name(&self) -> &str {
+                "codex"
+            }
+
+            fn model_name(&self) -> &str {
+                "invalid-image-recovery"
+            }
+
+            fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                let mut calls = self.calls.lock().expect("calls lock");
+                *calls += 1;
+                let messages_value = Value::Array(turn.messages.clone());
+                if *calls == 1 {
+                    assert_eq!(count_input_images(&messages_value), 1);
+                    return Err(ProviderError::non_retryable(
+                        browser_use_providers::ProviderErrorKind::InvalidImage,
+                        "The image data you provided does not represent a valid image",
+                    )
+                    .into());
+                }
+                assert_eq!(count_input_images(&messages_value), 0);
+                assert!(turn
+                    .messages
+                    .iter()
+                    .any(|message| message_content_text(message).contains("Invalid image")));
+                Ok(vec![
+                    ModelEvent::TextDelta {
+                        text: "recovered".to_string(),
+                    },
+                    ModelEvent::Done,
+                ])
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = InvalidImageRecoveringProvider::default();
+        let result = start_provider_turn_with_retries(
+            &store,
+            &session.id,
+            &provider,
+            ProviderTurn {
+                messages: vec![serde_json::json!({
+                    "role": "tool",
+                    "tool_call_id": "image_tool",
+                    "name": "python",
+                    "content": [
+                        { "type": "output_text", "text": "tool image" },
+                        { "type": "input_image", "image_url": "data:image/png;base64,broken" }
+                    ]
+                })],
+                ..ProviderTurn::default()
+            },
+            0,
+            |_attempt, _event| Ok(()),
+            |_attempt| Ok(()),
+        )?;
+
+        assert_eq!(result.attempts, 2);
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.invalid_image_recovered"
+                && event.payload["replaced_images"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.turn.request" && event.payload["input_image_count"] == 0
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_git_diff_marks_dirty_baseline_as_inexact() -> Result<()> {
+        fn git_ok(cwd: &Path, args: &[&str]) -> Result<()> {
+            let output = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .with_context(|| format!("git {}", args.join(" ")))?;
+            if !output.status.success() {
+                bail!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        }
+
+        let temp = tempfile::tempdir()?;
+        git_ok(temp.path(), &["init"])?;
+        git_ok(temp.path(), &["config", "user.email", "test@example.com"])?;
+        git_ok(temp.path(), &["config", "user.name", "Test User"])?;
+        std::fs::write(temp.path().join("tracked.txt"), "base\n")?;
+        git_ok(temp.path(), &["add", "tracked.txt"])?;
+        git_ok(temp.path(), &["commit", "-m", "base"])?;
+        std::fs::write(temp.path().join("tracked.txt"), "preexisting\n")?;
+        let before = git_worktree_snapshot(temp.path().to_str().context("utf8 temp path")?)
+            .context("git snapshot")?;
+        std::fs::write(temp.path().join("new.txt"), "new turn output\n")?;
+
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        append_turn_git_diff_if_changed(&store, &session, Some(&before), 7)?;
+
+        let events = store.events_for_session(&session.id)?;
+        let diff = events
+            .iter()
+            .find(|event| event.event_type == "turn.diff")
+            .context("turn diff event")?;
+        assert_eq!(diff.payload["exact"], false);
+        assert_eq!(diff.payload["preexisting_dirty_worktree"], true);
+        assert!(diff.payload["unified_diff"].is_null());
+        assert!(diff.payload["reason"]
+            .as_str()
+            .is_some_and(|reason| reason.contains("preexisting changes")));
         Ok(())
     }
 
@@ -32210,6 +32519,40 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
     }
 
     #[test]
+    fn async_command_hooks_execute_and_inject_context() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let hooks = RuntimeHookConfig {
+            session_start: vec![HookMatcherGroup {
+                matcher: Some("^startup$".to_string()),
+                hooks: vec![HookCommandConfig {
+                    command: "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"SessionStart\",\"additionalContext\":\"async hook context\"}}'".to_string(),
+                    command_windows: None,
+                    timeout_sec: None,
+                    async_run: true,
+                    status_message: Some("async hook".to_string()),
+                }],
+            }],
+            ..RuntimeHookConfig::default()
+        };
+
+        let messages = run_session_start_hooks(&store, &session, &hooks, "gpt-5.4")?;
+        assert_eq!(messages.len(), 1);
+        assert!(message_content_text(&messages[0]).contains("async hook context"));
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "hook.completed"
+                && event.payload["hook_event_name"] == "SessionStart"
+                && event.payload["async"] == true
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "hook.skipped"));
+        Ok(())
+    }
+
+    #[test]
     fn compact_hooks_run_around_model_compaction() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let codex_home = create_empty_codex_home(temp.path())?;
@@ -32381,6 +32724,97 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
         }));
         assert!(events.iter().any(|event| {
             event.event_type == "session.compacted" && event.payload["summary_mode"] == "model"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn model_compaction_retries_overflow_by_dropping_oldest_history() -> Result<()> {
+        #[derive(Default)]
+        struct OverflowingCompactionProvider {
+            compaction_attempts: std::sync::Mutex<usize>,
+        }
+
+        impl ModelProvider for OverflowingCompactionProvider {
+            fn provider_name(&self) -> &str {
+                "portable"
+            }
+
+            fn model_name(&self) -> &str {
+                "overflowing-compactor"
+            }
+
+            fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                let prompt = turn
+                    .messages
+                    .iter()
+                    .map(message_content_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(turn.tools.is_empty());
+                assert!(prompt.contains("handoff summary"));
+                let mut attempts = self
+                    .compaction_attempts
+                    .lock()
+                    .expect("compaction attempts lock");
+                *attempts += 1;
+                if *attempts == 1 {
+                    assert!(prompt.contains("old history marker"));
+                    assert!(prompt.contains("recent history marker"));
+                    return Err(ProviderError::non_retryable(
+                        browser_use_providers::ProviderErrorKind::ContextWindowExceeded,
+                        "response.failed (context_length_exceeded): compact request too large",
+                    )
+                    .into());
+                }
+                assert!(!prompt.contains("old history marker"));
+                assert!(prompt.contains("recent history marker"));
+                Ok(vec![
+                    ModelEvent::TextDelta {
+                        text: "summary after overflow retry".to_string(),
+                    },
+                    ModelEvent::Done,
+                ])
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let provider = OverflowingCompactionProvider::default();
+        let mut messages = vec![
+            user_text_message(format!("old history marker {}", "x".repeat(300))),
+            user_text_message(format!("recent history marker {}", "y".repeat(300))),
+        ];
+        let options = AgentRunOptions {
+            model_compaction_enabled: true,
+            ..AgentRunOptions::default()
+        };
+
+        maybe_compact_messages_with_model(
+            &store,
+            &session,
+            &provider,
+            &mut messages,
+            40,
+            Some("base instructions"),
+            &ModelRequestSettings::default(),
+            &browser_use_providers::ModelRequestInfo::unknown(),
+            None,
+            Some(0),
+            None,
+            &options,
+            &RuntimeHookConfig::default(),
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.compaction_model_context_overflow_retry"
+                && event.payload["dropped_messages"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.compaction_model_summary"
+                && event.payload["summary"] == "summary after overflow retry"
         }));
         Ok(())
     }
