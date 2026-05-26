@@ -38,6 +38,7 @@ pub enum ProviderErrorKind {
     UsageLimitReached,
     UsageNotIncluded,
     InvalidRequest,
+    InvalidImage,
     RetryLimit,
     InternalServerError,
     UnexpectedStatus,
@@ -2747,6 +2748,12 @@ fn provider_http_status_error(
     }
 
     if status == reqwest::StatusCode::BAD_REQUEST {
+        if code == Some("invalid_image")
+            || invalid_image_error_message(parsed.message.as_deref(), body)
+        {
+            return ProviderError::non_retryable(ProviderErrorKind::InvalidImage, message)
+                .with_http_status_code(status);
+        }
         if code == Some("cyber_policy") {
             return ProviderError::non_retryable(
                 ProviderErrorKind::CyberPolicy,
@@ -4579,6 +4586,9 @@ fn response_failed_error(event: &Value) -> ProviderError {
         Some("invalid_prompt") => {
             ProviderError::non_retryable(ProviderErrorKind::InvalidRequest, message)
         }
+        Some("invalid_image") => {
+            ProviderError::non_retryable(ProviderErrorKind::InvalidImage, message)
+        }
         Some("cyber_policy") => {
             ProviderError::non_retryable(ProviderErrorKind::CyberPolicy, message)
         }
@@ -4592,6 +4602,12 @@ fn response_failed_error(event: &Value) -> ProviderError {
         Some(_) => ProviderError::retryable(message, None),
         None => ProviderError::stream(message),
     }
+}
+
+fn invalid_image_error_message(parsed_message: Option<&str>, body: &str) -> bool {
+    parsed_message
+        .unwrap_or(body)
+        .contains("The image data you provided does not represent a valid image")
 }
 
 fn response_completed_event(response: &Value) -> Result<ModelEvent> {
@@ -10697,6 +10713,7 @@ mod tests {
             ("insufficient_quota", ProviderErrorKind::QuotaExceeded),
             ("usage_not_included", ProviderErrorKind::UsageNotIncluded),
             ("invalid_prompt", ProviderErrorKind::InvalidRequest),
+            ("invalid_image", ProviderErrorKind::InvalidImage),
             ("cyber_policy", ProviderErrorKind::CyberPolicy),
             ("server_is_overloaded", ProviderErrorKind::ServerOverloaded),
             ("slow_down", ProviderErrorKind::ServerOverloaded),
@@ -11232,6 +11249,41 @@ mod tests {
             .downcast_ref::<ProviderError>()
             .expect("typed provider error");
         assert_eq!(provider_error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(!provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_400_invalid_image_is_typed_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "code": "invalid_image",
+                "message": "The image data you provided does not represent a valid image."
+            }
+        })
+        .to_string();
+        let (base_url, handle) =
+            spawn_mock_status_server(400, "Bad Request", body, "application/json")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("invalid image should be a typed recoverable terminal error");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::InvalidImage);
         assert!(!provider_error.is_retryable());
         Ok(())
     }

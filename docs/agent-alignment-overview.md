@@ -122,6 +122,23 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   mutating streaming futures, typed history/rollout state, active-turn mailbox
   semantics, goal budget lifecycle, full hook discovery/trust/concurrency, and
   multi-environment tool routing.
+- The current runtime-recovery slice closes those concrete targets. Providers
+  now classify invalid-image failures distinctly; the provider loop repairs one
+  rejected tool-output image by replacing it with `Invalid image` and retries
+  the turn. Model-assisted local compaction retries context-window overflow by
+  dropping oldest history from the summary request before falling back. Command
+  hooks marked `async_run` execute inline for now, so their context/blocking
+  effects are no longer skipped. Git snapshot `turn.diff` events now mark dirty
+  baselines as inexact and omit unified diffs when unrelated preexisting work
+  would be mixed into the report.
+- Verification for that slice passed across full Rust workspace tests, Python
+  tests, formatting, whitespace, and real Codex-auth root/child smokes. A fresh
+  ten-subagent broad audit found no new small concrete recovery-class gaps; the
+  remaining work is concentrated in larger runtime architecture: dynamic tool
+  routing, streaming futures, live active-turn/AgentControl state, typed
+  history/rollout reconstruction, goal accounting, hook concurrency/source
+  metadata, exact `TurnDiffTracker`, and deeper local compaction/token
+  lifecycle precision.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming
@@ -1431,9 +1448,12 @@ The biggest remaining categories are:
   `tool_input.command`, and hook `updatedInput.command` rewrites back into the
   local tool argument shape. The rescue path also covers `applypatch`, direct
   single-argument invocation, and strict `cd <path> && apply_patch <<EOF`
-  forms. Still open: concurrent/async hook execution, exact hook run
-  summaries/sources/validation, exact streaming futures for mutating tools, and
-  a full Codex `TurnDiffTracker` lifecycle across every tool runtime.
+  forms. Invalid-image recovery, compaction overflow retry, inline execution of
+  `async_run` hook effects, and inexact dirty-baseline git diff reporting are
+  now represented. Still open: true concurrent/background hook execution,
+  exact hook run summaries/sources/validation, exact streaming futures for
+  mutating tools, and a full Codex `TurnDiffTracker` lifecycle across every
+  tool runtime.
 - Multi-agent family routing now follows Codex's feature gate for represented
   sessions: `features.multi_agent_v2.enabled = true` selects the v2 task-path
   surface, while the default surface is the namespaced legacy
