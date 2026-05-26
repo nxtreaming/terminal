@@ -39,7 +39,7 @@ use browser_use_providers::{
     WebSearchToolConfig,
 };
 use browser_use_python_worker::{PythonWorker, PythonWorkerEvent, RunPythonResponse};
-use browser_use_store::{now_ms, AgentSummary, Store};
+use browser_use_store::{now_ms, AgentMessage, AgentSummary, Store};
 use chrono::{Local, Utc};
 use opentelemetry::KeyValue;
 use serde::{Deserialize, Serialize};
@@ -3974,6 +3974,10 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                         "before_finalization",
                         turn_idx,
                     )?;
+                    if active_queue_drain.has_deferred_trigger_mailbox() {
+                        step_span.set_ok();
+                        continue;
+                    }
                     if !active_queue_drain.is_empty() {
                         maybe_compact_messages_with_model(
                             store,
@@ -8046,12 +8050,18 @@ fn current_turn_user_message_seq(events: &[EventRecord]) -> Option<i64> {
 struct ActiveTurnQueueDrain {
     session_messages: usize,
     mailbox_messages: usize,
+    deferred_mailbox_messages: usize,
+    deferred_trigger_mailbox_messages: usize,
     last_seq: i64,
 }
 
 impl ActiveTurnQueueDrain {
     fn is_empty(self) -> bool {
         self.session_messages == 0 && self.mailbox_messages == 0
+    }
+
+    fn has_deferred_trigger_mailbox(self) -> bool {
+        self.deferred_trigger_mailbox_messages > 0
     }
 }
 
@@ -8081,8 +8091,22 @@ fn append_new_external_session_messages_with_phase(
         messages.extend(session_event_user_messages(&event.payload));
         appended_user_events += 1;
     }
+    let mailbox = store.messages_for_agent(session_id)?;
+    let mut deferred_mailbox_messages = 0_usize;
+    let mut deferred_trigger_mailbox_messages = 0_usize;
+    let should_defer_mailbox =
+        should_defer_mailbox_delivery_at_answer_boundary(phase, appended_user_events, &mailbox);
+    let mailbox = if should_defer_mailbox {
+        deferred_mailbox_messages = mailbox.len();
+        deferred_trigger_mailbox_messages = mailbox.iter().filter(|mail| mail.trigger_turn).count();
+        Vec::new()
+    } else if mailbox.is_empty() {
+        Vec::new()
+    } else {
+        store.drain_agent_messages_for_agent(session_id)?
+    };
     let mut appended_mail = 0_usize;
-    for mail in store.drain_agent_messages_for_agent(session_id)? {
+    for mail in mailbox {
         appended_mail += 1;
         let author_path = display_agent_path_for_session(store, &mail.author_session_id)?;
         let recipient_path = display_agent_path_for_session(store, &mail.target_session_id)?;
@@ -8118,6 +8142,21 @@ fn append_new_external_session_messages_with_phase(
                 "turn_idx": turn_idx,
                 "session_messages": appended_user_events,
                 "mailbox_messages": appended_mail,
+                "deferred_mailbox_messages": deferred_mailbox_messages,
+                "deferred_trigger_mailbox_messages": deferred_trigger_mailbox_messages,
+                "last_seq": *last_seq,
+            }),
+        )?;
+    } else if deferred_mailbox_messages > 0 {
+        store.append_event(
+            session_id,
+            "agent.turn_queue_deferred",
+            serde_json::json!({
+                "phase": phase,
+                "turn_idx": turn_idx,
+                "reason": "answer_boundary",
+                "mailbox_messages": deferred_mailbox_messages,
+                "trigger_mailbox_messages": deferred_trigger_mailbox_messages,
                 "last_seq": *last_seq,
             }),
         )?;
@@ -8125,8 +8164,18 @@ fn append_new_external_session_messages_with_phase(
     Ok(ActiveTurnQueueDrain {
         session_messages: appended_user_events,
         mailbox_messages: appended_mail,
+        deferred_mailbox_messages,
+        deferred_trigger_mailbox_messages,
         last_seq: *last_seq,
     })
+}
+
+fn should_defer_mailbox_delivery_at_answer_boundary(
+    phase: &str,
+    appended_user_events: usize,
+    mailbox: &[AgentMessage],
+) -> bool {
+    phase == "before_finalization" && appended_user_events == 0 && !mailbox.is_empty()
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -8149,6 +8198,20 @@ fn drain_active_turn_queue_into_messages(
         phase,
         Some(turn_idx),
     )?;
+    if drain.has_deferred_trigger_mailbox() {
+        store.append_event(
+            &session.id,
+            "model.response.continued",
+            serde_json::json!({
+                "turn_idx": turn_idx,
+                "reason": "active_turn_queue_deferred_trigger_mailbox",
+                "phase": phase,
+                "mailbox_messages": drain.deferred_mailbox_messages,
+                "trigger_mailbox_messages": drain.deferred_trigger_mailbox_messages,
+            }),
+        )?;
+        return Ok(drain);
+    }
     if drain.is_empty() {
         return Ok(drain);
     }
@@ -8201,6 +8264,7 @@ fn drain_active_turn_queue_into_messages(
 struct ActiveTurnQueuePending {
     session_messages: usize,
     mailbox_messages: usize,
+    trigger_mailbox_messages: usize,
 }
 
 impl ActiveTurnQueuePending {
@@ -8225,10 +8289,13 @@ fn active_turn_pending_queue_input(
                 )
         })
         .count();
-    let mailbox_messages = store.messages_for_agent(session_id)?.len();
+    let mailbox = store.messages_for_agent(session_id)?;
+    let mailbox_messages = mailbox.len();
+    let trigger_mailbox_messages = mailbox.iter().filter(|mail| mail.trigger_turn).count();
     Ok(ActiveTurnQueuePending {
         session_messages,
         mailbox_messages,
+        trigger_mailbox_messages,
     })
 }
 
@@ -11810,13 +11877,12 @@ fn dispatch_tool_calls_for_turn_with_streaming<P: ModelProvider>(
                     return Ok(outcomes);
                 }
             }
-            if !active_turn_pending_queue_input(
+            let pending_before_streaming_result = active_turn_pending_queue_input(
                 store,
                 &session.id,
                 active_queue_last_session_message_seq,
-            )?
-            .is_empty()
-            {
+            )?;
+            if !pending_before_streaming_result.is_empty() {
                 streaming_tool_scheduler.discard_all(store, "active_turn_queue_pause")?;
                 store.append_event(
                     &session.id,
@@ -11824,6 +11890,9 @@ fn dispatch_tool_calls_for_turn_with_streaming<P: ModelProvider>(
                     serde_json::json!({
                         "turn_idx": turn_idx,
                         "phase": "before_streaming_tool_result",
+                        "session_messages": pending_before_streaming_result.session_messages,
+                        "mailbox_messages": pending_before_streaming_result.mailbox_messages,
+                        "trigger_mailbox_messages": pending_before_streaming_result.trigger_mailbox_messages,
                         "remaining_tool_calls": tool_calls.len().saturating_sub(index),
                     }),
                 )?;
@@ -11942,6 +12011,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
                     "phase": "before_tool_call",
                     "session_messages": pending.session_messages,
                     "mailbox_messages": pending.mailbox_messages,
+                    "trigger_mailbox_messages": pending.trigger_mailbox_messages,
                     "remaining_tool_calls": tool_calls.len().saturating_sub(index),
                 }),
             )?;
@@ -11991,6 +12061,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
                         "phase": "after_parallel_tool_batch",
                         "session_messages": pending.session_messages,
                         "mailbox_messages": pending.mailbox_messages,
+                        "trigger_mailbox_messages": pending.trigger_mailbox_messages,
                         "remaining_tool_calls": tool_calls.len().saturating_sub(index),
                     }),
                 )?;
@@ -12043,6 +12114,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
                     "after_tool_call_id": call.id,
                     "session_messages": pending.session_messages,
                     "mailbox_messages": pending.mailbox_messages,
+                    "trigger_mailbox_messages": pending.trigger_mailbox_messages,
                     "remaining_tool_calls": tool_calls.len().saturating_sub(index),
                 }),
             )?;
@@ -33626,6 +33698,120 @@ name = "Thread"
         Ok(())
     }
 
+    #[test]
+    fn provider_loop_defers_queue_only_mailbox_at_answer_boundary_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/worker"),
+            Some("worker"),
+            Some("worker"),
+        )?;
+        store.set_status(&child.id, SessionStatus::Done)?;
+        store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "answer after child queue-only mail"}),
+        )?;
+        let provider = MailboxAtAnswerBoundaryProvider {
+            state_dir: store.state_dir().to_path_buf(),
+            parent_id: parent.id.clone(),
+            child_id: child.id.clone(),
+            trigger_turn: false,
+            attempts: std::sync::Mutex::new(0),
+        };
+
+        run_existing_session_with_provider(
+            &store,
+            &provider,
+            &parent.id,
+            AgentRunOptions::default(),
+        )?;
+
+        assert_eq!(*provider.attempts.lock().expect("attempts"), 1);
+        let events = store.events_for_session(&parent.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "parent final"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "agent.turn_queue_deferred"
+                && event.payload["phase"] == "before_finalization"
+                && event.payload["mailbox_messages"] == 1
+                && event.payload["trigger_mailbox_messages"] == 0
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "agent.mailbox_input"));
+        let remaining_mail = store.messages_for_agent(&parent.id)?;
+        assert_eq!(remaining_mail.len(), 1);
+        assert!(!remaining_mail[0].trigger_turn);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_moves_trigger_mailbox_after_answer_boundary_to_next_turn_like_codex(
+    ) -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let parent = store.create_session(None, temp.path())?;
+        let child = store.create_child_session(
+            &parent.id,
+            temp.path(),
+            Some("/root/worker"),
+            Some("worker"),
+            Some("worker"),
+        )?;
+        store.set_status(&child.id, SessionStatus::Done)?;
+        store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "answer after child trigger mail"}),
+        )?;
+        let provider = MailboxAtAnswerBoundaryProvider {
+            state_dir: store.state_dir().to_path_buf(),
+            parent_id: parent.id.clone(),
+            child_id: child.id.clone(),
+            trigger_turn: true,
+            attempts: std::sync::Mutex::new(0),
+        };
+
+        run_existing_session_with_provider(
+            &store,
+            &provider,
+            &parent.id,
+            AgentRunOptions::default(),
+        )?;
+
+        assert_eq!(*provider.attempts.lock().expect("attempts"), 2);
+        let events = store.events_for_session(&parent.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "agent.turn_queue_deferred"
+                && event.payload["phase"] == "before_finalization"
+                && event.payload["mailbox_messages"] == 1
+                && event.payload["trigger_mailbox_messages"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "model.response.continued"
+                && event.payload["reason"] == "active_turn_queue_deferred_trigger_mailbox"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "agent.mailbox_input"
+                && event.payload["content"] == "late trigger update"
+                && event.payload["trigger_turn"] == true
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "parent final"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "handled trigger mail"
+        }));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
+        Ok(())
+    }
+
     struct CancellingProvider {
         state_dir: std::path::PathBuf,
         session_id: String,
@@ -33751,6 +33937,75 @@ name = "Thread"
                 },
                 ModelEvent::Done,
             ])
+        }
+    }
+
+    struct MailboxAtAnswerBoundaryProvider {
+        state_dir: std::path::PathBuf,
+        parent_id: String,
+        child_id: String,
+        trigger_turn: bool,
+        attempts: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for MailboxAtAnswerBoundaryProvider {
+        fn provider_name(&self) -> &str {
+            "mailbox-answer-boundary"
+        }
+
+        fn model_name(&self) -> &str {
+            "mailbox-answer-boundary"
+        }
+
+        fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut attempts = self.attempts.lock().expect("attempt lock");
+            *attempts += 1;
+            if *attempts == 1 {
+                let store = Store::open(&self.state_dir)?;
+                let content = if self.trigger_turn {
+                    "late trigger update"
+                } else {
+                    "late queue-only update"
+                };
+                store.send_agent_message(
+                    &self.child_id,
+                    &self.parent_id,
+                    content,
+                    self.trigger_turn,
+                )?;
+                return Ok(vec![
+                    ModelEvent::TextDelta {
+                        text: "parent final".to_string(),
+                    },
+                    ModelEvent::Done,
+                ]);
+            }
+            if self.trigger_turn {
+                let model_text = turn
+                    .messages
+                    .iter()
+                    .map(message_content_text)
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                assert!(
+                    model_text.contains("late trigger update"),
+                    "second turn should receive deferred trigger mailbox: {model_text}"
+                );
+                return Ok(vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "done_after_trigger_mail".to_string(),
+                            name: "done".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({
+                                "result": "handled trigger mail",
+                            }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]);
+            }
+            bail!("queue-only mailbox should not force another provider turn");
         }
     }
 
