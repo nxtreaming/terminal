@@ -1636,6 +1636,28 @@ The biggest remaining categories are:
   skills/plugins, and review integration. Some individual reports used stale or
   shallow wording about hook/skill absence, so those claims were not treated as
   stronger evidence than the direct source/tests already in this log.
+- The current turn-diff slice tightens another concrete runtime-history edge:
+  git-backed `turn.diff` snapshots now include staged index changes as well as
+  unstaged worktree changes. Before this, a command that wrote a file and ran
+  `git add` could produce an exact-looking turn-diff event with file names but
+  an empty `unified_diff`; Codex's turn diff tracker is not blind to the git
+  index in that way. Local still does not claim the full shared in-memory
+  `TurnDiffTracker` architecture, but clean-baseline staged edits now produce
+  model-visible patch text instead of an empty diff.
+- Verification for the staged turn-diff slice passed the full local gate:
+  formatting, whitespace, Python tests, and full Rust workspace tests. The live
+  Codex-auth smoke used root session `8965e085a54f` and child session
+  `cdedc06e4946`; the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- A fresh ten-agent broad audit after the staged turn-diff slice found no new
+  branch-local regression. All ten auditors treated the staged-index diff
+  change as a useful fidelity fix. Their consensus was that the remaining gaps
+  are still architectural: dynamic tool contributors, cancellable async tool
+  futures with read/write gates, first-class active-turn state, typed
+  history/replay ownership, deeper local compaction/token lifecycle, richer
+  subagent lifecycle ownership, hooks/skills/plugins/review integration,
+  provider/model policy layering, extension/memory depth, and the full
+  in-memory `TurnDiffTracker`.
 
 ## Definition of Done
 

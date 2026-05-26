@@ -9557,12 +9557,19 @@ fn git_worktree_snapshot(cwd: &str) -> Option<WorktreeSnapshot> {
         return None;
     }
     let status = run_git_for_snapshot(cwd, &["status", "--short"])?;
-    let diff = run_git_for_snapshot(cwd, &["diff", "--no-ext-diff", "--no-color", "--"])?;
-    let names = run_git_for_snapshot(cwd, &["diff", "--name-only", "--"])?;
+    let unstaged_diff = run_git_for_snapshot(cwd, &["diff", "--no-ext-diff", "--no-color", "--"])?;
+    let staged_diff = run_git_for_snapshot(
+        cwd,
+        &["diff", "--cached", "--no-ext-diff", "--no-color", "--"],
+    )?;
+    let diff = combine_git_diff_sections(&staged_diff, &unstaged_diff);
+    let unstaged_names = run_git_for_snapshot(cwd, &["diff", "--name-only", "--"])?;
+    let staged_names = run_git_for_snapshot(cwd, &["diff", "--cached", "--name-only", "--"])?;
     let mut seen = HashSet::new();
     let mut changed_files = Vec::new();
-    for name in names
+    for name in staged_names
         .lines()
+        .chain(unstaged_names.lines())
         .chain(status.lines().filter_map(status_changed_path))
     {
         let name = name.trim();
@@ -9588,6 +9595,25 @@ fn run_git_for_snapshot(cwd: &str, args: &[&str]) -> Option<String> {
         .status
         .success()
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
+}
+
+fn combine_git_diff_sections(staged_diff: &str, unstaged_diff: &str) -> String {
+    match (
+        staged_diff.trim().is_empty(),
+        unstaged_diff.trim().is_empty(),
+    ) {
+        (true, true) => String::new(),
+        (false, true) => staged_diff.to_string(),
+        (true, false) => unstaged_diff.to_string(),
+        (false, false) => {
+            let mut combined = staged_diff.to_string();
+            if !combined.ends_with('\n') {
+                combined.push('\n');
+            }
+            combined.push_str(unstaged_diff);
+            combined
+        }
+    }
 }
 
 fn status_changed_path(line: &str) -> Option<&str> {
@@ -32713,6 +32739,59 @@ name = "Thread"
         assert!(diff.payload["reason"]
             .as_str()
             .is_some_and(|reason| reason.contains("preexisting changes")));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_git_diff_includes_staged_changes_like_codex_turn_tracker() -> Result<()> {
+        fn git_ok(cwd: &Path, args: &[&str]) -> Result<()> {
+            let output = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .with_context(|| format!("git {}", args.join(" ")))?;
+            if !output.status.success() {
+                bail!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        }
+
+        let temp = tempfile::tempdir()?;
+        git_ok(temp.path(), &["init"])?;
+        git_ok(temp.path(), &["config", "user.email", "test@example.com"])?;
+        git_ok(temp.path(), &["config", "user.name", "Test User"])?;
+        std::fs::write(temp.path().join("tracked.txt"), "base\n")?;
+        git_ok(temp.path(), &["add", "tracked.txt"])?;
+        git_ok(temp.path(), &["commit", "-m", "base"])?;
+        let before = git_worktree_snapshot(temp.path().to_str().context("utf8 temp path")?)
+            .context("git snapshot")?;
+
+        std::fs::write(temp.path().join("staged.txt"), "staged turn output\n")?;
+        git_ok(temp.path(), &["add", "staged.txt"])?;
+
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        append_turn_git_diff_if_changed(&store, &session, Some(&before), 8)?;
+
+        let events = store.events_for_session(&session.id)?;
+        let diff = events
+            .iter()
+            .find(|event| event.event_type == "turn.diff")
+            .context("turn diff event")?;
+        assert_eq!(diff.payload["exact"], true);
+        assert_eq!(diff.payload["preexisting_dirty_worktree"], false);
+        assert_eq!(diff.payload["files"][0], "staged.txt");
+        assert!(diff.payload["unified_diff"]
+            .as_str()
+            .is_some_and(
+                |unified| unified.contains("diff --git a/staged.txt b/staged.txt")
+                    && unified.contains("+staged turn output")
+            ));
         Ok(())
     }
 
