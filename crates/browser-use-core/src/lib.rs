@@ -206,15 +206,18 @@ const LOCAL_AGENTS_MD_FILENAME: &str = "AGENTS.override.md";
 const DEFAULT_AGENTS_MD_FILENAME: &str = "AGENTS.md";
 const AGENTS_MD_SEPARATOR: &str = "\n\n--- project-doc ---\n\n";
 const DEFAULT_PROJECT_ROOT_MARKER: &str = ".git";
-const CODEX_CONFIG_FILENAME: &str = "config.toml";
-const CODEX_PROFILE_CONFIG_SUFFIX: &str = ".config.toml";
-const CODEX_PLUGIN_CACHE_DIR: &str = "plugins/cache";
-const CODEX_CURATED_PLUGINS_DIR: &str = ".tmp/plugins/plugins";
-const CODEX_SKILLS_DIR: &str = "skills";
-const CODEX_AGENTS_DIR: &str = ".agents";
-const CODEX_TMP_SKILLS_DIR: &str = ".tmp/skills";
-const CODEX_MODELS_CACHE_FILENAME: &str = "models_cache.json";
-const CODEX_MODELS_CACHE_TTL_SECONDS: i64 = 300;
+const BROWSER_USE_TERMINAL_HOME_ENV: &str = "BROWSER_USE_TERMINAL_HOME";
+#[cfg(not(test))]
+const BROWSER_USE_TERMINAL_HOME_DIR: &str = ".browser-use-terminal";
+const BROWSER_USE_TERMINAL_CONFIG_FILENAME: &str = "config.toml";
+const BROWSER_USE_TERMINAL_PROFILE_CONFIG_SUFFIX: &str = ".config.toml";
+const BROWSER_USE_TERMINAL_PLUGIN_CACHE_DIR: &str = "plugins/cache";
+const BROWSER_USE_TERMINAL_CURATED_PLUGINS_DIR: &str = ".tmp/plugins/plugins";
+const BROWSER_USE_TERMINAL_SKILLS_DIR: &str = "skills";
+const BROWSER_USE_TERMINAL_AGENTS_DIR: &str = ".agents";
+const BROWSER_USE_TERMINAL_TMP_SKILLS_DIR: &str = ".tmp/skills";
+const BROWSER_USE_TERMINAL_MODELS_CACHE_FILENAME: &str = "models_cache.json";
+const BROWSER_USE_TERMINAL_MODELS_CACHE_TTL_SECONDS: i64 = 300;
 const OPENAI_MODEL_PROVIDER_ID: &str = "openai";
 const OLLAMA_MODEL_PROVIDER_ID: &str = "ollama";
 const LMSTUDIO_MODEL_PROVIDER_ID: &str = "lmstudio";
@@ -224,24 +227,26 @@ const RESERVED_CUSTOM_MODEL_PROVIDER_IDS: &[&str] = &[
     LMSTUDIO_MODEL_PROVIDER_ID,
 ];
 #[cfg(any(test, not(unix)))]
-const CODEX_MANAGED_CONFIG_FILENAME: &str = "managed_config.toml";
+const BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME: &str = "managed_config.toml";
 #[cfg(all(unix, not(test)))]
-const CODEX_MANAGED_CONFIG_SYSTEM_PATH: &str = "/etc/codex/managed_config.toml";
-const CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE: &str = "com.openai.codex:config_toml_base64";
-#[cfg(target_os = "macos")]
-const CODEX_MANAGED_PREFERENCES_APPLICATION_ID: &str = "com.openai.codex";
-#[cfg(target_os = "macos")]
-const CODEX_MANAGED_PREFERENCES_CONFIG_KEY: &str = "config_toml_base64";
-const PROJECT_CODEX_DIR: &str = ".codex";
+const BROWSER_USE_TERMINAL_MANAGED_CONFIG_SYSTEM_PATH: &str =
+    "/etc/browser-use-terminal/managed_config.toml";
+const BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_SOURCE: &str =
+    "com.browseruse.terminal:config_toml_base64";
+#[cfg(all(target_os = "macos", not(test)))]
+const BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_APPLICATION_ID: &str = "com.browseruse.terminal";
+#[cfg(all(target_os = "macos", not(test)))]
+const BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_KEY: &str = "config_toml_base64";
+const PROJECT_BROWSER_USE_TERMINAL_DIR: &str = ".browser-use";
 #[cfg(all(unix, not(test)))]
-const SYSTEM_CODEX_CONFIG_PATH: &str = "/etc/codex/config.toml";
+const SYSTEM_BROWSER_USE_TERMINAL_CONFIG_PATH: &str = "/etc/browser-use-terminal/config.toml";
 #[cfg(test)]
-const TEST_CODEX_SYSTEM_CONFIG_ENV: &str = "BROWSER_USE_TEST_CODEX_SYSTEM_CONFIG";
+const TEST_BROWSER_USE_TERMINAL_SYSTEM_CONFIG_ENV: &str = "BROWSER_USE_TEST_SYSTEM_CONFIG";
 #[cfg(test)]
-const TEST_CODEX_MANAGED_CONFIG_ENV: &str = "BROWSER_USE_TEST_CODEX_MANAGED_CONFIG";
+const TEST_BROWSER_USE_TERMINAL_MANAGED_CONFIG_ENV: &str = "BROWSER_USE_TEST_MANAGED_CONFIG";
 #[cfg(test)]
-const TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV: &str =
-    "BROWSER_USE_TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64";
+const TEST_BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_BASE64_ENV: &str =
+    "BROWSER_USE_TEST_MANAGED_PREFERENCES_CONFIG_BASE64";
 const PROJECT_LOCAL_CONFIG_DENYLIST: &[&str] = &[
     "openai_base_url",
     "chatgpt_base_url",
@@ -2437,8 +2442,8 @@ fn refresh_model_catalog_after_models_etag(
         return Ok(());
     }
     if config.model_catalog_cache_etag.as_deref() == Some(etag) {
-        if let Some(codex_home) = codex_home_dir() {
-            let _ = renew_models_cache_ttl(&codex_home);
+        if let Some(app_home) = browser_use_terminal_home_dir() {
+            let _ = renew_models_cache_ttl(&app_home);
         }
         return Ok(());
     }
@@ -2465,7 +2470,7 @@ fn refresh_model_catalog_online(
     else {
         return Ok(());
     };
-    let Some(codex_home) = codex_home_dir() else {
+    let Some(app_home) = browser_use_terminal_home_dir() else {
         return Ok(());
     };
     let response = match fetch_remote_models(endpoint) {
@@ -2474,7 +2479,7 @@ fn refresh_model_catalog_online(
     };
     let remote_models = response.models;
     let etag = response.etag;
-    let _ = persist_models_cache(&codex_home, remote_models.clone(), etag.clone());
+    let _ = persist_models_cache(&app_home, remote_models.clone(), etag.clone());
     config.model_catalog = Some(model_catalog_from_remote_models(remote_models, true));
     config.model_catalog_cache_etag = etag;
     Ok(())
@@ -2613,9 +2618,10 @@ fn send_remote_models_request(
     chatgpt_account_id: Option<&str>,
     include_originator: bool,
 ) -> reqwest::Result<reqwest::blocking::Response> {
-    let mut request = client
-        .get(&endpoint.url)
-        .query(&[("client_version", codex_client_version_to_whole())]);
+    let mut request = client.get(&endpoint.url).query(&[(
+        "client_version",
+        browser_use_terminal_client_version_to_whole(),
+    )]);
     for (key, value) in &endpoint.request_options.query_params {
         request = request.query(&[(key.as_str(), value.as_str())]);
     }
@@ -12175,12 +12181,12 @@ fn load_agents_md_context_for_cwd_with_thread_config(
         })
     };
     let base_instructions = config.base_instructions()?;
-    let codex_home = codex_home_dir();
+    let app_home = browser_use_terminal_home_dir();
     let skills_instructions =
-        render_available_skills_instructions(codex_home.as_deref(), cwd, &config);
+        render_available_skills_instructions(app_home.as_deref(), cwd, &config);
     let memory_instructions =
-        render_memory_context_instructions(codex_home.as_deref(), config.memories_enabled);
-    let plugin_summaries = codex_plugin_capability_summaries_for_config(&config);
+        render_memory_context_instructions(app_home.as_deref(), config.memories_enabled);
+    let plugin_summaries = browser_use_terminal_plugin_capability_summaries_for_config(&config);
     let plugins_instructions = render_available_plugins_instructions(&plugin_summaries);
     Ok(AgentsMdLoad {
         context,
@@ -12647,16 +12653,16 @@ fn load_agents_md_config_with_thread_config(
     session_thread_config: Option<&toml::Value>,
 ) -> Result<AgentsMdConfig> {
     let mut config = AgentsMdConfig::default();
-    let Some(base) = codex_home_dir() else {
+    let Some(base) = browser_use_terminal_home_dir() else {
         return Ok(config);
     };
     if let Some(profile) = config_profile {
-        validate_codex_config_profile_name(profile)?;
+        validate_browser_use_terminal_config_profile_name(profile)?;
     }
     let mut pre_project_config = toml::Value::Table(toml::map::Map::new());
 
-    if let Some(config_path) = system_codex_config_path() {
-        if let Some(value) = read_codex_config_toml(&config_path)? {
+    if let Some(config_path) = system_browser_use_terminal_config_path() {
+        if let Some(value) = read_browser_use_terminal_config_toml(&config_path)? {
             apply_agents_md_config_layer(
                 &mut config,
                 &value,
@@ -12669,8 +12675,8 @@ fn load_agents_md_config_with_thread_config(
         }
     }
 
-    let user_config_path = base.join(CODEX_CONFIG_FILENAME);
-    if let Some(value) = read_codex_config_toml(&user_config_path)? {
+    let user_config_path = base.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME);
+    if let Some(value) = read_browser_use_terminal_config_toml(&user_config_path)? {
         if let Some(profile) = config_profile {
             reject_legacy_profile_conflict(&value, profile, &user_config_path)?;
         }
@@ -12686,8 +12692,8 @@ fn load_agents_md_config_with_thread_config(
     }
 
     if let Some(profile) = config_profile {
-        let profile_config_path = codex_profile_config_path(&base, profile);
-        if let Some(value) = read_codex_config_toml(&profile_config_path)? {
+        let profile_config_path = browser_use_terminal_profile_config_path(&base, profile);
+        if let Some(value) = read_browser_use_terminal_config_toml(&profile_config_path)? {
             apply_agents_md_config_layer(
                 &mut config,
                 &value,
@@ -12739,8 +12745,8 @@ fn load_agents_md_config_with_thread_config(
         apply_session_thread_config_layer(&mut config, session_thread_config, cwd, warnings)?;
     }
 
-    let managed_config_path = managed_codex_config_path(&base);
-    if let Some(managed_config) = read_codex_config_toml(&managed_config_path)? {
+    let managed_config_path = managed_browser_use_terminal_config_path(&base);
+    if let Some(managed_config) = read_browser_use_terminal_config_toml(&managed_config_path)? {
         apply_agents_md_config_layer(
             &mut config,
             &managed_config,
@@ -12750,11 +12756,13 @@ fn load_agents_md_config_with_thread_config(
             warnings,
         )?;
     }
-    if let Some(managed_preferences_config) = read_codex_managed_preferences_config_toml()? {
+    if let Some(managed_preferences_config) =
+        read_browser_use_terminal_managed_preferences_config_toml()?
+    {
         apply_agents_md_config_layer(
             &mut config,
             &managed_preferences_config,
-            Path::new(CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE),
+            Path::new(BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_SOURCE),
             cwd,
             ConfigLayerKind::NonProject,
             warnings,
@@ -12851,11 +12859,13 @@ fn apply_toml_override(root: &mut toml::Value, path: &str, value: toml::Value) {
     }
 }
 
-fn codex_profile_config_path(codex_home: &Path, profile: &str) -> PathBuf {
-    codex_home.join(format!("{profile}{CODEX_PROFILE_CONFIG_SUFFIX}"))
+fn browser_use_terminal_profile_config_path(app_home: &Path, profile: &str) -> PathBuf {
+    app_home.join(format!(
+        "{profile}{BROWSER_USE_TERMINAL_PROFILE_CONFIG_SUFFIX}"
+    ))
 }
 
-fn validate_codex_config_profile_name(profile: &str) -> Result<()> {
+fn validate_browser_use_terminal_config_profile_name(profile: &str) -> Result<()> {
     if profile.is_empty()
         || !profile
             .bytes()
@@ -12876,8 +12886,10 @@ fn reject_legacy_profile_conflict(value: &toml::Value, profile: &str, path: &Pat
         .and_then(toml::Value::as_table)
         .is_some_and(|profiles| profiles.contains_key(profile));
     if legacy_profile_is_selected || legacy_profile_table_exists {
-        let active_profile_path =
-            codex_profile_config_path(path.parent().unwrap_or_else(|| Path::new("")), profile);
+        let active_profile_path = browser_use_terminal_profile_config_path(
+            path.parent().unwrap_or_else(|| Path::new("")),
+            profile,
+        );
         bail!(
             "--profile `{profile}` cannot be used while {} contains legacy `profile = \"{profile}\"` or `[profiles.{profile}]` config; move those settings into {} and remove the legacy profile selector/table.",
             path.display(),
@@ -12888,35 +12900,35 @@ fn reject_legacy_profile_conflict(value: &toml::Value, profile: &str, path: &Pat
 }
 
 #[cfg(test)]
-fn system_codex_config_path() -> Option<PathBuf> {
-    std::env::var_os(TEST_CODEX_SYSTEM_CONFIG_ENV).map(PathBuf::from)
+fn system_browser_use_terminal_config_path() -> Option<PathBuf> {
+    std::env::var_os(TEST_BROWSER_USE_TERMINAL_SYSTEM_CONFIG_ENV).map(PathBuf::from)
 }
 
 #[cfg(all(unix, not(test)))]
-fn system_codex_config_path() -> Option<PathBuf> {
-    Some(PathBuf::from(SYSTEM_CODEX_CONFIG_PATH))
+fn system_browser_use_terminal_config_path() -> Option<PathBuf> {
+    Some(PathBuf::from(SYSTEM_BROWSER_USE_TERMINAL_CONFIG_PATH))
 }
 
 #[cfg(all(not(unix), not(test)))]
-fn system_codex_config_path() -> Option<PathBuf> {
+fn system_browser_use_terminal_config_path() -> Option<PathBuf> {
     None
 }
 
 #[cfg(test)]
-fn managed_codex_config_path(codex_home: &Path) -> PathBuf {
-    std::env::var_os(TEST_CODEX_MANAGED_CONFIG_ENV)
+fn managed_browser_use_terminal_config_path(app_home: &Path) -> PathBuf {
+    std::env::var_os(TEST_BROWSER_USE_TERMINAL_MANAGED_CONFIG_ENV)
         .map(PathBuf::from)
-        .unwrap_or_else(|| codex_home.join(CODEX_MANAGED_CONFIG_FILENAME))
+        .unwrap_or_else(|| app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME))
 }
 
 #[cfg(all(unix, not(test)))]
-fn managed_codex_config_path(_codex_home: &Path) -> PathBuf {
-    PathBuf::from(CODEX_MANAGED_CONFIG_SYSTEM_PATH)
+fn managed_browser_use_terminal_config_path(_app_home: &Path) -> PathBuf {
+    PathBuf::from(BROWSER_USE_TERMINAL_MANAGED_CONFIG_SYSTEM_PATH)
 }
 
 #[cfg(all(not(unix), not(test)))]
-fn managed_codex_config_path(codex_home: &Path) -> PathBuf {
-    codex_home.join(CODEX_MANAGED_CONFIG_FILENAME)
+fn managed_browser_use_terminal_config_path(app_home: &Path) -> PathBuf {
+    app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME)
 }
 
 #[derive(Clone, Copy)]
@@ -12943,7 +12955,7 @@ fn merge_toml_value(base: &mut toml::Value, overlay: &toml::Value) {
     }
 }
 
-fn read_codex_config_toml(path: &Path) -> Result<Option<toml::Value>> {
+fn read_browser_use_terminal_config_toml(path: &Path) -> Result<Option<toml::Value>> {
     let data = match std::fs::read_to_string(path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -12951,7 +12963,7 @@ fn read_codex_config_toml(path: &Path) -> Result<Option<toml::Value>> {
         }
         Err(error) => {
             bail!(
-                "Failed to read Codex config from `{}`: {error}",
+                "Failed to read Browser Use Terminal config from `{}`: {error}",
                 path.display()
             );
         }
@@ -12959,7 +12971,7 @@ fn read_codex_config_toml(path: &Path) -> Result<Option<toml::Value>> {
     match data.parse::<toml::Value>() {
         Ok(value) => Ok(Some(value)),
         Err(error) => bail!(
-            "Failed to parse Codex config from `{}`: {error}",
+            "Failed to parse Browser Use Terminal config from `{}`: {error}",
             path.display()
         ),
     }
@@ -13003,7 +13015,7 @@ struct ModelsCacheFile {
     models: Vec<ModelCatalogEntryInfo>,
 }
 
-fn codex_client_version_to_whole() -> String {
+fn browser_use_terminal_client_version_to_whole() -> String {
     let version = env!("CARGO_PKG_VERSION");
     version
         .split_once('-')
@@ -13012,18 +13024,20 @@ fn codex_client_version_to_whole() -> String {
         .to_string()
 }
 
-fn load_fresh_models_cache(codex_home: &Path) -> Option<ModelsCacheSnapshot> {
-    let path = codex_home.join(CODEX_MODELS_CACHE_FILENAME);
+fn load_fresh_models_cache(app_home: &Path) -> Option<ModelsCacheSnapshot> {
+    let path = app_home.join(BROWSER_USE_TERMINAL_MODELS_CACHE_FILENAME);
     let data = std::fs::read_to_string(path).ok()?;
     let cache = serde_json::from_str::<ModelsCacheFile>(&data).ok()?;
-    if cache.client_version.as_deref() != Some(codex_client_version_to_whole().as_str()) {
+    if cache.client_version.as_deref()
+        != Some(browser_use_terminal_client_version_to_whole().as_str())
+    {
         return None;
     }
     let fetched_at = chrono::DateTime::parse_from_rfc3339(&cache.fetched_at)
         .ok()?
         .with_timezone(&Utc);
     let age = Utc::now().signed_duration_since(fetched_at);
-    if age > chrono::Duration::seconds(CODEX_MODELS_CACHE_TTL_SECONDS) {
+    if age > chrono::Duration::seconds(BROWSER_USE_TERMINAL_MODELS_CACHE_TTL_SECONDS) {
         return None;
     }
     Some(ModelsCacheSnapshot {
@@ -13033,18 +13047,18 @@ fn load_fresh_models_cache(codex_home: &Path) -> Option<ModelsCacheSnapshot> {
 }
 
 fn persist_models_cache(
-    codex_home: &Path,
+    app_home: &Path,
     models: Vec<ModelCatalogEntryInfo>,
     etag: Option<String>,
 ) -> Result<()> {
-    let path = codex_home.join(CODEX_MODELS_CACHE_FILENAME);
+    let path = app_home.join(BROWSER_USE_TERMINAL_MODELS_CACHE_FILENAME);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
     }
     let cache = ModelsCacheFile {
         fetched_at: Utc::now().to_rfc3339(),
         etag,
-        client_version: Some(codex_client_version_to_whole()),
+        client_version: Some(browser_use_terminal_client_version_to_whole()),
         models,
     };
     let json = serde_json::to_string_pretty(&cache)?;
@@ -13052,8 +13066,8 @@ fn persist_models_cache(
     Ok(())
 }
 
-fn renew_models_cache_ttl(codex_home: &Path) -> Result<()> {
-    let path = codex_home.join(CODEX_MODELS_CACHE_FILENAME);
+fn renew_models_cache_ttl(app_home: &Path) -> Result<()> {
+    let path = app_home.join(BROWSER_USE_TERMINAL_MODELS_CACHE_FILENAME);
     let data = std::fs::read_to_string(&path)?;
     let mut cache = serde_json::from_str::<ModelsCacheFile>(&data)?;
     cache.fetched_at = Utc::now().to_rfc3339();
@@ -13088,7 +13102,10 @@ fn model_catalog_from_remote_models(
     ModelCatalog { models: merged }
 }
 
-fn read_project_codex_config_toml(path: &Path, trusted: bool) -> Result<Option<toml::Value>> {
+fn read_project_browser_use_terminal_config_toml(
+    path: &Path,
+    trusted: bool,
+) -> Result<Option<toml::Value>> {
     let data = match std::fs::read_to_string(path) {
         Ok(data) => data,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
@@ -13111,8 +13128,8 @@ fn read_project_codex_config_toml(path: &Path, trusted: bool) -> Result<Option<t
     }
 }
 
-fn read_codex_managed_preferences_config_toml() -> Result<Option<toml::Value>> {
-    let Some(encoded) = codex_managed_preferences_config_base64()? else {
+fn read_browser_use_terminal_managed_preferences_config_toml() -> Result<Option<toml::Value>> {
+    let Some(encoded) = browser_use_terminal_managed_preferences_config_base64()? else {
         return Ok(None);
     };
     let trimmed = encoded.trim();
@@ -13123,8 +13140,8 @@ fn read_codex_managed_preferences_config_toml() -> Result<Option<toml::Value>> {
         Ok(bytes) => bytes,
         Err(error) => {
             bail!(
-                "Failed to decode Codex managed preferences `{}` for AGENTS.md discovery: {error}",
-                CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE,
+                "Failed to decode Browser Use Terminal managed preferences `{}` for AGENTS.md discovery: {error}",
+                BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_SOURCE,
             );
         }
     };
@@ -13132,8 +13149,8 @@ fn read_codex_managed_preferences_config_toml() -> Result<Option<toml::Value>> {
         Ok(raw_toml) => raw_toml,
         Err(error) => {
             bail!(
-                "Codex managed preferences `{}` for AGENTS.md discovery were not valid UTF-8: {error}",
-                CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE,
+                "Browser Use Terminal managed preferences `{}` for AGENTS.md discovery were not valid UTF-8: {error}",
+                BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_SOURCE,
             );
         }
     };
@@ -13141,24 +13158,24 @@ fn read_codex_managed_preferences_config_toml() -> Result<Option<toml::Value>> {
         Ok(toml::Value::Table(table)) => Ok(Some(toml::Value::Table(table))),
         Ok(other) => {
             bail!(
-                "Codex managed preferences `{}` for AGENTS.md discovery must have a TOML table at the root, found {other:?}",
-                CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE,
+                "Browser Use Terminal managed preferences `{}` for AGENTS.md discovery must have a TOML table at the root, found {other:?}",
+                BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_SOURCE,
             );
         }
         Err(error) => bail!(
-            "Failed to parse Codex managed preferences `{}` for AGENTS.md discovery: {error}",
-            CODEX_MANAGED_PREFERENCES_CONFIG_SOURCE,
+            "Failed to parse Browser Use Terminal managed preferences `{}` for AGENTS.md discovery: {error}",
+            BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_SOURCE,
         ),
     }
 }
 
 #[cfg(test)]
-fn codex_managed_preferences_config_base64() -> Result<Option<String>> {
-    Ok(std::env::var(TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV).ok())
+fn browser_use_terminal_managed_preferences_config_base64() -> Result<Option<String>> {
+    Ok(std::env::var(TEST_BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_BASE64_ENV).ok())
 }
 
 #[cfg(all(target_os = "macos", not(test)))]
-fn codex_managed_preferences_config_base64() -> Result<Option<String>> {
+fn browser_use_terminal_managed_preferences_config_base64() -> Result<Option<String>> {
     use core_foundation::base::TCFType;
     use core_foundation::string::{CFString, CFStringRef};
     use std::ffi::c_void;
@@ -13170,8 +13187,10 @@ fn codex_managed_preferences_config_base64() -> Result<Option<String>> {
 
     let value_ref = unsafe {
         CFPreferencesCopyAppValue(
-            CFString::new(CODEX_MANAGED_PREFERENCES_CONFIG_KEY).as_concrete_TypeRef(),
-            CFString::new(CODEX_MANAGED_PREFERENCES_APPLICATION_ID).as_concrete_TypeRef(),
+            CFString::new(BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_KEY)
+                .as_concrete_TypeRef(),
+            CFString::new(BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_APPLICATION_ID)
+                .as_concrete_TypeRef(),
         )
     };
     if value_ref.is_null() {
@@ -13185,7 +13204,7 @@ fn codex_managed_preferences_config_base64() -> Result<Option<String>> {
 }
 
 #[cfg(all(not(target_os = "macos"), not(test)))]
-fn codex_managed_preferences_config_base64() -> Result<Option<String>> {
+fn browser_use_terminal_managed_preferences_config_base64() -> Result<Option<String>> {
     Ok(None)
 }
 
@@ -13317,7 +13336,7 @@ fn apply_agents_md_config_layer(
     apply_skills_config_layer(config, value, path, relative_base)?;
     apply_hooks_config_layer(config, value, path)?;
     apply_codex_features_config_layer(config, value, path)?;
-    apply_codex_plugins_config_layer(config, value, path)?;
+    apply_browser_use_terminal_plugins_config_layer(config, value, path)?;
     apply_multi_agent_v2_config_layer(config, value, path)?;
     if let Some(reasoning_effort) = toml_optional_enum_string(
         value,
@@ -13386,7 +13405,7 @@ fn apply_codex_features_config_layer(
     };
     let Some(features) = features.as_table() else {
         bail!(
-            "Invalid Codex config `features` from `{}`: expected a table.",
+            "Invalid Browser Use Terminal config `features` from `{}`: expected a table.",
             path.display()
         );
     };
@@ -13468,7 +13487,7 @@ fn apply_codex_features_config_layer(
             if let Some(enabled) = table.get("enabled") {
                 let Some(enabled) = enabled.as_bool() else {
                     bail!(
-                        "Invalid Codex config `features.{key}.enabled` from `{}`: expected a boolean.",
+                        "Invalid Browser Use Terminal config `features.{key}.enabled` from `{}`: expected a boolean.",
                         path.display()
                     );
                 };
@@ -13477,14 +13496,14 @@ fn apply_codex_features_config_layer(
             continue;
         }
         bail!(
-            "Invalid Codex config `features.{key}` from `{}`: expected a boolean or table.",
+            "Invalid Browser Use Terminal config `features.{key}` from `{}`: expected a boolean or table.",
             path.display()
         );
     }
     Ok(())
 }
 
-fn apply_codex_plugins_config_layer(
+fn apply_browser_use_terminal_plugins_config_layer(
     config: &mut AgentsMdConfig,
     value: &toml::Value,
     path: &Path,
@@ -13494,14 +13513,14 @@ fn apply_codex_plugins_config_layer(
     };
     let Some(plugins) = raw_plugins.as_table() else {
         bail!(
-            "Invalid Codex config `plugins` from `{}`: expected a table.",
+            "Invalid Browser Use Terminal config `plugins` from `{}`: expected a table.",
             path.display()
         );
     };
     for (plugin_name, plugin_value) in plugins {
         let Some(plugin_table) = plugin_value.as_table() else {
             bail!(
-                "Invalid Codex config `plugins.{plugin_name}` from `{}`: expected a table.",
+                "Invalid Browser Use Terminal config `plugins.{plugin_name}` from `{}`: expected a table.",
                 path.display()
             );
         };
@@ -13509,7 +13528,7 @@ fn apply_codex_plugins_config_layer(
         if let Some(enabled) = plugin_table.get("enabled") {
             let Some(enabled) = enabled.as_bool() else {
                 bail!(
-                    "Invalid Codex config `plugins.{plugin_name}.enabled` from `{}`: expected a boolean.",
+                    "Invalid Browser Use Terminal config `plugins.{plugin_name}.enabled` from `{}`: expected a boolean.",
                     path.display()
                 );
             };
@@ -13529,7 +13548,7 @@ fn apply_hooks_config_layer(
     if let Some(hooks_value) = value.get("hooks") {
         let Some(_) = hooks_value.as_table() else {
             bail!(
-                "Invalid Codex config `hooks` from `{}`: expected a table.",
+                "Invalid Browser Use Terminal config `hooks` from `{}`: expected a table.",
                 path.display()
             );
         };
@@ -13549,7 +13568,7 @@ fn apply_hooks_config_events(
         };
         let Some(groups) = groups_value.as_array() else {
             bail!(
-                "Invalid Codex config `{}` from `{}`: expected an array of hook matcher groups.",
+                "Invalid Browser Use Terminal config `{}` from `{}`: expected an array of hook matcher groups.",
                 event.as_str(),
                 path.display()
             );
@@ -13557,7 +13576,7 @@ fn apply_hooks_config_events(
         for group_value in groups {
             let Some(group_table) = group_value.as_table() else {
                 bail!(
-                    "Invalid Codex config `{}` from `{}`: expected hook matcher groups to be tables.",
+                    "Invalid Browser Use Terminal config `{}` from `{}`: expected hook matcher groups to be tables.",
                     event.as_str(),
                     path.display()
                 );
@@ -13568,7 +13587,7 @@ fn apply_hooks_config_events(
                         .as_str()
                         .ok_or_else(|| {
                             anyhow!(
-                                "Invalid Codex config `{}.matcher` from `{}`: expected a string.",
+                                "Invalid Browser Use Terminal config `{}.matcher` from `{}`: expected a string.",
                                 event.as_str(),
                                 path.display()
                             )
@@ -13579,14 +13598,14 @@ fn apply_hooks_config_events(
             };
             let hooks_value = group_table.get("hooks").ok_or_else(|| {
                 anyhow!(
-                    "Invalid Codex config `{}` from `{}`: expected `hooks` array.",
+                    "Invalid Browser Use Terminal config `{}` from `{}`: expected `hooks` array.",
                     event.as_str(),
                     path.display()
                 )
             })?;
             let Some(hooks) = hooks_value.as_array() else {
                 bail!(
-                    "Invalid Codex config `{}.hooks` from `{}`: expected an array.",
+                    "Invalid Browser Use Terminal config `{}.hooks` from `{}`: expected an array.",
                     event.as_str(),
                     path.display()
                 );
@@ -13595,7 +13614,7 @@ fn apply_hooks_config_events(
             for hook_value in hooks {
                 let Some(hook_table) = hook_value.as_table() else {
                     bail!(
-                        "Invalid Codex config `{}.hooks` from `{}`: expected hook tables.",
+                        "Invalid Browser Use Terminal config `{}.hooks` from `{}`: expected hook tables.",
                         event.as_str(),
                         path.display()
                     );
@@ -13613,7 +13632,7 @@ fn apply_hooks_config_events(
                     .map(str::to_string)
                     .ok_or_else(|| {
                         anyhow!(
-                            "Invalid Codex config `{}.hooks.command` from `{}`: expected a string.",
+                            "Invalid Browser Use Terminal config `{}.hooks.command` from `{}`: expected a string.",
                             event.as_str(),
                             path.display()
                         )
@@ -13627,7 +13646,7 @@ fn apply_hooks_config_events(
                             .filter(|value| *value > 0)
                             .ok_or_else(|| {
                                 anyhow!(
-                                    "Invalid Codex config `{}.hooks.timeout_sec` from `{}`: expected a positive integer.",
+                                    "Invalid Browser Use Terminal config `{}.hooks.timeout_sec` from `{}`: expected a positive integer.",
                                     event.as_str(),
                                     path.display()
                                 )
@@ -13675,7 +13694,7 @@ fn apply_allowed_web_search_modes_config_layer(
     };
     let Some(raw_modes) = raw_modes.as_array() else {
         bail!(
-            "Invalid Codex config `allowed_web_search_modes` from `{}`: expected an array of strings.",
+            "Invalid Browser Use Terminal config `allowed_web_search_modes` from `{}`: expected an array of strings.",
             path.display()
         );
     };
@@ -13683,7 +13702,7 @@ fn apply_allowed_web_search_modes_config_layer(
     for raw_mode in raw_modes {
         let Some(raw_mode) = raw_mode.as_str() else {
             bail!(
-                "Invalid Codex config `allowed_web_search_modes` from `{}`: expected an array of strings.",
+                "Invalid Browser Use Terminal config `allowed_web_search_modes` from `{}`: expected an array of strings.",
                 path.display()
             );
         };
@@ -13692,7 +13711,7 @@ fn apply_allowed_web_search_modes_config_layer(
             "cached" => WebSearchMode::Cached,
             "live" => WebSearchMode::Live,
             _ => bail!(
-                "Invalid Codex config `allowed_web_search_modes` from `{}`: expected one of `disabled`, `cached`, `live`.",
+                "Invalid Browser Use Terminal config `allowed_web_search_modes` from `{}`: expected one of `disabled`, `cached`, `live`.",
                 path.display()
             ),
         };
@@ -13758,30 +13777,28 @@ struct LocalPluginAppConfig {
     id: String,
 }
 
-fn codex_plugin_capability_summaries_for_config(
+fn browser_use_terminal_plugin_capability_summaries_for_config(
     config: &AgentsMdConfig,
 ) -> Vec<LocalPluginCapabilitySummary> {
     if !config.plugins_enabled || config.plugins.is_empty() {
         return Vec::new();
     }
-    let Some(codex_home) = codex_home_dir() else {
+    let Some(app_home) = browser_use_terminal_home_dir() else {
         return Vec::new();
     };
     config
         .plugins
         .iter()
         .filter(|(_, plugin_config)| plugin_config.enabled)
-        .filter_map(|(config_name, _)| {
-            local_plugin_summary_for_config_name(&codex_home, config_name)
-        })
+        .filter_map(|(config_name, _)| local_plugin_summary_for_config_name(&app_home, config_name))
         .collect()
 }
 
 fn local_plugin_summary_for_config_name(
-    codex_home: &Path,
+    app_home: &Path,
     config_name: &str,
 ) -> Option<LocalPluginCapabilitySummary> {
-    let plugin_root = local_plugin_root_for_config_name(codex_home, config_name)?;
+    let plugin_root = local_plugin_root_for_config_name(app_home, config_name)?;
     let manifest_path = plugin_manifest_path(&plugin_root)?;
     let manifest = std::fs::read_to_string(manifest_path)
         .ok()
@@ -13823,7 +13840,7 @@ fn local_plugin_summary_for_config_name(
     })
 }
 
-fn local_plugin_root_for_config_name(codex_home: &Path, config_name: &str) -> Option<PathBuf> {
+fn local_plugin_root_for_config_name(app_home: &Path, config_name: &str) -> Option<PathBuf> {
     let plugin_name = plugin_name_from_config_name(config_name);
     let marketplace = config_name
         .split_once('@')
@@ -13832,27 +13849,35 @@ fn local_plugin_root_for_config_name(codex_home: &Path, config_name: &str) -> Op
     let mut candidates = Vec::new();
     if let Some(marketplace) = marketplace {
         candidates.push(
-            codex_home
-                .join(CODEX_PLUGIN_CACHE_DIR)
+            app_home
+                .join(BROWSER_USE_TERMINAL_PLUGIN_CACHE_DIR)
                 .join(marketplace)
                 .join(plugin_name)
                 .join("local"),
         );
         candidates.push(
-            codex_home
-                .join(CODEX_PLUGIN_CACHE_DIR)
+            app_home
+                .join(BROWSER_USE_TERMINAL_PLUGIN_CACHE_DIR)
                 .join(marketplace)
                 .join(plugin_name),
         );
     }
-    candidates.push(codex_home.join(CODEX_CURATED_PLUGINS_DIR).join(plugin_name));
-    candidates.push(codex_home.join(CODEX_CURATED_PLUGINS_DIR).join(config_name));
+    candidates.push(
+        app_home
+            .join(BROWSER_USE_TERMINAL_CURATED_PLUGINS_DIR)
+            .join(plugin_name),
+    );
+    candidates.push(
+        app_home
+            .join(BROWSER_USE_TERMINAL_CURATED_PLUGINS_DIR)
+            .join(config_name),
+    );
     for candidate in candidates {
         if plugin_manifest_path(&candidate).is_some() {
             return Some(candidate);
         }
     }
-    let cache_root = codex_home.join(CODEX_PLUGIN_CACHE_DIR);
+    let cache_root = app_home.join(BROWSER_USE_TERMINAL_PLUGIN_CACHE_DIR);
     let entries = std::fs::read_dir(cache_root).ok()?;
     for marketplace in entries.flatten() {
         let root = marketplace.path().join(plugin_name);
@@ -13874,7 +13899,7 @@ fn plugin_name_from_config_name(config_name: &str) -> &str {
 
 fn plugin_manifest_path(plugin_root: &Path) -> Option<PathBuf> {
     [
-        plugin_root.join(".codex-plugin").join("plugin.json"),
+        plugin_root.join(".browser-use-plugin").join("plugin.json"),
         plugin_root.join(".claude-plugin").join("plugin.json"),
     ]
     .into_iter()
@@ -13980,14 +14005,14 @@ struct LocalSkillSummary {
 }
 
 fn render_available_skills_instructions(
-    codex_home: Option<&Path>,
+    app_home: Option<&Path>,
     cwd: &Path,
     config: &AgentsMdConfig,
 ) -> Option<String> {
     if !config.skills_include_instructions {
         return None;
     }
-    let mut skills = available_skill_summaries(codex_home, Some(cwd), config);
+    let mut skills = available_skill_summaries(app_home, Some(cwd), config);
     if skills.is_empty() {
         return None;
     }
@@ -14036,7 +14061,7 @@ fn render_available_skills_instructions(
 }
 
 fn available_skill_summaries(
-    codex_home: Option<&Path>,
+    app_home: Option<&Path>,
     cwd: Option<&Path>,
     config: &AgentsMdConfig,
 ) -> Vec<LocalSkillSummary> {
@@ -14048,23 +14073,25 @@ fn available_skill_summaries(
     }
 
     let mut roots = Vec::new();
-    if let Some(codex_home) = codex_home {
+    if let Some(app_home) = app_home {
         roots.push(SkillRootCandidate {
-            path: codex_home.join(CODEX_SKILLS_DIR),
+            path: app_home.join(BROWSER_USE_TERMINAL_SKILLS_DIR),
             name_prefix: None,
             bundled: false,
         });
         roots.push(SkillRootCandidate {
-            path: codex_home.join(CODEX_AGENTS_DIR).join(CODEX_SKILLS_DIR),
+            path: app_home
+                .join(BROWSER_USE_TERMINAL_AGENTS_DIR)
+                .join(BROWSER_USE_TERMINAL_SKILLS_DIR),
             name_prefix: None,
             bundled: false,
         });
         roots.push(SkillRootCandidate {
-            path: codex_home.join(CODEX_TMP_SKILLS_DIR),
+            path: app_home.join(BROWSER_USE_TERMINAL_TMP_SKILLS_DIR),
             name_prefix: None,
             bundled: true,
         });
-        for plugin in codex_plugin_capability_summaries_for_config(config) {
+        for plugin in browser_use_terminal_plugin_capability_summaries_for_config(config) {
             if let Some(skill_root) = plugin.skill_root {
                 roots.push(SkillRootCandidate {
                     path: skill_root,
@@ -14074,7 +14101,7 @@ fn available_skill_summaries(
             }
         }
     }
-    if let Some(system_root) = system_codex_skills_dir() {
+    if let Some(system_root) = system_browser_use_terminal_skills_dir() {
         roots.push(SkillRootCandidate {
             path: system_root,
             name_prefix: None,
@@ -14086,12 +14113,16 @@ fn available_skill_summaries(
             .unwrap_or_else(|_| vec![cwd.to_path_buf()]);
         for dir in project_dirs {
             roots.push(SkillRootCandidate {
-                path: dir.join(CODEX_AGENTS_DIR).join(CODEX_SKILLS_DIR),
+                path: dir
+                    .join(BROWSER_USE_TERMINAL_AGENTS_DIR)
+                    .join(BROWSER_USE_TERMINAL_SKILLS_DIR),
                 name_prefix: None,
                 bundled: false,
             });
             roots.push(SkillRootCandidate {
-                path: dir.join(PROJECT_CODEX_DIR).join(CODEX_SKILLS_DIR),
+                path: dir
+                    .join(PROJECT_BROWSER_USE_TERMINAL_DIR)
+                    .join(BROWSER_USE_TERMINAL_SKILLS_DIR),
                 name_prefix: None,
                 bundled: false,
             });
@@ -14166,10 +14197,10 @@ fn collect_skill_summaries(
     }
 }
 
-fn system_codex_skills_dir() -> Option<PathBuf> {
+fn system_browser_use_terminal_skills_dir() -> Option<PathBuf> {
     #[cfg(all(unix, not(test)))]
     {
-        let path = PathBuf::from("/etc/codex/skills");
+        let path = PathBuf::from("/etc/browser-use-terminal/skills");
         path.is_dir().then_some(path)
     }
     #[cfg(not(all(unix, not(test))))]
@@ -14412,11 +14443,11 @@ fn strip_markdown_frontmatter(contents: &str) -> Option<&str> {
     Some(&contents[after_frontmatter + closing..])
 }
 
-fn render_memory_context_instructions(codex_home: Option<&Path>, enabled: bool) -> Option<String> {
+fn render_memory_context_instructions(app_home: Option<&Path>, enabled: bool) -> Option<String> {
     if !enabled {
         return None;
     }
-    let path = codex_home?.join("memories").join("memory_summary.md");
+    let path = app_home?.join("memories").join("memory_summary.md");
     let summary = std::fs::read_to_string(path).ok()?;
     let summary = summary.trim();
     if summary.is_empty() {
@@ -14515,7 +14546,7 @@ fn apply_web_search_tool_config_layer(
     }
     let Some(table) = raw.as_table() else {
         bail!(
-            "Invalid Codex config `tools.web_search` from `{}`: expected a table.",
+            "Invalid Browser Use Terminal config `tools.web_search` from `{}`: expected a table.",
             path.display()
         );
     };
@@ -14523,7 +14554,7 @@ fn apply_web_search_tool_config_layer(
     if let Some(context_size) = table.get("context_size") {
         let Some(context_size) = context_size.as_str() else {
             bail!(
-                "Invalid Codex config `tools.web_search.context_size` from `{}`: expected a string.",
+                "Invalid Browser Use Terminal config `tools.web_search.context_size` from `{}`: expected a string.",
                 path.display()
             );
         };
@@ -14532,7 +14563,7 @@ fn apply_web_search_tool_config_layer(
             "medium" => WebSearchContextSize::Medium,
             "high" => WebSearchContextSize::High,
             _ => bail!(
-                "Invalid Codex config `tools.web_search.context_size` from `{}`: expected one of `low`, `medium`, `high`.",
+                "Invalid Browser Use Terminal config `tools.web_search.context_size` from `{}`: expected one of `low`, `medium`, `high`.",
                 path.display()
             ),
         });
@@ -14540,7 +14571,7 @@ fn apply_web_search_tool_config_layer(
     if let Some(allowed_domains) = table.get("allowed_domains") {
         let Some(items) = allowed_domains.as_array() else {
             bail!(
-                "Invalid Codex config `tools.web_search.allowed_domains` from `{}`: expected an array of strings.",
+                "Invalid Browser Use Terminal config `tools.web_search.allowed_domains` from `{}`: expected an array of strings.",
                 path.display()
             );
         };
@@ -14548,7 +14579,7 @@ fn apply_web_search_tool_config_layer(
         for item in items {
             let Some(domain) = item.as_str() else {
                 bail!(
-                    "Invalid Codex config `tools.web_search.allowed_domains` from `{}`: expected an array of strings.",
+                    "Invalid Browser Use Terminal config `tools.web_search.allowed_domains` from `{}`: expected an array of strings.",
                     path.display()
                 );
             };
@@ -14559,7 +14590,7 @@ fn apply_web_search_tool_config_layer(
     if let Some(location) = table.get("location") {
         let Some(location) = location.as_table() else {
             bail!(
-                "Invalid Codex config `tools.web_search.location` from `{}`: expected a table.",
+                "Invalid Browser Use Terminal config `tools.web_search.location` from `{}`: expected a table.",
                 path.display()
             );
         };
@@ -14569,7 +14600,7 @@ fn apply_web_search_tool_config_layer(
             };
             let Some(value) = value.as_str() else {
                 bail!(
-                    "Invalid Codex config `tools.web_search.location.{key}` from `{}`: expected a string.",
+                    "Invalid Browser Use Terminal config `tools.web_search.location.{key}` from `{}`: expected a string.",
                     path.display()
                 );
             };
@@ -14596,14 +14627,14 @@ fn apply_memories_config_layer(
     };
     let Some(table) = raw.as_table() else {
         bail!(
-            "Invalid Codex config `memories` from `{}`: expected a table.",
+            "Invalid Browser Use Terminal config `memories` from `{}`: expected a table.",
             path.display()
         );
     };
     if let Some(use_memories) = table.get("use_memories") {
         let Some(use_memories) = use_memories.as_bool() else {
             bail!(
-                "Invalid Codex config `memories.use_memories` from `{}`: expected a boolean.",
+                "Invalid Browser Use Terminal config `memories.use_memories` from `{}`: expected a boolean.",
                 path.display()
             );
         };
@@ -14623,14 +14654,14 @@ fn apply_skills_config_layer(
     };
     let Some(table) = raw.as_table() else {
         bail!(
-            "Invalid Codex config `skills` from `{}`: expected a table.",
+            "Invalid Browser Use Terminal config `skills` from `{}`: expected a table.",
             path.display()
         );
     };
     if let Some(include_instructions) = table.get("include_instructions") {
         let Some(include_instructions) = include_instructions.as_bool() else {
             bail!(
-                "Invalid Codex config `skills.include_instructions` from `{}`: expected a boolean.",
+                "Invalid Browser Use Terminal config `skills.include_instructions` from `{}`: expected a boolean.",
                 path.display()
             );
         };
@@ -14639,14 +14670,14 @@ fn apply_skills_config_layer(
     if let Some(bundled) = table.get("bundled") {
         let Some(bundled) = bundled.as_table() else {
             bail!(
-                "Invalid Codex config `skills.bundled` from `{}`: expected a table.",
+                "Invalid Browser Use Terminal config `skills.bundled` from `{}`: expected a table.",
                 path.display()
             );
         };
         if let Some(enabled) = bundled.get("enabled") {
             let Some(enabled) = enabled.as_bool() else {
                 bail!(
-                    "Invalid Codex config `skills.bundled.enabled` from `{}`: expected a boolean.",
+                    "Invalid Browser Use Terminal config `skills.bundled.enabled` from `{}`: expected a boolean.",
                     path.display()
                 );
             };
@@ -14656,27 +14687,27 @@ fn apply_skills_config_layer(
     if let Some(raw_rules) = table.get("config") {
         let Some(raw_rules) = raw_rules.as_array() else {
             bail!(
-                "Invalid Codex config `skills.config` from `{}`: expected an array of tables.",
+                "Invalid Browser Use Terminal config `skills.config` from `{}`: expected an array of tables.",
                 path.display()
             );
         };
         for raw_rule in raw_rules {
             let Some(rule_table) = raw_rule.as_table() else {
                 bail!(
-                    "Invalid Codex config `skills.config` from `{}`: expected an array of tables.",
+                    "Invalid Browser Use Terminal config `skills.config` from `{}`: expected an array of tables.",
                     path.display()
                 );
             };
             let enabled = match rule_table.get("enabled") {
                 Some(value) => value.as_bool().ok_or_else(|| {
                     anyhow!(
-                        "Invalid Codex config `skills.config.enabled` from `{}`: expected a boolean.",
+                        "Invalid Browser Use Terminal config `skills.config.enabled` from `{}`: expected a boolean.",
                         path.display()
                     )
                 })?,
                 None => {
                     bail!(
-                        "Invalid Codex config `skills.config` from `{}`: every entry must define `enabled`.",
+                        "Invalid Browser Use Terminal config `skills.config` from `{}`: every entry must define `enabled`.",
                         path.display()
                     )
                 }
@@ -14685,7 +14716,7 @@ fn apply_skills_config_layer(
                 (Some(name), None) => {
                     let Some(name) = name.as_str() else {
                         bail!(
-                            "Invalid Codex config `skills.config.name` from `{}`: expected a string.",
+                            "Invalid Browser Use Terminal config `skills.config.name` from `{}`: expected a string.",
                             path.display()
                         );
                     };
@@ -14698,7 +14729,7 @@ fn apply_skills_config_layer(
                 (None, Some(rule_path)) => {
                     let Some(rule_path) = rule_path.as_str() else {
                         bail!(
-                            "Invalid Codex config `skills.config.path` from `{}`: expected a path string.",
+                            "Invalid Browser Use Terminal config `skills.config.path` from `{}`: expected a path string.",
                             path.display()
                         );
                     };
@@ -14927,7 +14958,7 @@ fn apply_model_provider_request_retry_config_layer(
     };
     let Some(model_providers) = model_providers.as_table() else {
         bail!(
-            "Invalid Codex config `model_providers` from `{}`: expected a table.",
+            "Invalid Browser Use Terminal config `model_providers` from `{}`: expected a table.",
             path.display()
         );
     };
@@ -14939,7 +14970,7 @@ fn apply_model_provider_request_retry_config_layer(
         }
         let Some(provider_config) = provider_config.as_table() else {
             bail!(
-                "Invalid Codex config `model_providers.{provider_id}` from `{}`: expected a table.",
+                "Invalid Browser Use Terminal config `model_providers.{provider_id}` from `{}`: expected a table.",
                 path.display()
             );
         };
@@ -15072,7 +15103,7 @@ fn parse_provider_command_auth_config(
         Some(value) => {
             let Some(items) = value.as_array() else {
                 bail!(
-                    "Invalid Codex config `model_providers.{provider_id}.auth.args` from `{}`: expected an array of strings.",
+                    "Invalid Browser Use Terminal config `model_providers.{provider_id}.auth.args` from `{}`: expected an array of strings.",
                     path.display()
                 );
             };
@@ -15080,7 +15111,7 @@ fn parse_provider_command_auth_config(
             for item in items {
                 let Some(item) = item.as_str() else {
                     bail!(
-                        "Invalid Codex config `model_providers.{provider_id}.auth.args` from `{}`: expected an array of strings.",
+                        "Invalid Browser Use Terminal config `model_providers.{provider_id}.auth.args` from `{}`: expected an array of strings.",
                         path.display()
                     );
                 };
@@ -15094,13 +15125,13 @@ fn parse_provider_command_auth_config(
         Some(value) => {
             let Some(timeout_ms) = value.as_integer() else {
                 bail!(
-                    "Invalid Codex config `model_providers.{provider_id}.auth.timeout_ms` from `{}`: expected a positive integer.",
+                    "Invalid Browser Use Terminal config `model_providers.{provider_id}.auth.timeout_ms` from `{}`: expected a positive integer.",
                     path.display()
                 );
             };
             if timeout_ms <= 0 {
                 bail!(
-                    "Invalid Codex config `model_providers.{provider_id}.auth.timeout_ms` from `{}`: expected a positive integer.",
+                    "Invalid Browser Use Terminal config `model_providers.{provider_id}.auth.timeout_ms` from `{}`: expected a positive integer.",
                     path.display()
                 );
             }
@@ -15112,13 +15143,13 @@ fn parse_provider_command_auth_config(
         Some(value) => {
             let Some(refresh_interval_ms) = value.as_integer() else {
                 bail!(
-                    "Invalid Codex config `model_providers.{provider_id}.auth.refresh_interval_ms` from `{}`: expected a non-negative integer.",
+                    "Invalid Browser Use Terminal config `model_providers.{provider_id}.auth.refresh_interval_ms` from `{}`: expected a non-negative integer.",
                     path.display()
                 );
             };
             if refresh_interval_ms < 0 {
                 bail!(
-                    "Invalid Codex config `model_providers.{provider_id}.auth.refresh_interval_ms` from `{}`: expected a non-negative integer.",
+                    "Invalid Browser Use Terminal config `model_providers.{provider_id}.auth.refresh_interval_ms` from `{}`: expected a non-negative integer.",
                     path.display()
                 );
             }
@@ -15130,7 +15161,7 @@ fn parse_provider_command_auth_config(
         Some(value) => {
             let Some(raw) = value.as_str() else {
                 bail!(
-                    "Invalid Codex config `model_providers.{provider_id}.auth.cwd` from `{}`: expected a path string.",
+                    "Invalid Browser Use Terminal config `model_providers.{provider_id}.auth.cwd` from `{}`: expected a path string.",
                     path.display()
                 );
             };
@@ -15208,7 +15239,7 @@ fn apply_agent_roles_config_layer(
     };
     let Some(agents_table) = agents.as_table() else {
         bail!(
-            "Invalid Codex config `agents` from `{}`: expected a table.",
+            "Invalid Browser Use Terminal config `agents` from `{}`: expected a table.",
             path.display()
         );
     };
@@ -15226,14 +15257,14 @@ fn apply_agent_roles_config_layer(
                 Some(value) => {
                     let Some(description) = value.as_str() else {
                         bail!(
-                        "Invalid Codex config `agents.{role_name}.description` from `{}`: expected a string.",
+                        "Invalid Browser Use Terminal config `agents.{role_name}.description` from `{}`: expected a string.",
                         path.display()
                     );
                     };
                     let description = description.trim();
                     if description.is_empty() {
                         bail!(
-                        "Invalid Codex config `agents.{role_name}.description` from `{}`: cannot be blank.",
+                        "Invalid Browser Use Terminal config `agents.{role_name}.description` from `{}`: cannot be blank.",
                         path.display()
                     );
                     }
@@ -15245,7 +15276,7 @@ fn apply_agent_roles_config_layer(
                 Some(value) => {
                     let Some(raw_path) = value.as_str() else {
                         bail!(
-                        "Invalid Codex config `agents.{role_name}.config_file` from `{}`: expected a path string.",
+                        "Invalid Browser Use Terminal config `agents.{role_name}.config_file` from `{}`: expected a path string.",
                         path.display()
                     );
                     };
@@ -15370,7 +15401,8 @@ fn config_layer_has_agent_role_directory(config_path: &Path) -> bool {
     let Some(file_name) = config_path.file_name().and_then(|name| name.to_str()) else {
         return false;
     };
-    file_name == CODEX_CONFIG_FILENAME || file_name.ends_with(CODEX_PROFILE_CONFIG_SUFFIX)
+    file_name == BROWSER_USE_TERMINAL_CONFIG_FILENAME
+        || file_name.ends_with(BROWSER_USE_TERMINAL_PROFILE_CONFIG_SUFFIX)
 }
 
 fn collect_agent_role_files(dir: &Path) -> Result<Vec<PathBuf>> {
@@ -15530,7 +15562,7 @@ fn config_file_relative_base(path: &Path) -> &Path {
 
 fn load_project_agents_md_config_layers(
     cwd: &Path,
-    codex_home: &Path,
+    app_home: &Path,
     user_config: &toml::Value,
     project_root_markers: &[String],
     config: &mut AgentsMdConfig,
@@ -15542,16 +15574,17 @@ fn load_project_agents_md_config_layers(
     };
     let trust_map = project_trust_map(user_config);
     for dir in dirs {
-        let dot_codex = dir.join(PROJECT_CODEX_DIR);
-        if !std::fs::metadata(&dot_codex).is_ok_and(|metadata| metadata.is_dir()) {
+        let project_app_dir = dir.join(PROJECT_BROWSER_USE_TERMINAL_DIR);
+        if !std::fs::metadata(&project_app_dir).is_ok_and(|metadata| metadata.is_dir()) {
             continue;
         }
-        if same_normalized_path(&dot_codex, codex_home) {
+        if same_normalized_path(&project_app_dir, app_home) {
             continue;
         }
-        let config_path = dot_codex.join(CODEX_CONFIG_FILENAME);
+        let config_path = project_app_dir.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME);
         let trusted = project_config_is_trusted(&trust_map, &dir, &project_root);
-        let Some(mut project_config) = read_project_codex_config_toml(&config_path, trusted)?
+        let Some(mut project_config) =
+            read_project_browser_use_terminal_config_toml(&config_path, trusted)?
         else {
             continue;
         };
@@ -15651,10 +15684,21 @@ fn normalized_project_trust_keys(path: &Path) -> Vec<String> {
         .unwrap_or_else(|_| path.to_path_buf())
         .to_string_lossy()
         .to_string();
-    if raw == canonical {
-        vec![canonical]
-    } else {
-        vec![canonical, raw]
+    let mut keys = Vec::new();
+    push_project_trust_key_variant(&mut keys, canonical);
+    push_project_trust_key_variant(&mut keys, raw);
+    keys
+}
+
+fn push_project_trust_key_variant(keys: &mut Vec<String>, key: String) {
+    if !keys.contains(&key) {
+        keys.push(key.clone());
+    }
+    if let Some(without_private) = key.strip_prefix("/private/") {
+        let without_private = format!("/{without_private}");
+        if !keys.contains(&without_private) {
+            keys.push(without_private);
+        }
     }
 }
 
@@ -15664,7 +15708,7 @@ fn toml_string_array(value: &toml::Value, key: &str, path: &Path) -> Result<Opti
     };
     let Some(items) = value.as_array() else {
         bail!(
-            "Invalid Codex config `{key}` from `{}`: expected an array of strings.",
+            "Invalid Browser Use Terminal config `{key}` from `{}`: expected an array of strings.",
             path.display()
         );
     };
@@ -15672,7 +15716,7 @@ fn toml_string_array(value: &toml::Value, key: &str, path: &Path) -> Result<Opti
     for item in items {
         let Some(item) = item.as_str() else {
             bail!(
-                "Invalid Codex config `{key}` from `{}`: expected an array of strings.",
+                "Invalid Browser Use Terminal config `{key}` from `{}`: expected an array of strings.",
                 path.display()
             );
         };
@@ -15690,14 +15734,14 @@ fn toml_nonnegative_usize(value: &toml::Value, key: &str, path: &Path) -> Result
     };
     let Some(max_bytes) = value.as_integer() else {
         bail!(
-            "Invalid Codex config `{key}` from `{}`: expected a non-negative integer.",
+            "Invalid Browser Use Terminal config `{key}` from `{}`: expected a non-negative integer.",
             path.display()
         );
     };
     match usize::try_from(max_bytes) {
         Ok(max_bytes) => Ok(Some(max_bytes)),
         Err(_) => bail!(
-            "Invalid Codex config `{key}` from `{}`: expected a non-negative integer.",
+            "Invalid Browser Use Terminal config `{key}` from `{}`: expected a non-negative integer.",
             path.display()
         ),
     }
@@ -15709,7 +15753,7 @@ fn toml_optional_string(value: &toml::Value, key: &str, path: &Path) -> Result<O
     };
     let Some(text) = value.as_str() else {
         bail!(
-            "Invalid Codex config `{key}` from `{}`: expected a string.",
+            "Invalid Browser Use Terminal config `{key}` from `{}`: expected a string.",
             path.display()
         );
     };
@@ -15726,7 +15770,7 @@ fn toml_optional_string_map(
     };
     let Some(table) = value.as_table() else {
         bail!(
-            "Invalid Codex config `{key}` from `{}`: expected a table of strings.",
+            "Invalid Browser Use Terminal config `{key}` from `{}`: expected a table of strings.",
             path.display()
         );
     };
@@ -15734,7 +15778,7 @@ fn toml_optional_string_map(
     for (item_key, item_value) in table {
         let Some(item_value) = item_value.as_str() else {
             bail!(
-                "Invalid Codex config `{key}.{item_key}` from `{}`: expected a string.",
+                "Invalid Browser Use Terminal config `{key}.{item_key}` from `{}`: expected a string.",
                 path.display()
             );
         };
@@ -15756,7 +15800,7 @@ fn toml_optional_enum_string(
         Ok(Some(raw))
     } else {
         bail!(
-            "Invalid Codex config `{key}` from `{}`: expected one of {}.",
+            "Invalid Browser Use Terminal config `{key}` from `{}`: expected one of {}.",
             path.display(),
             allowed
                 .iter()
@@ -15779,7 +15823,7 @@ fn toml_optional_service_tier(
         .map(Some)
         .ok_or_else(|| {
             anyhow!(
-                "Invalid Codex config `{key}` from `{}`: expected one of `default`, `priority`, `fast`, `flex`.",
+                "Invalid Browser Use Terminal config `{key}` from `{}`: expected one of `default`, `priority`, `fast`, `flex`.",
                 path.display()
             )
         })
@@ -15805,7 +15849,7 @@ fn toml_optional_path(
     };
     let Some(raw_path) = value.as_str() else {
         bail!(
-            "Invalid Codex config `{key}` from `{}`: expected a path string.",
+            "Invalid Browser Use Terminal config `{key}` from `{}`: expected a path string.",
             path.display()
         );
     };
@@ -15823,7 +15867,7 @@ fn toml_optional_bool(value: &toml::Value, key: &str, path: &Path) -> Result<Opt
     };
     let Some(value) = value.as_bool() else {
         bail!(
-            "Invalid Codex config `{key}` from `{}`: expected a boolean.",
+            "Invalid Browser Use Terminal config `{key}` from `{}`: expected a boolean.",
             path.display()
         );
     };
@@ -15844,7 +15888,7 @@ fn toml_optional_nested_bool(
     }
     let Some(value) = current.as_bool() else {
         bail!(
-            "Invalid Codex config `{}` from `{}`: expected a boolean.",
+            "Invalid Browser Use Terminal config `{}` from `{}`: expected a boolean.",
             keys.join("."),
             path.display()
         );
@@ -15869,7 +15913,7 @@ fn toml_optional_nested_enabled_bool(
         };
         let Some(enabled) = enabled.as_bool() else {
             bail!(
-                "Invalid Codex config `{}.enabled` from `{}`: expected a boolean.",
+                "Invalid Browser Use Terminal config `{}.enabled` from `{}`: expected a boolean.",
                 keys.join("."),
                 path.display()
             );
@@ -15877,7 +15921,7 @@ fn toml_optional_nested_enabled_bool(
         return Ok(Some(enabled));
     }
     bail!(
-        "Invalid Codex config `{}` from `{}`: expected a boolean or table.",
+        "Invalid Browser Use Terminal config `{}` from `{}`: expected a boolean or table.",
         keys.join("."),
         path.display()
     )
@@ -15893,7 +15937,7 @@ fn toml_optional_nested_string(
     };
     let Some(text) = value.as_str() else {
         bail!(
-            "Invalid Codex config `{}` from `{}`: expected a string.",
+            "Invalid Browser Use Terminal config `{}` from `{}`: expected a string.",
             keys.join("."),
             path.display()
         );
@@ -15911,7 +15955,7 @@ fn toml_optional_nested_i64(
     };
     let Some(integer) = value.as_integer() else {
         bail!(
-            "Invalid Codex config `{}` from `{}`: expected an integer.",
+            "Invalid Browser Use Terminal config `{}` from `{}`: expected an integer.",
             keys.join("."),
             path.display()
         );
@@ -15930,7 +15974,7 @@ fn toml_optional_nested_usize(
     match usize::try_from(integer) {
         Ok(integer) => Ok(Some(integer)),
         Err(_) => bail!(
-            "Invalid Codex config `{}` from `{}`: expected a non-negative integer.",
+            "Invalid Browser Use Terminal config `{}` from `{}`: expected a non-negative integer.",
             keys.join("."),
             path.display()
         ),
@@ -15966,19 +16010,29 @@ fn read_non_empty_compact_prompt_file(path: &Path) -> Result<String> {
     Ok(contents)
 }
 
-fn codex_home_dir() -> Option<PathBuf> {
-    std::env::var("CODEX_HOME")
+#[cfg(test)]
+fn browser_use_terminal_home_dir() -> Option<PathBuf> {
+    std::env::var(BROWSER_USE_TERMINAL_HOME_ENV)
         .ok()
+        .filter(|value| !value.trim().is_empty())
+        .map(PathBuf::from)
+}
+
+#[cfg(not(test))]
+fn browser_use_terminal_home_dir() -> Option<PathBuf> {
+    std::env::var(BROWSER_USE_TERMINAL_HOME_ENV)
+        .ok()
+        .filter(|value| !value.trim().is_empty())
         .map(PathBuf::from)
         .or_else(|| {
             std::env::var("HOME")
                 .ok()
-                .map(|home| PathBuf::from(home).join(".codex"))
+                .map(|home| PathBuf::from(home).join(BROWSER_USE_TERMINAL_HOME_DIR))
         })
 }
 
 fn load_global_agents_md(warnings: &mut Vec<String>) -> Option<(PathBuf, String)> {
-    let base = codex_home_dir()?;
+    let base = browser_use_terminal_home_dir()?;
     for filename in [LOCAL_AGENTS_MD_FILENAME, DEFAULT_AGENTS_MD_FILENAME] {
         let path = base.join(filename);
         let Some(text) = read_agents_md_file(&path, "Global", warnings) else {
@@ -18069,8 +18123,8 @@ fn materialize_plain_skill_context_messages(input: &mut CollabInput, cwd: &Path)
     let mut warnings = Vec::new();
     let config =
         load_agents_md_config_for_options(cwd, &mut warnings, &AgentRunOptions::default())?;
-    let codex_home = codex_home_dir();
-    let summaries = available_skill_summaries(codex_home.as_deref(), Some(cwd), &config);
+    let app_home = browser_use_terminal_home_dir();
+    let summaries = available_skill_summaries(app_home.as_deref(), Some(cwd), &config);
     if summaries.is_empty() {
         return Ok(());
     }
@@ -18143,7 +18197,7 @@ fn materialize_mention_context_messages(input: &mut CollabInput, cwd: &Path) -> 
     let mut warnings = Vec::new();
     let config =
         load_agents_md_config_for_options(cwd, &mut warnings, &AgentRunOptions::default())?;
-    let plugin_summaries = codex_plugin_capability_summaries_for_config(&config);
+    let plugin_summaries = browser_use_terminal_plugin_capability_summaries_for_config(&config);
     if plugin_summaries.is_empty() {
         return Ok(());
     }
@@ -20951,7 +21005,7 @@ fn record_tool_artifact(
 mod tests {
     use super::*;
 
-    static CODEX_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static BROWSER_USE_TERMINAL_HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     struct EnvVarGuard {
         key: &'static str,
@@ -21217,64 +21271,74 @@ mod tests {
         Ok(())
     }
 
-    fn with_codex_home<T>(codex_home: &Path, f: impl FnOnce() -> T) -> T {
-        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
-        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home);
-        let _system_guard = EnvVarGuard::remove(TEST_CODEX_SYSTEM_CONFIG_ENV);
-        let _managed_guard = EnvVarGuard::remove(TEST_CODEX_MANAGED_CONFIG_ENV);
+    fn with_browser_use_terminal_home<T>(app_home: &Path, f: impl FnOnce() -> T) -> T {
+        let _lock = BROWSER_USE_TERMINAL_HOME_ENV_LOCK
+            .lock()
+            .expect("Browser Use Terminal home env lock");
+        let _guard = EnvVarGuard::set_path(BROWSER_USE_TERMINAL_HOME_ENV, app_home);
+        let _system_guard = EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_SYSTEM_CONFIG_ENV);
+        let _managed_guard = EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_MANAGED_CONFIG_ENV);
         let _managed_preferences_guard =
-            EnvVarGuard::remove(TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
+            EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
         f()
     }
 
-    fn with_codex_home_and_system_config<T>(
-        codex_home: &Path,
+    fn with_browser_use_terminal_home_and_system_config<T>(
+        app_home: &Path,
         system_config: &Path,
         f: impl FnOnce() -> T,
     ) -> T {
-        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
-        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home);
-        let _system_guard = EnvVarGuard::set_path(TEST_CODEX_SYSTEM_CONFIG_ENV, system_config);
-        let _managed_guard = EnvVarGuard::remove(TEST_CODEX_MANAGED_CONFIG_ENV);
+        let _lock = BROWSER_USE_TERMINAL_HOME_ENV_LOCK
+            .lock()
+            .expect("Browser Use Terminal home env lock");
+        let _guard = EnvVarGuard::set_path(BROWSER_USE_TERMINAL_HOME_ENV, app_home);
+        let _system_guard =
+            EnvVarGuard::set_path(TEST_BROWSER_USE_TERMINAL_SYSTEM_CONFIG_ENV, system_config);
+        let _managed_guard = EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_MANAGED_CONFIG_ENV);
         let _managed_preferences_guard =
-            EnvVarGuard::remove(TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
+            EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
         f()
     }
 
-    fn with_codex_home_and_managed_config<T>(
-        codex_home: &Path,
+    fn with_browser_use_terminal_home_and_managed_config<T>(
+        app_home: &Path,
         managed_config: &Path,
         f: impl FnOnce() -> T,
     ) -> T {
-        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
-        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home);
-        let _system_guard = EnvVarGuard::remove(TEST_CODEX_SYSTEM_CONFIG_ENV);
-        let _managed_guard = EnvVarGuard::set_path(TEST_CODEX_MANAGED_CONFIG_ENV, managed_config);
+        let _lock = BROWSER_USE_TERMINAL_HOME_ENV_LOCK
+            .lock()
+            .expect("Browser Use Terminal home env lock");
+        let _guard = EnvVarGuard::set_path(BROWSER_USE_TERMINAL_HOME_ENV, app_home);
+        let _system_guard = EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_SYSTEM_CONFIG_ENV);
+        let _managed_guard =
+            EnvVarGuard::set_path(TEST_BROWSER_USE_TERMINAL_MANAGED_CONFIG_ENV, managed_config);
         let _managed_preferences_guard =
-            EnvVarGuard::remove(TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
+            EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_BASE64_ENV);
         f()
     }
 
-    fn with_codex_home_and_managed_preferences<T>(
-        codex_home: &Path,
+    fn with_browser_use_terminal_home_and_managed_preferences<T>(
+        app_home: &Path,
         managed_preferences_base64: &str,
         f: impl FnOnce() -> T,
     ) -> T {
-        let _lock = CODEX_HOME_ENV_LOCK.lock().expect("codex home env lock");
-        let _guard = EnvVarGuard::set_path("CODEX_HOME", codex_home);
-        let _system_guard = EnvVarGuard::remove(TEST_CODEX_SYSTEM_CONFIG_ENV);
-        let _managed_guard = EnvVarGuard::remove(TEST_CODEX_MANAGED_CONFIG_ENV);
+        let _lock = BROWSER_USE_TERMINAL_HOME_ENV_LOCK
+            .lock()
+            .expect("Browser Use Terminal home env lock");
+        let _guard = EnvVarGuard::set_path(BROWSER_USE_TERMINAL_HOME_ENV, app_home);
+        let _system_guard = EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_SYSTEM_CONFIG_ENV);
+        let _managed_guard = EnvVarGuard::remove(TEST_BROWSER_USE_TERMINAL_MANAGED_CONFIG_ENV);
         let _managed_preferences_guard = EnvVarGuard::set_str(
-            TEST_CODEX_MANAGED_PREFERENCES_CONFIG_BASE64_ENV,
+            TEST_BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_BASE64_ENV,
             managed_preferences_base64,
         );
         f()
     }
 
-    fn create_empty_codex_home(base: &Path) -> Result<PathBuf> {
-        let codex_home = base.join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
-        Ok(codex_home)
+    fn create_empty_browser_use_terminal_home(base: &Path) -> Result<PathBuf> {
+        let app_home = base.join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
+        Ok(app_home)
     }
 
     fn spawn_models_server(
@@ -21413,13 +21477,13 @@ mod tests {
     }
 
     fn write_corp_responses_provider_config(
-        codex_home: &Path,
+        app_home: &Path,
         base_url: &str,
         api_version: &str,
         static_header: &str,
     ) -> Result<()> {
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 r#"
 model_provider = "corp"
@@ -21639,9 +21703,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_uses_config_inline_instructions_as_base_instructions() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "instructions = \"snapshot instructions\"\n",
         )?;
         let project = temp.path().join("project");
@@ -21649,7 +21713,7 @@ x-env = "CORP_HEADER"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -21669,17 +21733,14 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_uses_config_personality_for_default_base_instructions() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "personality = \"friendly\"\n",
-        )?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join("config.toml"), "personality = \"friendly\"\n")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -21703,13 +21764,13 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_includes_browser_contract_only_for_browser_runs() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -21731,17 +21792,14 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_persists_default_base_instructions_across_config_changes() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "personality = \"friendly\"\n",
-        )?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join("config.toml"), "personality = \"friendly\"\n")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &provider,
@@ -21749,7 +21807,7 @@ x-env = "CORP_HEADER"
                 &project,
                 AgentRunOptions::default(),
             )?;
-            std::fs::write(codex_home.join("config.toml"), "personality = \"none\"\n")?;
+            std::fs::write(app_home.join("config.toml"), "personality = \"none\"\n")?;
             run_existing_session_with_provider(
                 &store,
                 &provider,
@@ -21782,17 +21840,14 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_config_override_temporarily_beats_persisted_base_instructions() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "personality = \"friendly\"\n",
-        )?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join("config.toml"), "personality = \"friendly\"\n")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &provider,
@@ -21801,7 +21856,7 @@ x-env = "CORP_HEADER"
                 AgentRunOptions::default(),
             )?;
             std::fs::write(
-                codex_home.join("config.toml"),
+                app_home.join("config.toml"),
                 "instructions = \"explicit override\"\n",
             )?;
             run_existing_session_with_provider(
@@ -21810,7 +21865,7 @@ x-env = "CORP_HEADER"
                 &session_id,
                 AgentRunOptions::default(),
             )?;
-            std::fs::write(codex_home.join("config.toml"), "")?;
+            std::fs::write(app_home.join("config.toml"), "")?;
             run_existing_session_with_provider(
                 &store,
                 &provider,
@@ -21844,9 +21899,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_runtime_base_instructions_override_matches_codex_precedence() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "instructions = \"config base should lose\"\n",
         )?;
         let project = temp.path().join("project");
@@ -21854,7 +21909,7 @@ x-env = "CORP_HEADER"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &provider,
@@ -21862,7 +21917,7 @@ x-env = "CORP_HEADER"
                 &project,
                 AgentRunOptions::default().with_base_instructions("runtime base"),
             )?;
-            std::fs::write(codex_home.join("config.toml"), "")?;
+            std::fs::write(app_home.join("config.toml"), "")?;
             run_existing_session_with_provider(
                 &store,
                 &provider,
@@ -21903,14 +21958,14 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_injects_model_switch_context_once_before_resumed_user_message() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let old_model = ModelSwitchCapturingProvider::new("gpt-5.2");
         let new_model = ModelSwitchCapturingProvider::new("gpt-5.4");
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &old_model,
@@ -21996,9 +22051,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_clamps_reasoning_effort_on_model_switch_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_reasoning_effort = \"minimal\"\nmodel_reasoning_summary = \"none\"\n",
         )?;
         let project = temp.path().join("project");
@@ -22007,7 +22062,7 @@ x-env = "CORP_HEADER"
         let old_model = ModelSwitchCapturingProvider::new("gpt-5.2");
         let new_model = ModelSwitchCapturingProvider::new("gpt-5.4");
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &old_model,
@@ -22058,17 +22113,14 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_injects_personality_context_once_for_same_model_change() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "personality = \"friendly\"\n",
-        )?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join("config.toml"), "personality = \"friendly\"\n")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &provider,
@@ -22077,7 +22129,7 @@ x-env = "CORP_HEADER"
                 AgentRunOptions::default(),
             )?;
             std::fs::write(
-                codex_home.join("config.toml"),
+                app_home.join("config.toml"),
                 "personality = \"pragmatic\"\n",
             )?;
             let followup = store.append_event(
@@ -22144,17 +22196,14 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_skips_personality_context_for_models_without_model_messages() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "personality = \"friendly\"\n",
-        )?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join("config.toml"), "personality = \"friendly\"\n")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = ModelSwitchCapturingProvider::new("gpt-5.2");
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &provider,
@@ -22163,7 +22212,7 @@ x-env = "CORP_HEADER"
                 AgentRunOptions::default(),
             )?;
             std::fs::write(
-                codex_home.join("config.toml"),
+                app_home.join("config.toml"),
                 "personality = \"pragmatic\"\n",
             )?;
             store.append_event(
@@ -22205,10 +22254,10 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_model_instructions_file_overrides_inline_instructions() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(codex_home.join("instructions.md"), " file instructions \n")?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join("instructions.md"), " file instructions \n")?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "instructions = \"inline instructions\"\nmodel_instructions_file = \"instructions.md\"\n",
         )?;
         let project = temp.path().join("project");
@@ -22216,7 +22265,7 @@ x-env = "CORP_HEADER"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -22237,10 +22286,10 @@ x-env = "CORP_HEADER"
     fn provider_turn_model_instructions_file_beats_higher_layer_inline_instructions() -> Result<()>
     {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(codex_home.join("instructions.md"), "file wins")?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join("instructions.md"), "file wins")?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_instructions_file = \"instructions.md\"\n",
         )?;
         let project = temp.path().join("project");
@@ -22252,7 +22301,7 @@ x-env = "CORP_HEADER"
             toml::Value::String("higher layer inline instructions".to_string()),
         )]);
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -22272,9 +22321,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_managed_instructions_override_session_instructions() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let managed_config = temp.path().join("managed_config.toml");
-        std::fs::write(codex_home.join("config.toml"), "")?;
+        std::fs::write(app_home.join("config.toml"), "")?;
         std::fs::write(&managed_config, "instructions = \"managed base\"\n")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
@@ -22285,7 +22334,7 @@ x-env = "CORP_HEADER"
             toml::Value::String("session base".to_string()),
         )]);
 
-        with_codex_home_and_managed_config(&codex_home, &managed_config, || {
+        with_browser_use_terminal_home_and_managed_config(&app_home, &managed_config, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -22303,32 +22352,32 @@ x-env = "CORP_HEADER"
     }
 
     #[test]
-    fn provider_turn_project_model_instructions_file_resolves_relative_to_dot_codex() -> Result<()>
-    {
+    fn provider_turn_project_model_instructions_file_resolves_relative_to_dot_browser_use(
+    ) -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 project.display()
             ),
         )?;
         std::fs::write(
-            project.join(".codex").join("config.toml"),
+            project.join(".browser-use").join("config.toml"),
             "model_instructions_file = \"instructions.md\"\n",
         )?;
         std::fs::write(
-            project.join(".codex").join("instructions.md"),
+            project.join(".browser-use").join("instructions.md"),
             "project file instructions",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -22348,10 +22397,10 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_rejects_empty_model_instructions_file_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(codex_home.join("empty.md"), "  \n")?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join("empty.md"), "  \n")?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_instructions_file = \"empty.md\"\n",
         )?;
         let project = temp.path().join("project");
@@ -22359,7 +22408,7 @@ x-env = "CORP_HEADER"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        let error = with_codex_home(&codex_home, || {
+        let error = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -22380,9 +22429,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_uses_config_model_request_settings() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_reasoning_effort = \"high\"\nmodel_reasoning_summary = \"detailed\"\nmodel_supports_reasoning_summaries = true\nmodel_verbosity = \"high\"\n",
         )?;
         let project = temp.path().join("project");
@@ -22390,7 +22439,7 @@ x-env = "CORP_HEADER"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -22416,9 +22465,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_uses_model_catalog_json_for_prompt_and_request_metadata() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("catalog.json"),
+            app_home.join("catalog.json"),
             r#"{
   "models": [
     {
@@ -22454,7 +22503,7 @@ x-env = "CORP_HEADER"
 }"#,
         )?;
         std::fs::write(
-	            codex_home.join("config.toml"),
+	            app_home.join("config.toml"),
 	            "model_catalog_json = \"catalog.json\"\nmodel_context_window = 5000\nmodel_auto_compact_token_limit = 2800\ntool_output_token_limit = 77\n",
 	        )?;
         let project = temp.path().join("project");
@@ -22462,7 +22511,7 @@ x-env = "CORP_HEADER"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -22501,9 +22550,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_turn_uses_fresh_models_cache_when_no_catalog_json_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("models_cache.json"),
+            app_home.join("models_cache.json"),
             format!(
                 r#"{{
   "fetched_at": "{}",
@@ -22528,16 +22577,16 @@ x-env = "CORP_HEADER"
   ]
 }}"#,
                 Utc::now().to_rfc3339(),
-                codex_client_version_to_whole()
+                browser_use_terminal_client_version_to_whole()
             ),
         )?;
-        std::fs::write(codex_home.join("config.toml"), "")?;
+        std::fs::write(app_home.join("config.toml"), "")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -22568,7 +22617,7 @@ x-env = "CORP_HEADER"
     #[test]
     fn model_catalog_fetches_remote_models_and_persists_cache_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let remote_body = r#"{
   "models": [
     {
@@ -22593,7 +22642,7 @@ x-env = "CORP_HEADER"
         let session = store.create_session(None, temp.path())?;
         let mut config = AgentsMdConfig::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             refresh_model_catalog_online(
                 &store,
                 &session,
@@ -22619,10 +22668,13 @@ x-env = "CORP_HEADER"
             Some("\"etag-remote\"")
         );
 
-        let cache_path = codex_home.join("models_cache.json");
+        let cache_path = app_home.join("models_cache.json");
         let cache: Value = serde_json::from_str(&std::fs::read_to_string(cache_path)?)?;
         assert_eq!(cache["etag"], "\"etag-remote\"");
-        assert_eq!(cache["client_version"], codex_client_version_to_whole());
+        assert_eq!(
+            cache["client_version"],
+            browser_use_terminal_client_version_to_whole()
+        );
         assert_eq!(cache["models"][0]["slug"], "remote-catalog-model");
         Ok(())
     }
@@ -22630,7 +22682,7 @@ x-env = "CORP_HEADER"
     #[test]
     fn model_catalog_fetches_command_auth_provider_models_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let auth_cwd = temp.path().join("auth-cwd");
         std::fs::create_dir_all(&auth_cwd)?;
         let remote_body = r#"{
@@ -22672,7 +22724,7 @@ x-env = "CORP_HEADER"
             },
         );
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             refresh_model_catalog_online(
                 &store,
                 &session,
@@ -22696,7 +22748,7 @@ x-env = "CORP_HEADER"
             Some("\"etag-command\"")
         );
         let cache: Value = serde_json::from_str(&std::fs::read_to_string(
-            codex_home.join("models_cache.json"),
+            app_home.join("models_cache.json"),
         )?)?;
         assert_eq!(cache["etag"], "\"etag-command\"");
         assert_eq!(cache["models"][0]["slug"], "command-catalog-model");
@@ -22788,9 +22840,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn matching_models_etag_renews_cache_ttl_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("models_cache.json"),
+            app_home.join("models_cache.json"),
             format!(
                 r#"{{
   "fetched_at": "1970-01-01T00:00:00+00:00",
@@ -22798,7 +22850,7 @@ x-env = "CORP_HEADER"
   "etag": "\"etag-match\"",
   "models": []
 }}"#,
-                codex_client_version_to_whole()
+                browser_use_terminal_client_version_to_whole()
             ),
         )?;
         let store = Store::open(temp.path().join("state"))?;
@@ -22806,7 +22858,7 @@ x-env = "CORP_HEADER"
         let mut config = AgentsMdConfig::default();
         config.model_catalog_cache_etag = Some("\"etag-match\"".to_string());
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             refresh_model_catalog_after_models_etag(
                 &store,
                 &session,
@@ -22819,7 +22871,7 @@ x-env = "CORP_HEADER"
         })?;
 
         let cache: Value = serde_json::from_str(&std::fs::read_to_string(
-            codex_home.join("models_cache.json"),
+            app_home.join("models_cache.json"),
         )?)?;
         assert_ne!(
             cache["fetched_at"].as_str(),
@@ -22832,10 +22884,10 @@ x-env = "CORP_HEADER"
     #[test]
     fn provider_models_etag_event_renews_cache_ttl_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let old_fetched_at = (Utc::now() - chrono::Duration::seconds(120)).to_rfc3339();
         std::fs::write(
-            codex_home.join("models_cache.json"),
+            app_home.join("models_cache.json"),
             format!(
                 r#"{{
   "fetched_at": "{old_fetched_at}",
@@ -22843,7 +22895,7 @@ x-env = "CORP_HEADER"
   "etag": "\"etag-event\"",
   "models": []
 }}"#,
-                codex_client_version_to_whole()
+                browser_use_terminal_client_version_to_whole()
             ),
         )?;
         let project = temp.path().join("project");
@@ -22865,12 +22917,12 @@ x-env = "CORP_HEADER"
         ]);
         let options = AgentRunOptions::default().with_model_provider_id("codex");
 
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(&store, &provider, "refresh etag", &project, options)
         })?;
 
         let cache: Value = serde_json::from_str(&std::fs::read_to_string(
-            codex_home.join("models_cache.json"),
+            app_home.join("models_cache.json"),
         )?)?;
         assert_ne!(cache["fetched_at"].as_str(), Some(old_fetched_at.as_str()));
         assert_eq!(cache["etag"], "\"etag-event\"");
@@ -23025,9 +23077,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn model_provider_config_parses_codex_request_shape_fields() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"
 model_provider = "corp"
 
@@ -23058,7 +23110,7 @@ x-missing = "CORP_MISSING_HEADER"
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
 
-        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+        let config = with_browser_use_terminal_home(&app_home, || -> Result<AgentsMdConfig> {
             let _api_key = EnvVarGuard::set_str("CORP_API_KEY", "corp-token");
             let _header = EnvVarGuard::set_str("CORP_HEADER", "present");
             let _missing = EnvVarGuard::remove("CORP_MISSING_HEADER");
@@ -23123,7 +23175,7 @@ x-missing = "CORP_MISSING_HEADER"
     #[test]
     fn custom_model_provider_wire_api_chat_runs_openai_compatible_chat() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let chat_body = serde_json::json!({
             "id": "chatcmpl_corp",
             "choices": [{
@@ -23144,7 +23196,7 @@ x-missing = "CORP_MISSING_HEADER"
         let (base_url, requests, handle) =
             spawn_responses_capture_server_sequence(vec![chat_body], Duration::from_secs(20))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 r#"
 model_provider = "corp"
@@ -23171,7 +23223,7 @@ x-env = "CORP_HEADER"
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let _header = EnvVarGuard::set_str("CORP_HEADER", "chat-env");
             run_agent_from_config(
                 &store,
@@ -23205,9 +23257,9 @@ x-env = "CORP_HEADER"
     #[test]
     fn model_provider_config_parses_command_auth_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"
 [model_providers.corp]
 name = "Corp"
@@ -23224,7 +23276,7 @@ cwd = "auth-cwd"
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
 
-        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+        let config = with_browser_use_terminal_home(&app_home, || -> Result<AgentsMdConfig> {
             let mut warnings = Vec::new();
             load_agents_md_config(&project, &mut warnings, None, &[])
         })?;
@@ -23242,7 +23294,7 @@ cwd = "auth-cwd"
         );
         assert_eq!(auth.timeout_ms, 1234);
         assert_eq!(auth.refresh_interval_ms, 0);
-        assert_eq!(auth.cwd, codex_home.join("auth-cwd"));
+        assert_eq!(auth.cwd, app_home.join("auth-cwd"));
         Ok(())
     }
 
@@ -23434,9 +23486,9 @@ command = "print-token"
     #[test]
     fn plan_mode_uses_codex_medium_reasoning_preset() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_reasoning_effort = \"high\"\n",
         )?;
         let project = temp.path().join("project");
@@ -23444,7 +23496,7 @@ command = "print-token"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -23466,9 +23518,9 @@ command = "print-token"
     #[test]
     fn plan_mode_reasoning_effort_config_overrides_preset_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_reasoning_effort = \"high\"\nplan_mode_reasoning_effort = \"low\"\n",
         )?;
         let project = temp.path().join("project");
@@ -23476,7 +23528,7 @@ command = "print-token"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -23525,13 +23577,13 @@ command = "print-token"
     #[test]
     fn provider_turn_persists_context_baseline_per_real_turn() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &provider,
@@ -23612,9 +23664,9 @@ command = "print-token"
     #[test]
     fn provider_turn_reuses_session_config_snapshot_when_defaults_change() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_reasoning_effort = \"high\"\nmodel_context_window = 12000\nmodel_auto_compact_token_limit = 8000\ntool_output_token_limit = 123\n",
         )?;
         let project = temp.path().join("project");
@@ -23622,7 +23674,7 @@ command = "print-token"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = run_agent_with_provider(
                 &store,
                 &provider,
@@ -23631,7 +23683,7 @@ command = "print-token"
                 AgentRunOptions::default(),
             )?;
             std::fs::write(
-                codex_home.join("config.toml"),
+                app_home.join("config.toml"),
                 "model_reasoning_effort = \"low\"\nmodel_context_window = 5000\nmodel_auto_compact_token_limit = 3000\ntool_output_token_limit = 44\n",
             )?;
             store.append_event(
@@ -23688,9 +23740,9 @@ command = "print-token"
     #[test]
     fn provider_turn_explicit_config_override_beats_session_config_snapshot() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_reasoning_effort = \"high\"\nmodel_context_window = 12000\ntool_output_token_limit = 123\n",
         )?;
         let project = temp.path().join("project");
@@ -23698,7 +23750,7 @@ command = "print-token"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || -> Result<()> {
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
             let session_id = run_agent_with_provider(
                 &store,
                 &provider,
@@ -23748,7 +23800,7 @@ command = "print-token"
     #[test]
     fn provider_resume_reuses_model_provider_info_snapshot_when_config_changes() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let (base_a, requests_a, handle_a) = spawn_responses_capture_server_sequence(
             vec![
                 responses_sse_body("resp-a1", "first done"),
@@ -23760,12 +23812,12 @@ command = "print-token"
             vec![responses_sse_body("resp-b1", "wrong server")],
             Duration::from_millis(400),
         )?;
-        write_corp_responses_provider_config(&codex_home, &base_a, "one", "first-static")?;
+        write_corp_responses_provider_config(&app_home, &base_a, "one", "first-static")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let session_id = {
                 let _header = EnvVarGuard::set_str("CORP_HEADER", "first-env");
                 run_agent_from_config(
@@ -23775,7 +23827,7 @@ command = "print-token"
                     ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5"),
                 )?
             };
-            write_corp_responses_provider_config(&codex_home, &base_b, "two", "second-static")?;
+            write_corp_responses_provider_config(&app_home, &base_b, "two", "second-static")?;
             store.append_event(
                 &session_id,
                 "session.followup",
@@ -23840,7 +23892,7 @@ command = "print-token"
     #[test]
     fn provider_resume_explicit_model_provider_uses_current_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let (base_a, requests_a, handle_a) = spawn_responses_capture_server_sequence(
             vec![responses_sse_body("resp-a1", "first done")],
             Duration::from_secs(20),
@@ -23849,12 +23901,12 @@ command = "print-token"
             vec![responses_sse_body("resp-b1", "second done")],
             Duration::from_secs(20),
         )?;
-        write_corp_responses_provider_config(&codex_home, &base_a, "one", "first-static")?;
+        write_corp_responses_provider_config(&app_home, &base_a, "one", "first-static")?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
 
-        let session_id = with_codex_home(&codex_home, || -> Result<String> {
+        let session_id = with_browser_use_terminal_home(&app_home, || -> Result<String> {
             let _header = EnvVarGuard::set_str("CORP_HEADER", "first-env");
             run_agent_from_config(
                 &store,
@@ -23863,8 +23915,8 @@ command = "print-token"
                 ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5"),
             )
         })?;
-        write_corp_responses_provider_config(&codex_home, &base_b, "two", "second-static")?;
-        with_codex_home(&codex_home, || -> Result<()> {
+        write_corp_responses_provider_config(&app_home, &base_b, "two", "second-static")?;
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
             store.append_event(
                 &session_id,
                 "session.followup",
@@ -23937,9 +23989,9 @@ command = "print-token"
     #[test]
     fn provider_turn_reasoning_summary_support_false_overrides_lower_true() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_supports_reasoning_summaries = true\n",
         )?;
         let project = temp.path().join("project");
@@ -23947,7 +23999,7 @@ command = "print-token"
         let store = Store::open(temp.path().join("state"))?;
         let provider = InstructionCapturingProvider::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -25634,7 +25686,7 @@ command = "print-token"
     #[test]
     fn agents_md_context_uses_project_root_to_cwd_order() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         let nested = project.join("crates").join("demo");
         std::fs::create_dir_all(project.join(".git"))?;
@@ -25642,8 +25694,9 @@ command = "print-token"
         std::fs::write(project.join("AGENTS.md"), "root rule")?;
         std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&nested))
+                .expect("agents context");
         let context = context.content;
 
         assert!(context.starts_with("# AGENTS.md instructions for "));
@@ -25658,7 +25711,7 @@ command = "print-token"
     #[test]
     fn workspace_context_replays_before_task_prompt() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::write(project.join("AGENTS.md"), "Prefer focused tests.")?;
@@ -25670,10 +25723,10 @@ command = "print-token"
             serde_json::json!({"text": "inspect project"}),
         )?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
-        assert!(!with_codex_home(&codex_home, || {
+        assert!(!with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
@@ -25715,7 +25768,7 @@ command = "print-token"
     #[test]
     fn workspace_context_includes_environment_without_agents_md() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
         store.append_event(
@@ -25724,7 +25777,7 @@ command = "print-token"
             serde_json::json!({"text": "inspect environment"}),
         )?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
@@ -25748,15 +25801,15 @@ command = "print-token"
     #[test]
     fn workspace_context_includes_config_developer_instructions() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "developer_instructions = \"Stay focused.\"\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         store.append_event(
@@ -25781,11 +25834,11 @@ command = "print-token"
     #[test]
     fn workspace_context_includes_default_collaboration_mode_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         store.append_event(
@@ -25809,15 +25862,15 @@ command = "print-token"
     fn workspace_context_can_disable_permissions_but_keep_developer_and_collaboration_like_codex(
     ) -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "include_permissions_instructions = false\ndeveloper_instructions = \"Stay focused.\"\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         store.append_event(
@@ -25838,23 +25891,23 @@ command = "print-token"
     #[test]
     fn config_parses_include_permissions_instructions_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "include_permissions_instructions = false\n",
         )?;
 
-        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+        let config = with_browser_use_terminal_home(&app_home, || -> Result<AgentsMdConfig> {
             let mut warnings = Vec::new();
             load_agents_md_config(temp.path(), &mut warnings, None, &[])
         })?;
         assert!(!config.include_permissions_instructions);
 
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "include_permissions_instructions = \"false\"\n",
         )?;
-        let error = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+        let error = with_browser_use_terminal_home(&app_home, || -> Result<AgentsMdConfig> {
             let mut warnings = Vec::new();
             load_agents_md_config(temp.path(), &mut warnings, None, &[])
         })
@@ -25866,12 +25919,12 @@ command = "print-token"
     #[test]
     fn workspace_context_runtime_option_can_disable_permissions_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
         let options = AgentRunOptions::default().with_include_permissions_instructions(false);
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
         store.append_event(
@@ -25890,9 +25943,9 @@ command = "print-token"
     #[test]
     fn compaction_does_not_reinject_suppressed_permissions_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "include_permissions_instructions = false\ninclude_collaboration_mode_instructions = false\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
@@ -25902,7 +25955,7 @@ command = "print-token"
             "session.input",
             serde_json::json!({"text": "inspect project"}),
         )?;
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         let events = store.events_for_session(&session.id)?;
@@ -25931,15 +25984,15 @@ command = "print-token"
     #[test]
     fn workspace_context_can_disable_collaboration_mode_instructions_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "include_collaboration_mode_instructions = false\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         store.append_event(
@@ -25956,11 +26009,11 @@ command = "print-token"
     #[test]
     fn collaboration_mode_update_replays_before_followup_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         store.append_event(
@@ -25976,7 +26029,7 @@ command = "print-token"
         let options =
             AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
@@ -26093,7 +26146,7 @@ command = "print-token"
     #[test]
     fn request_user_input_default_mode_feature_allows_default_mode_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let state_dir = temp.path().join("state");
         let store = Store::open(&state_dir)?;
         let session = store.create_session(None, temp.path())?;
@@ -26101,7 +26154,7 @@ command = "print-token"
             "features.default_mode_request_user_input".to_string(),
             toml::Value::Boolean(true),
         )]);
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
         let session_id = session.id.clone();
@@ -26172,13 +26225,13 @@ command = "print-token"
     #[test]
     fn request_user_input_request_uses_active_turn_id_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let state_dir = temp.path().join("state");
         let store = Store::open(&state_dir)?;
         let session = store.create_session(None, temp.path())?;
         let options =
             AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
         store.append_event(
@@ -26255,13 +26308,13 @@ command = "print-token"
     #[test]
     fn request_user_input_response_prefers_turn_id_over_call_id_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let state_dir = temp.path().join("state");
         let store = Store::open(&state_dir)?;
         let session = store.create_session(None, temp.path())?;
         let options =
             AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
         store.append_event(
@@ -26351,10 +26404,10 @@ command = "print-token"
     #[test]
     fn request_user_input_rejects_default_mode_and_subagents_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let root = store.create_session(None, temp.path())?;
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &root)
         })?);
         let call = ToolCall {
@@ -26395,13 +26448,13 @@ command = "print-token"
     #[test]
     fn request_user_input_waits_for_event_response_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let state_dir = temp.path().join("state");
         let store = Store::open(&state_dir)?;
         let session = store.create_session(None, temp.path())?;
         let options =
             AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
         let session_id = session.id.clone();
@@ -26513,9 +26566,9 @@ command = "print-token"
     #[test]
     fn workspace_context_managed_developer_instructions_override_session() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME),
             "developer_instructions = \"Managed policy.\"\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
@@ -26525,7 +26578,7 @@ command = "print-token"
             toml::Value::String("Session policy should be skipped.".to_string()),
         )]);
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
         store.append_event(
@@ -26544,13 +26597,13 @@ command = "print-token"
     #[test]
     fn workspace_context_runtime_developer_instructions_override_config_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "developer_instructions = \"User config policy should lose.\"\n",
         )?;
         std::fs::write(
-            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME),
             "developer_instructions = \"Managed policy should lose.\"\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
@@ -26558,7 +26611,7 @@ command = "print-token"
         let options =
             AgentRunOptions::default().with_developer_instructions("Runtime policy wins.");
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
         store.append_event(
@@ -26578,17 +26631,17 @@ command = "print-token"
     #[test]
     fn workspace_context_emits_agents_warnings_and_sources_outside_model_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::write(project.join("AGENTS.md"), b"rule before invalid byte \xff")?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, &project)?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
-        assert!(!with_codex_home(&codex_home, || {
+        assert!(!with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         store.append_event(
@@ -26652,28 +26705,28 @@ command = "print-token"
     #[test]
     fn workspace_context_preserves_agents_warnings_without_agents_content() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 project.display()
             ),
         )?;
         std::fs::write(
-            project.join(".codex").join("config.toml"),
+            project.join(".browser-use").join("config.toml"),
             "openai_base_url = \"https://example.test\"\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, &project)?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
-        assert!(!with_codex_home(&codex_home, || {
+        assert!(!with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         store.append_event(
@@ -26711,22 +26764,22 @@ command = "print-token"
     #[test]
     fn workspace_context_rejects_invalid_config_value_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "project_doc_fallback_filenames = \"INSTRUCTIONS.md\"\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        let error = with_codex_home(&codex_home, || {
+        let error = with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })
         .expect_err("invalid config value should fail");
 
         assert!(error
             .to_string()
-            .contains("Invalid Codex config `project_doc_fallback_filenames`"));
+            .contains("Invalid Browser Use Terminal config `project_doc_fallback_filenames`"));
         assert!(!store
             .events_for_session(&session.id)?
             .iter()
@@ -26737,12 +26790,12 @@ command = "print-token"
     #[test]
     fn workspace_context_rejects_invalid_config_profile_name() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
         let options = AgentRunOptions::default().with_config_profile("../work");
 
-        let error = with_codex_home(&codex_home, || {
+        let error = with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })
         .expect_err("invalid profile should fail");
@@ -26756,16 +26809,16 @@ command = "print-token"
     #[test]
     fn workspace_context_rejects_profile_v2_legacy_profile_conflict() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "profile = \"work\"\n[profiles.work]\nmodel = \"gpt-test\"\n",
         )?;
         let options = AgentRunOptions::default().with_config_profile("work");
 
-        let error = with_codex_home(&codex_home, || {
+        let error = with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })
         .expect_err("legacy profile conflict should fail");
@@ -26854,13 +26907,13 @@ command = "print-token"
     #[test]
     fn workspace_context_refreshes_environment_context_for_active_subagents() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let _codex_home = create_empty_codex_home(temp.path())?;
+        let _app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, &project)?;
 
-        with_codex_home(&_codex_home, || {
+        with_browser_use_terminal_home(&_app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
         store.create_child_session(
@@ -26870,7 +26923,7 @@ command = "print-token"
             Some("Newton"),
             Some("explorer"),
         )?;
-        with_codex_home(&_codex_home, || {
+        with_browser_use_terminal_home(&_app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
 
@@ -26889,13 +26942,13 @@ command = "print-token"
     #[test]
     fn workspace_context_omits_later_subagent_only_environment_update_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, &project)?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         store.append_event(
@@ -26916,7 +26969,7 @@ command = "print-token"
             serde_json::json!({"text": "subagent-only refresh"}),
         )?;
 
-        assert!(!with_codex_home(&codex_home, || {
+        assert!(!with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         let environment_events = store
@@ -26934,7 +26987,7 @@ command = "print-token"
     #[test]
     fn workspace_context_ignores_shell_only_environment_refresh_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
@@ -26942,7 +26995,7 @@ command = "print-token"
         let bash_environment = vec![EnvironmentContextEnvironment::new("local", "/repo", "bash")];
         let zsh_environment = vec![EnvironmentContextEnvironment::new("other", "/repo", "zsh")];
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(
                 &store,
                 &session,
@@ -26959,7 +27012,7 @@ command = "print-token"
             "session.followup",
             serde_json::json!({"text": "shell-only refresh"}),
         )?;
-        assert!(!with_codex_home(&codex_home, || {
+        assert!(!with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(
                 &store,
                 &session,
@@ -26987,7 +27040,7 @@ command = "print-token"
     #[test]
     fn workspace_context_refreshes_environment_when_cwd_changes_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
@@ -27003,7 +27056,7 @@ command = "print-token"
             "zsh",
         )];
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(
                 &store,
                 &session,
@@ -27021,7 +27074,7 @@ command = "print-token"
             "session.followup",
             serde_json::json!({"text": "cwd refresh"}),
         )?;
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(
                 &store,
                 &session,
@@ -27066,7 +27119,7 @@ command = "print-token"
     #[test]
     fn workspace_context_update_replays_before_followup_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
@@ -27074,7 +27127,7 @@ command = "print-token"
         let network = EnvironmentNetworkContext::new(vec!["api.example.com".to_string()], vec![]);
 
         let (session_id, followup_seq) =
-            with_codex_home(&codex_home, || -> Result<(String, i64)> {
+            with_browser_use_terminal_home(&app_home, || -> Result<(String, i64)> {
                 let session_id = run_agent_with_provider(
                     &store,
                     &provider,
@@ -27147,13 +27200,13 @@ command = "print-token"
     #[test]
     fn workspace_context_can_disable_environment_context_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let _codex_home = create_empty_codex_home(temp.path())?;
+        let _app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, &project)?;
 
-        with_codex_home(&_codex_home, || {
+        with_browser_use_terminal_home(&_app_home, || {
             append_workspace_context_event_with_options(
                 &store,
                 &session,
@@ -27174,9 +27227,9 @@ command = "print-token"
     #[test]
     fn workspace_context_honors_config_include_environment_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "include_environment_context = false\n",
         )?;
         let project = temp.path().join("project");
@@ -27184,7 +27237,7 @@ command = "print-token"
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, &project)?;
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
 
@@ -27201,19 +27254,17 @@ command = "print-token"
     #[test]
     fn agents_md_context_prefers_override_and_records_global_sources() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::write(
-            codex_home.join("AGENTS.override.md"),
-            "  global override  \n",
-        )?;
-        std::fs::write(codex_home.join("AGENTS.md"), "global default")?;
+        std::fs::write(app_home.join("AGENTS.override.md"), "  global override  \n")?;
+        std::fs::write(app_home.join("AGENTS.md"), "global default")?;
         std::fs::write(project.join("AGENTS.override.md"), "project override")?;
         std::fs::write(project.join("AGENTS.md"), "project default")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context.content.contains("global override"));
         assert!(!context.content.contains("  global override"));
@@ -27222,7 +27273,10 @@ command = "print-token"
         assert!(!context.content.contains("global default"));
         assert!(!context.content.contains("project default"));
         assert!(context.sources.iter().any(|source| {
-            source.ends_with(&format!("{}/{}", "codex-home", LOCAL_AGENTS_MD_FILENAME))
+            source.ends_with(&format!(
+                "{}/{}",
+                "browser-use-terminal-home", LOCAL_AGENTS_MD_FILENAME
+            ))
         }));
         assert!(context.sources.iter().any(|source| {
             source.ends_with(&format!("{}/{}", "project", LOCAL_AGENTS_MD_FILENAME))
@@ -27233,20 +27287,21 @@ command = "print-token"
     #[test]
     fn agents_md_context_uses_configured_fallback_filenames() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         let nested = project.join("nested");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::create_dir_all(&nested)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "project_doc_fallback_filenames = [\"INSTRUCTIONS.md\"]\n",
         )?;
         std::fs::write(project.join("INSTRUCTIONS.md"), "fallback root rule")?;
         std::fs::write(nested.join("INSTRUCTIONS.md"), "fallback nested rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&nested))
+                .expect("agents context");
 
         let root_pos = context
             .content
@@ -27271,7 +27326,7 @@ command = "print-token"
     #[test]
     fn agents_md_context_uses_system_config_without_user_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let system_config = temp.path().join("system-config.toml");
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
@@ -27281,10 +27336,11 @@ command = "print-token"
         )?;
         std::fs::write(project.join("SYSTEM.md"), "system configured rule")?;
 
-        let context = with_codex_home_and_system_config(&codex_home, &system_config, || {
-            agents_md_context_for_cwd(&project)
-        })
-        .expect("agents context");
+        let context =
+            with_browser_use_terminal_home_and_system_config(&app_home, &system_config, || {
+                agents_md_context_for_cwd(&project)
+            })
+            .expect("agents context");
 
         assert!(context.content.contains("system configured rule"));
         assert!(context
@@ -27297,7 +27353,7 @@ command = "print-token"
     #[test]
     fn agents_md_context_user_config_overrides_system_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let system_config = temp.path().join("system-config.toml");
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
@@ -27306,16 +27362,17 @@ command = "print-token"
             "project_doc_fallback_filenames = [\"SYSTEM.md\"]\n",
         )?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "project_doc_fallback_filenames = [\"USER.md\"]\n",
         )?;
         std::fs::write(project.join("SYSTEM.md"), "system rule should be skipped")?;
         std::fs::write(project.join("USER.md"), "user configured rule")?;
 
-        let context = with_codex_home_and_system_config(&codex_home, &system_config, || {
-            agents_md_context_for_cwd(&project)
-        })
-        .expect("agents context");
+        let context =
+            with_browser_use_terminal_home_and_system_config(&app_home, &system_config, || {
+                agents_md_context_for_cwd(&project)
+            })
+            .expect("agents context");
 
         assert!(context.content.contains("user configured rule"));
         assert!(!context.content.contains("system rule should be skipped"));
@@ -27333,21 +27390,21 @@ command = "print-token"
     #[test]
     fn agents_md_context_uses_profile_v2_config_layer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "project_doc_fallback_filenames = [\"USER.md\"]\n",
         )?;
         std::fs::write(
-            codex_home.join("work.config.toml"),
+            app_home.join("work.config.toml"),
             "project_doc_fallback_filenames = [\"PROFILE.md\"]\nproject_doc_max_bytes = 7\n",
         )?;
         std::fs::write(project.join("USER.md"), "user rule should be skipped")?;
         std::fs::write(project.join("PROFILE.md"), "profile instructions")?;
 
-        let context = with_codex_home(&codex_home, || {
+        let context = with_browser_use_terminal_home(&app_home, || {
             agents_md_context_for_cwd_with_options(&project, Some("work"), &[])
         })?
         .expect("agents context");
@@ -27367,25 +27424,25 @@ command = "print-token"
     #[test]
     fn agents_md_context_profile_v2_participates_in_project_trust() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
-        std::fs::write(codex_home.join("config.toml"), "")?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
+        std::fs::write(app_home.join("config.toml"), "")?;
         std::fs::write(
-            codex_home.join("work.config.toml"),
+            app_home.join("work.config.toml"),
             format!(
                 "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 project.display()
             ),
         )?;
         std::fs::write(
-            project.join(".codex").join("config.toml"),
+            project.join(".browser-use").join("config.toml"),
             "project_doc_fallback_filenames = [\"PROJECT.md\"]\n",
         )?;
         std::fs::write(project.join("PROJECT.md"), "trusted through profile")?;
 
-        let context = with_codex_home(&codex_home, || {
+        let context = with_browser_use_terminal_home(&app_home, || {
             agents_md_context_for_cwd_with_options(&project, Some("work"), &[])
         })?
         .expect("agents context");
@@ -27401,19 +27458,19 @@ command = "print-token"
     #[test]
     fn agents_md_context_session_overrides_apply_above_project_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 project.display()
             ),
         )?;
         std::fs::write(
-            project.join(".codex").join("config.toml"),
+            project.join(".browser-use").join("config.toml"),
             "project_doc_fallback_filenames = [\"PROJECT.md\"]\nproject_doc_max_bytes = 32\n",
         )?;
         std::fs::write(project.join("PROJECT.md"), "project rule should be skipped")?;
@@ -27426,7 +27483,7 @@ command = "print-token"
             ("project_doc_max_bytes".to_string(), toml::Value::Integer(7)),
         ];
 
-        let context = with_codex_home(&codex_home, || {
+        let context = with_browser_use_terminal_home(&app_home, || {
             agents_md_context_for_cwd_with_options(&project, None, &overrides)
         })?
         .expect("agents context");
@@ -27446,17 +27503,15 @@ command = "print-token"
     #[test]
     fn agents_md_context_uses_configured_project_doc_max_bytes() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "project_doc_max_bytes = 4\n",
-        )?;
+        std::fs::write(app_home.join("config.toml"), "project_doc_max_bytes = 4\n")?;
         std::fs::write(project.join("AGENTS.md"), "abcdef")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context
             .content
@@ -27468,25 +27523,26 @@ command = "print-token"
     #[test]
     fn agents_md_context_uses_trusted_project_config_layer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 project.display()
             ),
         )?;
         std::fs::write(
-            project.join(".codex").join("config.toml"),
+            project.join(".browser-use").join("config.toml"),
             "project_doc_fallback_filenames = [\"INSTRUCTIONS.md\"]\nproject_doc_max_bytes = 7\n",
         )?;
         std::fs::write(project.join("INSTRUCTIONS.md"), "project instructions")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context
             .content
@@ -27502,20 +27558,21 @@ command = "print-token"
     #[test]
     fn agents_md_context_ignores_untrusted_project_config_layer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
-        std::fs::write(codex_home.join("config.toml"), "")?;
-        std::fs::write(codex_home.join("AGENTS.md"), "global rule")?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
+        std::fs::write(app_home.join("config.toml"), "")?;
+        std::fs::write(app_home.join("AGENTS.md"), "global rule")?;
         std::fs::write(
-            project.join(".codex").join("config.toml"),
+            project.join(".browser-use").join("config.toml"),
             "project_doc_fallback_filenames = [\"INSTRUCTIONS.md\"]\n",
         )?;
         std::fs::write(project.join("INSTRUCTIONS.md"), "untrusted project rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context.content.contains("global rule"));
         assert!(!context.content.contains("untrusted project rule"));
@@ -27526,17 +27583,21 @@ command = "print-token"
     #[test]
     fn agents_md_context_ignores_untrusted_project_config_parse_errors() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
-        std::fs::write(codex_home.join("config.toml"), "")?;
-        std::fs::write(codex_home.join("AGENTS.md"), "global rule")?;
-        std::fs::write(project.join(".codex").join("config.toml"), "not = [toml")?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
+        std::fs::write(app_home.join("config.toml"), "")?;
+        std::fs::write(app_home.join("AGENTS.md"), "global rule")?;
+        std::fs::write(
+            project.join(".browser-use").join("config.toml"),
+            "not = [toml",
+        )?;
         std::fs::write(project.join("AGENTS.md"), "project rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context.content.contains("global rule"));
         assert!(context.content.contains("project rule"));
@@ -27546,20 +27607,23 @@ command = "print-token"
     #[test]
     fn agents_md_context_rejects_trusted_project_config_parse_errors() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 project.display()
             ),
         )?;
-        std::fs::write(project.join(".codex").join("config.toml"), "not = [toml")?;
+        std::fs::write(
+            project.join(".browser-use").join("config.toml"),
+            "not = [toml",
+        )?;
 
-        let error = with_codex_home(&codex_home, || {
+        let error = with_browser_use_terminal_home(&app_home, || {
             load_agents_md_context_for_cwd_with_options(&project, None, &[])
         })
         .expect_err("trusted malformed project config should fail");
@@ -27573,28 +27637,29 @@ command = "print-token"
     #[test]
     fn agents_md_context_ignores_project_config_root_markers() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         let nested = project.join("nested");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
         std::fs::create_dir_all(&nested)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 "[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 project.display()
             ),
         )?;
         std::fs::write(
-            project.join(".codex").join("config.toml"),
+            project.join(".browser-use").join("config.toml"),
             "project_root_markers = []\n",
         )?;
         std::fs::write(project.join("AGENTS.md"), "root rule")?;
         std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&nested))
+                .expect("agents context");
 
         let root_pos = context.content.find("root rule").expect("root rule");
         let nested_pos = context.content.find("nested rule").expect("nested rule");
@@ -27605,31 +27670,32 @@ command = "print-token"
     #[test]
     fn agents_md_context_managed_config_overrides_project_config_layer() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::create_dir_all(project.join(".codex"))?;
+        std::fs::create_dir_all(project.join(".browser-use"))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             format!(
                 "project_doc_fallback_filenames = [\"USER.md\"]\n[projects.\"{}\"]\ntrust_level = \"trusted\"\n",
                 project.display()
             ),
         )?;
         std::fs::write(
-            project.join(".codex").join("config.toml"),
+            project.join(".browser-use").join("config.toml"),
             "project_doc_fallback_filenames = [\"PROJECT.md\"]\nproject_doc_max_bytes = 20\n",
         )?;
         std::fs::write(
-            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME),
             "project_doc_fallback_filenames = [\"MANAGED.md\"]\nproject_doc_max_bytes = 7\n",
         )?;
         std::fs::write(project.join("USER.md"), "user rule should be skipped")?;
         std::fs::write(project.join("PROJECT.md"), "project rule should be skipped")?;
         std::fs::write(project.join("MANAGED.md"), "managed instructions")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context
             .content
@@ -27647,18 +27713,16 @@ command = "print-token"
     #[test]
     fn agents_md_context_zero_project_doc_max_bytes_keeps_global_only() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "project_doc_max_bytes = 0\n",
-        )?;
-        std::fs::write(codex_home.join("AGENTS.md"), "global rule")?;
+        std::fs::write(app_home.join("config.toml"), "project_doc_max_bytes = 0\n")?;
+        std::fs::write(app_home.join("AGENTS.md"), "global rule")?;
         std::fs::write(project.join("AGENTS.md"), "project rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context.content.contains("global rule"));
         assert!(!context.content.contains("project rule"));
@@ -27666,7 +27730,7 @@ command = "print-token"
         assert!(context
             .sources
             .iter()
-            .any(|source| source.ends_with("codex-home/AGENTS.md")));
+            .any(|source| source.ends_with("browser-use-terminal-home/AGENTS.md")));
         assert!(!context
             .sources
             .iter()
@@ -27678,19 +27742,20 @@ command = "print-token"
     #[test]
     fn agents_md_context_project_metadata_error_drops_project_docs() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "project_doc_fallback_filenames = [\"INSTRUCTIONS.md\"]\n",
         )?;
-        std::fs::write(codex_home.join("AGENTS.md"), "global rule")?;
+        std::fs::write(app_home.join("AGENTS.md"), "global rule")?;
         std::os::unix::fs::symlink("AGENTS.md", project.join("AGENTS.md"))?;
         std::fs::write(project.join("INSTRUCTIONS.md"), "fallback project rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context.content.contains("global rule"));
         assert!(!context.content.contains("fallback project rule"));
@@ -27705,20 +27770,21 @@ command = "print-token"
     #[test]
     fn agents_md_context_uses_configured_project_root_markers() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         let nested = project.join("nested");
         std::fs::create_dir_all(&nested)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "project_root_markers = [\"WORKSPACE\"]\n",
         )?;
         std::fs::write(project.join("WORKSPACE"), "")?;
         std::fs::write(project.join("AGENTS.md"), "workspace root rule")?;
         std::fs::write(nested.join("AGENTS.md"), "workspace nested rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&nested))
+                .expect("agents context");
 
         let root_pos = context
             .content
@@ -27735,24 +27801,22 @@ command = "print-token"
     #[test]
     fn agents_md_context_managed_config_root_markers_override_user_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         let nested = project.join("nested");
         std::fs::create_dir_all(&nested)?;
+        std::fs::write(app_home.join("config.toml"), "project_root_markers = []\n")?;
         std::fs::write(
-            codex_home.join("config.toml"),
-            "project_root_markers = []\n",
-        )?;
-        std::fs::write(
-            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME),
             "project_root_markers = [\"WORKSPACE\"]\n",
         )?;
         std::fs::write(project.join("WORKSPACE"), "")?;
         std::fs::write(project.join("AGENTS.md"), "managed root marker rule")?;
         std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&nested))
+                .expect("agents context");
 
         let root_pos = context
             .content
@@ -27766,23 +27830,20 @@ command = "print-token"
     #[test]
     fn agents_md_context_profile_v2_root_markers_override_user_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         let nested = project.join("nested");
         std::fs::create_dir_all(&nested)?;
+        std::fs::write(app_home.join("config.toml"), "project_root_markers = []\n")?;
         std::fs::write(
-            codex_home.join("config.toml"),
-            "project_root_markers = []\n",
-        )?;
-        std::fs::write(
-            codex_home.join("work.config.toml"),
+            app_home.join("work.config.toml"),
             "project_root_markers = [\"WORKSPACE\"]\n",
         )?;
         std::fs::write(project.join("WORKSPACE"), "")?;
         std::fs::write(project.join("AGENTS.md"), "profile root marker rule")?;
         std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
 
-        let context = with_codex_home(&codex_home, || {
+        let context = with_browser_use_terminal_home(&app_home, || {
             agents_md_context_for_cwd_with_options(&nested, Some("work"), &[])
         })?
         .expect("agents context");
@@ -27799,14 +27860,11 @@ command = "print-token"
     #[test]
     fn agents_md_context_session_root_markers_participate_before_project_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         let nested = project.join("nested");
         std::fs::create_dir_all(&nested)?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "project_root_markers = []\n",
-        )?;
+        std::fs::write(app_home.join("config.toml"), "project_root_markers = []\n")?;
         std::fs::write(project.join("WORKSPACE"), "")?;
         std::fs::write(project.join("AGENTS.md"), "session root marker rule")?;
         std::fs::write(nested.join("AGENTS.md"), "nested rule")?;
@@ -27815,7 +27873,7 @@ command = "print-token"
             toml::Value::Array(vec![toml::Value::String("WORKSPACE".to_string())]),
         )];
 
-        let context = with_codex_home(&codex_home, || {
+        let context = with_browser_use_terminal_home(&app_home, || {
             agents_md_context_for_cwd_with_options(&nested, None, &overrides)
         })?
         .expect("agents context");
@@ -27832,13 +27890,13 @@ command = "print-token"
     #[test]
     fn agents_md_context_managed_config_overrides_session_overrides() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::write(project.join("SESSION.md"), "session rule should be skipped")?;
         std::fs::write(project.join("MANAGED.md"), "managed rule")?;
         std::fs::write(
-            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME),
             "project_doc_fallback_filenames = [\"MANAGED.md\"]\n",
         )?;
         let overrides = vec![(
@@ -27846,7 +27904,7 @@ command = "print-token"
             toml::Value::Array(vec![toml::Value::String("SESSION.md".to_string())]),
         )];
 
-        let context = with_codex_home(&codex_home, || {
+        let context = with_browser_use_terminal_home(&app_home, || {
             agents_md_context_for_cwd_with_options(&project, None, &overrides)
         })?
         .expect("agents context");
@@ -27863,17 +27921,17 @@ command = "print-token"
     #[test]
     fn agents_md_context_managed_config_path_override_is_used() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let managed_config = temp.path().join("etc-codex-managed_config.toml");
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::write(
             project.join("HOME.md"),
-            "codex-home managed rule should be skipped",
+            "browser-use-terminal-home managed rule should be skipped",
         )?;
         std::fs::write(project.join("SYSTEM.md"), "system managed rule")?;
         std::fs::write(
-            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME),
             "project_doc_fallback_filenames = [\"HOME.md\"]\n",
         )?;
         std::fs::write(
@@ -27881,15 +27939,16 @@ command = "print-token"
             "project_doc_fallback_filenames = [\"SYSTEM.md\"]\n",
         )?;
 
-        let context = with_codex_home_and_managed_config(&codex_home, &managed_config, || {
-            agents_md_context_for_cwd(&project)
-        })
-        .expect("agents context");
+        let context =
+            with_browser_use_terminal_home_and_managed_config(&app_home, &managed_config, || {
+                agents_md_context_for_cwd(&project)
+            })
+            .expect("agents context");
 
         assert!(context.content.contains("system managed rule"));
         assert!(!context
             .content
-            .contains("codex-home managed rule should be skipped"));
+            .contains("browser-use-terminal-home managed rule should be skipped"));
         assert!(context
             .sources
             .iter()
@@ -27900,7 +27959,7 @@ command = "print-token"
     #[test]
     fn agents_md_context_managed_preferences_override_managed_config() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::write(
@@ -27909,16 +27968,17 @@ command = "print-token"
         )?;
         std::fs::write(project.join("MDM.md"), "mdm managed rule")?;
         std::fs::write(
-            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME),
             "project_doc_fallback_filenames = [\"FILE.md\"]\n",
         )?;
         let encoded =
             general_purpose::STANDARD.encode("project_doc_fallback_filenames = [\"MDM.md\"]\n");
 
-        let context = with_codex_home_and_managed_preferences(&codex_home, &encoded, || {
-            agents_md_context_for_cwd(&project)
-        })
-        .expect("agents context");
+        let context =
+            with_browser_use_terminal_home_and_managed_preferences(&app_home, &encoded, || {
+                agents_md_context_for_cwd(&project)
+            })
+            .expect("agents context");
 
         assert!(context.content.contains("mdm managed rule"));
         assert!(!context
@@ -27934,17 +27994,18 @@ command = "print-token"
     #[test]
     fn agents_md_context_managed_preferences_invalid_base64_fails() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
 
-        let error = with_codex_home_and_managed_preferences(&codex_home, "not base64", || {
-            load_agents_md_context_for_cwd_with_options(&project, None, &[])
-        })
-        .expect_err("invalid managed preferences should fail");
+        let error =
+            with_browser_use_terminal_home_and_managed_preferences(&app_home, "not base64", || {
+                load_agents_md_context_for_cwd_with_options(&project, None, &[])
+            })
+            .expect_err("invalid managed preferences should fail");
 
         assert!(error.to_string().contains(
-            "Failed to decode Codex managed preferences `com.openai.codex:config_toml_base64`"
+            "Failed to decode Browser Use Terminal managed preferences `com.browseruse.terminal:config_toml_base64`"
         ));
         Ok(())
     }
@@ -27952,7 +28013,7 @@ command = "print-token"
     #[test]
     fn thread_config_overrides_request_provider_and_features_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
         let request_overrides = vec![
@@ -27999,7 +28060,7 @@ request_max_retries = 7
             .with_session_thread_config(thread_config);
 
         let (config, headers, specs, hosted_tools) =
-            with_codex_home(&codex_home, || -> Result<_> {
+            with_browser_use_terminal_home(&app_home, || -> Result<_> {
                 let config = load_provider_config_for_session(&session, &options)?;
                 let headers = codex_responses_extra_headers(&store, &session, &options, None)?;
                 let specs = browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)?;
@@ -28047,7 +28108,7 @@ request_max_retries = 7
     #[test]
     fn shell_feature_gates_select_codex_shell_family() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
@@ -28055,7 +28116,7 @@ request_max_retries = 7
             "features.shell_tool".to_string(),
             toml::Value::Boolean(false),
         )]);
-        let disabled_specs = with_codex_home(&codex_home, || {
+        let disabled_specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &disabled, "gpt-5.5", true)
         })?;
         assert!(!disabled_specs.iter().any(|spec| {
@@ -28069,14 +28130,14 @@ request_max_retries = 7
             "features.unified_exec".to_string(),
             toml::Value::Boolean(false),
         )]);
-        let legacy_specs = with_codex_home(&codex_home, || {
+        let legacy_specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &legacy, "gpt-5.5", true)
         })?;
         assert!(legacy_specs.iter().any(|spec| spec.name == "shell_command"));
         assert!(!legacy_specs.iter().any(|spec| spec.name == "exec_command"));
         assert!(!legacy_specs.iter().any(|spec| spec.name == "write_stdin"));
 
-        let default_registry = with_codex_home(&codex_home, || {
+        let default_registry = with_browser_use_terminal_home(&app_home, || {
             browser_tool_registry_for_session(
                 &session,
                 &AgentRunOptions::default(),
@@ -28088,7 +28149,7 @@ request_max_retries = 7
             default_registry.handler_for("shell_command"),
             Some(ToolHandlerKind::ShellCommand)
         );
-        let default_specs = with_codex_home(&codex_home, || {
+        let default_specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
         assert!(default_specs.iter().any(|spec| spec.name == "exec_command"));
@@ -28100,7 +28161,7 @@ request_max_retries = 7
             "allow_login_shell".to_string(),
             toml::Value::Boolean(false),
         )]);
-        let login_disabled_specs = with_codex_home(&codex_home, || {
+        let login_disabled_specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &login_disabled, "gpt-5.5", true)
         })?;
         let exec = login_disabled_specs
@@ -28116,7 +28177,7 @@ request_max_retries = 7
             ),
             ("allow_login_shell".to_string(), toml::Value::Boolean(false)),
         ]);
-        let legacy_login_disabled_specs = with_codex_home(&codex_home, || {
+        let legacy_login_disabled_specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &legacy_login_disabled, "gpt-5.5", true)
         })?;
         let shell = legacy_login_disabled_specs
@@ -28130,7 +28191,7 @@ request_max_retries = 7
     #[test]
     fn goals_feature_gate_hides_goal_tools_like_review_mode() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
@@ -28138,7 +28199,7 @@ request_max_retries = 7
             "features.goals".to_string(),
             toml::Value::Boolean(false),
         )]);
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &options, "gpt-5.5", true)
         })?;
 
@@ -28153,7 +28214,7 @@ request_max_retries = 7
     #[test]
     fn shell_parallel_support_uses_visible_handler_capability_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
         let exec_call = ToolCall {
@@ -28175,7 +28236,7 @@ request_max_retries = 7
             arguments: serde_json::json!({"query": "subagent tools", "limit": 3}),
         };
 
-        let default_registry = with_codex_home(&codex_home, || {
+        let default_registry = with_browser_use_terminal_home(&app_home, || {
             browser_tool_registry_for_session(
                 &session,
                 &AgentRunOptions::default(),
@@ -28197,7 +28258,7 @@ request_max_retries = 7
             "features.unified_exec".to_string(),
             toml::Value::Boolean(false),
         )]);
-        let legacy_registry = with_codex_home(&codex_home, || {
+        let legacy_registry = with_browser_use_terminal_home(&app_home, || {
             browser_tool_registry_for_session(&session, &legacy, "gpt-5.5", true)
         })?;
         assert!(tool_call_supports_parallel(&legacy_registry, &shell_call));
@@ -28207,11 +28268,11 @@ request_max_retries = 7
     #[test]
     fn hosted_tools_use_codex_config_model_and_provider_gates() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        let hosted = with_codex_home(&codex_home, || {
+        let hosted = with_browser_use_terminal_home(&app_home, || {
             hosted_tool_specs_for_session(
                 &session,
                 &AgentRunOptions::default(),
@@ -28241,7 +28302,7 @@ request_max_retries = 7
                 toml::Value::Boolean(false),
             ),
         ]);
-        let disabled = with_codex_home(&codex_home, || {
+        let disabled = with_browser_use_terminal_home(&app_home, || {
             hosted_tool_specs_for_session(&session, &options, "gpt-5.5", true, true)
         })?;
         assert!(disabled.is_empty());
@@ -28303,9 +28364,9 @@ request_max_retries = 7
     #[test]
     fn allowed_web_search_modes_constrain_hosted_tool_like_codex_requirements() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             r#"
 allowed_web_search_modes = ["cached"]
 web_search = "live"
@@ -28313,7 +28374,7 @@ web_search = "live"
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        let hosted = with_codex_home(&codex_home, || {
+        let hosted = with_browser_use_terminal_home(&app_home, || {
             hosted_tool_specs_for_session(
                 &session,
                 &AgentRunOptions::default(),
@@ -28376,9 +28437,9 @@ web_search = "live"
     #[test]
     fn thread_config_loses_to_managed_config_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_MANAGED_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_MANAGED_CONFIG_FILENAME),
             r#"
 model_provider = "managed"
 
@@ -28402,7 +28463,7 @@ name = "Thread"
 "#
         .parse()?;
 
-        let config = with_codex_home(&codex_home, || -> Result<AgentsMdConfig> {
+        let config = with_browser_use_terminal_home(&app_home, || -> Result<AgentsMdConfig> {
             let mut warnings = Vec::new();
             load_agents_md_config_with_thread_config(
                 temp.path(),
@@ -28426,20 +28487,18 @@ name = "Thread"
     #[test]
     fn agents_md_context_empty_project_root_markers_disable_parent_traversal() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         let nested = project.join("nested");
         std::fs::create_dir_all(project.join(".git"))?;
         std::fs::create_dir_all(&nested)?;
-        std::fs::write(
-            codex_home.join("config.toml"),
-            "project_root_markers = []\n",
-        )?;
+        std::fs::write(app_home.join("config.toml"), "project_root_markers = []\n")?;
         std::fs::write(project.join("AGENTS.md"), "root rule should be skipped")?;
         std::fs::write(nested.join("AGENTS.md"), "nested only rule")?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&nested))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&nested))
+                .expect("agents context");
 
         assert!(context.content.contains("nested only rule"));
         assert!(!context.content.contains("root rule should be skipped"));
@@ -28449,15 +28508,16 @@ name = "Thread"
     #[test]
     fn agents_md_context_warns_for_invalid_utf8_but_not_truncation() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let mut data = vec![b'a'; AGENTS_MD_MAX_BYTES + 8];
         data[0] = 0xff;
         std::fs::write(project.join("AGENTS.md"), data)?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(context.content.contains('\u{fffd}'));
         assert!(!context
@@ -28474,15 +28534,16 @@ name = "Thread"
     #[test]
     fn agents_md_context_warns_about_invalid_utf8_past_truncation() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let project = temp.path().join("project");
         std::fs::create_dir_all(project.join(".git"))?;
         let mut data = vec![b'a'; AGENTS_MD_MAX_BYTES + 8];
         data[AGENTS_MD_MAX_BYTES + 4] = 0xff;
         std::fs::write(project.join("AGENTS.md"), data)?;
 
-        let context = with_codex_home(&codex_home, || agents_md_context_for_cwd(&project))
-            .expect("agents context");
+        let context =
+            with_browser_use_terminal_home(&app_home, || agents_md_context_for_cwd(&project))
+                .expect("agents context");
 
         assert!(!context.content.contains('\u{fffd}'));
         assert!(context
@@ -30261,10 +30322,10 @@ name = "Thread"
     #[test]
     fn provider_can_use_exec_command_tool() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let provider = ExecToolOutputInspectingProvider::default();
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -30813,7 +30874,7 @@ name = "Thread"
     #[test]
     fn legacy_hidden_file_tools_still_dispatch_for_old_sessions() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let patch = r#"*** Begin Patch
 *** Add File: note.txt
@@ -30877,7 +30938,7 @@ name = "Thread"
                 ModelEvent::Done,
             ],
         ]);
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -30976,9 +31037,9 @@ name = "Thread"
     #[test]
     fn pre_tool_use_command_hook_can_update_input_and_add_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"[[hooks.PreToolUse]]
 matcher = "^Bash$"
 
@@ -30989,7 +31050,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = HookUpdatingProvider::default();
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -31011,9 +31072,9 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PreToolUse\
     #[test]
     fn pre_tool_use_exit_code_two_blocks_tool_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"[[hooks.PreToolUse]]
 matcher = "^Bash$"
 
@@ -31024,7 +31085,7 @@ command = "printf blocked-by-hook >&2; exit 2"
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = HookBlockingProvider::default();
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -31061,9 +31122,9 @@ command = "printf blocked-by-hook >&2; exit 2"
     #[test]
     fn post_tool_use_feedback_replaces_model_visible_tool_output_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"[[hooks.PostToolUse]]
 matcher = "Bash"
 
@@ -31074,7 +31135,7 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = PostToolFeedbackProvider::default();
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -31166,9 +31227,9 @@ command = "printf '%s' '{\"decision\":\"block\",\"reason\":\"post hook replaceme
     #[test]
     fn compact_hooks_run_around_model_compaction() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"[[hooks.PreCompact]]
 matcher = "^auto$"
 
@@ -31191,7 +31252,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             model_compaction_enabled: true,
             ..AgentRunOptions::default()
         };
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -31451,12 +31512,12 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn update_plan_rejects_plan_mode_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
         let options =
             AgentRunOptions::default().with_collaboration_mode(CollaborationModeKind::Plan);
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?);
 
@@ -31604,7 +31665,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn compaction_rebuilds_codex_style_summary_history_without_tool_calls() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         store.append_event(
@@ -31612,7 +31673,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             "session.input",
             serde_json::json!({ "text": "compact with pending call" }),
         )?;
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         let mut messages = vec![
@@ -31808,7 +31869,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn server_model_mismatch_records_reroute_warning_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = ScriptedProvider::new(vec![vec![
             ModelEvent::ServerModel {
@@ -31820,7 +31881,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             ModelEvent::Done,
         ]]);
 
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -31912,7 +31973,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn compaction_drops_recent_tool_result_from_replacement_history() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         store.append_event(
@@ -31920,7 +31981,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             "session.input",
             serde_json::json!({ "text": "compact after tool" }),
         )?;
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         let mut messages = vec![
@@ -32405,7 +32466,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn active_goal_assistant_text_requests_continuation_until_goal_update() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
         append_workspace_context_event(&store, &session)?;
@@ -32455,7 +32516,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
         let session_id = session.id.clone();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_loaded_session_with_provider(
                 &store,
                 &provider,
@@ -32483,8 +32544,8 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn available_skills_inventory_is_injected_with_workspace_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        let skill_dir = codex_home.join("skills").join("Docs");
+        let app_home = temp.path().join("browser-use-terminal-home");
+        let skill_dir = app_home.join("skills").join("Docs");
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(
             skill_dir.join("SKILL.md"),
@@ -32492,7 +32553,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
@@ -32510,7 +32571,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn available_skills_inventory_includes_project_scoped_skills() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let skill_dir = temp.path().join(".agents").join("skills").join("RepoDocs");
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(
@@ -32519,7 +32580,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
 
@@ -32538,10 +32599,10 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
     #[test]
     fn skills_config_roots_and_disable_rules_match_codex_shape() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"
 [skills.bundled]
 enabled = false
@@ -32551,19 +32612,19 @@ name = "HiddenSkill"
 enabled = false
 "#,
         )?;
-        let user_skill = codex_home.join(".agents").join("skills").join("UserDocs");
+        let user_skill = app_home.join(".agents").join("skills").join("UserDocs");
         std::fs::create_dir_all(&user_skill)?;
         std::fs::write(
             user_skill.join("SKILL.md"),
             "---\nname: custom-user-docs\nmetadata:\n  short-description: Use for user docs.\n---\nBody.\n",
         )?;
-        let hidden_skill = codex_home.join("skills").join("HiddenSkill");
+        let hidden_skill = app_home.join("skills").join("HiddenSkill");
         std::fs::create_dir_all(&hidden_skill)?;
         std::fs::write(
             hidden_skill.join("SKILL.md"),
             "---\ndescription: This should be disabled by name.\n---\n",
         )?;
-        let bundled_skill = codex_home.join("skills").join(".system").join("Bundled");
+        let bundled_skill = app_home.join("skills").join(".system").join("Bundled");
         std::fs::create_dir_all(&bundled_skill)?;
         std::fs::write(
             bundled_skill.join("SKILL.md"),
@@ -32572,7 +32633,7 @@ enabled = false
 
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
 
@@ -32592,16 +32653,18 @@ enabled = false
     #[test]
     fn plugin_skills_are_prefixed_and_use_openai_yaml_metadata() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "[plugins.demo]\nenabled = true\n",
         )?;
-        let plugin_root = codex_home.join(CODEX_CURATED_PLUGINS_DIR).join("demo");
-        std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+        let plugin_root = app_home
+            .join(BROWSER_USE_TERMINAL_CURATED_PLUGINS_DIR)
+            .join("demo");
+        std::fs::create_dir_all(plugin_root.join(".browser-use-plugin"))?;
         std::fs::write(
-            plugin_root.join(".codex-plugin").join("plugin.json"),
+            plugin_root.join(".browser-use-plugin").join("plugin.json"),
             r#"{"name":"DemoPlugin","description":"Demo plugin","skills":"skills"}"#,
         )?;
         let skill_dir = plugin_root.join("skills").join("Assist");
@@ -32614,7 +32677,7 @@ enabled = false
 
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
 
@@ -32634,19 +32697,19 @@ enabled = false
     #[test]
     fn skills_include_instructions_can_disable_skill_inventory() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "[skills]\ninclude_instructions = false\n",
         )?;
-        let skill_dir = codex_home.join("skills").join("Docs");
+        let skill_dir = app_home.join("skills").join("Docs");
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(skill_dir.join("SKILL.md"), "Use docs.")?;
 
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
 
@@ -32664,12 +32727,12 @@ enabled = false
     #[test]
     fn plain_dollar_skill_mentions_materialize_skill_context_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        let skill_dir = codex_home.join("skills").join("Docs");
+        let app_home = temp.path().join("browser-use-terminal-home");
+        let skill_dir = app_home.join("skills").join("Docs");
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(skill_dir.join("SKILL.md"), "Use the docs workflow.")?;
 
-        let payload = with_codex_home(&codex_home, || {
+        let payload = with_browser_use_terminal_home(&app_home, || {
             typed_user_input_payload_from_text_for_cwd("Please use $Docs here", temp.path())
         })?;
         let messages = session_event_user_messages(&payload);
@@ -32687,12 +32750,12 @@ enabled = false
     #[test]
     fn plain_dollar_project_skill_mentions_materialize_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let skill_dir = temp.path().join(".agents").join("skills").join("RepoDocs");
         std::fs::create_dir_all(&skill_dir)?;
         std::fs::write(skill_dir.join("SKILL.md"), "Use the repo docs workflow.")?;
 
-        let payload = with_codex_home(&codex_home, || {
+        let payload = with_browser_use_terminal_home(&app_home, || {
             typed_user_input_payload_from_text_for_cwd("Please use $RepoDocs", temp.path())
         })?;
         let messages = session_event_user_messages(&payload);
@@ -32709,8 +32772,8 @@ enabled = false
     #[test]
     fn memory_summary_is_injected_when_feature_enabled() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        let memory_dir = codex_home.join("memories");
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let memory_dir = app_home.join("memories");
         std::fs::create_dir_all(&memory_dir)?;
         std::fs::write(
             memory_dir.join("memory_summary.md"),
@@ -32723,7 +32786,7 @@ enabled = false
             toml::Value::Boolean(true),
         )]);
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event_with_options(&store, &session, &options)
         })?;
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
@@ -32740,12 +32803,12 @@ enabled = false
     #[test]
     fn memory_summary_is_injected_when_use_memories_config_enabled() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "[memories]\nuse_memories = true\n",
         )?;
-        let memory_dir = codex_home.join("memories");
+        let memory_dir = app_home.join("memories");
         std::fs::create_dir_all(&memory_dir)?;
         std::fs::write(
             memory_dir.join("memory_summary.md"),
@@ -32754,7 +32817,7 @@ enabled = false
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
@@ -32771,14 +32834,14 @@ enabled = false
     #[test]
     fn memory_summary_is_omitted_when_feature_disabled() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        let memory_dir = codex_home.join("memories");
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let memory_dir = app_home.join("memories");
         std::fs::create_dir_all(&memory_dir)?;
         std::fs::write(memory_dir.join("memory_summary.md"), "Hidden memory")?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
         let messages = provider_messages_from_events(&store.events_for_session(&session.id)?);
@@ -33014,7 +33077,7 @@ enabled = false
     #[test]
     fn spawn_agent_rejects_unknown_agent_type_like_codex_v2() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         let provider = InstructionCapturingProvider::default();
@@ -33030,7 +33093,7 @@ enabled = false
             }),
         };
 
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33101,8 +33164,8 @@ enabled = false
     fn spawn_agent_configured_role_overrides_requested_model_and_reasoning_like_codex() -> Result<()>
     {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        let role_dir = codex_home.join("agents");
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let role_dir = app_home.join("agents");
         std::fs::create_dir_all(&role_dir)?;
         let role_file = role_dir.join("researcher.toml");
         std::fs::write(
@@ -33110,7 +33173,7 @@ enabled = false
             "developer_instructions = \"Research carefully\"\nmodel = \"role-model\"\nmodel_reasoning_effort = \"high\"\ninstructions = \"Role base instructions\"\n",
         )?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[agents.researcher]\ndescription = \"Research role\"\nconfig_file = \"./agents/researcher.toml\"\n",
         )?;
         let store = Store::open(temp.path())?;
@@ -33147,7 +33210,7 @@ enabled = false
             }),
         };
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33193,9 +33256,9 @@ enabled = false
     #[test]
     fn spawn_agent_discovers_user_role_files_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(codex_home.join(CODEX_CONFIG_FILENAME), "")?;
-        let role_dir = codex_home.join("agents").join("research");
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME), "")?;
+        let role_dir = app_home.join("agents").join("research");
         std::fs::create_dir_all(&role_dir)?;
         std::fs::write(
             role_dir.join("researcher.toml"),
@@ -33238,7 +33301,7 @@ model_reasoning_effort = "high"
             }),
         };
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33262,9 +33325,9 @@ model_reasoning_effort = "high"
     #[test]
     fn spawn_agent_uses_role_specific_nickname_candidates_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[agents.researcher]\ndescription = \"Research role\"\nnickname_candidates = [\"Atlas\"]\n",
         )?;
         let store = Store::open(temp.path())?;
@@ -33292,7 +33355,7 @@ model_reasoning_effort = "high"
             }),
         };
 
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33321,8 +33384,8 @@ model_reasoning_effort = "high"
     #[test]
     fn declared_role_file_metadata_overrides_inline_metadata_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        let role_dir = codex_home.join("agents");
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let role_dir = app_home.join("agents");
         std::fs::create_dir_all(&role_dir)?;
         std::fs::write(
             role_dir.join("archivist.toml"),
@@ -33333,12 +33396,12 @@ developer_instructions = "Research carefully"
 "#,
         )?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\n[agents.archivist]\ndescription = \"Inline archivist role\"\nconfig_file = \"./agents/archivist.toml\"\nnickname_candidates = [\"Inline\"]\n",
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
         let spawn_agent = specs
@@ -33373,7 +33436,7 @@ developer_instructions = "Research carefully"
                 "fork_turns": "1",
             }),
         };
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33392,12 +33455,12 @@ developer_instructions = "Research carefully"
     fn spawn_agent_tool_description_lists_discovered_user_roles_before_builtins_like_codex(
     ) -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\n",
         )?;
-        let role_dir = codex_home.join("agents");
+        let role_dir = app_home.join("agents");
         std::fs::create_dir_all(&role_dir)?;
         std::fs::write(
             role_dir.join("researcher.toml"),
@@ -33409,7 +33472,7 @@ developer_instructions = "Research carefully"
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
 
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
         let spawn_agent = specs
@@ -33430,21 +33493,21 @@ developer_instructions = "Research carefully"
     #[test]
     fn spawn_agent_tool_description_marks_locked_role_settings_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        let role_dir = codex_home.join("agents");
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let role_dir = app_home.join("agents");
         std::fs::create_dir_all(&role_dir)?;
         std::fs::write(
             role_dir.join("locked.toml"),
             "model = \"gpt-5.4\"\nmodel_reasoning_effort = \"high\"\nservice_tier = \"priority\"\ndeveloper_instructions = \"Stay locked\"\n",
         )?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\n[agents.locked]\ndescription = \"Locked role\"\nconfig_file = \"./agents/locked.toml\"\n",
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
 
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
         let spawn_agent = specs
@@ -33463,15 +33526,15 @@ developer_instructions = "Research carefully"
     #[test]
     fn spawn_agent_schema_hides_metadata_fields_when_configured_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\nhide_spawn_agent_metadata = true\n",
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
 
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
         let spawn_agent = specs
@@ -33494,9 +33557,9 @@ developer_instructions = "Research carefully"
     #[test]
     fn multi_agent_v2_config_table_parses_and_validates_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             r#"[features.multi_agent_v2]
 enabled = true
 max_concurrent_threads_per_session = 5
@@ -33513,7 +33576,7 @@ non_code_mode_only = true
 "#,
         )?;
 
-        let config = with_codex_home(&codex_home, || {
+        let config = with_browser_use_terminal_home(&app_home, || {
             let mut warnings = Vec::new();
             load_agents_md_config(temp.path(), &mut warnings, None, &[])
         })?;
@@ -33543,10 +33606,10 @@ non_code_mode_only = true
         assert!(config.multi_agent_v2.non_code_mode_only);
 
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\nmin_wait_timeout_ms = 100\nmax_wait_timeout_ms = 50\n",
         )?;
-        let error = with_codex_home(&codex_home, || {
+        let error = with_browser_use_terminal_home(&app_home, || {
             let mut warnings = Vec::new();
             load_agents_md_config(temp.path(), &mut warnings, None, &[])
         })
@@ -33556,10 +33619,10 @@ non_code_mode_only = true
         ));
 
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\ntool_namespace = \"functions\"\n",
         )?;
-        let error = with_codex_home(&codex_home, || {
+        let error = with_browser_use_terminal_home(&app_home, || {
             let mut warnings = Vec::new();
             load_agents_md_config(temp.path(), &mut warnings, None, &[])
         })
@@ -33573,15 +33636,15 @@ non_code_mode_only = true
     #[test]
     fn multi_agent_v2_non_code_mode_only_stays_visible_without_local_code_mode() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\nnon_code_mode_only = true\n",
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
 
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
 
@@ -33597,9 +33660,9 @@ non_code_mode_only = true
     #[test]
     fn multi_agent_v2_config_drives_tool_specs_and_wait_validation() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             r#"[features.multi_agent_v2]
 enabled = true
 max_concurrent_threads_per_session = 17
@@ -33612,7 +33675,7 @@ usage_hint_enabled = false
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
 
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
         let spawn = specs
@@ -33632,7 +33695,7 @@ usage_hint_enabled = false
             "Optional timeout in milliseconds. Defaults to 0, min 0, max 50."
         );
 
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_wait_agent_tool(
                 &store,
                 &session,
@@ -33652,7 +33715,7 @@ usage_hint_enabled = false
         )?;
         assert_eq!(data["timed_out"], true);
 
-        let too_high = with_codex_home(&codex_home, || {
+        let too_high = with_browser_use_terminal_home(&app_home, || {
             dispatch_wait_agent_tool(
                 &store,
                 &session,
@@ -33676,18 +33739,18 @@ usage_hint_enabled = false
     fn multi_agent_v2_configured_tool_namespace_is_visible_when_provider_supports_namespaces_like_codex(
     ) -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\ntool_namespace = \"agents\"\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
         })?;
-        let registry = with_codex_home(&codex_home, || {
+        let registry = with_browser_use_terminal_home(&app_home, || {
             browser_tool_registry_for_session(
                 &session,
                 &AgentRunOptions::default(),
@@ -33731,18 +33794,18 @@ usage_hint_enabled = false
     fn multi_agent_v2_configured_tool_namespace_is_ignored_without_provider_namespace_support_like_codex(
     ) -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\ntool_namespace = \"agents\"\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", false)
         })?;
-        let registry = with_codex_home(&codex_home, || {
+        let registry = with_browser_use_terminal_home(&app_home, || {
             browser_tool_registry_for_session(
                 &session,
                 &AgentRunOptions::default(),
@@ -33782,15 +33845,15 @@ usage_hint_enabled = false
     #[test]
     fn spawn_agent_enforces_multi_agent_v2_thread_cap_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 1\n",
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         let provider = FakeProvider::with_text("child result");
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33821,9 +33884,9 @@ usage_hint_enabled = false
     #[test]
     fn spawn_agent_counts_completed_unclosed_agents_against_v2_thread_cap() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 2\n",
         )?;
         let store = Store::open(temp.path())?;
@@ -33831,7 +33894,7 @@ usage_hint_enabled = false
         let provider = FakeProvider::with_text("child result");
         let options = AgentRunOptions::default();
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33853,7 +33916,7 @@ usage_hint_enabled = false
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].status, "done");
 
-        let rejected = with_codex_home(&codex_home, || {
+        let rejected = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33882,9 +33945,9 @@ usage_hint_enabled = false
     #[test]
     fn spawn_agent_rejects_duplicate_v2_task_name_before_store_error() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\nmax_concurrent_threads_per_session = 4\n",
         )?;
         let store = Store::open(temp.path())?;
@@ -33901,7 +33964,7 @@ usage_hint_enabled = false
             }),
         };
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33911,7 +33974,7 @@ usage_hint_enabled = false
                 &None,
             )
         })?;
-        let duplicate = with_codex_home(&codex_home, || {
+        let duplicate = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -33936,7 +33999,7 @@ usage_hint_enabled = false
     #[test]
     fn mailbox_messages_are_drained_into_target_turn_once_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let parent = store.create_session(None, temp.path())?;
         let child = store.create_child_session(
@@ -33949,7 +34012,7 @@ usage_hint_enabled = false
         store.send_agent_message(&parent.id, &child.id, "hello child", false)?;
         let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_existing_session_with_provider(
                 &store,
                 &provider,
@@ -33986,7 +34049,7 @@ usage_hint_enabled = false
     #[test]
     fn child_completion_sends_parent_subagent_notification_mail_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let parent = store.create_session(None, temp.path())?;
         let child = store.create_child_session(
@@ -34014,7 +34077,7 @@ usage_hint_enabled = false
             .contains("\"completed\":\"child finished\""));
 
         let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_existing_session_with_provider(
                 &store,
                 &provider,
@@ -34105,9 +34168,9 @@ usage_hint_enabled = false
     fn multi_agent_v2_root_and_subagent_usage_hints_are_standalone_developer_context() -> Result<()>
     {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             r#"[features.multi_agent_v2]
 enabled = true
 root_agent_usage_hint_text = "Root guidance."
@@ -34116,7 +34179,7 @@ subagent_usage_hint_text = "Subagent guidance."
         )?;
         let store = Store::open(temp.path())?;
         let root = store.create_session(None, temp.path())?;
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &root)
         })?);
         store.append_event(
@@ -34137,7 +34200,7 @@ subagent_usage_hint_text = "Subagent guidance."
 
         let child =
             store.create_child_session(&root.id, temp.path(), Some("/root/child"), None, None)?;
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &child)
         })?);
         store.append_event(
@@ -34218,9 +34281,9 @@ subagent_usage_hint_text = "Subagent guidance."
     #[test]
     fn spawn_agent_schema_uses_model_catalog_json_model_guidance() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("catalog.json"),
+            app_home.join("catalog.json"),
             r#"{"models":[{
   "slug":"catalog-child",
   "display_name":"Catalog Child",
@@ -34237,13 +34300,13 @@ subagent_usage_hint_text = "Subagent guidance."
 }]}"#,
         )?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "model_catalog_json = \"catalog.json\"\n",
         )?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
 
-        let specs = with_codex_home(&codex_home, || {
+        let specs = with_browser_use_terminal_home(&app_home, || {
             browser_tool_specs_for_session(
                 &session,
                 &AgentRunOptions::default(),
@@ -34264,9 +34327,9 @@ subagent_usage_hint_text = "Subagent guidance."
     #[test]
     fn spawn_agent_validates_model_and_reasoning_against_catalog_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join("catalog.json"),
+            app_home.join("catalog.json"),
             r#"{"models":[{
   "slug":"catalog-child",
   "display_name":"Catalog Child",
@@ -34283,7 +34346,7 @@ subagent_usage_hint_text = "Subagent guidance."
 }]}"#,
         )?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "model_catalog_json = \"catalog.json\"\n",
         )?;
         let store = Store::open(temp.path())?;
@@ -34301,7 +34364,7 @@ subagent_usage_hint_text = "Subagent guidance."
             }),
         };
 
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -34326,7 +34389,7 @@ subagent_usage_hint_text = "Subagent guidance."
                 "fork_turns": "1"
             }),
         };
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -34344,9 +34407,9 @@ subagent_usage_hint_text = "Subagent guidance."
     #[test]
     fn spawn_agent_result_hides_nickname_but_keeps_session_metadata_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[features.multi_agent_v2]\nenabled = true\nhide_spawn_agent_metadata = true\n",
         )?;
         let store = Store::open(temp.path())?;
@@ -34373,7 +34436,7 @@ subagent_usage_hint_text = "Subagent guidance."
             }),
         };
 
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -34416,9 +34479,9 @@ subagent_usage_hint_text = "Subagent guidance."
     #[test]
     fn malformed_discovered_agent_role_is_warning_not_fatal_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        std::fs::write(codex_home.join(CODEX_CONFIG_FILENAME), "")?;
-        let role_dir = codex_home.join("agents");
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        std::fs::write(app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME), "")?;
+        let role_dir = app_home.join("agents");
         std::fs::create_dir_all(&role_dir)?;
         std::fs::write(
             role_dir.join("bad.toml"),
@@ -34429,7 +34492,7 @@ description = "Missing developer instructions"
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         let events = store.events_for_session(&session.id)?;
@@ -34446,15 +34509,15 @@ description = "Missing developer instructions"
     #[test]
     fn malformed_declared_agent_role_is_warning_not_fatal_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "[agents.researcher]\ndescription = \"Research role\"\nnickname_candidates = [\"Atlas\", \" Atlas \"]\n",
         )?;
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
 
-        assert!(with_codex_home(&codex_home, || {
+        assert!(with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?);
         let events = store.events_for_session(&session.id)?;
@@ -34479,7 +34542,7 @@ description = "Missing developer instructions"
                 "fork_turns": "1",
             }),
         };
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -34498,7 +34561,7 @@ description = "Missing developer instructions"
     #[test]
     fn spawn_agent_full_fork_accepts_service_tier_like_codex_v2() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
@@ -34526,7 +34589,7 @@ description = "Missing developer instructions"
             }),
         };
 
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -34558,7 +34621,7 @@ description = "Missing developer instructions"
     #[test]
     fn spawn_agent_full_fork_seeds_filtered_response_history_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         store.append_event(
@@ -34631,7 +34694,7 @@ description = "Missing developer instructions"
             }),
         };
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -34802,7 +34865,7 @@ description = "Missing developer instructions"
     #[test]
     fn multi_agent_v1_spawn_preserves_typed_items_for_child_replay_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         let provider = FakeProvider::default();
@@ -34826,7 +34889,7 @@ description = "Missing developer instructions"
             }),
         };
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -35086,16 +35149,16 @@ description = "Missing developer instructions"
         Ok(())
     }
 
-    fn write_mock_codex_plugin_bundle(codex_home: &Path) -> Result<()> {
-        let plugin_root = codex_home
-            .join(CODEX_PLUGIN_CACHE_DIR)
+    fn write_mock_codex_plugin_bundle(app_home: &Path) -> Result<()> {
+        let plugin_root = app_home
+            .join(BROWSER_USE_TERMINAL_PLUGIN_CACHE_DIR)
             .join("test")
             .join("sample")
             .join("local");
-        std::fs::create_dir_all(plugin_root.join(".codex-plugin"))?;
+        std::fs::create_dir_all(plugin_root.join(".browser-use-plugin"))?;
         std::fs::create_dir_all(plugin_root.join("skills").join("sample-search"))?;
         std::fs::write(
-            plugin_root.join(".codex-plugin").join("plugin.json"),
+            plugin_root.join(".browser-use-plugin").join("plugin.json"),
             serde_json::json!({
                 "name": "sample",
                 "description": "Inspect sample data",
@@ -35128,7 +35191,7 @@ description = "Missing developer instructions"
             .to_string(),
         )?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"
 [features]
 plugins = true
@@ -35143,15 +35206,15 @@ enabled = true
     #[test]
     fn workspace_context_includes_available_plugin_instructions_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        write_mock_codex_plugin_bundle(&codex_home)?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        write_mock_codex_plugin_bundle(&app_home)?;
         let state_dir = temp.path().join("state");
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project)?;
         let store = Store::open(&state_dir)?;
         let session = store.create_session(None, &project)?;
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             append_workspace_context_event(&store, &session)
         })?;
 
@@ -35171,15 +35234,15 @@ enabled = true
     #[test]
     fn explicit_plugin_mention_materializes_configured_capabilities_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        write_mock_codex_plugin_bundle(&codex_home)?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        write_mock_codex_plugin_bundle(&app_home)?;
         let state_dir = temp.path().join("state");
         let project = temp.path().join("project");
         std::fs::create_dir_all(&project)?;
         let store = Store::open(&state_dir)?;
         let session = store.create_session(None, &project)?;
 
-        let payload = with_codex_home(&codex_home, || {
+        let payload = with_browser_use_terminal_home(&app_home, || {
             typed_user_input_payload_from_text_for_cwd(
                 "use [@sample](plugin://sample@test)",
                 &project,
@@ -35280,7 +35343,7 @@ enabled = true
     fn multi_agent_v1_completion_notification_uses_id_contextual_user_message_like_codex(
     ) -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let parent = store.create_session(None, temp.path())?;
         let provider = FakeProvider::default();
@@ -35293,7 +35356,7 @@ enabled = true
             }),
         };
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -35317,7 +35380,7 @@ enabled = true
             .contains(&format!("\"agent_path\":\"{}\"", child.child_session_id)));
 
         let parent_provider = ModelSwitchCapturingProvider::new("gpt-5.4");
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             run_existing_session_with_provider(
                 &store,
                 &parent_provider,
@@ -35436,7 +35499,7 @@ enabled = true
     #[test]
     fn spawn_agent_rejects_unsupported_requested_service_tier_like_codex_v2() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         let provider = ModelSwitchCapturingProvider::new("gpt-5.4");
@@ -35451,7 +35514,7 @@ enabled = true
             }),
         };
 
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -35479,7 +35542,7 @@ enabled = true
                 "service_tier": "priority",
             }),
         };
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &unsupported_model_provider,
@@ -35504,7 +35567,7 @@ enabled = true
                 "service_tier": "priority",
             }),
         };
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &unsupported_mini_provider,
@@ -35524,15 +35587,15 @@ enabled = true
     fn spawn_agent_role_service_tier_falls_back_to_supported_parent_tier_like_codex() -> Result<()>
     {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
-        let role_dir = codex_home.join("agents");
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
+        let role_dir = app_home.join("agents");
         std::fs::create_dir_all(&role_dir)?;
         std::fs::write(
             role_dir.join("tiered.toml"),
             "model = \"gpt-5.4\"\nservice_tier = \"turbo\"\ndeveloper_instructions = \"Use the tiered role.\"\n",
         )?;
         std::fs::write(
-            codex_home.join(CODEX_CONFIG_FILENAME),
+            app_home.join(BROWSER_USE_TERMINAL_CONFIG_FILENAME),
             "service_tier = \"priority\"\n[agents.tiered]\ndescription = \"Tiered role\"\nconfig_file = \"./agents/tiered.toml\"\n",
         )?;
         let store = Store::open(temp.path())?;
@@ -35567,7 +35630,7 @@ enabled = true
             }),
         };
 
-        with_codex_home(&codex_home, || {
+        with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -35590,7 +35653,7 @@ enabled = true
     #[test]
     fn spawn_agent_partial_fork_passes_model_and_reasoning_to_child_runner() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
         let provider = InstructionCapturingProvider::default();
@@ -35621,7 +35684,7 @@ enabled = true
             }),
         };
 
-        let outcome = with_codex_home(&codex_home, || {
+        let outcome = with_browser_use_terminal_home(&app_home, || {
             dispatch_spawn_agent_tool(
                 &store,
                 &provider,
@@ -35657,7 +35720,7 @@ enabled = true
     #[test]
     fn spawn_agent_with_child_runner_returns_before_child_finishes_and_wait_blocks() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         let store = Store::open(temp.path())?;
         let state_dir = store.state_dir().to_path_buf();
         let runner = ChildAgentRunner::new(move |request| {
@@ -35671,7 +35734,7 @@ enabled = true
             Ok(())
         });
         let provider = BlockingExplorerParentProvider::default();
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,
@@ -36817,11 +36880,11 @@ enabled = true
     #[test]
     fn python_image_outputs_are_forwarded_to_next_model_turn() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = create_empty_codex_home(temp.path())?;
+        let app_home = create_empty_browser_use_terminal_home(temp.path())?;
         std::fs::write(temp.path().join("shot.png"), b"not-really-a-png")?;
         let store = Store::open(temp.path().join("state"))?;
         let provider = ImageInspectingProvider::default();
-        let session_id = with_codex_home(&codex_home, || {
+        let session_id = with_browser_use_terminal_home(&app_home, || {
             run_agent_with_provider(
                 &store,
                 &provider,

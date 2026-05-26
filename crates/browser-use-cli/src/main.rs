@@ -50,7 +50,7 @@ use serde_json::Value;
 struct Args {
     #[arg(long, default_value = "~/.browser-use-terminal")]
     state_dir: PathBuf,
-    /// Layer $CODEX_HOME/<name>.config.toml on top of the base user config.
+    /// Layer $BROWSER_USE_TERMINAL_HOME/<name>.config.toml on top of the base user config.
     #[arg(long = "profile", short = 'p', global = true)]
     config_profile: Option<String>,
     /// Override a configuration value. Use a dotted path and TOML value.

@@ -129,9 +129,9 @@ related differences can be fixed in the same loop, fix all of them in that loop.
   the same short reaction window before collecting output.
   Compaction now preserves the canonical
   startup context instead of replacing it with only a summary. AGENTS discovery
-  now reads Codex's project-doc config knobs from Codex-home `config.toml` and
-  trusted project-local `.codex/config.toml`, including the final legacy
-  managed-config and macOS managed-preferences precedence layers.
+  now reads Codex's project-doc config knobs from Browser Use Terminal home
+  `config.toml` and trusted project-local `.browser-use/config.toml`, including
+  the final managed-config and macOS managed-preferences precedence layers.
   Codex-style `developer_instructions` are now loaded from that same config
   stack and appended to the aggregated developer context alongside the
   no-approval permissions instructions. Typed runtime `AgentRunOptions`
@@ -209,7 +209,8 @@ current gap list.
 - The model-visible tool surface now includes represented Codex-style goal
   tools: `get_goal`, `create_goal`, and `update_goal`.
 - Workspace context now injects local skills discovered under
-  `CODEX_HOME/skills`, using a Codex-shaped `<skills_instructions>` block.
+  `BROWSER_USE_TERMINAL_HOME/skills`, using a Codex-shaped
+  `<skills_instructions>` block.
 - The CLI now has represented `review` prompt entry points for uncommitted
   changes, base branches, commits, and custom review instructions.
 - The CLI now has `user-shell`, which runs a user shell command and records the
@@ -240,16 +241,17 @@ current gap list.
   clarified plugin MCP wording so configured servers are not described as
   callable unless their tools are separately exposed.
 - The latest local slices targeted model-input quality directly: project-scoped
-  `.agents/skills`/`.codex/skills` discovery plus frontmatter descriptions,
+  `.agents/skills`/`.browser-use/skills` discovery plus frontmatter descriptions,
   cwd-aware plain `$Skill` materialization, opt-in read-only memory summary
   context, active-goal context injection before provider turns, Codex-like local
   prompt-image resizing to 2048px bounds, and honest `tool_search` wording for
   MCP/app/plugin tools that are not actually exposed. The follow-up extended
   that into Codex-shaped hidden user `<goal_context>` continuation prompts,
   provider-loop auto-continuation while an active goal has not been completed or
-  strictly blocked, `$CODEX_HOME/.agents/skills`, plugin skill roots, frontmatter
-  names/metadata, `openai.yaml` short descriptions, `skills.include_instructions`,
-  `skills.bundled.enabled`, `[[skills.config]]` disable rules, and
+  strictly blocked, `$BROWSER_USE_TERMINAL_HOME/.agents/skills`, plugin skill
+  roots, frontmatter names/metadata, `openai.yaml` short descriptions,
+  `skills.include_instructions`, `skills.bundled.enabled`, `[[skills.config]]`
+  disable rules, and
   `[memories] use_memories`.
 - The latest broad runtime slice then removed the browser-harness contract from
   non-browser terminal prompts, added model-assisted local compaction behind a
@@ -1028,30 +1030,30 @@ AGENTS.md parity.
   are ignored, invalid UTF-8 remains lossy with a warning, truncation is not a
   startup warning, and non-`NotFound` project metadata/read failures omit the
   project-doc block instead of leaking warnings into model-visible context.
-- Added trusted project-local AGENTS config layering: `.codex/config.toml`
+- Added trusted project-local AGENTS config layering: `.browser-use/config.toml`
   may override `project_doc_max_bytes` and `project_doc_fallback_filenames`
   after the project is trusted in the user config. Project-local
   `project_root_markers` is ignored for AGENTS discovery, matching Codex's
   non-circular root-selection rule.
 - Added Codex's file-backed AGENTS config precedence for the implemented
-  layers: Unix system config, Codex-home user config, trusted project config,
-  then legacy `managed_config.toml`. Managed config can override
+  layers: Unix system config, Browser Use Terminal home user config, trusted
+  project config, then managed `managed_config.toml`. Managed config can override
   `project_root_markers` for AGENTS discovery because Codex merges non-project
   layers for that decision after the final stack exists.
 - Added Codex profile-v2 AGENTS config layering for selected profiles:
-  `$CODEX_HOME/<name>.config.toml` is treated as a second user layer above base
-  user config, can override project-doc settings and `project_root_markers`,
-  and can participate in project trust. The local runner also validates plain
-  profile names and rejects selected legacy `profile`/`[profiles.<name>]`
-  conflicts like Codex.
+  `$BROWSER_USE_TERMINAL_HOME/<name>.config.toml` is treated as a second user
+  layer above base user config, can override project-doc settings and
+  `project_root_markers`, and can participate in project trust. The local runner
+  also validates plain profile names and rejects selected legacy
+  `profile`/`[profiles.<name>]` conflicts like Codex.
 - Added Codex `-c/--config key=value` session override behavior for AGENTS
   config: direct CLI/provider runs parse TOML values with raw-string fallback,
   build dotted-key override tables, use those overrides for pre-project
   root/trust discovery, apply them above trusted project config, and keep
   managed config higher precedence.
-- Added Codex legacy managed-config MDM behavior for AGENTS config: Unix
-  managed config defaults to `/etc/codex/managed_config.toml` outside tests,
-  and macOS `com.openai.codex:config_toml_base64` managed preferences are
+- Added managed-config MDM behavior for AGENTS config: Unix managed config
+  defaults to `/etc/browser-use-terminal/managed_config.toml` outside tests, and
+  macOS `com.browseruse.terminal:config_toml_base64` managed preferences are
   decoded and applied as the highest-precedence AGENTS config layer.
 - Matched Codex's AGENTS-impacting config-load fatality rules: missing config
   files/preferences are no-ops, malformed or unreadable system/user/profile and

@@ -21,7 +21,7 @@ const DEFAULT_MAX_LIST_RESULTS: usize = 200;
 const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 const PATCH_REJECTED_OUTSIDE_PROJECT_REASON: &str =
     "patch rejected: writing outside of the project; rejected by user approval settings";
-const PROTECTED_PATCH_METADATA_NAMES: &[&str] = &[".git", ".agents", ".codex"];
+const PROTECTED_PATCH_METADATA_NAMES: &[&str] = &[".git", ".agents", ".browser-use", ".codex"];
 
 #[derive(Debug)]
 pub(crate) struct FileToolResult {
@@ -1978,6 +1978,7 @@ EOF
         let cases = [
             ("patch_git_metadata", ".git/config"),
             ("patch_agents_metadata", ".agents/skills/example.md"),
+            ("patch_browser_use_metadata", ".browser-use/config.toml"),
             ("patch_codex_metadata", ".codex/config.toml"),
         ];
 

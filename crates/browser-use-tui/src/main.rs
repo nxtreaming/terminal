@@ -106,7 +106,7 @@ struct Args {
     state_dir: PathBuf,
     #[arg(long)]
     model: Option<String>,
-    /// Layer $CODEX_HOME/<name>.config.toml on top of the base user config.
+    /// Layer $BROWSER_USE_TERMINAL_HOME/<name>.config.toml on top of the base user config.
     #[arg(long = "profile", short = 'p')]
     config_profile: Option<String>,
     /// Override a configuration value. Use a dotted path and TOML value.
@@ -5608,7 +5608,7 @@ fn seed_demo_if_requested(store: &Store, mode: Option<&str>) -> Result<()> {
 mod redesign_tests {
     use super::*;
 
-    static CODEX_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+    static BROWSER_USE_TERMINAL_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     fn args(temp: &tempfile::TempDir) -> Args {
         Args {
@@ -5639,26 +5639,28 @@ mod redesign_tests {
         Ok(app)
     }
 
-    fn with_codex_home<T>(codex_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _lock = CODEX_HOME_TEST_LOCK.lock().expect("CODEX_HOME test lock");
-        let previous = std::env::var_os("CODEX_HOME");
+    fn with_browser_use_terminal_home<T>(app_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
+        let _lock = BROWSER_USE_TERMINAL_HOME_TEST_LOCK
+            .lock()
+            .expect("BROWSER_USE_TERMINAL_HOME test lock");
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         unsafe {
-            std::env::set_var("CODEX_HOME", codex_home);
+            std::env::set_var("BROWSER_USE_TERMINAL_HOME", app_home);
         }
         let result = f();
         unsafe {
             match previous {
-                Some(value) => std::env::set_var("CODEX_HOME", value),
-                None => std::env::remove_var("CODEX_HOME"),
+                Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+                None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
             }
         }
         result
     }
 
-    fn write_tui_model_catalog(codex_home: &std::path::Path) -> Result<()> {
-        std::fs::create_dir_all(codex_home)?;
+    fn write_tui_model_catalog(app_home: &std::path::Path) -> Result<()> {
+        std::fs::create_dir_all(app_home)?;
         std::fs::write(
-            codex_home.join("catalog.json"),
+            app_home.join("catalog.json"),
             r#"{
   "models": [
     {
@@ -5689,7 +5691,7 @@ mod redesign_tests {
 }"#,
         )?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             "model_catalog_json = \"catalog.json\"\n",
         )?;
         Ok(())
@@ -7350,10 +7352,10 @@ mod redesign_tests {
     #[test]
     fn model_selector_uses_active_catalog_presets() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        write_tui_model_catalog(&codex_home)?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        write_tui_model_catalog(&app_home)?;
 
-        with_codex_home(&codex_home, || -> Result<()> {
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
             let mut app = ready_app(&temp)?;
             app.store.set_setting("auth.codex.access_token", "token")?;
             app.store.set_setting("auth.codex.account_id", "account")?;
@@ -7379,10 +7381,10 @@ mod redesign_tests {
     #[test]
     fn startup_uses_configured_model_and_provider_without_masking_provider() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"
 model = "configured-corp-model"
 model_provider = "corp"
@@ -7395,7 +7397,7 @@ wire_api = "responses"
 "#,
         )?;
 
-        with_codex_home(&codex_home, || -> Result<()> {
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
             let app_args = Args {
                 agent: AgentBackend::Codex,
                 ..args(&temp)
@@ -7415,10 +7417,10 @@ wire_api = "responses"
     #[test]
     fn startup_and_workspace_context_use_profile_and_config_overrides() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"
 [model_providers.corp]
 name = "Corp"
@@ -7428,14 +7430,14 @@ wire_api = "responses"
 "#,
         )?;
         std::fs::write(
-            codex_home.join("work.config.toml"),
+            app_home.join("work.config.toml"),
             r#"
 model = "profile-model"
 model_provider = "corp"
 "#,
         )?;
 
-        with_codex_home(&codex_home, || -> Result<()> {
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
             let app_args = Args {
                 agent: AgentBackend::Codex,
                 config_profile: Some("work".to_string()),
@@ -7485,10 +7487,10 @@ model_provider = "corp"
         store.set_setting("provider.id", "codex")?;
         drop(store);
 
-        let codex_home = temp.path().join("codex-home");
-        std::fs::create_dir_all(&codex_home)?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        std::fs::create_dir_all(&app_home)?;
         std::fs::write(
-            codex_home.join("config.toml"),
+            app_home.join("config.toml"),
             r#"
 [model_providers.corp]
 name = "Corp"
@@ -7498,7 +7500,7 @@ wire_api = "responses"
 "#,
         )?;
 
-        with_codex_home(&codex_home, || -> Result<()> {
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
             let app_args = Args {
                 agent: AgentBackend::Codex,
                 config_overrides: vec![
@@ -7521,10 +7523,10 @@ wire_api = "responses"
     #[test]
     fn model_selection_is_session_scoped_for_followups() -> Result<()> {
         let temp = tempfile::tempdir()?;
-        let codex_home = temp.path().join("codex-home");
-        write_tui_model_catalog(&codex_home)?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        write_tui_model_catalog(&app_home)?;
 
-        with_codex_home(&codex_home, || -> Result<()> {
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
             let mut app = ready_app(&temp)?;
             app.store.set_setting("auth.openai.api_key", "openai-key")?;
             let session = app.store.create_session(None, std::env::current_dir()?)?;
