@@ -7,11 +7,12 @@ use std::path::{Component, Path, PathBuf};
 use std::process::Command;
 
 use anyhow::{bail, Context, Result};
-use base64::{engine::general_purpose, Engine as _};
 use browser_use_protocol::{SessionMeta, ToolCall};
 use browser_use_store::Store;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
+
+use crate::prompt_image::{load_for_prompt_bytes, PromptImageMode};
 
 const DEFAULT_MAX_READ_LINES: usize = 400;
 const DEFAULT_MAX_READ_BYTES: usize = 80_000;
@@ -292,17 +293,25 @@ pub(crate) fn view_image(
                 MAX_INLINE_LOCAL_IMAGE_BYTES
             );
         }
-        let mime = image_mime_for_bytes(&bytes).with_context(|| {
+        let mode = if detail == "original" {
+            PromptImageMode::Original
+        } else {
+            PromptImageMode::ResizeToFit
+        };
+        let prompt_image = load_for_prompt_bytes(&path, bytes, mode).with_context(|| {
             format!(
                 "view_image cannot inline {}: unsupported or invalid image bytes",
                 path.display()
             )
         })?;
+        let mime = prompt_image.mime;
         let image = json!({
             "path": path.display().to_string(),
             "mime_type": mime,
             "detail": detail,
-            "bytes": bytes.len(),
+            "bytes": prompt_image.bytes.len(),
+            "width": prompt_image.width,
+            "height": prompt_image.height,
         });
         let event = store.append_event(
             &session.id,
@@ -324,7 +333,7 @@ pub(crate) fn view_image(
         Ok(FileToolResult {
             content: Value::Array(vec![json!({
                 "type": "input_image",
-                "image_url": format!("data:{mime};base64,{}", general_purpose::STANDARD.encode(bytes)),
+                "image_url": prompt_image.into_data_url(),
                 "detail": detail,
             })]),
         })
@@ -1245,22 +1254,6 @@ fn is_not_found(error: &anyhow::Error) -> bool {
         .any(|error| error.kind() == io::ErrorKind::NotFound)
 }
 
-fn image_mime_for_bytes(bytes: &[u8]) -> Option<&'static str> {
-    if bytes.starts_with(&[0x89, b'P', b'N', b'G', 0x0d, 0x0a, 0x1a, 0x0a]) {
-        return Some("image/png");
-    }
-    if bytes.starts_with(&[0xff, 0xd8, 0xff]) {
-        return Some("image/jpeg");
-    }
-    if bytes.starts_with(b"GIF87a") || bytes.starts_with(b"GIF89a") {
-        return Some("image/gif");
-    }
-    if bytes.len() >= 12 && bytes.starts_with(b"RIFF") && &bytes[8..12] == b"WEBP" {
-        return Some("image/webp");
-    }
-    None
-}
-
 fn lines_to_text(lines: &[String], final_newline: bool) -> String {
     let mut text = lines.join("\n");
     if final_newline && !lines.is_empty() {
@@ -1424,6 +1417,9 @@ fn normalize_common_punctuation(text: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
+    use image::{DynamicImage, GenericImageView, ImageBuffer, ImageFormat, Rgba};
+    use std::io::Cursor;
     use tempfile::TempDir;
 
     fn test_session(tmp: &TempDir) -> (Store, SessionMeta) {
@@ -1432,6 +1428,15 @@ mod tests {
         fs::create_dir_all(&cwd).expect("cwd");
         let session = store.create_session(None, cwd).expect("session");
         (store, session)
+    }
+
+    fn png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_pixel(width, height, Rgba([255, 0, 0, 255]));
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode png");
+        encoded.into_inner()
     }
 
     #[test]
@@ -2080,16 +2085,7 @@ EOF
         let tmp = TempDir::new().expect("tmp");
         let (store, session) = test_session(&tmp);
         let path = Path::new(&session.cwd).join("pixel.png");
-        fs::write(
-            &path,
-            [
-                137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 73, 72, 68, 82, 0, 0, 0, 1, 0, 0, 0,
-                1, 8, 6, 0, 0, 0, 31, 21, 196, 137, 0, 0, 0, 13, 73, 68, 65, 84, 120, 156, 99, 248,
-                15, 4, 0, 9, 251, 3, 253, 167, 209, 143, 38, 0, 0, 0, 0, 73, 69, 78, 68, 174, 66,
-                96, 130,
-            ],
-        )
-        .expect("write png");
+        fs::write(&path, png_bytes(1, 1)).expect("write png");
         let result = view_image(
             &store,
             &session,
@@ -2111,6 +2107,43 @@ EOF
         let artifacts = store.artifacts_for_session(&session.id).expect("artifacts");
         assert_eq!(artifacts.len(), 1);
         assert_eq!(artifacts[0].kind, "image");
+    }
+
+    #[test]
+    fn view_image_high_detail_resizes_large_images() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let path = Path::new(&session.cwd).join("wide.png");
+        fs::write(&path, png_bytes(2304, 864)).expect("write png");
+
+        let result = view_image(
+            &store,
+            &session,
+            &ToolCall {
+                id: "image_1".to_string(),
+                name: "view_image".to_string(),
+                namespace: None,
+                arguments: json!({"path": "wide.png", "detail": "high"}),
+            },
+            true,
+        )
+        .expect("view image");
+
+        let image_url = result.content[0]["image_url"].as_str().expect("image url");
+        let (prefix, encoded) = image_url.split_once(',').expect("data url");
+        assert_eq!(prefix, "data:image/png;base64");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode image");
+        let resized = image::load_from_memory(&decoded).expect("load resized");
+        assert_eq!(resized.dimensions(), (2048, 768));
+        let events = store.events_for_session(&session.id).expect("events");
+        let image_event = events
+            .iter()
+            .find(|event| event.event_type == "tool.image")
+            .expect("tool image event");
+        assert_eq!(image_event.payload["image"]["width"], 2048);
+        assert_eq!(image_event.payload["image"]["height"], 768);
     }
 
     #[test]

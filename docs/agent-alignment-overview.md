@@ -223,25 +223,38 @@ current gap list.
   inlining, removed unsupported `prevent_idle_sleep` beta advertising, and
   clarified plugin MCP wording so configured servers are not described as
   callable unless their tools are separately exposed.
+- The latest local slices targeted model-input quality directly: project-scoped
+  `.agents/skills`/`.codex/skills` discovery plus frontmatter descriptions,
+  cwd-aware plain `$Skill` materialization, opt-in read-only memory summary
+  context, active-goal context injection before provider turns, Codex-like local
+  prompt-image resizing to 2048px bounds, and honest `tool_search` wording for
+  MCP/app/plugin tools that are not actually exposed. The follow-up extended
+  that into Codex-shaped hidden user `<goal_context>` continuation prompts,
+  provider-loop auto-continuation while an active goal has not been completed or
+  strictly blocked, `$CODEX_HOME/.agents/skills`, plugin skill roots, frontmatter
+  names/metadata, `openai.yaml` short descriptions, `skills.include_instructions`,
+  `skills.bundled.enabled`, `[[skills.config]]` disable rules, and
+  `[memories] use_memories`.
 - Verification passed: `cargo fmt --check`, `cargo test`,
   `uv run --with pytest python -m pytest -q`, and `git diff --check`. The
   standing Codex-auth smoke passed again in
-  `/tmp/but-codex-smoke-agent-quality5.ygotFs`: root `5838b2656021` returned
-  `Paris`, and child `f70bb933931a` read
+  `/tmp/but-codex-smoke-agent-quality6.qYruta`: root `30942471de10` returned
+  `Paris`, and child `7f840adea56e` read
   `/tmp/but-codex-agent-parity-smoke.txt` and returned
   `agent-parity-smoke-ok`.
 - Ten read-only broad auditors then rechecked the current branch against Codex.
   They agreed the remaining high-impact gaps are hooks, dynamic MCP/app/plugin
-  tool inventory, goal runtime steering/continuation, and scoped skills. Medium
-  gaps are WebSocket/processed-ack transport, structured isolated review mode,
-  read-only memory context, image resizing/repair, effective-config
-  provenance, and queue/steering details.
+  tool inventory, full goal runtime steering/continuation, full Codex skill
+  manager semantics, model-based local compaction, and input-queue/turn
+  orchestration. Medium gaps are WebSocket/processed-ack transport, memory
+  read-path retrieval/tools, effective-config/context-diff provenance, and
+  subagent control-plane exactness.
 - Remaining high-impact gaps are true websocket ack/fallback transport,
   dynamic MCP/app/deferred inventory surfaces, hook runtime/context behavior,
-  deeper goal continuation/budget steering, exact shell snapshot edge parity
-  across zsh/non-Unix shells, memory read-path context, exact local image
-  resizing parity, full effective-config provenance, and any app-server
-  lifecycle surfaces that materially affect local agent quality.
+  deeper goal budget/accounting edge cases, remaining full skill-manager
+  semantics, local model-based compaction, input queue/active-turn steering,
+  memory read-path tools/policy, full effective-config provenance, and any
+  app-server lifecycle surfaces that materially affect local agent quality.
 
 The previous batch extended the G-031/G-034 compaction/token lifecycle slice,
 removed remote-compaction advertising, and removed Codex-only AWS/Bedrock

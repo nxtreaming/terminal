@@ -561,7 +561,7 @@ fn tool_search_tool_spec(searchable_sources: &[(&str, Option<&str>)]) -> ToolSpe
         namespace: None,
         namespace_description: None,
         description: format!(
-            "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{source_descriptions}\nSome of the tools may not have been provided to you upfront, and you should use this tool (`{TOOL_SEARCH_TOOL_NAME}`) to search for the required tools. For MCP tool discovery, always use `{TOOL_SEARCH_TOOL_NAME}` instead of `list_mcp_resources` or `list_mcp_resource_templates`."
+            "# Tool discovery\n\nSearches over deferred tool metadata with BM25 and exposes matching tools for the next model call.\n\nYou have access to tools from the following sources:\n{source_descriptions}\nSome tools may not have been provided upfront. Use `{TOOL_SEARCH_TOOL_NAME}` to search this terminal's currently indexed deferred tools. MCP, app, or plugin tools are searchable here only when they are separately exposed in this tool registry."
         ),
         input_schema: serde_json::json!({
             "type": "object",
