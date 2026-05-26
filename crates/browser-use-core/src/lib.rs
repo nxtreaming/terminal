@@ -14360,8 +14360,13 @@ fn load_agents_md_context_for_cwd_with_thread_config(
     };
     let base_instructions = config.base_instructions()?;
     let codex_home = codex_home_dir();
-    let skills_instructions =
-        render_available_skills_instructions(codex_home.as_deref(), cwd, &config);
+    let rendered_skills = render_available_skills_instructions(codex_home.as_deref(), cwd, &config);
+    let skills_instructions = rendered_skills
+        .as_ref()
+        .map(|rendered| rendered.content.clone());
+    if let Some(warning) = rendered_skills.and_then(|rendered| rendered.warning) {
+        warnings.push(warning);
+    }
     let memory_instructions =
         render_memory_context_instructions(codex_home.as_deref(), config.memories_enabled);
     let plugin_summaries = codex_plugin_capability_summaries_for_config(&config);
@@ -16368,48 +16373,16 @@ fn prompt_safe_plugin_description(description: Option<&str>) -> Option<String> {
     )
 }
 
-#[derive(Clone, Debug)]
-struct LocalSkillSummary {
-    name: String,
-    path: PathBuf,
-    description: Option<String>,
-    allow_implicit_invocation: bool,
-}
-
-fn render_available_skills_instructions(
-    codex_home: Option<&Path>,
-    cwd: &Path,
-    config: &AgentsMdConfig,
-) -> Option<String> {
-    if !config.skills_include_instructions {
-        return None;
-    }
-    let mut skills = available_skill_summaries(codex_home, Some(cwd), config);
-    if skills.is_empty() {
-        return None;
-    }
-    skills.sort_by(|left, right| left.name.cmp(&right.name).then(left.path.cmp(&right.path)));
-    const MAX_SKILLS: usize = 80;
-    if skills.len() > MAX_SKILLS {
-        skills.truncate(MAX_SKILLS);
-    }
-    let mut lines = vec![
-        SKILLS_INSTRUCTIONS_OPEN_TAG.to_string(),
-        "## Skills".to_string(),
-        "A skill is a set of local instructions to follow that is stored in a SKILL.md file. Below is the list of skills available in this session.".to_string(),
-        "### Available skills".to_string(),
-    ];
-    lines.extend(skills.iter().map(|skill| {
-        let path = skill.path.display();
-        if let Some(description) = skill.description.as_deref() {
-            format!("- `{}`: {} (file: {path})", skill.name, description)
-        } else {
-            format!("- `{}` (file: {path})", skill.name)
-        }
-    }));
-    lines.push("### How to use skills".to_string());
-    lines.push(
-        r###"- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.
+const DEFAULT_SKILL_METADATA_CHAR_BUDGET: usize = 8_000;
+const SKILL_METADATA_CONTEXT_WINDOW_PERCENT: usize = 2;
+const SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS: usize = 100;
+const SKILL_DESCRIPTION_TRUNCATED_WARNING: &str = "Skill descriptions were shortened to fit the skills context budget. The model can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
+const SKILL_DESCRIPTION_TRUNCATED_WARNING_WITH_PERCENT: &str = "Skill descriptions were shortened to fit the 2% skills context budget. The model can still see every skill, but some descriptions are shorter. Disable unused skills or plugins to leave more room for the rest.";
+const SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX: &str =
+    "Exceeded skills context budget. All skill descriptions were removed and";
+const SKILLS_INTRO_WITH_ABSOLUTE_PATHS: &str = "A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and file path so you can open the source for full instructions when using a specific skill.";
+const SKILLS_INTRO_WITH_ALIASES: &str = "A skill is a set of local instructions to follow that is stored in a `SKILL.md` file. Below is the list of skills that can be used. Each entry includes a name, description, and a short path that can be expanded into an absolute path using the skill roots table.";
+const SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS: &str = r###"- Discovery: The list above is the skills available in this session (name + description + file path). Skill bodies live on disk at the listed paths.
 - Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
 - Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.
 - How to use a skill (progressive disclosure):
@@ -16425,11 +16398,684 @@ fn render_available_skills_instructions(
   - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.
   - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.
   - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.
-- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue."###
-            .to_string(),
+- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue."###;
+const SKILLS_HOW_TO_USE_WITH_ALIASES: &str = r###"- Discovery: The list above is the skills available in this session (name + description + short path). Skill bodies live on disk at the listed paths after expanding the matching alias from `### Skill roots`.
+- Trigger rules: If the user names a skill (with `$SkillName` or plain text) OR the task clearly matches a skill's description shown above, you must use that skill for that turn. Multiple mentions mean use them all. Do not carry skills across turns unless re-mentioned.
+- Missing/blocked: If a named skill isn't in the list or the path can't be read, say so briefly and continue with the best fallback.
+- How to use a skill (progressive disclosure):
+  1) After deciding to use a skill, expand the listed short `path` with the matching alias from `### Skill roots`, then open its `SKILL.md`. Read only enough to follow the workflow.
+  2) When `SKILL.md` references relative paths (e.g., `scripts/foo.py`), resolve them relative to the directory containing that expanded `SKILL.md` first, and only consider other paths if needed.
+  3) If `SKILL.md` points to extra folders such as `references/`, load only the specific files needed for the request; don't bulk-load everything.
+  4) If `scripts/` exist, prefer running or patching them instead of retyping large code blocks.
+  5) If `assets/` or templates exist, reuse them instead of recreating from scratch.
+- Coordination and sequencing:
+  - If multiple skills apply, choose the minimal set that covers the request and state the order you'll use them.
+  - Announce which skill(s) you're using and why (one short line). If you skip an obvious skill, say why.
+- Context hygiene:
+  - Keep context small: summarize long sections instead of pasting them; only load extra files when needed.
+  - Avoid deep reference-chasing: prefer opening only files directly linked from `SKILL.md` unless you're blocked.
+  - When variants exist (frameworks, providers, domains), pick only the relevant reference file(s) and note that choice.
+- Safety and fallback: If a skill can't be applied cleanly (missing files, unclear instructions), state the issue, pick the next-best approach, and continue."###;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SkillMetadataBudget {
+    Tokens(usize),
+    Characters(usize),
+}
+
+impl SkillMetadataBudget {
+    fn limit(self) -> usize {
+        match self {
+            Self::Tokens(limit) | Self::Characters(limit) => limit,
+        }
+    }
+
+    fn cost(self, text: &str) -> usize {
+        match self {
+            Self::Tokens(_) => approx_token_count(text),
+            Self::Characters(_) => text.chars().count(),
+        }
+    }
+
+    fn cost_from_counts(self, chars: usize, bytes: usize) -> usize {
+        match self {
+            Self::Tokens(_) => bytes.div_ceil(APPROX_CHARS_PER_TOKEN),
+            Self::Characters(_) => chars,
+        }
+    }
+}
+
+fn default_skill_metadata_budget(context_window: Option<i64>) -> SkillMetadataBudget {
+    context_window
+        .and_then(|window| usize::try_from(window).ok())
+        .filter(|window| *window > 0)
+        .map(|window| {
+            SkillMetadataBudget::Tokens(
+                window
+                    .saturating_mul(SKILL_METADATA_CONTEXT_WINDOW_PERCENT)
+                    .saturating_div(100)
+                    .max(1),
+            )
+        })
+        .unwrap_or(SkillMetadataBudget::Characters(
+            DEFAULT_SKILL_METADATA_CHAR_BUDGET,
+        ))
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalSkillRenderReport {
+    total_count: usize,
+    included_count: usize,
+    omitted_count: usize,
+    truncated_description_chars: usize,
+    truncated_description_count: usize,
+}
+
+impl LocalSkillRenderReport {
+    fn average_truncated_description_chars(&self) -> usize {
+        if self.total_count == 0 || self.truncated_description_chars == 0 {
+            return 0;
+        }
+        self.truncated_description_chars
+            .saturating_add(self.total_count.saturating_sub(1))
+            / self.total_count
+    }
+}
+
+#[derive(Clone, Debug, Default, PartialEq, Eq)]
+struct LocalSkillPathAliases {
+    skill_root_lines: Vec<String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct LocalAvailableSkills {
+    skill_root_lines: Vec<String>,
+    skill_lines: Vec<String>,
+    report: LocalSkillRenderReport,
+    warning_message: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct RenderedSkillsInstructions {
+    content: String,
+    warning: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+struct LocalSkillSummary {
+    name: String,
+    root: PathBuf,
+    path: PathBuf,
+    description: Option<String>,
+    allow_implicit_invocation: bool,
+    scope_rank: u8,
+}
+
+fn render_available_skills_instructions(
+    codex_home: Option<&Path>,
+    cwd: &Path,
+    config: &AgentsMdConfig,
+) -> Option<RenderedSkillsInstructions> {
+    if !config.skills_include_instructions {
+        return None;
+    }
+    let mut skills = available_skill_summaries(codex_home, Some(cwd), config);
+    if skills.is_empty() {
+        return None;
+    }
+    skills.sort_by(|left, right| {
+        left.scope_rank
+            .cmp(&right.scope_rank)
+            .then(left.name.cmp(&right.name))
+            .then(left.path.cmp(&right.path))
+    });
+    let available = build_local_available_skills(
+        &skills,
+        default_skill_metadata_budget(config.model_context_window),
+    )?;
+    let lines = vec![
+        SKILLS_INSTRUCTIONS_OPEN_TAG.to_string(),
+        render_available_skills_body(&available.skill_root_lines, &available.skill_lines),
+        SKILLS_INSTRUCTIONS_CLOSE_TAG.to_string(),
+    ];
+    Some(RenderedSkillsInstructions {
+        content: lines.join("\n"),
+        warning: available.warning_message,
+    })
+}
+
+fn render_available_skills_body(skill_root_lines: &[String], skill_lines: &[String]) -> String {
+    let mut lines = Vec::new();
+    lines.push("## Skills".to_string());
+    if skill_root_lines.is_empty() {
+        lines.push(SKILLS_INTRO_WITH_ABSOLUTE_PATHS.to_string());
+    } else {
+        lines.push(SKILLS_INTRO_WITH_ALIASES.to_string());
+        lines.push("### Skill roots".to_string());
+        lines.extend(skill_root_lines.iter().cloned());
+    }
+    lines.push("### Available skills".to_string());
+    lines.extend(skill_lines.iter().cloned());
+    lines.push("### How to use skills".to_string());
+    lines.push(
+        if skill_root_lines.is_empty() {
+            SKILLS_HOW_TO_USE_WITH_ABSOLUTE_PATHS
+        } else {
+            SKILLS_HOW_TO_USE_WITH_ALIASES
+        }
+        .to_string(),
     );
-    lines.push(SKILLS_INSTRUCTIONS_CLOSE_TAG.to_string());
-    Some(lines.join("\n"))
+    lines.join("\n")
+}
+
+fn build_local_available_skills(
+    skills: &[LocalSkillSummary],
+    budget: SkillMetadataBudget,
+) -> Option<LocalAvailableSkills> {
+    if skills.is_empty() {
+        return None;
+    }
+    let absolute = build_local_available_skills_from_lines(
+        ordered_local_skill_lines(skills, None),
+        skills.len(),
+        budget,
+        LocalSkillPathAliases::default(),
+    )?;
+    if absolute.report.omitted_count == 0 && absolute.report.truncated_description_chars == 0 {
+        return Some(absolute);
+    }
+    let Some(aliased) = build_aliased_local_available_skills(skills, budget) else {
+        return Some(absolute);
+    };
+    if local_aliased_render_is_better(&aliased, &absolute, budget) {
+        Some(aliased)
+    } else {
+        Some(absolute)
+    }
+}
+
+fn build_local_available_skills_from_lines(
+    skill_lines: Vec<LocalSkillLine<'_>>,
+    total_count: usize,
+    budget: SkillMetadataBudget,
+    path_aliases: LocalSkillPathAliases,
+) -> Option<LocalAvailableSkills> {
+    if total_count == 0 {
+        return None;
+    }
+    let (skill_lines, report) =
+        render_local_skill_lines_from_lines(skill_lines, total_count, budget);
+    let warning_message = if report.omitted_count > 0 {
+        let skill_word = if report.omitted_count == 1 {
+            "skill"
+        } else {
+            "skills"
+        };
+        let verb = if report.omitted_count == 1 {
+            "was"
+        } else {
+            "were"
+        };
+        Some(format!(
+            "{} {} additional {} {} not included in the model-visible skills list.",
+            skill_budget_warning_prefix(budget, SKILL_DESCRIPTIONS_REMOVED_WARNING_PREFIX),
+            report.omitted_count,
+            skill_word,
+            verb
+        ))
+    } else if report.average_truncated_description_chars()
+        > SKILL_DESCRIPTION_TRUNCATION_WARNING_THRESHOLD_CHARS
+    {
+        Some(
+            match budget {
+                SkillMetadataBudget::Tokens(_) => SKILL_DESCRIPTION_TRUNCATED_WARNING_WITH_PERCENT,
+                SkillMetadataBudget::Characters(_) => SKILL_DESCRIPTION_TRUNCATED_WARNING,
+            }
+            .to_string(),
+        )
+    } else {
+        None
+    };
+    Some(LocalAvailableSkills {
+        skill_root_lines: path_aliases.skill_root_lines,
+        skill_lines,
+        report,
+        warning_message,
+    })
+}
+
+fn render_local_skill_lines_from_lines(
+    skill_lines: Vec<LocalSkillLine<'_>>,
+    total_count: usize,
+    budget: SkillMetadataBudget,
+) -> (Vec<String>, LocalSkillRenderReport) {
+    let full_cost = skill_lines.iter().fold(0usize, |used, line| {
+        used.saturating_add(line.full_cost(budget))
+    });
+    if full_cost <= budget.limit() {
+        return (
+            skill_lines
+                .iter()
+                .map(LocalSkillLine::render_full)
+                .collect(),
+            local_skill_render_report(total_count, skill_lines.len(), 0, 0, 0),
+        );
+    }
+
+    let minimum_cost = skill_lines.iter().fold(0usize, |used, line| {
+        used.saturating_add(line.minimum_cost(budget))
+    });
+    if minimum_cost <= budget.limit() {
+        let rendered = render_local_lines_with_description_budget(
+            budget,
+            &skill_lines,
+            budget.limit().saturating_sub(minimum_cost),
+        );
+        let (truncated_description_chars, truncated_description_count) =
+            sum_local_description_truncation(&rendered);
+        return (
+            rendered.into_iter().map(|rendered| rendered.line).collect(),
+            local_skill_render_report(
+                total_count,
+                skill_lines.len(),
+                0,
+                truncated_description_chars,
+                truncated_description_count,
+            ),
+        );
+    }
+
+    render_minimum_local_skill_lines_until_budget(budget, skill_lines, total_count)
+}
+
+fn render_minimum_local_skill_lines_until_budget(
+    budget: SkillMetadataBudget,
+    skill_lines: Vec<LocalSkillLine<'_>>,
+    total_count: usize,
+) -> (Vec<String>, LocalSkillRenderReport) {
+    let mut included = Vec::new();
+    let mut used = 0usize;
+    let mut omitted_count = 0usize;
+    let mut truncated_description_chars = 0usize;
+    let mut truncated_description_count = 0usize;
+    for line in skill_lines {
+        let line_cost = line.minimum_cost(budget);
+        let description_char_count = line.description_char_count();
+        if used.saturating_add(line_cost) <= budget.limit() {
+            used = used.saturating_add(line_cost);
+            included.push(line.render_minimum());
+        } else {
+            omitted_count = omitted_count.saturating_add(1);
+        }
+        truncated_description_chars =
+            truncated_description_chars.saturating_add(description_char_count);
+        if description_char_count > 0 {
+            truncated_description_count = truncated_description_count.saturating_add(1);
+        }
+    }
+    let included_count = included.len();
+    (
+        included,
+        local_skill_render_report(
+            total_count,
+            included_count,
+            omitted_count,
+            truncated_description_chars,
+            truncated_description_count,
+        ),
+    )
+}
+
+fn local_skill_render_report(
+    total_count: usize,
+    included_count: usize,
+    omitted_count: usize,
+    truncated_description_chars: usize,
+    truncated_description_count: usize,
+) -> LocalSkillRenderReport {
+    LocalSkillRenderReport {
+        total_count,
+        included_count,
+        omitted_count,
+        truncated_description_chars,
+        truncated_description_count,
+    }
+}
+
+fn skill_budget_warning_prefix(budget: SkillMetadataBudget, prefix: &str) -> String {
+    match budget {
+        SkillMetadataBudget::Tokens(_) => prefix.replacen(
+            "Exceeded skills context budget.",
+            "Exceeded skills context budget of 2%.",
+            1,
+        ),
+        SkillMetadataBudget::Characters(_) => prefix.to_string(),
+    }
+}
+
+fn local_skill_line_cost(budget: SkillMetadataBudget, line: &str) -> usize {
+    budget.cost(&format!("{line}\n"))
+}
+
+fn local_skill_lines_cost(budget: SkillMetadataBudget, lines: &[String]) -> usize {
+    lines.iter().fold(0usize, |used, line| {
+        used.saturating_add(local_skill_line_cost(budget, line))
+    })
+}
+
+#[derive(Clone)]
+struct LocalSkillLine<'a> {
+    name: &'a str,
+    description: &'a str,
+    path: String,
+}
+
+impl<'a> LocalSkillLine<'a> {
+    fn new(skill: &'a LocalSkillSummary, path: Option<String>) -> Self {
+        Self {
+            name: skill.name.as_str(),
+            description: skill.description.as_deref().unwrap_or(""),
+            path: path.unwrap_or_else(|| normalized_prompt_path(&skill.path)),
+        }
+    }
+
+    fn full_cost(&self, budget: SkillMetadataBudget) -> usize {
+        local_skill_line_cost(budget, &self.render_full())
+    }
+
+    fn minimum_cost(&self, budget: SkillMetadataBudget) -> usize {
+        local_skill_line_cost(budget, &self.render_minimum())
+    }
+
+    fn description_char_count(&self) -> usize {
+        self.description.chars().count()
+    }
+
+    fn render_full(&self) -> String {
+        self.render_with_description(self.description)
+    }
+
+    fn render_minimum(&self) -> String {
+        self.render_with_description("")
+    }
+
+    fn render_with_description_chars(&self, description_chars: usize) -> String {
+        if description_chars == 0 {
+            self.render_minimum()
+        } else {
+            let end = self
+                .description
+                .char_indices()
+                .nth(description_chars)
+                .map_or(self.description.len(), |(idx, _)| idx);
+            self.render_with_description(&self.description[..end])
+        }
+    }
+
+    fn render_with_description(&self, description: &str) -> String {
+        if description.is_empty() {
+            format!("- {}: (file: {})", self.name, self.path)
+        } else {
+            format!("- {}: {} (file: {})", self.name, description, self.path)
+        }
+    }
+}
+
+struct RenderedLocalSkillLine {
+    line: String,
+    truncated_chars: usize,
+}
+
+struct LocalDescriptionBudgetLine<'a> {
+    line: &'a LocalSkillLine<'a>,
+    description_char_count: usize,
+    extra_costs: Vec<usize>,
+}
+
+impl<'a> LocalDescriptionBudgetLine<'a> {
+    fn new(line: &'a LocalSkillLine<'a>, budget: SkillMetadataBudget) -> Self {
+        let minimum_line = line.render_minimum();
+        let minimum_chars = minimum_line.chars().count().saturating_add(1);
+        let minimum_bytes = minimum_line.len().saturating_add(1);
+        let minimum_cost = budget.cost_from_counts(minimum_chars, minimum_bytes);
+        let description_char_count = line.description_char_count();
+        let mut extra_costs = Vec::with_capacity(description_char_count.saturating_add(1));
+        extra_costs.push(0);
+
+        let mut prefix_chars = 0usize;
+        let mut prefix_bytes = 0usize;
+        for ch in line.description.chars() {
+            prefix_chars = prefix_chars.saturating_add(1);
+            prefix_bytes = prefix_bytes.saturating_add(ch.len_utf8());
+            let rendered_chars = minimum_chars.saturating_add(prefix_chars).saturating_add(1);
+            let rendered_bytes = minimum_bytes.saturating_add(prefix_bytes).saturating_add(1);
+            extra_costs.push(
+                budget
+                    .cost_from_counts(rendered_chars, rendered_bytes)
+                    .saturating_sub(minimum_cost),
+            );
+        }
+
+        Self {
+            line,
+            description_char_count,
+            extra_costs,
+        }
+    }
+}
+
+fn render_local_lines_with_description_budget(
+    budget: SkillMetadataBudget,
+    skill_lines: &[LocalSkillLine<'_>],
+    limit: usize,
+) -> Vec<RenderedLocalSkillLine> {
+    let budget_lines = skill_lines
+        .iter()
+        .map(|line| LocalDescriptionBudgetLine::new(line, budget))
+        .collect::<Vec<_>>();
+    let mut char_allocations = vec![0usize; budget_lines.len()];
+    let mut current_extra_costs = vec![0usize; budget_lines.len()];
+    let mut remaining = limit;
+
+    loop {
+        let mut changed = false;
+        for (index, line) in budget_lines.iter().enumerate() {
+            if char_allocations[index] >= line.description_char_count {
+                continue;
+            }
+            let current_cost = current_extra_costs[index];
+            let next_chars = char_allocations[index].saturating_add(1);
+            let next_cost = line.extra_costs[next_chars];
+            let delta = next_cost.saturating_sub(current_cost);
+            if delta <= remaining {
+                char_allocations[index] = next_chars;
+                current_extra_costs[index] = next_cost;
+                remaining = remaining.saturating_sub(delta);
+                changed = true;
+            }
+        }
+        if !changed {
+            break;
+        }
+    }
+
+    budget_lines
+        .iter()
+        .zip(char_allocations)
+        .map(|(line, description_chars)| RenderedLocalSkillLine {
+            line: line.line.render_with_description_chars(description_chars),
+            truncated_chars: line
+                .description_char_count
+                .saturating_sub(description_chars),
+        })
+        .collect()
+}
+
+fn sum_local_description_truncation(rendered: &[RenderedLocalSkillLine]) -> (usize, usize) {
+    rendered
+        .iter()
+        .fold((0usize, 0usize), |(chars, count), line| {
+            if line.truncated_chars == 0 {
+                (chars, count)
+            } else {
+                (
+                    chars.saturating_add(line.truncated_chars),
+                    count.saturating_add(1),
+                )
+            }
+        })
+}
+
+fn ordered_local_skill_lines<'a>(
+    skills: &'a [LocalSkillSummary],
+    aliases: Option<&LocalAliasPlan>,
+) -> Vec<LocalSkillLine<'a>> {
+    skills
+        .iter()
+        .map(|skill| {
+            let path = aliases.and_then(|plan| local_skill_path_with_aliases(skill, plan));
+            LocalSkillLine::new(skill, path)
+        })
+        .collect()
+}
+
+fn build_aliased_local_available_skills(
+    skills: &[LocalSkillSummary],
+    budget: SkillMetadataBudget,
+) -> Option<LocalAvailableSkills> {
+    let plan = build_local_alias_plan(skills, budget)?;
+    if plan.table_cost >= budget.limit() {
+        return None;
+    }
+    let adjusted_limit = budget.limit().saturating_sub(plan.table_cost);
+    let adjusted_budget = match budget {
+        SkillMetadataBudget::Tokens(_) => SkillMetadataBudget::Tokens(adjusted_limit),
+        SkillMetadataBudget::Characters(_) => SkillMetadataBudget::Characters(adjusted_limit),
+    };
+    build_local_available_skills_from_lines(
+        ordered_local_skill_lines(skills, Some(&plan)),
+        skills.len(),
+        adjusted_budget,
+        plan.aliases,
+    )
+}
+
+struct LocalAliasPlan {
+    aliases: LocalSkillPathAliases,
+    root_aliases: HashMap<PathBuf, String>,
+    alias_root_by_path: HashMap<PathBuf, PathBuf>,
+    table_cost: usize,
+}
+
+fn build_local_alias_plan(
+    skills: &[LocalSkillSummary],
+    budget: SkillMetadataBudget,
+) -> Option<LocalAliasPlan> {
+    let mut alias_roots = Vec::new();
+    let mut seen = HashSet::new();
+    for skill in skills {
+        let alias_root = skill
+            .root
+            .canonicalize()
+            .unwrap_or_else(|_| skill.root.clone());
+        if seen.insert(alias_root.clone()) {
+            alias_roots.push(alias_root);
+        }
+    }
+    if alias_roots.is_empty() {
+        return None;
+    }
+    let root_aliases = alias_roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| (root.clone(), format!("r{index}")))
+        .collect::<HashMap<_, _>>();
+    let alias_root_by_path = skills
+        .iter()
+        .filter_map(|skill| {
+            let skill_path = skill
+                .path
+                .canonicalize()
+                .unwrap_or_else(|_| skill.path.clone());
+            let skill_root = skill
+                .root
+                .canonicalize()
+                .unwrap_or_else(|_| skill.root.clone());
+            root_aliases
+                .contains_key(&skill_root)
+                .then_some((skill_path, skill_root))
+        })
+        .collect::<HashMap<_, _>>();
+    let skill_root_lines = alias_roots
+        .iter()
+        .enumerate()
+        .map(|(index, root)| format!("- `r{index}` = `{}`", normalized_prompt_path(root)))
+        .collect::<Vec<_>>();
+    let table_cost = aliased_skill_metadata_overhead_cost(budget, &skill_root_lines);
+    Some(LocalAliasPlan {
+        aliases: LocalSkillPathAliases { skill_root_lines },
+        root_aliases,
+        alias_root_by_path,
+        table_cost,
+    })
+}
+
+fn aliased_skill_metadata_overhead_cost(
+    budget: SkillMetadataBudget,
+    skill_root_lines: &[String],
+) -> usize {
+    let empty_skill_lines: &[String] = &[];
+    budget
+        .cost(&render_available_skills_body(
+            skill_root_lines,
+            empty_skill_lines,
+        ))
+        .saturating_sub(budget.cost(&render_available_skills_body(&[], empty_skill_lines)))
+}
+
+fn local_skill_path_with_aliases(
+    skill: &LocalSkillSummary,
+    plan: &LocalAliasPlan,
+) -> Option<String> {
+    let skill_path = skill
+        .path
+        .canonicalize()
+        .unwrap_or_else(|_| skill.path.clone());
+    let alias_root = plan.alias_root_by_path.get(&skill_path)?;
+    let alias = plan.root_aliases.get(alias_root)?;
+    let relative = skill_path.strip_prefix(alias_root).ok()?;
+    Some(format!("{alias}/{}", normalized_prompt_path(relative)))
+}
+
+fn local_aliased_render_is_better(
+    aliased: &LocalAvailableSkills,
+    absolute: &LocalAvailableSkills,
+    budget: SkillMetadataBudget,
+) -> bool {
+    if aliased.report.included_count != absolute.report.included_count {
+        return aliased.report.included_count > absolute.report.included_count;
+    }
+    if aliased.report.truncated_description_chars != absolute.report.truncated_description_chars {
+        return aliased.report.truncated_description_chars
+            < absolute.report.truncated_description_chars;
+    }
+    local_available_skills_cost(budget, aliased) < local_available_skills_cost(budget, absolute)
+}
+
+fn local_available_skills_cost(
+    budget: SkillMetadataBudget,
+    available: &LocalAvailableSkills,
+) -> usize {
+    let metadata_cost = if available.skill_root_lines.is_empty() {
+        0
+    } else {
+        aliased_skill_metadata_overhead_cost(budget, &available.skill_root_lines)
+    };
+    metadata_cost.saturating_add(local_skill_lines_cost(budget, &available.skill_lines))
+}
+
+fn normalized_prompt_path(path: &Path) -> String {
+    path.to_string_lossy().replace('\\', "/")
 }
 
 fn available_skill_summaries(
@@ -16442,7 +17088,12 @@ fn available_skill_summaries(
         path: PathBuf,
         name_prefix: Option<String>,
         bundled: bool,
+        scope_rank: u8,
     }
+
+    const SYSTEM_SKILL_SCOPE_RANK: u8 = 0;
+    const REPO_SKILL_SCOPE_RANK: u8 = 2;
+    const USER_SKILL_SCOPE_RANK: u8 = 3;
 
     let mut roots = Vec::new();
     if let Some(codex_home) = codex_home {
@@ -16450,16 +17101,19 @@ fn available_skill_summaries(
             path: codex_home.join(CODEX_SKILLS_DIR),
             name_prefix: None,
             bundled: false,
+            scope_rank: USER_SKILL_SCOPE_RANK,
         });
         roots.push(SkillRootCandidate {
             path: codex_home.join(CODEX_AGENTS_DIR).join(CODEX_SKILLS_DIR),
             name_prefix: None,
             bundled: false,
+            scope_rank: USER_SKILL_SCOPE_RANK,
         });
         roots.push(SkillRootCandidate {
             path: codex_home.join(CODEX_TMP_SKILLS_DIR),
             name_prefix: None,
             bundled: true,
+            scope_rank: SYSTEM_SKILL_SCOPE_RANK,
         });
         for plugin in codex_plugin_capability_summaries_for_config(config) {
             if let Some(skill_root) = plugin.skill_root {
@@ -16467,6 +17121,7 @@ fn available_skill_summaries(
                     path: skill_root,
                     name_prefix: Some(plugin.display_name),
                     bundled: false,
+                    scope_rank: USER_SKILL_SCOPE_RANK,
                 });
             }
         }
@@ -16476,6 +17131,7 @@ fn available_skill_summaries(
             path: system_root,
             name_prefix: None,
             bundled: true,
+            scope_rank: SYSTEM_SKILL_SCOPE_RANK,
         });
     }
     if let Some(cwd) = cwd {
@@ -16486,11 +17142,13 @@ fn available_skill_summaries(
                 path: dir.join(CODEX_AGENTS_DIR).join(CODEX_SKILLS_DIR),
                 name_prefix: None,
                 bundled: false,
+                scope_rank: REPO_SKILL_SCOPE_RANK,
             });
             roots.push(SkillRootCandidate {
                 path: dir.join(PROJECT_CODEX_DIR).join(CODEX_SKILLS_DIR),
                 name_prefix: None,
                 bundled: false,
+                scope_rank: REPO_SKILL_SCOPE_RANK,
             });
         }
     }
@@ -16502,6 +17160,7 @@ fn available_skill_summaries(
             &root.path,
             root.name_prefix.as_deref(),
             root.bundled,
+            root.scope_rank,
             config,
             0,
             &mut seen,
@@ -16518,6 +17177,7 @@ fn collect_skill_summaries(
     dir: &Path,
     name_prefix: Option<&str>,
     bundled: bool,
+    scope_rank: u8,
     config: &AgentsMdConfig,
     depth: usize,
     seen: &mut HashSet<PathBuf>,
@@ -16539,7 +17199,12 @@ fn collect_skill_summaries(
             .canonicalize()
             .unwrap_or_else(|_| skill_path.clone());
         if seen.insert(canonical) {
-            summaries.push(skill_summary_from_skill_md(root, &skill_path, name_prefix));
+            summaries.push(skill_summary_from_skill_md(
+                root,
+                &skill_path,
+                name_prefix,
+                scope_rank,
+            ));
         }
         return;
     }
@@ -16554,6 +17219,7 @@ fn collect_skill_summaries(
                 &path,
                 name_prefix,
                 bundled,
+                scope_rank,
                 config,
                 depth + 1,
                 seen,
@@ -16588,6 +17254,7 @@ fn skill_summary_from_skill_md(
     root: &Path,
     path: &Path,
     name_prefix: Option<&str>,
+    scope_rank: u8,
 ) -> LocalSkillSummary {
     let parent = path.parent().unwrap_or(root);
     let relative = parent.strip_prefix(root).unwrap_or(parent);
@@ -16631,9 +17298,11 @@ fn skill_summary_from_skill_md(
         .unwrap_or(true);
     LocalSkillSummary {
         name,
+        root: root.to_path_buf(),
         path: path.to_path_buf(),
         description,
         allow_implicit_invocation,
+        scope_rank,
     }
 }
 
@@ -36977,8 +37646,146 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             .collect::<Vec<_>>()
             .join("\n");
         assert!(joined.contains("<skills_instructions>"));
-        assert!(joined.contains("`Docs`"));
+        assert!(joined.contains("- Docs:"));
         assert!(joined.contains("Use when documentation needs careful updates."));
+        Ok(())
+    }
+
+    fn local_skill_summary_for_test(
+        root: &Path,
+        name: &str,
+        description: &str,
+        scope_rank: u8,
+    ) -> LocalSkillSummary {
+        LocalSkillSummary {
+            name: name.to_string(),
+            root: root.to_path_buf(),
+            path: root.join(name).join("SKILL.md"),
+            description: Some(description.to_string()),
+            allow_implicit_invocation: true,
+            scope_rank,
+        }
+    }
+
+    #[test]
+    fn skill_metadata_budget_matches_codex_shape() {
+        assert_eq!(
+            default_skill_metadata_budget(Some(200_000)),
+            SkillMetadataBudget::Tokens(4_000)
+        );
+        assert_eq!(
+            default_skill_metadata_budget(Some(99)),
+            SkillMetadataBudget::Tokens(1)
+        );
+        assert_eq!(
+            default_skill_metadata_budget(None),
+            SkillMetadataBudget::Characters(DEFAULT_SKILL_METADATA_CHAR_BUDGET)
+        );
+    }
+
+    #[test]
+    fn available_skills_renderer_truncates_descriptions_before_omitting_skills() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("skills");
+        let alpha = local_skill_summary_for_test(&root, "alpha", &"a".repeat(250), 2);
+        let beta = local_skill_summary_for_test(&root, "beta", &"b".repeat(250), 2);
+        let minimum_cost = LocalSkillLine::new(&alpha, None)
+            .minimum_cost(SkillMetadataBudget::Characters(usize::MAX))
+            + LocalSkillLine::new(&beta, None)
+                .minimum_cost(SkillMetadataBudget::Characters(usize::MAX));
+
+        let rendered = build_local_available_skills(
+            &[alpha, beta],
+            SkillMetadataBudget::Characters(minimum_cost + 40),
+        )
+        .expect("skills should render");
+
+        assert_eq!(rendered.report.total_count, 2);
+        assert_eq!(rendered.report.included_count, 2);
+        assert_eq!(rendered.report.omitted_count, 0);
+        assert!(rendered.report.truncated_description_chars > 100);
+        assert_eq!(
+            rendered.warning_message,
+            Some(SKILL_DESCRIPTION_TRUNCATED_WARNING.to_string())
+        );
+        let joined = rendered.skill_lines.join("\n");
+        assert!(joined.contains("- alpha:"));
+        assert!(joined.contains("- beta:"));
+        assert!(!joined.contains(&"a".repeat(250)));
+        Ok(())
+    }
+
+    #[test]
+    fn available_skills_renderer_omits_low_priority_minimum_lines_over_budget() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp.path().join("skills");
+        let system = local_skill_summary_for_test(&root, "system", "system-desc", 0);
+        let repo = local_skill_summary_for_test(&root, "repo", "repo-desc", 2);
+        let user = local_skill_summary_for_test(&root, "user", "user-desc", 3);
+        let budget = LocalSkillLine::new(&system, None)
+            .minimum_cost(SkillMetadataBudget::Characters(usize::MAX))
+            + LocalSkillLine::new(&repo, None)
+                .minimum_cost(SkillMetadataBudget::Characters(usize::MAX));
+
+        let rendered = build_local_available_skills(
+            &[system, repo, user],
+            SkillMetadataBudget::Characters(budget),
+        )
+        .expect("skills should render");
+
+        assert_eq!(rendered.report.included_count, 2);
+        assert_eq!(rendered.report.omitted_count, 1);
+        assert_eq!(
+            rendered.warning_message,
+            Some(
+                "Exceeded skills context budget. All skill descriptions were removed and 1 additional skill was not included in the model-visible skills list."
+                    .to_string()
+            )
+        );
+        let joined = rendered.skill_lines.join("\n");
+        assert!(joined.contains("- system:"));
+        assert!(joined.contains("- repo:"));
+        assert!(!joined.contains("- user:"));
+        assert!(!joined.contains("system-desc"));
+        Ok(())
+    }
+
+    #[test]
+    fn available_skills_renderer_uses_root_aliases_when_they_preserve_more_skills() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let root = temp
+            .path()
+            .join("plugins/cache/example/hash/skills-with-a-long-shared-prefix");
+        let mut skills = Vec::new();
+        for index in 0..12 {
+            skills.push(local_skill_summary_for_test(
+                &root,
+                &format!("shared-root-skill-{index}"),
+                "desc",
+                3,
+            ));
+        }
+        let plan = build_local_alias_plan(&skills, SkillMetadataBudget::Characters(usize::MAX))
+            .expect("alias plan should build");
+        let alias_minimum_cost = skills.iter().fold(plan.table_cost, |cost, skill| {
+            cost.saturating_add(
+                LocalSkillLine::new(skill, local_skill_path_with_aliases(skill, &plan))
+                    .minimum_cost(SkillMetadataBudget::Characters(usize::MAX)),
+            )
+        });
+
+        let rendered = build_local_available_skills(
+            &skills,
+            SkillMetadataBudget::Characters(alias_minimum_cost),
+        )
+        .expect("skills should render");
+
+        assert_eq!(rendered.report.included_count, skills.len());
+        assert_eq!(rendered.report.omitted_count, 0);
+        assert_eq!(rendered.skill_root_lines.len(), 1);
+        let joined = rendered.skill_lines.join("\n");
+        assert!(joined.contains("r0/shared-root-skill-0/SKILL.md"));
+        assert!(joined.contains("r0/shared-root-skill-11/SKILL.md"));
         Ok(())
     }
 
@@ -37004,7 +37811,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
             .map(message_content_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("`RepoDocs`"));
+        assert!(joined.contains("- RepoDocs:"));
         assert!(joined.contains("Use when repo-local docs need updates."));
         assert!(joined.contains(".agents/skills/RepoDocs/SKILL.md"));
         Ok(())
@@ -37057,7 +37864,7 @@ enabled = false
             .map(message_content_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("`custom-user-docs`"));
+        assert!(joined.contains("- custom-user-docs:"));
         assert!(joined.contains("Use for user docs."));
         assert!(!joined.contains("HiddenSkill"));
         assert!(!joined.contains("Bundled"));
@@ -37099,7 +37906,7 @@ enabled = false
             .map(message_content_text)
             .collect::<Vec<_>>()
             .join("\n");
-        assert!(joined.contains("`DemoPlugin:Assist`"));
+        assert!(joined.contains("- DemoPlugin:Assist:"));
         assert!(joined.contains("Use for plugin assistance."));
         assert!(joined.contains("<plugins_instructions>"));
         assert!(joined.contains("`DemoPlugin`"));

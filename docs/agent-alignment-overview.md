@@ -1720,6 +1720,38 @@ The biggest remaining categories are:
   history/rollout/replay ownership, deeper local compaction/token lifecycle
   precision, persistent goal state and external mutation callbacks, richer
   subagent lifecycle ownership, and review/plugin/skill manager depth.
+- The current skills slice closes a model-visible prompt hygiene gap in the
+  local skill inventory. Instead of dumping every skill description until an
+  arbitrary count cap, available skills now render through a Codex-shaped
+  metadata budget: 2% of the configured model context window when known, or an
+  8k character fallback. The renderer fairly shortens descriptions before
+  omitting skills, keeps higher-priority scopes first when minimum lines exceed
+  the budget, emits provider-neutral startup warnings when metadata is
+  compressed, and uses `### Skill roots` aliases when shared path roots let more
+  skills fit. This matters because skill inventory lives in the model's
+  developer context on every turn; unbounded descriptions can waste context, and
+  silent omission can make the model miss reusable local capabilities.
+- Verification for the skills slice passed the full local gate: formatting,
+  whitespace, Python tests, and full Rust workspace tests. The full workspace
+  run passed with browser-use-browser 16 passed plus 2 ignored browser smokes,
+  CLI 18, core 439, protocol 19, providers 104, python-worker 11, store 15,
+  TUI 140, and doc-tests. The live Codex-auth smoke used root session
+  `4f462619aa02` and child session `18051821d0a3`; the root returned `Paris`,
+  and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad real child-agent audits after this slice treated the skill metadata
+  rewrite as the only branch-local model-visible change. The consensus was that
+  it is a useful parity improvement rather than a regression, with the normal
+  caution that budget and warning behavior now affects what the model sees.
+  Several individual reports repeated stale "hooks/skills/plugins/goals absent"
+  language; those claims were filtered against implemented code and focused
+  tests. The remaining material gaps are unchanged: dynamic callable
+  contributors from MCP/apps/plugins/extensions, cancellable async tool futures
+  with read/write gates, first-class active-turn/thread control state, typed
+  history/rollout/replay ownership, deeper local compaction/token lifecycle
+  precision, persistent goal state and external mutation callbacks, richer
+  subagent lifecycle ownership, richer review flow, and skill/plugin manager
+  depth beyond prompt rendering.
 
 ## Definition of Done
 
