@@ -5,14 +5,18 @@ use sha1::{Digest, Sha1};
 use std::collections::{BTreeMap, BTreeSet};
 use std::io::{BufRead, BufReader, Read, Write};
 use std::path::{Path, PathBuf};
-use std::process::{Command as ProcessCommand, Stdio};
-use std::sync::mpsc;
+use std::process::{Child, ChildStderr, ChildStdin, ChildStdout, Command as ProcessCommand, Stdio};
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{mpsc, Arc, Mutex, OnceLock};
 use std::thread;
 use std::time::{Duration, Instant};
 
 const DEFAULT_MCP_STARTUP_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_MCP_TOOL_TIMEOUT_MS: u64 = 60_000;
 const MCP_PROTOCOL_VERSION: &str = "2024-11-05";
+const MAX_MCP_STDERR_BUFFER_CHARS: usize = 8_000;
+
+type SharedMcpConnection = Arc<Mutex<Option<PersistentMcpConnection>>>;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub(crate) struct McpServerConfig {
@@ -272,13 +276,21 @@ fn parse_mcp_server_config(
     }))
 }
 
-pub(crate) fn discover_tool_definitions(
+pub(crate) fn discover_tool_definitions_for_session(
+    session_id: &str,
+    servers: &BTreeMap<String, McpServerConfig>,
+) -> Result<Vec<McpToolDefinition>> {
+    discover_tool_definitions_for_scope(Some(session_id), servers)
+}
+
+fn discover_tool_definitions_for_scope(
+    scope: Option<&str>,
     servers: &BTreeMap<String, McpServerConfig>,
 ) -> Result<Vec<McpToolDefinition>> {
     let mut definitions = Vec::new();
     let mut seen = BTreeSet::<(String, String)>::new();
     for server in servers.values() {
-        let tools = match list_server_tools(server) {
+        let tools = match list_server_tools_for_scope(scope, server) {
             Ok(tools) => tools,
             Err(error) if server.required => {
                 return Err(error).with_context(|| {
@@ -339,8 +351,21 @@ pub(crate) fn discover_tool_definitions(
     Ok(definitions)
 }
 
-pub(crate) fn call_tool(definition: &McpToolDefinition, arguments: &Value) -> Result<Value> {
+pub(crate) fn call_tool_for_session(
+    session_id: &str,
+    definition: &McpToolDefinition,
+    arguments: &Value,
+) -> Result<Value> {
+    call_tool_for_scope(Some(session_id), definition, arguments)
+}
+
+fn call_tool_for_scope(
+    scope: Option<&str>,
+    definition: &McpToolDefinition,
+    arguments: &Value,
+) -> Result<Value> {
     run_mcp_operation(
+        scope,
         &definition.server,
         McpOperation::CallTool {
             name: definition.raw_tool_name.clone(),
@@ -350,19 +375,47 @@ pub(crate) fn call_tool(definition: &McpToolDefinition, arguments: &Value) -> Re
     )
 }
 
-pub(crate) fn list_resources(server: &McpServerConfig, cursor: Option<&str>) -> Result<Value> {
-    list_resource_page(server, McpResourceListKind::Resources, cursor)
-}
-
-pub(crate) fn list_resource_templates(
+pub(crate) fn list_resources_for_session(
+    session_id: &str,
     server: &McpServerConfig,
     cursor: Option<&str>,
 ) -> Result<Value> {
-    list_resource_page(server, McpResourceListKind::Templates, cursor)
+    list_resource_page(
+        Some(session_id),
+        server,
+        McpResourceListKind::Resources,
+        cursor,
+    )
 }
 
-pub(crate) fn read_resource(server: &McpServerConfig, uri: &str) -> Result<Value> {
+pub(crate) fn list_resource_templates_for_session(
+    session_id: &str,
+    server: &McpServerConfig,
+    cursor: Option<&str>,
+) -> Result<Value> {
+    list_resource_page(
+        Some(session_id),
+        server,
+        McpResourceListKind::Templates,
+        cursor,
+    )
+}
+
+pub(crate) fn read_resource_for_session(
+    session_id: &str,
+    server: &McpServerConfig,
+    uri: &str,
+) -> Result<Value> {
+    read_resource_for_scope(Some(session_id), server, uri)
+}
+
+fn read_resource_for_scope(
+    scope: Option<&str>,
+    server: &McpServerConfig,
+    uri: &str,
+) -> Result<Value> {
     run_mcp_operation(
+        scope,
         server,
         McpOperation::ReadResource {
             uri: uri.to_string(),
@@ -371,20 +424,30 @@ pub(crate) fn read_resource(server: &McpServerConfig, uri: &str) -> Result<Value
     )
 }
 
-pub(crate) fn list_all_resources(
+pub(crate) fn list_all_resources_for_session(
+    session_id: &str,
     servers: &BTreeMap<String, McpServerConfig>,
 ) -> BTreeMap<String, Vec<Value>> {
-    list_all_resource_items(servers, McpResourceListKind::Resources)
+    list_all_resource_items(Some(session_id), servers, McpResourceListKind::Resources)
 }
 
-pub(crate) fn list_all_resource_templates(
+pub(crate) fn list_all_resource_templates_for_session(
+    session_id: &str,
     servers: &BTreeMap<String, McpServerConfig>,
 ) -> BTreeMap<String, Vec<Value>> {
-    list_all_resource_items(servers, McpResourceListKind::Templates)
+    list_all_resource_items(Some(session_id), servers, McpResourceListKind::Templates)
 }
 
-fn list_server_tools(server: &McpServerConfig) -> Result<Vec<Value>> {
-    let result = run_mcp_operation(server, McpOperation::ListTools, server.startup_timeout_ms)?;
+fn list_server_tools_for_scope(
+    scope: Option<&str>,
+    server: &McpServerConfig,
+) -> Result<Vec<Value>> {
+    let result = run_mcp_operation(
+        scope,
+        server,
+        McpOperation::ListTools,
+        server.startup_timeout_ms,
+    )?;
     Ok(result
         .get("tools")
         .and_then(Value::as_array)
@@ -422,11 +485,13 @@ impl McpResourceListKind {
 }
 
 fn list_resource_page(
+    scope: Option<&str>,
     server: &McpServerConfig,
     kind: McpResourceListKind,
     cursor: Option<&str>,
 ) -> Result<Value> {
     run_mcp_operation(
+        scope,
         server,
         McpOperation::ListResources {
             kind,
@@ -437,12 +502,13 @@ fn list_resource_page(
 }
 
 fn list_all_resource_items(
+    scope: Option<&str>,
     servers: &BTreeMap<String, McpServerConfig>,
     kind: McpResourceListKind,
 ) -> BTreeMap<String, Vec<Value>> {
     let mut collected_by_server = BTreeMap::new();
     for server in servers.values() {
-        let Ok(collected) = list_all_resource_items_for_server(server, kind) else {
+        let Ok(collected) = list_all_resource_items_for_server(scope, server, kind) else {
             continue;
         };
         collected_by_server.insert(server.server_name.clone(), collected);
@@ -451,6 +517,7 @@ fn list_all_resource_items(
 }
 
 fn list_all_resource_items_for_server(
+    scope: Option<&str>,
     server: &McpServerConfig,
     kind: McpResourceListKind,
 ) -> Result<Vec<Value>> {
@@ -458,7 +525,7 @@ fn list_all_resource_items_for_server(
     let mut cursor: Option<String> = None;
     let mut seen_cursors = BTreeSet::new();
     loop {
-        let result = list_resource_page(server, kind, cursor.as_deref())?;
+        let result = list_resource_page(scope, server, kind, cursor.as_deref())?;
         collected.extend(mcp_resource_items(&result, kind));
         let Some(next_cursor) = mcp_next_cursor(&result) else {
             return Ok(collected);
@@ -505,17 +572,69 @@ enum McpOperation {
     },
 }
 
+impl McpOperation {
+    fn into_json_rpc_request(self, id: i64) -> Value {
+        match self {
+            Self::ListTools => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/list",
+                "params": {},
+            }),
+            Self::CallTool { name, arguments } => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "tools/call",
+                "params": {
+                    "name": name,
+                    "arguments": arguments,
+                },
+            }),
+            Self::ListResources { kind, cursor } => {
+                let params = cursor
+                    .map(|cursor| json!({ "cursor": cursor }))
+                    .unwrap_or_else(|| json!({}));
+                json!({
+                    "jsonrpc": "2.0",
+                    "id": id,
+                    "method": kind.method(),
+                    "params": params,
+                })
+            }
+            Self::ReadResource { uri } => json!({
+                "jsonrpc": "2.0",
+                "id": id,
+                "method": "resources/read",
+                "params": {
+                    "uri": uri,
+                },
+            }),
+        }
+    }
+}
+
 fn run_mcp_operation(
+    scope: Option<&str>,
     server: &McpServerConfig,
     operation: McpOperation,
     timeout_ms: u64,
 ) -> Result<Value> {
     let server = server.clone();
     let server_name = server.server_name.clone();
+    let connection_key = persistent_mcp_connection_key(scope, &server);
+    let connection = persistent_mcp_connection_slot(&connection_key);
+    let canceled = Arc::new(AtomicBool::new(false));
     let (pid_tx, pid_rx) = mpsc::channel::<u32>();
     let (result_tx, result_rx) = mpsc::channel::<Result<Value>>();
+    let worker_canceled = Arc::clone(&canceled);
     let handle = thread::spawn(move || {
-        let result = run_mcp_operation_inner(&server, operation, pid_tx);
+        let result = run_persistent_mcp_operation_inner(
+            &server,
+            operation,
+            connection,
+            pid_tx,
+            worker_canceled,
+        );
         let _ = result_tx.send(result);
     });
     let timeout = Duration::from_millis(timeout_ms.max(1));
@@ -543,9 +662,11 @@ fn run_mcp_operation(
             Err(mpsc::TryRecvError::Empty) => {}
         }
         if started.elapsed() >= timeout {
+            canceled.store(true, Ordering::SeqCst);
             if let Some(pid) = child_pid {
                 terminate_process_id(pid);
             }
+            remove_persistent_mcp_connection(&connection_key);
             bail!(
                 "MCP server `{}` timed out after {} ms",
                 server_name,
@@ -556,48 +677,109 @@ fn run_mcp_operation(
     }
 }
 
-fn run_mcp_operation_inner(
+fn run_persistent_mcp_operation_inner(
     server: &McpServerConfig,
     operation: McpOperation,
+    connection: SharedMcpConnection,
     pid_tx: mpsc::Sender<u32>,
+    canceled: Arc<AtomicBool>,
 ) -> Result<Value> {
-    let mut command = ProcessCommand::new(&server.command);
-    command.args(&server.args);
-    if let Some(cwd) = &server.cwd {
-        command.current_dir(cwd);
+    if canceled.load(Ordering::SeqCst) {
+        bail!("MCP operation cancelled before start");
     }
-    command.envs(&server.env);
-    command.stdin(Stdio::piped());
-    command.stdout(Stdio::piped());
-    command.stderr(Stdio::piped());
-    let mut child = command
-        .spawn()
-        .with_context(|| format!("failed to start MCP server `{}`", server.server_name))?;
-    let _ = pid_tx.send(child.id());
-    let mut stdin = child
-        .stdin
-        .take()
-        .context("MCP child stdin was not captured")?;
-    let stdout = child
-        .stdout
-        .take()
-        .context("MCP child stdout was not captured")?;
-    let stderr = child
-        .stderr
-        .take()
-        .context("MCP child stderr was not captured")?;
-    let mut stdout = BufReader::new(stdout);
-    let stderr_handle = thread::spawn(move || {
-        let mut stderr_text = String::new();
-        let _ = BufReader::new(stderr).read_to_string(&mut stderr_text);
-        stderr_text
-    });
-    let result = (|| -> Result<Value> {
+    let mut guard = connection
+        .lock()
+        .map_err(|_| anyhow!("MCP connection cache lock poisoned"))?;
+    if canceled.load(Ordering::SeqCst) {
+        bail!("MCP operation cancelled before connection acquisition");
+    }
+    if guard.is_none() {
+        *guard = Some(PersistentMcpConnection::start(server, &pid_tx)?);
+    } else if let Some(connection) = guard.as_ref() {
+        let _ = pid_tx.send(connection.pid());
+    }
+    if canceled.load(Ordering::SeqCst) {
+        bail!("MCP operation cancelled before invocation");
+    }
+    let connection = guard
+        .as_mut()
+        .ok_or_else(|| anyhow!("MCP connection cache was empty after initialization"))?;
+    let result = connection.invoke(operation);
+    let reset_connection = result
+        .as_ref()
+        .err()
+        .is_some_and(mcp_operation_error_resets_connection);
+    if reset_connection {
+        connection.shutdown();
+    }
+    let stderr_text = connection.stderr_snapshot();
+    if reset_connection {
+        *guard = None;
+    }
+    with_mcp_stderr_context(result, &server.server_name, &stderr_text)
+}
+
+struct PersistentMcpConnection {
+    child: Child,
+    stdin: ChildStdin,
+    stdout: BufReader<ChildStdout>,
+    stderr_text: Arc<Mutex<String>>,
+    stderr_handle: Option<thread::JoinHandle<()>>,
+    next_request_id: i64,
+}
+
+impl PersistentMcpConnection {
+    fn start(server: &McpServerConfig, pid_tx: &mpsc::Sender<u32>) -> Result<Self> {
+        let mut command = ProcessCommand::new(&server.command);
+        command.args(&server.args);
+        if let Some(cwd) = &server.cwd {
+            command.current_dir(cwd);
+        }
+        command.envs(&server.env);
+        command.stdin(Stdio::piped());
+        command.stdout(Stdio::piped());
+        command.stderr(Stdio::piped());
+        let mut child = command
+            .spawn()
+            .with_context(|| format!("failed to start MCP server `{}`", server.server_name))?;
+        let _ = pid_tx.send(child.id());
+        let stdin = child
+            .stdin
+            .take()
+            .context("MCP child stdin was not captured")?;
+        let stdout = child
+            .stdout
+            .take()
+            .context("MCP child stdout was not captured")?;
+        let stderr = child
+            .stderr
+            .take()
+            .context("MCP child stderr was not captured")?;
+        let stderr_text = Arc::new(Mutex::new(String::new()));
+        let stderr_handle = spawn_mcp_stderr_reader(stderr, Arc::clone(&stderr_text));
+        let mut connection = Self {
+            child,
+            stdin,
+            stdout: BufReader::new(stdout),
+            stderr_text,
+            stderr_handle: Some(stderr_handle),
+            next_request_id: 1,
+        };
+        if let Err(error) = connection.initialize() {
+            connection.shutdown();
+            let stderr_text = connection.stderr_snapshot();
+            return with_mcp_stderr_context(Err(error), &server.server_name, &stderr_text);
+        }
+        Ok(connection)
+    }
+
+    fn initialize(&mut self) -> Result<()> {
+        let initialize_id = self.next_request_id();
         write_json_rpc(
-            &mut stdin,
+            &mut self.stdin,
             &json!({
                 "jsonrpc": "2.0",
-                "id": 1,
+                "id": initialize_id,
                 "method": "initialize",
                 "params": {
                     "protocolVersion": MCP_PROTOCOL_VERSION,
@@ -609,78 +791,196 @@ fn run_mcp_operation_inner(
                 },
             }),
         )?;
-        let _ = read_json_rpc_response(&mut stdout, 1)?;
+        let _ = read_json_rpc_response(&mut self.stdout, initialize_id)?;
         write_json_rpc(
-            &mut stdin,
+            &mut self.stdin,
             &json!({
                 "jsonrpc": "2.0",
                 "method": "notifications/initialized",
                 "params": {},
             }),
         )?;
-        match operation {
-            McpOperation::ListTools => {
-                write_json_rpc(
-                    &mut stdin,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": "tools/list",
-                        "params": {},
-                    }),
-                )?;
-                read_json_rpc_response(&mut stdout, 2)
-            }
-            McpOperation::CallTool { name, arguments } => {
-                write_json_rpc(
-                    &mut stdin,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": "tools/call",
-                        "params": {
-                            "name": name,
-                            "arguments": arguments,
-                        },
-                    }),
-                )?;
-                read_json_rpc_response(&mut stdout, 2)
-            }
-            McpOperation::ListResources { kind, cursor } => {
-                let params = cursor
-                    .map(|cursor| json!({ "cursor": cursor }))
-                    .unwrap_or_else(|| json!({}));
-                write_json_rpc(
-                    &mut stdin,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": kind.method(),
-                        "params": params,
-                    }),
-                )?;
-                read_json_rpc_response(&mut stdout, 2)
-            }
-            McpOperation::ReadResource { uri } => {
-                write_json_rpc(
-                    &mut stdin,
-                    &json!({
-                        "jsonrpc": "2.0",
-                        "id": 2,
-                        "method": "resources/read",
-                        "params": {
-                            "uri": uri,
-                        },
-                    }),
-                )?;
-                read_json_rpc_response(&mut stdout, 2)
+        Ok(())
+    }
+
+    fn invoke(&mut self, operation: McpOperation) -> Result<Value> {
+        let id = self.next_request_id();
+        write_json_rpc(&mut self.stdin, &operation.into_json_rpc_request(id))?;
+        read_json_rpc_response(&mut self.stdout, id)
+    }
+
+    fn next_request_id(&mut self) -> i64 {
+        let id = self.next_request_id;
+        self.next_request_id = self.next_request_id.saturating_add(1);
+        id
+    }
+
+    fn pid(&self) -> u32 {
+        self.child.id()
+    }
+
+    fn stderr_snapshot(&self) -> String {
+        self.stderr_text
+            .lock()
+            .map(|text| text.clone())
+            .unwrap_or_default()
+    }
+
+    fn shutdown(&mut self) {
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+        if let Some(stderr_handle) = self.stderr_handle.take() {
+            let _ = stderr_handle.join();
+        }
+    }
+}
+
+impl Drop for PersistentMcpConnection {
+    fn drop(&mut self) {
+        self.shutdown();
+    }
+}
+
+fn persistent_mcp_connection_slot(key: &str) -> SharedMcpConnection {
+    let mut connections = persistent_mcp_connections()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    connections
+        .entry(key.to_string())
+        .or_insert_with(|| Arc::new(Mutex::new(None)))
+        .clone()
+}
+
+fn remove_persistent_mcp_connection(key: &str) {
+    let mut connections = persistent_mcp_connections()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    connections.remove(key);
+}
+
+pub(crate) fn cleanup_mcp_connections_for_session(session_id: &str) -> usize {
+    cleanup_persistent_mcp_connections_for_scope(Some(session_id))
+}
+
+pub(crate) fn cleanup_all_mcp_connections() -> usize {
+    let connections = {
+        let mut connections = persistent_mcp_connections()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        std::mem::take(&mut *connections)
+    };
+    cleanup_persistent_mcp_connection_slots(connections.into_values())
+}
+
+fn cleanup_persistent_mcp_connections_for_scope(scope: Option<&str>) -> usize {
+    let prefix = persistent_mcp_scope_key_prefix(scope);
+    let slots = {
+        let mut connections = persistent_mcp_connections()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let keys = connections
+            .keys()
+            .filter(|key| key.starts_with(&prefix))
+            .cloned()
+            .collect::<Vec<_>>();
+        keys.into_iter()
+            .filter_map(|key| connections.remove(&key))
+            .collect::<Vec<_>>()
+    };
+    cleanup_persistent_mcp_connection_slots(slots)
+}
+
+fn cleanup_persistent_mcp_connection_slots(
+    slots: impl IntoIterator<Item = SharedMcpConnection>,
+) -> usize {
+    let mut cleaned = 0;
+    for slot in slots {
+        let Ok(mut connection) = slot.lock() else {
+            continue;
+        };
+        if let Some(mut connection) = connection.take() {
+            connection.shutdown();
+            cleaned += 1;
+        }
+    }
+    cleaned
+}
+
+fn persistent_mcp_connections() -> &'static Mutex<BTreeMap<String, SharedMcpConnection>> {
+    static CONNECTIONS: OnceLock<Mutex<BTreeMap<String, SharedMcpConnection>>> = OnceLock::new();
+    CONNECTIONS.get_or_init(|| Mutex::new(BTreeMap::new()))
+}
+
+fn persistent_mcp_scope_key_prefix(scope: Option<&str>) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(scope.unwrap_or("<global>").as_bytes());
+    format!("scope:{:x}:", hasher.finalize())
+}
+
+fn persistent_mcp_connection_key(scope: Option<&str>, server: &McpServerConfig) -> String {
+    let mut hasher = Sha1::new();
+    hasher.update(server.server_name.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(server.command.as_bytes());
+    hasher.update(b"\0");
+    for arg in &server.args {
+        hasher.update(arg.as_bytes());
+        hasher.update(b"\0");
+    }
+    for (key, value) in &server.env {
+        hasher.update(key.as_bytes());
+        hasher.update(b"=");
+        hasher.update(value.as_bytes());
+        hasher.update(b"\0");
+    }
+    if let Some(cwd) = &server.cwd {
+        hasher.update(cwd.display().to_string().as_bytes());
+    }
+    format!(
+        "{}{}:{:x}",
+        persistent_mcp_scope_key_prefix(scope),
+        server.server_name,
+        hasher.finalize()
+    )
+}
+
+fn spawn_mcp_stderr_reader(
+    stderr: ChildStderr,
+    buffer: Arc<Mutex<String>>,
+) -> thread::JoinHandle<()> {
+    thread::spawn(move || {
+        let mut reader = BufReader::new(stderr);
+        let mut chunk = [0u8; 1024];
+        loop {
+            match reader.read(&mut chunk) {
+                Ok(0) => break,
+                Ok(count) => append_mcp_stderr(&buffer, &String::from_utf8_lossy(&chunk[..count])),
+                Err(_) => break,
             }
         }
-    })();
-    let _ = child.kill();
-    let _ = child.wait();
-    let stderr_text = stderr_handle.join().unwrap_or_default();
-    with_mcp_stderr_context(result, &server.server_name, &stderr_text)
+    })
+}
+
+fn append_mcp_stderr(buffer: &Arc<Mutex<String>>, text: &str) {
+    let Ok(mut buffer) = buffer.lock() else {
+        return;
+    };
+    buffer.push_str(text);
+    if buffer.chars().count() <= MAX_MCP_STDERR_BUFFER_CHARS {
+        return;
+    }
+    let tail = buffer
+        .chars()
+        .rev()
+        .take(MAX_MCP_STDERR_BUFFER_CHARS)
+        .collect::<Vec<_>>();
+    let mut truncated = tail.into_iter().rev().collect::<String>();
+    truncated.insert_str(0, "[MCP stderr buffer truncated]\n");
+    *buffer = truncated;
+}
+
+fn mcp_operation_error_resets_connection(error: &anyhow::Error) -> bool {
+    !format!("{error:#}").contains("MCP server returned error for request")
 }
 
 fn with_mcp_stderr_context<T>(
@@ -1002,6 +1302,14 @@ fn terminate_process_id(_pid: u32) {}
 mod tests {
     use super::*;
 
+    struct McpSessionCleanup(&'static str);
+
+    impl Drop for McpSessionCleanup {
+        fn drop(&mut self) {
+            cleanup_mcp_connections_for_session(self.0);
+        }
+    }
+
     #[test]
     fn parses_stdio_mcp_server_config_like_codex() -> Result<()> {
         let value: toml::Value = r#"
@@ -1089,6 +1397,7 @@ mod tests {
 
     #[test]
     fn discovers_and_calls_stdio_mcp_tool() -> Result<()> {
+        let _cleanup = McpSessionCleanup("test-discovers-and-calls-stdio-mcp-tool");
         let temp = tempfile::tempdir()?;
         let script = temp.path().join("server.py");
         std::fs::write(
@@ -1157,7 +1466,10 @@ for line in sys.stdin:
             disabled_tools: BTreeSet::new(),
         };
         let servers = BTreeMap::from([("docs.server".to_string(), server)]);
-        let tools = discover_tool_definitions(&servers)?;
+        let tools = discover_tool_definitions_for_session(
+            "test-discovers-and-calls-stdio-mcp-tool",
+            &servers,
+        )?;
         assert_eq!(tools.len(), 1);
         let tool = &tools[0];
         assert_eq!(tool.callable_namespace, "mcp__docs_server__");
@@ -1165,7 +1477,11 @@ for line in sys.stdin:
         assert_eq!(tool.raw_tool_name, "echo.tool");
         assert_eq!(tool.input_schema["properties"]["text"]["type"], "string");
 
-        let result = call_tool(tool, &json!({"text": "hello"}))?;
+        let result = call_tool_for_session(
+            "test-discovers-and-calls-stdio-mcp-tool",
+            tool,
+            &json!({"text": "hello"}),
+        )?;
         assert_eq!(result["content"][0]["text"], "echo:hello");
         assert_eq!(result["structuredContent"]["text"], "hello");
         assert_eq!(result["isError"], false);
@@ -1173,7 +1489,193 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn stdio_mcp_connection_persists_across_tool_calls_like_codex() -> Result<()> {
+        let _cleanup_a = McpSessionCleanup("test-stateful-mcp-session-a");
+        let _cleanup_b = McpSessionCleanup("test-stateful-mcp-session-b");
+        let temp = tempfile::tempdir()?;
+        let script = temp.path().join("stateful_server.py");
+        std::fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+calls = 0
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "stateful", "version": "1.0"},
+            },
+        }
+    elif method == "tools/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "tools": [{
+                    "name": "count",
+                    "description": "Return call count.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }]
+            },
+        }
+    elif method == "tools/call":
+        calls += 1
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "content": [{"type": "text", "text": "count:" + str(calls)}],
+                "structuredContent": {"calls": calls},
+                "isError": False,
+            },
+        }
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )?;
+        let server = McpServerConfig {
+            server_name: "stateful.server".to_string(),
+            command: "python3".to_string(),
+            args: vec![script.display().to_string()],
+            env: BTreeMap::new(),
+            cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
+            startup_timeout_ms: 2_000,
+            tool_timeout_ms: 2_000,
+            enabled_tools: None,
+            disabled_tools: BTreeSet::new(),
+        };
+        let servers = BTreeMap::from([("stateful.server".to_string(), server)]);
+        let tools_a =
+            discover_tool_definitions_for_session("test-stateful-mcp-session-a", &servers)?;
+        let tools_b =
+            discover_tool_definitions_for_session("test-stateful-mcp-session-b", &servers)?;
+        assert_eq!(tools_a.len(), 1);
+        assert_eq!(tools_b.len(), 1);
+
+        let first = call_tool_for_session("test-stateful-mcp-session-a", &tools_a[0], &json!({}))?;
+        let second = call_tool_for_session("test-stateful-mcp-session-a", &tools_a[0], &json!({}))?;
+        let other_session_first =
+            call_tool_for_session("test-stateful-mcp-session-b", &tools_b[0], &json!({}))?;
+
+        assert_eq!(first["structuredContent"]["calls"], 1);
+        assert_eq!(first["content"][0]["text"], "count:1");
+        assert_eq!(second["structuredContent"]["calls"], 2);
+        assert_eq!(second["content"][0]["text"], "count:2");
+        assert_eq!(other_session_first["structuredContent"]["calls"], 1);
+        assert_eq!(other_session_first["content"][0]["text"], "count:1");
+        assert_eq!(
+            cleanup_mcp_connections_for_session("test-stateful-mcp-session-a"),
+            1
+        );
+        let after_cleanup =
+            call_tool_for_session("test-stateful-mcp-session-a", &tools_a[0], &json!({}))?;
+        assert_eq!(after_cleanup["structuredContent"]["calls"], 1);
+        Ok(())
+    }
+
+    #[test]
+    fn stdio_mcp_connection_recovers_after_transport_failure() -> Result<()> {
+        let _cleanup = McpSessionCleanup("test-mcp-transport-recovery");
+        let temp = tempfile::tempdir()?;
+        let script = temp.path().join("flaky_server.py");
+        let marker = temp.path().join("already_failed");
+        std::fs::write(
+            &script,
+            r#"
+import json
+import os
+import sys
+
+marker = os.environ["MCP_FAIL_MARKER"]
+failed_once = os.path.exists(marker)
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "flaky", "version": "1.0"},
+            },
+        }
+    elif method == "tools/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "tools": [{
+                    "name": "flaky",
+                    "description": "Fail once, then recover.",
+                    "inputSchema": {"type": "object", "properties": {}},
+                }]
+            },
+        }
+    elif method == "tools/call":
+        if not failed_once:
+            open(marker, "w").close()
+            sys.exit(0)
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "content": [{"type": "text", "text": "recovered"}],
+                "structuredContent": {"ok": True},
+                "isError": False,
+            },
+        }
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )?;
+        let server = McpServerConfig {
+            server_name: "flaky.server".to_string(),
+            command: "python3".to_string(),
+            args: vec![script.display().to_string()],
+            env: BTreeMap::from([("MCP_FAIL_MARKER".to_string(), marker.display().to_string())]),
+            cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
+            startup_timeout_ms: 2_000,
+            tool_timeout_ms: 2_000,
+            enabled_tools: None,
+            disabled_tools: BTreeSet::new(),
+        };
+        let servers = BTreeMap::from([("flaky.server".to_string(), server)]);
+        let tools = discover_tool_definitions_for_session("test-mcp-transport-recovery", &servers)?;
+        let first = call_tool_for_session("test-mcp-transport-recovery", &tools[0], &json!({}));
+        assert!(
+            format!("{:#}", first.expect_err("first call should close stdout"))
+                .contains("MCP server closed stdout")
+        );
+
+        let second = call_tool_for_session("test-mcp-transport-recovery", &tools[0], &json!({}))?;
+        assert_eq!(second["content"][0]["text"], "recovered");
+        assert_eq!(second["structuredContent"]["ok"], true);
+        Ok(())
+    }
+
+    #[test]
     fn lists_and_reads_stdio_mcp_resources_like_codex() -> Result<()> {
+        let _cleanup = McpSessionCleanup("test-lists-and-reads-stdio-mcp-resources");
         let temp = tempfile::tempdir()?;
         let script = temp.path().join("resource_server.py");
         std::fs::write(
@@ -1254,18 +1756,30 @@ for line in sys.stdin:
             disabled_tools: BTreeSet::new(),
         };
 
-        let first_page = list_resources(&server, None)?;
+        let first_page =
+            list_resources_for_session("test-lists-and-reads-stdio-mcp-resources", &server, None)?;
         assert_eq!(first_page["resources"][0]["uri"], "memo://one");
         assert_eq!(first_page["nextCursor"], "page-2");
-        let templates = list_resource_templates(&server, None)?;
+        let templates = list_resource_templates_for_session(
+            "test-lists-and-reads-stdio-mcp-resources",
+            &server,
+            None,
+        )?;
         assert_eq!(
             templates["resourceTemplates"][0]["uriTemplate"],
             "memo://{id}"
         );
-        let read = read_resource(&server, "memo://one")?;
+        let read = read_resource_for_session(
+            "test-lists-and-reads-stdio-mcp-resources",
+            &server,
+            "memo://one",
+        )?;
         assert_eq!(read["contents"][0]["text"], "resource body");
 
-        let all = list_all_resources(&BTreeMap::from([("docs".to_string(), server)]));
+        let all = list_all_resources_for_session(
+            "test-lists-and-reads-stdio-mcp-resources",
+            &BTreeMap::from([("docs".to_string(), server)]),
+        );
         assert_eq!(all["docs"].len(), 2);
         assert_eq!(all["docs"][1]["uri"], "memo://two");
         Ok(())
@@ -1287,13 +1801,15 @@ for line in sys.stdin:
             disabled_tools: BTreeSet::new(),
         };
         let servers = BTreeMap::from([("missing".to_string(), server)]);
-        let error = discover_tool_definitions(&servers).expect_err("required server should fail");
+        let error = discover_tool_definitions_for_session("test-required-mcp-failure", &servers)
+            .expect_err("required server should fail");
         assert!(format!("{error:#}").contains("required MCP server `missing` failed"));
         Ok(())
     }
 
     #[test]
     fn mcp_tool_name_collisions_are_disambiguated_and_read_only_is_detected() -> Result<()> {
+        let _cleanup = McpSessionCleanup("test-mcp-tool-name-collisions");
         let temp = tempfile::tempdir()?;
         let script = temp.path().join("server.py");
         std::fs::write(
@@ -1346,7 +1862,8 @@ for line in sys.stdin:
             disabled_tools: BTreeSet::new(),
         };
         let servers = BTreeMap::from([("docs".to_string(), server)]);
-        let tools = discover_tool_definitions(&servers)?;
+        let tools =
+            discover_tool_definitions_for_session("test-mcp-tool-name-collisions", &servers)?;
         assert_eq!(tools.len(), 2);
         assert_eq!(tools[0].callable_name, "read_file");
         assert!(tools[0].read_only_hint);
@@ -1360,6 +1877,7 @@ for line in sys.stdin:
 
     #[test]
     fn mcp_operation_errors_include_server_stderr() -> Result<()> {
+        let _cleanup = McpSessionCleanup("test-mcp-errors-include-stderr");
         let temp = tempfile::tempdir()?;
         let script = temp.path().join("bad_server.py");
         std::fs::write(
@@ -1384,7 +1902,8 @@ sys.stderr.flush()
             enabled_tools: None,
             disabled_tools: BTreeSet::new(),
         };
-        let error = list_server_tools(&server).expect_err("server should fail");
+        let error = list_server_tools_for_scope(Some("test-mcp-errors-include-stderr"), &server)
+            .expect_err("server should fail");
         let message = format!("{error:#}");
         assert!(message.contains("MCP server `bad` stderr"));
         assert!(message.contains("startup failed with useful detail"));
