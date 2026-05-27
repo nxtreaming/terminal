@@ -66,6 +66,11 @@ enum TranscriptKind {
         status: String,
         detail: Option<String>,
     },
+    // Streaming output hides the heartbeat text, but still owns its row so the
+    // inline terminal does not resize when status/tool activity resumes.
+    StatusReserve {
+        line_count: usize,
+    },
     Assistant {
         markdown: String,
         source: Option<String>,
@@ -133,6 +138,10 @@ impl TranscriptNode {
             TranscriptKind::PendingStatus { status, detail } => {
                 pending_status_lines(status, detail.as_deref(), ShimmerMode::Static)
             }
+            TranscriptKind::StatusReserve { line_count } => match mode {
+                DisplayMode::Active => blank_lines(*line_count),
+                DisplayMode::Scrollback => Vec::new(),
+            },
             TranscriptKind::Assistant { markdown, source } => {
                 let mut lines = markdown_cell_lines(markdown, width, mode);
                 if let Some(source) = source.as_deref() {
@@ -193,6 +202,7 @@ impl TranscriptNode {
             TranscriptKind::PendingStatus { status, detail } => {
                 vec![pending_status_text(status, detail.as_deref())]
             }
+            TranscriptKind::StatusReserve { .. } => Vec::new(),
             TranscriptKind::Assistant { markdown, source } => {
                 let mut out = markdown.lines().map(str::to_string).collect::<Vec<_>>();
                 if let Some(source) = source.as_ref() {
@@ -276,6 +286,7 @@ impl TranscriptNode {
             TranscriptKind::Stack { nodes } => nodes
                 .iter()
                 .all(TranscriptNode::is_active_viewport_placeholder),
+            TranscriptKind::StatusReserve { .. } => true,
             _ => false,
         }
     }
@@ -350,6 +361,7 @@ impl TranscriptNode {
                 detail.as_deref(),
                 ShimmerMode::AnimatedAt(shimmer_phase),
             ),
+            TranscriptKind::StatusReserve { line_count } => blank_lines(*line_count),
             TranscriptKind::ActiveStatus {
                 group,
                 lines,
@@ -603,6 +615,12 @@ pub(crate) fn gap_before_active(model: &TranscriptModel) -> usize {
 fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize {
     match (previous, next) {
         (_, TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. }) => 1,
+        (_, TranscriptKind::StatusReserve { .. }) => 0,
+        (TranscriptKind::StatusReserve { .. }, _) => 0,
+        (
+            TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. },
+            TranscriptKind::Timeline { .. } | TranscriptKind::ActiveStatus { .. },
+        ) => 1,
         (
             TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. },
             TranscriptKind::Assistant { .. }
@@ -610,8 +628,6 @@ fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize 
             | TranscriptKind::RequestUserInput { .. }
             | TranscriptKind::ResultFile { .. }
             | TranscriptKind::StreamingAssistant { .. }
-            | TranscriptKind::Timeline { .. }
-            | TranscriptKind::ActiveStatus { .. }
             | TranscriptKind::Error { .. }
             | TranscriptKind::Cancelled { .. }
             | TranscriptKind::Stack { .. },
@@ -1092,6 +1108,9 @@ fn active_node_for_session(
                 kind: TranscriptKind::ProposedPlan { markdown: plan },
             });
         }
+        if !active_nodes.is_empty() {
+            active_nodes.push(active_status_reserve_node(root, events));
+        }
     }
 
     if let Some(request) = app.pending_request_user_input(&root.id) {
@@ -1474,6 +1493,22 @@ fn pending_status_node(
             detail: detail.map(str::to_string),
         },
     }
+}
+
+fn active_status_reserve_node(root: &SessionMeta, events: &[EventRecord]) -> TranscriptNode {
+    let seq = events.last().map(|event| event.seq).unwrap_or_default();
+    TranscriptNode {
+        id: format!("{}:active-status-reserve", root.id),
+        seq,
+        revision: seq.max(0) as u64,
+        kind: TranscriptKind::StatusReserve { line_count: 1 },
+    }
+}
+
+fn blank_lines(count: usize) -> Vec<Line<'static>> {
+    std::iter::repeat_with(|| Line::from(""))
+        .take(count)
+        .collect()
 }
 
 fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
@@ -3115,6 +3150,35 @@ mod tests {
         assert_eq!(line_text(&lines[1]), "");
         assert_eq!(line_text(&lines[2]), "");
         assert_eq!(line_text(&lines[3]), "Please open Chrome first.");
+    }
+
+    #[test]
+    fn prompt_tool_rows_use_one_blank_line() {
+        let prompt = TranscriptNode {
+            id: "prompt".to_string(),
+            seq: 1,
+            revision: 1,
+            kind: TranscriptKind::Prompt {
+                text: "whats this repo about".to_string(),
+                followup: false,
+            },
+        };
+        let run = TranscriptNode {
+            id: "run".to_string(),
+            seq: 2,
+            revision: 2,
+            kind: TranscriptKind::Timeline {
+                group: "run".to_string(),
+                lines: vec!["pwd && rg --files".to_string()],
+                style: NodeStyle::Muted,
+            },
+        };
+
+        let lines = cells_to_lines([&prompt, &run].into_iter(), 80, DisplayMode::Scrollback);
+
+        assert_eq!(line_text(&lines[0]), "> whats this repo about");
+        assert_eq!(line_text(&lines[1]), "");
+        assert_eq!(line_text(&lines[2]), "• run");
     }
 
     #[test]
