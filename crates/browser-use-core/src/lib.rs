@@ -3162,6 +3162,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     options: AgentRunOptions,
 ) -> Result<String> {
     let analytics_started_at = Instant::now();
+    let turn_diff_display_root = turn_diff_display_root(&session.cwd);
     let analytics_source = options
         .analytics_source
         .as_deref()
@@ -3520,6 +3521,10 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
             let mut last_external_session_message_seq =
                 latest_session_message_seq(store, &session.id)?;
             for turn_idx in 0..options.max_turns {
+                tools::files::reset_turn_diff_tracker_for_session(
+                    &session.id,
+                    &turn_diff_display_root,
+                );
                 let turn_started_at_ms = now_ms();
                 ensure_not_cancelled(store, &session.id)?;
                 append_new_external_session_messages_with_phase(
@@ -4248,6 +4253,11 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     continue;
                 }
 
+                let turn_diff_start_seq = store
+                    .events_for_session(&session.id)?
+                    .last()
+                    .map(|event| event.seq)
+                    .unwrap_or(0);
                 let turn_diff_before = git_worktree_snapshot(&session.cwd);
                 let dispatched_outcomes = dispatch_tool_calls_for_turn_with_streaming(
                     store,
@@ -4270,6 +4280,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     store,
                     &session,
                     turn_diff_before.as_ref(),
+                    turn_diff_start_seq,
                     turn_idx,
                 )?;
                 append_goal_progress_accounting(
@@ -9940,6 +9951,17 @@ fn run_git_for_snapshot(cwd: &str, args: &[&str]) -> Option<String> {
         .then(|| String::from_utf8_lossy(&output.stdout).to_string())
 }
 
+fn turn_diff_display_root(cwd: &str) -> PathBuf {
+    git_worktree_root(cwd).unwrap_or_else(|| PathBuf::from(cwd))
+}
+
+fn git_worktree_root(cwd: &str) -> Option<PathBuf> {
+    run_git_for_snapshot(cwd, &["rev-parse", "--show-toplevel"])
+        .map(|root| root.trim().to_string())
+        .filter(|root| !root.is_empty())
+        .map(PathBuf::from)
+}
+
 fn combine_git_diff_sections(staged_diff: &str, unstaged_diff: &str) -> String {
     match (
         staged_diff.trim().is_empty(),
@@ -9971,6 +9993,7 @@ fn append_turn_git_diff_if_changed(
     store: &Store,
     session: &SessionMeta,
     before: Option<&WorktreeSnapshot>,
+    start_seq: i64,
     turn_idx: usize,
 ) -> Result<()> {
     let Some(before) = before else {
@@ -9980,6 +10003,9 @@ fn append_turn_git_diff_if_changed(
         return Ok(());
     };
     if &after == before {
+        return Ok(());
+    }
+    if exact_patch_turn_diff_emitted_after(store, &session.id, start_seq)? {
         return Ok(());
     }
     let preexisting_dirty = !before.status.trim().is_empty() || !before.diff.trim().is_empty();
@@ -10004,6 +10030,28 @@ fn append_turn_git_diff_if_changed(
     }
     store.append_event(&session.id, "turn.diff", payload)?;
     Ok(())
+}
+
+fn exact_patch_turn_diff_emitted_after(
+    store: &Store,
+    session_id: &str,
+    start_seq: i64,
+) -> Result<bool> {
+    Ok(store.events_for_session(session_id)?.iter().any(|event| {
+        event.seq > start_seq
+            && event.event_type == "turn.diff"
+            && event.payload.get("source").and_then(Value::as_str) == Some("apply_patch")
+            && event
+                .payload
+                .get("exact")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+            && event
+                .payload
+                .get("cumulative")
+                .and_then(Value::as_bool)
+                .unwrap_or(false)
+    }))
 }
 
 fn provider_messages_from_events(events: &[browser_use_protocol::EventRecord]) -> Vec<Value> {
@@ -35397,7 +35445,7 @@ for line in sys.stdin:
 
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        append_turn_git_diff_if_changed(&store, &session, Some(&before), 7)?;
+        append_turn_git_diff_if_changed(&store, &session, Some(&before), 0, 7)?;
 
         let events = store.events_for_session(&session.id)?;
         let diff = events
@@ -35447,7 +35495,7 @@ for line in sys.stdin:
 
         let store = Store::open(temp.path().join("state"))?;
         let session = store.create_session(None, temp.path())?;
-        append_turn_git_diff_if_changed(&store, &session, Some(&before), 8)?;
+        append_turn_git_diff_if_changed(&store, &session, Some(&before), 0, 8)?;
 
         let events = store.events_for_session(&session.id)?;
         let diff = events
@@ -35463,6 +35511,67 @@ for line in sys.stdin:
                 |unified| unified.contains("diff --git a/staged.txt b/staged.txt")
                     && unified.contains("+staged turn output")
             ));
+        Ok(())
+    }
+
+    #[test]
+    fn turn_git_diff_does_not_overwrite_exact_apply_patch_diff_with_git_fallback() -> Result<()> {
+        fn git_ok(cwd: &Path, args: &[&str]) -> Result<()> {
+            let output = ProcessCommand::new("git")
+                .arg("-C")
+                .arg(cwd)
+                .args(args)
+                .output()
+                .with_context(|| format!("git {}", args.join(" ")))?;
+            if !output.status.success() {
+                bail!(
+                    "git {} failed: {}",
+                    args.join(" "),
+                    String::from_utf8_lossy(&output.stderr)
+                );
+            }
+            Ok(())
+        }
+
+        let repo = tempfile::tempdir()?;
+        let state = tempfile::tempdir()?;
+        git_ok(repo.path(), &["init"])?;
+        git_ok(repo.path(), &["config", "user.email", "test@example.com"])?;
+        git_ok(repo.path(), &["config", "user.name", "Test User"])?;
+        std::fs::write(repo.path().join("tracked.txt"), "base\n")?;
+        git_ok(repo.path(), &["add", "tracked.txt"])?;
+        git_ok(repo.path(), &["commit", "-m", "base"])?;
+        let before = git_worktree_snapshot(repo.path().to_str().context("utf8 repo path")?)
+            .context("git snapshot")?;
+
+        let store = Store::open(state.path())?;
+        let session = store.create_session(None, repo.path())?;
+        let start_seq = store
+            .events_for_session(&session.id)?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or(0);
+        store.append_event(
+            &session.id,
+            "turn.diff",
+            serde_json::json!({
+                "source": "apply_patch",
+                "exact": true,
+                "cumulative": true,
+                "unified_diff": "diff --git a/new.txt b/new.txt\n",
+            }),
+        )?;
+        std::fs::write(repo.path().join("tracked.txt"), "changed by turn\n")?;
+
+        append_turn_git_diff_if_changed(&store, &session, Some(&before), start_seq, 9)?;
+
+        let events = store.events_for_session(&session.id)?;
+        let turn_diffs: Vec<_> = events
+            .iter()
+            .filter(|event| event.event_type == "turn.diff")
+            .collect();
+        assert_eq!(turn_diffs.len(), 1);
+        assert_eq!(turn_diffs[0].payload["source"], "apply_patch");
         Ok(())
     }
 
