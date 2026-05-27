@@ -26,13 +26,13 @@ use browser_use_protocol::{
 };
 use browser_use_providers::{
     claude_code_oauth_authorize_url, claude_code_oauth_pkce, load_codex_auth,
-    load_codex_managed_auth, ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth,
+    load_codex_managed_auth, ClaudeCodeOAuthCredential, CodexAuth,
 };
 #[cfg(not(test))]
 use browser_use_providers::{
-    exchange_claude_code_authorization_code, parse_claude_code_authorization_input,
-    ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH,
-    CLAUDE_CODE_CALLBACK_PORT,
+    exchange_claude_code_authorization_code, load_codex_auth_file,
+    parse_claude_code_authorization_input, ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_store::{resolve_state_dir, Store, StoreNotification, StoreNotifier};
 use clap::{Parser, ValueEnum};
@@ -81,8 +81,9 @@ use settings::{
     browser_use_cloud_env_key_present, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
     model_choices_for_catalog, provider_model_for_display, AgentBackend, ModelChoice,
-    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER,
-    BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_SETTING,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -2657,7 +2658,11 @@ impl App {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
                 ..
-            } if self.is_slash_palette_active() => self.execute_slash_palette_selection()?,
+            } if self.is_slash_palette_active() => {
+                if self.execute_slash_palette_selection()? {
+                    return Ok(true);
+                }
+            }
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
@@ -2952,31 +2957,15 @@ impl App {
 
     fn start_codex_auth(&mut self, account: String) -> Result<()> {
         if self.account_ready(&account)? {
-            self.show_codex_setup_result(account)?;
+            self.account = account.clone();
+            self.persist_runtime_settings()?;
+            self.show_setup_result(
+                SetupResultKind::Success,
+                account,
+                "Connected with Codex auth.".to_string(),
+            );
         } else {
             self.start_codex_device_login(account)?;
-        }
-        Ok(())
-    }
-
-    fn show_codex_setup_result(&mut self, account: String) -> Result<()> {
-        match self.ensure_codex_auth_imported() {
-            Ok(()) => {
-                self.account = account.clone();
-                self.persist_runtime_settings()?;
-                self.show_setup_result(
-                    SetupResultKind::Success,
-                    account,
-                    "Connected with Codex auth.".to_string(),
-                );
-            }
-            Err(error) => {
-                self.show_setup_result(
-                    SetupResultKind::Failure,
-                    account,
-                    format!("Could not find a Codex login: {error:#}"),
-                );
-            }
         }
         Ok(())
     }
@@ -3041,7 +3030,7 @@ impl App {
         Ok(())
     }
 
-    fn execute_palette_action(&mut self, action: PaletteAction) -> Result<()> {
+    fn execute_palette_action(&mut self, action: PaletteAction) -> Result<bool> {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
@@ -3053,8 +3042,9 @@ impl App {
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
+            PaletteAction::Exit => return Ok(true),
         }
-        Ok(())
+        Ok(false)
     }
 
     fn run_update(&mut self) -> Result<()> {
@@ -3131,15 +3121,10 @@ impl App {
         self.model_provider_id = Some(model_provider_id_for_backend(choice.backend).to_string());
         self.model_configured = true;
         self.track_model_selected();
-        if self.account == ACCOUNT_CODEX {
-            if let Err(error) = self.ensure_codex_auth_imported() {
-                self.pending_model_after_auth = Some(index);
-                self.start_codex_device_login(self.account.clone())
-                    .with_context(|| {
-                        format!("start Codex login after auth import failed: {error:#}")
-                    })?;
-                return Ok(());
-            }
+        if self.account == ACCOUNT_CODEX && !self.has_codex_login()? {
+            self.pending_model_after_auth = Some(index);
+            self.start_codex_device_login(self.account.clone())?;
+            return Ok(());
         }
         self.persist_runtime_settings()?;
         if !self.account_ready(&self.account)? {
@@ -3386,7 +3371,7 @@ impl App {
         self.api_key_account = None;
         self.composer.clear();
         self.codex_login = None;
-        let flow = match start_codex_login_flow(account.clone()) {
+        let flow = match start_codex_login_flow(account.clone(), self.args.state_dir.clone()) {
             Ok(flow) => flow,
             Err(error) => {
                 self.show_setup_result(
@@ -3699,7 +3684,7 @@ impl App {
         }
     }
 
-    fn execute_slash_palette_selection(&mut self) -> Result<()> {
+    fn execute_slash_palette_selection(&mut self) -> Result<bool> {
         let filter = self.palette_filter.trim().trim_start_matches('/');
         if let Some(plan_text) = filter
             .strip_prefix("plan")
@@ -3714,14 +3699,14 @@ impl App {
             if !plan_text.is_empty() {
                 self.submit_plain_text(plan_text.to_string())?;
             }
-            return Ok(());
+            return Ok(false);
         }
         let action = palette::selected_action(&self.palette_filter, self.selected_row);
         if let Some(action) = action {
             self.close_slash_palette();
-            self.execute_palette_action(action)?;
+            return self.execute_palette_action(action);
         }
-        Ok(())
+        Ok(false)
     }
 
     fn main_selection_count(&mut self) -> Result<usize> {
@@ -3823,6 +3808,10 @@ impl App {
                 "auth.openrouter.api_key",
                 &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
             )?,
+            ACCOUNT_DEEPSEEK => self.has_stored_or_env(
+                "auth.deepseek.api_key",
+                &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+            )?,
             ACCOUNT_ANTHROPIC => self.has_stored_or_env(
                 "auth.anthropic.api_key",
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
@@ -3860,10 +3849,17 @@ impl App {
                     "OpenRouter API key is missing. Authenticate here before retrying.".to_string(),
                 )
             }
-            AgentBackend::Codex if !self.has_codex_login()? => Some(
-                "Codex login is missing. Select Codex login to import local Codex auth."
-                    .to_string(),
-            ),
+            AgentBackend::Deepseek
+                if !self.has_stored_or_env(
+                    "auth.deepseek.api_key",
+                    &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+                )? =>
+            {
+                Some("DeepSeek API key is missing. Authenticate here before retrying.".to_string())
+            }
+            AgentBackend::Codex if !self.has_codex_login()? => {
+                Some("Codex login is missing. Select Codex login to sign in.".to_string())
+            }
             AgentBackend::Anthropic
                 if is_claude_code_account(&selection.account)
                     && !self.has_claude_code_oauth()? =>
@@ -3934,28 +3930,9 @@ impl App {
         {
             return Ok(true);
         }
-        Ok(load_codex_auth().is_ok())
-    }
-
-    fn ensure_codex_auth_imported(&self) -> Result<()> {
-        if self
-            .store
-            .get_setting("auth.codex.access_token")?
-            .is_some_and(|value| !value.trim().is_empty())
-            && self
-                .store
-                .get_setting("auth.codex.account_id")?
-                .is_some_and(|value| !value.trim().is_empty())
-        {
-            return Ok(());
-        }
-        match load_codex_managed_auth() {
-            Ok(auth) => self.store_codex_managed_auth(&auth),
-            Err(_) => {
-                let auth = load_codex_auth().context("load local Codex auth")?;
-                self.store_codex_auth(&auth)
-            }
-        }
+        Ok(load_codex_managed_auth().is_ok()
+            || load_codex_auth().is_ok()
+            || codex_env_auth_present())
     }
 
     fn store_codex_auth(&self, auth: &CodexAuth) -> Result<()> {
@@ -3967,49 +3944,6 @@ impl App {
         self.store.delete_setting("auth.codex.refresh_token")?;
         self.store.delete_setting("auth.codex.source_path")?;
         self.store.delete_setting("auth.codex.last_refresh")?;
-        Ok(())
-    }
-
-    fn store_codex_managed_auth(&self, auth: &CodexManagedAuth) -> Result<()> {
-        let snapshot = auth.current_snapshot()?;
-        self.store
-            .set_setting("auth.codex.access_token", snapshot.access_token.trim())?;
-        self.store
-            .set_setting("auth.codex.account_id", snapshot.account_id.trim())?;
-        if let Some(id_token) = snapshot
-            .id_token
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            self.store
-                .set_setting("auth.codex.id_token", id_token.trim())?;
-        } else {
-            self.store.delete_setting("auth.codex.id_token")?;
-        }
-        if let Some(refresh_token) = snapshot
-            .refresh_token
-            .as_deref()
-            .filter(|value| !value.trim().is_empty())
-        {
-            self.store
-                .set_setting("auth.codex.refresh_token", refresh_token.trim())?;
-        } else {
-            self.store.delete_setting("auth.codex.refresh_token")?;
-        }
-        if let Some(source_path) = snapshot.source_path.as_ref() {
-            self.store.set_setting(
-                "auth.codex.source_path",
-                source_path.to_string_lossy().as_ref(),
-            )?;
-        } else {
-            self.store.delete_setting("auth.codex.source_path")?;
-        }
-        if let Some(last_refresh) = snapshot.last_refresh {
-            self.store
-                .set_setting("auth.codex.last_refresh", &last_refresh.to_rfc3339())?;
-        } else {
-            self.store.delete_setting("auth.codex.last_refresh")?;
-        }
         Ok(())
     }
 
@@ -4082,10 +4016,20 @@ impl App {
 
 const LAMINAR_API_KEY_SETTING: &str = "telemetry.laminar.api_key";
 
+fn codex_env_auth_present() -> bool {
+    if std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").is_ok_and(|value| !value.trim().is_empty())
+        && std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").is_ok_and(|value| !value.trim().is_empty())
+    {
+        return true;
+    }
+    std::env::var("LLM_BROWSER_CODEX_AUTH_FILE").is_ok_and(|value| !value.trim().is_empty())
+}
+
 fn auth_setting_key(account: &str) -> &'static str {
     match account {
         ACCOUNT_OPENAI => "auth.openai.api_key",
         ACCOUNT_OPENROUTER => "auth.openrouter.api_key",
+        ACCOUNT_DEEPSEEK => "auth.deepseek.api_key",
         ACCOUNT_ANTHROPIC => "auth.anthropic.api_key",
         BROWSER_USE_CLOUD => BROWSER_USE_CLOUD_API_KEY_SETTING,
         account if is_claude_code_account(account) => "auth.claude_code.access_token",
@@ -4097,6 +4041,7 @@ fn auth_secret_label(account: &str) -> &'static str {
     match account {
         ACCOUNT_OPENAI => "OpenAI API key",
         ACCOUNT_OPENROUTER => "OpenRouter API key",
+        ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
         BROWSER_USE_CLOUD => "Browser Use cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
@@ -4109,11 +4054,17 @@ fn account_kind(account: &str) -> &'static str {
         ACCOUNT_CODEX => "codex",
         ACCOUNT_OPENAI => "openai",
         ACCOUNT_OPENROUTER => "openrouter",
+        ACCOUNT_DEEPSEEK => "deepseek",
         ACCOUNT_ANTHROPIC => "anthropic",
         BROWSER_USE_CLOUD => "browser_use_cloud",
         account if is_claude_code_account(account) => "claude_code",
         _ => "unknown",
     }
+}
+
+#[cfg(not(test))]
+fn app_codex_home(state_dir: &Path) -> PathBuf {
+    state_dir.join("codex-home")
 }
 
 fn browser_choice_kind(browser: &str) -> &'static str {
@@ -4269,9 +4220,14 @@ fn start_claude_code_oauth_flow(account: String) -> Result<ClaudeCodeOAuthFlow> 
 }
 
 #[cfg(not(test))]
-fn start_codex_login_flow(account: String) -> Result<CodexLoginFlow> {
+fn start_codex_login_flow(account: String, state_dir: PathBuf) -> Result<CodexLoginFlow> {
+    let codex_home = app_codex_home(&state_dir);
+    std::fs::create_dir_all(&codex_home)
+        .with_context(|| format!("create app Codex home {}", codex_home.display()))?;
+    let auth_path = codex_home.join("auth.json");
     let mut child = ProcessCommand::new("codex")
         .args(["login", "--device-auth"])
+        .env("CODEX_HOME", &codex_home)
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
         .spawn()
@@ -4300,8 +4256,13 @@ fn start_codex_login_flow(account: String) -> Result<CodexLoginFlow> {
             match child.try_wait() {
                 Ok(Some(status)) => {
                     let result = if status.success() {
-                        load_codex_auth()
-                            .context("load Codex auth after device sign-in")
+                        load_codex_auth_file(&auth_path)
+                            .with_context(|| {
+                                format!(
+                                    "load app Codex auth after device sign-in from {}",
+                                    auth_path.display()
+                                )
+                            })
                             .map_err(|error| format!("{error:#}"))
                     } else {
                         Err(format!("`codex login --device-auth` exited with {status}"))
@@ -4349,7 +4310,7 @@ where
 }
 
 #[cfg(test)]
-fn start_codex_login_flow(account: String) -> Result<CodexLoginFlow> {
+fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexLoginFlow> {
     let (stop_tx, _stop_rx) = mpsc::channel();
     let (event_tx, rx) = mpsc::channel();
     Ok(CodexLoginFlow {
@@ -7168,6 +7129,22 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("/task"));
         assert!(screen.contains("/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_exit_command_quits() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        for ch in "exit".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("/exit"));
+
+        assert!(app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         Ok(())
     }
 

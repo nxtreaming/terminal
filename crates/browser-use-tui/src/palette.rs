@@ -8,6 +8,7 @@ pub(crate) enum PaletteAction {
     ChooseModel,
     Authenticate,
     Update,
+    Exit,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -17,7 +18,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const ITEMS: [PaletteItem; 8] = [
+const VISIBLE_ITEMS: [PaletteItem; 6] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -48,6 +49,9 @@ const ITEMS: [PaletteItem; 8] = [
         description: "choose model and provider",
         action: PaletteAction::ChooseModel,
     },
+];
+
+const HIDDEN_ITEMS: [PaletteItem; 3] = [
     PaletteItem {
         command: "/auth",
         description: "sign in to a provider",
@@ -58,20 +62,26 @@ const ITEMS: [PaletteItem; 8] = [
         description: "install the latest release",
         action: PaletteAction::Update,
     },
+    PaletteItem {
+        command: "/exit",
+        description: "quit browser-use terminal",
+        action: PaletteAction::Exit,
+    },
 ];
 
 pub(crate) const fn max_item_count() -> usize {
-    ITEMS.len()
+    VISIBLE_ITEMS.len()
 }
 
 pub(crate) fn items_filtered(filter: &str) -> Vec<PaletteItem> {
     let trimmed = filter.trim_start_matches('/').to_ascii_lowercase();
     if trimmed.is_empty() {
-        return ITEMS.to_vec();
+        return VISIBLE_ITEMS.to_vec();
     }
-    ITEMS
+    VISIBLE_ITEMS
         .iter()
         .copied()
+        .chain(HIDDEN_ITEMS.iter().copied())
         .filter(|item| item.command[1..].to_ascii_lowercase().contains(&trimmed))
         .collect()
 }

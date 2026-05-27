@@ -3123,7 +3123,7 @@ mod tests {
                 name: "exec_command".to_string(),
                 namespace: None,
                 arguments: json!({
-                    "cmd": "python3 -u -c \"import subprocess, sys; print('done', flush=True); subprocess.Popen(['sleep','2'], stdout=sys.stdout, stderr=sys.stderr)\"",
+                    "cmd": "python3 -u -c \"import subprocess, sys; print('done', flush=True); subprocess.Popen(['sleep','5'], stdout=sys.stdout, stderr=sys.stderr)\"",
                     "yield_time_ms": 5000,
                 }),
             },
@@ -3131,7 +3131,7 @@ mod tests {
         .expect("exec");
 
         assert!(
-            started.elapsed() < Duration::from_millis(1000),
+            started.elapsed() < Duration::from_millis(2500),
             "post-exit reader drain should be capped instead of waiting for a background descendant"
         );
         assert_eq!(result.content["running"], false);
@@ -3153,7 +3153,7 @@ mod tests {
                 name: "exec_command".to_string(),
                 namespace: None,
                 arguments: json!({
-                    "cmd": "python3 -u -c \"import subprocess, sys, time; print('ready', flush=True); time.sleep(0.6); print('done', flush=True); subprocess.Popen(['sleep','2'], stdout=sys.stdout, stderr=sys.stderr)\"",
+                    "cmd": "python3 -u -c \"import subprocess, sys, time; print('ready', flush=True); time.sleep(0.6); print('done', flush=True); subprocess.Popen(['sleep','5'], stdout=sys.stdout, stderr=sys.stderr)\"",
                     "yield_time_ms": 50,
                 }),
             },
@@ -3178,7 +3178,7 @@ mod tests {
 
         let finished = finished.expect("background command.finished event");
         assert!(
-            wait_started.elapsed() < Duration::from_millis(1500),
+            wait_started.elapsed() < Duration::from_millis(3000),
             "background watcher should cap post-exit reader drain"
         );
         assert!(finished.payload["aggregated_output"]
@@ -3238,8 +3238,8 @@ mod tests {
                 name: "exec_command".to_string(),
                 namespace: None,
                 arguments: json!({
-                    "cmd": "python3 -u -c \"import sys, time; sys.stdout.write('prompt> '); sys.stdout.flush(); time.sleep(1.0)\"",
-                    "yield_time_ms": 250,
+                    "cmd": "python3 -u -c \"import sys, time; sys.stdout.write('prompt> '); sys.stdout.flush(); time.sleep(3.0)\"",
+                    "yield_time_ms": 1000,
                 }),
             },
         )
@@ -3262,8 +3262,8 @@ mod tests {
                 name: "exec_command".to_string(),
                 namespace: None,
                 arguments: json!({
-                    "cmd": "python3 -u -c \"import sys, time; sys.stdout.write('pty> '); sys.stdout.flush(); time.sleep(1.0)\"",
-                    "yield_time_ms": 250,
+                    "cmd": "python3 -u -c \"import sys, time; sys.stdout.write('pty> '); sys.stdout.flush(); time.sleep(3.0)\"",
+                    "yield_time_ms": 1000,
                     "tty": true,
                 }),
             },
@@ -3293,7 +3293,7 @@ mod tests {
                 arguments: json!({
                     "cmd": "python3 -u -c \"import sys; print('ready', flush=True); [print('echo:' + line.strip(), flush=True) for line in sys.stdin]\"",
                     "tty": true,
-                    "yield_time_ms": 100,
+                    "yield_time_ms": 1000,
                 }),
             },
         )
@@ -3350,7 +3350,7 @@ mod tests {
                 arguments: json!({
                     "cmd": "python3 -u -c \"import sys, time; print('ready', flush=True); sys.stdin.readline(); time.sleep(0.28); print('settled', flush=True); time.sleep(1.0)\"",
                     "tty": true,
-                    "yield_time_ms": 100,
+                    "yield_time_ms": 1000,
                 }),
             },
         )

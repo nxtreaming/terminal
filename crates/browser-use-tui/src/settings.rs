@@ -8,6 +8,7 @@ pub(crate) enum AgentBackend {
     Openai,
     Anthropic,
     Openrouter,
+    Deepseek,
     Fake,
     None,
 }
@@ -19,6 +20,7 @@ impl AgentBackend {
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
             Self::Openrouter => "openrouter",
+            Self::Deepseek => "deepseek",
             Self::Fake => "fake",
             Self::None => "none",
         }
@@ -30,6 +32,7 @@ impl AgentBackend {
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
             "openrouter" => Some(Self::Openrouter),
+            "deepseek" => Some(Self::Deepseek),
             "fake" => Some(Self::Fake),
             "none" => Some(Self::None),
             _ => None,
@@ -44,6 +47,7 @@ impl From<AgentBackend> for ProviderBackend {
             AgentBackend::Openai => Self::Openai,
             AgentBackend::Anthropic => Self::Anthropic,
             AgentBackend::Openrouter => Self::Openrouter,
+            AgentBackend::Deepseek => Self::Deepseek,
             AgentBackend::Fake => Self::Fake,
             AgentBackend::None => Self::None,
         }
@@ -55,6 +59,7 @@ pub(crate) enum ModelChoiceGroup {
     Recommended,
     BringYourOwnKey,
     OpenRouter,
+    Deepseek,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -73,12 +78,14 @@ pub(crate) const ACCOUNT_CLAUDE_CODE_LEGACY: &str = "Claude Code login";
 pub(crate) const ACCOUNT_OPENAI: &str = "OpenAI API key";
 pub(crate) const ACCOUNT_ANTHROPIC: &str = "Anthropic API key";
 pub(crate) const ACCOUNT_OPENROUTER: &str = "OpenRouter API key";
+pub(crate) const ACCOUNT_DEEPSEEK: &str = "DeepSeek API key";
 
-pub(crate) const ACCOUNT_CHOICES: [&str; 4] = [
+pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
     ACCOUNT_CODEX,
     ACCOUNT_OPENAI,
     ACCOUNT_ANTHROPIC,
     ACCOUNT_OPENROUTER,
+    ACCOUNT_DEEPSEEK,
 ];
 
 pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use cloud";
@@ -205,6 +212,14 @@ fn static_external_model_choices() -> Vec<ModelChoice> {
             provider_model: "deepseek/deepseek-v4-pro".to_string(),
             descriptor: "needs key".to_string(),
             group: ModelChoiceGroup::OpenRouter,
+        },
+        ModelChoice {
+            display: "DeepSeek V4 Pro".to_string(),
+            account: ACCOUNT_DEEPSEEK,
+            backend: AgentBackend::Deepseek,
+            provider_model: "deepseek-v4-pro".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::Deepseek,
         },
     ]
 }

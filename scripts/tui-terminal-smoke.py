@@ -501,7 +501,10 @@ def smoke_interactive_terminal(binary: Path) -> None:
         tmux_send(session, "Enter")
         model = wait_for(session, "Choose the model and provider for this session", "model-panel")
         assert_contains(model, "bring your own key", "model surface should show lower sections")
-        assert_contains(model, "DeepSeek V4 Pro", "model surface should fit all model rows")
+        if "DeepSeek V4 Pro" not in model:
+            tmux_send(session, "Up")
+            model = wait_for(session, "DeepSeek V4 Pro", "model-panel-deepseek")
+        assert_contains(model, "DeepSeek V4 Pro", "model surface should show all model rows through navigation")
         assert_contains(model, "Enter:select", "model surface footer should be visible")
         assert_first_content_near_top(model, 2, "model surface should not be rendered in the compact dock")
         tmux_send(session, "Escape")

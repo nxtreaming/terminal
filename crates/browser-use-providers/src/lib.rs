@@ -1820,6 +1820,12 @@ pub struct OpenAICompatibleChatProvider {
     base_url: String,
     provider_name: String,
     instructions: String,
+    include_image_content: bool,
+    include_parallel_tool_calls: bool,
+    include_tool_choice: bool,
+    include_usage_request: bool,
+    thinking: Option<Value>,
+    reasoning_effort: Option<String>,
     client: reqwest::blocking::Client,
     request_retry: ProviderRequestRetryConfig,
     request_options: ProviderRequestOptions,
@@ -1843,17 +1849,45 @@ impl OpenAICompatibleChatProvider {
         model: impl Into<String>,
         base_url: impl Into<String>,
     ) -> Self {
+        let model = model.into();
         Self {
             api_key,
             command_auth: None,
-            model: model.into(),
+            include_image_content: !is_deepseek_v4_model(&model),
+            model,
             base_url: base_url.into().trim_end_matches('/').to_string(),
             provider_name: "openai-compatible".to_string(),
             instructions: default_instructions(),
+            include_parallel_tool_calls: true,
+            include_tool_choice: true,
+            include_usage_request: true,
+            thinking: None,
+            reasoning_effort: None,
             client: reqwest::blocking::Client::new(),
             request_retry: ProviderRequestRetryConfig::default(),
             request_options: ProviderRequestOptions::default(),
         }
+    }
+
+    pub fn deepseek(
+        api_key: impl Into<String>,
+        model: impl Into<String>,
+        base_url: impl Into<String>,
+    ) -> Self {
+        let mut provider = Self::with_base_url(api_key, model, base_url);
+        provider.provider_name = "deepseek".to_string();
+        provider.include_image_content = false;
+        provider.include_parallel_tool_calls = false;
+        provider.include_tool_choice = false;
+        provider.include_usage_request = false;
+        provider.thinking = Some(json!({ "type": "enabled" }));
+        provider.reasoning_effort = Some(
+            std::env::var("LLM_BROWSER_DEEPSEEK_REASONING_EFFORT")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+                .unwrap_or_else(|| "high".to_string()),
+        );
+        provider
     }
 
     pub fn from_env(model: impl Into<String>) -> Result<Self> {
@@ -1910,20 +1944,35 @@ impl ModelProvider for OpenAICompatibleChatProvider {
             "role": "system",
             "content": instructions,
         })];
-        messages.extend(messages_to_chat_messages(&turn.messages)?);
+        messages.extend(messages_to_chat_messages(
+            &turn.messages,
+            self.include_image_content,
+        )?);
         let tools = tool_specs_to_chat_tools(&turn.tools);
         let model_info = model_request_info_for_turn(&self.model, &turn);
         let mut body = json!({
             "model": self.model,
             "messages": messages,
-            "parallel_tool_calls": model_info.supports_parallel_tool_calls,
         });
-        if self.base_url.contains("openrouter.ai") || include_openai_compatible_usage() {
+        if self.include_parallel_tool_calls {
+            body["parallel_tool_calls"] = json!(model_info.supports_parallel_tool_calls);
+        }
+        if let Some(thinking) = &self.thinking {
+            body["thinking"] = thinking.clone();
+        }
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort);
+        }
+        if (self.include_usage_request && self.base_url.contains("openrouter.ai"))
+            || include_openai_compatible_usage()
+        {
             body["usage"] = json!({ "include": true });
         }
         if !tools.is_empty() {
             body["tools"] = Value::Array(tools);
-            body["tool_choice"] = json!("auto");
+            if self.include_tool_choice {
+                body["tool_choice"] = json!("auto");
+            }
         }
         let command_auth = self.command_auth.clone();
         let command_auth_token = command_auth
@@ -1982,7 +2031,13 @@ type ClaudeCodeOAuthRefreshFn =
     Arc<dyn Fn(&str) -> Result<ClaudeCodeOAuthCredential> + Send + Sync>;
 type ClaudeCodeOAuthPersistFn = Arc<dyn Fn(&ClaudeCodeOAuthCredential) -> Result<()> + Send + Sync>;
 
-#[derive(Clone)]
+fn is_deepseek_v4_model(model: &str) -> bool {
+    let normalized = model.trim().to_ascii_lowercase().replace('_', "-");
+    normalized.contains("deepseek")
+        && (normalized.contains("v4-pro") || normalized.contains("v4-flash"))
+}
+
+#[derive(Clone, Debug)]
 pub struct AnthropicMessagesProvider {
     credential: Arc<Mutex<AnthropicCredential>>,
     oauth_refresh: Option<ClaudeCodeOAuthRefresh>,
@@ -5419,7 +5474,10 @@ fn responses_orphan_tool_context_message(message: &Value, call_id: &str) -> Opti
     }))
 }
 
-fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
+fn messages_to_chat_messages(
+    messages: &[Value],
+    include_image_content: bool,
+) -> Result<Vec<Value>> {
     let mut out = Vec::new();
     for message in messages {
         if should_skip_raw_response_item_for_fallback_provider(message) {
@@ -5438,10 +5496,16 @@ fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
                 out.push(json!({
                     "role": "tool",
                     "tool_call_id": call_id,
-                    "content": tool_output_text(message),
+                    "content": chat_tool_output_text(message, include_image_content),
                 }));
-                if let Some(visual_context) = chat_visual_context_message(message, call_id) {
-                    out.push(visual_context);
+                if include_image_content {
+                    if let Some(visual_context) = chat_visual_context_message(message, call_id) {
+                        out.push(visual_context);
+                    }
+                } else if let Some(omitted_context) =
+                    chat_omitted_visual_context_message(message, call_id)
+                {
+                    out.push(omitted_context);
                 }
             }
             "assistant" => {
@@ -5449,6 +5513,13 @@ fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
                     "role": "assistant",
                     "content": message_content_as_text(message),
                 });
+                if let Some(reasoning_content) = message
+                    .get("reasoning_content")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    item["reasoning_content"] = json!(reasoning_content);
+                }
                 let tool_calls = message
                     .get("tool_calls")
                     .and_then(Value::as_array)
@@ -5471,14 +5542,14 @@ fn messages_to_chat_messages(messages: &[Value]) -> Result<Vec<Value>> {
             })),
             _ => out.push(json!({
                 "role": "user",
-                "content": chat_content(message),
+                "content": chat_content(message, include_image_content),
             })),
         }
     }
     Ok(out)
 }
 
-fn chat_content(message: &Value) -> Value {
+fn chat_content(message: &Value, include_image_content: bool) -> Value {
     match message.get("content") {
         Some(Value::Array(parts)) => Value::Array(
             parts
@@ -5486,10 +5557,17 @@ fn chat_content(message: &Value) -> Value {
                 .filter_map(|part| match part.get("type").and_then(Value::as_str) {
                     Some("input_image") => {
                         let image_url = part.get("image_url").and_then(Value::as_str)?;
-                        Some(json!({
-                            "type": "image_url",
-                            "image_url": { "url": image_url },
-                        }))
+                        if include_image_content {
+                            Some(json!({
+                                "type": "image_url",
+                                "image_url": { "url": image_url },
+                            }))
+                        } else {
+                            Some(json!({
+                                "type": "text",
+                                "text": "[image omitted: selected model endpoint does not accept image content]",
+                            }))
+                        }
                     }
                     Some("input_text") | Some("output_text") | Some("text") | None => part
                         .get("text")
@@ -5801,7 +5879,26 @@ fn message_content_as_text(message: &Value) -> String {
     }
 }
 
+#[derive(Clone, Copy)]
+enum ToolImageStatus {
+    Attached,
+    Omitted,
+}
+
 fn tool_output_text(message: &Value) -> String {
+    tool_output_text_with_image_status(message, ToolImageStatus::Attached)
+}
+
+fn chat_tool_output_text(message: &Value, include_image_content: bool) -> String {
+    let image_status = if include_image_content {
+        ToolImageStatus::Attached
+    } else {
+        ToolImageStatus::Omitted
+    };
+    tool_output_text_with_image_status(message, image_status)
+}
+
+fn tool_output_text_with_image_status(message: &Value, image_status: ToolImageStatus) -> String {
     let Some(Value::Array(parts)) = message.get("content") else {
         return message_content_as_text(message);
     };
@@ -5821,9 +5918,14 @@ fn tool_output_text(message: &Value) -> String {
         }
     }
     if image_count > 0 {
-        text_parts.push(format!(
-            "[{image_count} screenshot image(s) attached in the following visual context message]"
-        ));
+        match image_status {
+            ToolImageStatus::Attached => text_parts.push(format!(
+                "[{image_count} screenshot image(s) attached in the following visual context message]"
+            )),
+            ToolImageStatus::Omitted => text_parts.push(format!(
+                "[{image_count} screenshot image(s) omitted because this model endpoint does not accept image content]"
+            )),
+        }
     }
     text_parts.join("\n")
 }
@@ -5853,6 +5955,12 @@ fn normalize_tool_image_part(part: &Value) -> Option<Value> {
 fn visual_context_text(call_id: &str, tool_name: &str) -> String {
     format!(
         "Visual context from tool call {call_id} ({tool_name}). Use these screenshots to verify the browser state before continuing. Do not call screenshot again unless the page changed or you need a different visual region."
+    )
+}
+
+fn omitted_visual_context_text(call_id: &str, tool_name: &str) -> String {
+    format!(
+        "Visual output from tool call {call_id} ({tool_name}) was omitted because this model endpoint does not accept image content. Continue using text, DOM state, and browser_script inspection instead."
     )
 }
 
@@ -5893,7 +6001,17 @@ fn chat_visual_context_message(message: &Value, call_id: &str) -> Option<Value> 
     let visual_message = json!({ "content": content });
     Some(json!({
         "role": "user",
-        "content": chat_content(&visual_message),
+        "content": chat_content(&visual_message, true),
+    }))
+}
+
+fn chat_omitted_visual_context_message(message: &Value, call_id: &str) -> Option<Value> {
+    if tool_output_images(message).is_empty() {
+        return None;
+    }
+    Some(json!({
+        "role": "user",
+        "content": omitted_visual_context_text(call_id, tool_name(message)),
     }))
 }
 
@@ -6001,6 +6119,14 @@ fn parse_chat_completion_output(
     else {
         bail!("OpenAI-compatible chat response missing choices[0].message");
     };
+    if let Some(reasoning_content) = message.get("reasoning_content").and_then(Value::as_str) {
+        if !reasoning_content.is_empty() {
+            events.push(ModelEvent::ThinkingDelta {
+                text: reasoning_content.to_string(),
+                label: Some("reasoning".to_string()),
+            });
+        }
+    }
     if let Some(content) = message.get("content").and_then(Value::as_str) {
         if !content.is_empty() {
             events.push(ModelEvent::TextDelta {
@@ -7363,7 +7489,7 @@ mod tests {
             }),
         ];
 
-        let chat = messages_to_chat_messages(&messages)?;
+        let chat = messages_to_chat_messages(&messages, true)?;
         assert_eq!(chat.len(), 1);
         assert_eq!(chat[0]["role"], "user");
         assert_eq!(chat[0]["content"], "next prompt");
@@ -7377,13 +7503,16 @@ mod tests {
 
     #[test]
     fn chat_messages_map_developer_context_to_system_priority() -> Result<()> {
-        let messages = messages_to_chat_messages(&[json!({
-            "role": "developer",
-            "content": [{
-                "type": "input_text",
-                "text": "<permissions instructions>Do not provide sandbox permissions.</permissions instructions>"
-            }]
-        })])?;
+        let messages = messages_to_chat_messages(
+            &[json!({
+                "role": "developer",
+                "content": [{
+                    "type": "input_text",
+                    "text": "<permissions instructions>Do not provide sandbox permissions.</permissions instructions>"
+                }]
+            })],
+            true,
+        )?;
 
         assert_eq!(messages[0]["role"], "system");
         assert!(messages[0]["content"]
@@ -8247,6 +8376,178 @@ mod tests {
                 arguments: json!({"patch": raw_patch}),
             }
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn chat_parser_surfaces_deepseek_reasoning_content() -> Result<()> {
+        let events = parse_chat_completion_output(
+            &json!({
+                "choices": [{
+                    "message": {
+                        "role": "assistant",
+                        "reasoning_content": "I need a tool.",
+                        "content": "",
+                        "tool_calls": [{
+                            "id": "call_123",
+                            "type": "function",
+                            "function": {
+                                "name": "done",
+                                "arguments": "{\"result\":\"ok\"}"
+                            }
+                        }]
+                    }
+                }]
+            }),
+            "deepseek-v4-pro",
+            &[],
+        )?;
+
+        assert!(events.contains(&ModelEvent::ThinkingDelta {
+            text: "I need a tool.".to_string(),
+            label: Some("reasoning".to_string()),
+        }));
+        assert!(events.contains(&ModelEvent::ToolCall {
+            call: ToolCall {
+                id: "call_123".to_string(),
+                name: "done".to_string(),
+                namespace: None,
+                arguments: json!({"result": "ok"}),
+            }
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn chat_messages_preserve_deepseek_reasoning_content() -> Result<()> {
+        let messages = messages_to_chat_messages(
+            &[json!({
+                "role": "assistant",
+                "content": "",
+                "reasoning_content": "Need page state.",
+                "tool_calls": [{
+                    "id": "call_123",
+                    "name": "python",
+                    "arguments": {"code": "print('ok')"},
+                }],
+            })],
+            true,
+        )?;
+
+        assert_eq!(messages[0]["role"], "assistant");
+        assert_eq!(messages[0]["reasoning_content"], "Need page state.");
+        assert_eq!(messages[0]["tool_calls"][0]["id"], "call_123");
+        Ok(())
+    }
+
+    #[test]
+    fn deepseek_v4_model_ids_disable_chat_image_content() {
+        let direct = OpenAICompatibleChatProvider::with_base_url(
+            "test-key",
+            "deepseek-v4-pro",
+            "https://example.test",
+        );
+        let openrouter = OpenAICompatibleChatProvider::with_base_url(
+            "test-key",
+            "deepseek/deepseek-v4-flash",
+            "https://openrouter.ai/api/v1",
+        );
+        let non_deepseek = OpenAICompatibleChatProvider::with_base_url(
+            "test-key",
+            "openai/gpt-4o",
+            "https://example.test",
+        );
+
+        assert!(!direct.include_image_content);
+        assert!(!openrouter.include_image_content);
+        assert!(non_deepseek.include_image_content);
+    }
+
+    #[test]
+    fn direct_deepseek_provider_disables_chat_image_content_for_any_model() {
+        let provider = OpenAICompatibleChatProvider::deepseek(
+            "test-key",
+            "deepseek-chat",
+            "https://api.deepseek.com",
+        );
+
+        assert!(!provider.include_image_content);
+    }
+
+    #[test]
+    fn chat_messages_can_omit_user_image_content() -> Result<()> {
+        let messages = messages_to_chat_messages(
+            &[json!({
+                "role": "user",
+                "content": [
+                    { "type": "input_text", "text": "What is shown?" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,abc" }
+                ],
+            })],
+            false,
+        )?;
+        let serialized = serde_json::to_string(&messages)?;
+
+        assert!(!serialized.contains("image_url"));
+        assert_eq!(messages[0]["content"][0]["text"], "What is shown?");
+        assert_eq!(
+            messages[0]["content"][1]["text"],
+            "[image omitted: selected model endpoint does not accept image content]"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn chat_messages_can_omit_tool_image_context() -> Result<()> {
+        let messages = messages_to_chat_messages(
+            &[json!({
+                "role": "tool",
+                "tool_call_id": "call_123",
+                "name": "browser",
+                "content": [
+                    { "type": "output_text", "text": "browser connected" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,abc" }
+                ],
+            })],
+            false,
+        )?;
+        let serialized = serde_json::to_string(&messages)?;
+
+        assert_eq!(messages.len(), 2);
+        assert!(!serialized.contains("image_url"));
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("omitted because this model endpoint does not accept image content"));
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("Visual output from tool call call_123 (browser) was omitted"));
+        Ok(())
+    }
+
+    #[test]
+    fn chat_messages_keep_tool_image_context_when_supported() -> Result<()> {
+        let messages = messages_to_chat_messages(
+            &[json!({
+                "role": "tool",
+                "tool_call_id": "call_123",
+                "name": "browser",
+                "content": [
+                    { "type": "output_text", "text": "browser connected" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,abc" }
+                ],
+            })],
+            true,
+        )?;
+        let serialized = serde_json::to_string(&messages)?;
+
+        assert_eq!(messages.len(), 2);
+        assert!(serialized.contains("image_url"));
+        assert!(messages[0]["content"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("attached in the following visual context message"));
         Ok(())
     }
 

@@ -12,7 +12,7 @@ echo "== cargo fmt =="
 cargo fmt --check
 
 echo "== rust tests =="
-cargo test
+cargo test -- --test-threads=1
 
 echo "== python tests =="
 uv run --with pytest python -m pytest -q
