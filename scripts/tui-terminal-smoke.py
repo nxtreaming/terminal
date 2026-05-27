@@ -986,13 +986,17 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             if first_line == "> yo":
                 raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + live_visible)
 
+        streaming_text = (
+            "I'll inspect the repo structure and key docs/config first, then\n"
+            "summarize what it appears to be and how it's organized."
+        )
         append_store_event(
             state_dir,
             session_id,
             "model.stream_delta",
-            {"text": "streaming now", "turn_idx": 1},
+            {"text": streaming_text, "turn_idx": 1},
         )
-        wait_for(session, "streaming now", "prompt-only-followup-streaming")
+        wait_for(session, "summarize what", "prompt-only-followup-streaming")
         streaming_visible = capture_after_idle(
             session,
             "prompt-only-followup-streaming-visible",
@@ -1005,8 +1009,19 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         )
         assert_contains(
             streaming_visible,
-            "streaming now",
+            "I'll inspect the repo structure and key docs/config first, then",
             "streaming follow-up should keep live output visible",
+        )
+        assert_contains(
+            streaming_visible,
+            "summarize what it appears to be and how it's organized.",
+            "streaming follow-up should keep the active tail visible",
+        )
+        assert_line_directly_followed_by(
+            streaming_visible,
+            "first, then",
+            "summarize what",
+            "streaming follow-up should not insert a separator inside the assistant paragraph",
         )
         assert_not_contains(
             streaming_visible,
@@ -1048,7 +1063,19 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         )
         assert_count(
             response_visible,
-            "streaming now",
+            "I'll inspect the repo structure and key docs/config first, then",
+            1,
+            "streaming text before a tool-call response should commit once above the tool row",
+        )
+        assert_line_directly_followed_by(
+            response_visible,
+            "first, then",
+            "summarize what",
+            "committed streaming text should keep paragraph lines adjacent above the tool row",
+        )
+        assert_count(
+            response_visible,
+            "summarize what it appears to be and how it's organized.",
             1,
             "streaming text before a tool-call response should commit once above the tool row",
         )
