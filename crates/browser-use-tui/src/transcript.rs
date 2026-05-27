@@ -692,21 +692,29 @@ fn committed_node_for_event(
         "session.failed" => {
             let text =
                 payload_string(event, "error").unwrap_or_else(|| "The task failed.".to_string());
-            Some(TranscriptNode {
+            let node = TranscriptNode {
                 id,
                 seq: event.seq,
                 revision: event.seq.max(0) as u64,
                 kind: TranscriptKind::Error { text },
-            })
+            };
+            Some(with_streaming_commentary_before_event(
+                root, events, event, node,
+            ))
         }
-        "session.cancelled" => Some(TranscriptNode {
-            id,
-            seq: event.seq,
-            revision: event.seq.max(0) as u64,
-            kind: TranscriptKind::Cancelled {
-                text: "Progress is saved in history.".to_string(),
-            },
-        }),
+        "session.cancelled" => {
+            let node = TranscriptNode {
+                id,
+                seq: event.seq,
+                revision: event.seq.max(0) as u64,
+                kind: TranscriptKind::Cancelled {
+                    text: "Progress is saved in history.".to_string(),
+                },
+            };
+            Some(with_streaming_commentary_before_event(
+                root, events, event, node,
+            ))
+        }
         "agent.spawned" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -1052,23 +1060,54 @@ fn pre_tool_commentary_node(
     if event.session_id != root.id || model_response_tool_call_count(event) == 0 {
         return None;
     }
-    let response_idx = events.iter().position(|candidate| {
+    streaming_commentary_node_before_event(root, events, event)
+}
+
+fn with_streaming_commentary_before_event(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    event: &EventRecord,
+    node: TranscriptNode,
+) -> TranscriptNode {
+    let Some(commentary) = streaming_commentary_node_before_event(root, events, event) else {
+        return node;
+    };
+    TranscriptNode {
+        id: format!("{}:{}:stack", event.session_id, event.seq),
+        seq: event.seq,
+        revision: event.seq.max(0) as u64,
+        kind: TranscriptKind::Stack {
+            nodes: vec![commentary, node],
+        },
+    }
+}
+
+fn streaming_commentary_node_before_event(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    event: &EventRecord,
+) -> Option<TranscriptNode> {
+    if event.session_id != root.id {
+        return None;
+    }
+    let event_idx = events.iter().position(|candidate| {
         candidate.session_id == event.session_id
             && candidate.seq == event.seq
             && candidate.event_type == event.event_type
     })?;
-    let turn_start = events[..response_idx]
+    let turn_start = events[..event_idx]
         .iter()
         .rposition(|candidate| {
             candidate.session_id == root.id
-                && matches!(
+                && (matches!(
                     candidate.event_type.as_str(),
                     "model.turn.request" | "model.turn.retry" | "model.turn.error"
-                )
+                ) || (candidate.event_type == "model.turn.response"
+                    && model_response_tool_call_count(candidate) > 0))
         })
         .map(|idx| idx.saturating_add(1))
         .unwrap_or(0);
-    let markdown = turn_streaming_text_from_events(&events[turn_start..response_idx])?;
+    let markdown = turn_streaming_text_from_events(&events[turn_start..event_idx])?;
     let markdown = markdown.trim_end().to_string();
     if markdown.trim().is_empty() {
         return None;

@@ -8460,6 +8460,91 @@ wire_api = "responses"
     }
 
     #[test]
+    fn failed_session_preserves_visible_streaming_text_before_error() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 40;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I found the transcript handoff issue."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.failed",
+            serde_json::json!({"error": "provider disconnected"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(
+            screen.contains("I found the transcript handoff issue."),
+            "{screen}"
+        );
+        assert!(screen.contains("provider disconnected"), "{screen}");
+        assert_eq!(
+            screen
+                .matches("I found the transcript handoff issue.")
+                .count(),
+            1,
+            "{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn cancelled_session_preserves_visible_streaming_text_before_stopped_row() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 40;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I found the transcript handoff issue."}),
+        )?;
+        app.store
+            .append_event(&session.id, "session.cancelled", serde_json::json!({}))?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(
+            screen.contains("I found the transcript handoff issue."),
+            "{screen}"
+        );
+        assert!(screen.contains("Progress is saved in history."), "{screen}");
+        assert_eq!(
+            screen
+                .matches("I found the transcript handoff issue.")
+                .count(),
+            1,
+            "{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn tool_call_response_does_not_render_prior_turn_text() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
