@@ -11690,7 +11690,7 @@ fn browser_tool_registry_for_session(
         model_supports_original_image_detail_for_catalog(model_name, config.model_catalog.as_ref()),
         model_overrides_description,
     );
-    registry.register_mcp_tools(mcp::discover_tool_definitions(&config.mcp_servers));
+    registry.register_mcp_tools(mcp::discover_tool_definitions(&config.mcp_servers)?);
     Ok(registry)
 }
 
@@ -12629,6 +12629,14 @@ fn dispatch_parallel_tool_call(
         Some(ToolHandlerKind::ToolSearch) => {
             dispatch_tool_search_tool(store, session, call, tool_router)
         }
+        Some(ToolHandlerKind::McpTool) => dispatch_mcp_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            tool_router,
+            supports_original_image_detail,
+        ),
         _ => dispatch_unknown_tool(store, session, call),
     }
 }
@@ -12822,9 +12830,15 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
         ToolHandlerKind::CloseAgentV1 => dispatch_close_agent_v1_tool(store, session, call),
         ToolHandlerKind::ToolSearch => dispatch_tool_search_tool(store, session, call, tool_router),
-        ToolHandlerKind::McpTool => {
-            dispatch_mcp_tool(store, session, call, tool_output_token_budget, tool_router)
-        }
+        ToolHandlerKind::McpTool => dispatch_mcp_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            tool_router,
+            resolved_model_request_info_for_session(session, options, provider.model_name())?
+                .supports_image_detail_original,
+        ),
     }
 }
 
@@ -12834,6 +12848,7 @@ fn dispatch_mcp_tool(
     call: &ToolCall,
     tool_output_token_budget: usize,
     tool_router: &ToolRouter,
+    supports_original_image_detail: bool,
 ) -> Result<ToolDispatchOutcome> {
     let Some(definition) = tool_router.mcp_tool_for_call(call.namespace.as_deref(), &call.name)
     else {
@@ -12894,7 +12909,7 @@ fn dispatch_mcp_tool(
             session,
             call,
             &call.name,
-            mcp_result_tool_content(&result, wall_time),
+            mcp_result_tool_content(&result, wall_time, supports_original_image_detail),
             tool_output_token_budget,
         )?],
     })
@@ -12925,7 +12940,11 @@ fn mcp_event_result_payload(result: &Value) -> (Value, bool, usize) {
     )
 }
 
-fn mcp_result_tool_content(result: &Value, wall_time: Duration) -> Value {
+fn mcp_result_tool_content(
+    result: &Value,
+    wall_time: Duration,
+    supports_original_image_detail: bool,
+) -> Value {
     let header = format!("Wall time: {:.4} seconds\nOutput:", wall_time.as_secs_f64());
     let structured_content = result
         .get("structuredContent")
@@ -12938,14 +12957,17 @@ fn mcp_result_tool_content(result: &Value, wall_time: Duration) -> Value {
     let Some(content) = result.get("content").and_then(Value::as_array) else {
         return Value::String(format!("{header}\n{result}"));
     };
-    if let Some(mut items) = mcp_content_items_for_model(content) {
+    if let Some(mut items) = mcp_content_items_for_model(content, supports_original_image_detail) {
         items.insert(0, json!({ "type": "output_text", "text": header }));
         return Value::Array(items);
     }
     Value::String(format!("{header}\n{}", Value::Array(content.clone())))
 }
 
-fn mcp_content_items_for_model(content: &[Value]) -> Option<Vec<Value>> {
+fn mcp_content_items_for_model(
+    content: &[Value],
+    supports_original_image_detail: bool,
+) -> Option<Vec<Value>> {
     let mut saw_image = false;
     let mut items = Vec::with_capacity(content.len());
     for item in content {
@@ -12979,6 +13001,11 @@ fn mcp_content_items_for_model(content: &[Value]) -> Option<Vec<Value>> {
                     .and_then(Value::as_str)
                     .filter(|detail| matches!(*detail, "high" | "original"))
                 {
+                    let detail = if detail == "original" && !supports_original_image_detail {
+                        "high"
+                    } else {
+                        detail
+                    };
                     image["detail"] = Value::String(detail.to_string());
                 }
                 items.push(image);
@@ -32125,6 +32152,7 @@ tool_timeout_ms = 2000
                 "isError": false,
             }),
             Duration::from_millis(12),
+            true,
         );
         let parts = content
             .as_array()
@@ -32136,6 +32164,20 @@ tool_timeout_ms = 2000
         assert_eq!(parts[2]["type"], "input_image");
         assert_eq!(parts[2]["image_url"], "data:image/png;base64,abcd");
         assert_eq!(parts[2]["detail"], "original");
+
+        let downgraded = mcp_result_tool_content(
+            &serde_json::json!({
+                "content": [{
+                    "type": "image",
+                    "data": "abcd",
+                    "mimeType": "image/png",
+                    "_meta": {"codex/imageDetail": "original"}
+                }],
+            }),
+            Duration::ZERO,
+            false,
+        );
+        assert_eq!(downgraded.as_array().unwrap()[1]["detail"], "high");
     }
 
     #[test]
