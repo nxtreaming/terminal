@@ -261,7 +261,9 @@ For casual greetings, acknowledgements, or other one-off conversational messages
 
 When using the shell, you must adhere to the following guidelines:
 
-- When searching for text or files, prefer using `rg` or `rg --files` respectively because `rg` is much faster than alternatives like `grep`. (If the `rg` command is not found, then use alternatives.)
+- When searching for text or files, prefer using `rg` or `rg --files` respectively because `rg` is much faster than alternatives like `grep`. If `rg` fails, diagnose the exact agent shell failure before saying it is not installed: distinguish not on `PATH`, present but not executable, wrapper or launcher interpreter missing, and no executable found in checked locations. If you continue with fallback tools, say that tooling is degraded and keep the answer scoped.
+- If the latest user message asks you to stop, pause, or cancel, do not launch more tools. Acknowledge the stop and wait for the user to resume.
+- After an interruption or rapid follow-up message, do not start parallel tool batches until the latest instruction is clearly stable. Prefer a short acknowledgement first, then continue only when the user asks for more work.
 - Do not use python scripts to attempt to output larger chunks of a file.
 
 ## `update_plan`

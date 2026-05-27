@@ -18,6 +18,10 @@ use serde_json::{json, Value};
 use tree_sitter::{Node, Parser, Tree};
 use tree_sitter_bash::LANGUAGE as BASH;
 
+use super::agent_env::{
+    agent_tool_path, agent_tool_shell_path_restore, apply_agent_tool_path_to_command,
+};
+
 const DEFAULT_EXEC_YIELD_TIME_MS: u64 = 10_000;
 const DEFAULT_SHELL_COMMAND_TIMEOUT_MS: u64 = 10_000;
 const DEFAULT_WRITE_STDIN_YIELD_TIME_MS: u64 = 250;
@@ -408,7 +412,8 @@ pub(crate) fn exec_command_with_budget(
     wait_for_output(yield_time, || managed.process.try_wait())?;
     if let Some(status) = managed.process.try_wait()? {
         let _ = finish_readers_after_exit(&mut managed);
-        let text = managed.read_recent_output();
+        let text =
+            append_command_startup_diagnostic(&cmd, managed.read_recent_output(), status.exit_code);
         let aggregated_output = managed.read_transcript_output();
         emit_command_output(store, &session.id, Some(process_id), &text)?;
         emit_command_finished(
@@ -579,14 +584,18 @@ pub(crate) fn shell_command_with_budget(
     let duration = started_at.elapsed();
     let stdout = recv_capped_reader(stdout_rx);
     let stderr = recv_capped_reader(stderr_rx);
-    let aggregated_output = aggregate_shell_output(&stdout, &stderr);
-    emit_command_output(store, &session.id, None, &aggregated_output)?;
-
     let exit_code = if timed_out {
         SHELL_COMMAND_TIMEOUT_EXIT_CODE
     } else {
         status.code().unwrap_or(-1)
     };
+    let aggregated_output = append_command_startup_diagnostic(
+        raw_command,
+        aggregate_shell_output(&stdout, &stderr),
+        Some(exit_code),
+    );
+    emit_command_output(store, &session.id, None, &aggregated_output)?;
+
     let success = exit_code == 0 && !timed_out;
     emit_shell_command_finished(
         store,
@@ -661,8 +670,9 @@ fn shell_command_with_snapshot(
     let Some(snapshot) = ensure_shell_snapshot(shell, workdir, thread_id) else {
         return command_text.to_string();
     };
+    let restore_agent_tool_path = agent_tool_shell_path_restore().unwrap_or_default();
     format!(
-        "if [ -r {snapshot} ]; then . {snapshot} >/dev/null 2>&1 || true; fi\n{}",
+        "if [ -r {snapshot} ]; then . {snapshot} >/dev/null 2>&1 || true; fi\n{restore_agent_tool_path}{}",
         command_text,
         snapshot = shell_single_quote(&snapshot.display().to_string())
     )
@@ -864,14 +874,15 @@ fn ensure_shell_snapshot(shell: &ShellSpec, workdir: &Path, thread_id: &str) -> 
         let _ = std::fs::create_dir_all(parent);
     }
     let script = shell_snapshot_capture_script(shell.shell_type);
-    let mut child = Command::new(shell.path_string())
+    let mut command = Command::new(shell.path_string());
+    command
         .args(shell.exec_args(&script, true))
         .current_dir(workdir)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .ok()?;
+        .stderr(Stdio::piped());
+    apply_agent_tool_path_to_command(&mut command);
+    let mut child = command.spawn().ok()?;
     let stdout = child.stdout.take()?;
     let stderr = child.stderr.take()?;
     let stdout_rx = spawn_capped_reader(stdout);
@@ -955,6 +966,7 @@ fn spawn_shell_command_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_unified_exec_env_to_command(&mut command, thread_id);
+    apply_agent_tool_path_to_command(&mut command);
     command.spawn().with_context(|| {
         format!(
             "spawn shell_command via shell {} in {}",
@@ -1025,6 +1037,285 @@ fn aggregate_shell_output(stdout: &str, stderr: &str) -> String {
         aggregated.extend_from_slice(&stderr_bytes[..stderr_take]);
     }
     String::from_utf8_lossy(&aggregated).to_string()
+}
+
+fn append_command_startup_diagnostic(
+    command_text: &str,
+    mut output: String,
+    exit_code: Option<i32>,
+) -> String {
+    let Some(diagnostic) = command_startup_diagnostic(command_text, &output, exit_code) else {
+        return output;
+    };
+    if !output.is_empty() && !output.ends_with('\n') {
+        output.push('\n');
+    }
+    output.push_str(&diagnostic);
+    output
+}
+
+fn command_startup_diagnostic(
+    command_text: &str,
+    output: &str,
+    exit_code: Option<i32>,
+) -> Option<String> {
+    if output.contains("browser-use terminal could not find a working ripgrep executable") {
+        return None;
+    }
+    let lower = output.to_ascii_lowercase();
+    let looks_like_startup_failure = exit_code == Some(127)
+        || lower.contains("command not found")
+        || (exit_code == Some(126)
+            && (lower.contains("permission denied")
+                || lower.contains("bad interpreter")
+                || lower.contains("interpreter")));
+    if !looks_like_startup_failure {
+        return None;
+    }
+    if output.trim().is_empty()
+        && exit_code == Some(127)
+        && !command_text_is_lookup_probe(command_text)
+    {
+        return None;
+    }
+    let targets = command_diagnostic_targets(command_text);
+    if targets.is_empty() {
+        return None;
+    }
+    let diagnostics = targets
+        .iter()
+        .filter_map(|target| diagnose_command_target(target))
+        .collect::<Vec<_>>();
+    if diagnostics.is_empty() {
+        return None;
+    }
+    Some(format!(
+        "browser-use terminal diagnostic: {}",
+        diagnostics.join(" ")
+    ))
+}
+
+fn command_text_is_lookup_probe(command_text: &str) -> bool {
+    let Some(commands) = commands_for_local_exec_policy(command_text) else {
+        return false;
+    };
+    commands.iter().all(|words| {
+        words
+            .first()
+            .and_then(|word| executable_name_lookup_key(word))
+            .is_some_and(|name| name == "command" || name == "which")
+    })
+}
+
+fn command_diagnostic_targets(command_text: &str) -> Vec<String> {
+    let Some(commands) = commands_for_local_exec_policy(command_text) else {
+        return Vec::new();
+    };
+    let mut targets = Vec::new();
+    for words in commands {
+        let Some(first) = words.first() else {
+            continue;
+        };
+        let first_name = executable_name_lookup_key(first).unwrap_or_else(|| first.to_string());
+        let target = match first_name.as_str() {
+            "command" => command_builtin_lookup_target(&words[1..]),
+            "which" => words
+                .iter()
+                .skip(1)
+                .find(|arg| !arg.starts_with('-'))
+                .cloned(),
+            "env" => env_command_target(&words[1..]),
+            _ => Some(first.clone()),
+        };
+        if let Some(target) = target.filter(|target| !target.trim().is_empty()) {
+            if !targets.contains(&target) {
+                targets.push(target);
+            }
+        }
+    }
+    targets
+}
+
+fn command_builtin_lookup_target(args: &[String]) -> Option<String> {
+    let mut saw_lookup_flag = false;
+    for arg in args {
+        match arg.as_str() {
+            "-v" | "-V" => {
+                saw_lookup_flag = true;
+            }
+            value if value.starts_with('-') => {}
+            value if saw_lookup_flag => return Some(value.to_string()),
+            _ => return None,
+        }
+    }
+    None
+}
+
+fn env_command_target(args: &[String]) -> Option<String> {
+    let mut index = 0;
+    while index < args.len() {
+        let arg = args[index].as_str();
+        if arg == "-S" {
+            return args
+                .get(index + 1)
+                .and_then(|value| value.split_whitespace().next())
+                .map(str::to_string);
+        }
+        if arg == "-i" || arg == "-" || arg.starts_with("-u") || arg.contains('=') {
+            index += 1;
+            continue;
+        }
+        if arg.starts_with('-') {
+            index += 1;
+            continue;
+        }
+        return Some(arg.to_string());
+    }
+    None
+}
+
+fn diagnose_command_target(target: &str) -> Option<String> {
+    let path_dirs = effective_agent_path_dirs();
+    let target_path = Path::new(target);
+    if target_path.components().count() > 1 {
+        return diagnose_command_path(target_path, target, &path_dirs);
+    }
+    if let Some(path) = find_existing_on_path(target, &path_dirs) {
+        if !path_is_executable_file(&path) {
+            return Some(format!(
+                "`{target}` exists on the agent shell PATH at {} but is not executable.",
+                path.display()
+            ));
+        }
+        if let Some(diagnostic) = shebang_runtime_diagnostic(&path, &path_dirs) {
+            return Some(format!(
+                "`{target}` exists on the agent shell PATH at {} but {diagnostic}",
+                path.display()
+            ));
+        }
+        return Some(format!(
+            "`{target}` exists on the agent shell PATH at {} but failed while starting; inspect its wrapper, interpreter, or runtime dependencies.",
+            path.display()
+        ));
+    }
+    if let Some(path) = find_existing_in_common_locations(target) {
+        if path_is_executable_file(&path) {
+            return Some(format!(
+                "`{target}` exists at {} but that directory is not on the agent shell PATH.",
+                path.display()
+            ));
+        }
+        return Some(format!(
+            "`{target}` exists at {} but is not executable.",
+            path.display()
+        ));
+    }
+    Some(format!(
+        "`{target}` was not found on the agent shell PATH or common developer tool locations; install it or expose it to this exact agent environment."
+    ))
+}
+
+fn diagnose_command_path(path: &Path, display: &str, path_dirs: &[PathBuf]) -> Option<String> {
+    if !path.exists() {
+        return Some(format!("`{display}` does not exist."));
+    }
+    if !path_is_executable_file(path) {
+        return Some(format!("`{display}` exists but is not executable."));
+    }
+    if let Some(diagnostic) = shebang_runtime_diagnostic(path, path_dirs) {
+        return Some(format!("`{display}` exists but {diagnostic}"));
+    }
+    Some(format!(
+        "`{display}` exists and is executable but failed while starting; inspect its wrapper, interpreter, or runtime dependencies."
+    ))
+}
+
+fn shebang_runtime_diagnostic(path: &Path, path_dirs: &[PathBuf]) -> Option<String> {
+    let bytes = std::fs::read(path).ok()?;
+    if !bytes.starts_with(b"#!") {
+        return None;
+    }
+    let first_line = bytes
+        .split(|byte| *byte == b'\n')
+        .next()
+        .and_then(|line| std::str::from_utf8(line).ok())?;
+    let shebang = first_line.trim_start_matches("#!").trim();
+    let parts = shebang.split_whitespace().collect::<Vec<_>>();
+    let interpreter = parts.first()?;
+    if executable_name_lookup_key(interpreter).as_deref() == Some("env") {
+        let runtime = env_shebang_runtime(&parts[1..])?;
+        if find_executable_on_path(runtime, path_dirs).is_none() {
+            return Some(format!(
+                "its shebang uses `/usr/bin/env {runtime}`, and `{runtime}` is not on the agent shell PATH."
+            ));
+        }
+        return None;
+    }
+    let interpreter_path = Path::new(interpreter);
+    if !interpreter_path.exists() {
+        return Some(format!(
+            "its shebang interpreter `{interpreter}` does not exist."
+        ));
+    }
+    if !path_is_executable_file(interpreter_path) {
+        return Some(format!(
+            "its shebang interpreter `{interpreter}` is not executable."
+        ));
+    }
+    None
+}
+
+fn env_shebang_runtime<'a>(args: &'a [&str]) -> Option<&'a str> {
+    let mut index = 0;
+    while index < args.len() {
+        match args[index] {
+            "-S" => {
+                return args
+                    .get(index + 1)
+                    .and_then(|value| value.split_whitespace().next())
+            }
+            "-i" | "-" => index += 1,
+            value if value.starts_with("-u") => index += 1,
+            value if value.contains('=') => index += 1,
+            value if value.starts_with('-') => index += 1,
+            value => return Some(value),
+        }
+    }
+    None
+}
+
+fn effective_agent_path_dirs() -> Vec<PathBuf> {
+    agent_tool_path()
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_else(path_dirs_from_env)
+}
+
+fn find_existing_on_path(binary_name: &str, path_dirs: &[PathBuf]) -> Option<PathBuf> {
+    path_dirs
+        .iter()
+        .map(|dir| dir.join(binary_name))
+        .find(|path| path.exists())
+}
+
+fn find_executable_on_path(binary_name: &str, path_dirs: &[PathBuf]) -> Option<PathBuf> {
+    path_dirs
+        .iter()
+        .map(|dir| dir.join(binary_name))
+        .find(|path| path_is_executable_file(path))
+}
+
+fn find_existing_in_common_locations(binary_name: &str) -> Option<PathBuf> {
+    let mut candidates = Vec::new();
+    if let Some(home) = std::env::var_os("HOME").map(PathBuf::from) {
+        candidates.push(home.join(".cargo/bin").join(binary_name));
+        candidates.push(home.join(".local/bin").join(binary_name));
+    }
+    candidates.extend(
+        ["/opt/homebrew/bin", "/usr/local/bin", "/usr/bin", "/bin"]
+            .iter()
+            .map(|dir| Path::new(dir).join(binary_name)),
+    );
+    candidates.into_iter().find(|path| path.exists())
 }
 
 #[cfg(test)]
@@ -1496,6 +1787,7 @@ fn spawn_pipe_process(
         .stdout(Stdio::piped())
         .stderr(Stdio::piped());
     apply_unified_exec_env_to_command(&mut command, thread_id);
+    apply_agent_tool_path_to_command(&mut command);
     let mut child = command.spawn().with_context(|| {
         format!(
             "spawn command via shell {} in {}",
@@ -1567,6 +1859,9 @@ fn apply_unified_exec_env_to_command(command: &mut Command, thread_id: &str) {
 fn apply_unified_exec_env_to_pty_command(command: &mut CommandBuilder, thread_id: &str) {
     for (key, value) in UNIFIED_EXEC_ENV {
         command.env(key, value);
+    }
+    if let Some(path) = agent_tool_path() {
+        command.env("PATH", path);
     }
     command.env("CODEX_THREAD_ID", thread_id);
 }
@@ -3315,6 +3610,29 @@ mod tests {
                 session.id
             ))
         );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn startup_diagnostic_reports_missing_shebang_runtime() {
+        use std::os::unix::fs::PermissionsExt;
+
+        let tmp = TempDir::new().expect("tmp");
+        let launcher = tmp.path().join("launcher");
+        std::fs::write(&launcher, "#!/usr/bin/env definitely-missing-runtime\n")
+            .expect("write launcher");
+        std::fs::set_permissions(&launcher, std::fs::Permissions::from_mode(0o755))
+            .expect("chmod launcher");
+
+        let output = append_command_startup_diagnostic(
+            &format!("{} --version", launcher.display()),
+            "env: definitely-missing-runtime: No such file or directory\n".to_string(),
+            Some(127),
+        );
+
+        assert!(output.contains("browser-use terminal diagnostic"));
+        assert!(output.contains("definitely-missing-runtime"));
+        assert!(output.contains("is not on the agent shell PATH"));
     }
 
     #[test]

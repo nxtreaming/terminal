@@ -657,6 +657,11 @@ const CODEX_FRIENDLY_PERSONALITY_MESSAGE: &str =
     "You optimize for team morale and being a supportive teammate as much as code quality.";
 const CODEX_PRAGMATIC_PERSONALITY_MESSAGE: &str =
     "You are a deeply pragmatic, effective software engineer.";
+const TERMINAL_AGENT_TOOLING_AMENDMENT: &str = r#"## Agent Tooling Reliability
+
+- When repository search is needed, use `rg` or `rg --files` first. If `rg` fails, diagnose the exact agent shell failure before saying it is not installed: distinguish not on `PATH`, present but not executable, wrapper or launcher interpreter missing, and no executable found in checked locations. If you continue with fallback tools, say that tooling is degraded and keep the answer scoped.
+- If the latest user message asks you to stop, pause, or cancel, do not launch more tools. Acknowledge the stop and wait for the user to resume.
+- After an interruption or rapid follow-up message, do not start parallel tool batches until the latest instruction is clearly stable. Prefer a short acknowledgement first, then continue only when the user asks for more work."#;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct StaticModelRequestInfo {
@@ -4848,10 +4853,12 @@ pub fn default_terminal_agent_instructions_for_model_and_personality_with_catalo
     personality: ModelPersonality,
     catalog: Option<&ModelCatalog>,
 ) -> String {
-    codex_model_instructions_for_model_and_personality_with_catalog(
-        model,
-        Some(personality),
-        catalog,
+    append_terminal_agent_tooling_amendment(
+        codex_model_instructions_for_model_and_personality_with_catalog(
+            model,
+            Some(personality),
+            catalog,
+        ),
     )
 }
 
@@ -4860,10 +4867,12 @@ pub fn browser_agent_instructions_for_model_and_personality_with_catalog(
     personality: ModelPersonality,
     catalog: Option<&ModelCatalog>,
 ) -> String {
-    let mut instructions = codex_model_instructions_for_model_and_personality_with_catalog(
-        model,
-        Some(personality),
-        catalog,
+    let mut instructions = append_terminal_agent_tooling_amendment(
+        codex_model_instructions_for_model_and_personality_with_catalog(
+            model,
+            Some(personality),
+            catalog,
+        ),
     );
     instructions.push_str("\n\n## Browser Agent Contract\n\n");
     instructions.push_str(include_str!("../../../prompts/browser-agent-system.md").trim());
@@ -4876,6 +4885,14 @@ pub fn browser_agent_instructions_for_model_and_personality_with_catalog(
         instructions.push_str(path);
         instructions.push_str("\n\n");
         instructions.push_str(content.trim());
+    }
+    instructions
+}
+
+fn append_terminal_agent_tooling_amendment(mut instructions: String) -> String {
+    if !instructions.contains("## Agent Tooling Reliability") {
+        instructions.push_str("\n\n");
+        instructions.push_str(TERMINAL_AGENT_TOOLING_AMENDMENT);
     }
     instructions
 }

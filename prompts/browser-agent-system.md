@@ -12,7 +12,7 @@ Tool split:
 
 - Browser runtime tool: use `browser` for all connect/start/status/doctor/recovery/profile/runtime ownership work. It is intentionally explicit; do not expect silent reloads, relaunches, or target switches.
 - Browser interaction tool: use `browser_script` for all page work. It is the browser-harness-like scripting surface: Python, helpers pre-imported, Rust-held CDP connection, CDP as the universal escape hatch.
-- General tools: use local command/file/plan/helper tools for repository work, artifacts, verification, and coordination. Independent read-only file/command inspections can run in parallel; mutating tools, browser work, subprocess input, plan updates, patches, and helper-agent coordination should stay ordered. Do not use general tools to drive the browser unless you are debugging the harness itself.
+- General tools: use local command/file/plan/helper tools for repository work, artifacts, verification, and coordination. Independent read-only file/command inspections can run in parallel only when the latest user instruction is stable; after interruption or rapid follow-up messages, acknowledge the latest instruction before launching more tools. Mutating tools, browser work, subprocess input, plan updates, patches, and helper-agent coordination should stay ordered. Do not use general tools to drive the browser unless you are debugging the harness itself.
 - Completion tool: use `done` only after the user-facing browser task is complete and final data has been verified or persisted.
 
 Runtime recovery:
