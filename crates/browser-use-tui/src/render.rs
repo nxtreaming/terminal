@@ -481,6 +481,9 @@ pub(crate) fn active_modal_overlay(
     if app.is_slash_palette_active() {
         return command_palette_overlay(app, area);
     }
+    if app.prompt_history.search.is_some() {
+        return prompt_history_search_overlay(app, area);
+    }
     if app.surface.is_popup() {
         return surface_popup_overlay(app, state, area, app.surface);
     }
@@ -851,6 +854,147 @@ fn render_command_palette_box(
     .alignment(Alignment::Right)
     .render(footer_chunk, buffer);
     cursor
+}
+
+fn prompt_history_search_overlay(app: &App, area: Rect) -> Option<ModalOverlay> {
+    let rect = prompt_history_search_popup_rect(area)?;
+    let local_rect = Rect::new(0, 0, rect.width, rect.height);
+    let mut buffer = Buffer::empty(local_rect);
+    let local_cursor = render_prompt_history_search_box(&mut buffer, local_rect, app)?;
+    let cursor = Position {
+        x: rect.x.saturating_add(local_cursor.x),
+        y: rect.y.saturating_add(local_cursor.y),
+    };
+    Some(ModalOverlay {
+        rect,
+        buffer,
+        cursor: Some(cursor),
+    })
+}
+
+fn prompt_history_search_popup_rect(area: Rect) -> Option<Rect> {
+    if area.width == 0 || area.height == 0 {
+        return None;
+    }
+    const MIN_W: u16 = 40;
+    const MIN_H: u16 = 9;
+    const MAX_W: u16 = 84;
+    const H_MARGIN: u16 = 4;
+    const V_MARGIN: u16 = 2;
+
+    let popup_w = if area.width <= MIN_W {
+        area.width
+    } else {
+        area.width
+            .saturating_sub(H_MARGIN.saturating_mul(2))
+            .min(MAX_W)
+            .max(MIN_W)
+    };
+    let available_h = area
+        .height
+        .saturating_sub(V_MARGIN.saturating_mul(2))
+        .max(MIN_H.min(area.height));
+    let popup_h = 11.min(available_h).max(MIN_H.min(available_h));
+    let popup_x = area.x + area.width.saturating_sub(popup_w) / 2;
+    let popup_y = area.y + area.height.saturating_sub(popup_h) / 2;
+    Some(Rect {
+        x: popup_x,
+        y: popup_y,
+        width: popup_w,
+        height: popup_h,
+    })
+}
+
+fn render_prompt_history_search_box(
+    buffer: &mut Buffer,
+    popup_rect: Rect,
+    app: &App,
+) -> Option<Position> {
+    let search = app.prompt_history.search.as_ref()?;
+    Clear.render(popup_rect, buffer);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .border_style(border());
+    let inner = block.inner(popup_rect);
+    block.render(popup_rect, buffer);
+    if inner.width == 0 || inner.height == 0 {
+        return None;
+    }
+
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(1),
+            Constraint::Length(1),
+            Constraint::Min(1),
+            Constraint::Length(1),
+        ])
+        .split(inner);
+
+    let input_area = chunks[0];
+    let query = search.query.clone();
+    Paragraph::new(Line::from(vec![
+        Span::styled("> ", accent()),
+        Span::styled(query.clone(), text_style()),
+    ]))
+    .render(input_area, buffer);
+    let cursor = Position {
+        x: input_area
+            .x
+            .saturating_add(2)
+            .saturating_add((query.chars().count() as u16).min(input_area.width.saturating_sub(2))),
+        y: input_area.y,
+    };
+
+    Paragraph::new(Line::from("")).render(chunks[1], buffer);
+
+    let body_width = chunks[2].width as usize;
+    let body_h = chunks[2].height as usize;
+    let mut rows = prompt_history_search_rows(search, body_width);
+    if rows.len() > body_h {
+        rows.truncate(body_h);
+    }
+    Paragraph::new(rows)
+        .style(Style::default().fg(text()))
+        .wrap(Wrap { trim: false })
+        .render(chunks[2], buffer);
+
+    Paragraph::new(Line::from(Span::styled(
+        " ctrl+r/↑ older · ctrl+s/↓ newer · enter accept · esc cancel",
+        muted(),
+    )))
+    .alignment(Alignment::Right)
+    .render(chunks[3], buffer);
+    Some(cursor)
+}
+
+fn prompt_history_search_rows(
+    search: &super::PromptHistorySearchState,
+    width: usize,
+) -> Vec<Line<'static>> {
+    if search.query.trim().is_empty() {
+        return vec![Line::from(Span::styled("  ", muted()))];
+    }
+    if search.matches.is_empty() {
+        return vec![Line::from(Span::styled("  No matching prompts.", muted()))];
+    }
+    search
+        .matches
+        .iter()
+        .enumerate()
+        .map(|(idx, text)| {
+            let is_selected = search.selected == Some(idx);
+            let marker = if is_selected { "› " } else { "  " };
+            let preview = truncate(&first_line(text), width.saturating_sub(6).max(4));
+            let style = if is_selected { text_style() } else { muted() };
+            highlight_selectable_row(
+                vec![Span::styled(marker, accent()), Span::styled(preview, style)],
+                is_selected,
+                width,
+            )
+        })
+        .collect()
 }
 
 fn visible_tail_lines(mut lines: Vec<Line<'static>>, height: u16) -> Vec<Line<'static>> {

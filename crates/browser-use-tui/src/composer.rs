@@ -61,6 +61,10 @@ impl Composer {
         self.text.chars().count()
     }
 
+    pub(crate) fn cursor_is_at_text_boundary(&self) -> bool {
+        self.cursor == 0 || self.cursor == self.input_len()
+    }
+
     #[cfg(test)]
     pub(crate) fn height(&self) -> u16 {
         self.line_count().clamp(1, 10) as u16 + 2

@@ -15,11 +15,12 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use browser_use_core::{
-    cleanup_unified_exec_commands_for_agent_subtree, configured_model_for_cwd_with_options,
+    cleanup_agent_runtime_state_for_agent_subtree, configured_model_for_cwd_with_options,
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
     install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
     product_analytics, typed_user_input_payload_from_text_for_cwd, AgentRunOptions,
-    CollaborationModeKind, ConfigOverrides, UnifiedExecShutdownCleanup,
+    CollaborationModeKind, ConfigOverrides, MessageHistoryConfig, MessageHistoryPersistence,
+    UnifiedExecShutdownCleanup,
 };
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
@@ -398,6 +399,7 @@ struct App {
     args: Args,
     selected_session_id: Option<String>,
     composer: Composer,
+    prompt_history: PromptHistoryState,
     request_input: Option<RequestUserInputState>,
     surface: Surface,
     selected_row: usize,
@@ -789,6 +791,220 @@ impl NativeHistoryState {
         self.clear_before_replay = false;
         should_clear
     }
+}
+
+const MAX_LOCAL_PROMPT_HISTORY_ENTRIES: usize = 1_000;
+
+#[derive(Debug, Default)]
+struct PromptHistoryState {
+    persistent_initialized: bool,
+    persistent_log_id: u64,
+    persistent_count: usize,
+    persistent_cache: HashMap<usize, String>,
+    persistent_search_entries: Option<Vec<String>>,
+    local_entries: Vec<String>,
+    nav_index: Option<usize>,
+    nav_draft: Option<String>,
+    last_history_text: Option<String>,
+    search: Option<PromptHistorySearchState>,
+}
+
+#[derive(Clone, Debug)]
+struct PromptHistorySearchState {
+    query: String,
+    draft: String,
+    matches: Vec<String>,
+    selected: Option<usize>,
+}
+
+impl PromptHistoryState {
+    fn refresh_persistent_metadata(&mut self, config: Option<&MessageHistoryConfig>) {
+        let Some(config) = config else {
+            self.replace_persistent_metadata(0, 0);
+            return;
+        };
+        if matches!(config.settings.persistence, MessageHistoryPersistence::None) {
+            self.replace_persistent_metadata(0, 0);
+            return;
+        }
+
+        let (log_id, count) = browser_use_core::message_history_metadata(config);
+        if !self.persistent_initialized
+            || self.persistent_log_id != log_id
+            || count < self.persistent_count
+        {
+            self.replace_persistent_metadata(log_id, count);
+        }
+    }
+
+    fn replace_persistent_metadata(&mut self, log_id: u64, count: usize) {
+        if self.persistent_initialized
+            && self.persistent_log_id == log_id
+            && self.persistent_count == count
+        {
+            return;
+        }
+        self.persistent_initialized = true;
+        self.persistent_log_id = log_id;
+        self.persistent_count = count;
+        self.persistent_cache.clear();
+        self.persistent_search_entries = None;
+        self.reset_navigation();
+    }
+
+    fn record_submission(&mut self, text: &str) {
+        let text = text.trim();
+        if text.is_empty() {
+            return;
+        }
+        if self.local_entries.last().is_some_and(|entry| entry == text) {
+            self.reset_navigation();
+            self.search = None;
+            return;
+        }
+        self.local_entries.push(text.to_string());
+        if self.local_entries.len() > MAX_LOCAL_PROMPT_HISTORY_ENTRIES {
+            let overflow = self
+                .local_entries
+                .len()
+                .saturating_sub(MAX_LOCAL_PROMPT_HISTORY_ENTRIES);
+            self.local_entries.drain(0..overflow);
+        }
+        self.reset_navigation();
+        self.search = None;
+    }
+
+    fn reset_navigation(&mut self) {
+        self.nav_index = None;
+        self.nav_draft = None;
+        self.last_history_text = None;
+    }
+
+    fn is_navigating(&self) -> bool {
+        self.nav_index.is_some()
+    }
+
+    fn should_handle_navigation(&self, text: &str, cursor_at_boundary: bool) -> bool {
+        if self.total_entries() == 0 {
+            return false;
+        }
+        if text.is_empty() {
+            return true;
+        }
+        cursor_at_boundary && self.last_history_text.as_deref() == Some(text)
+    }
+
+    fn total_entries(&self) -> usize {
+        self.persistent_count + self.local_entries.len()
+    }
+
+    fn entry_at(&mut self, index: usize, config: Option<&MessageHistoryConfig>) -> Option<String> {
+        if index < self.persistent_count {
+            return self.persistent_entry(index, config);
+        }
+        self.local_entries
+            .get(index.saturating_sub(self.persistent_count))
+            .cloned()
+    }
+
+    fn persistent_entry(
+        &mut self,
+        offset: usize,
+        config: Option<&MessageHistoryConfig>,
+    ) -> Option<String> {
+        if offset >= self.persistent_count {
+            return None;
+        }
+        if let Some(entry) = self.persistent_cache.get(&offset) {
+            return Some(entry.clone());
+        }
+        let config = config?;
+        let entry =
+            browser_use_core::lookup_message_history_entry(self.persistent_log_id, offset, config)?;
+        if entry.text.trim().is_empty() {
+            return None;
+        }
+        self.persistent_cache.insert(offset, entry.text.clone());
+        Some(entry.text)
+    }
+
+    fn search_entries(&mut self, config: Option<&MessageHistoryConfig>) -> Vec<String> {
+        if self.persistent_search_entries.is_none() {
+            let persistent_entries = config
+                .filter(|_| self.persistent_count > 0)
+                .map(|config| {
+                    browser_use_core::message_history_entries(
+                        self.persistent_log_id,
+                        self.persistent_count,
+                        config,
+                    )
+                    .into_iter()
+                    .filter_map(|entry| (!entry.text.trim().is_empty()).then_some(entry.text))
+                    .collect::<Vec<_>>()
+                })
+                .unwrap_or_default();
+            self.persistent_search_entries = Some(persistent_entries);
+        }
+        let persistent_entries = self.persistent_search_entries.clone().unwrap_or_default();
+        let mut entries = Vec::with_capacity(persistent_entries.len() + self.local_entries.len());
+        entries.extend(persistent_entries);
+        entries.extend(self.local_entries.iter().cloned());
+        entries
+    }
+}
+
+fn prompt_history_search_matches(entries: &[String], query: &str) -> Vec<String> {
+    let query = query.trim().to_lowercase();
+    if query.is_empty() {
+        return Vec::new();
+    }
+    let mut seen = HashSet::new();
+    let mut matches = Vec::new();
+    for entry in entries.iter().rev() {
+        let normalized = entry.to_lowercase();
+        if normalized.contains(&query) && seen.insert(entry.clone()) {
+            matches.push(entry.clone());
+        }
+    }
+    matches
+}
+
+fn key_matches_control_char(key: KeyEvent, ch: char, raw: char) -> bool {
+    matches!(
+        key,
+        KeyEvent {
+            code: KeyCode::Char(value),
+            modifiers: KeyModifiers::CONTROL,
+            ..
+        } if value.eq_ignore_ascii_case(&ch)
+    ) || matches!(
+        key,
+        KeyEvent {
+            code: KeyCode::Char(value),
+            modifiers: KeyModifiers::NONE,
+            ..
+        } if value == raw
+    )
+}
+
+fn is_prompt_history_search_start_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 'r', '\u{0012}')
+}
+
+fn is_prompt_history_search_next_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 's', '\u{0013}')
+}
+
+fn is_prompt_history_search_cancel_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 'c', '\u{0003}')
+}
+
+fn is_prompt_history_search_backspace_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 'h', '\u{0008}')
+}
+
+fn is_prompt_history_search_clear_key(key: KeyEvent) -> bool {
+    key_matches_control_char(key, 'u', '\u{0015}')
 }
 
 pub(crate) fn collaboration_mode_label(mode: CollaborationModeKind) -> &'static str {
@@ -1345,6 +1561,7 @@ impl App {
             args,
             selected_session_id,
             composer: Composer::default(),
+            prompt_history: PromptHistoryState::default(),
             request_input: None,
             surface,
             selected_row,
@@ -2276,11 +2493,14 @@ impl App {
                     &session,
                     &options,
                 )?;
+                let _ = self.refresh_prompt_history_for(&cwd, &options);
                 self.store.append_event(
                     &session.id,
                     "session.input",
                     typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
                 )?;
+                self.prompt_history.record_submission(&text);
+                self.maybe_append_message_history(&session.id, &text, &cwd, &options);
                 self.selected_session_id = Some(session.id.clone());
                 self.native_history.reset_with_clear();
                 self.start_agent_for_session(session.id)?;
@@ -2300,11 +2520,24 @@ impl App {
                     .store
                     .load_session(&session_id)?
                     .with_context(|| format!("unknown session id: {session_id}"))?;
+                let options = self.configured_agent_options().ok();
+                if let Some(options) = options.as_ref() {
+                    let _ = self.refresh_prompt_history_for(Path::new(&session.cwd), options);
+                }
                 self.store.append_event(
                     &session_id,
                     "session.followup",
                     typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
                 )?;
+                self.prompt_history.record_submission(&text);
+                if let Some(options) = options.as_ref() {
+                    self.maybe_append_message_history(
+                        &session_id,
+                        &text,
+                        Path::new(&session.cwd),
+                        options,
+                    );
+                }
                 if !active {
                     self.start_agent_for_session(session_id)?;
                 }
@@ -2454,7 +2687,7 @@ impl App {
             return Ok(false);
         }
         self.store.request_cancel(&id, "stopped from terminal")?;
-        cleanup_unified_exec_commands_for_agent_subtree(&self.store, &id)?;
+        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id)?;
         Ok(true)
     }
 
@@ -2508,9 +2741,57 @@ impl App {
                 ..
             }
         );
+        if quit_requested {
+            return Ok(true);
+        }
+        if self.prompt_history.search.is_some() {
+            self.handle_prompt_history_search_key(key)?;
+            self.drain_store_notifications()?;
+            return Ok(false);
+        }
         if !quit_requested && self.handle_request_user_input_key(key)? {
             self.drain_store_notifications()?;
             return Ok(false);
+        }
+        if self.surface == Surface::Main
+            && !self.is_slash_palette_active()
+            && !self.is_first_run_setup_visible()?
+        {
+            match key {
+                _ if is_prompt_history_search_start_key(key) => {
+                    self.begin_prompt_history_search()?;
+                    self.drain_store_notifications()?;
+                    return Ok(false);
+                }
+                KeyEvent {
+                    code: KeyCode::Up, ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Char('p'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } if self.should_prompt_history_handle_older()?
+                    && self.navigate_prompt_history_older()? =>
+                {
+                    self.drain_store_notifications()?;
+                    return Ok(false);
+                }
+                KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                }
+                | KeyEvent {
+                    code: KeyCode::Char('n'),
+                    modifiers: KeyModifiers::CONTROL,
+                    ..
+                } if self.prompt_history.is_navigating()
+                    && self.navigate_prompt_history_newer()? =>
+                {
+                    self.drain_store_notifications()?;
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
         match key {
             KeyEvent {
@@ -2525,6 +2806,7 @@ impl App {
             } => {
                 if !self.composer.is_empty() {
                     self.composer.clear();
+                    self.prompt_history.reset_navigation();
                 } else if self.cancel_current_task()? {
                     self.quit_hint_until = None;
                 } else if self
@@ -2623,13 +2905,13 @@ impl App {
                 code: KeyCode::Up, ..
             } if self.surface == Surface::Main
                 && !(self.composer.is_empty() && self.main_selection_count()? > 0)
-                && self.composer.handle_key(key) => {}
+                && self.handle_main_composer_key(key) => {}
             KeyEvent {
                 code: KeyCode::Down,
                 ..
             } if self.surface == Surface::Main
                 && !(self.composer.is_empty() && self.main_selection_count()? > 0)
-                && self.composer.handle_key(key) => {}
+                && self.handle_main_composer_key(key) => {}
             KeyEvent {
                 code: KeyCode::Up, ..
             } if self.surface != Surface::Main
@@ -2713,11 +2995,7 @@ impl App {
                 self.palette_filter.pop();
                 self.clamp_slash_palette_selection();
             }
-            _ if self.surface == Surface::Main && self.composer.handle_key(key) => {
-                if self.is_slash_palette_active() {
-                    self.clamp_slash_palette_selection();
-                }
-            }
+            _ if self.surface == Surface::Main && self.handle_main_composer_key(key) => {}
             KeyEvent {
                 code: KeyCode::Char('d'),
                 modifiers: KeyModifiers::CONTROL,
@@ -2735,12 +3013,19 @@ impl App {
             self.clamp_slash_palette_selection();
             return;
         }
+        if let Some(search) = self.prompt_history.search.as_mut() {
+            search.query.push_str(text);
+            let _ = self.update_prompt_history_search_matches();
+            return;
+        }
         if self.is_first_run_setup_visible().unwrap_or(false) {
             return;
         }
         match self.surface {
             Surface::Main => {
-                self.composer.insert_paste(text);
+                if self.composer.insert_paste(text) {
+                    self.prompt_history.reset_navigation();
+                }
             }
             Surface::ApiKey | Surface::Telemetry => {
                 self.composer.insert_paste(text);
@@ -3182,6 +3467,300 @@ impl App {
             options = options.with_config_overrides(config_overrides);
         }
         Ok(options)
+    }
+
+    fn maybe_append_message_history(
+        &self,
+        session_id: &str,
+        text: &str,
+        cwd: &Path,
+        options: &AgentRunOptions,
+    ) {
+        #[cfg(not(test))]
+        {
+            let session_id = session_id.to_string();
+            let text = text.to_string();
+            let cwd = cwd.to_path_buf();
+            let options = options.clone();
+            std::thread::spawn(move || {
+                let _ = browser_use_core::append_message_history_entry_for_cwd(
+                    &text,
+                    &session_id,
+                    &cwd,
+                    &options,
+                );
+            });
+        }
+        #[cfg(test)]
+        {
+            let _ = (session_id, text, cwd, options);
+        }
+    }
+
+    fn prompt_history_config(&self) -> Result<Option<MessageHistoryConfig>> {
+        let cwd = std::env::current_dir()?;
+        let options = self.configured_agent_options()?;
+        browser_use_core::message_history_config_for_cwd_with_options(&cwd, &options)
+    }
+
+    fn refresh_prompt_history(&mut self) -> Result<Option<MessageHistoryConfig>> {
+        let config = self.prompt_history_config()?;
+        self.prompt_history
+            .refresh_persistent_metadata(config.as_ref());
+        Ok(config)
+    }
+
+    fn refresh_prompt_history_for(
+        &mut self,
+        cwd: &Path,
+        options: &AgentRunOptions,
+    ) -> Result<Option<MessageHistoryConfig>> {
+        let config = browser_use_core::message_history_config_for_cwd_with_options(cwd, options)?;
+        self.prompt_history
+            .refresh_persistent_metadata(config.as_ref());
+        Ok(config)
+    }
+
+    fn should_prompt_history_handle_older(&mut self) -> Result<bool> {
+        if self.surface != Surface::Main || self.is_slash_palette_active() {
+            return Ok(false);
+        }
+        if self.is_first_run_setup_visible()? {
+            return Ok(false);
+        }
+        let _ = self.refresh_prompt_history()?;
+        let text = self.composer.input().to_string();
+        if text.is_empty() && self.main_selection_count()? > 0 {
+            return Ok(false);
+        }
+        Ok(self
+            .prompt_history
+            .should_handle_navigation(&text, self.composer.cursor_is_at_text_boundary()))
+    }
+
+    fn navigate_prompt_history_older(&mut self) -> Result<bool> {
+        let config = self.refresh_prompt_history()?;
+        let total_entries = self.prompt_history.total_entries();
+        if total_entries == 0 {
+            return Ok(false);
+        }
+        let mut next_index = match self.prompt_history.nav_index {
+            Some(index) if index > 0 => index - 1,
+            Some(_) => return Ok(true),
+            None => {
+                self.prompt_history.nav_draft = Some(self.composer.input().to_string());
+                total_entries - 1
+            }
+        };
+        let entry = loop {
+            if let Some(entry) = self.prompt_history.entry_at(next_index, config.as_ref()) {
+                break entry;
+            }
+            if next_index == 0 {
+                return Ok(false);
+            }
+            next_index -= 1;
+        };
+        self.prompt_history.nav_index = Some(next_index);
+        self.prompt_history.last_history_text = Some(entry.clone());
+        self.composer.set_input(entry);
+        Ok(true)
+    }
+
+    fn navigate_prompt_history_newer(&mut self) -> Result<bool> {
+        let Some(index) = self.prompt_history.nav_index else {
+            return Ok(false);
+        };
+        let config = self.refresh_prompt_history()?;
+        let total_entries = self.prompt_history.total_entries();
+        if index + 1 < total_entries {
+            let next_index = index + 1;
+            let Some(entry) = self.prompt_history.entry_at(next_index, config.as_ref()) else {
+                return Ok(false);
+            };
+            self.prompt_history.nav_index = Some(next_index);
+            self.prompt_history.last_history_text = Some(entry.clone());
+            self.composer.set_input(entry);
+        } else {
+            let draft = self.prompt_history.nav_draft.take().unwrap_or_default();
+            self.prompt_history.nav_index = None;
+            self.prompt_history.last_history_text = None;
+            self.composer.set_input(draft);
+        }
+        Ok(true)
+    }
+
+    fn begin_prompt_history_search(&mut self) -> Result<()> {
+        let _ = self.refresh_prompt_history()?;
+        self.close_slash_palette();
+        self.prompt_history.reset_navigation();
+        self.prompt_history.search = Some(PromptHistorySearchState {
+            query: String::new(),
+            draft: self.composer.input().to_string(),
+            matches: Vec::new(),
+            selected: None,
+        });
+        Ok(())
+    }
+
+    fn handle_prompt_history_search_key(&mut self, key: KeyEvent) -> Result<bool> {
+        if self.prompt_history.search.is_none() {
+            return Ok(false);
+        }
+        if is_prompt_history_search_start_key(key)
+            || matches!(
+                key,
+                KeyEvent {
+                    code: KeyCode::Up,
+                    ..
+                }
+            )
+        {
+            self.move_prompt_history_search_selection(1);
+            return Ok(true);
+        }
+        if is_prompt_history_search_next_key(key)
+            || matches!(
+                key,
+                KeyEvent {
+                    code: KeyCode::Down,
+                    ..
+                }
+            )
+        {
+            self.move_prompt_history_search_selection(-1);
+            return Ok(true);
+        }
+        if is_prompt_history_search_cancel_key(key) {
+            self.cancel_prompt_history_search();
+            return Ok(true);
+        }
+        if is_prompt_history_search_backspace_key(key) {
+            if let Some(search) = self.prompt_history.search.as_mut() {
+                search.query.pop();
+            }
+            self.update_prompt_history_search_matches()?;
+            return Ok(true);
+        }
+        if is_prompt_history_search_clear_key(key) {
+            if let Some(search) = self.prompt_history.search.as_mut() {
+                search.query.clear();
+            }
+            self.update_prompt_history_search_matches()?;
+            return Ok(true);
+        }
+        let handled = match key {
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } => {
+                self.cancel_prompt_history_search();
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Enter,
+                modifiers: KeyModifiers::NONE,
+                ..
+            } => {
+                if self
+                    .prompt_history
+                    .search
+                    .as_ref()
+                    .is_some_and(|search| search.selected.is_some())
+                {
+                    self.prompt_history.search = None;
+                    self.prompt_history.reset_navigation();
+                }
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Backspace,
+                ..
+            } => {
+                if let Some(search) = self.prompt_history.search.as_mut() {
+                    search.query.pop();
+                }
+                self.update_prompt_history_search_matches()?;
+                true
+            }
+            KeyEvent {
+                code: KeyCode::Char(ch),
+                modifiers,
+                ..
+            } if !ch.is_control()
+                && !modifiers.contains(KeyModifiers::CONTROL)
+                && !modifiers.contains(KeyModifiers::ALT) =>
+            {
+                if let Some(search) = self.prompt_history.search.as_mut() {
+                    search.query.push(ch);
+                }
+                self.update_prompt_history_search_matches()?;
+                true
+            }
+            _ => true,
+        };
+        Ok(handled)
+    }
+
+    fn update_prompt_history_search_matches(&mut self) -> Result<()> {
+        let Some(search) = self.prompt_history.search.as_ref() else {
+            return Ok(());
+        };
+        let query = search.query.clone();
+        let draft = search.draft.clone();
+        let config = self.refresh_prompt_history()?;
+        let entries = self.prompt_history.search_entries(config.as_ref());
+        let matches = prompt_history_search_matches(&entries, &query);
+        let selected = (!matches.is_empty()).then_some(0);
+        if let Some(search) = self.prompt_history.search.as_mut() {
+            search.matches = matches;
+            search.selected = selected;
+        }
+        if let Some(text) = self.prompt_history_selected_search_text() {
+            self.composer.set_input(text);
+        } else {
+            self.composer.set_input(draft);
+        }
+        Ok(())
+    }
+
+    fn move_prompt_history_search_selection(&mut self, delta: isize) {
+        let Some(search) = self.prompt_history.search.as_mut() else {
+            return;
+        };
+        let Some(selected) = search.selected else {
+            return;
+        };
+        let max = search.matches.len().saturating_sub(1);
+        let next = (selected as isize + delta).clamp(0, max as isize) as usize;
+        search.selected = Some(next);
+        if let Some(text) = self.prompt_history_selected_search_text() {
+            self.composer.set_input(text);
+        }
+    }
+
+    fn prompt_history_selected_search_text(&self) -> Option<String> {
+        let search = self.prompt_history.search.as_ref()?;
+        let selected = search.selected?;
+        search.matches.get(selected).cloned()
+    }
+
+    fn cancel_prompt_history_search(&mut self) {
+        if let Some(search) = self.prompt_history.search.take() {
+            self.composer.set_input(search.draft);
+        }
+        self.prompt_history.reset_navigation();
+    }
+
+    fn handle_main_composer_key(&mut self, key: KeyEvent) -> bool {
+        let before = self.composer.input().to_string();
+        let handled = self.composer.handle_key(key);
+        if handled && self.composer.input() != before {
+            self.prompt_history.reset_navigation();
+        }
+        if handled && self.is_slash_palette_active() {
+            self.clamp_slash_palette_selection();
+        }
+        handled
     }
 
     fn session_model_selection_or_current(
@@ -3649,6 +4228,8 @@ impl App {
     }
 
     fn open_slash_palette(&mut self) {
+        self.prompt_history.search = None;
+        self.prompt_history.reset_navigation();
         self.palette_open = true;
         self.palette_filter.clear();
         self.selected_row = 0;
@@ -5627,7 +6208,7 @@ mod redesign_tests {
     fn with_browser_use_terminal_home<T>(app_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
         let _lock = BROWSER_USE_TERMINAL_HOME_TEST_LOCK
             .lock()
-            .expect("BROWSER_USE_TERMINAL_HOME test lock");
+            .unwrap_or_else(|error| error.into_inner());
         let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         unsafe {
             std::env::set_var("BROWSER_USE_TERMINAL_HOME", app_home);
@@ -8095,6 +8676,176 @@ wire_api = "responses"
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
         assert_eq!(app.composer.cursor(), app.composer.input_len());
         Ok(())
+    }
+
+    #[test]
+    fn prompt_history_recalls_persistent_and_local_entries() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
+            let config = browser_use_core::MessageHistoryConfig {
+                app_home: codex_home.path().to_path_buf(),
+                settings: browser_use_core::MessageHistorySettings::default(),
+            };
+            browser_use_core::append_message_history_entry(
+                "older persisted prompt",
+                "session-a",
+                &config,
+            )?;
+            browser_use_core::append_message_history_entry(
+                "newer persisted prompt",
+                "session-b",
+                &config,
+            )?;
+
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "newer persisted prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "older persisted prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "newer persisted prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Down, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "");
+
+            app.set_input("draft prompt".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "draft prompt");
+
+            app.set_input(String::new());
+            app.prompt_history.record_submission("local newest prompt");
+            browser_use_core::append_message_history_entry(
+                "local newest prompt",
+                "session-c",
+                &config,
+            )?;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "local newest prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "newer persisted prompt");
+
+            app.set_input(String::new());
+            app.prompt_history.reset_navigation();
+            app.prompt_history
+                .record_submission("local\nmultiline prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "local\nmultiline prompt");
+            app.set_input_cursor("local".chars().count());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "local\nmultiline prompt");
+
+            app.set_input("draft first line\nsecond line".to_string());
+            app.prompt_history.reset_navigation();
+            app.set_input_cursor("draft first line".chars().count());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "draft first line\nsecond line");
+            assert_eq!(app.composer.cursor(), "draft first line".chars().count());
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn prompt_history_snapshots_before_local_submission_and_skips_bad_offsets() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
+            let config = browser_use_core::MessageHistoryConfig {
+                app_home: codex_home.path().to_path_buf(),
+                settings: browser_use_core::MessageHistorySettings::default(),
+            };
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let options = app.configured_agent_options()?;
+            app.refresh_prompt_history_for(temp.path(), &options)?;
+            app.prompt_history.record_submission("same-turn prompt");
+            browser_use_core::append_message_history_entry(
+                "same-turn prompt",
+                "session-a",
+                &config,
+            )?;
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "same-turn prompt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "same-turn prompt");
+
+            let history_path = codex_home.path().join("history.jsonl");
+            std::fs::remove_file(&history_path)?;
+            browser_use_core::append_message_history_entry(
+                "valid persisted prompt",
+                "session-b",
+                &config,
+            )?;
+            use std::io::Write as _;
+            let mut file = std::fs::OpenOptions::new()
+                .append(true)
+                .open(&history_path)?;
+            writeln!(file, "{{not-json")?;
+
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Up, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "valid persisted prompt");
+            Ok(())
+        })
+    }
+
+    #[test]
+    fn prompt_history_ctrl_r_search_accepts_and_restores_drafts() -> Result<()> {
+        let codex_home = tempfile::tempdir()?;
+        with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
+            let config = browser_use_core::MessageHistoryConfig {
+                app_home: codex_home.path().to_path_buf(),
+                settings: browser_use_core::MessageHistorySettings::default(),
+            };
+            browser_use_core::append_message_history_entry(
+                "find old invoice",
+                "session-a",
+                &config,
+            )?;
+            browser_use_core::append_message_history_entry("book hotel", "session-b", &config)?;
+            browser_use_core::append_message_history_entry(
+                "find newer receipt",
+                "session-c",
+                &config,
+            )?;
+
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\u{0012}'), KeyModifiers::NONE))?);
+            for ch in "find".chars() {
+                assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+            }
+            assert_eq!(app.composer.input(), "find newer receipt");
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains("find newer receipt"));
+            let matches = &app.prompt_history.search.as_ref().unwrap().matches;
+            assert_eq!(
+                matches,
+                &vec![
+                    "find newer receipt".to_string(),
+                    "find old invoice".to_string()
+                ]
+            );
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\u{0012}'), KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "find old invoice");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\u{0013}'), KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "find newer receipt");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "find newer receipt");
+            assert!(app.prompt_history.search.is_none());
+
+            app.set_input("draft text".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL))?);
+            for ch in "missing".chars() {
+                assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+            }
+            assert_eq!(app.composer.input(), "draft text");
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('\u{0003}'), KeyModifiers::NONE))?);
+            assert_eq!(app.composer.input(), "draft text");
+            assert!(app.prompt_history.search.is_none());
+            Ok(())
+        })
     }
 
     #[test]

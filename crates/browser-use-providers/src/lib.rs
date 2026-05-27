@@ -12,7 +12,7 @@ use rand::Rng as _;
 use serde::{Deserialize, Serialize};
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeSet, HashMap, HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet, VecDeque};
 use std::fs;
 use std::fs::OpenOptions;
 use std::io::{BufRead, BufReader, Write};
@@ -38,6 +38,7 @@ pub enum ProviderErrorKind {
     UsageLimitReached,
     UsageNotIncluded,
     InvalidRequest,
+    InvalidImage,
     RetryLimit,
     InternalServerError,
     UnexpectedStatus,
@@ -1922,6 +1923,102 @@ impl OpenAICompatibleChatProvider {
         self.command_auth = Some(ProviderCommandAuth::new(auth));
         self
     }
+
+    fn chat_request_body(&self, turn: &ProviderTurn, stream: bool) -> Result<Value> {
+        let instructions = turn.instructions_or_default(&self.instructions).to_string();
+        let mut messages = vec![json!({
+            "role": "system",
+            "content": instructions,
+        })];
+        messages.extend(messages_to_chat_messages(
+            &turn.messages,
+            self.include_image_content,
+        )?);
+        let tools = tool_specs_to_chat_tools(&turn.tools);
+        let model_info = model_request_info_for_turn(&self.model, turn);
+        let mut body = json!({
+            "model": self.model,
+            "messages": messages,
+        });
+        if self.include_parallel_tool_calls {
+            body["parallel_tool_calls"] = json!(model_info.supports_parallel_tool_calls);
+        }
+        if let Some(thinking) = &self.thinking {
+            body["thinking"] = thinking.clone();
+        }
+        if let Some(reasoning_effort) = &self.reasoning_effort {
+            body["reasoning_effort"] = json!(reasoning_effort);
+        }
+        let include_usage = (self.include_usage_request && self.base_url.contains("openrouter.ai"))
+            || include_openai_compatible_usage();
+        if include_usage {
+            body["usage"] = json!({ "include": true });
+        }
+        if stream {
+            body["stream"] = json!(true);
+            if include_usage {
+                body["stream_options"] = json!({ "include_usage": true });
+            }
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
+            if self.include_tool_choice {
+                body["tool_choice"] = json!("auto");
+            }
+        }
+        Ok(body)
+    }
+
+    fn build_chat_request(
+        &self,
+        body: &Value,
+        auth_token: Option<&str>,
+        accept: Option<&str>,
+    ) -> reqwest::blocking::RequestBuilder {
+        let mut request = self
+            .client
+            .post(format!("{}/chat/completions", self.base_url));
+        if let Some(accept) = accept {
+            request = request.header("Accept", accept);
+        }
+        request = apply_query_params(request, &self.request_options.query_params);
+        request = apply_extra_headers(request, Some(&self.request_options.headers));
+        if let Some(api_key) = auth_token
+            .or(self.api_key.as_deref())
+            .filter(|key| !key.trim().is_empty())
+        {
+            request = request.bearer_auth(api_key);
+        }
+        request.json(body)
+    }
+
+    fn send_chat_stream_request(
+        &self,
+        body: &Value,
+        request_retry: ProviderRequestRetryConfig,
+    ) -> Result<reqwest::blocking::Response> {
+        let command_auth = self.command_auth.clone();
+        let command_auth_token = command_auth
+            .as_ref()
+            .map(ProviderCommandAuth::access_token)
+            .transpose()
+            .map_err(provider_command_auth_error)?;
+        let send_with_auth = |auth_token: Option<&str>| {
+            send_provider_request("send OpenAI-compatible chat request", request_retry, || {
+                self.build_chat_request(body, auth_token, Some("text/event-stream"))
+            })
+        };
+        let mut response = send_with_auth(command_auth_token.as_deref())?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED {
+            if let Some(command_auth) = command_auth.as_ref() {
+                let refreshed = command_auth
+                    .refresh_access_token()
+                    .map_err(provider_command_auth_error)?;
+                response = send_with_auth(Some(&refreshed))?;
+            }
+        }
+        Ok(response)
+    }
 }
 
 impl ModelProvider for OpenAICompatibleChatProvider {
@@ -1939,41 +2036,7 @@ impl ModelProvider for OpenAICompatibleChatProvider {
 
     fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
         let request_retry = self.request_retry.for_turn(&turn);
-        let instructions = turn.instructions_or_default(&self.instructions).to_string();
-        let mut messages = vec![json!({
-            "role": "system",
-            "content": instructions,
-        })];
-        messages.extend(messages_to_chat_messages(
-            &turn.messages,
-            self.include_image_content,
-        )?);
-        let tools = tool_specs_to_chat_tools(&turn.tools);
-        let model_info = model_request_info_for_turn(&self.model, &turn);
-        let mut body = json!({
-            "model": self.model,
-            "messages": messages,
-        });
-        if self.include_parallel_tool_calls {
-            body["parallel_tool_calls"] = json!(model_info.supports_parallel_tool_calls);
-        }
-        if let Some(thinking) = &self.thinking {
-            body["thinking"] = thinking.clone();
-        }
-        if let Some(reasoning_effort) = &self.reasoning_effort {
-            body["reasoning_effort"] = json!(reasoning_effort);
-        }
-        if (self.include_usage_request && self.base_url.contains("openrouter.ai"))
-            || include_openai_compatible_usage()
-        {
-            body["usage"] = json!({ "include": true });
-        }
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools);
-            if self.include_tool_choice {
-                body["tool_choice"] = json!("auto");
-            }
-        }
+        let body = self.chat_request_body(&turn, false)?;
         let command_auth = self.command_auth.clone();
         let command_auth_token = command_auth
             .as_ref()
@@ -1985,20 +2048,7 @@ impl ModelProvider for OpenAICompatibleChatProvider {
                 "send OpenAI-compatible chat request",
                 "read OpenAI-compatible chat response body",
                 request_retry,
-                || {
-                    let mut request = self
-                        .client
-                        .post(format!("{}/chat/completions", self.base_url));
-                    request = apply_query_params(request, &self.request_options.query_params);
-                    request = apply_extra_headers(request, Some(&self.request_options.headers));
-                    if let Some(api_key) = auth_token
-                        .or(self.api_key.as_deref())
-                        .filter(|key| !key.trim().is_empty())
-                    {
-                        request = request.bearer_auth(api_key);
-                    }
-                    request.json(&body)
-                },
+                || self.build_chat_request(&body, auth_token, None),
             )
         };
         let (mut status, mut headers, mut body_text) =
@@ -2024,6 +2074,36 @@ impl ModelProvider for OpenAICompatibleChatProvider {
             ProviderError::retryable(format!("parse OpenAI-compatible chat JSON: {error}"), None)
         })?;
         parse_chat_completion_output(&body, &self.model, &turn.tools)
+    }
+
+    fn stream_turn(
+        &self,
+        turn: ProviderTurn,
+        on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+    ) -> Result<()> {
+        let request_retry = self.request_retry.for_turn(&turn);
+        let stream_idle_timeout = stream_idle_timeout_for_turn(&turn);
+        let body = self.chat_request_body(&turn, true)?;
+        let response = self.send_chat_stream_request(&body, request_retry)?;
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body_text = response.text().unwrap_or_default();
+            return Err(provider_http_status_error(
+                "OpenAI-compatible chat",
+                status,
+                &body_text,
+                Some(&headers),
+            )
+            .into());
+        }
+        parse_chat_completion_sse_stream(
+            response,
+            &self.model,
+            &turn.tools,
+            stream_idle_timeout,
+            on_event,
+        )
     }
 }
 
@@ -2300,38 +2380,80 @@ impl AnthropicMessagesProvider {
         credential: &AnthropicCredential,
         request_retry: ProviderRequestRetryConfig,
     ) -> Result<(reqwest::StatusCode, reqwest::header::HeaderMap, String), ProviderError> {
-        let is_oauth = credential.is_oauth();
         send_provider_text_request(
             "send Anthropic Messages request",
             "read Anthropic Messages response body",
             request_retry,
-            || {
-                let request = self
-                    .client
-                    .post(format!("{}/messages", self.base_url))
-                    .header("accept", "application/json")
-                    .header("content-type", "application/json")
-                    .header("anthropic-version", "2023-06-01")
-                    .header("anthropic-dangerous-direct-browser-access", "true");
-                match credential {
-                    AnthropicCredential::ApiKey(api_key) if !is_oauth => request
-                        .header("x-api-key", api_key)
-                        .header("anthropic-beta", ANTHROPIC_BETA_FEATURES.join(","))
-                        .json(body),
-                    AnthropicCredential::ApiKey(auth_token)
-                    | AnthropicCredential::AuthToken(auth_token) => {
-                        let mut beta = vec!["claude-code-20250219", "oauth-2025-04-20"];
-                        beta.extend_from_slice(ANTHROPIC_BETA_FEATURES);
-                        request
-                            .bearer_auth(auth_token)
-                            .header("anthropic-beta", beta.join(","))
-                            .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
-                            .header("x-app", "cli")
-                            .json(body)
-                    }
-                }
-            },
+            || self.build_messages_request(body, credential, "application/json"),
         )
+    }
+
+    fn send_messages_stream_request(
+        &self,
+        body: &Value,
+        credential: &AnthropicCredential,
+        request_retry: ProviderRequestRetryConfig,
+    ) -> Result<reqwest::blocking::Response, ProviderError> {
+        send_provider_request("send Anthropic Messages request", request_retry, || {
+            self.build_messages_request(body, credential, "text/event-stream")
+        })
+    }
+
+    fn build_messages_request(
+        &self,
+        body: &Value,
+        credential: &AnthropicCredential,
+        accept: &'static str,
+    ) -> reqwest::blocking::RequestBuilder {
+        let is_oauth = credential.is_oauth();
+        let request = self
+            .client
+            .post(format!("{}/messages", self.base_url))
+            .header("accept", accept)
+            .header("content-type", "application/json")
+            .header("anthropic-version", "2023-06-01")
+            .header("anthropic-dangerous-direct-browser-access", "true");
+        match credential {
+            AnthropicCredential::ApiKey(api_key) if !is_oauth => request
+                .header("x-api-key", api_key)
+                .header("anthropic-beta", ANTHROPIC_BETA_FEATURES.join(","))
+                .json(body),
+            AnthropicCredential::ApiKey(auth_token)
+            | AnthropicCredential::AuthToken(auth_token) => {
+                let mut beta = vec!["claude-code-20250219", "oauth-2025-04-20"];
+                beta.extend_from_slice(ANTHROPIC_BETA_FEATURES);
+                request
+                    .bearer_auth(auth_token)
+                    .header("anthropic-beta", beta.join(","))
+                    .header("user-agent", format!("claude-cli/{CLAUDE_CODE_VERSION}"))
+                    .header("x-app", "cli")
+                    .json(body)
+            }
+        }
+    }
+
+    fn messages_request_body(
+        &self,
+        turn: &ProviderTurn,
+        is_oauth: bool,
+        stream: bool,
+    ) -> Result<Value> {
+        let tools = tool_specs_to_anthropic_tools(&turn.tools, is_oauth);
+        let instructions = turn.instructions_or_default(&self.instructions).to_string();
+        let mut body = json!({
+            "model": self.model,
+            "max_tokens": 16000,
+            "system": anthropic_system_blocks_with_developer_context(&instructions, &turn.messages, is_oauth),
+            "messages": messages_to_anthropic_messages(&turn.messages, is_oauth)?,
+        });
+        if stream {
+            body["stream"] = json!(true);
+        }
+        if !tools.is_empty() {
+            body["tools"] = Value::Array(tools);
+            body["tool_choice"] = json!({"type": "auto"});
+        }
+        Ok(body)
     }
 }
 
@@ -2352,18 +2474,7 @@ impl ModelProvider for AnthropicMessagesProvider {
         let request_retry = self.request_retry.for_turn(&turn);
         let mut credential = self.current_credential()?;
         let is_oauth = credential.is_oauth();
-        let tools = tool_specs_to_anthropic_tools(&turn.tools, is_oauth);
-        let instructions = turn.instructions_or_default(&self.instructions).to_string();
-        let mut body = json!({
-            "model": self.model,
-            "max_tokens": 16000,
-            "system": anthropic_system_blocks_with_developer_context(&instructions, &turn.messages, is_oauth),
-            "messages": messages_to_anthropic_messages(&turn.messages, is_oauth)?,
-        });
-        if !tools.is_empty() {
-            body["tools"] = Value::Array(tools);
-            body["tool_choice"] = json!({"type": "auto"});
-        }
+        let body = self.messages_request_body(&turn, is_oauth, false)?;
         let (mut status, mut headers, mut body_text) =
             self.send_messages_request(&body, &credential, request_retry)?;
         if status == reqwest::StatusCode::UNAUTHORIZED && is_oauth {
@@ -2393,6 +2504,52 @@ impl ModelProvider for AnthropicMessagesProvider {
             ProviderError::retryable(format!("parse Anthropic Messages JSON: {error}"), None)
         })?;
         parse_anthropic_messages_output(&body, &self.model, &turn.tools, is_oauth)
+    }
+
+    fn stream_turn(
+        &self,
+        turn: ProviderTurn,
+        on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+    ) -> Result<()> {
+        let request_retry = self.request_retry.for_turn(&turn);
+        let stream_idle_timeout = stream_idle_timeout_for_turn(&turn);
+        let mut credential = self.current_credential()?;
+        let is_oauth = credential.is_oauth();
+        let body = self.messages_request_body(&turn, is_oauth, true)?;
+        let mut response = self.send_messages_stream_request(&body, &credential, request_retry)?;
+        if response.status() == reqwest::StatusCode::UNAUTHORIZED && is_oauth {
+            if let Some(refresh) = self.oauth_refresh.as_ref() {
+                let refreshed = refresh.refresh().map_err(|error| {
+                    ProviderError::non_retryable(
+                        ProviderErrorKind::Unauthorized,
+                        format!("refresh Claude Code OAuth token after 401: {error:#}"),
+                    )
+                })?;
+                self.replace_oauth_access_token(refreshed.access_token.clone())?;
+                credential = AnthropicCredential::AuthToken(refreshed.access_token);
+                response = self.send_messages_stream_request(&body, &credential, request_retry)?;
+            }
+        }
+        let status = response.status();
+        if !status.is_success() {
+            let headers = response.headers().clone();
+            let body_text = response.text().unwrap_or_default();
+            return Err(provider_http_status_error(
+                "Anthropic Messages",
+                status,
+                &body_text,
+                Some(&headers),
+            )
+            .into());
+        }
+        parse_anthropic_messages_sse_stream(
+            response,
+            &self.model,
+            &turn.tools,
+            is_oauth,
+            stream_idle_timeout,
+            on_event,
+        )
     }
 }
 
@@ -2644,6 +2801,12 @@ fn provider_http_status_error(
     }
 
     if status == reqwest::StatusCode::BAD_REQUEST {
+        if code == Some("invalid_image")
+            || invalid_image_error_message(parsed.message.as_deref(), body)
+        {
+            return ProviderError::non_retryable(ProviderErrorKind::InvalidImage, message)
+                .with_http_status_code(status);
+        }
         if code == Some("cyber_policy") {
             return ProviderError::non_retryable(
                 ProviderErrorKind::CyberPolicy,
@@ -4116,6 +4279,72 @@ fn is_sse_idle_timeout_error(error: &std::io::Error) -> bool {
     message.contains("timed out") || message.contains("operation timed out")
 }
 
+fn response_is_json(response: &reqwest::blocking::Response) -> bool {
+    response
+        .headers()
+        .get(reqwest::header::CONTENT_TYPE)
+        .and_then(|value| value.to_str().ok())
+        .is_some_and(|content_type| content_type.contains("application/json"))
+}
+
+fn read_sse_data_stream(
+    response: reqwest::blocking::Response,
+    stream_idle_timeout: Duration,
+    read_error_context: &'static str,
+    on_data: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    let mut data_lines = Vec::new();
+    let (line_tx, line_rx) = std::sync::mpsc::channel();
+    thread::spawn(move || {
+        for line in BufReader::new(response).lines() {
+            if line_tx.send(line).is_err() {
+                return;
+            }
+        }
+    });
+    loop {
+        let line = match line_rx.recv_timeout(stream_idle_timeout) {
+            Ok(line) => line,
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                return Err(ProviderError::stream("idle timeout waiting for SSE").into());
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => break,
+        };
+        let line = match line {
+            Ok(line) => line,
+            Err(error) if is_sse_idle_timeout_error(&error) => {
+                return Err(ProviderError::stream("idle timeout waiting for SSE").into());
+            }
+            Err(error) => return Err(error).context(read_error_context),
+        };
+        if line.is_empty() {
+            flush_generic_sse_data(&mut data_lines, on_data)?;
+        } else if let Some(data) = line.strip_prefix("data:") {
+            data_lines.push(data.trim().to_string());
+        } else if line.starts_with("event:") || line.starts_with(':') {
+            continue;
+        } else {
+            data_lines.push(line.trim().to_string());
+        }
+    }
+    flush_generic_sse_data(&mut data_lines, on_data)
+}
+
+fn flush_generic_sse_data(
+    data_lines: &mut Vec<String>,
+    on_data: &mut dyn FnMut(&str) -> Result<()>,
+) -> Result<()> {
+    if data_lines.is_empty() {
+        return Ok(());
+    }
+    let data = data_lines.join("\n");
+    data_lines.clear();
+    if data.trim().is_empty() {
+        return Ok(());
+    }
+    on_data(data.trim())
+}
+
 fn emit_responses_header_events(
     headers: &reqwest::header::HeaderMap,
     stream_state: &mut CodexSseStreamState,
@@ -4412,6 +4641,9 @@ fn response_failed_error(event: &Value) -> ProviderError {
         Some("invalid_prompt") => {
             ProviderError::non_retryable(ProviderErrorKind::InvalidRequest, message)
         }
+        Some("invalid_image") => {
+            ProviderError::non_retryable(ProviderErrorKind::InvalidImage, message)
+        }
         Some("cyber_policy") => {
             ProviderError::non_retryable(ProviderErrorKind::CyberPolicy, message)
         }
@@ -4425,6 +4657,12 @@ fn response_failed_error(event: &Value) -> ProviderError {
         Some(_) => ProviderError::retryable(message, None),
         None => ProviderError::stream(message),
     }
+}
+
+fn invalid_image_error_message(parsed_message: Option<&str>, body: &str) -> bool {
+    parsed_message
+        .unwrap_or(body)
+        .contains("The image data you provided does not represent a valid image")
 }
 
 fn response_completed_event(response: &Value) -> Result<ModelEvent> {
@@ -6168,6 +6406,159 @@ fn parse_chat_completion_output(
     Ok(events)
 }
 
+fn parse_chat_completion_sse_stream(
+    response: reqwest::blocking::Response,
+    model: &str,
+    tools: &[ToolSpec],
+    stream_idle_timeout: Duration,
+    on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+) -> Result<()> {
+    if response_is_json(&response) {
+        let body_text = response
+            .text()
+            .context("read OpenAI-compatible chat JSON body")?;
+        let body: Value = serde_json::from_str(&body_text).map_err(|error| {
+            ProviderError::retryable(format!("parse OpenAI-compatible chat JSON: {error}"), None)
+        })?;
+        for event in parse_chat_completion_output(&body, model, tools)? {
+            on_event(event)?;
+        }
+        return Ok(());
+    }
+
+    let mut tool_calls = BTreeMap::<usize, ChatStreamToolCall>::new();
+    let mut emitted_done = false;
+    read_sse_data_stream(
+        response,
+        stream_idle_timeout,
+        "read OpenAI-compatible chat SSE line",
+        &mut |data| {
+            if data.trim() == "[DONE]" {
+                flush_chat_stream_tool_calls(&mut tool_calls, tools, on_event)?;
+                on_event(ModelEvent::Done)?;
+                emitted_done = true;
+                return Ok(());
+            }
+            let chunk: Value = serde_json::from_str(data).map_err(|error| {
+                ProviderError::retryable(
+                    format!("parse OpenAI-compatible chat SSE JSON: {error}"),
+                    None,
+                )
+            })?;
+            if chunk
+                .get("choices")
+                .and_then(Value::as_array)
+                .and_then(|choices| choices.first())
+                .and_then(|choice| choice.get("message"))
+                .is_some()
+            {
+                for event in parse_chat_completion_output(&chunk, model, tools)? {
+                    on_event(event)?;
+                }
+                emitted_done = true;
+                return Ok(());
+            }
+            if let Some(usage) = parse_chat_usage(chunk.get("usage"), model) {
+                on_event(ModelEvent::Usage { usage })?;
+            }
+            for choice in chunk
+                .get("choices")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+            {
+                let Some(delta) = choice.get("delta") else {
+                    continue;
+                };
+                if let Some(content) = delta.get("content").and_then(Value::as_str) {
+                    if !content.is_empty() {
+                        on_event(ModelEvent::TextDelta {
+                            text: content.to_string(),
+                        })?;
+                    }
+                }
+                if let Some(text) = delta
+                    .get("reasoning_content")
+                    .or_else(|| delta.get("reasoning"))
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.is_empty())
+                {
+                    on_event(ModelEvent::ThinkingDelta {
+                        text: text.to_string(),
+                        label: Some("reasoning".to_string()),
+                    })?;
+                }
+                for tool_delta in delta
+                    .get("tool_calls")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
+                    let index = tool_delta
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(tool_calls.len() as u64)
+                        as usize;
+                    let entry = tool_calls.entry(index).or_default();
+                    if let Some(id) = tool_delta.get("id").and_then(Value::as_str) {
+                        entry.id = Some(id.to_string());
+                    }
+                    if let Some(function) = tool_delta.get("function") {
+                        if let Some(name) = function.get("name").and_then(Value::as_str) {
+                            entry.name = Some(name.to_string());
+                        }
+                        if let Some(arguments) = function.get("arguments").and_then(Value::as_str) {
+                            entry.arguments.push_str(arguments);
+                        }
+                    }
+                }
+            }
+            Ok(())
+        },
+    )?;
+    if !emitted_done {
+        return Err(
+            ProviderError::stream("OpenAI-compatible chat stream closed before [DONE]").into(),
+        );
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct ChatStreamToolCall {
+    id: Option<String>,
+    name: Option<String>,
+    arguments: String,
+}
+
+fn flush_chat_stream_tool_calls(
+    tool_calls: &mut BTreeMap<usize, ChatStreamToolCall>,
+    tools: &[ToolSpec],
+    on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+) -> Result<()> {
+    let pending = std::mem::take(tool_calls);
+    for (_, call) in pending {
+        let name = call
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .context("chat streamed tool call missing function.name")?;
+        let call_id = call
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .context("chat streamed tool call missing id")?;
+        let function = json!({ "arguments": call.arguments });
+        on_event(ModelEvent::ToolCall {
+            call: ToolCall {
+                id: call_id,
+                name: name.clone(),
+                namespace: None,
+                arguments: chat_tool_call_arguments(&name, &function, tools),
+            },
+        })?;
+    }
+    Ok(())
+}
+
 fn chat_tool_call_arguments(name: &str, function: &Value, tools: &[ToolSpec]) -> Value {
     let raw = function
         .get("arguments")
@@ -6255,6 +6646,248 @@ fn parse_anthropic_messages_output(
     }
     events.push(ModelEvent::Done);
     Ok(events)
+}
+
+fn parse_anthropic_messages_sse_stream(
+    response: reqwest::blocking::Response,
+    model: &str,
+    tools: &[ToolSpec],
+    is_oauth: bool,
+    stream_idle_timeout: Duration,
+    on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+) -> Result<()> {
+    if response_is_json(&response) {
+        let body_text = response
+            .text()
+            .context("read Anthropic Messages JSON body")?;
+        let body: Value = serde_json::from_str(&body_text).map_err(|error| {
+            ProviderError::retryable(format!("parse Anthropic Messages JSON: {error}"), None)
+        })?;
+        for event in parse_anthropic_messages_output(&body, model, tools, is_oauth)? {
+            on_event(event)?;
+        }
+        return Ok(());
+    }
+
+    let mut state = AnthropicStreamState::default();
+    let mut emitted_done = false;
+    read_sse_data_stream(
+        response,
+        stream_idle_timeout,
+        "read Anthropic Messages SSE line",
+        &mut |data| {
+            let event: Value = serde_json::from_str(data).map_err(|error| {
+                ProviderError::retryable(
+                    format!("parse Anthropic Messages SSE JSON: {error}"),
+                    None,
+                )
+            })?;
+            if event.get("content").and_then(Value::as_array).is_some() {
+                for parsed in parse_anthropic_messages_output(&event, model, tools, is_oauth)? {
+                    on_event(parsed)?;
+                }
+                emitted_done = true;
+                return Ok(());
+            }
+            match event.get("type").and_then(Value::as_str) {
+                Some("message_start") => {
+                    state.merge_usage(
+                        event
+                            .get("message")
+                            .and_then(|message| message.get("usage")),
+                    );
+                }
+                Some("content_block_start") => {
+                    let index = event
+                        .get("index")
+                        .and_then(Value::as_u64)
+                        .unwrap_or(state.tool_blocks.len() as u64)
+                        as usize;
+                    if let Some(block) = event.get("content_block") {
+                        state.remember_content_block(index, block);
+                    }
+                }
+                Some("content_block_delta") => {
+                    let index = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    if let Some(delta) = event.get("delta") {
+                        match delta.get("type").and_then(Value::as_str) {
+                            Some("text_delta") => {
+                                if let Some(text) = delta.get("text").and_then(Value::as_str) {
+                                    if !text.is_empty() {
+                                        on_event(ModelEvent::TextDelta {
+                                            text: text.to_string(),
+                                        })?;
+                                    }
+                                }
+                            }
+                            Some("thinking_delta") => {
+                                if let Some(text) = delta.get("thinking").and_then(Value::as_str) {
+                                    if !text.is_empty() {
+                                        on_event(ModelEvent::ThinkingDelta {
+                                            text: text.to_string(),
+                                            label: Some("thinking".to_string()),
+                                        })?;
+                                    }
+                                }
+                            }
+                            Some("input_json_delta") => {
+                                if let Some(partial) =
+                                    delta.get("partial_json").and_then(Value::as_str)
+                                {
+                                    state
+                                        .tool_blocks
+                                        .entry(index)
+                                        .or_default()
+                                        .input_json
+                                        .push_str(partial);
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+                }
+                Some("content_block_stop") => {
+                    let index = event.get("index").and_then(Value::as_u64).unwrap_or(0) as usize;
+                    if let Some(call) = state.finish_tool_block(index, tools, is_oauth)? {
+                        on_event(ModelEvent::ToolCall { call })?;
+                    }
+                }
+                Some("message_delta") => {
+                    state.merge_usage(event.get("usage"));
+                }
+                Some("message_stop") => {
+                    for call in state.finish_all_tool_blocks(tools, is_oauth)? {
+                        on_event(ModelEvent::ToolCall { call })?;
+                    }
+                    if let Some(usage) = state.usage(model) {
+                        on_event(ModelEvent::Usage { usage })?;
+                    }
+                    on_event(ModelEvent::Done)?;
+                    emitted_done = true;
+                }
+                Some("ping") => {}
+                Some("error") => bail!("Anthropic stream error: {event}"),
+                _ => {}
+            }
+            Ok(())
+        },
+    )?;
+    if !emitted_done {
+        return Err(ProviderError::stream("Anthropic stream closed before message_stop").into());
+    }
+    Ok(())
+}
+
+#[derive(Default)]
+struct AnthropicStreamState {
+    input_tokens: Option<i64>,
+    output_tokens: Option<i64>,
+    tool_blocks: BTreeMap<usize, AnthropicStreamToolBlock>,
+}
+
+impl AnthropicStreamState {
+    fn merge_usage(&mut self, usage: Option<&Value>) {
+        if let Some(input_tokens) = usage
+            .and_then(|usage| usage.get("input_tokens"))
+            .and_then(Value::as_i64)
+        {
+            self.input_tokens = Some(input_tokens);
+        }
+        if let Some(output_tokens) = usage
+            .and_then(|usage| usage.get("output_tokens"))
+            .and_then(Value::as_i64)
+        {
+            self.output_tokens = Some(output_tokens);
+        }
+    }
+
+    fn remember_content_block(&mut self, index: usize, block: &Value) {
+        if block.get("type").and_then(Value::as_str) != Some("tool_use") {
+            return;
+        }
+        let entry = self.tool_blocks.entry(index).or_default();
+        if let Some(id) = block.get("id").and_then(Value::as_str) {
+            entry.id = Some(id.to_string());
+        }
+        if let Some(name) = block.get("name").and_then(Value::as_str) {
+            entry.name = Some(name.to_string());
+        }
+        if let Some(input) = block.get("input").filter(|input| !input.is_null()) {
+            entry.input = Some(input.clone());
+        }
+    }
+
+    fn finish_tool_block(
+        &mut self,
+        index: usize,
+        tools: &[ToolSpec],
+        is_oauth: bool,
+    ) -> Result<Option<ToolCall>> {
+        let Some(block) = self.tool_blocks.remove(&index) else {
+            return Ok(None);
+        };
+        block.into_tool_call(tools, is_oauth).map(Some)
+    }
+
+    fn finish_all_tool_blocks(
+        &mut self,
+        tools: &[ToolSpec],
+        is_oauth: bool,
+    ) -> Result<Vec<ToolCall>> {
+        let pending = std::mem::take(&mut self.tool_blocks);
+        pending
+            .into_values()
+            .map(|block| block.into_tool_call(tools, is_oauth))
+            .collect()
+    }
+
+    fn usage(&self, model: &str) -> Option<ModelUsage> {
+        if self.input_tokens.is_none() && self.output_tokens.is_none() {
+            return None;
+        }
+        parse_usage(
+            Some(&json!({
+                "input_tokens": self.input_tokens,
+                "output_tokens": self.output_tokens,
+            })),
+            model,
+        )
+    }
+}
+
+#[derive(Default)]
+struct AnthropicStreamToolBlock {
+    id: Option<String>,
+    name: Option<String>,
+    input: Option<Value>,
+    input_json: String,
+}
+
+impl AnthropicStreamToolBlock {
+    fn into_tool_call(self, tools: &[ToolSpec], is_oauth: bool) -> Result<ToolCall> {
+        let name = self
+            .name
+            .filter(|name| !name.trim().is_empty())
+            .context("Anthropic streamed tool_use missing name")?;
+        let call_id = self
+            .id
+            .filter(|id| !id.trim().is_empty())
+            .context("Anthropic streamed tool_use missing id")?;
+        let local_name = anthropic_response_tool_name(&name, tools, is_oauth);
+        let input = if self.input_json.trim().is_empty() {
+            self.input.unwrap_or_else(|| json!({}))
+        } else {
+            serde_json::from_str::<Value>(&self.input_json).unwrap_or_else(|_| {
+                freeform_tool_arguments_from_raw(&local_name, &self.input_json, tools)
+            })
+        };
+        Ok(ToolCall {
+            id: call_id,
+            name: local_name.clone(),
+            namespace: None,
+            arguments: anthropic_tool_use_arguments(&local_name, Some(&input), tools),
+        })
+    }
 }
 
 fn anthropic_tool_use_arguments(name: &str, input: Option<&Value>, tools: &[ToolSpec]) -> Value {
@@ -8552,6 +9185,68 @@ mod tests {
     }
 
     #[test]
+    fn openai_compatible_chat_provider_streams_text_tool_calls_and_usage() -> Result<()> {
+        let sse = concat!(
+            "data: {\"choices\":[{\"delta\":{\"content\":\"Working.\\n\"}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"id\":\"call_done\",\"type\":\"function\",\"function\":{\"name\":\"done\",\"arguments\":\"{\\\"result\\\"\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"index\":0,\"function\":{\"arguments\":\":\\\"ok\\\"}\"}}]}}]}\n\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}],\"usage\":{\"prompt_tokens\":5,\"completion_tokens\":6,\"total_tokens\":11}}\n\n",
+            "data: [DONE]\n\n",
+        );
+        let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
+        let provider =
+            OpenAICompatibleChatProvider::with_base_url("test-key", "openrouter/test", base_url);
+        let mut events = Vec::new();
+        provider.stream_turn(
+            ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                tools: vec![ToolSpec {
+                    name: "done".to_string(),
+                    namespace: None,
+                    namespace_description: None,
+                    description: "finish".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "result": { "type": "string" } },
+                        "required": ["result"],
+                        "additionalProperties": false
+                    }),
+                    output_schema: None,
+                    freeform: None,
+                }],
+                ..ProviderTurn::default()
+            },
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )?;
+        handle.join().expect("mock server thread");
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Working.\n".to_string()
+        }));
+        assert!(events.contains(&ModelEvent::ToolCall {
+            call: ToolCall {
+                id: "call_done".to_string(),
+                name: "done".to_string(),
+                namespace: None,
+                arguments: json!({"result": "ok"}),
+            }
+        }));
+        assert!(events.contains(&ModelEvent::Usage {
+            usage: ModelUsage {
+                input_tokens: Some(5),
+                output_tokens: Some(6),
+                total_tokens: Some(11),
+                cost_usd: None,
+                ..Default::default()
+            }
+        }));
+        assert!(matches!(events.last(), Some(ModelEvent::Done)));
+        Ok(())
+    }
+
+    #[test]
     fn anthropic_messages_provider_parses_text_tool_use_and_usage() -> Result<()> {
         let (base_url, handle) = spawn_mock_server(
             json!({
@@ -8618,6 +9313,81 @@ mod tests {
                 ..Default::default()
             }
         }));
+        Ok(())
+    }
+
+    #[test]
+    fn anthropic_messages_provider_streams_text_tool_use_and_usage() -> Result<()> {
+        let sse = concat!(
+            "event: message_start\n",
+            "data: {\"type\":\"message_start\",\"message\":{\"usage\":{\"input_tokens\":7,\"output_tokens\":1}}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":0,\"content_block\":{\"type\":\"text\",\"text\":\"\"}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":0,\"delta\":{\"type\":\"text_delta\",\"text\":\"Working.\\n\"}}\n\n",
+            "event: content_block_start\n",
+            "data: {\"type\":\"content_block_start\",\"index\":1,\"content_block\":{\"type\":\"tool_use\",\"id\":\"toolu_123\",\"name\":\"done\",\"input\":{}}}\n\n",
+            "event: content_block_delta\n",
+            "data: {\"type\":\"content_block_delta\",\"index\":1,\"delta\":{\"type\":\"input_json_delta\",\"partial_json\":\"{\\\"result\\\":\\\"ok\\\"}\"}}\n\n",
+            "event: content_block_stop\n",
+            "data: {\"type\":\"content_block_stop\",\"index\":1}\n\n",
+            "event: message_delta\n",
+            "data: {\"type\":\"message_delta\",\"delta\":{\"stop_reason\":\"tool_use\"},\"usage\":{\"output_tokens\":8}}\n\n",
+            "event: message_stop\n",
+            "data: {\"type\":\"message_stop\"}\n\n",
+        );
+        let (base_url, handle) = spawn_mock_server(sse.to_string(), "text/event-stream")?;
+        let provider =
+            AnthropicMessagesProvider::with_base_url("anthropic-key", "claude-test", base_url);
+        let mut events = Vec::new();
+        provider.stream_turn(
+            ProviderTurn {
+                instructions: None,
+                model_settings: ModelRequestSettings::default(),
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                tools: vec![ToolSpec {
+                    name: "done".to_string(),
+                    namespace: None,
+                    namespace_description: None,
+                    description: "finish".to_string(),
+                    input_schema: json!({
+                        "type": "object",
+                        "properties": { "result": { "type": "string" } },
+                        "required": ["result"],
+                        "additionalProperties": false
+                    }),
+                    output_schema: None,
+                    freeform: None,
+                }],
+                ..ProviderTurn::default()
+            },
+            &mut |event| {
+                events.push(event);
+                Ok(())
+            },
+        )?;
+        handle.join().expect("mock server thread");
+        assert!(events.contains(&ModelEvent::TextDelta {
+            text: "Working.\n".to_string()
+        }));
+        assert!(events.contains(&ModelEvent::ToolCall {
+            call: ToolCall {
+                id: "toolu_123".to_string(),
+                name: "done".to_string(),
+                namespace: None,
+                arguments: json!({"result": "ok"}),
+            }
+        }));
+        assert!(events.contains(&ModelEvent::Usage {
+            usage: ModelUsage {
+                input_tokens: Some(7),
+                output_tokens: Some(8),
+                total_tokens: Some(15),
+                cost_usd: None,
+                ..Default::default()
+            }
+        }));
+        assert!(matches!(events.last(), Some(ModelEvent::Done)));
         Ok(())
     }
 
@@ -10278,6 +11048,7 @@ mod tests {
             ("insufficient_quota", ProviderErrorKind::QuotaExceeded),
             ("usage_not_included", ProviderErrorKind::UsageNotIncluded),
             ("invalid_prompt", ProviderErrorKind::InvalidRequest),
+            ("invalid_image", ProviderErrorKind::InvalidImage),
             ("cyber_policy", ProviderErrorKind::CyberPolicy),
             ("server_is_overloaded", ProviderErrorKind::ServerOverloaded),
             ("slow_down", ProviderErrorKind::ServerOverloaded),
@@ -10813,6 +11584,41 @@ mod tests {
             .downcast_ref::<ProviderError>()
             .expect("typed provider error");
         assert_eq!(provider_error.kind(), ProviderErrorKind::InvalidRequest);
+        assert!(!provider_error.is_retryable());
+        Ok(())
+    }
+
+    #[test]
+    fn responses_http_400_invalid_image_is_typed_like_codex() -> Result<()> {
+        let body = json!({
+            "error": {
+                "code": "invalid_image",
+                "message": "The image data you provided does not represent a valid image."
+            }
+        })
+        .to_string();
+        let (base_url, handle) =
+            spawn_mock_status_server(400, "Bad Request", body, "application/json")?;
+        let provider = CodexResponsesProvider::with_base_url(
+            CodexAuth {
+                access_token: "chatgpt-token".to_string(),
+                account_id: "account-123".to_string(),
+            },
+            "gpt-test",
+            format!("{}/backend-api", base_url.trim_end_matches("/v1")),
+        );
+
+        let err = provider
+            .start_turn(ProviderTurn {
+                messages: vec![json!({"role": "user", "content": "finish"})],
+                ..ProviderTurn::default()
+            })
+            .expect_err("invalid image should be a typed recoverable terminal error");
+        handle.join().expect("mock server thread");
+        let provider_error = err
+            .downcast_ref::<ProviderError>()
+            .expect("typed provider error");
+        assert_eq!(provider_error.kind(), ProviderErrorKind::InvalidImage);
         assert!(!provider_error.is_retryable());
         Ok(())
     }

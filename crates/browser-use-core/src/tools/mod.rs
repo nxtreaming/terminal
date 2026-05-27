@@ -1,12 +1,16 @@
-use bm25::{Document, Language, SearchEngineBuilder};
+use crate::mcp::{McpServerConfig, McpToolDefinition};
+use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
 use browser_use_protocol::{FreeformToolFormat, ToolSpec};
 use browser_use_providers::ModelShellType;
 use serde_json::Value;
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 pub(crate) mod command;
 pub(crate) mod files;
+
+const DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD: usize = 100;
 
 const APPLY_PATCH_LARK_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
 begin_patch: "*** Begin Patch" LF
@@ -60,6 +64,10 @@ pub(crate) enum ToolHandlerKind {
     CloseAgent,
     CloseAgentV1,
     ToolSearch,
+    McpTool,
+    ListMcpResources,
+    ListMcpResourceTemplates,
+    ReadMcpResource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -75,12 +83,14 @@ pub(crate) struct RegisteredTool {
     spec: ToolSpec,
     handler: ToolHandlerKind,
     exposure: ToolExposure,
+    mcp_tool: Option<McpToolDefinition>,
 }
 
 #[derive(Clone, Debug)]
 pub(crate) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     allow_login_shell: bool,
+    mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 impl Default for ToolRegistry {
@@ -88,6 +98,7 @@ impl Default for ToolRegistry {
         Self {
             tools: Vec::new(),
             allow_login_shell: true,
+            mcp_servers: BTreeMap::new(),
         }
     }
 }
@@ -182,6 +193,208 @@ const TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT: &str = "Spawn and manage sub-a
 struct ToolSearchEntry {
     search_text: String,
     spec: ToolSpec,
+    source: ToolSearchSourceInfo,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub(crate) struct ToolSearchSourceInfo {
+    pub(crate) name: String,
+    pub(crate) description: Option<String>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ToolRouter {
+    registry: ToolRegistry,
+    model_visible_specs: Vec<ToolSpec>,
+    search_entries: Vec<ToolSearchEntry>,
+    search_engine: Option<Arc<SearchEngine<usize>>>,
+    tool_search_enabled: bool,
+}
+
+impl ToolRouter {
+    pub(crate) fn new(
+        registry: ToolRegistry,
+        tool_search_supported: bool,
+        namespace_tools_supported: bool,
+    ) -> Self {
+        let search_entries = registry.deferred_tool_search_entries();
+        let search_sources = dedup_tool_search_sources(search_entries.iter().map(|entry| {
+            (
+                entry.source.name.as_str(),
+                entry.source.description.as_deref(),
+            )
+        }));
+        let search_engine = (!search_entries.is_empty()).then(|| {
+            Arc::new(
+                SearchEngineBuilder::<usize>::with_documents(
+                    Language::English,
+                    search_entries
+                        .iter()
+                        .enumerate()
+                        .map(|(idx, entry)| Document::new(idx, entry.search_text.clone()))
+                        .collect::<Vec<_>>(),
+                )
+                .build(),
+            )
+        });
+        let tool_search_enabled =
+            tool_search_supported && namespace_tools_supported && !search_entries.is_empty();
+        let mut model_visible_specs = Vec::new();
+        for tool in &registry.tools {
+            let visible = match tool.exposure {
+                ToolExposure::Hidden => false,
+                ToolExposure::Deferred => !tool_search_enabled,
+                ToolExposure::Direct | ToolExposure::DirectModelOnly => true,
+            };
+            if !visible {
+                continue;
+            }
+            if !namespace_tools_supported {
+                if let Some(mcp_tool) = &tool.mcp_tool {
+                    model_visible_specs.push(mcp_tool.flat_tool_spec());
+                } else if tool.spec.namespace.is_none() {
+                    model_visible_specs.push(tool.spec.clone());
+                }
+                continue;
+            }
+            model_visible_specs.push(tool.spec.clone());
+        }
+        if tool_search_enabled {
+            model_visible_specs.push(tool_search_tool_spec(&search_sources));
+        }
+        Self {
+            registry,
+            model_visible_specs,
+            search_entries,
+            search_engine,
+            tool_search_enabled,
+        }
+    }
+
+    pub(crate) fn model_visible_specs(&self) -> Vec<ToolSpec> {
+        self.model_visible_specs.clone()
+    }
+
+    pub(crate) fn allow_login_shell(&self) -> bool {
+        self.registry.allow_login_shell()
+    }
+
+    pub(crate) fn handler_for_dispatch(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<ToolHandlerKind> {
+        self.registry.handler_for_namespaced(namespace, name)
+    }
+
+    pub(crate) fn visible_handler_for_call(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<ToolHandlerKind> {
+        self.registry
+            .direct_handler_for_namespaced(namespace, name)
+            .or_else(|| {
+                (namespace.is_none() && name == TOOL_SEARCH_TOOL_NAME && self.tool_search_enabled)
+                    .then(|| {
+                        self.registry
+                            .handler_for_namespaced(None, TOOL_SEARCH_TOOL_NAME)
+                    })
+                    .flatten()
+            })
+    }
+
+    pub(crate) fn mcp_tool_for_call(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<McpToolDefinition> {
+        self.registry
+            .tools
+            .iter()
+            .filter_map(|tool| tool.mcp_tool.as_ref())
+            .find(|tool| tool.matches_call(namespace, name))
+            .cloned()
+    }
+
+    pub(crate) fn mcp_server(&self, server_name: &str) -> Option<McpServerConfig> {
+        self.registry.mcp_servers.get(server_name).cloned()
+    }
+
+    pub(crate) fn mcp_servers(&self) -> BTreeMap<String, McpServerConfig> {
+        self.registry.mcp_servers.clone()
+    }
+
+    pub(crate) fn tool_supports_parallel(
+        &self,
+        call_namespace: Option<&str>,
+        call_name: &str,
+    ) -> bool {
+        if self.visible_handler_for_call(call_namespace, call_name)
+            == Some(ToolHandlerKind::McpTool)
+        {
+            return self
+                .mcp_tool_for_call(call_namespace, call_name)
+                .is_some_and(|tool| tool.supports_parallel_tool_calls());
+        }
+        matches!(
+            self.visible_handler_for_call(call_namespace, call_name),
+            Some(
+                ToolHandlerKind::ExecCommand
+                    | ToolHandlerKind::ShellCommand
+                    | ToolHandlerKind::ReadFile
+                    | ToolHandlerKind::SearchFiles
+                    | ToolHandlerKind::ListFiles
+                    | ToolHandlerKind::ViewImage
+                    | ToolHandlerKind::ToolSearch
+                    | ToolHandlerKind::ListMcpResources
+                    | ToolHandlerKind::ListMcpResourceTemplates
+                    | ToolHandlerKind::ReadMcpResource
+            )
+        )
+    }
+
+    pub(crate) fn tool_supports_streaming_predispatch(
+        &self,
+        call_namespace: Option<&str>,
+        call_name: &str,
+    ) -> bool {
+        if self.visible_handler_for_call(call_namespace, call_name)
+            == Some(ToolHandlerKind::McpTool)
+        {
+            return self
+                .mcp_tool_for_call(call_namespace, call_name)
+                .is_some_and(|tool| tool.read_only_hint);
+        }
+        matches!(
+            self.visible_handler_for_call(call_namespace, call_name),
+            Some(
+                ToolHandlerKind::ReadFile
+                    | ToolHandlerKind::SearchFiles
+                    | ToolHandlerKind::ListFiles
+                    | ToolHandlerKind::ViewImage
+                    | ToolHandlerKind::ToolSearch
+                    | ToolHandlerKind::ListMcpResources
+                    | ToolHandlerKind::ListMcpResourceTemplates
+                    | ToolHandlerKind::ReadMcpResource
+            )
+        )
+    }
+
+    pub(crate) fn search_deferred_tools(&self, query: &str, limit: usize) -> Vec<Value> {
+        let query = query.trim();
+        if query.is_empty() || limit == 0 || self.search_entries.is_empty() {
+            return Vec::new();
+        }
+        let Some(search_engine) = self.search_engine.as_ref() else {
+            return Vec::new();
+        };
+        let matches = search_engine
+            .search(query, limit)
+            .into_iter()
+            .filter_map(|result| self.search_entries.get(result.document.id));
+        coalesce_loadable_tool_specs(matches.map(|entry| deferred_tool_json(&entry.spec)))
+    }
 }
 
 impl ToolRegistry {
@@ -311,10 +524,10 @@ impl ToolRegistry {
                     ToolExposure::Deferred,
                 );
                 registry.register_with_exposure(
-                    tool_search_tool_spec(&[(
-                        TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
-                        Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
-                    )]),
+                    tool_search_tool_spec(&[ToolSearchSourceInfo {
+                        name: TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT.to_string(),
+                        description: Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT.to_string()),
+                    }]),
                     ToolHandlerKind::ToolSearch,
                     ToolExposure::Hidden,
                 );
@@ -387,7 +600,46 @@ impl ToolRegistry {
             spec,
             handler,
             exposure,
+            mcp_tool: None,
         });
+    }
+
+    pub(crate) fn register_mcp_tools(&mut self, tools: Vec<McpToolDefinition>) {
+        let exposure = if tools.len() >= DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD {
+            ToolExposure::Deferred
+        } else {
+            ToolExposure::Direct
+        };
+        for tool in tools {
+            self.tools.push(RegisteredTool {
+                spec: tool.namespaced_tool_spec(),
+                handler: ToolHandlerKind::McpTool,
+                exposure,
+                mcp_tool: Some(tool),
+            });
+        }
+    }
+
+    pub(crate) fn register_mcp_resource_tools(
+        &mut self,
+        servers: BTreeMap<String, McpServerConfig>,
+    ) {
+        if servers.is_empty() {
+            return;
+        }
+        self.mcp_servers = servers;
+        self.register(
+            list_mcp_resources_tool_spec(),
+            ToolHandlerKind::ListMcpResources,
+        );
+        self.register(
+            list_mcp_resource_templates_tool_spec(),
+            ToolHandlerKind::ListMcpResourceTemplates,
+        );
+        self.register(
+            read_mcp_resource_tool_spec(),
+            ToolHandlerKind::ReadMcpResource,
+        );
     }
 
     pub(crate) fn allow_login_shell(&self) -> bool {
@@ -403,36 +655,18 @@ impl ToolRegistry {
             .collect()
     }
 
+    #[cfg(test)]
     pub(crate) fn specs_for_model(
         &self,
         tool_search_supported: bool,
         namespace_tools_supported: bool,
     ) -> Vec<ToolSpec> {
-        let use_tool_search =
-            tool_search_supported && namespace_tools_supported && self.has_deferred_tools();
-        let mut specs = self
-            .tools
-            .iter()
-            .filter(|tool| match tool.exposure {
-                ToolExposure::Hidden => false,
-                ToolExposure::Deferred => !use_tool_search,
-                ToolExposure::Direct | ToolExposure::DirectModelOnly => true,
-            })
-            .map(|tool| tool.spec.clone())
-            .collect::<Vec<_>>();
-        if use_tool_search {
-            specs.push(tool_search_tool_spec(&[(
-                TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
-                Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
-            )]));
-        }
-        specs
-    }
-
-    fn has_deferred_tools(&self) -> bool {
-        self.tools
-            .iter()
-            .any(|tool| tool.exposure == ToolExposure::Deferred)
+        ToolRouter::new(
+            self.clone(),
+            tool_search_supported,
+            namespace_tools_supported,
+        )
+        .model_visible_specs()
     }
 
     pub(crate) fn handler_for(&self, name: &str) -> Option<ToolHandlerKind> {
@@ -455,7 +689,16 @@ impl ToolRegistry {
                     tool.spec.name == name && tool.spec.namespace.as_deref() == Some(namespace)
                 })
                 .map(|tool| tool.handler),
-            None => self.handler_for(name),
+            None => self.handler_for(name).or_else(|| {
+                self.tools
+                    .iter()
+                    .find(|tool| {
+                        tool.mcp_tool
+                            .as_ref()
+                            .is_some_and(|mcp_tool| mcp_tool.flat_tool_name() == name)
+                    })
+                    .map(|tool| tool.handler)
+            }),
         }
     }
 
@@ -468,33 +711,19 @@ impl ToolRegistry {
             .iter()
             .find(|tool| {
                 tool.exposure != ToolExposure::Hidden
-                    && tool.spec.name == name
-                    && tool.spec.namespace.as_deref() == namespace
+                    && ((tool.spec.name == name && tool.spec.namespace.as_deref() == namespace)
+                        || (namespace.is_none()
+                            && tool
+                                .mcp_tool
+                                .as_ref()
+                                .is_some_and(|mcp_tool| mcp_tool.flat_tool_name() == name)))
             })
             .map(|tool| tool.handler)
     }
 
+    #[cfg(test)]
     pub(crate) fn search_deferred_tools(&self, query: &str, limit: usize) -> Vec<Value> {
-        let query = query.trim();
-        if query.is_empty() || limit == 0 {
-            return Vec::new();
-        }
-        let entries = self.deferred_tool_search_entries();
-        if entries.is_empty() {
-            return Vec::new();
-        }
-        let documents = entries
-            .iter()
-            .enumerate()
-            .map(|(idx, entry)| Document::new(idx, entry.search_text.clone()))
-            .collect::<Vec<_>>();
-        let search_engine =
-            SearchEngineBuilder::<usize>::with_documents(Language::English, documents).build();
-        let matches = search_engine
-            .search(query, limit)
-            .into_iter()
-            .filter_map(|result| entries.get(result.document.id));
-        coalesce_loadable_tool_specs(matches.map(|entry| deferred_tool_json(&entry.spec)))
+        ToolRouter::new(self.clone(), true, true).search_deferred_tools(query, limit)
     }
 
     fn deferred_tool_search_entries(&self) -> Vec<ToolSearchEntry> {
@@ -502,13 +731,67 @@ impl ToolRegistry {
             .iter()
             .filter(|tool| tool.exposure == ToolExposure::Deferred)
             .map(|tool| ToolSearchEntry {
-                search_text: multi_agent_v1_tool_search_text(tool.handler)
-                    .unwrap_or_else(|| tool.spec.name.as_str())
-                    .to_string(),
+                search_text: tool
+                    .mcp_tool
+                    .as_ref()
+                    .map(McpToolDefinition::search_text)
+                    .unwrap_or_else(|| {
+                        multi_agent_v1_tool_search_text(tool.handler)
+                            .unwrap_or_else(|| tool.spec.name.as_str())
+                            .to_string()
+                    }),
                 spec: tool.spec.clone(),
+                source: tool_search_source_for_tool(tool),
             })
             .collect()
     }
+}
+
+fn tool_search_source_for_tool(tool: &RegisteredTool) -> ToolSearchSourceInfo {
+    let (name, description) = match tool.handler {
+        ToolHandlerKind::SpawnAgentV1
+        | ToolHandlerKind::SendInputV1
+        | ToolHandlerKind::ResumeAgentV1
+        | ToolHandlerKind::WaitAgentV1
+        | ToolHandlerKind::CloseAgentV1 => (
+            TOOL_SEARCH_SOURCE_NAME_MULTI_AGENT,
+            Some(TOOL_SEARCH_SOURCE_DESCRIPTION_MULTI_AGENT),
+        ),
+        ToolHandlerKind::McpTool => (
+            tool.mcp_tool
+                .as_ref()
+                .map(|tool| tool.server.server_name.as_str())
+                .unwrap_or("MCP tools"),
+            tool.mcp_tool
+                .as_ref()
+                .map(|tool| tool.namespace_description.as_str()),
+        ),
+        _ => ("Deferred tools", None),
+    };
+    ToolSearchSourceInfo {
+        name: name.to_string(),
+        description: description.map(str::to_string),
+    }
+}
+
+fn dedup_tool_search_sources<'a>(
+    sources: impl IntoIterator<Item = (&'a str, Option<&'a str>)>,
+) -> Vec<ToolSearchSourceInfo> {
+    let mut source_descriptions = BTreeMap::<String, Option<String>>::new();
+    for (name, description) in sources {
+        source_descriptions
+            .entry(name.to_string())
+            .and_modify(|existing| {
+                if existing.is_none() {
+                    *existing = description.map(str::to_string);
+                }
+            })
+            .or_insert_with(|| description.map(str::to_string));
+    }
+    source_descriptions
+        .into_iter()
+        .map(|(name, description)| ToolSearchSourceInfo { name, description })
+        .collect()
 }
 
 fn multi_agent_v1_tool_search_text(handler: ToolHandlerKind) -> Option<&'static str> {
@@ -532,26 +815,20 @@ fn multi_agent_v1_tool_search_text(handler: ToolHandlerKind) -> Option<&'static 
     }
 }
 
-fn tool_search_tool_spec(searchable_sources: &[(&str, Option<&str>)]) -> ToolSpec {
-    let mut source_descriptions = BTreeMap::<String, Option<String>>::new();
-    for (name, description) in searchable_sources {
-        source_descriptions
-            .entry((*name).to_string())
-            .and_modify(|existing| {
-                if existing.is_none() {
-                    *existing = description.map(str::to_string);
-                }
-            })
-            .or_insert_with(|| description.map(str::to_string));
-    }
-    let source_descriptions = if source_descriptions.is_empty() {
+fn tool_search_tool_spec(searchable_sources: &[ToolSearchSourceInfo]) -> ToolSpec {
+    let sources = dedup_tool_search_sources(
+        searchable_sources
+            .iter()
+            .map(|source| (source.name.as_str(), source.description.as_deref())),
+    );
+    let source_descriptions = if sources.is_empty() {
         "None currently enabled.".to_string()
     } else {
-        source_descriptions
+        sources
             .into_iter()
-            .map(|(name, description)| match description {
-                Some(description) => format!("- {name}: {description}"),
-                None => format!("- {name}"),
+            .map(|source| match source.description {
+                Some(description) => format!("- {}: {description}", source.name),
+                None => format!("- {}", source.name),
             })
             .collect::<Vec<_>>()
             .join("\n")
@@ -1121,6 +1398,84 @@ fn write_stdin_tool_spec() -> ToolSpec {
             "additionalProperties": false
         }),
         output_schema: Some(unified_exec_output_schema()),
+        freeform: None,
+    }
+}
+
+fn list_mcp_resources_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "list_mcp_resources".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Optional MCP server name. When omitted, lists resources from every configured server."
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor returned by a previous list_mcp_resources call for the same server."
+                }
+            },
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn list_mcp_resource_templates_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "list_mcp_resource_templates".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Optional MCP server name. When omitted, lists resource templates from all configured servers."
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor returned by a previous list_mcp_resource_templates call for the same server."
+                }
+            },
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn read_mcp_resource_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "read_mcp_resource".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description:
+            "Read a specific resource from an MCP server given the server name and resource URI."
+                .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "MCP server name exactly as configured. Must match the 'server' field returned by list_mcp_resources."
+                },
+                "uri": {
+                    "type": "string",
+                    "description": "Resource URI to read. Must be one of the URIs returned by list_mcp_resources."
+                }
+            },
+            "required": ["server", "uri"],
+            "additionalProperties": false
+        }),
+        output_schema: None,
         freeform: None,
     }
 }
@@ -2275,10 +2630,17 @@ mod tests {
                 ShellToolSpecConfig::default(),
                 false,
                 browser_use_providers::spawn_agent_model_overrides_description(),
-            );
+        );
 
-        let direct_specs = registry.specs_for_model(true, true);
-        assert!(direct_specs.iter().any(|spec| spec.name == "tool_search"));
+        let router = ToolRouter::new(registry.clone(), true, true);
+        let direct_specs = router.model_visible_specs();
+        let tool_search = direct_specs
+            .iter()
+            .find(|spec| spec.name == "tool_search")
+            .expect("tool_search spec");
+        assert!(tool_search
+            .description
+            .contains("- Multi-agent tools: Spawn and manage sub-agents."));
         assert!(!direct_specs.iter().any(|spec| {
             spec.namespace.as_deref() == Some("multi_agent_v1") && spec.name == "spawn_agent"
         }));
@@ -2298,6 +2660,137 @@ mod tests {
             .unwrap()
             .iter()
             .any(|tool| { tool["name"] == "spawn_agent" && tool["defer_loading"] == true }));
+    }
+
+    #[test]
+    fn mcp_tools_are_direct_below_threshold_deferred_at_threshold_and_flatten_without_namespaces() {
+        let server = crate::mcp::McpServerConfig {
+            server_name: "docs".to_string(),
+            command: "python3".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
+            startup_timeout_ms: 1,
+            tool_timeout_ms: 1,
+            enabled_tools: None,
+            disabled_tools: std::collections::BTreeSet::new(),
+        };
+        let tool = McpToolDefinition {
+            server,
+            raw_tool_name: "lookup".to_string(),
+            callable_namespace: "mcp__docs__".to_string(),
+            callable_name: "lookup".to_string(),
+            namespace_description: "Tools from the docs MCP server.".to_string(),
+            description: "Lookup docs.".to_string(),
+            input_schema: serde_json::json!({
+                "type": "object",
+                "properties": {
+                    "query": {"type": "string"}
+                }
+            }),
+            output_schema: None,
+            read_only_hint: true,
+        };
+        let mut registry = ToolRegistry::default();
+        registry.register_mcp_tools(vec![tool.clone()]);
+
+        let router = ToolRouter::new(registry.clone(), true, true);
+        assert!(!router
+            .model_visible_specs()
+            .iter()
+            .any(|spec| spec.name == "tool_search"));
+        assert!(router
+            .model_visible_specs()
+            .iter()
+            .any(|spec| spec.namespace.as_deref() == Some("mcp__docs__")));
+        assert!(router.tool_supports_parallel(Some("mcp__docs__"), "lookup"));
+        assert!(router.tool_supports_streaming_predispatch(Some("mcp__docs__"), "lookup"));
+
+        let fallback = ToolRouter::new(registry, false, false);
+        let specs = fallback.model_visible_specs();
+        assert!(specs.iter().any(|spec| {
+            spec.namespace.is_none()
+                && spec.name == "mcp__docs__lookup"
+                && spec.description.contains("Raw MCP tool: lookup")
+        }));
+        assert_eq!(
+            fallback.handler_for_dispatch(None, "mcp__docs__lookup"),
+            Some(ToolHandlerKind::McpTool)
+        );
+        assert!(fallback
+            .mcp_tool_for_call(None, "mcp__docs__lookup")
+            .is_some());
+
+        let mut large_registry = ToolRegistry::default();
+        let large_tools = (0..DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD)
+            .map(|idx| McpToolDefinition {
+                callable_name: format!("lookup_{idx}"),
+                raw_tool_name: format!("lookup.{idx}"),
+                ..tool.clone()
+            })
+            .collect();
+        large_registry.register_mcp_tools(large_tools);
+        let large_router = ToolRouter::new(large_registry, true, true);
+        assert!(large_router
+            .model_visible_specs()
+            .iter()
+            .any(|spec| spec.name == "tool_search"));
+        assert!(!large_router
+            .model_visible_specs()
+            .iter()
+            .any(|spec| spec.namespace.as_deref() == Some("mcp__docs__")));
+        let loaded = large_router.search_deferred_tools("lookup docs query", 8);
+        assert_eq!(loaded[0]["type"], "namespace");
+        assert_eq!(loaded[0]["name"], "mcp__docs__");
+        assert_eq!(loaded[0]["tools"][0]["defer_loading"], true);
+    }
+
+    #[test]
+    fn mcp_resource_tools_match_codex_specs_and_are_read_only() {
+        let server = crate::mcp::McpServerConfig {
+            server_name: "docs".to_string(),
+            command: "python3".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
+            startup_timeout_ms: 1,
+            tool_timeout_ms: 1,
+            enabled_tools: None,
+            disabled_tools: std::collections::BTreeSet::new(),
+        };
+        let mut registry = ToolRegistry::default();
+        registry.register_mcp_resource_tools(std::collections::BTreeMap::from([(
+            "docs".to_string(),
+            server,
+        )]));
+        let router = ToolRouter::new(registry, true, true);
+        let specs = router.model_visible_specs();
+        assert!(specs.iter().any(|spec| {
+            spec.name == "list_mcp_resources"
+                && spec.description.starts_with("Lists resources provided by MCP servers")
+                && spec.input_schema["properties"]["server"]["description"]
+                    == "Optional MCP server name. When omitted, lists resources from every configured server."
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.name == "list_mcp_resource_templates"
+                && spec
+                    .description
+                    .starts_with("Lists resource templates provided by MCP servers")
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.name == "read_mcp_resource"
+                && spec.input_schema["required"] == serde_json::json!(["server", "uri"])
+        }));
+        assert!(router.tool_supports_parallel(None, "list_mcp_resources"));
+        assert!(router.tool_supports_streaming_predispatch(None, "read_mcp_resource"));
+        assert_eq!(
+            router.mcp_server("docs").map(|server| server.server_name),
+            Some("docs".to_string())
+        );
     }
 
     #[test]

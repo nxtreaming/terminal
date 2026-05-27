@@ -76,21 +76,149 @@ related differences can be fixed in the same loop, fix all of them in that loop.
 
 - Branch: `agent-gap-zero`
 - Gap log: `docs/agent-gap-log.md`
-- Latest local-runtime batch: non-browser runs now use the Codex terminal-agent
-  prompt without the browser-harness overlay, while CLI/browser runs keep the
-  browser contract. CLI compaction can use the active model for a handoff
-  summary with deterministic local fallback, and TUI runs enable the same local
-  compaction path. Command hooks now cover the first non-approval slice for
-  `SessionStart`, `UserPromptSubmit`, `PreToolUse`, `PostToolUse`,
-  assistant-text `Stop`, `done`-tool `Stop`, and local `PreCompact` /
-  `PostCompact`; exit-code-2 blocking is represented for the main blocking
-  hooks. Read-only file/image tools can batch through parallel dispatch without
-  unrelated hooks disabling batching; shell-originated file changes now emit a
-  `git_worktree` `turn.diff`; and active-turn prompt/mailbox drains are
-  recorded. Remaining runtime gaps are exact hook handler/matcher parity,
-  SubagentStart/SubagentStop hooks, dynamic MCP/app inventory, websocket
-  ack/fallback, streaming-time tool scheduling, app-server lifecycle/input-queue
-  events, exact turn-diff tracking, and deeper goal budget steering.
+- Latest local-runtime batch: the first active-turn queue slice now notices
+  same-turn follow-ups/mail before finalizing assistant text, pauses stale tool
+  calls when queued input appears, drains that input into model history with
+  prompt-hook processing, and records the phase of each drain/pause. Local
+  deterministic compaction now runs the same `PreCompact` / `PostCompact`
+  command-hook lifecycle as model-assisted compaction. Hook command input uses
+  the active turn id when available and includes child-agent identity/type for
+  subagent hooks. OpenAI-compatible chat and Anthropic providers now use SSE
+  streaming paths for text, thinking, tool-call, usage, and done events, while
+  retaining JSON fallback for non-streaming responses. Read-only tool calls
+  can now be pre-dispatched while the provider stream is still open, and stale
+  preempted tool calls receive model-visible skipped outputs so follow-up turns
+  do not inherit orphaned tool calls. Tool failures now carry an explicit
+  recovery classification and unknown runtime failures default to fatal rather
+  than being fed back to the model. Remaining high-impact runtime gaps are full
+  streaming-time futures for mutating/interactive tools, full dynamic
+  MCP/app/plugin tool inventory, exact `AgentControl`/mailbox semantics,
+  event/item-graph history reconstruction, exact `TurnDiffTracker`, websocket
+  ack/fallback, deeper local compaction/token lifecycle parity, and
+  multi-environment tool routing.
+- Latest verification: full Rust/Python/whitespace checks and Codex-auth root
+  plus child smokes passed for the hook-metadata batch. Root session
+  `1c902e5dc5eb` returned `Paris`, and child session `4f1a62227201` read
+  `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`. The full Rust suite now covers 423 core tests; this
+  loop also fixed a parallel test config-env leak by isolating `CODEX_HOME` in
+  the model-compaction provider-summary test. A fresh ten-platform-auditor
+  pass confirmed hook metadata is materially closed for command hooks and kept
+  the same architectural gap set open.
+- The next concrete runtime-tool slice closes several of those audit findings:
+  Bash and apply_patch hooks now receive Codex-style `tool_input.command`
+  payloads while preserving `raw_tool_input` for local diagnostics, and
+  `updatedInput.command` is rewritten back into local `cmd`/patch arguments.
+  Shell apply-patch rescue now also recognizes `applypatch`, single-argument
+  direct invocation, and strict `cd <path> && apply_patch <<EOF` forms. Local
+  image handling now normalizes/resizes before applying the inline byte limit,
+  and memory summary context includes Codex-style read-path guidance about
+  precedence, use boundaries, and avoiding direct memory-file edits.
+- A fresh ten-agent audit after that slice found the obvious hook/applypatch/
+  image mechanics closed and moved the concrete next targets to runtime
+  recovery: invalid-image provider-error repair, compaction overflow
+  drop-oldest-and-retry behavior, actually executing `async_run` hooks, and
+  avoiding exact-looking `turn.diff` output when local only has a broad git
+  snapshot. The larger remaining pillars are still dynamic tool routing,
+  mutating streaming futures, typed history/rollout state, active-turn mailbox
+  semantics, goal budget lifecycle, full hook discovery/trust/concurrency, and
+  multi-environment tool routing.
+- The current runtime-recovery slice closes those concrete targets. Providers
+  now classify invalid-image failures distinctly; the provider loop repairs one
+  rejected tool-output image by replacing it with `Invalid image` and retries
+  the turn. Model-assisted local compaction retries context-window overflow by
+  dropping oldest history from the summary request before falling back. Command
+  hooks marked `async_run` execute inline for now, so their context/blocking
+  effects are no longer skipped. Git snapshot `turn.diff` events now mark dirty
+  baselines as inexact and omit unified diffs when unrelated preexisting work
+  would be mixed into the report.
+- Verification for that slice passed across full Rust workspace tests, Python
+  tests, formatting, whitespace, and real Codex-auth root/child smokes. A fresh
+  ten-subagent broad audit found no new small concrete recovery-class gaps; the
+  remaining work is concentrated in larger runtime architecture: dynamic tool
+  routing, streaming futures, live active-turn/AgentControl state, typed
+  history/rollout reconstruction, goal accounting, hook concurrency/source
+  metadata, exact `TurnDiffTracker`, and deeper local compaction/token
+  lifecycle precision.
+- The current hook/compaction slice closes a concrete part of that larger hook
+  runtime gap. Matching command hooks now execute concurrently, preserving
+  configured order for stable context/feedback while selecting
+  `PreToolUse.updatedInput` by completion order like Codex. Hook lifecycle
+  events record both configured and completion order. Model-compaction overflow
+  retry now removes an old assistant/tool-output pair together when trimming
+  summary-request history, reducing invalid call/output fragments in local
+  compaction prompts.
+- The current hook-metadata slice moves that same runtime surface closer to
+  Codex's observable hook lifecycle. Hook events now include Codex-shaped run
+  summaries with source path/kind, display order, sync/async mode, scope,
+  status, timestamps, duration, output entries, state key, trusted hash, and
+  trust status. Hook command stdin now receives a real transcript snapshot path,
+  and `[hooks.state]` can disable configured hooks. Remaining hook-specific
+  gaps are prompt/agent hook handlers, exact trust enforcement/listing UX,
+  plugin/cloud hook discovery sources, strict output validation, and
+  app-server notification surfaces.
+- Verification for the hook-metadata slice passed with full Rust workspace
+  tests, Python tests, formatting, whitespace, and real Codex-auth root/child
+  smokes. Root session `1c902e5dc5eb` returned `Paris`; child session
+  `4f1a62227201` read `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`. The follow-up audit reached ten broad platform
+  reports and agreed the remaining high-impact gaps are architectural: dynamic
+  tool routing/inventory, true streaming tool futures with cancellation and
+  read/write gating, active-turn `InputQueue`/`AgentControl` semantics, typed
+  history/rollout reconstruction, deeper local compaction/token lifecycle
+  parity, subagent control-plane depth, exact turn diff tracking, generic
+  extension/contributor runtime including memory tools, and goal runtime
+  accounting. Hook-specific remaining gaps are now lower priority:
+  prompt/agent hook handlers, exact trust UX/enforcement, plugin/cloud hook
+  discovery, stricter output validation, app-server notifications, and one
+  `SubagentStop` transcript-path null.
+- The current memory slice replaces the local passive memory-summary block
+  with Codex's read-path developer policy. Enabled memories now tell the model
+  when to do a memory pass, how to search `MEMORY.md` and rollout summaries,
+  how to handle stale memory, how to emit the hidden `<oai-mem-citation>`
+  block, and how to write update notes only when explicitly asked. Source
+  inspection also found that Codex's memory list/read/search tool contributor
+  exists in the extension crate but is not installed in current Codex, so this
+  loop deliberately did not add callable memory tools locally.
+- Verification for the memory slice passed with full Rust workspace tests,
+  Python tests, formatting, whitespace, and real Codex-auth root/child smokes.
+  Root session `dbf87fd06c77` returned `Paris`; child session `2a94f1fc1a2e`
+  read `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`.
+- The follow-up ten-auditor pass agreed the memory read-path policy is closed
+  and that not exposing memory tools matches current Codex. The dominant open
+  work is still architectural: dynamic tool routing/inventory,
+  stream-integrated tool futures, active-turn input/mailbox state, typed
+  history/rollout/context-manager reconstruction, exact turn diffs, goal
+  runtime accounting, local compaction/token-window lifecycle, and deeper
+  skill/plugin/review task semantics. The pass also produced smaller next-slice
+  candidates: stream-safe hidden-markup filtering, structured memory citation
+  accounting, real child transcript paths for `SubagentStop`, and a prompt
+  drift check for uncataloged model fallbacks.
+- The current slice closes those concrete candidates. Streaming assistant text
+  is filtered before `model.stream_delta` and live `model.delta`, including
+  split partial hidden-tag openings. Final assistant text and `done.result`
+  parse Codex-shaped memory citation blocks into `memory.citation` sidecars
+  with entries plus deduped `rollout_ids`/legacy `thread_ids`. `SubagentStop`
+  hook input now carries real child and parent transcript snapshot paths.
+  Source inspection showed the local uncataloged Codex fallback prompt is
+  already byte-identical to Codex `codex-rs/models-manager/prompt.md`, so the
+  GPT-5.1-specific prompt item is not a current fallback-prompt gap.
+- Verification for this slice passed with full Rust workspace tests, Python
+  tests, formatting, whitespace, and real Codex-auth root/child smokes. Root
+  session `fa75168e01bf` returned `Paris`; child session `abdafe765c1b` read
+  `/tmp/but-codex-agent-parity-smoke.txt` and returned
+  `agent-parity-smoke-ok`.
+- The follow-up ten-auditor pass agreed this slice closed the previous
+  lower-scope targets and did not find a new small blocker. The remaining work
+  is architectural: dynamic router/inventory, stream-integrated mutating tool
+  futures, active-turn input/control state, typed context/history/rollout
+  reconstruction, exact turn diffs, full goal accounting, local
+  compaction/token-window precision, skills/plugins manager depth, and
+  review-task lifecycle. Two caveats remain: memory citation accounting is
+  still sidecar/event-based rather than Codex's typed agent-message/state-db
+  path, and truly unknown non-Codex models intentionally use the neutral
+  fallback prompt for provider portability.
 - Status: a 10-scope Codex-auth closure audit on 2026-05-24 found the gap is
   not closed. Prompt/context alignment is substantially improved, `apply_patch`
   has verified-write semantics for common Codex patch behavior, streaming
@@ -1391,6 +1519,26 @@ The biggest remaining categories are:
   full app-server collaboration/request events, pending interactive
   replay/filtering, delegated/MCP compatibility paths, and broader feature-flag
   breadth.
+- Runtime tool parity now includes the portable apply-patch rescue path Codex
+  uses when a model sends `apply_patch <<EOF ... EOF` through `exec_command` or
+  the legacy shell command surface: the harness intercepts the script and routes
+  it through the apply-patch implementation without spawning a shell process.
+  Patch completion and `turn.diff` events now include bounded unified diffs
+  generated from committed patch deltas. Hook payload names also follow Codex's
+  canonical names for `apply_patch` and `spawn_agent`, while matcher aliases
+  cover `Write`/`Edit` and `Agent`. Bash/apply_patch hook inputs now expose
+  `tool_input.command`, and hook `updatedInput.command` rewrites back into the
+  local tool argument shape. The rescue path also covers `applypatch`, direct
+  single-argument invocation, and strict `cd <path> && apply_patch <<EOF`
+  forms. Invalid-image recovery, compaction overflow retry, execution of
+  `async_run` hook effects, concurrent command-hook execution, completion-order
+  `updatedInput`, and inexact dirty-baseline git diff reporting are now
+  represented. Hook run summaries, source/trust metadata, transcript snapshots,
+  and `SubagentStop` child/parent transcript paths are represented for command
+  hooks. Still open: prompt/agent hook handler variants, exact trust
+  enforcement/listing UX, plugin/cloud hook discovery, stricter output
+  validation, exact streaming futures for mutating tools, and a full Codex
+  `TurnDiffTracker` lifecycle across every tool runtime.
 - Multi-agent family routing now follows Codex's feature gate for represented
   sessions: `features.multi_agent_v2.enabled = true` selects the v2 task-path
   surface, while the default surface is the namespaced legacy
@@ -1423,6 +1571,484 @@ The biggest remaining categories are:
   timing/baseline nuances, exact resume/fork `TurnContextItem` persistence, full
   typed auth-refresh transport retry, exact typed token estimation, and full
   app-server compaction/token-window lifecycle.
+- The latest runtime slice adds a per-turn `ToolRouter` substrate. Tool
+  planning, model-visible specs, deferred `tool_search` indexing, search-source
+  descriptions, parallel/read-only streaming eligibility, serial dispatch, and
+  parallel dispatch now share one router object for the turn instead of
+  rebuilding independent registries. This closes the represented static-router
+  inconsistency and moves the local architecture closer to Codex's
+  `ToolRouter`; the router also caches its BM25 deferred-tool search engine for
+  the turn rather than rebuilding it per query. The same pass fixed explicit
+  goal `updated_at_ms` preservation for imported/created goal events. What
+  remains is real dynamic callable contribution from MCP/app/plugin/extension
+  sources plus Codex's async tool-future lifecycle.
+- The current streaming-runtime slice uses that router to start every
+  parallel-safe direct tool during provider streaming, not only read-only file
+  tools. Read-only calls still carry the old `read_only_predispatch` event
+  label; visible terminal tools such as `exec_command` now carry
+  `parallel_predispatch` and can run before the provider stream completes when
+  hooks and queued user input do not block them. This closes the represented
+  latency gap for Codex-parallel-safe local tools while keeping model-visible
+  tool outputs ordered by the model's call order. It does not pretend to close
+  the deeper async runtime: cancellation, read/write gates for non-parallel
+  calls, and dynamic contributed tool executors still need larger substrates.
+- Ten real Codex-auth child-agent audits after the router slice found no new
+  easy client-side correctness blocker. Their consensus was that the remaining
+  agent-quality gaps are architectural: dynamic tool contributors, cancellable
+  async tool futures with read/write gating, first-class active-turn state,
+  typed history/rollout/context ownership, exact turn diffs, goal runtime
+  accounting, local compaction/token-window fidelity, and deeper skills/plugins
+  and review-task lifecycle.
+- Verification for the streaming-runtime slice passed after isolating
+  `CODEX_HOME` in the new default-unified-exec regression test. The full local
+  gate passed (`cargo fmt --check`, `git diff --check`, Python tests, and full
+  `cargo test`), and the live Codex-auth smoke used root session
+  `84c40f19c627` plus child session `9c649acf6e21`; the root returned `Paris`,
+  and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- A fresh ten-agent broad audit after this slice found no new correctness
+  regression. The auditors agreed the new `parallel_predispatch` path is a
+  useful latency improvement with an expected ordering risk surface, and that
+  the strict active-input and hook gates are the right guardrails for now. The
+  remaining provider-neutral gaps are still architectural: dynamic tool
+  contributors, cancellable async tool futures with read/write gates,
+  first-class active-turn state, typed history/replay ownership, exact turn
+  diffs, local compaction/token precision, subagent lifecycle depth, and
+  skills/plugins/review runtime depth.
+- The next streaming-runtime guardrail closes the concrete ordering risk
+  surfaced by that audit. During a streamed provider attempt, the scheduler now
+  installs a predispatch barrier as soon as it sees a serial tool, queued
+  active-turn input, or matching runtime hooks. Later parallel-safe calls in the
+  same streamed attempt then wait for normal ordered dispatch instead of
+  overtaking the earlier call. This matches the observable behavior Codex gets
+  from its read/write-gated async tool runtime for the represented local tools,
+  while still leaving the full cancellable future lifecycle and dynamic
+  contributed executors as larger open work.
+- Verification for the guardrail passed the full local gate: formatting,
+  whitespace, Python tests, and full Rust workspace tests. The live Codex-auth
+  smoke used root session `a9c3a83248da` and child session `7bf7aaa46710`; the
+  root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- A second ten-agent broad audit after the guardrail found no new correctness
+  regression. The auditors' consensus was that the barrier closes one concrete
+  streamed-tool ordering hole, while the remaining gaps are still the large
+  provider-neutral runtime pillars: dynamic tool contributors, cancellable
+  async tool futures with read/write gates, first-class active-turn/thread
+  state, typed history/replay ownership, deeper local compaction/token
+  lifecycle, richer subagent lifecycle ownership, and deeper hooks,
+  skills/plugins, and review integration. Some individual reports used stale or
+  shallow wording about hook/skill absence, so those claims were not treated as
+  stronger evidence than the direct source/tests already in this log.
+- The current turn-diff slice tightens another concrete runtime-history edge:
+  git-backed `turn.diff` snapshots now include staged index changes as well as
+  unstaged worktree changes. Before this, a command that wrote a file and ran
+  `git add` could produce an exact-looking turn-diff event with file names but
+  an empty `unified_diff`; Codex's turn diff tracker is not blind to the git
+  index in that way. Local still does not claim the full shared in-memory
+  `TurnDiffTracker` architecture, but clean-baseline staged edits now produce
+  model-visible patch text instead of an empty diff.
+- Verification for the staged turn-diff slice passed the full local gate:
+  formatting, whitespace, Python tests, and full Rust workspace tests. The live
+  Codex-auth smoke used root session `8965e085a54f` and child session
+  `cdedc06e4946`; the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- A fresh ten-agent broad audit after the staged turn-diff slice found no new
+  branch-local regression. All ten auditors treated the staged-index diff
+  change as a useful fidelity fix. Their consensus was that the remaining gaps
+  are still architectural: dynamic tool contributors, cancellable async tool
+  futures with read/write gates, first-class active-turn state, typed
+  history/replay ownership, deeper local compaction/token lifecycle, richer
+  subagent lifecycle ownership, hooks/skills/plugins/review integration,
+  provider/model policy layering, extension/memory depth, and the full
+  in-memory `TurnDiffTracker`.
+- The current goal-runtime slice closes several client-side accounting gaps
+  from Codex's goal extension. Goal usage now consumes uncached input plus
+  output tokens rather than raw total tokens; this prevents cached input and
+  reasoning-only deltas from falsely exhausting a goal budget. Goal tool
+  responses now include Codex-shaped `goal`, `remainingTokens`, and
+  `completionBudgetReport` fields while preserving the local response shape.
+  Active goals that cross their token budget are marked `budget_limited`, the
+  next tool finish injects a one-shot hidden wrap-up `<goal_context>`, and
+  non-retryable provider usage-limit failures mark active or budget-limited
+  goals `usage_limited`. This is still event-store based rather than Codex's
+  full state-db extension runtime, so exact wall-clock accounting, external
+  app/server mutations, and first-class active-turn `InputQueue` integration
+  remain open.
+- Verification for the goal-runtime slice passed the full local gate:
+  formatting, whitespace, Python tests, and full Rust workspace tests. The live
+  Codex-auth smoke used root session `a79c499dbbc5` and child session
+  `46c84d2bd649`; the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- A fresh ten-agent broad audit after the goal-runtime slice found no
+  non-goal regression. The auditors treated effective token accounting,
+  `completionBudgetReport`, `budget_limited` wrap-up steering, and
+  `usage_limited` provider-error handling as useful parity movement. Their
+  repeated caution is that this branch-new budget-limited state must stay
+  covered because it now steers model behavior. Remaining goal work is the
+  larger lifecycle layer: persistent goal state, exact wall-clock accounting,
+  external mutation callbacks, TUI/protocol rendering of budget-limited state,
+  and active-turn `InputQueue`/`AgentControl` integration. The broader
+  non-goal gaps remain typed history/replay, dynamic skill/plugin/tool
+  contributors, hook lifecycle depth, subagent lifecycle depth, and
+  provider/model policy layering.
+- The current goal-accounting slice closes the next concrete Codex goal-runtime
+  gap without adopting remote/server-only goal machinery. Goal time is no
+  longer derived from `now - created_at_ms`; it is accumulated from explicit
+  `goal.accounted` events emitted during active runtime checkpoints. The same
+  accounting events freeze stopped-goal usage so completed goals no longer drift
+  when later unrelated `token_count` events arrive. Runtime checkpoints now use
+  the active turn start as the wall-clock baseline and Codex-style effective
+  token deltas as the token baseline. `create_goal` also returns Codex's
+  positive-budget validation wording.
+- Verification for the goal-accounting slice passed the full local gate after
+  the audit-surfaced duplicate-charging regression was added: formatting,
+  whitespace, Python tests, and full Rust workspace tests. The full workspace
+  run passed with browser-use-browser 16 passed plus 2 ignored browser smokes,
+  CLI 18, core 435, protocol 19, providers 104, python-worker 11, store 15,
+  TUI 140, and doc-tests. The live Codex-auth smoke used root session
+  `bfa5626ce30f` and child session `4c5d285fcf07`; the root returned `Paris`,
+  and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad real child-agent audits after this slice agreed that the new
+  branch-local behavior was goal accounting, not a broad prompt/provider/tool
+  regression. Two auditors independently called out possible duplicate charging
+  across the new model-usage, assistant-turn, and tool-output checkpoints; the
+  new `goal_accounting_checkpoints_do_not_double_charge_tokens` regression
+  covers that path. Several reports over-counted out-of-scope SDK/server
+  surfaces or repeated stale "hooks/skills absent" language, so those claims
+  were filtered against the already implemented and tested hook, skill, plugin,
+  and review slices. The remaining material gaps are still architectural:
+  dynamic callable contributors, cancellable async tool futures with read/write
+  gates, first-class active-turn/thread control state, typed
+  history/rollout/replay ownership, deeper local compaction/token lifecycle
+  precision, persistent goal state and external mutation callbacks, richer
+  subagent lifecycle ownership, and review/plugin/skill manager depth.
+- The current skills slice closes a model-visible prompt hygiene gap in the
+  local skill inventory. Instead of dumping every skill description until an
+  arbitrary count cap, available skills now render through a Codex-shaped
+  metadata budget: 2% of the configured model context window when known, or an
+  8k character fallback. The renderer fairly shortens descriptions before
+  omitting skills, keeps higher-priority scopes first when minimum lines exceed
+  the budget, emits provider-neutral startup warnings when metadata is
+  compressed, and uses `### Skill roots` aliases when shared path roots let more
+  skills fit. This matters because skill inventory lives in the model's
+  developer context on every turn; unbounded descriptions can waste context, and
+  silent omission can make the model miss reusable local capabilities.
+- Verification for the skills slice passed the full local gate: formatting,
+  whitespace, Python tests, and full Rust workspace tests. The full workspace
+  run passed with browser-use-browser 16 passed plus 2 ignored browser smokes,
+  CLI 18, core 439, protocol 19, providers 104, python-worker 11, store 15,
+  TUI 140, and doc-tests. The live Codex-auth smoke used root session
+  `4f462619aa02` and child session `18051821d0a3`; the root returned `Paris`,
+  and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad real child-agent audits after this slice treated the skill metadata
+  rewrite as the only branch-local model-visible change. The consensus was that
+  it is a useful parity improvement rather than a regression, with the normal
+  caution that budget and warning behavior now affects what the model sees.
+  Several individual reports repeated stale "hooks/skills/plugins/goals absent"
+  language; those claims were filtered against implemented code and focused
+  tests. The remaining material gaps are unchanged: dynamic callable
+  contributors from MCP/apps/plugins/extensions, cancellable async tool futures
+  with read/write gates, first-class active-turn/thread control state, typed
+  history/rollout/replay ownership, deeper local compaction/token lifecycle
+  precision, persistent goal state and external mutation callbacks, richer
+  subagent lifecycle ownership, richer review flow, and skill/plugin manager
+  depth beyond prompt rendering.
+- The current plugin-hook slice closes a concrete extension/runtime gap.
+  Enabled local Codex plugin bundles can now contribute command hooks through
+  the same hook runtime used by workspace/user config. The loader supports the
+  default plugin `hooks/hooks.json`, manifest-provided hook file paths, arrays
+  of hook files, and inline manifest hook objects, while preserving plugin
+  source metadata for lifecycle events. This is deliberately local and
+  provider-neutral; it does not add Codex cloud/plugin marketplace behavior.
+- Verification for the plugin-hook slice passed the full local gate:
+  formatting, whitespace, Python tests, and full Rust workspace tests. The
+  full workspace run passed with browser-use-browser 16 passed plus 2 ignored
+  browser smokes, CLI 18, core 442, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 140, and doc-tests. The live Codex-auth
+  smoke used root session `64e05d17d794` and child session `8e56ce2d38da`;
+  the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- Ten broad real child-agent audits after this slice treated plugin-hook
+  ingestion as the only branch-local behavior change. Nine reports completed;
+  one child hit the provider turn cap and was recorded as errored. The
+  consensus was that plugin hooks are a parity gain, with the expected caution
+  that enabled plugin hooks can now affect runtime behavior and must keep
+  source/load-order coverage. The remaining material gaps are now concentrated
+  in active-turn/thread lifecycle and replay, dynamic MCP/app/plugin callable
+  contributors, public event-router style turn buffering, deeper local
+  compaction/token lifecycle, cancellable async tool futures with read/write
+  gates, richer subagent lifecycle ownership, and review/task lifecycle depth.
+- The current mailbox-boundary slice closes a concrete active-turn input queue
+  edge. Mailbox-only input that appears after the model has effectively reached
+  the answer boundary is no longer appended to the current final response.
+  Queue-only mailbox stays pending while the current answer completes; trigger
+  mailbox defers the final answer and continues into the next provider turn so
+  the mail is handled as its own turn input.
+- Verification for the mailbox-boundary slice passed formatting, whitespace,
+  Python tests, full Rust workspace tests, and live Codex-auth root plus child
+  smokes. The full workspace run passed with browser-use-browser 16 passed plus
+  2 ignored browser smokes, CLI 18, core 444, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 140, and doc-tests. The live smoke used root
+  session `73bbb0b0ca59` and child session `42eaa033ef78`; the root returned
+  `Paris`, and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad real child-agent audits after this slice treated the mailbox
+  answer-boundary behavior as the only branch-local runtime change. The
+  consensus was that the focused queue-only and trigger-turn tests cover the
+  concrete edge now implemented. The remaining material gap is the larger
+  active-turn architecture: generalized `InputQueue`, `TurnState`, and
+  `AgentControl` semantics, plus typed history/replay/rollout ownership,
+  dynamic callable contributors, compaction/token precision, richer hooks,
+  persistent goal state, and subagent control-plane depth.
+- The current stdio MCP slice closes the first concrete dynamic callable-tool
+  contributor gap. User-configured `[mcp_servers]` entries now discover tools
+  through MCP JSON-RPC, register them as namespaced/deferred model tools,
+  provide flat fallback tool names for models without namespace support, and
+  dispatch `tools/call` through the existing provider-neutral tool loop. The
+  model-facing output shape now follows Codex's wall-time/header convention
+  for structured/text/image MCP results, while event logs are bounded and MCP
+  server stderr is included in error context.
+- Verification for the stdio MCP slice passed formatting, whitespace, Python
+  tests, full Rust workspace tests, and live Codex-auth root plus child smokes.
+  The full workspace run passed with browser-use-browser 16 passed plus 2
+  ignored browser smokes, CLI 18, core 452, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 140, and doc-tests. The live smoke used root
+  session `2a492df679fe` and child session `993caa0d8ff5`; the root returned
+  `Paris`, and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten real Codex-auth child audits were run after the stdio MCP slice. Five
+  completed with final reports and five hit the provider-turn guard, which is
+  recorded as part of the audit result. The completed reports agreed that
+  stdio MCP is a real parity gain and that the remaining MCP work is
+  architectural: persistent per-session/server connection management,
+  discovery diagnostics, remote/OAuth/elicitation/resources, app/plugin
+  connector exposure, collision policy, read-only parallel hints, and richer
+  raw-vs-model output separation for future hooks/code-mode consumers.
+- The current MCP maturity slice closes the concrete MCP-tool heuristics found
+  after the first stdio implementation. Small MCP tool sets are now exposed
+  directly like Codex, while large sets defer behind `tool_search`; required
+  servers fail loudly; Codex-shaped `env_vars` are imported; sanitized name
+  collisions are disambiguated; read-only and server-level parallel hints feed
+  the existing parallel/predispatch scheduler; and unsupported `original` image
+  detail is downgraded before model replay.
+- Verification for the MCP maturity slice passed formatting, whitespace,
+  Python tests, full Rust workspace tests, and live Codex-auth root plus child
+  smokes. The full workspace run passed with browser-use-browser 16 passed
+  plus 2 ignored browser smokes, CLI 18, core 454, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 140, and doc-tests. The live smoke used root
+  session `cf071e265813` and child session `aa8ed0fbb9c8`; the root returned
+  `Paris`, and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad Codex-auth child audits after the MCP maturity slice produced eight
+  final reports and two provider-turn-cap failures. The completed reports did
+  not find a new concrete MCP regression. They converged on the same next
+  high-impact work: first-class turn/input/control state, typed
+  context/history/rollout reconstruction, stronger subagent inheritance and
+  lifecycle ownership, dynamic app/plugin/MCP connector inventory, fuller tool
+  runtime envelopes, and deeper local compaction/token lifecycle precision.
+- The current history/context slice closes a concrete typed-history and
+  turn-context gap. `$CODEX_HOME/history.jsonl` now follows Codex's append-only
+  JSONL shape with save/none config, max-byte trimming, file identity metadata,
+  lookup, and owner-only Unix permissions. CLI and TUI user submissions append
+  prompt history; TUI appends asynchronously so the terminal path stays
+  responsive.
+- The same slice enriches `context.baseline.turn_context` with model request
+  capabilities, config/profile/source details, history settings, feature flags,
+  MCP server inventory, available model metadata, final-output schema hints,
+  and runtime limits. This does not claim full Codex `TurnContext` or state-db
+  reconstruction parity, but it gives local replay/compaction/subagent
+  diagnostics a much closer client-state snapshot.
+- Remaining high-impact client-side gaps after this slice are full TUI message
+  history recall/search, typed rollout/state reconstruction, dynamic
+  app/plugin/extension tool contributors, async tool futures with cancellation
+  and read/write gating, first-class `InputQueue`/`TurnState`/`AgentControl`,
+  and deeper compaction/token lifecycle precision.
+- Verification for the history/context slice passed the full terminal UI
+  definition of done because `crates/browser-use-tui` changed: formatting,
+  full Rust tests, Python tests, deterministic setup/account/model/done/
+  running/cancelled/browser/history/developer dumps, and the real tmux terminal
+  smoke all passed via `scripts/verify-terminal-ui.sh`. The artifact directory
+  `/tmp/but-design-loop` was inspected, and no ANSI/bracketed-paste marker leaks
+  were found. The live Codex-auth smoke used root session `1e9dff3d2651` and
+  child session `6b27af558401`; the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- Ten broad Codex-auth child audits after this slice all completed. The
+  repeated remaining gaps shifted toward the TUI/workbench layer: prompt
+  history recall/search, actionable resume/fork/backtrack/session recovery,
+  richer goal/status and turn/tool lifecycle visibility, token-usage trend and
+  breakdown displays, stronger interrupt/recovery affordances, attachment-rich
+  composer state, and exact transcript/history reconstruction.
+- The current TUI prompt-history slice closes the highest-confidence
+  write-mostly history gap. The composer now reads Codex-shaped
+  `$CODEX_HOME/history.jsonl`, combines it with local in-session submissions,
+  supports Up/Ctrl+P and Down/Ctrl+N recall with draft restore, keeps multiline
+  cursor movement intact, and adds a Ctrl+R reverse-search overlay with
+  newest-first unique matching, match cycling, Enter acceptance, and Esc/Ctrl+C
+  draft restore.
+- The first broad audit wave found several prompt-history edge cases, so the
+  slice was tightened before final verification. Normal Up/Down lookup now
+  snapshots persistent history metadata and fetches entries lazily; local
+  submissions stay separate from later async persistence to avoid duplicate
+  recall; adjacent local duplicate submissions are collapsed; and non-empty
+  composer history navigation is allowed only when the text exactly matches the
+  last recalled entry at a text boundary, matching Codex's safer ownership
+  rule. Async command hooks are also skipped like Codex instead of running and
+  injecting context.
+- Verification for this slice passed the full terminal UI definition of done
+  because `crates/browser-use-tui` changed: `scripts/verify-terminal-ui.sh`
+  ran formatting, full Rust workspace tests, Python tests, deterministic setup/
+  account/model/done/running/cancelled/browser/history/developer dumps, and the
+  real tmux smoke. Focused coverage also passed `cargo test -p browser-use-tui
+  prompt_history`, `cargo test -p browser-use-tui`, `cargo test -p
+  browser-use-core message_history`, and `cargo test -p browser-use-core hook`.
+  The artifact directory `/tmp/but-design-loop` was inspected, and no ANSI or
+  bracketed-paste marker leaks were found.
+- The live Codex-auth smoke used root session `b069942a250f` and child session
+  `f6b0a4381917`. The root returned `Paris`; the child read
+  `/tmp/but-codex-agent-parity-smoke-final.txt` and returned
+  `agent-parity-smoke-ok`.
+- Ten broad read-only child audits after final verification all completed in
+  two waves. They did not identify a new bounded prompt-history regression.
+  Consensus remaining gaps are the larger provider-neutral architecture slices:
+  dynamic app/plugin/extension/MCP tool contributors, first-class active-turn
+  `InputQueue`/`TurnState`/`AgentControl`, stream-integrated cancellable tool
+  futures with read/write gates, typed rollout/history/fork reconstruction,
+  exact cumulative turn-diff tracking, deeper compaction/token lifecycle
+  precision, persistent MCP/session lifecycle, richer skill/plugin/review
+  manager depth, and multi-environment tool routing.
+- The current turn-diff slice closes a concrete part of Codex's
+  `TurnDiffTracker` behavior. The file-tool runtime now keeps an in-memory
+  turn-scoped tracker for committed `apply_patch` changes, reset at the start of
+  each model turn and rooted at the git worktree root when available.
+  `turn.diff` events from patches are cumulative and exact when the committed
+  deltas are exact: add-then-update is rendered as one add, delete-then-readd
+  becomes one update, add-then-delete clears the diff with an empty cumulative
+  event, and move-overwrite captures both the source delete and destination
+  update. Once an exact cumulative patch diff has been emitted for the turn, the
+  broader git-worktree fallback no longer appends a competing `turn.diff`;
+  shell/worktree snapshots still remain the fallback for non-`apply_patch`
+  mutations.
+- Focused verification for this slice passed `cargo test -p browser-use-core
+  apply_patch` and `cargo test -p browser-use-core turn_git_diff`, including
+  regressions for per-turn reset, git-root display paths, net-empty patch diffs,
+  and tracked-file git-fallback suppression. Full workspace verification also
+  passed (`cargo fmt --check`, `git diff --check`, Python tests, and
+  `cargo test`). The live Codex-auth smoke used root session `db6bce744f5a` and
+  child session `3909b3887310`; the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke-turndiff-final.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad read-only child audits after final verification completed in two
+  waves and were closed. They did not find a bounded regression in the
+  cumulative turn-diff slice. Their consensus remaining gaps are the larger
+  provider-neutral runtime systems: dynamic MCP/app/plugin/extension tool
+  contributors and persistent MCP sessions, stream-integrated cancellable tool
+  futures with read/write gates, first-class active-turn
+  `InputQueue`/`TurnState`/`AgentControl`, typed rollout/history/fork
+  reconstruction, token-window/compaction precision, goal runtime state depth,
+  structured review/user-shell surfaces, hook trust/handler breadth,
+  skill/plugin manager side effects, and multi-environment tool routing.
+- The current MCP resource slice closes another concrete dynamic-tool gap.
+  When MCP servers are configured, the registry now exposes Codex-shaped
+  `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource`
+  tools. Dispatch sends stdio MCP `resources/list`, `resources/templates/list`,
+  and `resources/read` requests, supports single-server cursors, aggregates
+  all-server listings with server-tagged entries, records `mcp.resource_result`
+  sidecars, and marks the resource tools as read-only/parallel-safe. This gives
+  the model a portable way to inspect MCP-provided context without relying on
+  browser behavior or OpenAI-only server features.
+- Focused verification for the MCP resource slice passed
+  `cargo test -p browser-use-core mcp_resource -- --nocapture`, covering tool
+  specs/read-only dispatch flags, raw stdio resource list/template/read calls,
+  pagination aggregation, and provider-loop model-visible outputs. It does not
+  claim persistent MCP-session parity; the local MCP path still launches per
+  operation and still lacks Codex's streamable HTTP/OAuth/elicitation/app/plugin
+  connector lifecycle.
+- Full verification for this slice passed `cargo fmt --check`,
+  `git diff --check`, `uv run --with pytest python -m pytest -q`, and
+  `cargo test`. The Rust workspace results were browser-use-browser 16 passed
+  plus 2 ignored browser smokes, CLI 18, core 466, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 143, and doc-tests. The live Codex-auth smoke
+  used root session `7a8cbb74fe0c` and child session `03275ba33199`; the root
+  returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke-mcpres-final.txt` as
+  `agent-parity-smoke-ok`. No TUI behavior changed, so
+  `scripts/verify-terminal-ui.sh` was not rerun for this slice.
+- Ten broad read-only child audits after the MCP resource slice all completed.
+  They agreed the resource tools are a useful local parity improvement and did
+  not report a bounded regression. The consensus remaining gaps are larger
+  provider-neutral runtime systems: dynamic per-turn tool contributors for
+  plugins/apps/extensions/deferred tools, persistent MCP sessions, unified
+  cancellable async tool execution with read/write gates, first-class
+  `InputQueue`/`TurnState`/`AgentControl`, typed response-item history and
+  rollout/fork/replay reconstruction, compaction/token-window precision,
+  multi-environment tool routing, hook engine/trust depth, plugin/skill manager
+  side effects, and fuller goal/review/user-shell lifecycle state. The most
+  repeated next implementation order was persistent stdio MCP manager, dynamic
+  tool contributor planning, active-turn/tool cancellation runtime, then typed
+  history reconstruction.
+- The current MCP session slice closes the persistent-stdio part of that gap.
+  Local MCP discovery, tool calls, resource listing, resource templates, and
+  resource reads now reuse an initialized stdio server process keyed by the
+  session id plus stable server config, matching Codex's managed-client behavior
+  for stateful MCP servers without sharing state across unrelated sessions. The
+  first broad audit wave caught the initial process-global cache risk, so the
+  patch now routes normal agent MCP calls through session-scoped helpers and
+  folds MCP shutdown into the same session/subtree/process cleanup path used for
+  background terminal sessions. Operations are serialized per server, request
+  ids keep increasing across calls, newest stderr is still attached to failures,
+  and timeouts or transport failures drop the cached session. Focused MCP tests
+  include a stateful Python server whose counter must advance from `count:1` to
+  `count:2` in one session, start at `count:1` in another session, and reset to
+  `count:1` after explicit cleanup. Remaining MCP work is streamable
+  HTTP/OAuth/elicitation, app/plugin connector lifecycle, richer startup status
+  events, retry-on-fresh-transport nuances, same-server parallel throughput, and
+  the broader dynamic tool contributor graph.
+- Full verification passed after the session-scoped MCP slice. The terminal
+  verifier ran formatting, the full Rust workspace, Python tests, deterministic
+  UI dumps, and the real tmux terminal smoke; `/tmp/but-design-loop` was
+  inspected and scans found no ANSI escape or bracketed-paste marker leaks. A
+  final live Codex-auth smoke used root session `1b346f802c2e`, which returned
+  `Paris`, and child session `89442bdb6ff2`, which read `AGENTS.md` as
+  `Agent Notes`.
+- Ten broad read-only child audits completed after the MCP work. The first wave
+  found the initial process-global cache risk; that drove the session-scoping,
+  cleanup, newest-stderr, and stale-transport recovery fixes. The final wave
+  agreed persistent stdio MCP is now a useful local parity improvement, while
+  the remaining MCP deltas are lifecycle depth, same-server parallel throughput,
+  HTTP/OAuth/elicitation, startup/status/provenance, and app/plugin connector
+  integration.
+- The current plugin-MCP slice connects enabled local Codex plugin bundles to
+  the same local stdio MCP runtime instead of only showing plugin MCP names in
+  prompt context. Wrapped `.mcp.json` files, flat server-map files, manifest
+  `mcpServers` paths, relative `cwd` normalization, OAuth key normalization,
+  and explicit-config precedence are covered by tests. A runtime regression
+  proves a plugin-provided stdio MCP server can expose and execute
+  `mcp__sample__echo_tool` through the provider loop. This deliberately does
+  not claim app connector, streamable HTTP, OAuth, elicitation, plugin install,
+  or marketplace sync parity.
+- Verification for the plugin-MCP slice passed formatting, whitespace, Python,
+  and full Rust workspace checks. The live Codex-auth smoke used root session
+  `8a3915043d32`, which returned `Paris`, and child session `291d1d6b0884`,
+  which read `AGENTS.md` as `Agent Notes`. No TUI behavior changed, so the
+  terminal verifier was not rerun for this slice.
+- Ten broad read-only audits after the plugin-MCP slice agreed that supported
+  local stdio plugin MCP runtime exposure is now closed. They did not find a
+  bounded parser/runtime regression in this slice. Their consensus moved the
+  next work back to architecture: a dynamic tool/contributor graph including
+  discoverable plugin/install tools, a cancellable stream-time tool runtime
+  with read/write gates and a shared turn-diff tracker, a first-class
+  `InputQueue`/`TurnState`/`AgentControl`, typed response-item/context history,
+  local compaction/token-window precision, MCP/tool-output fidelity, hook trust
+  and handler depth, structured review task lifecycle, multi-environment
+  routing, and exact diffs beyond `apply_patch`.
+- The repeated next high-impact gaps are not MCP-specific: per-turn dynamic
+  tool contributor/router planning, a unified cancellable tool runtime with
+  read/write gates and abort outputs, first-class active-turn
+  `InputQueue`/`TurnState`/`AgentControl`, typed response-item/context history
+  for replay/fork/resume/compaction, and deeper local compaction/token-window
+  precision.
 
 ## Definition of Done
 

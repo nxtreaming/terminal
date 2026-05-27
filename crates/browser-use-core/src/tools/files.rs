@@ -1,3 +1,4 @@
+use std::collections::{HashMap, HashSet};
 use std::error::Error as StdError;
 use std::ffi::OsStr;
 use std::fmt;
@@ -5,12 +6,14 @@ use std::fs;
 use std::io;
 use std::path::{Component, Path, PathBuf};
 use std::process::Command;
+use std::sync::{Mutex, OnceLock};
 
 use anyhow::{bail, Context, Result};
 use browser_use_protocol::{SessionMeta, ToolCall};
 use browser_use_store::Store;
 use ignore::WalkBuilder;
 use serde_json::{json, Value};
+use sha1::Digest;
 
 use crate::prompt_image::{load_for_prompt_bytes, PromptImageMode};
 
@@ -19,13 +22,29 @@ const DEFAULT_MAX_READ_BYTES: usize = 80_000;
 const DEFAULT_MAX_SEARCH_RESULTS: usize = 100;
 const DEFAULT_MAX_LIST_RESULTS: usize = 200;
 const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_TURN_DIFF_CHARS: usize = 60_000;
 const PATCH_REJECTED_OUTSIDE_PROJECT_REASON: &str =
     "patch rejected: writing outside of the project; rejected by user approval settings";
 const PROTECTED_PATCH_METADATA_NAMES: &[&str] = &[".git", ".agents", ".browser-use", ".codex"];
+const ZERO_OID: &str = "0000000000000000000000000000000000000000";
+const DEV_NULL: &str = "/dev/null";
+const REGULAR_FILE_MODE: &str = "100644";
+
+static TURN_DIFF_TRACKERS: OnceLock<Mutex<HashMap<String, TurnDiffTracker>>> = OnceLock::new();
 
 #[derive(Debug)]
 pub(crate) struct FileToolResult {
     pub(crate) content: Value,
+}
+
+pub(crate) fn reset_turn_diff_tracker_for_session(session_id: &str, cwd: &Path) {
+    let mut trackers = turn_diff_trackers()
+        .lock()
+        .expect("turn diff tracker mutex poisoned");
+    trackers.insert(
+        session_id.to_string(),
+        TurnDiffTracker::with_display_root(cwd.to_path_buf()),
+    );
 }
 
 pub(crate) fn read_file(
@@ -284,26 +303,26 @@ pub(crate) fn view_image(
         } else {
             "high"
         };
-        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
-        if bytes.len() > MAX_INLINE_LOCAL_IMAGE_BYTES {
-            bail!(
-                "view_image cannot inline {}: image is {} bytes, above the {} byte inline limit",
-                path.display(),
-                bytes.len(),
-                MAX_INLINE_LOCAL_IMAGE_BYTES
-            );
-        }
         let mode = if detail == "original" {
             PromptImageMode::Original
         } else {
             PromptImageMode::ResizeToFit
         };
+        let bytes = fs::read(&path).with_context(|| format!("read {}", path.display()))?;
         let prompt_image = load_for_prompt_bytes(&path, bytes, mode).with_context(|| {
             format!(
                 "view_image cannot inline {}: unsupported or invalid image bytes",
                 path.display()
             )
         })?;
+        if prompt_image.bytes.len() > MAX_INLINE_LOCAL_IMAGE_BYTES {
+            bail!(
+                "view_image cannot inline {}: image is {} bytes after normalization, above the {} byte inline limit",
+                path.display(),
+                prompt_image.bytes.len(),
+                MAX_INLINE_LOCAL_IMAGE_BYTES
+            );
+        }
         let mime = prompt_image.mime;
         let image = json!({
             "path": path.display().to_string(),
@@ -636,9 +655,283 @@ fn fallback_search(
 #[derive(Clone, Debug)]
 struct AppliedChange {
     path: PathBuf,
+    old_display_path: PathBuf,
     display_path: PathBuf,
     kind: &'static str,
     move_path: Option<PathBuf>,
+    overwritten_move_content: Option<String>,
+    old_content: Option<String>,
+    new_content: Option<String>,
+}
+
+#[derive(Debug)]
+struct TurnDiffSnapshot {
+    unified_diff: String,
+    changed_files: usize,
+    exact: bool,
+    should_emit: bool,
+}
+
+#[derive(Debug)]
+struct TurnDiffTracker {
+    valid: bool,
+    display_root: PathBuf,
+    baseline_by_path: HashMap<PathBuf, String>,
+    current_by_path: HashMap<PathBuf, String>,
+    origin_by_current_path: HashMap<PathBuf, PathBuf>,
+}
+
+impl TurnDiffTracker {
+    fn with_display_root(display_root: PathBuf) -> Self {
+        Self {
+            valid: true,
+            display_root,
+            baseline_by_path: HashMap::new(),
+            current_by_path: HashMap::new(),
+            origin_by_current_path: HashMap::new(),
+        }
+    }
+
+    fn track_delta(&mut self, changes: &[AppliedChange], exact: bool) -> TurnDiffSnapshot {
+        let previous_diff = self.get_unified_diff();
+        if exact {
+            for change in changes {
+                self.apply_change(change);
+            }
+        } else {
+            self.invalidate();
+        }
+        let current_diff = self.get_unified_diff();
+        let changed_files = current_diff.as_ref().map_or(0, |(_, count)| *count);
+        TurnDiffSnapshot {
+            unified_diff: current_diff.map(|(diff, _)| diff).unwrap_or_default(),
+            changed_files,
+            exact: self.valid,
+            should_emit: !changes.is_empty() && (previous_diff.is_some() || changed_files > 0),
+        }
+    }
+
+    fn invalidate(&mut self) {
+        self.valid = false;
+    }
+
+    fn apply_change(&mut self, change: &AppliedChange) {
+        match change.kind {
+            "added" => self.apply_add(
+                &change.path,
+                change.new_content.as_deref().unwrap_or_default(),
+                change.old_content.as_deref(),
+            ),
+            "deleted" => self.apply_delete(
+                &change.path,
+                change.old_content.as_deref().unwrap_or_default(),
+            ),
+            "moved" => self.apply_update(
+                &change.path,
+                change.move_path.as_deref(),
+                change.old_content.as_deref().unwrap_or_default(),
+                change.overwritten_move_content.as_deref(),
+                change.new_content.as_deref().unwrap_or_default(),
+            ),
+            _ => self.apply_update(
+                &change.path,
+                None,
+                change.old_content.as_deref().unwrap_or_default(),
+                None,
+                change.new_content.as_deref().unwrap_or_default(),
+            ),
+        }
+    }
+
+    fn apply_add(&mut self, path: &Path, content: &str, overwritten_content: Option<&str>) {
+        self.origin_by_current_path.remove(path);
+        if !self.current_by_path.contains_key(path) && !self.baseline_by_path.contains_key(path) {
+            if let Some(overwritten_content) = overwritten_content {
+                self.baseline_by_path
+                    .insert(path.to_path_buf(), overwritten_content.to_string());
+            }
+        }
+        self.current_by_path
+            .insert(path.to_path_buf(), content.to_string());
+    }
+
+    fn apply_delete(&mut self, path: &Path, content: &str) {
+        if self.current_by_path.remove(path).is_none() && !self.baseline_by_path.contains_key(path)
+        {
+            self.baseline_by_path
+                .insert(path.to_path_buf(), content.to_string());
+        }
+        self.origin_by_current_path.remove(path);
+    }
+
+    fn apply_update(
+        &mut self,
+        source_path: &Path,
+        move_path: Option<&Path>,
+        old_content: &str,
+        overwritten_move_content: Option<&str>,
+        new_content: &str,
+    ) {
+        if !self.current_by_path.contains_key(source_path)
+            && !self.baseline_by_path.contains_key(source_path)
+        {
+            self.baseline_by_path
+                .insert(source_path.to_path_buf(), old_content.to_string());
+        }
+
+        match move_path {
+            Some(dest_path) => {
+                if !self.current_by_path.contains_key(dest_path)
+                    && !self.baseline_by_path.contains_key(dest_path)
+                {
+                    if let Some(overwritten_move_content) = overwritten_move_content {
+                        self.baseline_by_path.insert(
+                            dest_path.to_path_buf(),
+                            overwritten_move_content.to_string(),
+                        );
+                    }
+                }
+                let origin = self
+                    .origin_by_current_path
+                    .remove(source_path)
+                    .unwrap_or_else(|| source_path.to_path_buf());
+                self.current_by_path.remove(source_path);
+                self.current_by_path
+                    .insert(dest_path.to_path_buf(), new_content.to_string());
+                self.origin_by_current_path.remove(dest_path);
+                if dest_path != origin.as_path() {
+                    self.origin_by_current_path
+                        .insert(dest_path.to_path_buf(), origin);
+                }
+            }
+            None => {
+                self.current_by_path
+                    .insert(source_path.to_path_buf(), new_content.to_string());
+            }
+        }
+    }
+
+    fn get_unified_diff(&self) -> Option<(String, usize)> {
+        if !self.valid {
+            return None;
+        }
+
+        let rename_pairs = self.rename_pairs();
+        let paired_destinations = rename_pairs.values().cloned().collect::<HashSet<_>>();
+        let mut handled = HashSet::new();
+        let mut paths = self
+            .baseline_by_path
+            .keys()
+            .chain(self.current_by_path.keys())
+            .cloned()
+            .collect::<Vec<_>>();
+        paths.sort_by_key(|path| self.display_path(path));
+        paths.dedup();
+
+        let mut aggregated = String::new();
+        let mut changed_files = 0;
+        for path in paths {
+            if !handled.insert(path.clone()) {
+                continue;
+            }
+            if paired_destinations.contains(&path) {
+                continue;
+            }
+
+            let diff = if let Some(dest) = rename_pairs.get(&path) {
+                handled.insert(dest.clone());
+                self.render_rename_diff(&path, dest)
+            } else {
+                self.render_path_diff(&path)
+            };
+            if let Some(diff) = diff {
+                changed_files += 1;
+                aggregated.push_str(&diff);
+                if !aggregated.ends_with('\n') {
+                    aggregated.push('\n');
+                }
+            }
+        }
+
+        (!aggregated.is_empty()).then_some((aggregated, changed_files))
+    }
+
+    fn rename_pairs(&self) -> HashMap<PathBuf, PathBuf> {
+        self.origin_by_current_path
+            .iter()
+            .filter_map(|(dest_path, origin_path)| {
+                if dest_path == origin_path
+                    || self.current_by_path.contains_key(origin_path)
+                    || !self.current_by_path.contains_key(dest_path)
+                    || !self.baseline_by_path.contains_key(origin_path)
+                    || self.baseline_by_path.contains_key(dest_path)
+                {
+                    return None;
+                }
+                Some((origin_path.clone(), dest_path.clone()))
+            })
+            .collect()
+    }
+
+    fn render_path_diff(&self, path: &Path) -> Option<String> {
+        self.render_diff(
+            path,
+            self.baseline_by_path.get(path).map(String::as_str),
+            path,
+            self.current_by_path.get(path).map(String::as_str),
+        )
+    }
+
+    fn render_rename_diff(&self, source_path: &Path, dest_path: &Path) -> Option<String> {
+        self.render_diff(
+            source_path,
+            self.baseline_by_path.get(source_path).map(String::as_str),
+            dest_path,
+            self.current_by_path.get(dest_path).map(String::as_str),
+        )
+    }
+
+    fn render_diff(
+        &self,
+        left_path: &Path,
+        left_content: Option<&str>,
+        right_path: &Path,
+        right_content: Option<&str>,
+    ) -> Option<String> {
+        render_unified_file_diff(
+            &self.display_path(left_path),
+            left_content,
+            &self.display_path(right_path),
+            right_content,
+        )
+    }
+
+    fn display_path(&self, path: &Path) -> String {
+        path.strip_prefix(&self.display_root)
+            .unwrap_or(path)
+            .display()
+            .to_string()
+            .replace('\\', "/")
+    }
+}
+
+fn turn_diff_trackers() -> &'static Mutex<HashMap<String, TurnDiffTracker>> {
+    TURN_DIFF_TRACKERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn track_session_turn_diff(
+    session_id: &str,
+    cwd: &Path,
+    changes: &[AppliedChange],
+    exact: bool,
+) -> TurnDiffSnapshot {
+    let mut trackers = turn_diff_trackers()
+        .lock()
+        .expect("turn diff tracker mutex poisoned");
+    trackers
+        .entry(session_id.to_string())
+        .or_insert_with(|| TurnDiffTracker::with_display_root(cwd.to_path_buf()))
+        .track_delta(changes, exact)
 }
 
 #[derive(Debug)]
@@ -702,6 +995,11 @@ fn emit_patch_finished(
     call: &ToolCall,
     finish: PatchFinish<'_>,
 ) -> Result<()> {
+    let unified_diff = render_applied_changes_unified_diff(finish.committed_changes);
+    let (unified_diff, diff_truncated) = unified_diff
+        .as_deref()
+        .map(|diff| truncate_chars(diff, MAX_TURN_DIFF_CHARS))
+        .unwrap_or_else(|| (String::new(), false));
     store.append_event(
         &session.id,
         "patch.finished",
@@ -716,18 +1014,36 @@ fn emit_patch_finished(
             "committed_changes": applied_changes_payload(finish.committed_changes),
             "committed_files": applied_changes_payload(finish.committed_changes),
             "committed_delta_exact": finish.committed_delta_exact,
+            "unified_diff": unified_diff.clone(),
+            "diff_truncated": diff_truncated,
         }),
     )?;
     if !finish.committed_changes.is_empty() {
+        let cumulative = track_session_turn_diff(
+            &session.id,
+            Path::new(&session.cwd),
+            finish.committed_changes,
+            finish.committed_delta_exact,
+        );
+        if !cumulative.should_emit {
+            return Ok(());
+        }
+        let (cumulative_diff, cumulative_diff_truncated) =
+            truncate_chars(&cumulative.unified_diff, MAX_TURN_DIFF_CHARS);
         store.append_event(
             &session.id,
             "turn.diff",
             json!({
                 "source": "apply_patch",
                 "tool_call_id": call.id,
-                "changed_files": finish.committed_changes.len(),
+                "changed_files": cumulative.changed_files,
+                "patch_changed_files": finish.committed_changes.len(),
                 "changes": applied_changes_payload(finish.committed_changes),
+                "cumulative": true,
+                "exact": cumulative.exact,
                 "committed_delta_exact": finish.committed_delta_exact,
+                "unified_diff": cumulative_diff,
+                "diff_truncated": cumulative_diff_truncated,
             }),
         )?;
     }
@@ -1029,29 +1345,40 @@ fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange
         PatchOperation::Add { path, content } => {
             let display_path = PathBuf::from(&path);
             let path = resolve_patch_path(cwd, &path)?;
+            let old_content = fs::read_to_string(&path).ok();
             if let Some(parent) = path.parent() {
                 fs::create_dir_all(parent)
                     .with_context(|| format!("create {}", parent.display()))?;
             }
-            fs::write(&path, content)
+            fs::write(&path, &content)
                 .with_context(|| format!("Failed to write file {}", path.display()))?;
             Ok(AppliedChange {
                 path,
+                old_display_path: display_path.clone(),
                 display_path,
                 kind: "added",
                 move_path: None,
+                overwritten_move_content: None,
+                old_content,
+                new_content: Some(content),
             })
         }
         PatchOperation::Delete { path } => {
             let display_path = PathBuf::from(&path);
             let path = resolve_patch_path(cwd, &path)?;
+            let old_content = fs::read_to_string(&path)
+                .with_context(|| format!("Failed to read {}", path.display()))?;
             fs::remove_file(&path)
                 .with_context(|| format!("Failed to delete file {}", path.display()))?;
             Ok(AppliedChange {
                 path,
+                old_display_path: display_path.clone(),
                 display_path,
                 kind: "deleted",
                 move_path: None,
+                overwritten_move_content: None,
+                old_content: Some(old_content),
+                new_content: None,
             })
         }
         PatchOperation::Update {
@@ -1060,10 +1387,16 @@ fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange
             hunks,
         } => {
             let display_path = PathBuf::from(move_path.as_deref().unwrap_or(&path));
+            let old_display_path = PathBuf::from(&path);
             let path = resolve_patch_path(cwd, &path)?;
             let move_path = move_path
                 .map(|target| resolve_patch_path(cwd, &target))
                 .transpose()?;
+            let overwritten_move_content = move_path.as_ref().and_then(|target| {
+                (target != &path)
+                    .then(|| fs::read_to_string(target).ok())
+                    .flatten()
+            });
             let original = fs::read_to_string(&path)
                 .with_context(|| format!("Failed to read file to update {}", path.display()))?;
             let original_lines = split_patch_lines(&original);
@@ -1088,6 +1421,7 @@ fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange
             }
             Ok(AppliedChange {
                 path,
+                old_display_path,
                 display_path,
                 kind: if move_path.is_some() {
                     "moved"
@@ -1095,9 +1429,99 @@ fn apply_patch_operation(cwd: &Path, op: PatchOperation) -> Result<AppliedChange
                     "modified"
                 },
                 move_path,
+                overwritten_move_content,
+                old_content: Some(original),
+                new_content: Some(new_content),
             })
         }
     }
+}
+
+fn render_applied_changes_unified_diff(changes: &[AppliedChange]) -> Option<String> {
+    let mut out = String::new();
+    for change in changes {
+        let left_path = change.display_old_path();
+        let right_path = change.display_new_path();
+        if let Some(diff) = render_unified_file_diff(
+            &left_path,
+            change.old_content.as_deref(),
+            &right_path,
+            change.new_content.as_deref(),
+        ) {
+            out.push_str(&diff);
+            if !out.ends_with('\n') {
+                out.push('\n');
+            }
+        }
+    }
+    (!out.is_empty()).then_some(out)
+}
+
+impl AppliedChange {
+    fn display_old_path(&self) -> String {
+        match self.kind {
+            "moved" => self.old_display_path.display().to_string(),
+            _ => self.display_path.display().to_string(),
+        }
+        .replace('\\', "/")
+    }
+
+    fn display_new_path(&self) -> String {
+        self.display_path.display().to_string().replace('\\', "/")
+    }
+}
+
+fn render_unified_file_diff(
+    left_path: &str,
+    left_content: Option<&str>,
+    right_path: &str,
+    right_content: Option<&str>,
+) -> Option<String> {
+    if left_content == right_content {
+        return None;
+    }
+    let left_oid = left_content.map_or_else(
+        || ZERO_OID.to_string(),
+        |content| git_blob_oid(content.as_bytes()),
+    );
+    let right_oid = right_content.map_or_else(
+        || ZERO_OID.to_string(),
+        |content| git_blob_oid(content.as_bytes()),
+    );
+    let mut diff = format!("diff --git a/{left_path} b/{right_path}\n");
+    match (left_content, right_content) {
+        (None, Some(_)) => diff.push_str(&format!("new file mode {REGULAR_FILE_MODE}\n")),
+        (Some(_), None) => diff.push_str(&format!("deleted file mode {REGULAR_FILE_MODE}\n")),
+        (Some(_), Some(_)) => {}
+        (None, None) => return None,
+    }
+    diff.push_str(&format!("index {left_oid}..{right_oid}\n"));
+    let old_header = if left_content.is_some() {
+        format!("a/{left_path}")
+    } else {
+        DEV_NULL.to_string()
+    };
+    let new_header = if right_content.is_some() {
+        format!("b/{right_path}")
+    } else {
+        DEV_NULL.to_string()
+    };
+    let unified =
+        similar::TextDiff::from_lines(left_content.unwrap_or(""), right_content.unwrap_or(""))
+            .unified_diff()
+            .context_radius(3)
+            .header(&old_header, &new_header)
+            .to_string();
+    diff.push_str(&unified);
+    Some(diff)
+}
+
+fn git_blob_oid(data: &[u8]) -> String {
+    let header = format!("blob {}\0", data.len());
+    let mut hasher = sha1::Sha1::new();
+    hasher.update(header.as_bytes());
+    hasher.update(data);
+    format!("{:x}", hasher.finalize())
 }
 
 fn patch_arg(arguments: &Value) -> Result<&str> {
@@ -1439,6 +1863,25 @@ mod tests {
         encoded.into_inner()
     }
 
+    fn noisy_png_bytes(width: u32, height: u32) -> Vec<u8> {
+        let image = ImageBuffer::from_fn(width, height, |x, y| {
+            let seed = x
+                .wrapping_mul(1_103_515_245)
+                .wrapping_add(y.wrapping_mul(12_345));
+            Rgba([
+                (seed & 0xff) as u8,
+                ((seed >> 8) & 0xff) as u8,
+                ((seed >> 16) & 0xff) as u8,
+                255,
+            ])
+        });
+        let mut encoded = Cursor::new(Vec::new());
+        DynamicImage::ImageRgba8(image)
+            .write_to(&mut encoded, ImageFormat::Png)
+            .expect("encode noisy png");
+        encoded.into_inner()
+    }
+
     #[test]
     fn read_file_returns_numbered_range() {
         let tmp = TempDir::new().expect("tmp");
@@ -1530,12 +1973,262 @@ mod tests {
             4
         );
         assert_eq!(finished.payload["committed_delta_exact"], true);
+        let patch_diff = finished.payload["unified_diff"]
+            .as_str()
+            .expect("patch unified diff");
+        assert!(patch_diff.contains("diff --git a/a.txt b/a.txt"));
+        assert!(patch_diff.contains("new file mode 100644"));
+        assert!(patch_diff.contains("diff --git a/update.txt b/update.txt"));
+        assert!(patch_diff.contains("-world"));
+        assert!(patch_diff.contains("+rust"));
+        assert!(patch_diff.contains("diff --git a/move.txt b/"));
+        assert!(patch_diff.contains("b.txt"));
+        assert!(patch_diff.contains("deleted file mode 100644"));
         let turn_diff = events
             .iter()
             .find(|event| event.event_type == "turn.diff")
             .expect("turn diff");
         assert_eq!(turn_diff.payload["source"], "apply_patch");
         assert_eq!(turn_diff.payload["changed_files"], 4);
+        assert_eq!(turn_diff.payload["cumulative"], true);
+        assert_eq!(turn_diff.payload["exact"], true);
+        let cumulative_diff = turn_diff.payload["unified_diff"]
+            .as_str()
+            .expect("turn diff");
+        assert_eq!(cumulative_diff.matches("diff --git").count(), 4);
+        assert!(cumulative_diff.contains("diff --git a/a.txt b/a.txt"));
+        assert!(cumulative_diff.contains("diff --git a/update.txt b/update.txt"));
+        assert!(cumulative_diff.contains("diff --git a/move.txt b/b.txt"));
+        assert!(cumulative_diff.contains("diff --git a/delete.txt b/delete.txt"));
+    }
+
+    #[test]
+    fn apply_patch_turn_diff_accumulates_net_patch_changes_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_add".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Add File: a.txt\n+foo\n*** End Patch"}),
+            },
+        )
+        .expect("add");
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_update".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Update File: a.txt\n@@\n foo\n+bar\n*** End Patch"}),
+            },
+        )
+        .expect("update");
+
+        assert_eq!(
+            fs::read_to_string(cwd.join("a.txt")).expect("read"),
+            "foo\nbar\n"
+        );
+        let events = store.events_for_session(&session.id).expect("events");
+        let turn_diffs = events
+            .iter()
+            .filter(|event| event.event_type == "turn.diff")
+            .collect::<Vec<_>>();
+        assert_eq!(turn_diffs.len(), 2);
+        let cumulative = turn_diffs.last().expect("last diff");
+        assert_eq!(cumulative.payload["source"], "apply_patch");
+        assert_eq!(cumulative.payload["cumulative"], true);
+        assert_eq!(cumulative.payload["exact"], true);
+        assert_eq!(cumulative.payload["changed_files"], 1);
+        let diff = cumulative.payload["unified_diff"].as_str().expect("diff");
+        assert_eq!(diff.matches("diff --git").count(), 1);
+        assert!(diff.contains("new file mode 100644"));
+        assert!(diff.contains("+foo"));
+        assert!(diff.contains("+bar"));
+    }
+
+    #[test]
+    fn apply_patch_turn_diff_clears_when_net_diff_returns_to_baseline() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_add".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Add File: temp.txt\n+gone\n*** End Patch"}),
+            },
+        )
+        .expect("add");
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_delete".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Delete File: temp.txt\n*** End Patch"}),
+            },
+        )
+        .expect("delete");
+
+        let events = store.events_for_session(&session.id).expect("events");
+        let cumulative = events
+            .iter()
+            .filter(|event| event.event_type == "turn.diff")
+            .next_back()
+            .expect("last diff");
+        assert_eq!(cumulative.payload["source"], "apply_patch");
+        assert_eq!(cumulative.payload["cumulative"], true);
+        assert_eq!(cumulative.payload["changed_files"], 0);
+        assert_eq!(cumulative.payload["unified_diff"], "");
+    }
+
+    #[test]
+    fn apply_patch_turn_diff_reset_starts_a_new_codex_style_turn() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+
+        reset_turn_diff_tracker_for_session(&session.id, cwd);
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_add".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Add File: turn.txt\n+first\n*** End Patch"}),
+            },
+        )
+        .expect("add");
+
+        reset_turn_diff_tracker_for_session(&session.id, cwd);
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_delete".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Delete File: turn.txt\n*** End Patch"}),
+            },
+        )
+        .expect("delete");
+
+        let events = store.events_for_session(&session.id).expect("events");
+        let cumulative = events
+            .iter()
+            .filter(|event| event.event_type == "turn.diff")
+            .next_back()
+            .expect("last diff");
+        assert_eq!(cumulative.payload["source"], "apply_patch");
+        assert_eq!(cumulative.payload["changed_files"], 1);
+        let diff = cumulative.payload["unified_diff"].as_str().expect("diff");
+        assert!(diff.contains("diff --git a/turn.txt b/turn.txt"));
+        assert!(diff.contains("deleted file mode 100644"));
+        assert!(diff.contains("-first"));
+    }
+
+    #[test]
+    fn apply_patch_turn_diff_uses_configured_display_root() {
+        let tmp = TempDir::new().expect("tmp");
+        let store = Store::open(tmp.path().join("state")).expect("store");
+        let repo = tmp.path().join("repo");
+        let cwd = repo.join("sub");
+        fs::create_dir_all(&cwd).expect("cwd");
+        let session = store.create_session(None, &cwd).expect("session");
+
+        reset_turn_diff_tracker_for_session(&session.id, &repo);
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_add".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Add File: file.txt\n+rooted\n*** End Patch"}),
+            },
+        )
+        .expect("add");
+
+        let events = store.events_for_session(&session.id).expect("events");
+        let cumulative = events
+            .iter()
+            .find(|event| event.event_type == "turn.diff")
+            .expect("turn diff");
+        let diff = cumulative.payload["unified_diff"].as_str().expect("diff");
+        assert!(diff.contains("diff --git a/sub/file.txt b/sub/file.txt"));
+    }
+
+    #[test]
+    fn apply_patch_turn_diff_handles_delete_readd_and_move_overwrite_edges() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let cwd = Path::new(&session.cwd);
+        fs::write(cwd.join("cycle.txt"), "before\n").expect("cycle");
+        fs::write(cwd.join("from.txt"), "source\n").expect("from");
+        fs::write(cwd.join("to.txt"), "dest\n").expect("to");
+
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_delete".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Delete File: cycle.txt\n*** End Patch"}),
+            },
+        )
+        .expect("delete");
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_readd".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Add File: cycle.txt\n+after\n*** End Patch"}),
+            },
+        )
+        .expect("readd");
+        apply_patch_tool(
+            &store,
+            &session,
+            &ToolCall {
+                id: "patch_move".to_string(),
+                name: "apply_patch".to_string(),
+                namespace: None,
+                arguments: json!({"patch": "*** Begin Patch\n*** Update File: from.txt\n*** Move to: to.txt\n@@\n-source\n+moved\n*** End Patch"}),
+            },
+        )
+        .expect("move");
+
+        let events = store.events_for_session(&session.id).expect("events");
+        let cumulative = events
+            .iter()
+            .filter(|event| event.event_type == "turn.diff")
+            .next_back()
+            .expect("last diff");
+        assert_eq!(cumulative.payload["changed_files"], 3);
+        let diff = cumulative.payload["unified_diff"].as_str().expect("diff");
+        assert!(diff.contains("diff --git a/cycle.txt b/cycle.txt"));
+        assert!(diff.contains("-before"));
+        assert!(diff.contains("+after"));
+        assert!(diff.contains("diff --git a/from.txt b/from.txt"));
+        assert!(diff.contains("deleted file mode 100644"));
+        assert!(diff.contains("diff --git a/to.txt b/to.txt"));
+        assert!(diff.contains("-dest"));
+        assert!(diff.contains("+moved"));
     }
 
     #[test]
@@ -2145,6 +2838,42 @@ EOF
             .expect("tool image event");
         assert_eq!(image_event.payload["image"]["width"], 2048);
         assert_eq!(image_event.payload["image"]["height"], 768);
+    }
+
+    #[test]
+    fn view_image_resizes_before_enforcing_inline_limit_like_codex() {
+        let tmp = TempDir::new().expect("tmp");
+        let (store, session) = test_session(&tmp);
+        let path = Path::new(&session.cwd).join("large-raw.png");
+        let bytes = noisy_png_bytes(2600, 2600);
+        assert!(
+            bytes.len() > MAX_INLINE_LOCAL_IMAGE_BYTES,
+            "test fixture should exceed raw inline limit; got {}",
+            bytes.len()
+        );
+        fs::write(&path, bytes).expect("write png");
+
+        let result = view_image(
+            &store,
+            &session,
+            &ToolCall {
+                id: "image_1".to_string(),
+                name: "view_image".to_string(),
+                namespace: None,
+                arguments: json!({"path": "large-raw.png", "detail": "high"}),
+            },
+            true,
+        )
+        .expect("large raw image should resize before limit check");
+
+        let image_url = result.content[0]["image_url"].as_str().expect("image url");
+        let (_, encoded) = image_url.split_once(',').expect("data url");
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(encoded)
+            .expect("decode image");
+        assert!(decoded.len() <= MAX_INLINE_LOCAL_IMAGE_BYTES);
+        let resized = image::load_from_memory(&decoded).expect("load resized");
+        assert_eq!(resized.dimensions(), (2048, 2048));
     }
 
     #[test]
