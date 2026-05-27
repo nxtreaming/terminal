@@ -1915,6 +1915,37 @@ The biggest remaining categories are:
   exact cumulative turn-diff tracking, deeper compaction/token lifecycle
   precision, persistent MCP/session lifecycle, richer skill/plugin/review
   manager depth, and multi-environment tool routing.
+- The current turn-diff slice closes a concrete part of Codex's
+  `TurnDiffTracker` behavior. The file-tool runtime now keeps an in-memory
+  turn-scoped tracker for committed `apply_patch` changes, reset at the start of
+  each model turn and rooted at the git worktree root when available.
+  `turn.diff` events from patches are cumulative and exact when the committed
+  deltas are exact: add-then-update is rendered as one add, delete-then-readd
+  becomes one update, add-then-delete clears the diff with an empty cumulative
+  event, and move-overwrite captures both the source delete and destination
+  update. Once an exact cumulative patch diff has been emitted for the turn, the
+  broader git-worktree fallback no longer appends a competing `turn.diff`;
+  shell/worktree snapshots still remain the fallback for non-`apply_patch`
+  mutations.
+- Focused verification for this slice passed `cargo test -p browser-use-core
+  apply_patch` and `cargo test -p browser-use-core turn_git_diff`, including
+  regressions for per-turn reset, git-root display paths, net-empty patch diffs,
+  and tracked-file git-fallback suppression. Full workspace verification also
+  passed (`cargo fmt --check`, `git diff --check`, Python tests, and
+  `cargo test`). The live Codex-auth smoke used root session `db6bce744f5a` and
+  child session `3909b3887310`; the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke-turndiff-final.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad read-only child audits after final verification completed in two
+  waves and were closed. They did not find a bounded regression in the
+  cumulative turn-diff slice. Their consensus remaining gaps are the larger
+  provider-neutral runtime systems: dynamic MCP/app/plugin/extension tool
+  contributors and persistent MCP sessions, stream-integrated cancellable tool
+  futures with read/write gates, first-class active-turn
+  `InputQueue`/`TurnState`/`AgentControl`, typed rollout/history/fork
+  reconstruction, token-window/compaction precision, goal runtime state depth,
+  structured review/user-shell surfaces, hook trust/handler breadth,
+  skill/plugin manager side effects, and multi-environment tool routing.
 
 ## Definition of Done
 
