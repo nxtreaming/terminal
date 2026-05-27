@@ -5209,7 +5209,11 @@ fn maybe_emit_native_live_stream(
     if emit_count <= already {
         return Ok(());
     }
-    insert_native_lines(terminal, lines[already..emit_count].to_vec())?;
+    let mut emitted_lines = lines[already..emit_count].to_vec();
+    if already == 0 {
+        emitted_lines.insert(0, Line::from(""));
+    }
+    insert_native_lines(terminal, emitted_lines)?;
     let emitted_text_lines = plain_text_lines(&lines[..emit_count]);
     app.native_history.set_live_stream_emitted_lines(
         &model.session_id,
@@ -8351,7 +8355,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn active_streaming_viewport_stays_stable_while_message_grows() -> Result<()> {
+    fn active_streaming_viewport_moves_separator_to_native_scrollback() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -8396,7 +8400,7 @@ wire_api = "responses"
 
         let grown_desired =
             desired_terminal_viewport_height_for(&mut app, terminal_width, terminal_height)?;
-        assert_eq!(grown_desired, initial_desired);
+        assert_eq!(grown_desired.saturating_add(1), initial_desired);
         Ok(())
     }
 
@@ -8616,6 +8620,27 @@ wire_api = "responses"
                 "• warning",
                 "  └ Model `gpt-5.5` is not in the active model catalog.",
                 "ready to work on the repo.",
+            ]
+        );
+    }
+
+    #[test]
+    fn live_stream_prefix_preserves_separator_before_remaining_tail() {
+        let lines = vec![
+            Line::from(""),
+            Line::from("I'll inspect the repo structure and key docs/config first, then"),
+            Line::from("summarize what it appears to be and how it's organized."),
+        ];
+        let prefix =
+            vec!["I'll inspect the repo structure and key docs/config first, then".to_string()];
+
+        let stripped = plain_text_lines(&strip_live_stream_prefix(lines, &prefix));
+
+        assert_eq!(
+            stripped,
+            vec![
+                "",
+                "summarize what it appears to be and how it's organized.",
             ]
         );
     }
@@ -9573,7 +9598,7 @@ wire_api = "responses"
         app.drain_store_notifications()?;
 
         let measured = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
-        assert_eq!(measured, docked.saturating_add(1));
+        assert_eq!(measured, docked);
         app.args.width = 80;
         app.args.height = measured;
         let screen = render_dump(&mut app)?;
@@ -9644,7 +9669,7 @@ wire_api = "responses"
         app.drain_store_notifications()?;
 
         let grown = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
-        assert_eq!(grown, initial);
+        assert_eq!(grown.saturating_add(1), initial);
         app.args.width = 100;
         app.args.height = grown;
         let screen = render_dump(&mut app)?;

@@ -522,7 +522,8 @@ pub(crate) fn active_viewport_lines_with_stream_skip(
         Some(&mut skip),
         false,
     );
-    if active.needs_leading_status_padding() && !lines.is_empty() {
+    let consumed_stream_lines = stream_skip_lines > skip;
+    if active.needs_leading_status_padding() && !lines.is_empty() && !consumed_stream_lines {
         lines.insert(0, Line::from(""));
     }
     if lines.len() > height as usize {
@@ -3191,7 +3192,7 @@ mod tests {
     }
 
     #[test]
-    fn active_streaming_reserves_leading_separator_without_committing_partial_line() {
+    fn active_streaming_moves_separator_with_emitted_prefix() {
         fn model_for(markdown: &str) -> TranscriptModel {
             TranscriptModel {
                 session_id: "session".to_string(),
@@ -3228,9 +3229,7 @@ mod tests {
         let second_viewport =
             active_viewport_lines_with_stream_skip(Some(&second), 80, 100, emitted_lines);
 
-        assert_eq!(line_text(&second_viewport[0]), "");
-        assert_eq!(line_text(&second_viewport[1]), "Send me the command.");
-        assert_eq!(first_viewport.len(), second_viewport.len());
+        assert_eq!(line_text(&second_viewport[0]), "Send me the command.");
     }
 
     #[test]
