@@ -69,11 +69,6 @@ enum TranscriptKind {
         status: String,
         detail: Option<String>,
     },
-    // Streaming output hides the heartbeat text, but still owns its row so the
-    // inline terminal does not resize when status/tool activity resumes.
-    StatusReserve {
-        line_count: usize,
-    },
     Assistant {
         markdown: String,
         source: Option<String>,
@@ -141,10 +136,6 @@ impl TranscriptNode {
             TranscriptKind::PendingStatus { status, detail } => {
                 pending_status_lines(status, detail.as_deref(), ShimmerMode::Static)
             }
-            TranscriptKind::StatusReserve { line_count } => match mode {
-                DisplayMode::Active => blank_lines(*line_count),
-                DisplayMode::Scrollback => Vec::new(),
-            },
             TranscriptKind::Assistant { markdown, source } => {
                 let mut lines = markdown_cell_lines(markdown, width, mode);
                 if let Some(source) = source.as_deref() {
@@ -153,11 +144,7 @@ impl TranscriptNode {
                 lines
             }
             TranscriptKind::StreamingAssistant { markdown } => {
-                let mut lines = markdown_cell_lines(markdown, width, mode);
-                if mode == DisplayMode::Active {
-                    reserve_streaming_tail_line(&mut lines);
-                }
-                lines
+                markdown_cell_lines(markdown, width, mode)
             }
             TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
             TranscriptKind::RequestUserInput { request, state } => {
@@ -209,7 +196,6 @@ impl TranscriptNode {
             TranscriptKind::PendingStatus { status, detail } => {
                 vec![pending_status_text(status, detail.as_deref())]
             }
-            TranscriptKind::StatusReserve { .. } => Vec::new(),
             TranscriptKind::Assistant { markdown, source } => {
                 let mut out = markdown.lines().map(str::to_string).collect::<Vec<_>>();
                 if let Some(source) = source.as_ref() {
@@ -293,7 +279,6 @@ impl TranscriptNode {
             TranscriptKind::Stack { nodes } => nodes
                 .iter()
                 .all(TranscriptNode::is_active_viewport_placeholder),
-            TranscriptKind::StatusReserve { .. } => true,
             _ => false,
         }
     }
@@ -311,6 +296,7 @@ impl TranscriptNode {
     fn needs_leading_status_padding(&self) -> bool {
         match &self.kind {
             TranscriptKind::PendingStatus { .. } => true,
+            TranscriptKind::StreamingAssistant { .. } => true,
             TranscriptKind::Stack { nodes } => nodes
                 .iter()
                 .find(|node| !node.is_active_viewport_placeholder())
@@ -368,7 +354,6 @@ impl TranscriptNode {
                 detail.as_deref(),
                 ShimmerMode::AnimatedAt(shimmer_phase),
             ),
-            TranscriptKind::StatusReserve { line_count } => blank_lines(*line_count),
             TranscriptKind::ActiveStatus {
                 group,
                 lines,
@@ -388,7 +373,6 @@ impl TranscriptNode {
                         lines = lines.into_iter().skip(skip).collect();
                     }
                 }
-                reserve_streaming_tail_line(&mut lines);
                 lines
             }
             TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
@@ -623,8 +607,6 @@ pub(crate) fn gap_before_active(model: &TranscriptModel) -> usize {
 fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize {
     match (previous, next) {
         (_, TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. }) => 1,
-        (_, TranscriptKind::StatusReserve { .. }) => 0,
-        (TranscriptKind::StatusReserve { .. }, _) => 0,
         (
             TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. },
             TranscriptKind::Timeline { .. } | TranscriptKind::ActiveStatus { .. },
@@ -1157,9 +1139,6 @@ fn active_node_for_session(
                 kind: TranscriptKind::ProposedPlan { markdown: plan },
             });
         }
-        if !active_nodes.is_empty() {
-            active_nodes.push(active_status_reserve_node(root, events));
-        }
     }
 
     if let Some(request) = app.pending_request_user_input(&root.id) {
@@ -1544,22 +1523,6 @@ fn pending_status_node(
     }
 }
 
-fn active_status_reserve_node(root: &SessionMeta, events: &[EventRecord]) -> TranscriptNode {
-    let seq = events.last().map(|event| event.seq).unwrap_or_default();
-    TranscriptNode {
-        id: format!("{}:active-status-reserve", root.id),
-        seq,
-        revision: seq.max(0) as u64,
-        kind: TranscriptKind::StatusReserve { line_count: 1 },
-    }
-}
-
-fn blank_lines(count: usize) -> Vec<Line<'static>> {
-    std::iter::repeat_with(|| Line::from(""))
-        .take(count)
-        .collect()
-}
-
 fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
     let name = payload_string(event, "name").unwrap_or_else(|| "tool".to_string());
     if is_subagent_management_tool(&name) || name == "request_user_input" {
@@ -1939,19 +1902,6 @@ fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Lin
         lines.push(Line::from(""));
     }
     lines
-}
-
-fn reserve_streaming_tail_line(lines: &mut Vec<Line<'static>>) {
-    if lines.last().is_none_or(line_is_blank) {
-        return;
-    }
-    lines.push(Line::from(""));
-}
-
-fn line_is_blank(line: &Line<'_>) -> bool {
-    line.spans
-        .iter()
-        .all(|span| span.content.as_ref().trim().is_empty())
 }
 
 fn proposed_plan_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
@@ -3238,11 +3188,10 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "> whats up");
         assert_eq!(line_text(&lines[1]), "");
         assert_eq!(line_text(&lines[2]), "Not much. I'm ready to work.");
-        assert_eq!(line_text(&lines[3]), "");
     }
 
     #[test]
-    fn active_streaming_reserves_tail_without_committing_partial_line() {
+    fn active_streaming_reserves_leading_separator_without_committing_partial_line() {
         fn model_for(markdown: &str) -> TranscriptModel {
             TranscriptModel {
                 session_id: "session".to_string(),
@@ -3267,11 +3216,11 @@ mod tests {
         assert_eq!(first_native_stream.len(), 1);
 
         let first_viewport = active_viewport_lines_with_stream_skip(Some(&first), 80, 100, 0);
+        assert_eq!(line_text(&first_viewport[0]), "");
         assert_eq!(
-            line_text(&first_viewport[0]),
+            line_text(&first_viewport[1]),
             "Not much. I'm ready to work."
         );
-        assert_eq!(line_text(&first_viewport[1]), "");
 
         let second = model_for("Not much. I'm ready to work.\n\nSend me the command.");
         let second_native_stream = active_streaming_lines(Some(&second), 80);
@@ -3279,8 +3228,8 @@ mod tests {
         let second_viewport =
             active_viewport_lines_with_stream_skip(Some(&second), 80, 100, emitted_lines);
 
-        assert_eq!(line_text(&second_viewport[0]), "Send me the command.");
-        assert_eq!(line_text(&second_viewport[1]), "");
+        assert_eq!(line_text(&second_viewport[0]), "");
+        assert_eq!(line_text(&second_viewport[1]), "Send me the command.");
         assert_eq!(first_viewport.len(), second_viewport.len());
     }
 
