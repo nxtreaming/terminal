@@ -1985,6 +1985,43 @@ The biggest remaining categories are:
   repeated next implementation order was persistent stdio MCP manager, dynamic
   tool contributor planning, active-turn/tool cancellation runtime, then typed
   history reconstruction.
+- The current MCP session slice closes the persistent-stdio part of that gap.
+  Local MCP discovery, tool calls, resource listing, resource templates, and
+  resource reads now reuse an initialized stdio server process keyed by the
+  session id plus stable server config, matching Codex's managed-client behavior
+  for stateful MCP servers without sharing state across unrelated sessions. The
+  first broad audit wave caught the initial process-global cache risk, so the
+  patch now routes normal agent MCP calls through session-scoped helpers and
+  folds MCP shutdown into the same session/subtree/process cleanup path used for
+  background terminal sessions. Operations are serialized per server, request
+  ids keep increasing across calls, newest stderr is still attached to failures,
+  and timeouts or transport failures drop the cached session. Focused MCP tests
+  include a stateful Python server whose counter must advance from `count:1` to
+  `count:2` in one session, start at `count:1` in another session, and reset to
+  `count:1` after explicit cleanup. Remaining MCP work is streamable
+  HTTP/OAuth/elicitation, app/plugin connector lifecycle, richer startup status
+  events, retry-on-fresh-transport nuances, same-server parallel throughput, and
+  the broader dynamic tool contributor graph.
+- Full verification passed after the session-scoped MCP slice. The terminal
+  verifier ran formatting, the full Rust workspace, Python tests, deterministic
+  UI dumps, and the real tmux terminal smoke; `/tmp/but-design-loop` was
+  inspected and scans found no ANSI escape or bracketed-paste marker leaks. A
+  final live Codex-auth smoke used root session `1b346f802c2e`, which returned
+  `Paris`, and child session `89442bdb6ff2`, which read `AGENTS.md` as
+  `Agent Notes`.
+- Ten broad read-only child audits completed after the MCP work. The first wave
+  found the initial process-global cache risk; that drove the session-scoping,
+  cleanup, newest-stderr, and stale-transport recovery fixes. The final wave
+  agreed persistent stdio MCP is now a useful local parity improvement, while
+  the remaining MCP deltas are lifecycle depth, same-server parallel throughput,
+  HTTP/OAuth/elicitation, startup/status/provenance, and app/plugin connector
+  integration.
+- The repeated next high-impact gaps are not MCP-specific: per-turn dynamic
+  tool contributor/router planning, a unified cancellable tool runtime with
+  read/write gates and abort outputs, first-class active-turn
+  `InputQueue`/`TurnState`/`AgentControl`, typed response-item/context history
+  for replay/fork/resume/compaction, and deeper local compaction/token-window
+  precision.
 
 ## Definition of Done
 

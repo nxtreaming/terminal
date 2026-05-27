@@ -11,7 +11,7 @@ use anyhow::{bail, Context, Result};
 use browser_use_core::{
     append_user_shell_command_context_event, append_workspace_context_event,
     append_workspace_context_event_with_options, canonical_agent_path_from_task_name,
-    canonical_agent_reference, cleanup_unified_exec_commands_for_agent_subtree, collect_agent_tree,
+    canonical_agent_reference, cleanup_agent_runtime_state_for_agent_subtree, collect_agent_tree,
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
     display_agent_path_for_session, final_statuses_for_v1_wait, install_process_crypto_provider,
     last_task_message_for_agent, local_agent_status_value, model_catalog_for_cwd_with_options,
@@ -1559,7 +1559,7 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
 fn cancel(store: &Store, task_id: &str, reason: &str) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     store.request_cancel(task_id, reason)?;
-    cleanup_unified_exec_commands_for_agent_subtree(store, task_id)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, task_id)?;
     notify_parent_agent_done(store, &task)?;
     println!("cancelled {task_id}");
     Ok(())
@@ -2761,7 +2761,7 @@ fn close_agent(store: &Store, current_id: Option<&str>, target: &str, reason: &s
         .agent_summary_for_child(&child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
     let previous_status = local_agent_status_value(store, &child, Some(&summary))?;
-    cleanup_unified_exec_commands_for_agent_subtree(store, &child_id)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, &child_id)?;
     store.close_child_agent(&child_id, reason)?;
     store.append_event(
         &summary.parent_session_id,

@@ -4387,7 +4387,7 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
     let cancelled = is_cancelled(store, &session.id)?;
     let final_events = store.events_for_session(&session.id).unwrap_or_default();
     if cancelled {
-        let _ = cleanup_unified_exec_commands_for_agent_subtree(store, &session.id);
+        let _ = cleanup_agent_runtime_state_for_agent_subtree(store, &session.id);
         telemetry.record_agent_output(&agent_span, "cancelled");
     } else if let Err(error) = &result {
         let output = failure_from_events(&final_events).unwrap_or_else(|| format!("{error:#}"));
@@ -11902,7 +11902,10 @@ fn browser_tool_registry_for_session(
         model_overrides_description,
     );
     registry.register_mcp_resource_tools(config.mcp_servers.clone());
-    registry.register_mcp_tools(mcp::discover_tool_definitions(&config.mcp_servers)?);
+    registry.register_mcp_tools(mcp::discover_tool_definitions_for_session(
+        &session.id,
+        &config.mcp_servers,
+    )?);
     Ok(registry)
 }
 
@@ -13123,7 +13126,7 @@ fn dispatch_mcp_tool(
         }),
     )?;
     let started = Instant::now();
-    let result = mcp::call_tool(&definition, &call.arguments)?;
+    let result = mcp::call_tool_for_session(&session.id, &definition, &call.arguments)?;
     let wall_time = started.elapsed();
     let is_error = result
         .get("isError")
@@ -13251,16 +13254,22 @@ fn dispatch_list_mcp_resource_kind_tool(
             .mcp_server(&server_name)
             .with_context(|| format!("unknown MCP server `{server_name}`"))?;
         let result = match kind {
-            McpResourceListTool::Resources => mcp::list_resources(&server, cursor.as_deref())?,
+            McpResourceListTool::Resources => {
+                mcp::list_resources_for_session(&session.id, &server, cursor.as_deref())?
+            }
             McpResourceListTool::Templates => {
-                mcp::list_resource_templates(&server, cursor.as_deref())?
+                mcp::list_resource_templates_for_session(&session.id, &server, cursor.as_deref())?
             }
         };
         list_mcp_resource_payload_for_server(kind, &server_name, result)
     } else {
         let by_server = match kind {
-            McpResourceListTool::Resources => mcp::list_all_resources(&servers),
-            McpResourceListTool::Templates => mcp::list_all_resource_templates(&servers),
+            McpResourceListTool::Resources => {
+                mcp::list_all_resources_for_session(&session.id, &servers)
+            }
+            McpResourceListTool::Templates => {
+                mcp::list_all_resource_templates_for_session(&session.id, &servers)
+            }
         };
         list_mcp_resource_payload_for_all(kind, by_server)
     };
@@ -13299,7 +13308,7 @@ fn dispatch_read_mcp_resource_tool(
         .with_context(|| format!("unknown MCP server `{server_name}`"))?;
     append_mcp_resource_tool_started(store, session, call, Some(&server_name))?;
     let started = Instant::now();
-    let result = mcp::read_resource(&server, &uri)?;
+    let result = mcp::read_resource_for_session(&session.id, &server, &uri)?;
     let payload = read_mcp_resource_payload(&server_name, &uri, result);
     append_mcp_resource_tool_finished(
         store,
@@ -21515,7 +21524,7 @@ fn close_direct_active_child_subtrees(store: &Store, session_id: &str) -> Result
             .load_session(&agent.child_session_id)?
             .is_some_and(|session| session.status.is_active());
         if child_is_active || !subtree_active.is_empty() {
-            cleanup_unified_exec_commands_for_agent_subtree(store, &agent.child_session_id)?;
+            cleanup_agent_runtime_state_for_agent_subtree(store, &agent.child_session_id)?;
             store.close_child_agent(&agent.child_session_id, "parent finished task")?;
             store.append_event(
                 session_id,
@@ -23685,6 +23694,11 @@ pub fn cleanup_unified_exec_commands_for_session(session_id: &str) -> usize {
     tools::command::cleanup_session_commands(session_id)
 }
 
+pub fn cleanup_agent_runtime_state_for_session(session_id: &str) -> usize {
+    cleanup_unified_exec_commands_for_session(session_id)
+        + mcp::cleanup_mcp_connections_for_session(session_id)
+}
+
 pub fn cleanup_unified_exec_commands_for_agent_subtree(
     store: &Store,
     root_session_id: &str,
@@ -23697,8 +23711,24 @@ pub fn cleanup_unified_exec_commands_for_agent_subtree(
         .sum())
 }
 
+pub fn cleanup_agent_runtime_state_for_agent_subtree(
+    store: &Store,
+    root_session_id: &str,
+) -> Result<usize> {
+    let mut session_ids = Vec::new();
+    collect_agent_subtree_session_ids(store, root_session_id, &mut session_ids)?;
+    Ok(session_ids
+        .iter()
+        .map(|session_id| cleanup_agent_runtime_state_for_session(session_id))
+        .sum())
+}
+
 pub fn cleanup_all_unified_exec_commands() -> usize {
     tools::command::cleanup_all_commands()
+}
+
+pub fn cleanup_all_agent_runtime_state() -> usize {
+    cleanup_all_unified_exec_commands() + mcp::cleanup_all_mcp_connections()
 }
 
 #[derive(Debug, Default)]
@@ -23712,7 +23742,7 @@ impl UnifiedExecShutdownCleanup {
 
 impl Drop for UnifiedExecShutdownCleanup {
     fn drop(&mut self) {
-        cleanup_all_unified_exec_commands();
+        cleanup_all_agent_runtime_state();
     }
 }
 
@@ -24578,7 +24608,7 @@ fn dispatch_close_agent_tool(
         .load_session(&child_session_id)?
         .with_context(|| format!("unknown child session id: {child_session_id}"))?;
     let previous_status = local_agent_status_value(store, &child, target_agent.summary.as_ref())?;
-    cleanup_unified_exec_commands_for_agent_subtree(store, &child_session_id)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, &child_session_id)?;
     store.close_child_agent(&child_session_id, "closed by parent agent")?;
     store.append_event(
         &session.id,
@@ -24661,7 +24691,7 @@ fn dispatch_close_agent_v1_tool(
         }),
     )?;
     let previous_status = local_agent_status_value(store, &child, agent_summary.as_ref())?;
-    cleanup_unified_exec_commands_for_agent_subtree(store, child_session_id)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, child_session_id)?;
     store.close_child_agent(child_session_id, "closed by parent agent")?;
     store.append_event(
         &session.id,

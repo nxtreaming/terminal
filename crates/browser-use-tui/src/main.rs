@@ -15,7 +15,7 @@ use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 use browser_use_core::{
-    cleanup_unified_exec_commands_for_agent_subtree, configured_model_for_cwd_with_options,
+    cleanup_agent_runtime_state_for_agent_subtree, configured_model_for_cwd_with_options,
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
     install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
     product_analytics, typed_user_input_payload_from_text_for_cwd, AgentRunOptions,
@@ -2686,7 +2686,7 @@ impl App {
             return Ok(false);
         }
         self.store.request_cancel(&id, "stopped from terminal")?;
-        cleanup_unified_exec_commands_for_agent_subtree(&self.store, &id)?;
+        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id)?;
         Ok(true)
     }
 
