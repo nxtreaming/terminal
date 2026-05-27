@@ -770,11 +770,25 @@ def http_get(url, headers=None, timeout=20.0, binary=None):
             from fetch_use import fetch_sync
 
             response = fetch_sync(url, headers=headers, timeout_ms=int(float(timeout) * 1000))
+            status_code = getattr(response, "status_code", getattr(response, "status", None))
+            response_headers = dict(getattr(response, "headers", {}) or {})
+            response_url = getattr(response, "url", url)
+            if binary is True:
+                data = getattr(response, "content", None)
+                if data is None:
+                    data = getattr(response, "body", None)
+                if data is None:
+                    data = getattr(response, "text", "").encode("utf-8", errors="replace")
+                elif isinstance(data, str):
+                    data = data.encode("utf-8", errors="replace")
+                else:
+                    data = bytes(data)
+                return _HttpGetBytes(data, status_code, response_headers, response_url)
             return _HttpGetText(
                 response.text,
-                getattr(response, "status_code", getattr(response, "status", None)),
-                dict(getattr(response, "headers", {}) or {}),
-                getattr(response, "url", url),
+                status_code,
+                response_headers,
+                response_url,
             )
         except ImportError:
             pass

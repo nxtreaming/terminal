@@ -5052,6 +5052,14 @@ class FakeFetchModule:
     def fetch_sync(url, headers=None, timeout_ms=None):
         assert headers == {"X": "1"}
         assert timeout_ms == 1234
+        if url.endswith("/binary"):
+            return types.SimpleNamespace(
+                text="",
+                content=bytes([0, 159, 255]),
+                status_code=202,
+                headers={"x-proxy": "yes"},
+                url=url,
+            )
         return types.SimpleNamespace(text="proxied", status_code=202, headers={"x-proxy": "yes"}, url=url)
 
 sys.modules["fetch_use"] = FakeFetchModule
@@ -5060,6 +5068,10 @@ proxied = http_get("https://example.test/data", headers={"X": "1"}, timeout=1.23
 assert proxied == "proxied"
 assert proxied.status_code == 202
 assert proxied.headers["x-proxy"] == "yes"
+proxied_binary = http_get("https://example.test/binary", headers={"X": "1"}, timeout=1.234, binary=True)
+assert proxied_binary == bytes([0, 159, 255])
+assert proxied_binary.status_code == 202
+assert proxied_binary.content == bytes([0, 159, 255])
 print("http_get parity ok")
 "#,
             10,

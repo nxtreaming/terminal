@@ -90,7 +90,7 @@ pub(crate) fn load_for_prompt_bytes(
 fn can_preserve_source_bytes(format: ImageFormat) -> bool {
     matches!(
         format,
-        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::WebP
+        ImageFormat::Png | ImageFormat::Jpeg | ImageFormat::Gif | ImageFormat::WebP
     )
 }
 
@@ -207,6 +207,24 @@ mod tests {
 
         assert_eq!(processed.width, 4096);
         assert_eq!(processed.height, 2048);
+        assert_eq!(processed.bytes, original);
+    }
+
+    #[test]
+    fn original_mode_preserves_gif_bytes() {
+        let image = ImageBuffer::from_pixel(32, 16, Rgba([80, 120, 200, 255]));
+        let original = image_bytes(&image, ImageFormat::Gif);
+
+        let processed = load_for_prompt_bytes(
+            Path::new("animated.gif"),
+            original.clone(),
+            PromptImageMode::Original,
+        )
+        .expect("process");
+
+        assert_eq!(processed.width, 32);
+        assert_eq!(processed.height, 16);
+        assert_eq!(processed.mime, "image/gif");
         assert_eq!(processed.bytes, original);
     }
 }

@@ -4418,6 +4418,7 @@ fn usage_summary_from_manifest(manifest: &Value) -> Value {
             "input_cached_tokens",
             "input_cache_creation_tokens",
             "output_tokens",
+            "reasoning_output_tokens",
             "total_tokens",
             "invocation_count",
         ] {
@@ -4457,6 +4458,7 @@ fn empty_usage_summary() -> Value {
         "input_cached_tokens": 0,
         "input_cache_creation_tokens": 0,
         "output_tokens": 0,
+        "reasoning_output_tokens": 0,
         "total_tokens": 0,
         "input_cost_usd": 0.0,
         "input_cached_cost_usd": 0.0,
@@ -4668,6 +4670,40 @@ mod tests {
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    #[test]
+    fn dataset_manifest_usage_summary_aggregates_reasoning_tokens() {
+        let manifest = serde_json::json!({
+            "sessions": [
+                {
+                    "usage": {
+                        "input_tokens": 10,
+                        "output_tokens": 20,
+                        "reasoning_output_tokens": 7,
+                        "total_tokens": 37,
+                        "invocation_count": 1,
+                    }
+                },
+                {
+                    "usage": {
+                        "input_tokens": 3,
+                        "output_tokens": 4,
+                        "reasoning_output_tokens": 5,
+                        "total_tokens": 12,
+                        "invocation_count": 2,
+                    }
+                }
+            ]
+        });
+
+        let usage = usage_summary_from_manifest(&manifest);
+
+        assert_eq!(usage["input_tokens"], 13);
+        assert_eq!(usage["output_tokens"], 24);
+        assert_eq!(usage["reasoning_output_tokens"], 12);
+        assert_eq!(usage["total_tokens"], 49);
+        assert_eq!(usage["invocation_count"], 3);
     }
 
     #[test]
