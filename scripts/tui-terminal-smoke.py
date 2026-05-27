@@ -986,6 +986,24 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             if first_line == "> yo":
                 raise AssertionError("submitted follow-up should not become the visible top anchor\n\n" + live_visible)
 
+        append_store_event(
+            state_dir,
+            session_id,
+            "file.read",
+            {"path": "Cargo.toml"},
+        )
+        wait_for(session, "read Cargo.toml", "prompt-only-followup-deferred-read")
+        deferred_read_visible = capture_after_idle(
+            session,
+            "prompt-only-followup-deferred-read-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            deferred_read_visible,
+            "read Cargo.toml",
+            "follow-up activity should show as the active tail before streaming starts",
+        )
+
         streaming_text = (
             "I'll inspect the repo structure and key docs/config first, then\n"
             "summarize what it appears to be and how it's organized."
@@ -1002,6 +1020,11 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "prompt-only-followup-streaming-visible",
             visible_only=True,
         )
+        streaming_full = capture_after_idle(
+            session,
+            "prompt-only-followup-streaming-full",
+            visible_only=False,
+        )
         assert_contains(
             streaming_visible,
             "> yo",
@@ -1016,6 +1039,16 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             streaming_visible,
             "summarize what it appears to be and how it's organized.",
             "streaming follow-up should keep the active tail visible",
+        )
+        assert_contains(
+            streaming_visible,
+            "read Cargo.toml",
+            "streaming follow-up should keep the previous activity tail visible",
+        )
+        assert_contains(
+            streaming_full,
+            "read Cargo.toml",
+            "streaming follow-up should flush the previous activity tail into native scrollback",
         )
         assert_line_directly_followed_by(
             streaming_visible,

@@ -1298,8 +1298,10 @@ fn active_timeline_tail_node(
     root: &SessionMeta,
     live_events: &[EventRecord],
 ) -> Option<TranscriptNode> {
+    let after_seq = app.native_history.last_seq;
     let nodes = live_events
         .iter()
+        .filter(|event| event.seq > after_seq)
         .filter_map(|event| committed_node_for_event(app, state, root, live_events, event))
         .filter(|node| !node.is_terminal_scrollback_transient())
         .collect::<Vec<_>>();

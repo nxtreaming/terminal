@@ -5146,13 +5146,15 @@ fn maybe_emit_native_transcript(
     };
     debug_assert_eq!(model.session_id, session_id);
     let _model_revision = model.revision;
-    let defer_pending_prompt = session.status.is_active();
+    let has_live_streaming_output =
+        !transcript::active_streaming_lines(Some(&model), width).is_empty();
+    let defer_open_tail = session.status.is_active() && !has_live_streaming_output;
 
     if !app.native_history.is_active_for(Some(&session_id)) {
         // No session header card — the transcript starts straight with
         // the conversation content.
         let emission =
-            transcript::terminal_scrollback_emission_since(&model, 0, width, defer_pending_prompt);
+            transcript::terminal_scrollback_emission_since(&model, 0, width, defer_open_tail);
         if !emission.lines.is_empty() {
             insert_initial_native_lines(terminal, emission.lines)?;
         }
@@ -5172,7 +5174,7 @@ fn maybe_emit_native_transcript(
             &model,
             after_seq,
             width,
-            defer_pending_prompt,
+            defer_open_tail,
         );
         if let Some(prefix) = live_stream_prefix.as_deref() {
             emission.lines = strip_live_stream_prefix(emission.lines, prefix);
@@ -9949,6 +9951,129 @@ wire_api = "responses"
             lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
         assert!(active_text.contains("git status --short"), "{active_text}");
         assert!(!active_text.contains("README.md"), "{active_text}");
+        Ok(())
+    }
+
+    #[test]
+    fn streaming_flushes_deferred_activity_tail_before_replacing_live_view() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "greet me"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "Hello! How can I help you today?"}),
+        )?;
+        let events = app.store.events_for_session(&session.id)?;
+        let done_seq = events.last().map(|event| event.seq).unwrap_or_default();
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), done_seq);
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "inspect repo".to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "README.md"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "Cargo.toml"}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let prompt_emission =
+            transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
+        let prompt_text = lines_plain_text(&prompt_emission.lines);
+        assert!(prompt_text.contains("> inspect repo"));
+        assert!(!prompt_text.contains("README.md"), "{prompt_text}");
+        app.native_history.last_seq = prompt_emission.last_seq;
+        let active_before_stream =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(
+            active_before_stream.contains("read README.md, Cargo.toml"),
+            "{active_before_stream}"
+        );
+
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I am checking the files before summarizing."}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let has_live_streaming_output =
+            !transcript::active_streaming_lines(Some(&model), 120).is_empty();
+        let stream_emission = transcript::terminal_scrollback_emission_since(
+            &model,
+            app.native_history.last_seq,
+            120,
+            !has_live_streaming_output,
+        );
+        let stream_emission_text = lines_plain_text(&stream_emission.lines);
+        assert!(
+            stream_emission_text.contains("read README.md, Cargo.toml"),
+            "{stream_emission_text}"
+        );
+        assert!(
+            !stream_emission_text.contains("I am checking"),
+            "{stream_emission_text}"
+        );
+        app.native_history.last_seq = stream_emission.last_seq;
+        let active_during_stream =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(
+            active_during_stream.contains("I am checking the files"),
+            "{active_during_stream}"
+        );
+        assert!(
+            !active_during_stream.contains("README.md"),
+            "{active_during_stream}"
+        );
+
+        app.store.append_event(
+            &session.id,
+            "model.turn.response",
+            serde_json::json!({"tool_call_count": 1}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "Taskfile.yml"}),
+        )?;
+        app.drain_store_notifications()?;
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let active_after_response =
+            lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
+        assert!(
+            active_after_response.contains("read Taskfile.yml"),
+            "{active_after_response}"
+        );
+        assert!(
+            !active_after_response.contains("README.md"),
+            "{active_after_response}"
+        );
+        assert!(
+            !active_after_response.contains("Cargo.toml"),
+            "{active_after_response}"
+        );
         Ok(())
     }
 
