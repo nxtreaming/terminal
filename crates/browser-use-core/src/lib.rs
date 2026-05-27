@@ -13286,16 +13286,8 @@ fn renew_models_cache_ttl(app_home: &Path) -> Result<()> {
 
 fn model_catalog_from_remote_models(
     remote_models: Vec<ModelCatalogEntryInfo>,
-    chatgpt_mode: bool,
+    _chatgpt_mode: bool,
 ) -> ModelCatalog {
-    let remote_has_picker_visible_model =
-        remote_models.iter().any(|model| model.visibility == "list");
-    if chatgpt_mode && !remote_models.is_empty() && remote_has_picker_visible_model {
-        return ModelCatalog {
-            models: remote_models,
-        };
-    }
-
     let mut merged = bundled_model_catalog().models;
     for remote_model in remote_models {
         if let Some(existing) = merged
@@ -22880,8 +22872,11 @@ x-env = "CORP_HEADER"
         assert!(request_lower.contains("chatgpt-account-id: codex-account"));
 
         let catalog = config.model_catalog.context("remote catalog")?;
-        assert_eq!(catalog.models.len(), 1);
-        assert_eq!(catalog.models[0].slug, "remote-catalog-model");
+        assert!(catalog
+            .models
+            .iter()
+            .any(|model| model.slug == "remote-catalog-model"));
+        assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.5"));
         assert_eq!(
             config.model_catalog_cache_etag.as_deref(),
             Some("\"etag-remote\"")
@@ -23156,17 +23151,17 @@ x-env = "CORP_HEADER"
     fn remote_models_merge_with_bundled_when_not_authoritative_like_codex() {
         let catalog = model_catalog_from_remote_models(
             vec![ModelCatalogEntryInfo {
-                slug: "hidden-remote-model".to_string(),
-                display_name: "Hidden Remote".to_string(),
+                slug: "remote-picker-model".to_string(),
+                display_name: "Remote Picker".to_string(),
                 description: None,
                 default_reasoning_level: None,
                 supported_reasoning_levels: Vec::new(),
-                visibility: "none".to_string(),
+                visibility: "list".to_string(),
                 supported_in_api: true,
                 priority: 0,
                 service_tiers: Vec::new(),
                 default_service_tier: None,
-                base_instructions: "hidden remote".to_string(),
+                base_instructions: "remote picker".to_string(),
                 model_messages: None,
                 supports_reasoning_summaries: false,
                 default_reasoning_summary: "auto".to_string(),
@@ -23189,7 +23184,7 @@ x-env = "CORP_HEADER"
         assert!(catalog
             .models
             .iter()
-            .any(|model| model.slug == "hidden-remote-model"));
+            .any(|model| model.slug == "remote-picker-model"));
         assert!(catalog.models.iter().any(|model| model.slug == "gpt-5.5"));
     }
 
