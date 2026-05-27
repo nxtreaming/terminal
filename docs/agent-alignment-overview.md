@@ -1823,6 +1823,28 @@ The biggest remaining categories are:
   discovery diagnostics, remote/OAuth/elicitation/resources, app/plugin
   connector exposure, collision policy, read-only parallel hints, and richer
   raw-vs-model output separation for future hooks/code-mode consumers.
+- The current MCP maturity slice closes the concrete MCP-tool heuristics found
+  after the first stdio implementation. Small MCP tool sets are now exposed
+  directly like Codex, while large sets defer behind `tool_search`; required
+  servers fail loudly; Codex-shaped `env_vars` are imported; sanitized name
+  collisions are disambiguated; read-only and server-level parallel hints feed
+  the existing parallel/predispatch scheduler; and unsupported `original` image
+  detail is downgraded before model replay.
+- Verification for the MCP maturity slice passed formatting, whitespace,
+  Python tests, full Rust workspace tests, and live Codex-auth root plus child
+  smokes. The full workspace run passed with browser-use-browser 16 passed
+  plus 2 ignored browser smokes, CLI 18, core 454, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 140, and doc-tests. The live smoke used root
+  session `cf071e265813` and child session `aa8ed0fbb9c8`; the root returned
+  `Paris`, and the child read `/tmp/but-codex-agent-parity-smoke.txt` as
+  `agent-parity-smoke-ok`.
+- Ten broad Codex-auth child audits after the MCP maturity slice produced eight
+  final reports and two provider-turn-cap failures. The completed reports did
+  not find a new concrete MCP regression. They converged on the same next
+  high-impact work: first-class turn/input/control state, typed
+  context/history/rollout reconstruction, stronger subagent inheritance and
+  lifecycle ownership, dynamic app/plugin/MCP connector inventory, fuller tool
+  runtime envelopes, and deeper local compaction/token lifecycle precision.
 
 ## Definition of Done
 

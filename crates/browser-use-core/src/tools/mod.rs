@@ -10,6 +10,8 @@ use std::sync::Arc;
 pub(crate) mod command;
 pub(crate) mod files;
 
+const DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD: usize = 100;
+
 const APPLY_PATCH_LARK_GRAMMAR: &str = r#"start: begin_patch hunk+ end_patch
 begin_patch: "*** Begin Patch" LF
 end_patch: "*** End Patch" LF?
@@ -315,6 +317,13 @@ impl ToolRouter {
         call_namespace: Option<&str>,
         call_name: &str,
     ) -> bool {
+        if self.visible_handler_for_call(call_namespace, call_name)
+            == Some(ToolHandlerKind::McpTool)
+        {
+            return self
+                .mcp_tool_for_call(call_namespace, call_name)
+                .is_some_and(|tool| tool.supports_parallel_tool_calls());
+        }
         matches!(
             self.visible_handler_for_call(call_namespace, call_name),
             Some(
@@ -334,6 +343,13 @@ impl ToolRouter {
         call_namespace: Option<&str>,
         call_name: &str,
     ) -> bool {
+        if self.visible_handler_for_call(call_namespace, call_name)
+            == Some(ToolHandlerKind::McpTool)
+        {
+            return self
+                .mcp_tool_for_call(call_namespace, call_name)
+                .is_some_and(|tool| tool.read_only_hint);
+        }
         matches!(
             self.visible_handler_for_call(call_namespace, call_name),
             Some(
@@ -570,11 +586,16 @@ impl ToolRegistry {
     }
 
     pub(crate) fn register_mcp_tools(&mut self, tools: Vec<McpToolDefinition>) {
+        let exposure = if tools.len() >= DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD {
+            ToolExposure::Deferred
+        } else {
+            ToolExposure::Direct
+        };
         for tool in tools {
             self.tools.push(RegisteredTool {
                 spec: tool.namespaced_tool_spec(),
                 handler: ToolHandlerKind::McpTool,
-                exposure: ToolExposure::Deferred,
+                exposure,
                 mcp_tool: Some(tool),
             });
         }
@@ -2503,13 +2524,15 @@ mod tests {
     }
 
     #[test]
-    fn mcp_tools_defer_behind_tool_search_and_flatten_without_namespaces() {
+    fn mcp_tools_are_direct_below_threshold_deferred_at_threshold_and_flatten_without_namespaces() {
         let server = crate::mcp::McpServerConfig {
             server_name: "docs".to_string(),
             command: "python3".to_string(),
             args: Vec::new(),
             env: std::collections::BTreeMap::new(),
             cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
             startup_timeout_ms: 1,
             tool_timeout_ms: 1,
             enabled_tools: None,
@@ -2529,24 +2552,22 @@ mod tests {
                 }
             }),
             output_schema: None,
+            read_only_hint: true,
         };
         let mut registry = ToolRegistry::default();
-        registry.register_mcp_tools(vec![tool]);
+        registry.register_mcp_tools(vec![tool.clone()]);
 
         let router = ToolRouter::new(registry.clone(), true, true);
-        assert!(router
-            .model_visible_specs()
-            .iter()
-            .any(|spec| spec.name == "tool_search"));
         assert!(!router
             .model_visible_specs()
             .iter()
+            .any(|spec| spec.name == "tool_search"));
+        assert!(router
+            .model_visible_specs()
+            .iter()
             .any(|spec| spec.namespace.as_deref() == Some("mcp__docs__")));
-        let loaded = router.search_deferred_tools("lookup docs query", 8);
-        assert_eq!(loaded[0]["type"], "namespace");
-        assert_eq!(loaded[0]["name"], "mcp__docs__");
-        assert_eq!(loaded[0]["tools"][0]["name"], "lookup");
-        assert_eq!(loaded[0]["tools"][0]["defer_loading"], true);
+        assert!(router.tool_supports_parallel(Some("mcp__docs__"), "lookup"));
+        assert!(router.tool_supports_streaming_predispatch(Some("mcp__docs__"), "lookup"));
 
         let fallback = ToolRouter::new(registry, false, false);
         let specs = fallback.model_visible_specs();
@@ -2562,6 +2583,29 @@ mod tests {
         assert!(fallback
             .mcp_tool_for_call(None, "mcp__docs__lookup")
             .is_some());
+
+        let mut large_registry = ToolRegistry::default();
+        let large_tools = (0..DIRECT_MCP_TOOL_EXPOSURE_THRESHOLD)
+            .map(|idx| McpToolDefinition {
+                callable_name: format!("lookup_{idx}"),
+                raw_tool_name: format!("lookup.{idx}"),
+                ..tool.clone()
+            })
+            .collect();
+        large_registry.register_mcp_tools(large_tools);
+        let large_router = ToolRouter::new(large_registry, true, true);
+        assert!(large_router
+            .model_visible_specs()
+            .iter()
+            .any(|spec| spec.name == "tool_search"));
+        assert!(!large_router
+            .model_visible_specs()
+            .iter()
+            .any(|spec| spec.namespace.as_deref() == Some("mcp__docs__")));
+        let loaded = large_router.search_deferred_tools("lookup docs query", 8);
+        assert_eq!(loaded[0]["type"], "namespace");
+        assert_eq!(loaded[0]["name"], "mcp__docs__");
+        assert_eq!(loaded[0]["tools"][0]["defer_loading"], true);
     }
 
     #[test]

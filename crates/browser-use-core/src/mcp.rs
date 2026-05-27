@@ -21,6 +21,8 @@ pub(crate) struct McpServerConfig {
     pub(crate) args: Vec<String>,
     pub(crate) env: BTreeMap<String, String>,
     pub(crate) cwd: Option<PathBuf>,
+    pub(crate) required: bool,
+    pub(crate) supports_parallel_tool_calls: bool,
     pub(crate) startup_timeout_ms: u64,
     pub(crate) tool_timeout_ms: u64,
     pub(crate) enabled_tools: Option<BTreeSet<String>>,
@@ -48,9 +50,14 @@ pub(crate) struct McpToolDefinition {
     pub(crate) description: String,
     pub(crate) input_schema: Value,
     pub(crate) output_schema: Option<Value>,
+    pub(crate) read_only_hint: bool,
 }
 
 impl McpToolDefinition {
+    pub(crate) fn supports_parallel_tool_calls(&self) -> bool {
+        self.server.supports_parallel_tool_calls || self.read_only_hint
+    }
+
     pub(crate) fn namespaced_tool_spec(&self) -> ToolSpec {
         ToolSpec {
             name: self.callable_name.clone(),
@@ -162,16 +169,31 @@ fn parse_mcp_server_config(
     if command.is_empty() {
         return Ok(None);
     }
+    let required = table
+        .get("required")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
+    let supports_parallel_tool_calls = table
+        .get("supports_parallel_tool_calls")
+        .and_then(toml::Value::as_bool)
+        .unwrap_or(false);
     let args = table
         .get("args")
         .map(|value| toml_string_array(value, path, &format!("mcp_servers.{server_name}.args")))
         .transpose()?
         .unwrap_or_default();
-    let env = table
-        .get("env")
-        .map(|value| toml_string_map(value, path, &format!("mcp_servers.{server_name}.env")))
+    let mut env = table
+        .get("env_vars")
+        .map(|value| toml_env_vars(value, path, &format!("mcp_servers.{server_name}.env_vars")))
         .transpose()?
         .unwrap_or_default();
+    env.extend(
+        table
+            .get("env")
+            .map(|value| toml_string_map(value, path, &format!("mcp_servers.{server_name}.env")))
+            .transpose()?
+            .unwrap_or_default(),
+    );
     let cwd = table
         .get("cwd")
         .and_then(toml::Value::as_str)
@@ -241,6 +263,8 @@ fn parse_mcp_server_config(
         args,
         env,
         cwd,
+        required,
+        supports_parallel_tool_calls,
         startup_timeout_ms,
         tool_timeout_ms,
         enabled_tools,
@@ -250,12 +274,21 @@ fn parse_mcp_server_config(
 
 pub(crate) fn discover_tool_definitions(
     servers: &BTreeMap<String, McpServerConfig>,
-) -> Vec<McpToolDefinition> {
+) -> Result<Vec<McpToolDefinition>> {
     let mut definitions = Vec::new();
     let mut seen = BTreeSet::<(String, String)>::new();
     for server in servers.values() {
-        let Ok(tools) = list_server_tools(server) else {
-            continue;
+        let tools = match list_server_tools(server) {
+            Ok(tools) => tools,
+            Err(error) if server.required => {
+                return Err(error).with_context(|| {
+                    format!(
+                        "required MCP server `{}` failed to initialize",
+                        server.server_name
+                    )
+                });
+            }
+            Err(_) => continue,
         };
         for raw_tool in tools {
             let Some(raw_name) = raw_tool.get("name").and_then(Value::as_str) else {
@@ -268,10 +301,7 @@ pub(crate) fn discover_tool_definitions(
                 "mcp__{}__",
                 sanitize_responses_api_identifier(&server.server_name, "server")
             );
-            let callable_name = sanitize_responses_api_identifier(raw_name, "tool");
-            if !seen.insert((callable_namespace.clone(), callable_name.clone())) {
-                continue;
-            }
+            let callable_name = unique_callable_name(&callable_namespace, raw_name, &mut seen);
             let description = raw_tool
                 .get("description")
                 .and_then(Value::as_str)
@@ -292,6 +322,7 @@ pub(crate) fn discover_tool_definitions(
                     .cloned()
                     .unwrap_or_else(|| json!({})),
             ));
+            let read_only_hint = mcp_tool_read_only_hint(&raw_tool);
             definitions.push(McpToolDefinition {
                 server: server.clone(),
                 raw_tool_name: raw_name.to_string(),
@@ -301,10 +332,11 @@ pub(crate) fn discover_tool_definitions(
                 description,
                 input_schema,
                 output_schema,
+                read_only_hint,
             });
         }
     }
-    definitions
+    Ok(definitions)
 }
 
 pub(crate) fn call_tool(definition: &McpToolDefinition, arguments: &Value) -> Result<Value> {
@@ -578,6 +610,46 @@ fn mcp_call_tool_result_output_schema(structured_content_schema: Value) -> Value
     })
 }
 
+fn mcp_tool_read_only_hint(raw_tool: &Value) -> bool {
+    let Some(annotations) = raw_tool.get("annotations").and_then(Value::as_object) else {
+        return false;
+    };
+    annotations
+        .get("readOnlyHint")
+        .or_else(|| annotations.get("read_only_hint"))
+        .or_else(|| annotations.get("readOnly"))
+        .or_else(|| annotations.get("read_only"))
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn unique_callable_name(
+    callable_namespace: &str,
+    raw_tool_name: &str,
+    seen: &mut BTreeSet<(String, String)>,
+) -> String {
+    let base = sanitize_responses_api_identifier(raw_tool_name, "tool");
+    if seen.insert((callable_namespace.to_string(), base.clone())) {
+        return base;
+    }
+
+    let mut hasher = Sha1::new();
+    hasher.update(callable_namespace.as_bytes());
+    hasher.update(b"\0");
+    hasher.update(raw_tool_name.as_bytes());
+    let hash = format!("{:x}", hasher.finalize());
+    let prefix_len = 55.min(base.len());
+    let mut candidate = format!("{}_{}", &base[..prefix_len], &hash[..8]);
+    let mut counter = 2;
+    while !seen.insert((callable_namespace.to_string(), candidate.clone())) {
+        let suffix = format!("_{}_{counter}", &hash[..8]);
+        let prefix_len = 64usize.saturating_sub(suffix.len()).min(base.len());
+        candidate = format!("{}{}", &base[..prefix_len], suffix);
+        counter += 1;
+    }
+    candidate
+}
+
 fn sanitize_responses_api_identifier(value: &str, fallback: &str) -> String {
     let mut sanitized = value
         .trim()
@@ -661,6 +733,52 @@ fn toml_string_array(value: &toml::Value, path: &Path, label: &str) -> Result<Ve
         .collect()
 }
 
+fn toml_env_vars(
+    value: &toml::Value,
+    path: &Path,
+    label: &str,
+) -> Result<BTreeMap<String, String>> {
+    let Some(array) = value.as_array() else {
+        bail!(
+            "Invalid Codex config `{label}` from `{}`: expected an array.",
+            path.display()
+        );
+    };
+    let mut env = BTreeMap::new();
+    for (idx, item) in array.iter().enumerate() {
+        let name = if let Some(name) = item.as_str() {
+            name
+        } else if let Some(table) = item.as_table() {
+            match table.get("source").and_then(toml::Value::as_str) {
+                None | Some("local") => {}
+                Some("remote") => continue,
+                Some(source) => bail!(
+                    "Invalid Codex config `{label}[{idx}].source` from `{}`: expected `local` or `remote`, got `{source}`.",
+                    path.display()
+                ),
+            }
+            table
+                .get("name")
+                .and_then(toml::Value::as_str)
+                .with_context(|| {
+                    format!(
+                        "Invalid Codex config `{label}[{idx}]` from `{}`: expected a `name` string.",
+                        path.display()
+                    )
+                })?
+        } else {
+            bail!(
+                "Invalid Codex config `{label}[{idx}]` from `{}`: expected a string or table.",
+                path.display()
+            );
+        };
+        if let Ok(value) = std::env::var(name) {
+            env.insert(name.to_string(), value);
+        }
+    }
+    Ok(env)
+}
+
 fn toml_string_map(
     value: &toml::Value,
     path: &Path,
@@ -722,8 +840,11 @@ mod tests {
             command = "python3"
             args = ["server.py"]
             cwd = "tools"
+            required = true
+            supports_parallel_tool_calls = true
             startup_timeout_ms = 50
             tool_timeout_sec = 2
+            env_vars = ["PATH", { name = "REMOTE_ONLY", source = "remote" }]
             disabled_tools = ["write"]
 
             [mcp_servers.docs.env]
@@ -744,11 +865,18 @@ mod tests {
         assert_eq!(server.command, "python3");
         assert_eq!(server.args, vec!["server.py"]);
         assert_eq!(server.cwd.as_deref(), Some(Path::new("/repo/.codex/tools")));
+        assert!(server.required);
+        assert!(server.supports_parallel_tool_calls);
         assert_eq!(server.startup_timeout_ms, 50);
         assert_eq!(server.tool_timeout_ms, 2000);
         assert!(server.disabled_tools.contains("write"));
         assert!(server.disabled_tools.contains("delete"));
         assert_eq!(server.env.get("TOKEN").map(String::as_str), Some("abc"));
+        assert_eq!(
+            server.env.get("PATH").map(String::as_str),
+            std::env::var("PATH").ok().as_deref()
+        );
+        assert!(!server.env.contains_key("REMOTE_ONLY"));
         Ok(())
     }
 
@@ -760,6 +888,8 @@ mod tests {
             args: Vec::new(),
             env: BTreeMap::new(),
             cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
             startup_timeout_ms: 1,
             tool_timeout_ms: 1,
             enabled_tools: None,
@@ -777,6 +907,7 @@ mod tests {
             description: String::new(),
             input_schema: normalize_mcp_input_schema(json!({})),
             output_schema: None,
+            read_only_hint: false,
         };
         assert_eq!(definition.callable_namespace, "mcp__server_one__");
         assert_eq!(definition.callable_name, "tool_two_three");
@@ -849,13 +980,15 @@ for line in sys.stdin:
             args: vec![script.display().to_string()],
             env: BTreeMap::new(),
             cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
             startup_timeout_ms: 2_000,
             tool_timeout_ms: 2_000,
             enabled_tools: None,
             disabled_tools: BTreeSet::new(),
         };
         let servers = BTreeMap::from([("docs.server".to_string(), server)]);
-        let tools = discover_tool_definitions(&servers);
+        let tools = discover_tool_definitions(&servers)?;
         assert_eq!(tools.len(), 1);
         let tool = &tools[0];
         assert_eq!(tool.callable_namespace, "mcp__docs_server__");
@@ -867,6 +1000,93 @@ for line in sys.stdin:
         assert_eq!(result["content"][0]["text"], "echo:hello");
         assert_eq!(result["structuredContent"]["text"], "hello");
         assert_eq!(result["isError"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn required_mcp_server_discovery_failure_is_not_silent() -> Result<()> {
+        let server = McpServerConfig {
+            server_name: "missing".to_string(),
+            command: "definitely-missing-mcp-binary".to_string(),
+            args: Vec::new(),
+            env: BTreeMap::new(),
+            cwd: None,
+            required: true,
+            supports_parallel_tool_calls: false,
+            startup_timeout_ms: 100,
+            tool_timeout_ms: 100,
+            enabled_tools: None,
+            disabled_tools: BTreeSet::new(),
+        };
+        let servers = BTreeMap::from([("missing".to_string(), server)]);
+        let error = discover_tool_definitions(&servers).expect_err("required server should fail");
+        assert!(format!("{error:#}").contains("required MCP server `missing` failed"));
+        Ok(())
+    }
+
+    #[test]
+    fn mcp_tool_name_collisions_are_disambiguated_and_read_only_is_detected() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let script = temp.path().join("server.py");
+        std::fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}},
+                "serverInfo": {"name": "test", "version": "1.0"},
+            },
+        }
+    elif method == "tools/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "tools": [
+                    {"name": "read.file", "inputSchema": {"type": "object"}, "annotations": {"readOnlyHint": True}},
+                    {"name": "read-file", "inputSchema": {"type": "object"}}
+                ]
+            },
+        }
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )?;
+        let server = McpServerConfig {
+            server_name: "docs".to_string(),
+            command: "python3".to_string(),
+            args: vec![script.display().to_string()],
+            env: BTreeMap::new(),
+            cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
+            startup_timeout_ms: 2_000,
+            tool_timeout_ms: 2_000,
+            enabled_tools: None,
+            disabled_tools: BTreeSet::new(),
+        };
+        let servers = BTreeMap::from([("docs".to_string(), server)]);
+        let tools = discover_tool_definitions(&servers)?;
+        assert_eq!(tools.len(), 2);
+        assert_eq!(tools[0].callable_name, "read_file");
+        assert!(tools[0].read_only_hint);
+        assert!(tools[0].supports_parallel_tool_calls());
+        assert_ne!(tools[1].callable_name, "read_file");
+        assert!(tools[1].callable_name.starts_with("read_file_"));
+        assert!(!tools[1].read_only_hint);
+        assert!(!tools[1].supports_parallel_tool_calls());
         Ok(())
     }
 
@@ -889,6 +1109,8 @@ sys.stderr.flush()
             args: vec![script.display().to_string()],
             env: BTreeMap::new(),
             cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
             startup_timeout_ms: 2_000,
             tool_timeout_ms: 2_000,
             enabled_tools: None,
