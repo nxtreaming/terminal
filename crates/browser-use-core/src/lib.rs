@@ -1,7 +1,8 @@
 use std::collections::{BTreeMap, BTreeSet, HashMap, HashSet};
 use std::fmt::Write as _;
+use std::fs::{File, OpenOptions};
 use std::hash::{Hash, Hasher};
-use std::io::Write as IoWrite;
+use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write as IoWrite};
 use std::path::{Path, PathBuf};
 use std::process::{Command as ProcessCommand, Stdio};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -65,6 +66,10 @@ const DEFAULT_STREAM_MAX_RETRIES: usize = 5;
 const MAX_STREAM_MAX_RETRIES: usize = 100;
 const MODELS_REFRESH_TIMEOUT: Duration = Duration::from_secs(5);
 const COMPACT_USER_MESSAGE_MAX_TOKENS: usize = 20_000;
+const MESSAGE_HISTORY_FILENAME: &str = "history.jsonl";
+const MESSAGE_HISTORY_SOFT_CAP_RATIO: f64 = 0.8;
+const MESSAGE_HISTORY_LOCK_RETRIES: usize = 10;
+const MESSAGE_HISTORY_LOCK_RETRY_SLEEP: Duration = Duration::from_millis(100);
 const COMPACTION_SUMMARY_PREFIX: &str = concat!(
     "Another language model started to solve this problem and produced a summary of its thinking ",
     "process. You also have access to the state of the tools that were used by that language ",
@@ -398,6 +403,49 @@ impl ProviderRunConfig {
 }
 
 pub type ConfigOverrides = Vec<(String, toml::Value)>;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum MessageHistoryPersistence {
+    SaveAll,
+    None,
+}
+
+impl Default for MessageHistoryPersistence {
+    fn default() -> Self {
+        Self::SaveAll
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageHistorySettings {
+    #[serde(default)]
+    pub persistence: MessageHistoryPersistence,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub max_bytes: Option<usize>,
+}
+
+impl Default for MessageHistorySettings {
+    fn default() -> Self {
+        Self {
+            persistence: MessageHistoryPersistence::SaveAll,
+            max_bytes: None,
+        }
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct MessageHistoryEntry {
+    pub session_id: String,
+    pub ts: u64,
+    pub text: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MessageHistoryConfig {
+    pub codex_home: PathBuf,
+    pub settings: MessageHistorySettings,
+}
 
 pub fn parse_config_overrides(raw_config_overrides: &[String]) -> Result<ConfigOverrides> {
     raw_config_overrides
@@ -3416,6 +3464,9 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                     current_personality,
                     options.collaboration_mode,
                     &model_settings,
+                    &options,
+                    &turn_config,
+                    &model_request_info,
                     model_config_event.seq,
                 )?;
             }
@@ -6328,6 +6379,9 @@ fn append_context_baseline_event(
     personality: ModelPersonality,
     collaboration_mode: CollaborationModeKind,
     model_settings: &ModelRequestSettings,
+    options: &AgentRunOptions,
+    config: &AgentsMdConfig,
+    model_request_info: &browser_use_providers::ModelRequestInfo,
     model_config_seq: i64,
 ) -> Result<bool> {
     let events = store.events_for_session(&session.id)?;
@@ -6365,6 +6419,9 @@ fn append_context_baseline_event(
         personality,
         collaboration_mode,
         model_settings,
+        options,
+        config,
+        model_request_info,
         environment.as_ref(),
     )?;
     let mut payload = serde_json::json!({
@@ -6396,6 +6453,9 @@ fn codex_turn_context_payload(
     personality: ModelPersonality,
     collaboration_mode: CollaborationModeKind,
     model_settings: &ModelRequestSettings,
+    options: &AgentRunOptions,
+    config: &AgentsMdConfig,
+    model_request_info: &browser_use_providers::ModelRequestInfo,
     environment: Option<&EnvironmentContextSnapshot>,
 ) -> Result<Value> {
     let mut payload = serde_json::json!({
@@ -6407,7 +6467,28 @@ fn codex_turn_context_payload(
         "collaboration_mode": collaboration_mode.as_str(),
         "collaboration_mode_kind": collaboration_mode.as_str(),
         "model_settings": model_request_settings_json(model_settings),
+        "model_request_info": model_request_info,
+        "config_profile": options.config_profile.clone(),
+        "model_provider_id": options.model_provider_id.clone(),
+        "model_provider_id_source": run_config_value_source_key(options.model_provider_id_source),
+        "max_turns": options.max_turns,
+        "max_context_chars": options.max_context_chars,
+        "include_environment_context": options.include_environment_context,
+        "include_permissions_instructions": options.include_permissions_instructions,
+        "model_compaction_enabled": options.model_compaction_enabled,
+        "python_tool_timeout_seconds": options.python_tool_timeout_seconds,
+        "final_output_json_schema_strict": options.final_output_json_schema_strict,
+        "config": turn_context_config_payload(config),
     });
+    if let Some(base_instructions) = options.base_instructions.as_ref() {
+        payload["base_instructions"] = Value::String(base_instructions.clone());
+    }
+    if let Some(developer_instructions) = options.developer_instructions.as_ref() {
+        payload["developer_instructions"] = Value::String(developer_instructions.clone());
+    }
+    if let Some(schema) = options.final_output_json_schema.as_ref() {
+        payload["final_output_json_schema"] = schema.clone();
+    }
     if let Some(environment) = environment {
         payload["current_date"] = Value::String(environment.current_date.clone());
         payload["timezone"] = Value::String(environment.timezone.clone());
@@ -6420,6 +6501,85 @@ fn codex_turn_context_payload(
         }
     }
     Ok(payload)
+}
+
+fn run_config_value_source_key(source: RunConfigValueSource) -> &'static str {
+    match source {
+        RunConfigValueSource::Explicit => "explicit",
+        RunConfigValueSource::Default => "default",
+    }
+}
+
+fn web_search_mode_key(mode: WebSearchMode) -> &'static str {
+    match mode {
+        WebSearchMode::Disabled => "disabled",
+        WebSearchMode::Cached => "cached",
+        WebSearchMode::Live => "live",
+    }
+}
+
+fn turn_context_config_payload(config: &AgentsMdConfig) -> Value {
+    let model_catalog_models = config.model_catalog.as_ref().map(|catalog| {
+        catalog
+            .models
+            .iter()
+            .map(|model| {
+                json!({
+                    "slug": model.slug.clone(),
+                    "display_name": model.display_name.clone(),
+                    "visibility": model.visibility.clone(),
+                    "supported_in_api": model.supported_in_api,
+                })
+            })
+            .collect::<Vec<_>>()
+    });
+    let mcp_servers = config
+        .mcp_servers
+        .values()
+        .map(|server| {
+            json!({
+                "name": server.server_name,
+                "required": server.required,
+                "supports_parallel_tool_calls": server.supports_parallel_tool_calls,
+                "enabled_tools": server.enabled_tools.as_ref().map(|tools| tools.iter().cloned().collect::<Vec<_>>()),
+                "disabled_tools": server.disabled_tools.iter().cloned().collect::<Vec<_>>(),
+                "startup_timeout_ms": server.startup_timeout_ms,
+                "tool_timeout_ms": server.tool_timeout_ms,
+            })
+        })
+        .collect::<Vec<_>>();
+    json!({
+        "model": config.model.clone(),
+        "review_model": config.review_model.clone(),
+        "model_provider": config.model_provider_id.clone(),
+        "model_context_window": config.model_context_window,
+        "model_auto_compact_token_limit": config.model_auto_compact_token_limit,
+        "tool_output_token_limit": config.tool_output_token_limit,
+        "plan_mode_reasoning_effort": config.plan_mode_reasoning_effort.clone(),
+        "history": config.history.clone(),
+        "features": {
+            "goals": config.goals_enabled,
+            "multi_agent": config.multi_agent_enabled,
+            "multi_agent_v2": {
+                "enabled": config.multi_agent_v2.enabled,
+                "hide_spawn_agent_metadata": config.multi_agent_v2.hide_spawn_agent_metadata,
+                "max_concurrent_threads_per_session": config.multi_agent_v2.max_concurrent_threads_per_session,
+            },
+            "shell_tool": config.shell_tool_enabled,
+            "unified_exec": config.unified_exec_enabled,
+            "image_generation": config.image_generation_enabled,
+            "memories": config.memories_enabled,
+            "skills_include_instructions": config.skills_include_instructions,
+            "bundled_skills": config.bundled_skills_enabled,
+            "plugins": config.plugins_enabled,
+            "request_user_input_default_mode": config.request_user_input_default_mode_enabled,
+        },
+        "web_search": config.web_search_mode.map(web_search_mode_key),
+        "agent_roles": config.agent_roles.keys().cloned().collect::<Vec<_>>(),
+        "mcp_servers": mcp_servers,
+        "available_models": model_catalog_models,
+        "advertised_beta_features": config.advertised_beta_features.clone(),
+    })
 }
 
 fn model_request_settings_json(settings: &ModelRequestSettings) -> Value {
@@ -14768,6 +14928,7 @@ struct AgentsMdConfig {
     web_search_mode: Option<WebSearchMode>,
     web_search_allowed_modes: Option<BTreeSet<WebSearchMode>>,
     web_search_config: Option<WebSearchToolConfig>,
+    history: MessageHistorySettings,
     request_user_input_default_mode_enabled: bool,
     plugins_enabled: bool,
     plugins: BTreeMap<String, CodexPluginConfig>,
@@ -14821,6 +14982,7 @@ impl Default for AgentsMdConfig {
             web_search_mode: None,
             web_search_allowed_modes: None,
             web_search_config: None,
+            history: MessageHistorySettings::default(),
             request_user_input_default_mode_enabled: false,
             plugins_enabled: true,
             plugins: BTreeMap::new(),
@@ -15847,6 +16009,7 @@ fn apply_agents_md_config_layer(
         config.unified_exec_enabled = use_unified_exec;
     }
     apply_web_search_tool_config_layer(config, value, path)?;
+    apply_message_history_config_layer(config, value, path)?;
     apply_memories_config_layer(config, value, path)?;
     apply_skills_config_layer(config, value, path, relative_base)?;
     apply_hooks_config_layer(config, value, path, layer_kind)?;
@@ -18298,6 +18461,53 @@ fn apply_web_search_tool_config_layer(
     Ok(())
 }
 
+fn apply_message_history_config_layer(
+    config: &mut AgentsMdConfig,
+    value: &toml::Value,
+    path: &Path,
+) -> Result<()> {
+    let Some(raw) = value.get("history") else {
+        return Ok(());
+    };
+    let Some(table) = raw.as_table() else {
+        bail!(
+            "Invalid Codex config `history` from `{}`: expected a table.",
+            path.display()
+        );
+    };
+    if let Some(persistence) = table.get("persistence") {
+        let Some(persistence) = persistence.as_str() else {
+            bail!(
+                "Invalid Codex config `history.persistence` from `{}`: expected a string.",
+                path.display()
+            );
+        };
+        config.history.persistence = match persistence {
+            "save-all" => MessageHistoryPersistence::SaveAll,
+            "none" => MessageHistoryPersistence::None,
+            _ => bail!(
+                "Invalid Codex config `history.persistence` from `{}`: expected one of `save-all`, `none`.",
+                path.display()
+            ),
+        };
+    }
+    if let Some(max_bytes) = table.get("max_bytes") {
+        let Some(max_bytes) = max_bytes.as_integer() else {
+            bail!(
+                "Invalid Codex config `history.max_bytes` from `{}`: expected a non-negative integer.",
+                path.display()
+            );
+        };
+        config.history.max_bytes = Some(usize::try_from(max_bytes).map_err(|_| {
+            anyhow!(
+                "Invalid Codex config `history.max_bytes` from `{}`: expected a non-negative integer.",
+                path.display()
+            )
+        })?);
+    }
+    Ok(())
+}
+
 fn apply_memories_config_layer(
     config: &mut AgentsMdConfig,
     value: &toml::Value,
@@ -19685,6 +19895,265 @@ fn codex_home_dir() -> Option<PathBuf> {
                 .ok()
                 .map(|home| PathBuf::from(home).join(".codex"))
         })
+}
+
+pub fn message_history_config_for_cwd_with_options(
+    cwd: impl AsRef<Path>,
+    options: &AgentRunOptions,
+) -> Result<Option<MessageHistoryConfig>> {
+    let Some(codex_home) = codex_home_dir() else {
+        return Ok(None);
+    };
+    let mut warnings = Vec::new();
+    let config = load_agents_md_config_for_options(cwd.as_ref(), &mut warnings, options)?;
+    Ok(Some(MessageHistoryConfig {
+        codex_home,
+        settings: config.history,
+    }))
+}
+
+pub fn append_message_history_entry_for_cwd(
+    text: &str,
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    options: &AgentRunOptions,
+) -> Result<bool> {
+    let Some(config) = message_history_config_for_cwd_with_options(cwd, options)? else {
+        return Ok(false);
+    };
+    append_message_history_entry(text, session_id, &config)
+}
+
+pub fn append_message_history_entry(
+    text: &str,
+    session_id: &str,
+    config: &MessageHistoryConfig,
+) -> Result<bool> {
+    if matches!(config.settings.persistence, MessageHistoryPersistence::None) {
+        return Ok(false);
+    }
+    if text.trim().is_empty() {
+        return Ok(false);
+    }
+
+    let path = message_history_path(config);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent).with_context(|| {
+            format!("failed to create message history dir {}", parent.display())
+        })?;
+    }
+
+    let ts = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map_err(|error| anyhow!("system clock before Unix epoch: {error}"))?
+        .as_secs();
+    let entry = MessageHistoryEntry {
+        session_id: session_id.to_string(),
+        ts,
+        text: text.to_string(),
+    };
+    let mut line = serde_json::to_string(&entry)?;
+    line.push('\n');
+
+    let mut options = OpenOptions::new();
+    options.read(true).write(true).create(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.append(true).mode(0o600);
+    }
+    #[cfg(not(unix))]
+    {
+        options.append(true);
+    }
+    let mut file = options
+        .open(&path)
+        .with_context(|| format!("failed to open message history {}", path.display()))?;
+    ensure_message_history_permissions(&file)?;
+
+    for _ in 0..MESSAGE_HISTORY_LOCK_RETRIES {
+        match file.try_lock() {
+            Ok(()) => {
+                file.seek(SeekFrom::End(0))?;
+                file.write_all(line.as_bytes())?;
+                file.flush()?;
+                enforce_message_history_limit(&mut file, config.settings.max_bytes)?;
+                return Ok(true);
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                thread::sleep(MESSAGE_HISTORY_LOCK_RETRY_SLEEP);
+            }
+            Err(error) => return Err(error).context("failed to lock message history"),
+        }
+    }
+    bail!("could not acquire exclusive lock on message history file after multiple attempts")
+}
+
+pub fn message_history_metadata(config: &MessageHistoryConfig) -> (u64, usize) {
+    message_history_metadata_for_path(&message_history_path(config))
+}
+
+pub fn lookup_message_history_entry(
+    log_id: u64,
+    offset: usize,
+    config: &MessageHistoryConfig,
+) -> Option<MessageHistoryEntry> {
+    lookup_message_history_entry_at_path(&message_history_path(config), log_id, offset)
+}
+
+fn message_history_path(config: &MessageHistoryConfig) -> PathBuf {
+    config.codex_home.join(MESSAGE_HISTORY_FILENAME)
+}
+
+#[cfg(unix)]
+fn ensure_message_history_permissions(file: &File) -> Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    let metadata = file.metadata()?;
+    let current_mode = metadata.permissions().mode() & 0o777;
+    if current_mode != 0o600 {
+        let mut permissions = metadata.permissions();
+        permissions.set_mode(0o600);
+        file.set_permissions(permissions)?;
+    }
+    Ok(())
+}
+
+#[cfg(not(unix))]
+fn ensure_message_history_permissions(_file: &File) -> Result<()> {
+    Ok(())
+}
+
+fn enforce_message_history_limit(file: &mut File, max_bytes: Option<usize>) -> Result<()> {
+    let Some(max_bytes) = max_bytes else {
+        return Ok(());
+    };
+    if max_bytes == 0 {
+        return Ok(());
+    }
+    let max_bytes = max_bytes as u64;
+    let mut current_len = file.metadata()?.len();
+    if current_len <= max_bytes {
+        return Ok(());
+    }
+
+    let mut reader_file = file.try_clone()?;
+    reader_file.seek(SeekFrom::Start(0))?;
+    let mut reader = BufReader::new(reader_file);
+    let mut line_lengths = Vec::new();
+    let mut line = String::new();
+    loop {
+        line.clear();
+        let bytes = reader.read_line(&mut line)?;
+        if bytes == 0 {
+            break;
+        }
+        line_lengths.push(bytes as u64);
+    }
+    if line_lengths.is_empty() {
+        return Ok(());
+    }
+
+    let last_index = line_lengths.len() - 1;
+    let newest_entry_len = line_lengths[last_index];
+    let trim_target = message_history_trim_target_bytes(max_bytes, newest_entry_len);
+    let mut drop_bytes = 0u64;
+    let mut idx = 0usize;
+    while current_len > trim_target && idx < last_index {
+        current_len = current_len.saturating_sub(line_lengths[idx]);
+        drop_bytes += line_lengths[idx];
+        idx += 1;
+    }
+    if drop_bytes == 0 {
+        return Ok(());
+    }
+
+    let mut reader = reader.into_inner();
+    reader.seek(SeekFrom::Start(drop_bytes))?;
+    let mut tail = Vec::with_capacity(usize::try_from(current_len).unwrap_or(0));
+    reader.read_to_end(&mut tail)?;
+    file.set_len(0)?;
+    file.seek(SeekFrom::Start(0))?;
+    file.write_all(&tail)?;
+    file.flush()?;
+    Ok(())
+}
+
+fn message_history_trim_target_bytes(max_bytes: u64, newest_entry_len: u64) -> u64 {
+    let soft_cap_bytes = ((max_bytes as f64) * MESSAGE_HISTORY_SOFT_CAP_RATIO)
+        .floor()
+        .clamp(1.0, max_bytes as f64) as u64;
+    soft_cap_bytes.max(newest_entry_len)
+}
+
+fn message_history_metadata_for_path(path: &Path) -> (u64, usize) {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(_) => return (0, 0),
+    };
+    let log_id = message_history_log_identity(&metadata).unwrap_or(0);
+    let mut file = match File::open(path) {
+        Ok(file) => file,
+        Err(_) => return (log_id, 0),
+    };
+    let mut buffer = [0_u8; 8192];
+    let mut count = 0usize;
+    loop {
+        match file.read(&mut buffer) {
+            Ok(0) => break,
+            Ok(n) => count += buffer[..n].iter().filter(|&&byte| byte == b'\n').count(),
+            Err(_) => return (log_id, 0),
+        }
+    }
+    (log_id, count)
+}
+
+fn lookup_message_history_entry_at_path(
+    path: &Path,
+    log_id: u64,
+    offset: usize,
+) -> Option<MessageHistoryEntry> {
+    let file = OpenOptions::new().read(true).open(path).ok()?;
+    let metadata = file.metadata().ok()?;
+    let current_log_id = message_history_log_identity(&metadata)?;
+    if log_id != 0 && current_log_id != log_id {
+        return None;
+    }
+    for _ in 0..MESSAGE_HISTORY_LOCK_RETRIES {
+        match file.try_lock_shared() {
+            Ok(()) => {
+                let reader = BufReader::new(&file);
+                for (idx, line) in reader.lines().enumerate() {
+                    let line = line.ok()?;
+                    if idx == offset {
+                        return serde_json::from_str::<MessageHistoryEntry>(&line).ok();
+                    }
+                }
+                return None;
+            }
+            Err(std::fs::TryLockError::WouldBlock) => {
+                thread::sleep(MESSAGE_HISTORY_LOCK_RETRY_SLEEP);
+            }
+            Err(_) => return None,
+        }
+    }
+    None
+}
+
+#[cfg(unix)]
+fn message_history_log_identity(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::unix::fs::MetadataExt;
+    Some(metadata.ino())
+}
+
+#[cfg(windows)]
+fn message_history_log_identity(metadata: &std::fs::Metadata) -> Option<u64> {
+    use std::os::windows::fs::MetadataExt;
+    Some(metadata.creation_time())
+}
+
+#[cfg(not(any(unix, windows)))]
+fn message_history_log_identity(_metadata: &std::fs::Metadata) -> Option<u64> {
+    None
 }
 
 fn load_global_agents_md(warnings: &mut Vec<String>) -> Option<(PathBuf, String)> {
@@ -27107,6 +27576,13 @@ command = "print-token"
         assert_eq!(turn_context["provider"], provider.provider_name());
         assert_eq!(turn_context["model"], provider.model_name());
         assert_eq!(turn_context["collaboration_mode_kind"], "default");
+        assert_eq!(turn_context["max_turns"], 80);
+        assert_eq!(
+            turn_context["model_request_info"]["supports_parallel_tool_calls"],
+            true
+        );
+        assert_eq!(turn_context["config"]["features"]["goals"], true);
+        assert_eq!(turn_context["config"]["history"]["persistence"], "save-all");
         assert!(turn_context
             .get("current_date")
             .is_some_and(|value| value.as_str().is_some()));
@@ -27115,6 +27591,111 @@ command = "print-token"
             .get("workspace_context_seqs")
             .and_then(|value| value.get(WORKSPACE_CONTEXT_ENVIRONMENT_KIND))
             .is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn message_history_config_parses_codex_history_section() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        std::fs::write(
+            codex_home.join(CODEX_CONFIG_FILENAME),
+            "[history]\npersistence = \"none\"\nmax_bytes = 1234\n",
+        )?;
+
+        let config = with_codex_home(&codex_home, || {
+            message_history_config_for_cwd_with_options(temp.path(), &AgentRunOptions::default())
+        })?
+        .context("history config")?;
+
+        assert_eq!(config.codex_home, codex_home);
+        assert_eq!(config.settings.persistence, MessageHistoryPersistence::None);
+        assert_eq!(config.settings.max_bytes, Some(1234));
+        Ok(())
+    }
+
+    #[test]
+    fn message_history_appends_metadata_and_lookup_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let config = MessageHistoryConfig {
+            codex_home: temp.path().join("codex-home"),
+            settings: MessageHistorySettings::default(),
+        };
+
+        assert!(append_message_history_entry(
+            "first prompt",
+            "session-a",
+            &config
+        )?);
+        assert!(append_message_history_entry(
+            "second prompt",
+            "session-b",
+            &config
+        )?);
+
+        let (log_id, count) = message_history_metadata(&config);
+        assert_ne!(log_id, 0);
+        assert_eq!(count, 2);
+        assert_eq!(
+            lookup_message_history_entry(log_id, 0, &config)
+                .context("first history entry")?
+                .text,
+            "first prompt"
+        );
+        assert_eq!(
+            lookup_message_history_entry(log_id, 1, &config)
+                .context("second history entry")?
+                .session_id,
+            "session-b"
+        );
+        assert!(lookup_message_history_entry(log_id.saturating_add(1), 0, &config).is_none());
+
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            let mode = std::fs::metadata(message_history_path(&config))?
+                .permissions()
+                .mode()
+                & 0o777;
+            assert_eq!(mode, 0o600);
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn message_history_respects_persistence_none_and_trims_to_newest() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let disabled = MessageHistoryConfig {
+            codex_home: temp.path().join("disabled"),
+            settings: MessageHistorySettings {
+                persistence: MessageHistoryPersistence::None,
+                max_bytes: None,
+            },
+        };
+        assert!(!append_message_history_entry(
+            "skip me", "session", &disabled
+        )?);
+        assert!(!message_history_path(&disabled).exists());
+
+        let trimmed = MessageHistoryConfig {
+            codex_home: temp.path().join("trimmed"),
+            settings: MessageHistorySettings {
+                persistence: MessageHistoryPersistence::SaveAll,
+                max_bytes: Some(260),
+            },
+        };
+        for idx in 0..6 {
+            append_message_history_entry(
+                &format!("prompt-{idx}-{}", "x".repeat(80)),
+                "session",
+                &trimmed,
+            )?;
+        }
+
+        let contents = std::fs::read_to_string(message_history_path(&trimmed))?;
+        assert!(contents.contains("prompt-5-"));
+        assert!(!contents.contains("prompt-0-"));
+        assert!(std::fs::metadata(message_history_path(&trimmed))?.len() <= 260);
         Ok(())
     }
 

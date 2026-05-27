@@ -10,19 +10,18 @@ use std::time::{Duration, Instant};
 use anyhow::{bail, Context, Result};
 use browser_use_core::{
     append_user_shell_command_context_event, append_workspace_context_event,
-    canonical_agent_path_from_task_name, canonical_agent_reference,
-    cleanup_unified_exec_commands_for_agent_subtree, collect_agent_tree,
+    append_workspace_context_event_with_options, canonical_agent_path_from_task_name,
+    canonical_agent_reference, cleanup_unified_exec_commands_for_agent_subtree, collect_agent_tree,
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
     display_agent_path_for_session, final_statuses_for_v1_wait, install_process_crypto_provider,
     last_task_message_for_agent, local_agent_status_value, model_catalog_for_cwd_with_options,
     parse_config_overrides, product_analytics, record_python_response_final_event,
     record_python_worker_event, resolve_agent_reference_in_tree, review_prompt_base_branch,
     review_prompt_commit, review_prompt_custom, review_prompt_uncommitted_changes, root_session_id,
-    run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
-    run_fake_agent, start_review_session, typed_user_input_payload_from_text_for_cwd,
-    update_parent_from_child_run, AgentRunOptions, CollaborationModeKind, ConfigOverrides,
-    FakeAgentOptions, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
-    UnifiedExecShutdownCleanup,
+    run_existing_session_from_config, run_existing_session_with_provider, run_fake_agent,
+    start_review_session, typed_user_input_payload_from_text_for_cwd, update_parent_from_child_run,
+    AgentRunOptions, CollaborationModeKind, ConfigOverrides, FakeAgentOptions, ProviderBackend,
+    ProviderRunConfig, RunConfigValueSource, UnifiedExecShutdownCleanup,
 };
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, sanitized_agent_context_from_events,
@@ -1166,8 +1165,45 @@ fn start(store: &Store, text: String) -> Result<()> {
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
+    maybe_append_message_history(&task.id, &text, &cwd, &AgentRunOptions::default());
     println!("{}", task.id);
     Ok(())
+}
+
+fn run_new_session_from_config(
+    store: &Store,
+    text: String,
+    config: ProviderRunConfig,
+) -> Result<()> {
+    let cwd = std::env::current_dir()?;
+    let session = store.create_session(None, &cwd)?;
+    append_workspace_context_event_with_options(store, &session, &config.options)?;
+    store.append_event(
+        &session.id,
+        "session.input",
+        typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
+    )?;
+    maybe_append_message_history(&session.id, &text, &cwd, &config.options);
+    let session_id = run_existing_session_from_config(store, &session.id, config)?;
+    println!("{session_id}");
+    Ok(())
+}
+
+fn maybe_append_message_history(
+    session_id: &str,
+    text: &str,
+    cwd: &Path,
+    options: &AgentRunOptions,
+) {
+    #[cfg(not(test))]
+    {
+        let _ =
+            browser_use_core::append_message_history_entry_for_cwd(text, session_id, cwd, options);
+    }
+    #[cfg(test)]
+    {
+        let _ = (session_id, text, cwd, options);
+    }
 }
 
 fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<()> {
@@ -1321,9 +1357,7 @@ fn run_openai(
             raw_config_overrides,
             collaboration_mode,
         )?);
-    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
-    println!("{session_id}");
-    Ok(())
+    run_new_session_from_config(store, text, config)
 }
 
 fn run_codex(
@@ -1347,9 +1381,7 @@ fn run_codex(
             raw_config_overrides,
             collaboration_mode,
         )?);
-    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
-    println!("{session_id}");
-    Ok(())
+    run_new_session_from_config(store, text, config)
 }
 
 fn run_anthropic(
@@ -1363,9 +1395,7 @@ fn run_anthropic(
     let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
         cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
     );
-    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
-    println!("{session_id}");
-    Ok(())
+    run_new_session_from_config(store, text, config)
 }
 
 fn run_openrouter(
@@ -1379,9 +1409,7 @@ fn run_openrouter(
     let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
         cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
     );
-    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
-    println!("{session_id}");
-    Ok(())
+    run_new_session_from_config(store, text, config)
 }
 
 fn run_openai_session(
@@ -1506,6 +1534,12 @@ fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
         "session.followup",
         typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
     )?;
+    maybe_append_message_history(
+        task_id,
+        &text,
+        Path::new(&session.cwd),
+        &AgentRunOptions::default(),
+    );
     println!("followup {task_id}");
     Ok(())
 }
