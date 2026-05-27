@@ -11901,6 +11901,7 @@ fn browser_tool_registry_for_session(
         model_supports_original_image_detail_for_catalog(model_name, config.model_catalog.as_ref()),
         model_overrides_description,
     );
+    registry.register_mcp_resource_tools(config.mcp_servers.clone());
     registry.register_mcp_tools(mcp::discover_tool_definitions(&config.mcp_servers)?);
     Ok(registry)
 }
@@ -12840,6 +12841,29 @@ fn dispatch_parallel_tool_call(
         Some(ToolHandlerKind::ToolSearch) => {
             dispatch_tool_search_tool(store, session, call, tool_router)
         }
+        Some(ToolHandlerKind::ListMcpResources) => dispatch_list_mcp_resources_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            tool_router,
+        ),
+        Some(ToolHandlerKind::ListMcpResourceTemplates) => {
+            dispatch_list_mcp_resource_templates_tool(
+                store,
+                session,
+                call,
+                tool_output_token_budget,
+                tool_router,
+            )
+        }
+        Some(ToolHandlerKind::ReadMcpResource) => dispatch_read_mcp_resource_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            tool_router,
+        ),
         Some(ToolHandlerKind::McpTool) => dispatch_mcp_tool(
             store,
             session,
@@ -13041,6 +13065,27 @@ fn dispatch_tool_call<P: ModelProvider>(
         ToolHandlerKind::CloseAgent => dispatch_close_agent_tool(store, session, call),
         ToolHandlerKind::CloseAgentV1 => dispatch_close_agent_v1_tool(store, session, call),
         ToolHandlerKind::ToolSearch => dispatch_tool_search_tool(store, session, call, tool_router),
+        ToolHandlerKind::ListMcpResources => dispatch_list_mcp_resources_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            tool_router,
+        ),
+        ToolHandlerKind::ListMcpResourceTemplates => dispatch_list_mcp_resource_templates_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            tool_router,
+        ),
+        ToolHandlerKind::ReadMcpResource => dispatch_read_mcp_resource_tool(
+            store,
+            session,
+            call,
+            tool_output_token_budget,
+            tool_router,
+        ),
         ToolHandlerKind::McpTool => dispatch_mcp_tool(
             store,
             session,
@@ -13124,6 +13169,316 @@ fn dispatch_mcp_tool(
             tool_output_token_budget,
         )?],
     })
+}
+
+fn dispatch_list_mcp_resources_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+    tool_router: &ToolRouter,
+) -> Result<ToolDispatchOutcome> {
+    dispatch_list_mcp_resource_kind_tool(
+        store,
+        session,
+        call,
+        tool_output_token_budget,
+        tool_router,
+        McpResourceListTool::Resources,
+    )
+}
+
+fn dispatch_list_mcp_resource_templates_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+    tool_router: &ToolRouter,
+) -> Result<ToolDispatchOutcome> {
+    dispatch_list_mcp_resource_kind_tool(
+        store,
+        session,
+        call,
+        tool_output_token_budget,
+        tool_router,
+        McpResourceListTool::Templates,
+    )
+}
+
+#[derive(Clone, Copy)]
+enum McpResourceListTool {
+    Resources,
+    Templates,
+}
+
+impl McpResourceListTool {
+    fn output_key(self) -> &'static str {
+        match self {
+            Self::Resources => "resources",
+            Self::Templates => "resourceTemplates",
+        }
+    }
+
+    fn result_keys(self) -> (&'static str, &'static str) {
+        match self {
+            Self::Resources => ("resources", "resources"),
+            Self::Templates => ("resourceTemplates", "resource_templates"),
+        }
+    }
+}
+
+fn dispatch_list_mcp_resource_kind_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+    tool_router: &ToolRouter,
+    kind: McpResourceListTool,
+) -> Result<ToolDispatchOutcome> {
+    let server_name = optional_tool_string(&call.arguments, "server")?;
+    let cursor = optional_tool_string(&call.arguments, "cursor")?;
+    if server_name.is_none() && cursor.is_some() {
+        bail!("cursor can only be used when a server is specified");
+    }
+    let servers = tool_router.mcp_servers();
+    if servers.is_empty() {
+        bail!("{} requires at least one configured MCP server", call.name);
+    }
+    append_mcp_resource_tool_started(store, session, call, server_name.as_deref())?;
+    let started = Instant::now();
+    let payload = if let Some(server_name) = server_name {
+        let server = tool_router
+            .mcp_server(&server_name)
+            .with_context(|| format!("unknown MCP server `{server_name}`"))?;
+        let result = match kind {
+            McpResourceListTool::Resources => mcp::list_resources(&server, cursor.as_deref())?,
+            McpResourceListTool::Templates => {
+                mcp::list_resource_templates(&server, cursor.as_deref())?
+            }
+        };
+        list_mcp_resource_payload_for_server(kind, &server_name, result)
+    } else {
+        let by_server = match kind {
+            McpResourceListTool::Resources => mcp::list_all_resources(&servers),
+            McpResourceListTool::Templates => mcp::list_all_resource_templates(&servers),
+        };
+        list_mcp_resource_payload_for_all(kind, by_server)
+    };
+    append_mcp_resource_tool_finished(
+        store,
+        session,
+        call,
+        server_name_from_payload(&payload),
+        started.elapsed(),
+        &payload,
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            &call.name,
+            payload,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn dispatch_read_mcp_resource_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+    tool_router: &ToolRouter,
+) -> Result<ToolDispatchOutcome> {
+    let server_name = required_tool_string(&call.arguments, "server")?;
+    let uri = required_tool_string(&call.arguments, "uri")?;
+    let server = tool_router
+        .mcp_server(&server_name)
+        .with_context(|| format!("unknown MCP server `{server_name}`"))?;
+    append_mcp_resource_tool_started(store, session, call, Some(&server_name))?;
+    let started = Instant::now();
+    let result = mcp::read_resource(&server, &uri)?;
+    let payload = read_mcp_resource_payload(&server_name, &uri, result);
+    append_mcp_resource_tool_finished(
+        store,
+        session,
+        call,
+        Some(&server_name),
+        started.elapsed(),
+        &payload,
+    )?;
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            &call.name,
+            payload,
+            tool_output_token_budget,
+        )?],
+    })
+}
+
+fn optional_tool_string(arguments: &Value, key: &str) -> Result<Option<String>> {
+    match arguments.get(key) {
+        None | Some(Value::Null) => Ok(None),
+        Some(Value::String(value)) => {
+            let value = value.trim();
+            Ok((!value.is_empty()).then(|| value.to_string()))
+        }
+        Some(_) => bail!("{key} must be a string"),
+    }
+}
+
+fn required_tool_string(arguments: &Value, key: &str) -> Result<String> {
+    optional_tool_string(arguments, key)?.with_context(|| format!("{key} must not be empty"))
+}
+
+fn list_mcp_resource_payload_for_server(
+    kind: McpResourceListTool,
+    server: &str,
+    result: Value,
+) -> Value {
+    let (primary_key, fallback_key) = kind.result_keys();
+    let resources = result
+        .get(primary_key)
+        .or_else(|| result.get(fallback_key))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+        .into_iter()
+        .map(|resource| value_with_server(server, resource))
+        .collect::<Vec<_>>();
+    let mut payload = Map::new();
+    payload.insert("server".to_string(), Value::String(server.to_string()));
+    payload.insert(kind.output_key().to_string(), Value::Array(resources));
+    if let Some(next_cursor) = result
+        .get("nextCursor")
+        .or_else(|| result.get("next_cursor"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|cursor| !cursor.is_empty())
+    {
+        payload.insert(
+            "nextCursor".to_string(),
+            Value::String(next_cursor.to_string()),
+        );
+    }
+    Value::Object(payload)
+}
+
+fn list_mcp_resource_payload_for_all(
+    kind: McpResourceListTool,
+    by_server: BTreeMap<String, Vec<Value>>,
+) -> Value {
+    let resources = by_server
+        .into_iter()
+        .flat_map(|(server, resources)| {
+            resources
+                .into_iter()
+                .map(move |resource| value_with_server(&server, resource))
+        })
+        .collect::<Vec<_>>();
+    let mut payload = Map::new();
+    payload.insert(kind.output_key().to_string(), Value::Array(resources));
+    Value::Object(payload)
+}
+
+fn read_mcp_resource_payload(server: &str, uri: &str, result: Value) -> Value {
+    let mut payload = Map::new();
+    payload.insert("server".to_string(), Value::String(server.to_string()));
+    payload.insert("uri".to_string(), Value::String(uri.to_string()));
+    match result {
+        Value::Object(result) => {
+            for (key, value) in result {
+                payload.insert(key, value);
+            }
+        }
+        other => {
+            payload.insert("result".to_string(), other);
+        }
+    }
+    Value::Object(payload)
+}
+
+fn value_with_server(server: &str, value: Value) -> Value {
+    match value {
+        Value::Object(mut object) => {
+            object.insert("server".to_string(), Value::String(server.to_string()));
+            Value::Object(object)
+        }
+        other => json!({
+            "server": server,
+            "value": other,
+        }),
+    }
+}
+
+fn append_mcp_resource_tool_started(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    server: Option<&str>,
+) -> Result<()> {
+    store.append_event(
+        &session.id,
+        "tool.started",
+        json!({
+            "name": call.name,
+            "namespace": call.namespace,
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+            "mcp_server": server,
+            "mcp_tool": call.name,
+        }),
+    )?;
+    Ok(())
+}
+
+fn append_mcp_resource_tool_finished(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    server: Option<&str>,
+    wall_time: Duration,
+    payload: &Value,
+) -> Result<()> {
+    let (event_result, event_result_truncated, event_result_char_count) =
+        mcp_event_result_payload(payload);
+    store.append_event(
+        &session.id,
+        "mcp.resource_result",
+        json!({
+            "tool_call_id": call.id,
+            "name": call.name,
+            "namespace": call.namespace,
+            "mcp_server": server,
+            "mcp_tool": call.name,
+            "duration_ms": wall_time.as_millis(),
+            "result": event_result,
+            "result_truncated": event_result_truncated,
+            "result_char_count": event_result_char_count,
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "tool.finished",
+        json!({
+            "name": call.name,
+            "namespace": call.namespace,
+            "tool_call_id": call.id,
+            "mcp_server": server,
+            "mcp_tool": call.name,
+        }),
+    )?;
+    Ok(())
+}
+
+fn server_name_from_payload(payload: &Value) -> Option<&str> {
+    payload.get("server").and_then(Value::as_str)
 }
 
 fn mcp_event_result_payload(result: &Value) -> (Value, bool, usize) {
@@ -32828,6 +33183,100 @@ tool_timeout_ms = 2000
     }
 
     #[test]
+    fn provider_loop_dispatches_mcp_resource_tools_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let codex_home = create_empty_codex_home(temp.path())?;
+        let mcp_script = temp.path().join("mcp_resources.py");
+        write_test_mcp_resource_server(&mcp_script)?;
+        std::fs::write(
+            codex_home.join("config.toml"),
+            format!(
+                r#"
+[mcp_servers.docs]
+command = "python3"
+args = [{}]
+startup_timeout_ms = 2000
+tool_timeout_ms = 2000
+"#,
+                toml_basic_string(mcp_script.to_string_lossy().as_ref())
+            ),
+        )?;
+
+        with_codex_home(&codex_home, || -> Result<()> {
+            let store = Store::open(temp.path().join("state"))?;
+            let provider = ScriptedProvider::new(vec![
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "mcp_resources_1".to_string(),
+                            name: "list_mcp_resources".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({"server": "docs"}),
+                        },
+                    },
+                    ModelEvent::Done,
+                ],
+                vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "mcp_read_1".to_string(),
+                            name: "read_mcp_resource".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({
+                                "server": "docs",
+                                "uri": "memo://hello"
+                            }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ],
+                vec![
+                    ModelEvent::TextDelta {
+                        text: "final".to_string(),
+                    },
+                    ModelEvent::Done,
+                ],
+            ]);
+
+            let session_id = run_agent_with_provider(
+                &store,
+                &provider,
+                "Use MCP resources.",
+                temp.path(),
+                AgentRunOptions::default(),
+            )?;
+            let events = store.events_for_session(&session_id)?;
+            assert!(events.iter().any(|event| {
+                event.event_type == "mcp.resource_result"
+                    && event.payload["name"] == "list_mcp_resources"
+                    && event.payload["mcp_server"] == "docs"
+                    && event.payload["result"]["resources"][0]["uri"] == "memo://hello"
+            }));
+            assert!(events.iter().any(|event| {
+                event.event_type == MODEL_RESPONSE_INPUT_ITEM_EVENT
+                    && event.payload["call_id"] == "mcp_resources_1"
+                    && event.payload["item"]["output"]
+                        .as_str()
+                        .is_some_and(|output| {
+                            output.contains("\"server\":\"docs\"")
+                                && output.contains("\"uri\":\"memo://hello\"")
+                        })
+            }));
+            assert!(events.iter().any(|event| {
+                event.event_type == MODEL_RESPONSE_INPUT_ITEM_EVENT
+                    && event.payload["call_id"] == "mcp_read_1"
+                    && event.payload["item"]["output"]
+                        .as_str()
+                        .is_some_and(|output| output.contains("resource body"))
+            }));
+            assert!(events.iter().any(|event| {
+                event.event_type == "session.done" && event.payload["result"] == "final"
+            }));
+            Ok(())
+        })
+    }
+
+    #[test]
     fn mcp_result_tool_content_preserves_image_content_like_codex() {
         let content = mcp_result_tool_content(
             &serde_json::json!({
@@ -32935,6 +33384,77 @@ for line in sys.stdin:
                 "content": [{"type": "text", "text": "echo:" + text}],
                 "structuredContent": {"text": text},
                 "isError": False,
+            },
+        }
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )?;
+        Ok(())
+    }
+
+    fn write_test_mcp_resource_server(path: &Path) -> Result<()> {
+        std::fs::write(
+            path,
+            r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    params = request.get("params", {})
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"tools": {}, "resources": {}},
+                "serverInfo": {"name": "test", "version": "1.0"},
+            },
+        }
+    elif method == "tools/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {"tools": []},
+        }
+    elif method == "resources/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "resources": [{
+                    "uri": "memo://hello",
+                    "name": "hello",
+                    "mimeType": "text/plain",
+                }],
+            },
+        }
+    elif method == "resources/templates/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "resourceTemplates": [{
+                    "uriTemplate": "memo://{id}",
+                    "name": "memo",
+                }],
+            },
+        }
+    elif method == "resources/read":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "contents": [{
+                    "uri": params.get("uri"),
+                    "mimeType": "text/plain",
+                    "text": "resource body",
+                }],
             },
         }
     else:
