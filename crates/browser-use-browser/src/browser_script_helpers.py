@@ -680,8 +680,6 @@ def press_key(key, modifiers=0):
     }
     event_type = "rawKeyDown" if modifiers else "keyDown"
     cdp("Input.dispatchKeyEvent", type=event_type, **base, **({"text": text} if text and not modifiers else {}))
-    if text and len(text) == 1 and not modifiers:
-        cdp("Input.dispatchKeyEvent", type="char", text=text, **{k: v for k, v in base.items() if k != "text"})
     cdp("Input.dispatchKeyEvent", type="keyUp", **base)
     return True
 
