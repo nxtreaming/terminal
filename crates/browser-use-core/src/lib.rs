@@ -33549,6 +33549,18 @@ request_max_retries = 7
             namespace: None,
             arguments: serde_json::json!({"query": "subagent tools", "limit": 3}),
         };
+        let view_image_call = ToolCall {
+            id: "view_image".to_string(),
+            name: "view_image".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({"path": "/tmp/shot.png"}),
+        };
+        let browser_script_call = ToolCall {
+            id: "browser_script".to_string(),
+            name: "browser_script".to_string(),
+            namespace: None,
+            arguments: serde_json::json!({"code": "screenshot('current')"}),
+        };
 
         let default_router = with_browser_use_terminal_home(&app_home, || {
             browser_tool_router_for_session(&session, &AgentRunOptions::default(), "gpt-5.5", true)
@@ -33569,6 +33581,22 @@ request_max_retries = 7
         assert_eq!(
             tool_call_streaming_predispatch_kind(&default_router, &tool_search_call),
             Some(StreamingPredispatchKind::ReadOnly)
+        );
+        assert!(
+            !tool_call_supports_parallel(&default_router, &view_image_call),
+            "view_image must stay serial so screenshots/images are observed after prior parallel work"
+        );
+        assert_eq!(
+            tool_call_streaming_predispatch_kind(&default_router, &view_image_call),
+            None
+        );
+        assert!(
+            !tool_call_supports_parallel(&default_router, &browser_script_call),
+            "browser_script mutates shared browser state and must stay serial"
+        );
+        assert_eq!(
+            tool_call_streaming_predispatch_kind(&default_router, &browser_script_call),
+            None
         );
 
         let legacy = AgentRunOptions::default().with_config_overrides(vec![(

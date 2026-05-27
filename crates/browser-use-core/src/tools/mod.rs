@@ -346,7 +346,6 @@ impl ToolRouter {
                     | ToolHandlerKind::ReadFile
                     | ToolHandlerKind::SearchFiles
                     | ToolHandlerKind::ListFiles
-                    | ToolHandlerKind::ViewImage
                     | ToolHandlerKind::ToolSearch
                     | ToolHandlerKind::ListMcpResources
                     | ToolHandlerKind::ListMcpResourceTemplates
