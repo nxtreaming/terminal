@@ -1845,6 +1845,38 @@ The biggest remaining categories are:
   context/history/rollout reconstruction, stronger subagent inheritance and
   lifecycle ownership, dynamic app/plugin/MCP connector inventory, fuller tool
   runtime envelopes, and deeper local compaction/token lifecycle precision.
+- The current history/context slice closes a concrete typed-history and
+  turn-context gap. `$CODEX_HOME/history.jsonl` now follows Codex's append-only
+  JSONL shape with save/none config, max-byte trimming, file identity metadata,
+  lookup, and owner-only Unix permissions. CLI and TUI user submissions append
+  prompt history; TUI appends asynchronously so the terminal path stays
+  responsive.
+- The same slice enriches `context.baseline.turn_context` with model request
+  capabilities, config/profile/source details, history settings, feature flags,
+  MCP server inventory, available model metadata, final-output schema hints,
+  and runtime limits. This does not claim full Codex `TurnContext` or state-db
+  reconstruction parity, but it gives local replay/compaction/subagent
+  diagnostics a much closer client-state snapshot.
+- Remaining high-impact client-side gaps after this slice are full TUI message
+  history recall/search, typed rollout/state reconstruction, dynamic
+  app/plugin/extension tool contributors, async tool futures with cancellation
+  and read/write gating, first-class `InputQueue`/`TurnState`/`AgentControl`,
+  and deeper compaction/token lifecycle precision.
+- Verification for the history/context slice passed the full terminal UI
+  definition of done because `crates/browser-use-tui` changed: formatting,
+  full Rust tests, Python tests, deterministic setup/account/model/done/
+  running/cancelled/browser/history/developer dumps, and the real tmux terminal
+  smoke all passed via `scripts/verify-terminal-ui.sh`. The artifact directory
+  `/tmp/but-design-loop` was inspected, and no ANSI/bracketed-paste marker leaks
+  were found. The live Codex-auth smoke used root session `1e9dff3d2651` and
+  child session `6b27af558401`; the root returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke.txt` as `agent-parity-smoke-ok`.
+- Ten broad Codex-auth child audits after this slice all completed. The
+  repeated remaining gaps shifted toward the TUI/workbench layer: prompt
+  history recall/search, actionable resume/fork/backtrack/session recovery,
+  richer goal/status and turn/tool lifecycle visibility, token-usage trend and
+  breakdown displays, stronger interrupt/recovery affordances, attachment-rich
+  composer state, and exact transcript/history reconstruction.
 
 ## Definition of Done
 

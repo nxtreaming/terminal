@@ -2280,6 +2280,7 @@ impl App {
                     "session.input",
                     typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
                 )?;
+                self.maybe_append_message_history(&session.id, &text, &cwd, &options);
                 self.selected_session_id = Some(session.id.clone());
                 self.native_history.reset_with_clear();
                 self.start_agent_for_session(session.id)?;
@@ -2304,6 +2305,14 @@ impl App {
                     "session.followup",
                     typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
                 )?;
+                if let Ok(options) = self.configured_agent_options() {
+                    self.maybe_append_message_history(
+                        &session_id,
+                        &text,
+                        Path::new(&session.cwd),
+                        &options,
+                    );
+                }
                 if !active {
                     self.start_agent_for_session(session_id)?;
                 }
@@ -3197,6 +3206,34 @@ impl App {
             options = options.with_config_overrides(config_overrides);
         }
         Ok(options)
+    }
+
+    fn maybe_append_message_history(
+        &self,
+        session_id: &str,
+        text: &str,
+        cwd: &Path,
+        options: &AgentRunOptions,
+    ) {
+        #[cfg(not(test))]
+        {
+            let session_id = session_id.to_string();
+            let text = text.to_string();
+            let cwd = cwd.to_path_buf();
+            let options = options.clone();
+            std::thread::spawn(move || {
+                let _ = browser_use_core::append_message_history_entry_for_cwd(
+                    &text,
+                    &session_id,
+                    &cwd,
+                    &options,
+                );
+            });
+        }
+        #[cfg(test)]
+        {
+            let _ = (session_id, text, cwd, options);
+        }
     }
 
     fn session_model_selection_or_current(
