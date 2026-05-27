@@ -795,6 +795,14 @@ def smoke_streaming_transcript_scrolls_above_composer(binary: Path) -> None:
         append_store_event(
             state_dir,
             session_id,
+            "session.startup_warning",
+            {
+                "message": "Model `gpt-5.5` is not in the active model catalog; using conservative fallback capabilities."
+            },
+        )
+        append_store_event(
+            state_dir,
+            session_id,
             "model.turn.request",
             {"model": "GPT-5.5", "provider": "codex", "turn_idx": 1},
         )
@@ -849,6 +857,11 @@ def smoke_streaming_transcript_scrolls_above_composer(binary: Path) -> None:
         )
         time.sleep(0.5)
         done_full = capture(session, "transcript-scroll-done-full")
+        assert_contains(
+            done_full,
+            "Model `gpt-5.5` is not in the active model catalog",
+            "final committed answer should preserve deferred startup warnings",
+        )
         assert_count(
             done_full,
             "live output line 01",

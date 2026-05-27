@@ -5228,16 +5228,34 @@ fn strip_live_stream_prefix(
         return lines;
     }
     let line_text = plain_text_lines(&lines);
-    let skip = line_text
-        .iter()
-        .zip(live_stream_prefix.iter())
-        .take_while(|(line, prefix)| line.trim_end() == prefix.trim_end())
-        .count();
-    if skip == 0 {
-        lines
-    } else {
-        lines.into_iter().skip(skip).collect()
+    let Some(prefix_start) = live_stream_prefix_start(&line_text, live_stream_prefix) else {
+        return lines;
+    };
+    let prefix_end = prefix_start + live_stream_prefix.len();
+    lines
+        .into_iter()
+        .enumerate()
+        .filter_map(|(idx, line)| {
+            if (prefix_start..prefix_end).contains(&idx) {
+                None
+            } else {
+                Some(line)
+            }
+        })
+        .collect()
+}
+
+fn live_stream_prefix_start(line_text: &[String], live_stream_prefix: &[String]) -> Option<usize> {
+    if live_stream_prefix.is_empty() || live_stream_prefix.len() > line_text.len() {
+        return None;
     }
+    let last_start = line_text.len() - live_stream_prefix.len();
+    (0..=last_start).rev().find(|start| {
+        line_text[*start..*start + live_stream_prefix.len()]
+            .iter()
+            .zip(live_stream_prefix.iter())
+            .all(|(line, prefix)| line.trim_end() == prefix.trim_end())
+    })
 }
 
 fn plain_text_lines(lines: &[Line<'static>]) -> Vec<String> {
@@ -8573,6 +8591,33 @@ wire_api = "responses"
         assert!(!screen.contains("SHOULD_NOT_RENDER"), "{screen}");
         assert!(!screen.contains("real file body"), "{screen}");
         Ok(())
+    }
+
+    #[test]
+    fn live_stream_prefix_strips_after_deferred_warning_rows() {
+        let lines = vec![
+            Line::from("• warning"),
+            Line::from("  └ Model `gpt-5.5` is not in the active model catalog."),
+            Line::from(
+                "Not much. I'm in /Users/reagan/.superset/projects/browser-use-terminal and",
+            ),
+            Line::from("ready to work on the repo."),
+        ];
+        let prefix = vec![
+            "Not much. I'm in /Users/reagan/.superset/projects/browser-use-terminal and"
+                .to_string(),
+        ];
+
+        let stripped = plain_text_lines(&strip_live_stream_prefix(lines, &prefix));
+
+        assert_eq!(
+            stripped,
+            vec![
+                "• warning",
+                "  └ Model `gpt-5.5` is not in the active model catalog.",
+                "ready to work on the repo.",
+            ]
+        );
     }
 
     #[test]
