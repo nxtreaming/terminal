@@ -350,6 +350,39 @@ pub(crate) fn call_tool(definition: &McpToolDefinition, arguments: &Value) -> Re
     )
 }
 
+pub(crate) fn list_resources(server: &McpServerConfig, cursor: Option<&str>) -> Result<Value> {
+    list_resource_page(server, McpResourceListKind::Resources, cursor)
+}
+
+pub(crate) fn list_resource_templates(
+    server: &McpServerConfig,
+    cursor: Option<&str>,
+) -> Result<Value> {
+    list_resource_page(server, McpResourceListKind::Templates, cursor)
+}
+
+pub(crate) fn read_resource(server: &McpServerConfig, uri: &str) -> Result<Value> {
+    run_mcp_operation(
+        server,
+        McpOperation::ReadResource {
+            uri: uri.to_string(),
+        },
+        server.tool_timeout_ms,
+    )
+}
+
+pub(crate) fn list_all_resources(
+    servers: &BTreeMap<String, McpServerConfig>,
+) -> BTreeMap<String, Vec<Value>> {
+    list_all_resource_items(servers, McpResourceListKind::Resources)
+}
+
+pub(crate) fn list_all_resource_templates(
+    servers: &BTreeMap<String, McpServerConfig>,
+) -> BTreeMap<String, Vec<Value>> {
+    list_all_resource_items(servers, McpResourceListKind::Templates)
+}
+
 fn list_server_tools(server: &McpServerConfig) -> Result<Vec<Value>> {
     let result = run_mcp_operation(server, McpOperation::ListTools, server.startup_timeout_ms)?;
     Ok(result
@@ -359,10 +392,117 @@ fn list_server_tools(server: &McpServerConfig) -> Result<Vec<Value>> {
         .unwrap_or_default())
 }
 
+#[derive(Clone, Copy, Debug)]
+enum McpResourceListKind {
+    Resources,
+    Templates,
+}
+
+impl McpResourceListKind {
+    fn method(self) -> &'static str {
+        match self {
+            Self::Resources => "resources/list",
+            Self::Templates => "resources/templates/list",
+        }
+    }
+
+    fn result_key(self) -> &'static str {
+        match self {
+            Self::Resources => "resources",
+            Self::Templates => "resourceTemplates",
+        }
+    }
+
+    fn fallback_result_key(self) -> &'static str {
+        match self {
+            Self::Resources => "resources",
+            Self::Templates => "resource_templates",
+        }
+    }
+}
+
+fn list_resource_page(
+    server: &McpServerConfig,
+    kind: McpResourceListKind,
+    cursor: Option<&str>,
+) -> Result<Value> {
+    run_mcp_operation(
+        server,
+        McpOperation::ListResources {
+            kind,
+            cursor: cursor.map(str::to_string),
+        },
+        server.tool_timeout_ms,
+    )
+}
+
+fn list_all_resource_items(
+    servers: &BTreeMap<String, McpServerConfig>,
+    kind: McpResourceListKind,
+) -> BTreeMap<String, Vec<Value>> {
+    let mut collected_by_server = BTreeMap::new();
+    for server in servers.values() {
+        let Ok(collected) = list_all_resource_items_for_server(server, kind) else {
+            continue;
+        };
+        collected_by_server.insert(server.server_name.clone(), collected);
+    }
+    collected_by_server
+}
+
+fn list_all_resource_items_for_server(
+    server: &McpServerConfig,
+    kind: McpResourceListKind,
+) -> Result<Vec<Value>> {
+    let mut collected = Vec::new();
+    let mut cursor: Option<String> = None;
+    let mut seen_cursors = BTreeSet::new();
+    loop {
+        let result = list_resource_page(server, kind, cursor.as_deref())?;
+        collected.extend(mcp_resource_items(&result, kind));
+        let Some(next_cursor) = mcp_next_cursor(&result) else {
+            return Ok(collected);
+        };
+        if !seen_cursors.insert(next_cursor.clone()) {
+            bail!("{} returned duplicate cursor", kind.method());
+        }
+        cursor = Some(next_cursor);
+    }
+}
+
+fn mcp_resource_items(result: &Value, kind: McpResourceListKind) -> Vec<Value> {
+    result
+        .get(kind.result_key())
+        .or_else(|| result.get(kind.fallback_result_key()))
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default()
+}
+
+fn mcp_next_cursor(result: &Value) -> Option<String> {
+    result
+        .get("nextCursor")
+        .or_else(|| result.get("next_cursor"))
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|cursor| !cursor.is_empty())
+        .map(str::to_string)
+}
+
 #[derive(Clone, Debug)]
 enum McpOperation {
     ListTools,
-    CallTool { name: String, arguments: Value },
+    CallTool {
+        name: String,
+        arguments: Value,
+    },
+    ListResources {
+        kind: McpResourceListKind,
+        cursor: Option<String>,
+    },
+    ReadResource {
+        uri: String,
+    },
 }
 
 fn run_mcp_operation(
@@ -501,6 +641,35 @@ fn run_mcp_operation_inner(
                         "params": {
                             "name": name,
                             "arguments": arguments,
+                        },
+                    }),
+                )?;
+                read_json_rpc_response(&mut stdout, 2)
+            }
+            McpOperation::ListResources { kind, cursor } => {
+                let params = cursor
+                    .map(|cursor| json!({ "cursor": cursor }))
+                    .unwrap_or_else(|| json!({}));
+                write_json_rpc(
+                    &mut stdin,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": kind.method(),
+                        "params": params,
+                    }),
+                )?;
+                read_json_rpc_response(&mut stdout, 2)
+            }
+            McpOperation::ReadResource { uri } => {
+                write_json_rpc(
+                    &mut stdin,
+                    &json!({
+                        "jsonrpc": "2.0",
+                        "id": 2,
+                        "method": "resources/read",
+                        "params": {
+                            "uri": uri,
                         },
                     }),
                 )?;
@@ -1000,6 +1169,105 @@ for line in sys.stdin:
         assert_eq!(result["content"][0]["text"], "echo:hello");
         assert_eq!(result["structuredContent"]["text"], "hello");
         assert_eq!(result["isError"], false);
+        Ok(())
+    }
+
+    #[test]
+    fn lists_and_reads_stdio_mcp_resources_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let script = temp.path().join("resource_server.py");
+        std::fs::write(
+            &script,
+            r#"
+import json
+import sys
+
+for line in sys.stdin:
+    request = json.loads(line)
+    method = request.get("method")
+    params = request.get("params", {})
+    if method == "initialize":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "protocolVersion": "2024-11-05",
+                "capabilities": {"resources": {}},
+                "serverInfo": {"name": "test", "version": "1.0"},
+            },
+        }
+    elif method == "resources/list":
+        if params.get("cursor") == "page-2":
+            response = {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "resources": [{"uri": "memo://two", "name": "two"}],
+                },
+            }
+        else:
+            response = {
+                "jsonrpc": "2.0",
+                "id": request["id"],
+                "result": {
+                    "resources": [{"uri": "memo://one", "name": "one"}],
+                    "nextCursor": "page-2",
+                },
+            }
+    elif method == "resources/templates/list":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "resourceTemplates": [{"uriTemplate": "memo://{id}", "name": "memo"}],
+            },
+        }
+    elif method == "resources/read":
+        response = {
+            "jsonrpc": "2.0",
+            "id": request["id"],
+            "result": {
+                "contents": [{
+                    "uri": params.get("uri"),
+                    "mimeType": "text/plain",
+                    "text": "resource body",
+                }],
+            },
+        }
+    else:
+        continue
+    sys.stdout.write(json.dumps(response) + "\n")
+    sys.stdout.flush()
+"#,
+        )?;
+        let server = McpServerConfig {
+            server_name: "docs".to_string(),
+            command: "python3".to_string(),
+            args: vec![script.display().to_string()],
+            env: BTreeMap::new(),
+            cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
+            startup_timeout_ms: 2_000,
+            tool_timeout_ms: 2_000,
+            enabled_tools: None,
+            disabled_tools: BTreeSet::new(),
+        };
+
+        let first_page = list_resources(&server, None)?;
+        assert_eq!(first_page["resources"][0]["uri"], "memo://one");
+        assert_eq!(first_page["nextCursor"], "page-2");
+        let templates = list_resource_templates(&server, None)?;
+        assert_eq!(
+            templates["resourceTemplates"][0]["uriTemplate"],
+            "memo://{id}"
+        );
+        let read = read_resource(&server, "memo://one")?;
+        assert_eq!(read["contents"][0]["text"], "resource body");
+
+        let all = list_all_resources(&BTreeMap::from([("docs".to_string(), server)]));
+        assert_eq!(all["docs"].len(), 2);
+        assert_eq!(all["docs"][1]["uri"], "memo://two");
         Ok(())
     }
 

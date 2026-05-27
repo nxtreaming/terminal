@@ -1946,6 +1946,45 @@ The biggest remaining categories are:
   reconstruction, token-window/compaction precision, goal runtime state depth,
   structured review/user-shell surfaces, hook trust/handler breadth,
   skill/plugin manager side effects, and multi-environment tool routing.
+- The current MCP resource slice closes another concrete dynamic-tool gap.
+  When MCP servers are configured, the registry now exposes Codex-shaped
+  `list_mcp_resources`, `list_mcp_resource_templates`, and `read_mcp_resource`
+  tools. Dispatch sends stdio MCP `resources/list`, `resources/templates/list`,
+  and `resources/read` requests, supports single-server cursors, aggregates
+  all-server listings with server-tagged entries, records `mcp.resource_result`
+  sidecars, and marks the resource tools as read-only/parallel-safe. This gives
+  the model a portable way to inspect MCP-provided context without relying on
+  browser behavior or OpenAI-only server features.
+- Focused verification for the MCP resource slice passed
+  `cargo test -p browser-use-core mcp_resource -- --nocapture`, covering tool
+  specs/read-only dispatch flags, raw stdio resource list/template/read calls,
+  pagination aggregation, and provider-loop model-visible outputs. It does not
+  claim persistent MCP-session parity; the local MCP path still launches per
+  operation and still lacks Codex's streamable HTTP/OAuth/elicitation/app/plugin
+  connector lifecycle.
+- Full verification for this slice passed `cargo fmt --check`,
+  `git diff --check`, `uv run --with pytest python -m pytest -q`, and
+  `cargo test`. The Rust workspace results were browser-use-browser 16 passed
+  plus 2 ignored browser smokes, CLI 18, core 466, protocol 19, providers 104,
+  python-worker 11, store 15, TUI 143, and doc-tests. The live Codex-auth smoke
+  used root session `7a8cbb74fe0c` and child session `03275ba33199`; the root
+  returned `Paris`, and the child read
+  `/tmp/but-codex-agent-parity-smoke-mcpres-final.txt` as
+  `agent-parity-smoke-ok`. No TUI behavior changed, so
+  `scripts/verify-terminal-ui.sh` was not rerun for this slice.
+- Ten broad read-only child audits after the MCP resource slice all completed.
+  They agreed the resource tools are a useful local parity improvement and did
+  not report a bounded regression. The consensus remaining gaps are larger
+  provider-neutral runtime systems: dynamic per-turn tool contributors for
+  plugins/apps/extensions/deferred tools, persistent MCP sessions, unified
+  cancellable async tool execution with read/write gates, first-class
+  `InputQueue`/`TurnState`/`AgentControl`, typed response-item history and
+  rollout/fork/replay reconstruction, compaction/token-window precision,
+  multi-environment tool routing, hook engine/trust depth, plugin/skill manager
+  side effects, and fuller goal/review/user-shell lifecycle state. The most
+  repeated next implementation order was persistent stdio MCP manager, dynamic
+  tool contributor planning, active-turn/tool cancellation runtime, then typed
+  history reconstruction.
 
 ## Definition of Done
 

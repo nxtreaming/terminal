@@ -1,4 +1,4 @@
-use crate::mcp::McpToolDefinition;
+use crate::mcp::{McpServerConfig, McpToolDefinition};
 use bm25::{Document, Language, SearchEngine, SearchEngineBuilder};
 use browser_use_protocol::{FreeformToolFormat, ToolSpec};
 use browser_use_providers::ModelShellType;
@@ -65,6 +65,9 @@ pub(crate) enum ToolHandlerKind {
     CloseAgentV1,
     ToolSearch,
     McpTool,
+    ListMcpResources,
+    ListMcpResourceTemplates,
+    ReadMcpResource,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -87,6 +90,7 @@ pub(crate) struct RegisteredTool {
 pub(crate) struct ToolRegistry {
     tools: Vec<RegisteredTool>,
     allow_login_shell: bool,
+    mcp_servers: BTreeMap<String, McpServerConfig>,
 }
 
 impl Default for ToolRegistry {
@@ -94,6 +98,7 @@ impl Default for ToolRegistry {
         Self {
             tools: Vec::new(),
             allow_login_shell: true,
+            mcp_servers: BTreeMap::new(),
         }
     }
 }
@@ -312,6 +317,14 @@ impl ToolRouter {
             .cloned()
     }
 
+    pub(crate) fn mcp_server(&self, server_name: &str) -> Option<McpServerConfig> {
+        self.registry.mcp_servers.get(server_name).cloned()
+    }
+
+    pub(crate) fn mcp_servers(&self) -> BTreeMap<String, McpServerConfig> {
+        self.registry.mcp_servers.clone()
+    }
+
     pub(crate) fn tool_supports_parallel(
         &self,
         call_namespace: Option<&str>,
@@ -334,6 +347,9 @@ impl ToolRouter {
                     | ToolHandlerKind::ListFiles
                     | ToolHandlerKind::ViewImage
                     | ToolHandlerKind::ToolSearch
+                    | ToolHandlerKind::ListMcpResources
+                    | ToolHandlerKind::ListMcpResourceTemplates
+                    | ToolHandlerKind::ReadMcpResource
             )
         )
     }
@@ -358,6 +374,9 @@ impl ToolRouter {
                     | ToolHandlerKind::ListFiles
                     | ToolHandlerKind::ViewImage
                     | ToolHandlerKind::ToolSearch
+                    | ToolHandlerKind::ListMcpResources
+                    | ToolHandlerKind::ListMcpResourceTemplates
+                    | ToolHandlerKind::ReadMcpResource
             )
         )
     }
@@ -599,6 +618,28 @@ impl ToolRegistry {
                 mcp_tool: Some(tool),
             });
         }
+    }
+
+    pub(crate) fn register_mcp_resource_tools(
+        &mut self,
+        servers: BTreeMap<String, McpServerConfig>,
+    ) {
+        if servers.is_empty() {
+            return;
+        }
+        self.mcp_servers = servers;
+        self.register(
+            list_mcp_resources_tool_spec(),
+            ToolHandlerKind::ListMcpResources,
+        );
+        self.register(
+            list_mcp_resource_templates_tool_spec(),
+            ToolHandlerKind::ListMcpResourceTemplates,
+        );
+        self.register(
+            read_mcp_resource_tool_spec(),
+            ToolHandlerKind::ReadMcpResource,
+        );
     }
 
     pub(crate) fn allow_login_shell(&self) -> bool {
@@ -1357,6 +1398,84 @@ fn write_stdin_tool_spec() -> ToolSpec {
             "additionalProperties": false
         }),
         output_schema: Some(unified_exec_output_schema()),
+        freeform: None,
+    }
+}
+
+fn list_mcp_resources_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "list_mcp_resources".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Lists resources provided by MCP servers. Resources allow servers to share data that provides context to language models, such as files, database schemas, or application-specific information. Prefer resources over web search when possible.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Optional MCP server name. When omitted, lists resources from every configured server."
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor returned by a previous list_mcp_resources call for the same server."
+                }
+            },
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn list_mcp_resource_templates_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "list_mcp_resource_templates".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Lists resource templates provided by MCP servers. Parameterized resource templates allow servers to share data that takes parameters and provides context to language models, such as files, database schemas, or application-specific information. Prefer resource templates over web search when possible.".to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "Optional MCP server name. When omitted, lists resource templates from all configured servers."
+                },
+                "cursor": {
+                    "type": "string",
+                    "description": "Opaque cursor returned by a previous list_mcp_resource_templates call for the same server."
+                }
+            },
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn read_mcp_resource_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "read_mcp_resource".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description:
+            "Read a specific resource from an MCP server given the server name and resource URI."
+                .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "server": {
+                    "type": "string",
+                    "description": "MCP server name exactly as configured. Must match the 'server' field returned by list_mcp_resources."
+                },
+                "uri": {
+                    "type": "string",
+                    "description": "Resource URI to read. Must be one of the URIs returned by list_mcp_resources."
+                }
+            },
+            "required": ["server", "uri"],
+            "additionalProperties": false
+        }),
+        output_schema: None,
         freeform: None,
     }
 }
@@ -2606,6 +2725,52 @@ mod tests {
         assert_eq!(loaded[0]["type"], "namespace");
         assert_eq!(loaded[0]["name"], "mcp__docs__");
         assert_eq!(loaded[0]["tools"][0]["defer_loading"], true);
+    }
+
+    #[test]
+    fn mcp_resource_tools_match_codex_specs_and_are_read_only() {
+        let server = crate::mcp::McpServerConfig {
+            server_name: "docs".to_string(),
+            command: "python3".to_string(),
+            args: Vec::new(),
+            env: std::collections::BTreeMap::new(),
+            cwd: None,
+            required: false,
+            supports_parallel_tool_calls: false,
+            startup_timeout_ms: 1,
+            tool_timeout_ms: 1,
+            enabled_tools: None,
+            disabled_tools: std::collections::BTreeSet::new(),
+        };
+        let mut registry = ToolRegistry::default();
+        registry.register_mcp_resource_tools(std::collections::BTreeMap::from([(
+            "docs".to_string(),
+            server,
+        )]));
+        let router = ToolRouter::new(registry, true, true);
+        let specs = router.model_visible_specs();
+        assert!(specs.iter().any(|spec| {
+            spec.name == "list_mcp_resources"
+                && spec.description.starts_with("Lists resources provided by MCP servers")
+                && spec.input_schema["properties"]["server"]["description"]
+                    == "Optional MCP server name. When omitted, lists resources from every configured server."
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.name == "list_mcp_resource_templates"
+                && spec
+                    .description
+                    .starts_with("Lists resource templates provided by MCP servers")
+        }));
+        assert!(specs.iter().any(|spec| {
+            spec.name == "read_mcp_resource"
+                && spec.input_schema["required"] == serde_json::json!(["server", "uri"])
+        }));
+        assert!(router.tool_supports_parallel(None, "list_mcp_resources"));
+        assert!(router.tool_supports_streaming_predispatch(None, "read_mcp_resource"));
+        assert_eq!(
+            router.mcp_server("docs").map(|server| server.server_name),
+            Some("docs".to_string())
+        );
     }
 
     #[test]
