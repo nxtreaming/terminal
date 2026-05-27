@@ -1,5 +1,8 @@
 use browser_use_core::CollaborationModeKind;
-use browser_use_protocol::{normalize_result_text, EventRecord, SessionMeta, WorkbenchState};
+use browser_use_protocol::{
+    normalize_result_text, turn_streaming_text_from_events, EventRecord, SessionMeta,
+    WorkbenchState,
+};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde::Deserialize;
@@ -415,7 +418,7 @@ pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<Tran
     let mut terminal_committed = Vec::new();
 
     for event in events {
-        if let Some(node) = committed_node_for_event(app, state, session, event) {
+        if let Some(node) = committed_node_for_event(app, state, session, events, event) {
             terminal_committed.push(node.clone());
             push_committed_node(&mut committed, node);
         }
@@ -640,6 +643,7 @@ fn committed_node_for_event(
     app: &App,
     state: &WorkbenchState,
     root: &SessionMeta,
+    events: &[EventRecord],
     event: &EventRecord,
 ) -> Option<TranscriptNode> {
     if event.session_id != root.id {
@@ -687,6 +691,7 @@ fn committed_node_for_event(
                 },
             })
         }
+        "model.turn.response" => pre_tool_commentary_node(root, events, event),
         "plan.proposed" => {
             let text = payload_string(event, "text")?;
             Some(TranscriptNode {
@@ -950,7 +955,6 @@ fn committed_node_for_event(
             NodeStyle::Failed,
         )),
         "model.turn.request"
-        | "model.turn.response"
         | "model.thinking_delta"
         | "model.turn.retry"
         | "model.stream_delta"
@@ -1050,6 +1054,46 @@ fn model_response_tool_call_count(event: &EventRecord) -> u64 {
         .get("tool_call_count")
         .and_then(serde_json::Value::as_u64)
         .unwrap_or(0)
+}
+
+fn pre_tool_commentary_node(
+    root: &SessionMeta,
+    events: &[EventRecord],
+    event: &EventRecord,
+) -> Option<TranscriptNode> {
+    if event.session_id != root.id || model_response_tool_call_count(event) == 0 {
+        return None;
+    }
+    let response_idx = events.iter().position(|candidate| {
+        candidate.session_id == event.session_id
+            && candidate.seq == event.seq
+            && candidate.event_type == event.event_type
+    })?;
+    let turn_start = events[..response_idx]
+        .iter()
+        .rposition(|candidate| {
+            candidate.session_id == root.id
+                && matches!(
+                    candidate.event_type.as_str(),
+                    "model.turn.request" | "model.turn.retry" | "model.turn.error"
+                )
+        })
+        .map(|idx| idx.saturating_add(1))
+        .unwrap_or(0);
+    let markdown = turn_streaming_text_from_events(&events[turn_start..response_idx])?;
+    let markdown = markdown.trim_end().to_string();
+    if markdown.trim().is_empty() {
+        return None;
+    }
+    Some(TranscriptNode {
+        id: format!("{}:{}:commentary", event.session_id, event.seq),
+        seq: event.seq,
+        revision: event.seq.max(0) as u64,
+        kind: TranscriptKind::Assistant {
+            markdown,
+            source: None,
+        },
+    })
 }
 
 fn active_node_for_session(
@@ -1232,7 +1276,7 @@ fn active_timeline_tail_node(
 ) -> Option<TranscriptNode> {
     let nodes = live_events
         .iter()
-        .filter_map(|event| committed_node_for_event(app, state, root, event))
+        .filter_map(|event| committed_node_for_event(app, state, root, live_events, event))
         .filter(|node| !node.is_terminal_scrollback_transient())
         .collect::<Vec<_>>();
     let last = nodes.last()?;
@@ -1280,7 +1324,7 @@ fn pending_followup_active_node(
     let has_prior_scrollback = events
         .iter()
         .filter(|event| event.seq < latest_followup.seq)
-        .filter_map(|event| committed_node_for_event(app, state, root, event))
+        .filter_map(|event| committed_node_for_event(app, state, root, events, event))
         .any(|node| !node.is_terminal_scrollback_transient());
     if !has_prior_scrollback {
         return None;
@@ -1288,7 +1332,7 @@ fn pending_followup_active_node(
     let has_committed_output_after = events
         .iter()
         .filter(|event| event.seq > latest_followup.seq)
-        .filter_map(|event| committed_node_for_event(app, state, root, event))
+        .filter_map(|event| committed_node_for_event(app, state, root, events, event))
         .filter(|node| !node.is_terminal_scrollback_transient())
         .any(|node| !node.is_prompt());
     if has_committed_output_after {

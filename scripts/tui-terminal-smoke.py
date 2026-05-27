@@ -1049,8 +1049,8 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
         assert_count(
             response_visible,
             "streaming now",
-            0,
-            "streaming text hidden by a tool-call response should not remain duplicated in active viewport",
+            1,
+            "streaming text before a tool-call response should commit once above the tool row",
         )
     finally:
         tmux("kill-session", "-t", session, check=False)

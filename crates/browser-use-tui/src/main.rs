@@ -8401,7 +8401,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn pre_tool_streaming_text_is_hidden_after_tool_call_response() -> Result<()> {
+    fn pre_tool_streaming_text_commits_before_tool_rows() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -8449,7 +8449,7 @@ wire_api = "responses"
 
         let screen = render_dump(&mut app)?;
         assert!(!screen.contains("• note"));
-        assert!(!screen.contains("Need more targeted."));
+        assert!(screen.contains("Need more targeted."));
         assert!(screen.contains("Final answer from session.done."));
         assert!(!screen.contains("• answer draft"));
         Ok(())
@@ -9708,16 +9708,16 @@ wire_api = "responses"
 
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
-        let note_emission = transcript::terminal_scrollback_emission_since(
+        let commentary_emission = transcript::terminal_scrollback_emission_since(
             &model,
             prompt_emission.last_seq,
             120,
             true,
         );
-        let note_text = lines_plain_text(&note_emission.lines);
-        assert!(!note_text.contains("> can you tell me about this repo?"));
-        assert!(!note_text.contains("• note"));
-        assert!(!note_text.contains("Yoooo! What can I help you with?"));
+        let commentary_text = lines_plain_text(&commentary_emission.lines);
+        assert!(!commentary_text.contains("> can you tell me about this repo?"));
+        assert!(!commentary_text.contains("• note"));
+        assert!(commentary_text.contains("Yoooo! What can I help you with?"));
         let replay_emission =
             transcript::terminal_scrollback_emission_since(&model, done_seq, 120, true);
         let replay_text = lines_plain_text(&replay_emission.lines);
@@ -9729,7 +9729,7 @@ wire_api = "responses"
             "{replay_text}"
         );
         assert!(!replay_text.contains("• note"));
-        assert!(!replay_text.contains("Yoooo! What can I help you with?"));
+        assert!(replay_text.contains("Yoooo! What can I help you with?"));
 
         app.args.width = 120;
         app.args.height = 28;
@@ -9737,7 +9737,7 @@ wire_api = "responses"
         assert_eq!(
             active_screen.matches("Yoooo! What can I help you with?").count(),
             0,
-            "stream text committed as a note should not be duplicated in the active viewport\n{active_screen}"
+            "committed pre-tool commentary should not be duplicated in the active viewport\n{active_screen}"
         );
         Ok(())
     }
