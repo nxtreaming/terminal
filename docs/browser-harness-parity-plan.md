@@ -88,6 +88,47 @@ agent-facing surfaces should converge:
 - browser state recovery and stale-target handling
 - conformance evidence for real tasks
 
+## Browser-Script Helper Compatibility Contract
+
+For helpers exposed through `browser_script`, browser-harness is the source of
+truth when a helper name overlaps. Rod is the CDP-level sanity check: if a helper
+claims to simulate a physical browser action, its CDP events should look like a
+normal Rod or browser-harness path, not a custom mixture the model has to
+remember.
+
+The immediate input contract is:
+
+- `press_key(key, modifiers=0)` simulates a physical key or shortcut. Printable
+  unmodified keys send one text-bearing `Input.dispatchKeyEvent` keydown and a
+  matching keyup. Modified shortcuts such as `Meta+A` send key events without
+  text insertion. It must not emit a second manual `char` event for the same
+  character.
+- `type_text(text)` is text insertion or paste semantics. It maps directly to
+  `Input.insertText` for the focused element.
+- `fill_input(selector, text)` is the default for React, Vue, Svelte, Polaris,
+  and other controlled inputs. It focuses the element, clears with raw
+  Cmd/Ctrl+A plus Backspace, types via physical key events, and dispatches final
+  `input` and `change` events. Direct `element.value = ...` mutation is not the
+  default path because it can visually fill a composer while leaving framework
+  state and submit buttons disabled.
+
+Initial helper audit matrix:
+
+| Helper area | Compatibility target | Status |
+| --- | --- | --- |
+| `press_key` | Must match browser-harness physical key semantics; Rod-style separation between key events and text insertion | Covered by unit tests for chords, no manual `char`, and exact printable key events |
+| `type_text` | Must map to `Input.insertText` | Covered by unit test |
+| `fill_input` | Must use browser-harness focus, clear, physical typing, and final event path | Covered by unit tests plus an ignored real-browser controlled-textarea smoke |
+| `click_at_xy`, mouse, scroll | Should match browser-harness unless runtime constraints require a documented adaptation | Pending audit |
+| screenshots, viewport, image emission | Should match browser-harness model-visible artifact and image behavior | Pending audit |
+| tabs, navigation, lifecycle waits | Should match browser-harness helper names, return shapes, and stale-target recovery behavior | Pending audit |
+| uploads, downloads, dialogs, network, `http_get` | Should match browser-harness behavior where exposed to the agent | Pending audit |
+| terminal-only helpers | May diverge only with explicit docs and prompt wording | Pending audit |
+
+The work order for helper parity is input and keyboard first, mouse/click/scroll
+next, screenshots and viewport after that, then tabs/navigation, then
+uploads/downloads/dialogs/network.
+
 ## Workstreams
 
 ### 1. Prompt And Tool Contract Parity

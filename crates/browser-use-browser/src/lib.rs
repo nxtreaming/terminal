@@ -5051,6 +5051,125 @@ print("press_key chords ok")
     }
 
     #[test]
+    fn browser_script_press_key_does_not_emit_duplicate_char_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-press-key-no-char",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+seen = []
+
+def cdp(method, **params):
+    seen.append((method, params))
+    return {}
+
+press_key("a")
+events = [params for method, params in seen if method == "Input.dispatchKeyEvent"]
+assert [(event["type"], event["key"], event.get("text")) for event in events] == [
+    ("keyDown", "a", "a"),
+    ("keyUp", "a", None),
+], events
+assert not any(event.get("type") == "char" for event in events), events
+print("press_key no char ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("press_key no char ok"));
+    }
+
+    #[test]
+    fn browser_script_fill_input_matches_browser_harness_key_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-fill-input-key-events",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+import sys
+
+seen = []
+
+def js(expression, *args, **kwargs):
+    return True
+
+def cdp(method, **params):
+    if method == "Input.dispatchKeyEvent":
+        seen.append(params)
+    return {}
+
+fill_input("#inp", "CP23-29", clear_first=False)
+text_events = [event for event in seen if event.get("text")]
+assert [(event["key"], event["code"], event["text"]) for event in text_events] == [
+    ("C", "KeyC", "C"),
+    ("P", "KeyP", "P"),
+    ("2", "Digit2", "2"),
+    ("3", "Digit3", "3"),
+    ("-", "Minus", "-"),
+    ("2", "Digit2", "2"),
+    ("9", "Digit9", "9"),
+], seen
+assert not any(event.get("type") == "char" for event in seen), seen
+assert not any(event.get("key") == "Backspace" for event in seen), seen
+
+seen.clear()
+fill_input("#inp", "x", clear_first=True)
+expected_mod = 4 if sys.platform == "darwin" else 2
+a_events = [event for event in seen if event.get("key") == "a"]
+assert a_events, seen
+assert all(event.get("modifiers") == expected_mod for event in a_events), seen
+assert not any(event.get("type") == "char" and event.get("text") == "a" for event in seen), seen
+assert "Backspace" in [event.get("key") for event in seen], seen
+print("fill_input key events ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("fill_input key events ok"));
+    }
+
+    #[test]
+    fn browser_script_type_text_maps_to_insert_text_and_fill_input_missing_selector_errors() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-type-text-and-missing-input",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+seen = []
+
+def cdp(method, **params):
+    seen.append((method, params))
+    return {}
+
+type_text("go to google")
+assert seen == [("Input.insertText", {"text": "go to google"})], seen
+
+def js(expression, *args, **kwargs):
+    return False
+
+try:
+    fill_input("#missing", "hello")
+except RuntimeError as exc:
+    assert "element not found" in str(exc), exc
+else:
+    raise AssertionError("fill_input should reject a missing selector")
+print("type_text and missing selector ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("type_text and missing selector ok"));
+    }
+
+    #[test]
     fn browser_script_http_get_matches_proxy_gzip_and_binary_contracts() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -5638,6 +5757,90 @@ screenshot("managed_smoke")
             !script.images.is_empty(),
             "expected screenshot image artifact"
         );
+
+        cleanup_session(session_id);
+    }
+
+    #[test]
+    #[ignore = "launches a real local Chromium-family browser for controlled-input smoke verification"]
+    fn managed_browser_fill_input_controlled_textarea_smoke() {
+        if chromium_candidate_paths(true).is_empty() {
+            eprintln!("skipping controlled textarea smoke: no Chromium-family browser found");
+            return;
+        }
+
+        let temp = tempfile::tempdir().unwrap();
+        let artifacts = temp.path().join("artifacts");
+        let session_id = "managed-controlled-input-smoke";
+
+        let connect = run_browser_command(
+            session_id,
+            temp.path(),
+            &artifacts,
+            "browser connect managed --headless",
+        )
+        .unwrap();
+        assert_eq!(connect.content["status"], "connected");
+
+        let script = run_browser_script(
+            session_id,
+            temp.path(),
+            &artifacts,
+            r##"
+new_tab("about:blank")
+js("""
+(() => {
+  document.title = "Controlled Input Smoke";
+  document.body.innerHTML = `
+    <textarea id="composer" placeholder="Message"></textarea>
+    <button id="send" disabled>Send</button>
+    <output id="result"></output>
+  `;
+  const textarea = document.querySelector("#composer");
+  const send = document.querySelector("#send");
+  const result = document.querySelector("#result");
+  let state = "";
+  const render = () => {
+    send.disabled = state.length === 0;
+  };
+  textarea.addEventListener("input", event => {
+    state = event.target.value;
+    render();
+  });
+  send.addEventListener("click", () => {
+    result.textContent = state;
+  });
+  render();
+  return true;
+})()
+""")
+wait_for_element("#composer")
+fill_input("#composer", "go to google", timeout=2)
+state = js("""
+(() => {
+  const textarea = document.querySelector("#composer");
+  const send = document.querySelector("#send");
+  const result = document.querySelector("#result");
+  return {
+    value: textarea.value,
+    disabled: send.disabled,
+    result: result.textContent,
+  };
+})()
+""")
+print("state", state)
+assert state["value"] == "go to google", state
+assert state["disabled"] is False, state
+js('document.querySelector("#send").click(); true')
+submitted = js('document.querySelector("#result").textContent')
+assert submitted == "go to google", submitted
+(pathlib.Path(outputs_dir()) / "controlled-input-smoke.json").write_text(json.dumps(state), encoding="utf-8")
+"##,
+            30,
+        )
+        .unwrap();
+        assert!(script.ok, "{:?}\n{}", script.error, script.text);
+        assert!(script.text.contains("go to google"), "{}", script.text);
 
         cleanup_session(session_id);
     }
