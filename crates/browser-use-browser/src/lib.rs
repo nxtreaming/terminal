@@ -5014,6 +5014,43 @@ print("fill_input js ok")
     }
 
     #[test]
+    fn browser_script_press_key_accepts_common_chord_strings() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-press-key-chords",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+seen = []
+
+def cdp(method, **params):
+    seen.append((method, params))
+    return {}
+
+press_key("Meta+A")
+events = [params for method, params in seen if method == "Input.dispatchKeyEvent"]
+assert events[0]["type"] == "rawKeyDown", events
+assert events[0]["key"] == "A", events
+assert events[0]["modifiers"] == 4, events
+assert "text" not in events[0], events
+assert not any(event.get("type") == "char" for event in events), events
+
+seen.clear()
+press_key("Ctrl+Shift+Tab")
+events = [params for method, params in seen if method == "Input.dispatchKeyEvent"]
+assert events[0]["key"] == "Tab", events
+assert events[0]["modifiers"] == 10, events
+print("press_key chords ok")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("press_key chords ok"));
+    }
+
+    #[test]
     fn browser_script_http_get_matches_proxy_gzip_and_binary_contracts() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(

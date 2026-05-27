@@ -36,7 +36,7 @@ screenshot_clip(label, x, y, width, height)
 click_at_xy(x, y)
 fill_input(selector, text, clear=True)
 type_text(text)
-press_key(key)
+press_key(key, modifiers=0)  # accepts chords like "Meta+A"; modifiers: Alt=1, Ctrl=2, Meta/Cmd=4, Shift=8
 scroll(x=0, y=600)
 
 wait_for_load(timeout=10)

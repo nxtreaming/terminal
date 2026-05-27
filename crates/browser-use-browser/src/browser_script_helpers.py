@@ -623,6 +623,17 @@ _PRINTABLE_KEY_CODES = {
     "`": (192, "Backquote"),
 }
 
+_MODIFIER_BITS = {
+    "alt": 1,
+    "option": 1,
+    "ctrl": 2,
+    "control": 2,
+    "cmd": 4,
+    "command": 4,
+    "meta": 4,
+    "shift": 8,
+}
+
 
 def _printable_key_metadata(key):
     if len(key) != 1:
@@ -638,8 +649,27 @@ def _printable_key_metadata(key):
     return ord(key), key, key
 
 
+def _parse_key_chord(key, modifiers):
+    if not isinstance(key, str) or "+" not in key:
+        return key, modifiers
+    parts = [part.strip() for part in key.split("+") if part.strip()]
+    if len(parts) < 2:
+        return key, modifiers
+    parsed_modifiers = modifiers
+    for part in parts[:-1]:
+        bit = _MODIFIER_BITS.get(part.lower())
+        if bit is None:
+            return key, modifiers
+        parsed_modifiers |= bit
+    parsed_key = parts[-1]
+    if parsed_key.lower() == "space":
+        parsed_key = " "
+    return parsed_key, parsed_modifiers
+
+
 def press_key(key, modifiers=0):
-    """Modifiers bitfield: 1=Alt, 2=Ctrl, 4=Meta(Cmd), 8=Shift."""
+    """Modifiers bitfield: 1=Alt, 2=Ctrl, 4=Meta(Cmd), 8=Shift. Chords like "Meta+A" also work."""
+    key, modifiers = _parse_key_chord(key, modifiers)
     vk, code, text = _KEYS.get(key) or _printable_key_metadata(key) or (0, key, "")
     base = {
         "key": key,
@@ -648,8 +678,9 @@ def press_key(key, modifiers=0):
         "windowsVirtualKeyCode": vk,
         "nativeVirtualKeyCode": vk,
     }
-    cdp("Input.dispatchKeyEvent", type="keyDown", **base, **({"text": text} if text else {}))
-    if text and len(text) == 1:
+    event_type = "rawKeyDown" if modifiers else "keyDown"
+    cdp("Input.dispatchKeyEvent", type=event_type, **base, **({"text": text} if text and not modifiers else {}))
+    if text and len(text) == 1 and not modifiers:
         cdp("Input.dispatchKeyEvent", type="char", text=text, **{k: v for k, v in base.items() if k != "text"})
     cdp("Input.dispatchKeyEvent", type="keyUp", **base)
     return True
