@@ -8658,6 +8658,11 @@ impl StreamingToolScheduler {
         attempt: usize,
         event: &ModelEvent,
     ) -> Result<()> {
+        ensure_not_cancelled(
+            store,
+            &self.session.id,
+            self.active_queue_last_session_message_seq,
+        )?;
         let ModelEvent::ToolCall { call } = event else {
             return Ok(());
         };
@@ -35992,6 +35997,87 @@ for line in sys.stdin:
         assert!(turn_response_seq < command_started_seq);
         assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "serial barrier ok"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_loop_does_not_predispatch_streamed_tool_after_cancel() -> Result<()> {
+        struct CancelThenStreamToolProvider {
+            state_dir: std::path::PathBuf,
+            session_id: String,
+        }
+
+        impl ModelProvider for CancelThenStreamToolProvider {
+            fn provider_name(&self) -> &str {
+                "cancel-then-stream-tool"
+            }
+
+            fn model_name(&self) -> &str {
+                "cancel-then-stream-tool"
+            }
+
+            fn start_turn(&self, turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+                let mut events = Vec::new();
+                self.stream_turn(turn, &mut |event| {
+                    events.push(event);
+                    Ok(())
+                })?;
+                Ok(events)
+            }
+
+            fn stream_turn(
+                &self,
+                _turn: ProviderTurn,
+                on_event: &mut dyn FnMut(ModelEvent) -> Result<()>,
+            ) -> Result<()> {
+                Store::open(&self.state_dir)?.request_cancel(&self.session_id, "user stop")?;
+                on_event(ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "should_not_launch_after_cancel".to_string(),
+                        name: "exec_command".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({
+                            "cmd": "printf launched > launched-after-cancel.txt",
+                            "yield_time_ms": 5000,
+                        }),
+                    },
+                })?;
+                on_event(ModelEvent::Done)?;
+                Ok(())
+            }
+        }
+
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "stop before any more tools"}),
+        )?;
+        let provider = CancelThenStreamToolProvider {
+            state_dir: store.state_dir().to_path_buf(),
+            session_id: session.id.clone(),
+        };
+
+        let result = run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        );
+
+        assert!(result.is_err());
+        assert!(!temp.path().join("launched-after-cancel.txt").exists());
+        let events = store.events_for_session(&session.id)?;
+        assert!(!events.iter().any(|event| {
+            event.event_type == "command.started"
+                && event.payload["tool_call_id"] == "should_not_launch_after_cancel"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "tool.streaming_started"
+                && event.payload["tool_call_id"] == "should_not_launch_after_cancel"
         }));
         Ok(())
     }

@@ -7,6 +7,7 @@ use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+pub(crate) mod agent_env;
 pub(crate) mod command;
 pub(crate) mod files;
 

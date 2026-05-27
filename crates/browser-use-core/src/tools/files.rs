@@ -16,6 +16,7 @@ use serde_json::{json, Value};
 use sha1::Digest;
 
 use crate::prompt_image::{load_for_prompt_bytes, PromptImageMode};
+use crate::tools::agent_env::{apply_agent_tool_path_to_command, ripgrep_command_path};
 
 const DEFAULT_MAX_READ_LINES: usize = 400;
 const DEFAULT_MAX_READ_BYTES: usize = 80_000;
@@ -540,7 +541,7 @@ fn rg_search(
     context_lines: usize,
     max_results: usize,
 ) -> Result<SearchResult> {
-    let mut command = Command::new("rg");
+    let mut command = Command::new(ripgrep_command_path());
     command
         .arg("--json")
         .arg("--line-number")
@@ -554,6 +555,7 @@ fn rg_search(
         command.arg("--glob").arg(glob);
     }
     command.arg(query).arg(root);
+    apply_agent_tool_path_to_command(&mut command);
     let output = command.output().context("run rg")?;
     if !output.status.success() && output.status.code() != Some(1) {
         bail!(
