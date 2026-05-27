@@ -1367,24 +1367,34 @@ fn dispatch_local(
             } else {
                 (open::that(url).is_ok(), None, None)
             };
-            Ok(json!({
-                "status": "needs-user-action",
-                "opened": opened,
-                "url": url,
-                "profile": profile,
-                "open_error": open_error,
-                "instructions": [
-                    "In the browser/profile that opens, enable 'Allow remote debugging for this browser instance' if Chrome reports it is blocked.",
-                    "If Chrome shows an additional permission prompt, click Allow.",
-                    "Then run `browser connect local` again."
-                ],
-                "next_step": "browser connect local"
-            }))
+            Ok(local_setup_user_action_response(
+                opened, profile, open_error,
+            ))
         }
         Some("profiles") => dispatch_local_profiles(argv),
         Some(other) => bail!("unknown browser local command: {other}"),
         None => bail!("browser local requires list, setup, or profiles"),
     }
+}
+
+fn local_setup_user_action_response(
+    opened: bool,
+    profile: Option<LocalBrowserProfile>,
+    open_error: Option<String>,
+) -> Value {
+    json!({
+        "status": "needs-user-action",
+        "opened": opened,
+        "url": "chrome://inspect/#remote-debugging",
+        "profile": profile,
+        "open_error": open_error,
+        "instructions": [
+            "In the browser/profile that opens, enable 'Allow remote debugging for this browser instance' if Chrome reports it is blocked.",
+            "If Chrome shows an additional permission prompt, click Allow.",
+            "Do not retry until the user confirms that permission is enabled, then run `browser connect local` again."
+        ],
+        "next_step": "Wait for user confirmation, then run browser connect local."
+    })
 }
 
 fn dispatch_local_profiles(argv: &[String]) -> Result<Value> {
@@ -4639,6 +4649,20 @@ mod tests {
         assert_eq!(status["next_step"], "browser connect local");
         assert!(status.get("safety").is_some());
         assert!(status.get("connection_generation").is_some());
+    }
+
+    #[test]
+    fn local_setup_waits_for_user_confirmation_before_retry() {
+        let status = local_setup_user_action_response(false, None, None);
+        assert_eq!(status["status"], "needs-user-action");
+        assert!(status["next_step"]
+            .as_str()
+            .unwrap()
+            .contains("Wait for user confirmation"));
+        assert!(status["instructions"][2]
+            .as_str()
+            .unwrap()
+            .contains("Do not retry until the user confirms"));
     }
 
     #[test]
