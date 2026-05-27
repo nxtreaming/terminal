@@ -9475,7 +9475,7 @@ wire_api = "responses"
         )?;
         app.drain_store_notifications()?;
         let streaming = desired_terminal_viewport_height_for(&mut app, 120, 28)?;
-        assert_eq!(streaming, prompt_only.saturating_add(1));
+        assert_eq!(streaming, prompt_only);
         let streaming_screen = render_dump(&mut app)?;
         assert!(streaming_screen.contains("streaming now"));
         assert!(!streaming_screen.contains("thinking"));
@@ -9573,7 +9573,7 @@ wire_api = "responses"
         app.drain_store_notifications()?;
 
         let measured = desired_terminal_viewport_height_for(&mut app, 80, 28)?;
-        assert_eq!(measured, docked.saturating_add(2));
+        assert_eq!(measured, docked.saturating_add(1));
         app.args.width = 80;
         app.args.height = measured;
         let screen = render_dump(&mut app)?;
@@ -9630,7 +9630,7 @@ wire_api = "responses"
         app.drain_store_notifications()?;
 
         let initial = desired_terminal_viewport_height_for(&mut app, 100, 28)?;
-        assert_eq!(initial, docked.saturating_add(2));
+        assert_eq!(initial, docked.saturating_add(1));
 
         let streamed = (1..=24)
             .map(|idx| format!("live output line {idx:02}"))
