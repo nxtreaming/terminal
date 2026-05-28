@@ -3549,13 +3549,9 @@ impl App {
 
     fn paste_image_from_clipboard(&mut self) {
         match clipboard_paste::paste_image_to_temp_png() {
-            Ok((path, info)) => {
+            Ok((path, _info)) => {
                 self.composer.attach_image(path);
                 self.prompt_history.reset_navigation();
-                self.status_notice = Some(format!(
-                    "Attached clipboard image ({}x{}).",
-                    info.width, info.height
-                ));
             }
             Err(error) => {
                 self.status_notice = Some(format!("Failed to paste image: {error}"));
