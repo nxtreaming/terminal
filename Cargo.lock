@@ -217,7 +217,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-browser"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -231,7 +231,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-cli"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "browser-use-browser",
@@ -250,7 +250,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -285,7 +285,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-protocol"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "serde",
  "serde_json",
@@ -293,7 +293,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-providers"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "base64",
@@ -312,7 +312,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-python-worker"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "libc",
@@ -323,7 +323,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-store"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "browser-use-protocol",
@@ -336,7 +336,7 @@ dependencies = [
 
 [[package]]
 name = "browser-use-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "arboard",
