@@ -3,11 +3,16 @@ set -euo pipefail
 
 ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 OUT_DIR="${OUT_DIR:-"$ROOT/target/dev-bin"}"
+AGENT_TOOLS_DIR="$ROOT/target/debug/agent-tools"
 
 cd "$ROOT"
 cargo build -p browser-use-tui -p browser-use-cli
 
 mkdir -p "$OUT_DIR"
+
+write_agent_tools() {
+  "$ROOT/scripts/install-agent-ripgrep.sh" "$AGENT_TOOLS_DIR"
+}
 
 write_tui_wrapper() {
   local name="$1"
@@ -15,6 +20,7 @@ write_tui_wrapper() {
   cat >"$path" <<EOF
 #!/bin/sh
 export BUT_AUTO_UPDATE=0
+export BUT_AGENT_TOOLS_DIR="$AGENT_TOOLS_DIR"
 export PYTHONPATH="$ROOT/python\${PYTHONPATH:+:\$PYTHONPATH}"
 exec "$ROOT/target/debug/but" "\$@"
 EOF
@@ -27,6 +33,7 @@ write_hybrid_wrapper() {
   cat >"$path" <<EOF
 #!/bin/sh
 export BUT_AUTO_UPDATE=0
+export BUT_AGENT_TOOLS_DIR="$AGENT_TOOLS_DIR"
 export PYTHONPATH="$ROOT/python\${PYTHONPATH:+:\$PYTHONPATH}"
 if [ "\$#" -eq 0 ]; then
   exec "$ROOT/target/debug/but"
@@ -36,6 +43,7 @@ EOF
   chmod 0755 "$path"
 }
 
+write_agent_tools
 write_hybrid_wrapper browser
 write_hybrid_wrapper browser-use
 write_hybrid_wrapper browser-use-terminal

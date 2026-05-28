@@ -2,6 +2,8 @@ use std::ffi::OsString;
 use std::path::{Path, PathBuf};
 use std::process::Command;
 
+const BUT_AGENT_TOOLS_DIR_ENV: &str = "BUT_AGENT_TOOLS_DIR";
+
 const RG_BOOTSTRAP_SCRIPT: &str = r#"#!/bin/sh
 set -fu
 
@@ -56,8 +58,8 @@ find_working_rg() {
 rg_bin="$(find_working_rg || true)"
 if [ -z "$rg_bin" ]; then
   printf '%s\n' 'browser-use terminal could not find a working ripgrep executable for `rg`.' >&2
-  printf '%s\n' 'The `rg` on PATH may be a DotSlash launcher, but `dotslash` is not installed in this agent shell.' >&2
-  printf '%s\n' 'Install ripgrep and make it visible to the agent shell, or install dotslash on the same PATH as the launcher.' >&2
+  printf '%s\n' 'Release and dev builds should include `bin/agent-tools/rg`; if this is a source checkout, run `scripts/dev-bin.sh` or `scripts/install-agent-ripgrep.sh target/debug/agent-tools`.' >&2
+  printf '%s\n' 'If the only `rg` on PATH is a DotSlash launcher, `dotslash` must be available in this same agent shell.' >&2
   exit 127
 fi
 
@@ -71,8 +73,7 @@ pub(crate) fn apply_agent_tool_path_to_command(command: &mut Command) {
 }
 
 pub(crate) fn agent_tool_path() -> Option<OsString> {
-    let bin_dir = ensure_agent_tool_bin_dir()?;
-    let mut paths = vec![bin_dir];
+    let mut paths = agent_tool_prefix_dirs()?;
     if let Some(path) = std::env::var_os("PATH") {
         paths.extend(std::env::split_paths(&path));
     }
@@ -80,18 +81,65 @@ pub(crate) fn agent_tool_path() -> Option<OsString> {
 }
 
 pub(crate) fn agent_tool_shell_path_restore() -> Option<String> {
-    ensure_agent_tool_bin_dir().map(|bin_dir| {
-        format!(
-            "export PATH={}:\"$PATH\"\n",
-            shell_single_quote(&bin_dir.display().to_string())
-        )
-    })
+    let prefix = agent_tool_prefix_dirs()?;
+    let quoted = prefix
+        .iter()
+        .map(|dir| shell_single_quote(&dir.display().to_string()))
+        .collect::<Vec<_>>()
+        .join(":");
+    Some(format!("export PATH={}:\"$PATH\"\n", quoted))
 }
 
 pub(crate) fn ripgrep_command_path() -> PathBuf {
-    ensure_agent_tool_bin_dir()
+    agent_tool_prefix_dirs()
+        .and_then(|dirs| dirs.into_iter().next())
         .map(|bin_dir| bin_dir.join("rg"))
         .unwrap_or_else(|| PathBuf::from("rg"))
+}
+
+fn agent_tool_prefix_dirs() -> Option<Vec<PathBuf>> {
+    let mut dirs = vec![ensure_agent_tool_bin_dir()?];
+    dirs.extend(managed_agent_tool_dirs());
+    Some(dedupe_paths(dirs))
+}
+
+fn managed_agent_tool_dirs() -> Vec<PathBuf> {
+    managed_agent_tool_dirs_for(
+        std::env::var_os(BUT_AGENT_TOOLS_DIR_ENV),
+        std::env::current_exe().ok(),
+    )
+}
+
+fn managed_agent_tool_dirs_for(
+    explicit_dir: Option<OsString>,
+    current_exe: Option<PathBuf>,
+) -> Vec<PathBuf> {
+    let mut dirs = Vec::new();
+    if let Some(dir) = explicit_dir {
+        push_existing_dir(&mut dirs, PathBuf::from(dir));
+    }
+    if let Some(exe) = current_exe {
+        if let Some(bin_dir) = exe.parent() {
+            push_existing_dir(&mut dirs, bin_dir.join("agent-tools"));
+        }
+    }
+    dedupe_paths(dirs)
+}
+
+fn push_existing_dir(dirs: &mut Vec<PathBuf>, path: PathBuf) {
+    if path.is_dir() {
+        dirs.push(path);
+    }
+}
+
+fn dedupe_paths(paths: Vec<PathBuf>) -> Vec<PathBuf> {
+    let mut unique = Vec::new();
+    for path in paths {
+        if !unique.iter().any(|existing| existing == &path) {
+            unique.push(path);
+        }
+    }
+    unique
 }
 
 fn ensure_agent_tool_bin_dir() -> Option<PathBuf> {
@@ -198,5 +246,34 @@ mod tests {
         assert!(stdout.contains("/wrapper/rg"), "{stdout}");
         assert!(stdout.contains("ripgrep 99.0.0"), "{stdout}");
         assert!(stdout.contains("file.txt"), "{stdout}");
+    }
+
+    #[test]
+    fn managed_agent_tool_dirs_include_explicit_and_release_relative_dirs() {
+        let tmp = TempDir::new().expect("tmp");
+        let explicit = tmp.path().join("explicit-tools");
+        let release_bin = tmp.path().join("release").join("bin");
+        let release_tools = release_bin.join("agent-tools");
+        std::fs::create_dir_all(&explicit).expect("explicit tools");
+        std::fs::create_dir_all(&release_tools).expect("release tools");
+        let exe = release_bin.join("but");
+
+        let dirs = managed_agent_tool_dirs_for(Some(explicit.clone().into_os_string()), Some(exe));
+
+        assert_eq!(dirs, vec![explicit, release_tools]);
+    }
+
+    #[test]
+    fn managed_agent_tool_dirs_skip_missing_dirs_and_dedupe() {
+        let tmp = TempDir::new().expect("tmp");
+        let release_bin = tmp.path().join("release").join("bin");
+        let release_tools = release_bin.join("agent-tools");
+        std::fs::create_dir_all(&release_tools).expect("release tools");
+        let exe = release_bin.join("but");
+
+        let dirs =
+            managed_agent_tool_dirs_for(Some(release_tools.clone().into_os_string()), Some(exe));
+
+        assert_eq!(dirs, vec![release_tools]);
     }
 }

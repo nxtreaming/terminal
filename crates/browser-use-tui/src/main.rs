@@ -9283,6 +9283,30 @@ wire_api = "responses"
     }
 
     #[test]
+    fn browser_live_url_is_visible_in_browser_panel() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.live_url",
+            serde_json::json!({"live_url": "https://live.browser-use.com/?wss=example"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.open_surface(Surface::Browser);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("live view"));
+        assert!(screen.contains("https://live.browser-use.com/?wss=example"));
+        Ok(())
+    }
+
+    #[test]
     fn laminar_key_can_be_saved_from_developer_surface() -> Result<()> {
         let saved = std::env::var("LMNR_PROJECT_API_KEY").ok();
         std::env::remove_var("LMNR_PROJECT_API_KEY");

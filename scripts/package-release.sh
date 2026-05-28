@@ -49,6 +49,7 @@ cp "$BUILD_DIR/but" "$STAGE/$PACKAGE_NAME/bin/but"
 cp "$BUILD_DIR/browser-use-terminal" "$STAGE/$PACKAGE_NAME/bin/browser-use-terminal"
 ln -sf but "$STAGE/$PACKAGE_NAME/bin/browser"
 ln -sf but "$STAGE/$PACKAGE_NAME/bin/browser-use"
+"$ROOT/scripts/install-agent-ripgrep.sh" "$STAGE/$PACKAGE_NAME/bin/agent-tools" "$TARGET_TRIPLE"
 cp -R "$ROOT/python/llm_browser_worker" "$STAGE/$PACKAGE_NAME/python/llm_browser_worker"
 find "$STAGE/$PACKAGE_NAME/python" -type d -name __pycache__ -prune -exec rm -rf {} +
 find "$STAGE/$PACKAGE_NAME/python" -type f -name '*.pyc' -delete

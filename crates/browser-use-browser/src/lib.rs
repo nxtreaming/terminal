@@ -1474,10 +1474,13 @@ impl BrowserSession {
             "type": event_type,
             "payload": payload,
         }));
-        if self.live_url.is_some() {
+        if let Some(live_url) = self.live_url.as_deref() {
             events.push(json!({
                 "type": "browser.live_url",
-                "payload": { "url": self.live_url },
+                "payload": {
+                    "live_url": live_url,
+                    "url": live_url,
+                },
             }));
         }
         events
@@ -4730,6 +4733,7 @@ mod tests {
         assert!(session.browser_events().is_empty());
 
         session.mode = BrowserMode::Local;
+        session.live_url = Some("https://live.browser-use.com/watch".to_string());
         session.endpoint = Some(Endpoint {
             kind: "local".to_string(),
             http_url: Some("http://127.0.0.1:9222".to_string()),
@@ -4738,8 +4742,13 @@ mod tests {
         });
 
         let first = session.browser_events();
-        assert_eq!(first.len(), 1);
+        assert_eq!(first.len(), 2);
         assert_eq!(first[0]["type"], "browser.disconnected");
+        assert_eq!(first[1]["type"], "browser.live_url");
+        assert_eq!(
+            first[1]["payload"]["live_url"],
+            "https://live.browser-use.com/watch"
+        );
         assert!(session.browser_events().is_empty());
 
         let connected = json!({
