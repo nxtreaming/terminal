@@ -158,9 +158,10 @@ impl Composer {
             return true;
         }
 
-        // Option/Alt + Backspace deletes the previous word.
+        // Option/Alt + Backspace deletes back to the previous blank, matching
+        // the shell-style behavior users expect from word erase.
         if key_pressed(key, KeyCode::Backspace, KeyModifiers::ALT) {
-            self.delete_backward_token();
+            self.delete_backward_word();
             return true;
         }
 
@@ -341,19 +342,6 @@ impl Composer {
             start -= 1;
         }
         while start > 0 && !chars[start - 1].is_whitespace() {
-            start -= 1;
-        }
-        self.delete_char_range(start, self.cursor);
-    }
-
-    fn delete_backward_token(&mut self) {
-        if self.cursor == 0 {
-            return;
-        }
-        let chars = self.chars();
-        let mut start = self.cursor;
-        let class = TokenClass::of(chars[start - 1]);
-        while start > 0 && TokenClass::of(chars[start - 1]) == class {
             start -= 1;
         }
         self.delete_char_range(start, self.cursor);
@@ -608,25 +596,6 @@ fn has_ctrl_or_alt(modifiers: KeyModifiers) -> bool {
     modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT | KeyModifiers::META)
 }
 
-#[derive(Clone, Copy, PartialEq, Eq)]
-enum TokenClass {
-    Word,
-    Whitespace,
-    Punctuation,
-}
-
-impl TokenClass {
-    fn of(ch: char) -> Self {
-        if ch == '_' || ch.is_alphanumeric() {
-            Self::Word
-        } else if ch.is_whitespace() {
-            Self::Whitespace
-        } else {
-            Self::Punctuation
-        }
-    }
-}
-
 fn text_char_for_key(event: KeyEvent) -> Option<char> {
     let modifiers = normalized_modifiers(event.modifiers);
     if has_ctrl_or_alt(modifiers) {
@@ -686,22 +655,24 @@ mod tests {
     }
 
     #[test]
-    fn alt_backspace_deletes_previous_token_by_character_class() {
+    fn alt_backspace_deletes_back_to_previous_blank() {
         let mut composer = Composer::default();
 
         composer.set_input("/stuff".to_string());
         assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
-        assert_eq!(composer.input(), "/");
+        assert_eq!(composer.input(), "");
 
         composer.set_input("something-bla".to_string());
-        for expected in ["something-", "something", ""] {
-            assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
-            assert_eq!(composer.input(), expected);
-        }
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
+        assert_eq!(composer.input(), "");
+
+        composer.set_input("before something-bla".to_string());
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
+        assert_eq!(composer.input(), "before ");
 
         composer.set_input("alpha  ".to_string());
         assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::ALT)));
-        assert_eq!(composer.input(), "alpha");
+        assert_eq!(composer.input(), "");
 
         composer.set_input("alpha  ".to_string());
         assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::META)));
