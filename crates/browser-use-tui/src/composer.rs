@@ -1,3 +1,5 @@
+use std::path::PathBuf;
+
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use ratatui::text::{Line, Span};
 
@@ -6,17 +8,19 @@ use crate::theme::{accent, dim};
 #[derive(Debug, Default)]
 pub(crate) struct Composer {
     text: String,
+    local_images: Vec<PathBuf>,
     cursor: usize,
     preferred_column: Option<usize>,
 }
 
 impl Composer {
     pub(crate) fn is_empty(&self) -> bool {
-        self.text.is_empty()
+        self.text.is_empty() && self.local_images.is_empty()
     }
 
     pub(crate) fn clear(&mut self) {
         self.text.clear();
+        self.local_images.clear();
         self.cursor = 0;
         self.preferred_column = None;
     }
@@ -27,8 +31,23 @@ impl Composer {
         text
     }
 
+    pub(crate) fn take_submission(&mut self) -> (String, Vec<PathBuf>) {
+        let text = self.text.trim().to_string();
+        let local_images = std::mem::take(&mut self.local_images);
+        self.clear();
+        (text, local_images)
+    }
+
     pub(crate) fn input(&self) -> &str {
         &self.text
+    }
+
+    pub(crate) fn has_local_images(&self) -> bool {
+        !self.local_images.is_empty()
+    }
+
+    pub(crate) fn attach_image(&mut self, path: PathBuf) {
+        self.local_images.push(path);
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) -> bool {
@@ -47,6 +66,7 @@ impl Composer {
 
     pub(crate) fn set_input(&mut self, value: String) {
         self.text = value;
+        self.local_images.clear();
         self.cursor = self.input_len();
         self.preferred_column = None;
     }
@@ -111,16 +131,10 @@ impl Composer {
             return (2, 0);
         }
         let content_width = width.saturating_sub(2).max(1);
-        let (cursor_row, cursor_col) = self.cursor_row_col();
-        let mut visual_row = 0usize;
-        for line in self.text.split('\n').take(cursor_row) {
-            visual_row += wrapped_line_count(line, content_width);
-        }
-        let (cursor_line_row, cursor_line_col) = wrapped_cursor_row_col(cursor_col, content_width);
-        visual_row += cursor_line_row;
+        let (visual_row, visual_col) = self.cursor_visual_row_col_wrapped(content_width);
         let visible_start = self.visible_wrapped_line_start(max_lines, width);
         (
-            cursor_line_col.saturating_add(2) as u16,
+            visual_col.saturating_add(2) as u16,
             visual_row.saturating_sub(visible_start) as u16,
         )
     }
@@ -132,6 +146,13 @@ impl Composer {
 
         if is_insert_newline_key(key) {
             self.insert_str("\n");
+            return true;
+        }
+
+        if matches!(normalize_key(key), (KeyCode::Backspace, _))
+            && self.text.is_empty()
+            && self.local_images.pop().is_some()
+        {
             return true;
         }
 
@@ -211,24 +232,48 @@ impl Composer {
     }
 
     fn composer_input_lines(&self) -> Vec<Line<'static>> {
-        self.text
-            .split('\n')
-            .enumerate()
-            .map(|(idx, source_line)| {
-                let prefix = if idx == 0 { "> " } else { "  " };
-                Line::from(vec![
-                    Span::styled(prefix, accent()),
-                    Span::raw(source_line.to_string()),
-                ])
-            })
-            .collect()
+        let image_spans = self.image_spans(!self.text.is_empty());
+        if self.text.is_empty() {
+            if image_spans.is_empty() {
+                return vec![Line::from(vec![Span::styled("  ", accent())])];
+            }
+            let mut spans = vec![Span::styled("> ", accent())];
+            spans.extend(image_spans);
+            return vec![Line::from(spans)];
+        }
+
+        let mut lines = Vec::new();
+        for (idx, source_line) in self.text.split('\n').enumerate() {
+            let mut spans = vec![Span::styled(if idx == 0 { "> " } else { "  " }, accent())];
+            if idx == 0 {
+                spans.extend(image_spans.clone());
+            }
+            spans.push(Span::raw(source_line.to_string()));
+            lines.push(Line::from(spans));
+        }
+        lines
     }
 
     fn wrapped_composer_input_lines(&self, width: usize) -> Vec<Line<'static>> {
         let content_width = width.saturating_sub(2).max(1);
+        let image_spans = self.image_spans(!self.text.is_empty());
+        let image_width = self.image_width(!self.text.is_empty());
+        if self.text.is_empty() {
+            if image_spans.is_empty() {
+                return vec![Line::from(vec![Span::styled("  ", accent())])];
+            }
+            let mut spans = vec![Span::styled("> ", accent())];
+            spans.extend(image_spans);
+            return vec![Line::from(spans)];
+        }
         let mut lines = Vec::new();
         for (logical_idx, source_line) in self.text.split('\n').enumerate() {
-            let mut chunks = hard_wrap_line(source_line, content_width);
+            let wrap_width = if logical_idx == 0 {
+                content_width.saturating_sub(image_width).max(1)
+            } else {
+                content_width
+            };
+            let mut chunks = hard_wrap_line(source_line, wrap_width);
             if chunks.is_empty() {
                 chunks.push(String::new());
             }
@@ -238,20 +283,48 @@ impl Composer {
                 } else {
                     "  "
                 };
-                lines.push(Line::from(vec![
-                    Span::styled(prefix, accent()),
-                    Span::raw(chunk),
-                ]));
+                let mut spans = vec![Span::styled(prefix, accent())];
+                if logical_idx == 0 && chunk_idx == 0 {
+                    spans.extend(image_spans.clone());
+                }
+                spans.push(Span::raw(chunk));
+                lines.push(Line::from(spans));
             }
         }
         lines
+    }
+
+    fn image_spans(&self, trailing_space: bool) -> Vec<Span<'static>> {
+        let last_idx = self.local_images.len().saturating_sub(1);
+        self.local_images
+            .iter()
+            .enumerate()
+            .flat_map(|(idx, _)| {
+                let mut spans = vec![Span::styled(format!("[Image {}]", idx + 1), accent())];
+                if idx != last_idx || trailing_space {
+                    spans.push(Span::raw(" "));
+                }
+                spans
+            })
+            .collect()
+    }
+
+    fn image_width(&self, trailing_space: bool) -> usize {
+        self.local_images
+            .iter()
+            .enumerate()
+            .map(|(idx, _)| {
+                image_label_width(idx + 1)
+                    + usize::from(idx + 1 < self.local_images.len() || trailing_space)
+            })
+            .sum()
     }
 
     fn visible_line_start(&self, max_lines: usize) -> usize {
         if max_lines == 0 {
             return 0;
         }
-        let line_count = self.line_count();
+        let line_count = self.display_line_count();
         if line_count <= max_lines {
             return 0;
         }
@@ -271,13 +344,7 @@ impl Composer {
         if line_count <= max_lines {
             return 0;
         }
-        let (cursor_row, cursor_col) = self.cursor_row_col();
-        let mut cursor_visual_row = 0usize;
-        for line in self.text.split('\n').take(cursor_row) {
-            cursor_visual_row += wrapped_line_count(line, content_width);
-        }
-        let (cursor_line_row, _) = wrapped_cursor_row_col(cursor_col, content_width);
-        cursor_visual_row += cursor_line_row;
+        let (cursor_visual_row, _) = self.cursor_visual_row_col_wrapped(content_width);
         let max_start = line_count.saturating_sub(max_lines);
         cursor_visual_row
             .saturating_sub(max_lines.saturating_sub(1))
@@ -285,11 +352,53 @@ impl Composer {
     }
 
     fn wrapped_line_count(&self, content_width: usize) -> usize {
+        if self.text.is_empty() {
+            return 1;
+        }
+        let image_width = self.image_width(!self.text.is_empty());
         self.text
             .split('\n')
-            .map(|line| wrapped_line_count(line, content_width))
+            .enumerate()
+            .map(|(idx, line)| {
+                let wrap_width = if idx == 0 {
+                    content_width.saturating_sub(image_width).max(1)
+                } else {
+                    content_width
+                };
+                wrapped_line_count(line, wrap_width)
+            })
             .sum::<usize>()
             .max(1)
+    }
+
+    fn cursor_visual_row_col_wrapped(&self, content_width: usize) -> (usize, usize) {
+        let image_width = self.image_width(!self.text.is_empty());
+        if self.text.is_empty() {
+            return (0, image_width);
+        }
+        let (cursor_row, cursor_col) = self.cursor_row_col();
+        let mut visual_row = 0usize;
+        for (idx, line) in self.text.split('\n').take(cursor_row).enumerate() {
+            let wrap_width = if idx == 0 {
+                content_width.saturating_sub(image_width).max(1)
+            } else {
+                content_width
+            };
+            visual_row += wrapped_line_count(line, wrap_width);
+        }
+        let wrap_width = if cursor_row == 0 {
+            content_width.saturating_sub(image_width).max(1)
+        } else {
+            content_width
+        };
+        let (cursor_line_row, cursor_line_col) = wrapped_cursor_row_col(cursor_col, wrap_width);
+        visual_row += cursor_line_row;
+        let visual_col = if cursor_row == 0 && cursor_line_row == 0 {
+            image_width + cursor_line_col
+        } else {
+            cursor_line_col
+        };
+        (visual_row, visual_col)
     }
 
     fn should_swallow_unmodified_key(&self, key: KeyEvent) -> bool {
@@ -482,9 +591,17 @@ impl Composer {
         self.text.split('\n').count()
     }
 
+    fn display_line_count(&self) -> usize {
+        self.line_count().max(1)
+    }
+
     fn chars(&self) -> Vec<char> {
         self.text.chars().collect()
     }
+}
+
+fn image_label_width(index: usize) -> usize {
+    format!("[Image {index}]").chars().count()
 }
 
 fn visible_composer_lines(
@@ -715,5 +832,52 @@ mod tests {
         composer.set_input("abcdefghijkl".to_string());
         assert_eq!(composer.render_lines_wrapped(2, 8, "placeholder").len(), 2);
         assert_eq!(composer.cursor_position_wrapped(2, 8), (8, 1));
+    }
+
+    #[test]
+    fn attached_images_render_before_text_and_submit_with_paths() {
+        let mut composer = Composer::default();
+        composer.set_input("describe it".to_string());
+        composer.attach_image(PathBuf::from("/tmp/shot.png"));
+        composer.attach_image(PathBuf::from("/tmp/other.png"));
+
+        assert_eq!(
+            plain(composer.render_lines_wrapped(4, 80, "placeholder")),
+            "> [Image 1] [Image 2] describe it\n"
+        );
+
+        let (text, images) = composer.take_submission();
+        assert_eq!(text, "describe it");
+        assert_eq!(
+            images,
+            vec![
+                PathBuf::from("/tmp/shot.png"),
+                PathBuf::from("/tmp/other.png")
+            ]
+        );
+        assert!(composer.is_empty());
+    }
+
+    #[test]
+    fn attached_images_without_text_render_inline_without_paths() {
+        let mut composer = Composer::default();
+        composer.attach_image(PathBuf::from("/tmp/shot.png"));
+        composer.attach_image(PathBuf::from("/tmp/other.png"));
+        composer.attach_image(PathBuf::from("/tmp/third.png"));
+
+        let rendered = plain(composer.render_lines_wrapped(4, 40, "placeholder"));
+        assert_eq!(rendered, "> [Image 1] [Image 2] [Image 3]\n");
+        assert!(!rendered.contains("shot.png"));
+        assert_eq!(composer.visual_line_count_wrapped(40), 1);
+        assert_eq!(composer.cursor_position_wrapped(4, 40), (31, 0));
+    }
+
+    #[test]
+    fn backspace_removes_image_when_text_is_empty() {
+        let mut composer = Composer::default();
+        composer.attach_image(PathBuf::from("/tmp/shot.png"));
+
+        assert!(composer.handle_key(KeyEvent::new(KeyCode::Backspace, KeyModifiers::NONE,)));
+        assert!(composer.is_empty());
     }
 }

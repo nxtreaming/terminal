@@ -22,7 +22,8 @@ use crate::theme::*;
 use crate::transcript;
 
 use super::{
-    collaboration_mode_label, App, ProductState, RequestUserInputFocus, SetupResultKind, Surface,
+    collaboration_mode_label, App, MessageActionKind, ProductState, RequestUserInputFocus,
+    SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -398,7 +399,9 @@ fn main_bottom_height_for(
     )
     .len() as u16;
     let max_height = match surface {
-        Surface::Model | Surface::History => area.height.saturating_sub(2).max(6),
+        Surface::Model | Surface::History | Surface::Messages => {
+            area.height.saturating_sub(2).max(6)
+        }
         Surface::BrowserSelect => 22,
         _ => 18,
     };
@@ -449,9 +452,9 @@ fn render_bottom_pane(
     let body_width = body_area.width as usize;
     let mut lines = surface_lines(surface, app, state, body_width, body_area.height as usize);
     // For surfaces whose body is a straight list of selectable rows indexed by
-    // `selected_row` (currently just History), keep the selection in view by
+    // `selected_row`, keep the selection in view by
     // dropping rows from the top once it would otherwise scroll off the bottom.
-    if matches!(surface, Surface::History) {
+    if matches!(surface, Surface::History | Surface::Messages) {
         let body_h = body_area.height as usize;
         if body_h > 0 && app.selected_row >= body_h {
             let skip = app.selected_row + 1 - body_h;
@@ -629,7 +632,7 @@ fn render_surface_popup_box(
     // Layout inside the popup: header lines, body, footer line.
     let header = surface_header_lines(surface, inner.width);
     let header_h = (header.len() as u16).min(inner.height);
-    let footer_text = surface_footer(surface);
+    let footer_text = surface_footer_for_app(surface, app);
     let footer_h: u16 = if footer_text.is_empty() { 0 } else { 1 };
     let body_h = inner
         .height
@@ -655,7 +658,7 @@ fn render_surface_popup_box(
         body_area.width as usize,
         body_area.height as usize,
     );
-    if matches!(surface, Surface::History) {
+    if matches!(surface, Surface::History | Surface::Messages) {
         let body_h = body_area.height as usize;
         if body_h > 0 && app.selected_row >= body_h {
             let skip = app.selected_row + 1 - body_h;
@@ -1069,7 +1072,7 @@ fn render_surface(
         body_area,
     );
     frame.render_widget(
-        Paragraph::new(surface_footer(surface))
+        Paragraph::new(surface_footer_for_app(surface, app))
             .style(muted())
             .alignment(Alignment::Right),
         chunks[2],
@@ -1090,6 +1093,10 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
         Surface::History => ("History", "Browse and resume previous tasks"),
+        Surface::Messages => (
+            "Messages",
+            "Edit submitted prompts or cancel queued follow-ups",
+        ),
         Surface::Developer => ("Developer", "Developer tools and diagnostics"),
         Surface::Main => ("", ""),
     }
@@ -1119,11 +1126,28 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::ApiKey => "Enter:save | Esc:cancel",
         Surface::Telemetry => "Enter:save | Esc:cancel",
         Surface::History => "",
+        Surface::Messages => "Enter:edit | Esc:close",
         Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::Developer => "Esc:close",
         _ => "Enter:select | Esc:back",
+    }
+}
+
+fn messages_footer(app: &App) -> &'static str {
+    if app.selected_message_action_is_queued() {
+        "Enter:edit | Del:cancel queued | Esc:close"
+    } else {
+        "Enter:edit | Esc:close"
+    }
+}
+
+fn surface_footer_for_app(surface: Surface, app: &App) -> &'static str {
+    if surface == Surface::Messages {
+        messages_footer(app)
+    } else {
+        surface_footer(surface)
     }
 }
 
@@ -1146,6 +1170,7 @@ fn surface_lines(
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
         Surface::History => history_lines(app, state, width),
+        Surface::Messages => message_lines(app, width),
         Surface::Developer => developer_lines(app, state),
         Surface::Main => Vec::new(),
     }
@@ -1524,7 +1549,9 @@ fn render_footer(
     {
         "ctrl+c again to quit"
     } else if app.escape_stop_is_pending() {
-        "esc again to stop"
+        "esc again to edit messages"
+    } else if app.surface == Surface::Messages {
+        messages_footer(app)
     } else if app.surface.is_bottom_pane() {
         surface_footer(app.surface)
     } else {
@@ -2425,6 +2452,31 @@ fn history_lines(app: &App, state: &WorkbenchState, width: usize) -> Vec<Line<'s
         .iter()
         .enumerate()
         .map(|(idx, row)| history_overlay_line(row, idx, app.selected_row, width))
+        .collect()
+}
+
+fn message_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let rows = app.message_action_rows();
+    if rows.is_empty() {
+        return vec![Line::from(Span::styled(
+            "No submitted messages yet.",
+            dim(),
+        ))];
+    }
+    rows.into_iter()
+        .enumerate()
+        .map(|(idx, row)| {
+            let kind = match row.kind {
+                MessageActionKind::Submitted if row.followup => "sent",
+                MessageActionKind::Submitted => "start",
+                MessageActionKind::Queued => "queued",
+            };
+            let content = vec![
+                Span::styled(format!("{kind:<8}"), muted()),
+                Span::styled(truncate(&row.text, width.saturating_sub(12)), text_style()),
+            ];
+            highlight_selectable_row(content, idx == app.selected_row, width)
+        })
         .collect()
 }
 

@@ -4679,7 +4679,6 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                 }
                 ModelEvent::ToolCall { .. }
                 | ModelEvent::Usage { .. }
-                | ModelEvent::ResponseOutputItem { item: _ }
                 | ModelEvent::ResponseCompleted { .. }
                 | ModelEvent::ServerModel { .. }
                 | ModelEvent::ModelRateLimits { .. }
@@ -4687,6 +4686,16 @@ fn start_provider_turn_with_retries<P: ModelProvider>(
                 | ModelEvent::ModelsEtag { .. }
                 | ModelEvent::ServerReasoningIncluded { .. }
                 | ModelEvent::Done => {}
+                ModelEvent::ResponseOutputItem { item } => {
+                    record_model_response_output_item_completed_live(
+                        store,
+                        session_id,
+                        provider,
+                        turn_idx,
+                        attempt + 1,
+                        item,
+                    )?;
+                }
             }
             on_stream_event(attempt + 1, &event)?;
             events.push(event);
@@ -5158,6 +5167,34 @@ fn record_model_response_output_item<P: ModelProvider>(
         }),
     )?;
     save_image_generation_result_artifact(store, session, item)
+}
+
+fn record_model_response_output_item_completed_live<P: ModelProvider>(
+    store: &Store,
+    session_id: &str,
+    provider: &P,
+    turn_idx: usize,
+    attempt: usize,
+    item: &Value,
+) -> Result<()> {
+    if item.get("type").and_then(Value::as_str) != Some("message")
+        || item.get("phase").and_then(Value::as_str) != Some("commentary")
+    {
+        return Ok(());
+    }
+    store.append_event(
+        session_id,
+        "model.response.output_item.completed",
+        serde_json::json!({
+            "turn_idx": turn_idx,
+            "attempt": attempt,
+            "provider": provider.provider_name(),
+            "model": provider.model_name(),
+            "item_type": "message",
+            "phase": "commentary",
+        }),
+    )?;
+    Ok(())
 }
 
 fn save_image_generation_result_artifact(
@@ -8396,22 +8433,31 @@ fn append_new_external_session_messages_with_phase(
     turn_idx: Option<usize>,
 ) -> Result<ActiveTurnQueueDrain> {
     let mut appended_user_events = 0_usize;
-    let mut events = store
-        .events_for_session(session_id)?
-        .into_iter()
-        .filter(|event| {
-            event.seq > *last_seq
-                && matches!(
+    let session_events = store.events_for_session(session_id)?;
+    let max_seen_seq = session_events
+        .iter()
+        .filter(|event| event.seq > *last_seq)
+        .map(|event| event.seq)
+        .max();
+    let mut checkpoint_messages = Vec::new();
+    let mut events =
+        rollback_filtered_events_after(&session_events, *last_seq, &mut checkpoint_messages)
+            .into_iter()
+            .filter(|event| {
+                matches!(
                     event.event_type.as_str(),
                     "session.input" | "session.followup"
                 )
-        })
-        .collect::<Vec<_>>();
+            })
+            .collect::<Vec<_>>();
     events.sort_by_key(|event| event.seq);
     for event in events {
         *last_seq = (*last_seq).max(event.seq);
         messages.extend(session_event_user_messages(&event.payload));
         appended_user_events += 1;
+    }
+    if let Some(max_seen_seq) = max_seen_seq {
+        *last_seq = (*last_seq).max(max_seen_seq);
     }
     let mailbox = store.messages_for_agent(session_id)?;
     let mut deferred_mailbox_messages = 0_usize;
@@ -8604,17 +8650,21 @@ fn active_turn_pending_queue_input(
     session_id: &str,
     last_external_session_message_seq: i64,
 ) -> Result<ActiveTurnQueuePending> {
-    let session_messages = store
-        .events_for_session(session_id)?
-        .into_iter()
-        .filter(|event| {
-            event.seq > last_external_session_message_seq
-                && matches!(
-                    event.event_type.as_str(),
-                    "session.input" | "session.followup"
-                )
-        })
-        .count();
+    let events = store.events_for_session(session_id)?;
+    let mut checkpoint_messages = Vec::new();
+    let session_messages = rollback_filtered_events_after(
+        &events,
+        last_external_session_message_seq,
+        &mut checkpoint_messages,
+    )
+    .into_iter()
+    .filter(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "session.input" | "session.followup"
+        )
+    })
+    .count();
     let mailbox = store.messages_for_agent(session_id)?;
     let mailbox_messages = mailbox.len();
     let trigger_mailbox_messages = mailbox.iter().filter(|mail| mail.trigger_turn).count();
@@ -10323,6 +10373,10 @@ fn latest_compaction_checkpoint(events: &[EventRecord]) -> Option<CompactionChec
                 || event.payload.get("replacement_response_items").is_some(),
         })
     })
+}
+
+pub fn rollback_filtered_event_records(events: &[EventRecord]) -> Vec<&EventRecord> {
+    rollback_filtered_events(events)
 }
 
 fn rollback_filtered_events(events: &[EventRecord]) -> Vec<&EventRecord> {
@@ -35240,6 +35294,12 @@ for line in sys.stdin:
                 .count(),
             2
         );
+        let live_completed = events
+            .iter()
+            .filter(|event| event.event_type == "model.response.output_item.completed")
+            .collect::<Vec<_>>();
+        assert_eq!(live_completed.len(), 1);
+        assert_eq!(live_completed[0].payload["phase"], "commentary");
         assert!(events.iter().any(|event| {
             event.event_type == "session.done" && event.payload["result"] == "Final answer"
         }));
@@ -36592,6 +36652,48 @@ for line in sys.stdin:
             }
             bail!("queue-only mailbox should not force another provider turn");
         }
+    }
+
+    #[test]
+    fn active_turn_queue_ignores_rolled_back_followup_before_drain() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+        let input = store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial task"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "cancel this steering"}),
+        )?;
+        store.append_event(
+            &session.id,
+            SESSION_ROLLBACK_EVENT,
+            serde_json::json!({"num_turns": 1}),
+        )?;
+
+        let mut messages = Vec::new();
+        let mut last_seq = input.seq;
+        let mut last_hook_seq = 0;
+        let drain = drain_active_turn_queue_into_messages(
+            &store,
+            &session,
+            &mut messages,
+            &mut last_seq,
+            &mut last_hook_seq,
+            &RuntimeHookConfig::default(),
+            "test-model",
+            "before_tool_call",
+            0,
+        )?;
+
+        assert!(drain.is_empty());
+        assert!(messages.is_empty());
+        assert!(last_seq > input.seq);
+        Ok(())
     }
 
     #[test]

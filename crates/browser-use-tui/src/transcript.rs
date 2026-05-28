@@ -3,6 +3,7 @@ use browser_use_protocol::{
     normalize_result_text, turn_streaming_text_from_events, EventRecord, SessionMeta,
     WorkbenchState,
 };
+use browser_use_store::now_ms;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
 use serde::Deserialize;
@@ -18,13 +19,15 @@ use crate::theme::{
 };
 
 use super::{
-    App, PendingRequestUserInput, RequestUserInputFocus, RequestUserInputQuestion,
-    RequestUserInputState, REQUEST_USER_INPUT_OTHER_LABEL,
+    user_input_display_text_from_payload, App, PendingRequestUserInput, RequestUserInputFocus,
+    RequestUserInputQuestion, RequestUserInputState, REQUEST_USER_INPUT_OTHER_LABEL,
+    SESSION_QUEUED_FOLLOWUP_EVENT,
 };
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
 const GROUP_VALUE_LAST_PREFIX: &str = "  └ ";
 const ACTIVE_FALLBACK_STATUS: &str = "running browser task";
+const LIVE_STREAM_QUIET_STATUS_DELAY_MS: i64 = 500;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayMode {
@@ -397,12 +400,29 @@ impl TranscriptNode {
             _ => Vec::new(),
         }
     }
+
+    fn can_commit_full_live_stream(&self) -> bool {
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => nodes.iter().enumerate().any(|(idx, node)| {
+                matches!(node.kind, TranscriptKind::StreamingAssistant { .. })
+                    && nodes[idx + 1..]
+                        .iter()
+                        .any(|node| matches!(node.kind, TranscriptKind::PendingStatus { .. }))
+            }),
+            _ => false,
+        }
+    }
 }
 
 pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<TranscriptModel> {
     let session = state.current_session.as_ref()?;
-    let events = app.cached_events_for_session(&session.id);
-    let last_event_seq = events.last().map(|event| event.seq).unwrap_or_default();
+    let raw_events = app.cached_events_for_session(&session.id);
+    let last_event_seq = raw_events.last().map(|event| event.seq).unwrap_or_default();
+    let events = browser_use_core::rollback_filtered_event_records(raw_events)
+        .into_iter()
+        .cloned()
+        .collect::<Vec<_>>();
+    let events = events.as_slice();
     let mut committed = Vec::new();
     let mut terminal_committed = Vec::new();
 
@@ -543,6 +563,12 @@ pub(crate) fn active_streaming_lines(
         .unwrap_or_default()
 }
 
+pub(crate) fn active_streaming_can_commit_all(model: Option<&TranscriptModel>) -> bool {
+    model
+        .and_then(|model| model.active.as_ref())
+        .is_some_and(TranscriptNode::can_commit_full_live_stream)
+}
+
 #[cfg(test)]
 pub(crate) fn active_viewport_has_live_content(model: Option<&TranscriptModel>) -> bool {
     model
@@ -607,6 +633,7 @@ pub(crate) fn gap_before_active(model: &TranscriptModel) -> usize {
 
 fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize {
     match (previous, next) {
+        (TranscriptKind::StreamingAssistant { .. }, TranscriptKind::PendingStatus { .. }) => 0,
         (_, TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. }) => 1,
         (
             TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. },
@@ -648,6 +675,21 @@ fn committed_node_for_event(
                 kind: TranscriptKind::Prompt {
                     text,
                     followup: event.event_type == "session.followup",
+                },
+            })
+        }
+        SESSION_QUEUED_FOLLOWUP_EVENT => {
+            if !app.queued_followup_is_pending(root.id.as_str(), event.seq) {
+                return None;
+            }
+            let text = payload_string(event, "text")?;
+            Some(TranscriptNode {
+                id,
+                seq: event.seq,
+                revision: event.seq.max(0) as u64,
+                kind: TranscriptKind::PendingStatus {
+                    status: "queued follow-up".to_string(),
+                    detail: Some(text),
                 },
             })
         }
@@ -955,6 +997,7 @@ fn committed_node_for_event(
         | "model.turn.retry"
         | "model.stream_delta"
         | "model.delta"
+        | "model.response.output_item.completed"
         | "model.config"
         | "model.usage"
         | "session.compaction_started"
@@ -1215,7 +1258,9 @@ fn active_node_for_session(
             }
         }
     }
-    if live_streaming_text.is_none() {
+    if live_streaming_text.is_none()
+        || (live_status == "Thinking..." && live_stream_pending_status_allowed(live_events))
+    {
         active_nodes.push(pending_status_node(
             root,
             events,
@@ -1417,6 +1462,30 @@ fn live_stream_has_committed_successor(live_events: &[EventRecord]) -> bool {
                 "session.done" | "session.failed" | "session.cancelled"
             ) || (event.event_type == "model.turn.response"
                 && model_response_tool_call_count(event) > 0))
+    })
+}
+
+fn live_stream_pending_status_allowed(live_events: &[EventRecord]) -> bool {
+    let Some(latest_stream) = latest_nonempty_stream_event(live_events) else {
+        return false;
+    };
+    if live_events
+        .iter()
+        .any(|event| event.seq > latest_stream.seq && event.event_type != "model.stream_delta")
+    {
+        return true;
+    }
+    now_ms().saturating_sub(latest_stream.ts_ms) >= LIVE_STREAM_QUIET_STATUS_DELAY_MS
+}
+
+fn latest_nonempty_stream_event(live_events: &[EventRecord]) -> Option<&EventRecord> {
+    live_events.iter().rev().find(|event| {
+        event.event_type == "model.stream_delta"
+            && event
+                .payload
+                .get("text")
+                .and_then(serde_json::Value::as_str)
+                .is_some_and(|text| !text.trim().is_empty())
     })
 }
 
@@ -2669,6 +2738,11 @@ fn prefixed_plain(prefix: &str, text: &str) -> Vec<String> {
 }
 
 fn payload_string(event: &EventRecord, key: &str) -> Option<String> {
+    if key == "text" {
+        if let Some(text) = user_input_display_text_from_payload(&event.payload) {
+            return Some(text);
+        }
+    }
     event
         .payload
         .get(key)
@@ -3230,6 +3304,51 @@ mod tests {
         assert_eq!(line_text(&lines[0]), "> whats up");
         assert_eq!(line_text(&lines[1]), "");
         assert_eq!(line_text(&lines[2]), "Not much. I'm ready to work.");
+    }
+
+    #[test]
+    fn streaming_with_pending_status_keeps_prompt_separator() {
+        let active = TranscriptNode {
+            id: "active-stack".to_string(),
+            seq: 3,
+            revision: 3,
+            kind: TranscriptKind::Stack {
+                nodes: vec![
+                    TranscriptNode {
+                        id: "stream".to_string(),
+                        seq: 2,
+                        revision: 2,
+                        kind: TranscriptKind::StreamingAssistant {
+                            markdown: "Not much. I'm ready to work.".to_string(),
+                        },
+                    },
+                    TranscriptNode {
+                        id: "status".to_string(),
+                        seq: 3,
+                        revision: 3,
+                        kind: TranscriptKind::PendingStatus {
+                            status: "Thinking...".to_string(),
+                            detail: None,
+                        },
+                    },
+                ],
+            },
+        };
+        let model = TranscriptModel {
+            session_id: "session".to_string(),
+            committed: Vec::new(),
+            terminal_committed: Vec::new(),
+            active: Some(active),
+            last_event_seq: 3,
+            revision: 3,
+            live_phase: 0,
+        };
+
+        let lines = active_viewport_lines(Some(&model), 80, 10);
+
+        assert_eq!(line_text(&lines[0]), "");
+        assert_eq!(line_text(&lines[1]), "Not much. I'm ready to work.");
+        assert_eq!(line_text(&lines[2]), "• Thinking...");
     }
 
     #[test]

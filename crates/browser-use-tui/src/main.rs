@@ -18,9 +18,9 @@ use browser_use_core::{
     cleanup_agent_runtime_state_for_agent_subtree, configured_model_for_cwd_with_options,
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
     install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
-    product_analytics, typed_user_input_payload_from_text_for_cwd, AgentRunOptions,
-    CollaborationModeKind, ConfigOverrides, MessageHistoryConfig, MessageHistoryPersistence,
-    UnifiedExecShutdownCleanup,
+    product_analytics, typed_user_input_payload_from_items_for_cwd,
+    typed_user_input_payload_from_text_for_cwd, AgentRunOptions, CollaborationModeKind,
+    ConfigOverrides, MessageHistoryConfig, MessageHistoryPersistence, UnifiedExecShutdownCleanup,
 };
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
@@ -61,6 +61,7 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use serde::{Deserialize, Serialize};
 use unicode_width::UnicodeWidthStr;
 
+mod clipboard_paste;
 mod composer;
 mod markdown;
 mod palette;
@@ -99,6 +100,10 @@ const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
 const REQUEST_USER_INPUT_RESPONSE_EVENT: &str = "request_user_input.response";
 const REQUEST_USER_INPUT_OTHER_LABEL: &str = "None of the above";
 const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
+pub(crate) const SESSION_QUEUED_FOLLOWUP_EVENT: &str = "session.queued_followup";
+const SESSION_QUEUED_FOLLOWUP_SENT_EVENT: &str = "session.queued_followup.sent";
+const SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT: &str = "session.queued_followup.cancelled";
+const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -165,6 +170,7 @@ enum Surface {
     Browser,
     BrowserSelect,
     History,
+    Messages,
     Developer,
 }
 
@@ -180,6 +186,7 @@ impl Surface {
                 | Self::Browser
                 | Self::BrowserSelect
                 | Self::History
+                | Self::Messages
                 | Self::Developer
         )
     }
@@ -354,9 +361,18 @@ impl Drop for CodexLoginFlow {
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppCommand {
     StartTask(String),
+    StartTaskSubmission(UserSubmission),
     SendFollowup {
         session_id: String,
         text: String,
+    },
+    SendFollowupSubmission {
+        session_id: String,
+        submission: UserSubmission,
+    },
+    QueueFollowupSubmission {
+        session_id: String,
+        submission: UserSubmission,
     },
     AnswerRequestUserInput {
         session_id: String,
@@ -381,6 +397,154 @@ enum AppCommand {
     SaveBrowser(usize),
     SaveAuth(String),
     SaveTelemetry(String),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct UserSubmission {
+    text: String,
+    local_images: Vec<PathBuf>,
+}
+
+impl UserSubmission {
+    fn text(text: String) -> Self {
+        Self {
+            text,
+            local_images: Vec::new(),
+        }
+    }
+
+    fn has_local_images(&self) -> bool {
+        !self.local_images.is_empty()
+    }
+
+    fn display_text(&self) -> String {
+        display_text_for_local_images_and_text(self.local_images.len(), &self.text)
+            .unwrap_or_default()
+    }
+}
+
+fn typed_user_input_payload_for_submission_for_cwd(
+    submission: &UserSubmission,
+    cwd: impl AsRef<Path>,
+) -> Result<serde_json::Value> {
+    if submission.local_images.is_empty() {
+        return typed_user_input_payload_from_text_for_cwd(&submission.text, cwd);
+    }
+
+    let mut items = Vec::new();
+    for path in &submission.local_images {
+        items.push(serde_json::json!({
+            "type": "local_image",
+            "path": path.display().to_string(),
+            "detail": "high",
+        }));
+    }
+    if !submission.text.is_empty() {
+        items.push(serde_json::json!({
+            "type": "text",
+            "text": submission.text,
+        }));
+    }
+    let mut payload =
+        typed_user_input_payload_from_items_for_cwd(&serde_json::Value::Array(items), cwd)?;
+    payload["text"] = serde_json::json!(submission.display_text());
+    Ok(payload)
+}
+
+pub(crate) fn user_input_display_text_from_payload(payload: &serde_json::Value) -> Option<String> {
+    if let Some(items) = payload.get("items").and_then(serde_json::Value::as_array) {
+        let local_image_count = items
+            .iter()
+            .filter(|item| {
+                matches!(
+                    item.get("type").and_then(serde_json::Value::as_str),
+                    Some("image" | "local_image")
+                )
+            })
+            .count();
+        if local_image_count > 0 {
+            let text = items
+                .iter()
+                .filter(|item| item.get("type").and_then(serde_json::Value::as_str) == Some("text"))
+                .filter_map(|item| item.get("text").and_then(serde_json::Value::as_str))
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+                .collect::<Vec<_>>()
+                .join("\n");
+            if let Some(display) = display_text_for_local_images_and_text(local_image_count, &text)
+            {
+                return Some(display);
+            }
+        }
+    }
+
+    payload
+        .get("text")
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn display_text_for_local_images_and_text(image_count: usize, text: &str) -> Option<String> {
+    let text = text.trim();
+    if image_count == 0 {
+        return (!text.is_empty()).then(|| text.to_string());
+    }
+    let labels = (1..=image_count)
+        .map(|idx| format!("[Image {idx}]"))
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        Some(labels)
+    } else {
+        Some(format!("{labels}\n{text}"))
+    }
+}
+
+fn event_payload_text(event: &EventRecord) -> Option<String> {
+    user_input_display_text_from_payload(&event.payload)
+}
+
+fn queued_followup_marker_seq(event: &EventRecord) -> Option<i64> {
+    event
+        .payload
+        .get("queued_seq")
+        .or_else(|| event.payload.get("seq"))
+        .and_then(serde_json::Value::as_i64)
+}
+
+fn pending_queued_followup_events_from_events(events: &[EventRecord]) -> Vec<&EventRecord> {
+    let closed = events
+        .iter()
+        .filter(|event| {
+            matches!(
+                event.event_type.as_str(),
+                SESSION_QUEUED_FOLLOWUP_SENT_EVENT | SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT
+            )
+        })
+        .filter_map(queued_followup_marker_seq)
+        .collect::<HashSet<_>>();
+    events
+        .iter()
+        .filter(|event| {
+            event.event_type == SESSION_QUEUED_FOLLOWUP_EVENT && !closed.contains(&event.seq)
+        })
+        .collect()
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MessageActionKind {
+    Submitted,
+    Queued,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct MessageActionRow {
+    seq: i64,
+    kind: MessageActionKind,
+    text: String,
+    followup: bool,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1621,6 +1785,11 @@ impl App {
         if changed {
             self.refresh_cached_projection();
         }
+        if self.flush_ready_queued_followups()? {
+            changed = true;
+            self.state_cache.refresh_all(&self.store)?;
+            self.refresh_cached_projection();
+        }
         Ok(changed)
     }
 
@@ -1714,8 +1883,13 @@ impl App {
     }
 
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
-        let changed = self.state_cache.refresh_all(&self.store)?;
+        let mut changed = self.state_cache.refresh_all(&self.store)?;
         if changed {
+            self.refresh_cached_projection();
+        }
+        if self.flush_ready_queued_followups()? {
+            changed = true;
+            self.state_cache.refresh_all(&self.store)?;
             self.refresh_cached_projection();
         }
         Ok(changed)
@@ -1723,6 +1897,92 @@ impl App {
 
     fn cached_events_for_session(&self, session_id: &str) -> &[EventRecord] {
         self.state_cache.events_for_session(session_id)
+    }
+
+    fn pending_queued_followup_events<'a>(
+        &self,
+        events: &'a [EventRecord],
+    ) -> Vec<&'a EventRecord> {
+        pending_queued_followup_events_from_events(events)
+    }
+
+    pub(crate) fn queued_followup_is_pending(&self, session_id: &str, queued_seq: i64) -> bool {
+        self.pending_queued_followup_events(self.cached_events_for_session(session_id))
+            .into_iter()
+            .any(|event| event.seq == queued_seq)
+    }
+
+    fn flush_ready_queued_followups(&mut self) -> Result<bool> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(false);
+        };
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(false);
+        };
+        if session.status.is_active() {
+            return Ok(false);
+        }
+        let events = self.store.events_for_session(&session_id)?;
+        let pending = pending_queued_followup_events_from_events(&events);
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let selection = self.session_model_selection_or_current(&session_id)?;
+        if !self.ensure_agent_ready_for_selection(&selection)? {
+            return Ok(false);
+        }
+        for queued in pending {
+            let mut payload = queued.payload.clone();
+            payload["queued_from_seq"] = serde_json::json!(queued.seq);
+            self.store
+                .append_event(&session_id, "session.followup", payload)?;
+            self.store.append_event(
+                &session_id,
+                SESSION_QUEUED_FOLLOWUP_SENT_EVENT,
+                serde_json::json!({ "queued_seq": queued.seq }),
+            )?;
+        }
+        self.status_notice = Some("Sent queued follow-up.".to_string());
+        self.start_agent_for_session(session_id)?;
+        Ok(true)
+    }
+
+    pub(crate) fn message_action_rows(&self) -> Vec<MessageActionRow> {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Vec::new();
+        };
+        let events = self.cached_events_for_session(session_id);
+        let mut rows = browser_use_core::rollback_filtered_event_records(events)
+            .into_iter()
+            .filter(|event| {
+                matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+            })
+            .filter_map(|event| {
+                event_payload_text(event).map(|text| MessageActionRow {
+                    seq: event.seq,
+                    kind: MessageActionKind::Submitted,
+                    text,
+                    followup: event.event_type == "session.followup",
+                })
+            })
+            .collect::<Vec<_>>();
+        rows.extend(
+            self.pending_queued_followup_events(events)
+                .into_iter()
+                .filter_map(|event| {
+                    event_payload_text(event).map(|text| MessageActionRow {
+                        seq: event.seq,
+                        kind: MessageActionKind::Queued,
+                        text,
+                        followup: true,
+                    })
+                }),
+        );
+        rows.sort_by_key(|row| row.seq);
+        rows
     }
 
     fn empty_workbench_state_with_failure(&self) -> WorkbenchState {
@@ -2131,10 +2391,10 @@ impl App {
         }
         match key {
             KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
+                code: KeyCode::Char(c),
+                modifiers,
                 ..
-            } => {
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
                 if !self.composer.is_empty() {
                     self.composer.clear();
                     self.save_current_request_input_notes();
@@ -2356,34 +2616,38 @@ impl App {
             return Ok(());
         }
         let text = self.composer.input().trim().to_string();
-        if let Some(plan_text) = text
-            .strip_prefix("/plan")
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-            .map(str::trim)
-        {
-            if self.current_task_is_active()?
-                && self.collaboration_mode != CollaborationModeKind::Plan
+        let has_local_images = self.composer.has_local_images();
+        if !has_local_images {
+            if let Some(plan_text) = text
+                .strip_prefix("/plan")
+                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+                .map(str::trim)
             {
-                self.status_notice = Some(
-                    "Collaboration mode can change after the running turn finishes.".to_string(),
-                );
+                if self.current_task_is_active()?
+                    && self.collaboration_mode != CollaborationModeKind::Plan
+                {
+                    self.status_notice = Some(
+                        "Collaboration mode can change after the running turn finishes."
+                            .to_string(),
+                    );
+                    return Ok(());
+                }
+                self.composer.take_trimmed();
+                self.dispatch(AppCommand::SetCollaborationMode(
+                    CollaborationModeKind::Plan,
+                ))?;
+                if !plan_text.is_empty() {
+                    self.submit_plain_text(plan_text.to_string())?;
+                }
                 return Ok(());
             }
-            self.composer.take_trimmed();
-            self.dispatch(AppCommand::SetCollaborationMode(
-                CollaborationModeKind::Plan,
-            ))?;
-            if !plan_text.is_empty() {
-                self.submit_plain_text(plan_text.to_string())?;
-            }
-            return Ok(());
         }
-        if text == "/mode" {
+        if !has_local_images && text == "/mode" {
             self.composer.take_trimmed();
             self.dispatch(AppCommand::ChangeMode)?;
             return Ok(());
         }
-        if text.is_empty() {
+        if text.is_empty() && !has_local_images {
             if let Some(session) = self
                 .selected_session_id
                 .as_deref()
@@ -2418,19 +2682,63 @@ impl App {
             if !active && !self.ensure_agent_ready()? {
                 return Ok(());
             }
-            let text = self.composer.take_trimmed();
-            self.dispatch(AppCommand::SendFollowup {
-                session_id: session.id,
-                text,
-            })?;
+            let submission = self.take_composer_submission();
+            if submission.has_local_images() {
+                self.dispatch(AppCommand::SendFollowupSubmission {
+                    session_id: session.id,
+                    submission,
+                })?;
+            } else {
+                self.dispatch(AppCommand::SendFollowup {
+                    session_id: session.id,
+                    text: submission.text,
+                })?;
+            }
             return Ok(());
         }
         if !self.ensure_agent_ready()? {
             return Ok(());
         }
-        let text = self.composer.take_trimmed();
-        self.dispatch(AppCommand::StartTask(text))?;
+        let submission = self.take_composer_submission();
+        if submission.has_local_images() {
+            self.dispatch(AppCommand::StartTaskSubmission(submission))?;
+        } else {
+            self.dispatch(AppCommand::StartTask(submission.text))?;
+        }
         Ok(())
+    }
+
+    fn take_composer_submission(&mut self) -> UserSubmission {
+        let (text, local_images) = self.composer.take_submission();
+        UserSubmission { text, local_images }
+    }
+
+    fn queue_current_composer_followup(&mut self) -> Result<bool> {
+        if self.surface != Surface::Main || self.composer.is_empty() {
+            return Ok(false);
+        }
+        let Some(session) = self
+            .selected_session_id
+            .as_deref()
+            .and_then(|id| {
+                self.state_cache
+                    .sessions
+                    .iter()
+                    .find(|session| session.id == id)
+            })
+            .cloned()
+        else {
+            return Ok(false);
+        };
+        if !session.status.is_active() {
+            return Ok(false);
+        }
+        let submission = self.take_composer_submission();
+        self.dispatch(AppCommand::QueueFollowupSubmission {
+            session_id: session.id,
+            submission,
+        })?;
+        Ok(true)
     }
 
     fn submit_plain_text(&mut self, text: String) -> Result<()> {
@@ -2480,67 +2788,25 @@ impl App {
     fn dispatch(&mut self, command: AppCommand) -> Result<()> {
         match command {
             AppCommand::StartTask(text) => {
-                let selection = self.current_model_selection();
-                if !self.ensure_agent_ready_for_selection(&selection)? {
-                    return Ok(());
-                }
-                let cwd = std::env::current_dir()?;
-                let session = self.store.create_session(None, &cwd)?;
-                self.append_session_model_selection(&session.id, &selection)?;
-                let options = self.configured_agent_options()?;
-                browser_use_core::append_workspace_context_event_with_options(
-                    &self.store,
-                    &session,
-                    &options,
-                )?;
-                let _ = self.refresh_prompt_history_for(&cwd, &options);
-                self.store.append_event(
-                    &session.id,
-                    "session.input",
-                    typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
-                )?;
-                self.prompt_history.record_submission(&text);
-                self.maybe_append_message_history(&session.id, &text, &cwd, &options);
-                self.selected_session_id = Some(session.id.clone());
-                self.native_history.reset_with_clear();
-                self.start_agent_for_session(session.id)?;
+                self.start_task_submission(UserSubmission::text(text))?;
+            }
+            AppCommand::StartTaskSubmission(submission) => {
+                self.start_task_submission(submission)?;
             }
             AppCommand::SendFollowup { session_id, text } => {
-                let active = self
-                    .store
-                    .load_session(&session_id)?
-                    .is_some_and(|session| session.status.is_active());
-                if !active {
-                    let selection = self.session_model_selection_or_current(&session_id)?;
-                    if !self.ensure_agent_ready_for_selection(&selection)? {
-                        return Ok(());
-                    }
-                }
-                let session = self
-                    .store
-                    .load_session(&session_id)?
-                    .with_context(|| format!("unknown session id: {session_id}"))?;
-                let options = self.configured_agent_options().ok();
-                if let Some(options) = options.as_ref() {
-                    let _ = self.refresh_prompt_history_for(Path::new(&session.cwd), options);
-                }
-                self.store.append_event(
-                    &session_id,
-                    "session.followup",
-                    typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
-                )?;
-                self.prompt_history.record_submission(&text);
-                if let Some(options) = options.as_ref() {
-                    self.maybe_append_message_history(
-                        &session_id,
-                        &text,
-                        Path::new(&session.cwd),
-                        options,
-                    );
-                }
-                if !active {
-                    self.start_agent_for_session(session_id)?;
-                }
+                self.send_followup_submission(session_id, UserSubmission::text(text))?;
+            }
+            AppCommand::SendFollowupSubmission {
+                session_id,
+                submission,
+            } => {
+                self.send_followup_submission(session_id, submission)?;
+            }
+            AppCommand::QueueFollowupSubmission {
+                session_id,
+                submission,
+            } => {
+                self.queue_followup_submission(session_id, submission)?;
             }
             AppCommand::AnswerRequestUserInput {
                 session_id,
@@ -2615,6 +2881,107 @@ impl App {
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
         }
         self.drain_store_notifications()?;
+        Ok(())
+    }
+
+    fn start_task_submission(&mut self, submission: UserSubmission) -> Result<()> {
+        let selection = self.current_model_selection();
+        if !self.ensure_agent_ready_for_selection(&selection)? {
+            return Ok(());
+        }
+        let cwd = std::env::current_dir()?;
+        let session = self.store.create_session(None, &cwd)?;
+        self.append_session_model_selection(&session.id, &selection)?;
+        let options = self.configured_agent_options()?;
+        browser_use_core::append_workspace_context_event_with_options(
+            &self.store,
+            &session,
+            &options,
+        )?;
+        let _ = self.refresh_prompt_history_for(&cwd, &options);
+        self.store.append_event(
+            &session.id,
+            "session.input",
+            typed_user_input_payload_for_submission_for_cwd(&submission, &cwd)?,
+        )?;
+        self.prompt_history.record_submission(&submission.text);
+        self.maybe_append_message_history(&session.id, &submission.text, &cwd, &options);
+        self.selected_session_id = Some(session.id.clone());
+        self.native_history.reset_with_clear();
+        self.start_agent_for_session(session.id)?;
+        Ok(())
+    }
+
+    fn send_followup_submission(
+        &mut self,
+        session_id: String,
+        submission: UserSubmission,
+    ) -> Result<()> {
+        let active = self
+            .store
+            .load_session(&session_id)?
+            .is_some_and(|session| session.status.is_active());
+        if !active {
+            let selection = self.session_model_selection_or_current(&session_id)?;
+            if !self.ensure_agent_ready_for_selection(&selection)? {
+                return Ok(());
+            }
+        }
+        let session = self
+            .store
+            .load_session(&session_id)?
+            .with_context(|| format!("unknown session id: {session_id}"))?;
+        let options = self.configured_agent_options().ok();
+        if let Some(options) = options.as_ref() {
+            let _ = self.refresh_prompt_history_for(Path::new(&session.cwd), options);
+        }
+        self.store.append_event(
+            &session_id,
+            "session.followup",
+            typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?,
+        )?;
+        self.prompt_history.record_submission(&submission.text);
+        if let Some(options) = options.as_ref() {
+            self.maybe_append_message_history(
+                &session_id,
+                &submission.text,
+                Path::new(&session.cwd),
+                options,
+            );
+        }
+        if !active {
+            self.start_agent_for_session(session_id)?;
+        }
+        Ok(())
+    }
+
+    fn queue_followup_submission(
+        &mut self,
+        session_id: String,
+        submission: UserSubmission,
+    ) -> Result<()> {
+        let session = self
+            .store
+            .load_session(&session_id)?
+            .with_context(|| format!("unknown session id: {session_id}"))?;
+        if !session.status.is_active() {
+            return self.send_followup_submission(session_id, submission);
+        }
+        let mut payload =
+            typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
+        payload["delivery"] = serde_json::json!("after_current_turn");
+        self.store
+            .append_event(&session_id, SESSION_QUEUED_FOLLOWUP_EVENT, payload)?;
+        self.prompt_history.record_submission(&submission.text);
+        if let Ok(Some(options)) = self.configured_agent_options().map(Some) {
+            self.maybe_append_message_history(
+                &session_id,
+                &submission.text,
+                Path::new(&session.cwd),
+                &options,
+            );
+        }
+        self.status_notice = Some("Queued follow-up after the current turn.".to_string());
         Ok(())
     }
 
@@ -2708,19 +3075,132 @@ impl App {
             .is_some_and(|until| Instant::now() <= until)
     }
 
-    fn handle_main_escape(&mut self) -> Result<()> {
-        if self.escape_stop_is_pending() {
-            if self.cancel_current_task()? {
-                self.escape_stop_until = None;
-                self.quit_hint_until = None;
-                return Ok(());
+    fn open_message_actions(&mut self) -> Result<()> {
+        self.refresh_state_cache_from_store()?;
+        let rows = self.message_action_rows();
+        if rows.is_empty() {
+            self.status_notice = Some("No messages to edit.".to_string());
+            self.escape_stop_until = None;
+            return Ok(());
+        }
+        self.close_slash_palette();
+        self.surface = Surface::Messages;
+        self.selected_row = rows.len().saturating_sub(1);
+        self.escape_stop_until = None;
+        Ok(())
+    }
+
+    fn selected_message_action_row(&self) -> Option<MessageActionRow> {
+        let rows = self.message_action_rows();
+        rows.get(self.selected_row.min(rows.len().saturating_sub(1)))
+            .cloned()
+    }
+
+    pub(crate) fn selected_message_action_is_queued(&self) -> bool {
+        self.selected_message_action_row()
+            .is_some_and(|row| row.kind == MessageActionKind::Queued)
+    }
+
+    fn submitted_turns_to_rollback_from(&self, target_seq: i64) -> usize {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return 1;
+        };
+        browser_use_core::rollback_filtered_event_records(
+            self.cached_events_for_session(session_id),
+        )
+        .into_iter()
+        .filter(|event| {
+            event.seq >= target_seq
+                && matches!(
+                    event.event_type.as_str(),
+                    "session.input" | "session.followup"
+                )
+        })
+        .count()
+        .max(1)
+    }
+
+    fn cancel_queued_followup(&mut self, row: &MessageActionRow) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Ok(());
+        };
+        self.store.append_event(
+            session_id,
+            SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT,
+            serde_json::json!({
+                "queued_seq": row.seq,
+                "reason": "removed from message selector",
+            }),
+        )?;
+        self.status_notice = Some("Removed queued follow-up.".to_string());
+        Ok(())
+    }
+
+    fn rollback_submitted_message(&mut self, row: &MessageActionRow, action: &str) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(());
+        };
+        if self.current_task_is_active()? {
+            self.cancel_current_task()?;
+        }
+        let num_turns = self.submitted_turns_to_rollback_from(row.seq);
+        self.store.append_event(
+            &session_id,
+            SESSION_ROLLBACK_EVENT,
+            serde_json::json!({
+                "num_turns": num_turns,
+                "target_seq": row.seq,
+                "action": action,
+                "source": "tui_message_selector",
+            }),
+        )?;
+        self.native_history.reset_with_clear();
+        Ok(())
+    }
+
+    fn edit_selected_message(&mut self) -> Result<()> {
+        let Some(row) = self.selected_message_action_row() else {
+            return Ok(());
+        };
+        match row.kind {
+            MessageActionKind::Queued => self.cancel_queued_followup(&row)?,
+            MessageActionKind::Submitted => self.rollback_submitted_message(&row, "edit")?,
+        }
+        self.composer.set_input(row.text);
+        self.close_surface();
+        self.status_notice = Some("Editing message. Press Enter to send.".to_string());
+        Ok(())
+    }
+
+    fn remove_selected_message(&mut self) -> Result<()> {
+        let Some(row) = self.selected_message_action_row() else {
+            return Ok(());
+        };
+        match row.kind {
+            MessageActionKind::Queued => self.cancel_queued_followup(&row)?,
+            MessageActionKind::Submitted => {
+                self.status_notice =
+                    Some("Submitted messages can be edited, not removed.".to_string());
             }
         }
-        self.escape_stop_until = if self.current_task_is_active()? {
-            Some(Instant::now() + DOUBLE_ESCAPE_STOP_WINDOW)
-        } else {
-            None
-        };
+        if row.kind == MessageActionKind::Queued {
+            self.close_surface();
+        }
+        Ok(())
+    }
+
+    fn handle_main_escape(&mut self) -> Result<()> {
+        if self.escape_stop_is_pending() {
+            self.open_message_actions()?;
+            self.quit_hint_until = None;
+            return Ok(());
+        }
+        self.escape_stop_until =
+            if self.selected_session_id.is_some() && !self.message_action_rows().is_empty() {
+                Some(Instant::now() + DOUBLE_ESCAPE_STOP_WINDOW)
+            } else {
+                None
+            };
         self.close_surface();
         Ok(())
     }
@@ -2758,7 +3238,9 @@ impl App {
             && !self.is_first_run_setup_visible()?
         {
             match key {
-                _ if is_prompt_history_search_start_key(key) => {
+                _ if !self.composer.has_local_images()
+                    && is_prompt_history_search_start_key(key) =>
+                {
                     self.begin_prompt_history_search()?;
                     self.drain_store_notifications()?;
                     return Ok(false);
@@ -2795,20 +3277,33 @@ impl App {
         }
         match key {
             KeyEvent {
+                code: KeyCode::Char(c),
+                modifiers,
+                ..
+            } if self.surface == Surface::Main
+                && modifiers.intersects(KeyModifiers::CONTROL | KeyModifiers::ALT)
+                && c.eq_ignore_ascii_case(&'v') =>
+            {
+                self.paste_image_from_clipboard();
+            }
+            KeyEvent {
                 code: KeyCode::Char('q'),
                 modifiers: KeyModifiers::CONTROL,
                 ..
             } => return Ok(true),
             KeyEvent {
-                code: KeyCode::Char('c'),
-                modifiers: KeyModifiers::CONTROL,
+                code: KeyCode::Char(c),
+                modifiers,
                 ..
-            } => {
+            } if modifiers.contains(KeyModifiers::CONTROL) && c.eq_ignore_ascii_case(&'c') => {
                 if !self.composer.is_empty() {
                     self.composer.clear();
                     self.prompt_history.reset_navigation();
                 } else if self.cancel_current_task()? {
                     self.quit_hint_until = None;
+                    if self.surface == Surface::Messages {
+                        self.close_surface();
+                    }
                 } else if self
                     .quit_hint_until
                     .is_some_and(|until| Instant::now() <= until)
@@ -2875,6 +3370,9 @@ impl App {
             }
             KeyEvent {
                 code: KeyCode::Tab, ..
+            } if self.queue_current_composer_followup()? => {}
+            KeyEvent {
+                code: KeyCode::Tab, ..
             } => self.open_surface(Surface::History),
             KeyEvent {
                 code: KeyCode::F(1),
@@ -2936,6 +3434,20 @@ impl App {
                 code: KeyCode::Down,
                 ..
             } if self.surface == Surface::Main => {}
+            KeyEvent {
+                code: KeyCode::Backspace | KeyCode::Delete,
+                ..
+            } if self.surface == Surface::Messages => self.remove_selected_message()?,
+            KeyEvent {
+                code: KeyCode::Char('x') | KeyCode::Char('d'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.surface == Surface::Messages => self.remove_selected_message()?,
+            KeyEvent {
+                code: KeyCode::Char('e'),
+                modifiers: KeyModifiers::NONE,
+                ..
+            } if self.surface == Surface::Messages => self.edit_selected_message()?,
             KeyEvent {
                 code: KeyCode::Enter,
                 modifiers: KeyModifiers::NONE,
@@ -3032,6 +3544,22 @@ impl App {
                 self.selected_row = 0;
             }
             _ => {}
+        }
+    }
+
+    fn paste_image_from_clipboard(&mut self) {
+        match clipboard_paste::paste_image_to_temp_png() {
+            Ok((path, info)) => {
+                self.composer.attach_image(path);
+                self.prompt_history.reset_navigation();
+                self.status_notice = Some(format!(
+                    "Attached clipboard image ({}x{}).",
+                    info.width, info.height
+                ));
+            }
+            Err(error) => {
+                self.status_notice = Some(format!("Failed to paste image: {error}"));
+            }
         }
     }
 
@@ -3133,6 +3661,7 @@ impl App {
             Surface::BrowserSelect => {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
+            Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
                 0 => self.dispatch(AppCommand::ConfigureTelemetry)?,
                 _ => self.close_surface(),
@@ -3523,6 +4052,9 @@ impl App {
 
     fn should_prompt_history_handle_older(&mut self) -> Result<bool> {
         if self.surface != Surface::Main || self.is_slash_palette_active() {
+            return Ok(false);
+        }
+        if self.composer.has_local_images() {
             return Ok(false);
         }
         if self.is_first_run_setup_visible()? {
@@ -4208,6 +4740,7 @@ impl App {
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::History => self.workbench_state()?.history.len(),
+            Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
         })
     }
@@ -5407,11 +5940,17 @@ fn desired_terminal_viewport_height_for(
                 .live_stream_emitted_lines_for(&session.id, body_width)
         })
         .unwrap_or(0);
-    let stream_skip_lines = stream_skip_lines.max(
-        transcript::active_streaming_lines(transcript_model.as_ref(), body_width)
-            .len()
-            .saturating_sub(1),
-    );
+    let active_streaming_lines =
+        transcript::active_streaming_lines(transcript_model.as_ref(), body_width);
+    let estimated_stream_skip_lines =
+        if transcript::active_streaming_can_commit_all(transcript_model.as_ref())
+            && active_streaming_lines.len() > 1
+        {
+            active_streaming_lines.len()
+        } else {
+            active_streaming_lines.len().saturating_sub(1)
+        };
+    let stream_skip_lines = stream_skip_lines.max(estimated_stream_skip_lines);
     let active_lines = transcript::active_viewport_lines_with_stream_skip(
         transcript_model.as_ref(),
         body_width,
@@ -5741,7 +6280,12 @@ fn maybe_emit_native_live_stream(
     width: u16,
 ) -> Result<()> {
     let lines = transcript::active_streaming_lines(Some(model), width);
-    let emit_count = lines.len().saturating_sub(1);
+    let emit_count = if transcript::active_streaming_can_commit_all(Some(model)) && lines.len() > 1
+    {
+        lines.len()
+    } else {
+        lines.len().saturating_sub(1)
+    };
     if emit_count == 0 {
         app.native_history.clear_live_stream();
         return Ok(());
@@ -6205,6 +6749,15 @@ mod redesign_tests {
         Ok(app)
     }
 
+    fn write_test_png(path: &Path) -> Result<()> {
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let image = image::ImageBuffer::from_pixel(2, 2, image::Rgba([12u8, 34, 56, 255]));
+        image.save(path)?;
+        Ok(())
+    }
+
     fn with_browser_use_terminal_home<T>(app_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
         let _lock = BROWSER_USE_TERMINAL_HOME_TEST_LOCK
             .lock()
@@ -6221,6 +6774,66 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn submit_attached_image_as_local_image_item() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let image_path = temp.path().join("clipboard.png");
+        write_test_png(&image_path)?;
+
+        app.composer.set_input("describe this".to_string());
+        app.composer.attach_image(image_path.clone());
+        app.submit()?;
+
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session after submit")?;
+        let events = app.store.events_for_session(&session_id)?;
+        let input = events
+            .iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert_eq!(input.payload["text"], "[Image 1]\ndescribe this");
+        assert!(!input.payload["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains(image_path.to_string_lossy().as_ref()));
+        assert_eq!(input.payload["items"][0]["type"], "local_image");
+        assert_eq!(
+            input.payload["items"][0]["path"],
+            image_path.display().to_string()
+        );
+        assert_eq!(input.payload["items"][1]["type"], "text");
+        let content = input.payload["content"].as_array().context("content")?;
+        assert!(content.iter().any(|part| {
+            part["type"] == "input_image"
+                && part["image_url"]
+                    .as_str()
+                    .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+        }));
+        assert!(content
+            .iter()
+            .any(|part| part["type"] == "input_text" && part["text"] == "describe this"));
+        Ok(())
+    }
+
+    #[test]
+    fn local_image_display_text_uses_labels_not_paths() {
+        let payload = serde_json::json!({
+            "text": "[local_image:/tmp/but-clipboard-one.png]\n[local_image:/tmp/but-clipboard-two.png]\nwhat is here",
+            "items": [
+                {"type": "local_image", "path": "/tmp/but-clipboard-one.png"},
+                {"type": "local_image", "path": "/tmp/but-clipboard-two.png"},
+                {"type": "text", "text": "what is here"}
+            ],
+        });
+
+        let display = user_input_display_text_from_payload(&payload).expect("display text");
+        assert_eq!(display, "[Image 1] [Image 2]\nwhat is here");
+        assert!(!display.contains("but-clipboard"));
     }
 
     fn write_tui_model_catalog(app_home: &std::path::Path) -> Result<()> {
@@ -6386,6 +6999,7 @@ mod redesign_tests {
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::History => "History",
+            Surface::Messages => "Messages",
             Surface::Developer => "Developer",
             Surface::ApiKey => "API key",
             Surface::Telemetry => "Laminar",
@@ -10318,12 +10932,79 @@ wire_api = "responses"
         assert_eq!(streaming, prompt_only);
         let streaming_screen = render_dump(&mut app)?;
         assert!(streaming_screen.contains("streaming now"));
-        assert!(!streaming_screen.contains("thinking"));
+        assert!(!streaming_screen.contains("Thinking..."));
         assert!(!streaming_screen.contains("Working..."));
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         let emission = transcript::terminal_scrollback_emission_since(&model, last_seq, 120, true);
         assert!(lines_plain_text(&emission.lines).contains("> yo"));
+        Ok(())
+    }
+
+    #[test]
+    fn quiet_streaming_commentary_shows_thinking_status_after_debounce() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event_with_identity(
+            &session.id,
+            "quiet-streaming-commentary".to_string(),
+            browser_use_store::now_ms().saturating_sub(1_000),
+            "model.stream_delta",
+            serde_json::json!({"text": "I checked the top-level files and docs."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("I checked the top-level files and docs."));
+        assert!(screen.contains("Thinking..."));
+        assert!(!screen.contains("Working..."));
+        Ok(())
+    }
+
+    #[test]
+    fn commentary_completion_restores_thinking_status_without_debounce() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I checked the top-level files and docs."}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.response.output_item.completed",
+            serde_json::json!({"item_type": "message", "phase": "commentary"}),
+        )?;
+        app.selected_session_id = Some(session.id);
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("I checked the top-level files and docs."));
+        assert!(screen.contains("Thinking..."));
+        assert!(!screen.contains("Working..."));
         Ok(())
     }
 
@@ -10418,6 +11099,7 @@ wire_api = "responses"
         app.args.height = measured;
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("Type to steer the agent"));
+        assert!(!screen.contains("Thinking..."));
         let state = app.workbench_state()?;
         let model = transcript::transcript_model(&app, &state).expect("model");
         let streaming_lines = lines_plain_text(&transcript::active_streaming_lines(
@@ -10427,7 +11109,6 @@ wire_api = "responses"
         assert!(streaming_lines.contains("This is a Rust-first browser agent"));
         assert!(streaming_lines.contains("browser-use"));
         assert!(streaming_lines.contains("core design"));
-        assert!(!screen.contains("thinking"));
         Ok(())
     }
 
@@ -10490,6 +11171,7 @@ wire_api = "responses"
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("live output line 24"));
         assert!(!screen.contains("live output line 01"));
+        assert!(!screen.contains("Thinking..."));
         assert!(!screen.contains("Working..."));
         assert!(screen.contains("Type to steer the agent"));
         Ok(())
@@ -10768,6 +11450,14 @@ wire_api = "responses"
             lines_plain_text(&transcript::active_viewport_lines(Some(&model), 120, 20));
         assert!(
             active_during_stream.contains("I am checking the files"),
+            "{active_during_stream}"
+        );
+        assert!(
+            !active_during_stream.contains("Thinking..."),
+            "{active_during_stream}"
+        );
+        assert!(
+            !active_during_stream.contains("Working..."),
             "{active_during_stream}"
         );
         assert!(
@@ -11052,6 +11742,142 @@ wire_api = "responses"
     }
 
     #[test]
+    fn enter_steers_and_tab_queues_followup_like_codex() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        app.set_input("steer before the next tool".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.followup"
+                && event.payload["text"] == "steer before the next tool"
+        }));
+
+        app.set_input("after the current turn".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        let queued = events
+            .iter()
+            .find(|event| {
+                event.event_type == SESSION_QUEUED_FOLLOWUP_EVENT
+                    && event.payload["text"] == "after the current turn"
+            })
+            .context("queued follow-up")?
+            .seq;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "session.followup")
+                .count(),
+            1
+        );
+
+        app.store.append_event(
+            &running.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+        app.drain_store_notifications()?;
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_QUEUED_FOLLOWUP_SENT_EVENT
+                && event.payload["queued_seq"] == queued
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.followup"
+                && event.payload["text"] == "after the current turn"
+                && event.payload["queued_from_seq"] == queued
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn message_selector_edits_submitted_and_cancels_queued_messages() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "initial task"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "first answer"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.followup",
+            serde_json::json!({"text": "revise this"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "second answer"}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.drain_store_notifications()?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Messages);
+        let submitted_selector = render_dump(&mut app)?;
+        assert!(submitted_selector.contains("Enter:edit | Esc:close"));
+        assert!(!submitted_selector.contains("Del:remove"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Messages);
+        assert!(app.composer.input().is_empty());
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == SESSION_ROLLBACK_EVENT));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert_eq!(app.composer.input(), "revise this");
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_ROLLBACK_EVENT
+                && event.payload["action"] == "edit"
+                && event.payload["num_turns"] == 1
+        }));
+        let visible = browser_use_core::rollback_filtered_event_records(&events)
+            .into_iter()
+            .filter_map(event_payload_text)
+            .collect::<Vec<_>>();
+        assert_eq!(visible, vec!["initial task"]);
+
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "running"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+        app.set_input("queued draft".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        assert_eq!(app.surface, Surface::Messages);
+        let queued_selector = render_dump(&mut app)?;
+        assert!(queued_selector.contains("Del:cancel queued"));
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Delete, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT
+                && event.payload["reason"] == "removed from message selector"
+        }));
+        Ok(())
+    }
+
+    #[test]
     fn agent_panic_records_failed_session() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
@@ -11089,7 +11915,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn escape_twice_stops_running_task() -> Result<()> {
+    fn escape_twice_opens_message_selector_and_ctrl_c_stops_running_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let running = app.store.create_session(None, std::env::current_dir()?)?;
@@ -11109,16 +11935,25 @@ wire_api = "responses"
             Some(SessionStatus::Running)
         );
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("esc again to stop"));
+        assert!(screen.contains("esc again to edit messages"));
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
         assert!(!app.escape_stop_is_pending());
+        assert_eq!(app.surface, Surface::Messages);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Messages"));
+        assert!(screen.contains("run"));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('C'), KeyModifiers::CONTROL))?);
         assert_eq!(
             app.store
                 .load_session(&running.id)?
                 .map(|session| session.status),
             Some(SessionStatus::Cancelled)
         );
+        assert_eq!(app.surface, Surface::Main);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("stopped"));
         Ok(())
     }
 }
