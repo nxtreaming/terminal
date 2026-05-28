@@ -27266,6 +27266,8 @@ x-env = "CORP_HEADER"
             .first()
             .and_then(Option::as_deref)
             .context("instructions")?;
+        assert!(instructions.starts_with("You are Browser Use Terminal, a web agent"));
+        assert!(instructions.contains("describe your web-browsing abilities first"));
         assert!(instructions.contains("Browser Agent Contract"));
         Ok(())
     }
@@ -39840,6 +39842,7 @@ command = "printf '%s' '{\"hookSpecificOutput\":{\"hookEventName\":\"PostCompact
         assert!(message.contains("Loaded Browser-Harness Interaction Skills"));
         assert!(message.contains("interaction-skills/screenshots.md"));
         assert!(message.contains("interaction-skills/tabs.md"));
+        assert!(message.contains("interaction-skills/forms.md"));
         assert!(message.contains("Compacted prior browser-agent context"));
         assert!(message.contains("https://example.com"));
         Ok(())

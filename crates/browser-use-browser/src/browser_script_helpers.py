@@ -689,17 +689,70 @@ def scroll(x=0, y=0, dy=600, dx=0):
     return True
 
 
+def _query_selector_node_id(selector):
+    doc = cdp("DOM.getDocument", depth=0)
+    root = (doc or {}).get("root") or {}
+    root_id = root.get("nodeId")
+    if not root_id:
+        return None
+    result = cdp("DOM.querySelector", nodeId=root_id, selector=selector)
+    node_id = (result or {}).get("nodeId")
+    return node_id or None
+
+
+def _wait_for_selector_node_id(selector, timeout=0.0):
+    deadline = _time.monotonic() + _timeout_seconds(timeout)
+    while True:
+        node_id = _query_selector_node_id(selector)
+        if node_id:
+            return node_id
+        if timeout <= 0 or _time.monotonic() >= deadline:
+            return None
+        _time.sleep(0.1)
+
+
+def _quad_center(quad):
+    if not quad or len(quad) < 8:
+        return None
+    xs = quad[0::2]
+    ys = quad[1::2]
+    if max(xs) <= min(xs) or max(ys) <= min(ys):
+        return None
+    return (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
+
+
+def _node_center(node_id):
+    try:
+        model = (cdp("DOM.getBoxModel", nodeId=node_id) or {}).get("model") or {}
+    except Exception:
+        return None
+    return _quad_center(model.get("border")) or _quad_center(model.get("content"))
+
+
+def _focus_selector_like_user(selector, timeout=0.0):
+    node_id = _wait_for_selector_node_id(selector, timeout=timeout)
+    if not node_id:
+        return False
+    try:
+        cdp("DOM.scrollIntoViewIfNeeded", nodeId=node_id)
+    except Exception:
+        pass
+    center = _node_center(node_id)
+    if center:
+        click_at_xy(center[0], center[1])
+        return True
+    try:
+        cdp("DOM.focus", nodeId=node_id)
+        return True
+    except Exception:
+        return False
+
+
 def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
-    """Fill a framework-managed input using real key events plus input/change."""
+    """Fill an input by focusing it through CDP, then using browser input events."""
     if clear_first is not None:
         clear = clear_first
-    if timeout > 0 and not wait_for_element(selector, timeout=timeout):
-        raise RuntimeError(f"fill_input: element not found: {selector!r}")
-    focused = js(
-        f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-        "if(!e)return false;e.focus();return true;})()"
-    )
-    if not focused:
+    if not _focus_selector_like_user(selector, timeout=timeout):
         raise RuntimeError(f"fill_input: element not found: {selector!r}")
     if clear:
         mods = 4 if sys.platform == "darwin" else 2
@@ -713,27 +766,9 @@ def fill_input(selector, text, clear=True, clear_first=None, timeout=0.0):
         cdp("Input.dispatchKeyEvent", type="rawKeyDown", **select_all)
         cdp("Input.dispatchKeyEvent", type="keyUp", **select_all)
         press_key("Backspace")
-    for ch in text:
-        press_key(ch)
-    js(
-        f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-        "if(!e)return;"
-        "e.dispatchEvent(new Event('input',{bubbles:true}));"
-        "e.dispatchEvent(new Event('change',{bubbles:true}));})();"
-    )
+    if text:
+        type_text(str(text))
     return True
-
-
-_KC = {"Enter": 13, "Tab": 9, "Escape": 27, "Backspace": 8, " ": 32, "ArrowLeft": 37, "ArrowUp": 38, "ArrowRight": 39, "ArrowDown": 40}
-
-
-def dispatch_key(selector, key="Enter", event="keypress"):
-    kc = _KC.get(key, ord(key) if len(key) == 1 else 0)
-    js(
-        f"(()=>{{const e=document.querySelector({json.dumps(selector)});"
-        f"if(e){{e.focus();e.dispatchEvent(new KeyboardEvent({json.dumps(event)},"
-        f"{{key:{json.dumps(key)},code:{json.dumps(key)},keyCode:{kc},which:{kc},bubbles:true}}));}}}})()"
-    )
 
 
 def upload_file(selector, path):
