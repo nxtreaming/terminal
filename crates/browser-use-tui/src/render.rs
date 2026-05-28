@@ -1301,7 +1301,7 @@ fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
 /// Status row below the composer: active model and context-fill bar,
 /// plus running cost when there is one. The browser lives on the box's
 /// bottom border, not here.
-fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Line<'static> {
+fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line<'static> {
     let usage = session_usage(app, state);
     let mut spans = vec![Span::styled(app.model.clone(), accent())];
     spans.push(status_separator());
@@ -1317,6 +1317,24 @@ fn composer_status_line(app: &App, state: &WorkbenchState, _width: usize) -> Lin
     if usage.cost_usd > 0.0 {
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
+    }
+    if let Some(live_url) = state
+        .browser
+        .live_url
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        let used = spans_text_width(&spans);
+        let prefix_width = status_separator_width() + "live ".chars().count();
+        if width > used.saturating_add(prefix_width).saturating_add(8) {
+            let available = width.saturating_sub(used + prefix_width);
+            spans.push(status_separator());
+            spans.push(Span::styled(
+                format!("live {}", truncate(live_url, available)),
+                muted(),
+            ));
+        }
     }
     Line::from(spans)
 }
@@ -1396,6 +1414,14 @@ fn context_bar_spans(used_tokens: i64, budget_tokens: Option<i64>) -> Vec<Span<'
 
 fn status_separator() -> Span<'static> {
     Span::styled("  ·  ", dim())
+}
+
+fn status_separator_width() -> usize {
+    5
+}
+
+fn spans_text_width(spans: &[Span<'_>]) -> usize {
+    spans.iter().map(|span| span.content.chars().count()).sum()
 }
 
 /// Per-session token and cost totals. Codex-style `token_count` events are the
@@ -2366,12 +2392,7 @@ fn browser_panel_lines(app: &App, state: &WorkbenchState) -> Vec<Line<'static>> 
         ),
         kv_line(
             "live view",
-            state
-                .browser
-                .live_url
-                .as_deref()
-                .map(|_| "available")
-                .unwrap_or("not available"),
+            state.browser.live_url.as_deref().unwrap_or("not available"),
         ),
         kv_line(
             "tabs",

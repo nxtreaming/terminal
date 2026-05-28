@@ -493,6 +493,9 @@ install_release() {
     mkdir -p "$stage_release/python"
   fi
   chmod 0755 "$stage_release/bin/but" "$stage_release/bin/browser-use-terminal"
+  if [ -d "$stage_release/bin/agent-tools" ]; then
+    find "$stage_release/bin/agent-tools" -type f -exec chmod 0755 {} +
+  fi
 
   if [ -e "$release_dir" ] || [ -L "$release_dir" ]; then
     rm -rf "$release_dir"
@@ -508,6 +511,7 @@ release_dir_is_complete() {
   [ -d "$release_dir" ] &&
     [ -x "$release_dir/bin/but" ] &&
     [ -x "$release_dir/bin/browser-use-terminal" ] &&
+    [ -x "$release_dir/bin/agent-tools/rg" ] &&
     [ -f "$release_dir/python/llm_browser_worker/worker.py" ] &&
     [ "$(basename "$release_dir")" = "$expected_version-$expected_target" ]
 }

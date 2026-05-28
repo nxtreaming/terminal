@@ -601,6 +601,7 @@ pub fn browser_summary_from_events(
                 summary.live_url = event
                     .payload
                     .get("live_url")
+                    .or_else(|| event.payload.get("url"))
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned);
             }
@@ -1336,6 +1337,32 @@ mod tests {
                 "ran cargo test -p browser-use-core",
                 "modified main.rs",
             ]
+        );
+    }
+
+    #[test]
+    fn browser_live_url_projection_accepts_current_and_legacy_payload_keys() {
+        let current = vec![event(
+            1,
+            "browser.live_url",
+            json!({"live_url": "https://live.browser-use.com/watch"}),
+        )];
+        let browser = browser_summary_from_events(&current, "browser use cloud");
+        assert_eq!(browser.status, "connected");
+        assert_eq!(
+            browser.live_url.as_deref(),
+            Some("https://live.browser-use.com/watch")
+        );
+
+        let legacy = vec![event(
+            1,
+            "browser.live_url",
+            json!({"url": "https://live.browser-use.com/legacy"}),
+        )];
+        let browser = browser_summary_from_events(&legacy, "browser use cloud");
+        assert_eq!(
+            browser.live_url.as_deref(),
+            Some("https://live.browser-use.com/legacy")
         );
     }
 

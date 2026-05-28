@@ -98,6 +98,17 @@ scripts/verify-terminal-ui.sh
 
 Terminal UI changes must pass the full verification script. It runs Rust tests, Python tests, deterministic Ratatui dumps, and a real tmux smoke test.
 
+### Agent Tools
+
+Release archives include a managed ripgrep binary at `bin/agent-tools/rg`.
+Agent shell commands prepend Browser Use Terminal's temporary tool shim and
+managed tools directory to `PATH`, so `rg`, `rg --version`, and `rg --files`
+work without depending on the user's shell dotfiles or DotSlash. Source
+checkout entry points and local dev wrappers install the same managed ripgrep
+under `target/debug/agent-tools/rg`; run
+`scripts/install-agent-ripgrep.sh target/debug/agent-tools` to refresh it
+manually.
+
 ### Telemetry
 
 You can disable (100% completely anonymous) telemetry with  `BUT_TELEMETRY=0`.

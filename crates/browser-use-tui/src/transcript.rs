@@ -917,7 +917,10 @@ fn committed_node_for_event(
         "browser.live_url" => Some(timeline_node(
             event,
             "browser",
-            vec!["live view available".to_string()],
+            vec![payload_string(event, "live_url")
+                .or_else(|| payload_string(event, "url"))
+                .map(|url| format!("live view {}", compact_url(&url)))
+                .unwrap_or_else(|| "live view available".to_string())],
             NodeStyle::Normal,
         )),
         "browser.page" | "browser.state" => event

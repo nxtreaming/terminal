@@ -13231,9 +13231,13 @@ fn dispatch_tool_call<P: ModelProvider>(
             runtime_hooks,
             tool_output_token_budget,
         ),
-        ToolHandlerKind::Browser => {
-            dispatch_browser_tool(store, session, call, tool_output_token_budget)
-        }
+        ToolHandlerKind::Browser => dispatch_browser_tool(
+            store,
+            session,
+            call,
+            options.browser_mode.as_deref(),
+            tool_output_token_budget,
+        ),
         ToolHandlerKind::BrowserScript => dispatch_browser_script_tool(
             store,
             session,
@@ -14795,6 +14799,7 @@ fn dispatch_browser_tool(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     call: &ToolCall,
+    selected_browser_mode: Option<&str>,
     tool_output_token_budget: usize,
 ) -> Result<ToolDispatchOutcome> {
     let cmd = call
@@ -14815,13 +14820,34 @@ fn dispatch_browser_tool(
             "arguments": call.arguments,
         }),
     )?;
-    let output = if let Some(content) = dispatch_browser_preference_command(store, session, cmd)? {
+    let output = if let Some(content) = match dispatch_browser_preference_command_for_mode(
+        store,
+        session,
+        cmd,
+        selected_browser_mode,
+    ) {
+        Ok(content) => content,
+        Err(error) => {
+            return dispatch_tool_validation_error(store, session, call, &format!("{error:#}"));
+        }
+    } {
         browser_use_browser::BrowserCommandOutput {
             content,
             events: Vec::new(),
         }
     } else {
-        let resolved_cmd = resolve_browser_connect_command(store, cmd)?;
+        let resolved_cmd =
+            match resolve_browser_command_for_selected_mode(store, cmd, selected_browser_mode) {
+                Ok(resolved_cmd) => resolved_cmd,
+                Err(error) => {
+                    return dispatch_tool_validation_error(
+                        store,
+                        session,
+                        call,
+                        &format!("{error:#}"),
+                    );
+                }
+            };
         browser_use_browser::run_browser_command(
             &session.id,
             &session.cwd,
@@ -14854,10 +14880,11 @@ fn dispatch_browser_tool(
     })
 }
 
-fn dispatch_browser_preference_command(
+fn dispatch_browser_preference_command_for_mode(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     cmd: &str,
+    selected_browser_mode: Option<&str>,
 ) -> Result<Option<Value>> {
     let argv = browser_command_words(cmd)?;
     let args = strip_browser_prefix(&argv);
@@ -14865,7 +14892,11 @@ fn dispatch_browser_preference_command(
         return Ok(None);
     };
     match first {
-        "preference" | "preferences" => Ok(Some(dispatch_browser_preference(store, &args)?)),
+        "preference" | "preferences" => Ok(Some(dispatch_browser_preference(
+            store,
+            &args,
+            selected_browser_mode,
+        )?)),
         "profile" | "profiles"
             if args.get(1).is_some_and(|arg| {
                 matches!(
@@ -14875,14 +14906,21 @@ fn dispatch_browser_preference_command(
             }) =>
         {
             Ok(Some(dispatch_browser_profile_preference(
-                store, session, &args,
+                store,
+                session,
+                &args,
+                selected_browser_mode,
             )?))
         }
         _ => Ok(None),
     }
 }
 
-fn dispatch_browser_preference(store: &Store, args: &[String]) -> Result<Value> {
+fn dispatch_browser_preference(
+    store: &Store,
+    args: &[String],
+    selected_browser_mode: Option<&str>,
+) -> Result<Value> {
     match args.get(1).map(String::as_str) {
         None | Some("--json") | Some("show") => browser_preference_json(store),
         Some("use") => {
@@ -14890,6 +14928,7 @@ fn dispatch_browser_preference(store: &Store, args: &[String]) -> Result<Value> 
                 anyhow!("browser preference use requires <local|cloud|managed-headless>")
             })?;
             let normalized = normalize_browser_preference_mode(mode)?;
+            enforce_selected_browser_mode(selected_browser_mode, normalized)?;
             store.set_setting(BROWSER_PREF_MODE, normalized)?;
             store.set_setting("browser", browser_display_name(normalized))?;
             Ok(json!({
@@ -14906,10 +14945,12 @@ fn dispatch_browser_profile_preference(
     store: &Store,
     session: &browser_use_protocol::SessionMeta,
     args: &[String],
+    selected_browser_mode: Option<&str>,
 ) -> Result<Value> {
     match args.get(1).map(String::as_str) {
         Some("current") => browser_preference_json(store),
         Some("use") => {
+            enforce_selected_browser_mode(selected_browser_mode, "local")?;
             let profile_id = args
                 .get(2)
                 .map(String::as_str)
@@ -14932,8 +14973,14 @@ fn dispatch_browser_profile_preference(
             let mode = option_value_core(args, "--mode")
                 .map(|mode| normalize_browser_preference_mode(&mode).map(ToOwned::to_owned))
                 .transpose()?
+                .or_else(|| {
+                    selected_browser_mode
+                        .and_then(|mode| normalize_browser_preference_mode(mode).ok())
+                        .map(ToOwned::to_owned)
+                })
                 .or_else(|| store.get_setting(BROWSER_PREF_MODE).ok().flatten())
                 .unwrap_or_else(|| "local".to_string());
+            enforce_selected_browser_mode(selected_browser_mode, &mode)?;
             let value = json!({
                 "domain": normalize_domain(&domain),
                 "mode": mode,
@@ -14970,6 +15017,7 @@ fn dispatch_browser_profile_preference(
             Ok(json!({ "status": "ok", "forgot_domain": normalize_domain(&domain) }))
         }
         Some("suggest") => {
+            enforce_selected_browser_mode(selected_browser_mode, "local")?;
             let domain = option_value_core(args, "--domain")
                 .or_else(|| args.get(2).cloned())
                 .ok_or_else(|| anyhow!("browser profile suggest requires --domain <domain>"))?;
@@ -15010,33 +15058,150 @@ fn dispatch_browser_profile_preference(
     }
 }
 
-fn resolve_browser_connect_command(store: &Store, cmd: &str) -> Result<String> {
+fn resolve_browser_command_for_selected_mode(
+    store: &Store,
+    cmd: &str,
+    selected_browser_mode: Option<&str>,
+) -> Result<String> {
     let argv = browser_command_words(cmd)?;
     let args = strip_browser_prefix(&argv);
     if args.len() == 1 && args.first().is_some_and(|arg| arg == "connect") {
-        let mode = store
-            .get_setting(BROWSER_PREF_MODE)?
-            .unwrap_or_else(|| "local".to_string());
-        let profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
-        let command = match normalize_browser_preference_mode(&mode)? {
-            "cloud" => {
-                if let Some(profile_id) = profile_id.as_deref().filter(|value| !value.is_empty()) {
-                    return Ok(format!(
-                        "browser remote start --profile-id {}",
-                        shell_quote_browser_arg(profile_id)
-                    ));
-                }
-                "browser remote start"
-            }
-            "managed-headless" => "browser connect managed --headless",
-            "managed-headed" => "browser connect managed --headed",
-            "local" => "browser connect local",
-            _ => "browser connect local",
+        let effective_mode = effective_browser_mode(store, selected_browser_mode)?;
+        let profile_id = if selected_browser_mode.is_some() {
+            None
+        } else {
+            store.get_setting(BROWSER_PREF_PROFILE)?
         };
-        Ok(command.to_string())
+        Ok(browser_connect_command_for_mode(
+            effective_mode,
+            profile_id.as_deref(),
+        ))
     } else {
+        enforce_browser_command_matches_selected_mode(&args, selected_browser_mode)?;
         Ok(cmd.to_string())
     }
+}
+
+fn effective_browser_mode(
+    store: &Store,
+    selected_browser_mode: Option<&str>,
+) -> Result<&'static str> {
+    if let Some(mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return normalize_browser_preference_mode(mode);
+    }
+    preferred_browser_mode(store)
+}
+
+fn preferred_browser_mode(store: &Store) -> Result<&'static str> {
+    let mode = store
+        .get_setting(BROWSER_PREF_MODE)?
+        .or_else(|| {
+            store
+                .get_setting("browser")
+                .ok()
+                .flatten()
+                .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+        })
+        .unwrap_or_else(|| "local".to_string());
+    normalize_browser_preference_mode(&mode)
+}
+
+fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> String {
+    match normalize_browser_preference_mode(mode).unwrap_or("local") {
+        "cloud" => profile_id.filter(|value| !value.is_empty()).map_or_else(
+            || "browser remote start".to_string(),
+            |profile_id| {
+                format!(
+                    "browser remote start --profile-id {}",
+                    shell_quote_browser_arg(profile_id)
+                )
+            },
+        ),
+        "managed-headless" => "browser connect managed --headless".to_string(),
+        "managed-headed" => "browser connect managed --headed".to_string(),
+        _ => "browser connect local".to_string(),
+    }
+}
+
+fn enforce_selected_browser_mode(
+    selected_browser_mode: Option<&str>,
+    requested_mode: &str,
+) -> Result<()> {
+    let Some(selected_mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let selected_mode = normalize_browser_preference_mode(selected_mode)?;
+    let requested_mode = normalize_browser_preference_mode(requested_mode)?;
+    if selected_mode == requested_mode {
+        return Ok(());
+    }
+    bail!(
+        "browser mode is locked to {} for this run; change the browser selector in the terminal UI before using {}",
+        browser_display_name(selected_mode),
+        browser_display_name(requested_mode),
+    )
+}
+
+fn enforce_browser_command_matches_selected_mode(
+    args: &[String],
+    selected_browser_mode: Option<&str>,
+) -> Result<()> {
+    let Some(selected_mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let selected_mode = normalize_browser_preference_mode(selected_mode)?;
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(());
+    };
+    match command {
+        "help" | "--help" | "-h" | "status" | "doctor" | "domain" | "runtime" | "script" => Ok(()),
+        "connect" => match args.get(1).map(String::as_str) {
+            None => Ok(()),
+            Some("local") => enforce_selected_browser_mode(Some(selected_mode), "local"),
+            Some("managed") => {
+                let requested_mode = if has_browser_arg(args, "--headed")
+                    || has_browser_arg(args, "--headful")
+                {
+                    "managed-headed"
+                } else {
+                    "managed-headless"
+                };
+                enforce_selected_browser_mode(Some(selected_mode), requested_mode)
+            }
+            Some("remote-cdp") => bail!(
+                "browser mode is locked to {} for this run; remote CDP endpoints are not selectable from this terminal browser mode",
+                browser_display_name(selected_mode),
+            ),
+            Some(other) => bail!("unknown browser connect mode: {other}"),
+        },
+        "local" => enforce_selected_browser_mode(Some(selected_mode), "local"),
+        "remote" => enforce_selected_browser_mode(Some(selected_mode), "cloud"),
+        "recover" => match args.get(1).map(String::as_str) {
+            Some("restart-owned-browser") => match selected_mode {
+                "managed-headless" | "managed-headed" => Ok(()),
+                _ => bail!(
+                    "browser mode is locked to {} for this run; restart-owned-browser only applies to managed Chromium",
+                    browser_display_name(selected_mode),
+                ),
+            },
+            Some("stop-owned-remote") => enforce_selected_browser_mode(Some(selected_mode), "cloud"),
+            _ => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn has_browser_arg(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
 }
 
 fn browser_preference_json(store: &Store) -> Result<Value> {
@@ -26833,9 +26998,13 @@ x-env = "CORP_HEADER"
         let store = Store::open(temp.path())?;
         let session = store.create_session(None, temp.path())?;
 
-        let output =
-            dispatch_browser_preference_command(&store, &session, "browser preference use cloud")?
-                .expect("preference command");
+        let output = dispatch_browser_preference_command_for_mode(
+            &store,
+            &session,
+            "browser preference use cloud",
+            None,
+        )?
+        .expect("preference command");
         assert_eq!(output["status"], "ok");
         assert_eq!(
             store.get_setting(BROWSER_PREF_MODE)?.as_deref(),
@@ -26846,14 +27015,15 @@ x-env = "CORP_HEADER"
             Some("Browser Use cloud")
         );
         assert_eq!(
-            resolve_browser_connect_command(&store, "browser connect")?,
+            resolve_browser_command_for_selected_mode(&store, "browser connect", None)?,
             "browser remote start"
         );
 
-        let output = dispatch_browser_preference_command(
+        let output = dispatch_browser_preference_command_for_mode(
             &store,
             &session,
             "browser profile remember --domain https://www.gusto.com/ --profile 'google-chrome:Profile 2' --mode local",
+            None,
         )?
         .expect("profile command");
         assert_eq!(output["status"], "ok");
@@ -26869,20 +27039,89 @@ x-env = "CORP_HEADER"
             .unwrap()
             .contains("browser local setup --profile 'google-chrome:Profile 2'"));
         assert_eq!(
-            resolve_browser_connect_command(&store, "connect")?,
+            resolve_browser_command_for_selected_mode(&store, "connect", None)?,
             "browser connect local"
         );
 
-        dispatch_browser_preference_command(
+        dispatch_browser_preference_command_for_mode(
             &store,
             &session,
             "browser profile remember --domain browser-use.com --profile 'cloud profile id' --mode cloud",
+            None,
         )?
         .expect("cloud profile command");
         assert_eq!(
-            resolve_browser_connect_command(&store, "browser connect")?,
+            resolve_browser_command_for_selected_mode(&store, "browser connect", None)?,
             "browser remote start --profile-id 'cloud profile id'"
         );
+        Ok(())
+    }
+
+    #[test]
+    fn selected_browser_mode_resolves_default_connect_and_blocks_mismatches() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, temp.path())?;
+
+        store.set_setting("browser", "Browser Use cloud")?;
+        assert_eq!(
+            resolve_browser_command_for_selected_mode(&store, "browser connect", None)?,
+            "browser remote start"
+        );
+        store.set_setting(BROWSER_PREF_PROFILE, "google-chrome:Profile 2")?;
+        assert_eq!(
+            resolve_browser_command_for_selected_mode(&store, "browser connect", Some("cloud"))?,
+            "browser remote start"
+        );
+        assert_eq!(
+            resolve_browser_command_for_selected_mode(&store, "browser connect", Some("local"))?,
+            "browser connect local"
+        );
+        assert_eq!(
+            resolve_browser_command_for_selected_mode(
+                &store,
+                "browser connect",
+                Some("managed-headless"),
+            )?,
+            "browser connect managed --headless"
+        );
+
+        let cloud_local = resolve_browser_command_for_selected_mode(
+            &store,
+            "browser connect local",
+            Some("cloud"),
+        )
+        .expect_err("cloud mode must reject local connect")
+        .to_string();
+        assert!(cloud_local.contains("locked to Browser Use cloud"));
+
+        let local_remote = resolve_browser_command_for_selected_mode(
+            &store,
+            "browser remote start",
+            Some("local"),
+        )
+        .expect_err("local mode must reject remote start")
+        .to_string();
+        assert!(local_remote.contains("locked to Local Chrome"));
+
+        let headless_headed = resolve_browser_command_for_selected_mode(
+            &store,
+            "browser connect managed --headed",
+            Some("managed-headless"),
+        )
+        .expect_err("headless mode must reject headed managed browser")
+        .to_string();
+        assert!(headless_headed.contains("locked to Headless Chromium"));
+
+        let preference_change = dispatch_browser_preference_command_for_mode(
+            &store,
+            &session,
+            "browser preference use cloud",
+            Some("local"),
+        )
+        .expect_err("locked local mode must reject cloud preference")
+        .to_string();
+        assert!(preference_change.contains("locked to Local Chrome"));
         Ok(())
     }
 

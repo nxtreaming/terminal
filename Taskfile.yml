@@ -5,7 +5,11 @@ tasks:
     desc: Run the browser-use CLI from source, forwarding args after --
     silent: true
     cmds:
-      - BUT_TELEMETRY="${BUT_TELEMETRY:-0}" cargo run -p browser-use-cli -- {{.CLI_ARGS}}
+      - |
+        scripts/install-agent-ripgrep.sh target/debug/agent-tools >/dev/null
+        BUT_TELEMETRY="${BUT_TELEMETRY:-0}" \
+          BUT_AGENT_TOOLS_DIR="$PWD/target/debug/agent-tools" \
+          cargo run -p browser-use-cli -- {{.CLI_ARGS}}
 
   tui:dev:
     aliases:
@@ -14,7 +18,11 @@ tasks:
     desc: Run the browser-use TUI from source, forwarding args after --
     silent: true
     cmds:
-      - BUT_TELEMETRY="${BUT_TELEMETRY:-0}" cargo run -p browser-use-tui -- {{.CLI_ARGS}}
+      - |
+        scripts/install-agent-ripgrep.sh target/debug/agent-tools >/dev/null
+        BUT_TELEMETRY="${BUT_TELEMETRY:-0}" \
+          BUT_AGENT_TOOLS_DIR="$PWD/target/debug/agent-tools" \
+          cargo run -p browser-use-tui -- {{.CLI_ARGS}}
 
   reset:onboarding:
     aliases:
