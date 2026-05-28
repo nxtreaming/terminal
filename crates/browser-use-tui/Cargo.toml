@@ -10,20 +10,20 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow.workspace = true
+arboard.workspace = true
 browser-use-core = { path = "../browser-use-core" }
 browser-use-providers = { path = "../browser-use-providers" }
 browser-use-protocol = { path = "../browser-use-protocol" }
 browser-use-store = { path = "../browser-use-store" }
 clap.workspace = true
 crossterm.workspace = true
+image.workspace = true
 open.workspace = true
 pulldown-cmark.workspace = true
 ratatui.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 syntect.workspace = true
+tempfile.workspace = true
 two-face.workspace = true
 unicode-width.workspace = true
-
-[dev-dependencies]
-tempfile.workspace = true

@@ -275,6 +275,15 @@ def append_store_event(state_dir: Path, session_id: str, event_type: str, payloa
         conn.execute("UPDATE sessions SET updated_ms = ? WHERE id = ?", (now_ms, session_id))
 
 
+def set_session_status(state_dir: Path, session_id: str, status: str) -> None:
+    now_ms = int(time.time() * 1000)
+    with sqlite3.connect(state_dir / "state.db") as conn:
+        conn.execute(
+            "UPDATE sessions SET status = ?, updated_ms = ? WHERE id = ?",
+            (status, now_ms, session_id),
+        )
+
+
 def create_live_subagent(
     state_dir: Path,
     parent_id: str,
@@ -682,19 +691,63 @@ def smoke_tall_terminal_keeps_running_controls_attached_to_content(binary: Path)
         shutil.rmtree(state_dir, ignore_errors=True)
 
 
-def smoke_double_escape_stops_running_task(binary: Path) -> None:
+def smoke_double_escape_opens_message_selector(binary: Path) -> None:
     session = f"but-smoke-esc-stop-{os.getpid()}"
     state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-stop-"))
     try:
         start_session(session, binary, state_dir)
         wait_for(session, "Type to steer the agent", "double-escape-running")
         tmux_send(session, "Escape")
-        armed = wait_for(session, "esc again to stop", "double-escape-armed")
+        armed = wait_for(session, "esc again to edit messages", "double-escape-armed")
         assert_contains(armed, "Type to steer the agent", "first escape should keep the task running")
         assert_no_legacy_dashboard_chrome(armed, "first escape should not restore old dashboard chrome")
         tmux_send(session, "Escape")
-        stopped = wait_for(session, "stopped", "double-escape-stopped")
-        assert_not_contains(stopped, "^[[", "double escape should not leak escape sequences")
+        selector = wait_for(session, "Messages", "double-escape-messages")
+        assert_contains(selector, "run", "message selector should show the submitted prompt")
+        assert_contains(
+            selector,
+            "Edit submitted prompts or cancel queued follow-ups",
+            "message selector should describe the actual submitted/queued actions",
+        )
+        assert_contains(selector, "Enter:edit | Esc:close", "submitted message selector should not advertise delete")
+        assert_not_contains(selector, "Del:remove", "submitted messages cannot be literally deleted")
+        assert_not_contains(selector, "^[[", "double escape should not leak escape sequences")
+        tmux_send(session, "C-c")
+        stopped = wait_for(session, "stopped", "ctrl-c-stopped-after-message-selector")
+        assert_not_contains(stopped, "^[[", "ctrl+c stop should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_tab_queues_followup_after_current_turn(binary: Path) -> None:
+    session = f"but-smoke-tab-queue-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-tab-queue-"))
+    try:
+        start_session(session, binary, state_dir)
+        wait_for(session, "Type to steer the agent", "tab-queue-running")
+        tmux_send_literal(session, "after current turn")
+        tmux_send(session, "Tab")
+        queued = wait_for(session, "queued follow-up", "tab-queue-pending")
+        assert_contains(queued, "after current turn", "tab should keep the queued prompt visible")
+        assert_contains(queued, "Type to steer", "tab should leave the active turn running")
+
+        session_id = latest_session_id(state_dir)
+        append_store_event(
+            state_dir,
+            session_id,
+            "session.done",
+            {"result": "Current turn finished"},
+        )
+        set_session_status(state_dir, session_id, "done")
+        sent = wait_for(session, "sending", "tab-queue-sent")
+        assert_contains(
+            sent,
+            "> after current turn",
+            "queued follow-up should submit when the current turn finishes",
+        )
+        assert_not_contains(sent, "queued follow-up", "sent queued follow-up should stop rendering as queued")
+        assert_not_contains(sent, "^[[", "tab queued follow-up should not leak escape sequences")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -1022,6 +1075,22 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             {"text": streaming_text, "turn_idx": 1},
         )
         wait_for(session, "summarize what", "prompt-only-followup-streaming")
+        fresh_streaming_visible = capture_visible(
+            session,
+            "prompt-only-followup-streaming-fresh-visible",
+        )
+        assert_not_contains(
+            fresh_streaming_visible,
+            "Thinking...",
+            "fresh streaming follow-up should not show the thinking indicator while text is arriving",
+        )
+        append_store_event(
+            state_dir,
+            session_id,
+            "model.response.output_item.completed",
+            {"item_type": "message", "phase": "commentary", "turn_idx": 1},
+        )
+        wait_for(session, "Thinking...", "prompt-only-followup-commentary-complete")
         streaming_visible = capture_after_idle(
             session,
             "prompt-only-followup-streaming-visible",
@@ -1063,15 +1132,15 @@ def smoke_prompt_only_followup_keeps_completed_transcript(binary: Path) -> None:
             "summarize what",
             "streaming follow-up should not insert a separator inside the assistant paragraph",
         )
+        assert_contains(
+            streaming_visible,
+            "Thinking...",
+            "commentary before tool calls should keep the live thinking indicator visible",
+        )
         assert_not_contains(
             streaming_visible,
             "Working...",
             "streaming follow-up should not show a redundant live heartbeat",
-        )
-        assert_not_contains(
-            streaming_visible,
-            "thinking",
-            "streaming follow-up should replace the prompt-only thinking indicator",
         )
         assert_not_contains(
             streaming_visible,
@@ -1415,7 +1484,8 @@ def main() -> int:
     smoke_ready_resize_does_not_leave_stale_frames(binary)
     smoke_history_selection_emits_native_transcript(binary)
     smoke_tall_terminal_keeps_running_controls_attached_to_content(binary)
-    smoke_double_escape_stops_running_task(binary)
+    smoke_double_escape_opens_message_selector(binary)
+    smoke_tab_queues_followup_after_current_turn(binary)
     smoke_completed_history_uses_native_scrollback(binary)
     smoke_streaming_transcript_scrolls_above_composer(binary)
     smoke_prompt_only_followup_keeps_completed_transcript(binary)
