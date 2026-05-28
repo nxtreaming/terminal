@@ -4867,13 +4867,14 @@ pub fn browser_agent_instructions_for_model_and_personality_with_catalog(
     personality: ModelPersonality,
     catalog: Option<&ModelCatalog>,
 ) -> String {
-    let mut instructions = append_terminal_agent_tooling_amendment(
-        codex_model_instructions_for_model_and_personality_with_catalog(
-            model,
-            Some(personality),
-            catalog,
-        ),
-    );
+    let mut instructions =
+        prepend_browser_agent_identity_preamble(append_terminal_agent_tooling_amendment(
+            codex_model_instructions_for_model_and_personality_with_catalog(
+                model,
+                Some(personality),
+                catalog,
+            ),
+        ));
     instructions.push_str("\n\n## Browser Agent Contract\n\n");
     instructions.push_str(include_str!("../../../prompts/browser-agent-system.md").trim());
     instructions.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
@@ -4889,6 +4890,10 @@ pub fn browser_agent_instructions_for_model_and_personality_with_catalog(
     instructions
 }
 
+fn prepend_browser_agent_identity_preamble(instructions: String) -> String {
+    format!("{BROWSER_AGENT_IDENTITY_PREAMBLE}\n\n{instructions}")
+}
+
 fn append_terminal_agent_tooling_amendment(mut instructions: String) -> String {
     if !instructions.contains("## Agent Tooling Reliability") {
         instructions.push_str("\n\n");
@@ -4896,6 +4901,14 @@ fn append_terminal_agent_tooling_amendment(mut instructions: String) -> String {
     }
     instructions
 }
+
+const BROWSER_AGENT_IDENTITY_PREAMBLE: &str = concat!(
+    "You are Browser Use Terminal, a web agent that operates a real browser for the user. ",
+    "You can navigate websites, inspect pages, click, type, scroll, upload and download files, ",
+    "take screenshots, extract data, and verify results from live web pages. ",
+    "You also have terminal and coding tools for supporting work, but when the user asks what you are ",
+    "or what you can do, describe your web-browsing abilities first."
+);
 
 pub fn default_personality_message_for_personality(personality: ModelPersonality) -> &'static str {
     codex_personality_message(personality)
@@ -5104,6 +5117,10 @@ fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str
         (
             "interaction-skills/dropdowns.md",
             include_str!("../../../prompts/interaction-skills/dropdowns.md"),
+        ),
+        (
+            "interaction-skills/forms.md",
+            include_str!("../../../prompts/interaction-skills/forms.md"),
         ),
         (
             "interaction-skills/iframes.md",
@@ -10198,8 +10215,9 @@ mod tests {
             ModelPersonality::Pragmatic,
             Some(&catalog),
         );
+        assert!(instructions.starts_with("You are Browser Use Terminal, a web agent"));
         assert!(instructions
-            .starts_with("Catalog template pragmatic personality :: {{ base_instructions }}"));
+            .contains("Catalog template pragmatic personality :: {{ base_instructions }}"));
     }
 
     #[test]
@@ -11857,7 +11875,9 @@ mod tests {
     #[test]
     fn default_instructions_preserve_bitter_cdp_browser_harness_contract() {
         let instructions = default_instructions();
+        assert!(instructions.starts_with("You are Browser Use Terminal, a web agent"));
         for expected in [
+            "describe your web-browsing abilities first",
             "You are Codex, a coding agent based on GPT-5",
             "deeply pragmatic, effective software engineer",
             "As an expert coding agent",
@@ -11873,6 +11893,7 @@ mod tests {
             "not `goto_url(url)`",
             "Prefer coordinate clicks",
             "Chrome hit-testing handles iframes",
+            "Never bulk-fill a live form by setting DOM values",
             "screenshot(\"label\")",
             "input_image",
             "agent_helpers.py",
@@ -11883,6 +11904,8 @@ mod tests {
             "interaction-skills/screenshots.md",
             "interaction-skills/tabs.md",
             "interaction-skills/dialogs.md",
+            "interaction-skills/forms.md",
+            "JS may inspect forms; browser input actions mutate forms",
             "Do not build manager layers",
             "Do not import or install Playwright",
         ] {

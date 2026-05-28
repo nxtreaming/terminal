@@ -4988,38 +4988,49 @@ print("bs4 available", bs4.__version__)
     }
 
     #[test]
-    fn browser_script_fill_input_builds_valid_helper_js() {
+    fn browser_script_fill_input_uses_cdp_focus_and_input() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
-            "script-fill-input-js",
+            "script-fill-input-cdp",
             temp.path(),
             temp.path().join("artifacts"),
             r#"
-seen = []
+events = []
 
 def js(expression, *args, **kwargs):
-    seen.append(expression)
-    return True
+    raise AssertionError(f"fill_input should not use page JS: {expression}")
 
-def cdp(*args, **kwargs):
+def cdp(method, *args, **kwargs):
+    events.append((method, kwargs))
+    if method == "DOM.getDocument":
+        return {"root": {"nodeId": 1}}
+    if method == "DOM.querySelector":
+        assert kwargs["selector"] == "input", kwargs
+        return {"nodeId": 2}
+    if method == "DOM.getBoxModel":
+        return {"model": {"border": [10, 20, 110, 20, 110, 60, 10, 60]}}
     return {}
 
-def press_key(key):
-    seen.append(("key", key))
-    return True
-
 fill_input("input", "ab")
-assert any("return true;})()" in item for item in seen if isinstance(item, str)), seen
-assert not any("return true;}})()" in item for item in seen if isinstance(item, str)), seen
-assert any("change" in item and "})();" in item for item in seen if isinstance(item, str)), seen
-print("fill_input js ok")
+
+mouse = [event for event in events if event[0] == "Input.dispatchMouseEvent"]
+assert len(mouse) == 2, events
+assert mouse[0][1]["type"] == "mousePressed", mouse
+assert mouse[0][1]["x"] == 60 and mouse[0][1]["y"] == 40, mouse
+assert mouse[1][1]["type"] == "mouseReleased", mouse
+
+assert any(event[0] == "Input.dispatchKeyEvent" and event[1].get("key") == "a" for event in events), events
+assert any(event[0] == "Input.dispatchKeyEvent" and event[1].get("key") == "Backspace" for event in events), events
+assert ("Input.insertText", {"text": "ab"}) in events, events
+assert not any(event[0] == "Runtime.evaluate" for event in events), events
+print("fill_input cdp ok")
 "#,
             10,
         )
         .unwrap();
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("fill_input js ok"));
+        assert!(output.text.contains("fill_input cdp ok"));
     }
 
     #[test]
@@ -5100,46 +5111,49 @@ print("press_key no char ok")
             r##"
 import sys
 
-seen = []
+events = []
 
 def js(expression, *args, **kwargs):
-    return True
+    raise AssertionError(f"fill_input should not use page JS: {expression}")
 
 def cdp(method, **params):
-    if method == "Input.dispatchKeyEvent":
-        seen.append(params)
+    events.append((method, params))
+    if method == "DOM.getDocument":
+        return {"root": {"nodeId": 1}}
+    if method == "DOM.querySelector":
+        assert params["selector"] == "#inp", params
+        return {"nodeId": 2}
+    if method == "DOM.getBoxModel":
+        return {"model": {"border": [20, 40, 140, 40, 140, 80, 20, 80]}}
     return {}
 
 fill_input("#inp", "CP23-29", clear_first=False)
-text_events = [event for event in seen if event.get("text")]
-assert [(event["key"], event["code"], event["text"]) for event in text_events] == [
-    ("C", "KeyC", "C"),
-    ("P", "KeyP", "P"),
-    ("2", "Digit2", "2"),
-    ("3", "Digit3", "3"),
-    ("-", "Minus", "-"),
-    ("2", "Digit2", "2"),
-    ("9", "Digit9", "9"),
-], seen
-assert not any(event.get("type") == "char" for event in seen), seen
-assert not any(event.get("key") == "Backspace" for event in seen), seen
+mouse = [params for method, params in events if method == "Input.dispatchMouseEvent"]
+assert len(mouse) == 2, events
+assert mouse[0]["type"] == "mousePressed" and mouse[0]["x"] == 80 and mouse[0]["y"] == 60, mouse
+assert ("Input.insertText", {"text": "CP23-29"}) in events, events
+assert not any(method == "Input.dispatchKeyEvent" for method, _ in events), events
 
-seen.clear()
+events.clear()
 fill_input("#inp", "x", clear_first=True)
 expected_mod = 4 if sys.platform == "darwin" else 2
-a_events = [event for event in seen if event.get("key") == "a"]
-assert a_events, seen
-assert all(event.get("modifiers") == expected_mod for event in a_events), seen
-assert not any(event.get("type") == "char" and event.get("text") == "a" for event in seen), seen
-assert "Backspace" in [event.get("key") for event in seen], seen
-print("fill_input key events ok")
+key_events = [params for method, params in events if method == "Input.dispatchKeyEvent"]
+a_events = [event for event in key_events if event.get("key") == "a"]
+assert a_events, events
+assert all(event.get("modifiers") == expected_mod for event in a_events), events
+assert not any(event.get("type") == "char" for event in key_events), events
+assert "Backspace" in [event.get("key") for event in key_events], events
+assert ("Input.insertText", {"text": "x"}) in events, events
+print("fill_input cdp/browser-harness events ok")
 "##,
             10,
         )
         .unwrap();
 
         assert!(output.ok, "{:?}\n{}", output.error, output.text);
-        assert!(output.text.contains("fill_input key events ok"));
+        assert!(output
+            .text
+            .contains("fill_input cdp/browser-harness events ok"));
     }
 
     #[test]
