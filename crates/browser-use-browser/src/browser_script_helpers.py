@@ -533,7 +533,7 @@ def _write_b64_artifact(label, data_b64, suffix=".png", mime_type="image/png"):
     safe = "".join(ch if ch.isalnum() or ch in "-_" else "_" for ch in str(label or "screenshot")).strip("_") or "screenshot"
     path = ARTIFACT_DIR / f"{int(_time.time() * 1000)}_{safe}{suffix}"
     path.write_bytes(base64.b64decode(data_b64))
-    meta = {"path": str(path), "mime_type": mime_type, "detail": "auto", "label": label}
+    meta = {"path": str(path), "mime_type": mime_type, "detail": "auto", "label": label, "source": "screenshot"}
     __images.append(meta)
     __artifacts.append({"path": str(path), "kind": "image", "mime_type": mime_type})
     return str(path)

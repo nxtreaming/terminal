@@ -1643,9 +1643,25 @@ fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
         return None;
     }
     let mut lines = Vec::new();
-    if should_show_generic_tool_output_text(&name) {
+    let browser_script_summary_lines = if name == "browser_script" {
+        browser_script_summary_lines(event)
+    } else {
+        Vec::new()
+    };
+    let has_browser_script_summary = !browser_script_summary_lines.is_empty();
+    lines.extend(browser_script_summary_lines);
+    if name == "browser_script" && !has_browser_script_summary {
+        lines.extend(browser_script_structured_output_lines(event));
+    }
+    if should_show_generic_tool_output_text(&name)
+        && !(name == "browser_script" && has_browser_script_summary)
+    {
         if let Some(text) = payload_string(event, "text").filter(|text| !text.trim().is_empty()) {
-            lines.extend(preview_lines(&text, 3));
+            if name == "browser_script" {
+                lines.extend(browser_script_text_preview_lines(&text));
+            } else {
+                lines.extend(preview_lines(&text, 3));
+            }
         }
     }
     if event
@@ -1698,6 +1714,168 @@ fn tool_output_node(event: &EventRecord) -> Option<TranscriptNode> {
         lines,
         NodeStyle::Muted,
     ))
+}
+
+fn browser_script_summary_lines(event: &EventRecord) -> Vec<String> {
+    let Some(summary) = event
+        .payload
+        .get("summary")
+        .and_then(serde_json::Value::as_array)
+    else {
+        return Vec::new();
+    };
+    let mut lines = summary
+        .iter()
+        .filter_map(browser_script_summary_record_line)
+        .take(6)
+        .collect::<Vec<_>>();
+    if summary.len() > lines.len() {
+        lines.push(format!("... +{} summaries", summary.len() - lines.len()));
+    }
+    lines
+}
+
+fn browser_script_summary_record_line(value: &serde_json::Value) -> Option<String> {
+    let kind = summary_value_string(value, "kind").unwrap_or_else(|| "summary".to_string());
+    let message = summary_value_string(value, "message");
+    match kind.as_str() {
+        "page" | "opened" | "navigation" | "navigated" => {
+            let mut line = if let Some(url) = summary_value_string(value, "url") {
+                format!("page: {}", compact_url(&url))
+            } else if let Some(message) = message.as_deref() {
+                format!("page: {}", truncate_inline(message, 140))
+            } else {
+                "page: updated".to_string()
+            };
+            if let Some(title) = summary_value_string(value, "title") {
+                line.push_str(" - ");
+                line.push_str(&truncate_inline(&title, 80));
+            }
+            Some(line)
+        }
+        "click" | "clicked" => {
+            let target = summary_value_string(value, "text")
+                .or_else(|| summary_value_string(value, "label"))
+                .or_else(|| summary_value_string(value, "selector"))
+                .or(message)
+                .unwrap_or_else(|| "target".to_string());
+            let mut line = format!("clicked: {}", truncate_inline(&target, 100));
+            if let Some(url) =
+                summary_value_string(value, "href").or_else(|| summary_value_string(value, "url"))
+            {
+                line.push_str(" -> ");
+                line.push_str(&compact_url(&url));
+            }
+            Some(line)
+        }
+        "input" | "typed" | "fill" | "filled" => {
+            let target = summary_value_string(value, "label")
+                .or_else(|| summary_value_string(value, "selector"))
+                .or(message)
+                .unwrap_or_else(|| "field".to_string());
+            Some(format!("filled: {}", truncate_inline(&target, 120)))
+        }
+        "extract" | "extracted" => {
+            if let Some(message) = message {
+                return Some(truncate_inline(&message, 140));
+            }
+            if let Some(count) = summary_value_string(value, "count") {
+                return Some(format!("extracted: {count} items"));
+            }
+            Some("extracted: data".to_string())
+        }
+        "screenshot" | "image" => {
+            let label = summary_value_string(value, "label")
+                .or(message)
+                .unwrap_or_else(|| "screenshot".to_string());
+            Some(format!("screenshot: {}", truncate_inline(&label, 120)))
+        }
+        _ => {
+            if let Some(message) = message {
+                return Some(truncate_inline(&message, 140));
+            }
+            if let Some(url) = summary_value_string(value, "url") {
+                return Some(format!("{kind}: {}", compact_url(&url)));
+            }
+            compact_summary_json(value).map(|summary| format!("{kind}: {summary}"))
+        }
+    }
+}
+
+fn browser_script_structured_output_lines(event: &EventRecord) -> Vec<String> {
+    let Some(outputs) = event
+        .payload
+        .get("outputs")
+        .and_then(serde_json::Value::as_array)
+        .filter(|outputs| !outputs.is_empty())
+    else {
+        return Vec::new();
+    };
+    let labels = outputs
+        .iter()
+        .filter_map(|output| summary_value_string(output, "label"))
+        .take(3)
+        .collect::<Vec<_>>();
+    if labels.is_empty() {
+        return vec![format!(
+            "{} structured output{}",
+            outputs.len(),
+            plural(outputs.len())
+        )];
+    }
+    let mut line = format!("structured output: {}", labels.join(", "));
+    if outputs.len() > labels.len() {
+        line.push_str(&format!(" (+{})", outputs.len() - labels.len()));
+    }
+    vec![line]
+}
+
+fn browser_script_text_preview_lines(text: &str) -> Vec<String> {
+    let trimmed = text.trim();
+    if trimmed.starts_with("browser_script is still running.") {
+        return Vec::new();
+    }
+    let visible = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty())
+        .filter(|line| !is_browser_script_runtime_instruction_line(line))
+        .collect::<Vec<_>>();
+    let mut out = visible
+        .iter()
+        .take(2)
+        .map(|line| truncate_inline(line, 180))
+        .collect::<Vec<_>>();
+    if visible.len() > out.len() {
+        out.push(format!("... +{} lines", visible.len() - out.len()));
+    }
+    out
+}
+
+fn is_browser_script_runtime_instruction_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line.starts_with("run_id:")
+        || line.starts_with("Next:")
+        || line.starts_with("Next step:")
+        || line == "browser_script is still running."
+}
+
+fn summary_value_string(value: &serde_json::Value, key: &str) -> Option<String> {
+    value.get(key).and_then(|value| match value {
+        serde_json::Value::String(text) => {
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_string())
+        }
+        serde_json::Value::Number(_) | serde_json::Value::Bool(_) => Some(value.to_string()),
+        _ => None,
+    })
+}
+
+fn compact_summary_json(value: &serde_json::Value) -> Option<String> {
+    serde_json::to_string(value)
+        .ok()
+        .map(|text| truncate_inline(&text, 160))
+        .filter(|text| !text.is_empty())
 }
 
 #[derive(Debug, Deserialize)]
@@ -3223,13 +3401,42 @@ fn plural(count: usize) -> &'static str {
 }
 
 fn tool_image_label(event: &EventRecord, state: &WorkbenchState) -> String {
-    event
-        .payload
-        .get("image")
+    let image = event.payload.get("image");
+    let path = image
         .and_then(|image| image.get("path"))
+        .and_then(serde_json::Value::as_str);
+    let label = image
+        .and_then(|image| image.get("label"))
         .and_then(serde_json::Value::as_str)
-        .map(|path| format!("image {}", display_path(path, state)))
-        .unwrap_or_else(|| "received image artifact".to_string())
+        .map(str::trim)
+        .filter(|label| !label.is_empty());
+    let source = image
+        .and_then(|image| image.get("source"))
+        .and_then(serde_json::Value::as_str);
+    let target = label
+        .map(ToOwned::to_owned)
+        .or_else(|| path.map(|path| display_path(path, state)));
+    match source {
+        Some("screenshot") => target
+            .map(|target| format!("screenshot: {target}"))
+            .unwrap_or_else(|| "screenshot captured".to_string()),
+        Some("emit_image") => target
+            .map(|target| format!("attached image: {target}"))
+            .unwrap_or_else(|| "attached image".to_string()),
+        _ => event
+            .payload
+            .get("name")
+            .and_then(serde_json::Value::as_str)
+            .is_some_and(|name| name == "browser_script")
+            .then(|| {
+                target
+                    .clone()
+                    .map(|target| format!("browser image: {target}"))
+                    .unwrap_or_else(|| "browser image attached".to_string())
+            })
+            .or_else(|| target.map(|target| format!("image: {target}")))
+            .unwrap_or_else(|| "received image artifact".to_string()),
+    }
 }
 
 fn browser_event_label(event: &EventRecord) -> String {
@@ -3252,6 +3459,21 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
+    }
+
+    fn test_workbench_state() -> WorkbenchState {
+        WorkbenchState {
+            setup_complete: true,
+            current_session: None,
+            task: None,
+            result: None,
+            failure: None,
+            activity: Vec::new(),
+            transcript: Vec::new(),
+            browser: Default::default(),
+            telemetry: Default::default(),
+            history: Vec::new(),
+        }
     }
 
     #[test]
@@ -3532,6 +3754,197 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.contains("Traceback (most recent call last)")));
+    }
+
+    #[test]
+    fn browser_script_summary_hides_raw_page_info_text() {
+        let event = EventRecord {
+            seq: 8,
+            id: "event-8".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.output".to_string(),
+            payload: serde_json::json!({
+                "name": "browser_script",
+                "text": "{'url': 'https://login.gusto.com/realms/zenpayroll/protocol/openid-connect/auth?client_id=zenpayroll&device_uuid=secret', 'title': 'Gusto Login - Payroll, Benefits, HR | Gusto', 'readyState': 'complete', 'target': {'targetId': 'B6CDD9676BD0503360290CD36A12A4D1'}}",
+                "summary": [{
+                    "kind": "page",
+                    "url": "https://login.gusto.com/realms/zenpayroll/protocol/openid-connect/auth?client_id=zenpayroll&device_uuid=secret",
+                    "title": "Gusto Login - Payroll, Benefits, HR | Gusto"
+                }],
+                "images": [{"path": "/tmp/page.png"}],
+                "artifacts": [{"path": "/tmp/result.json"}]
+            }),
+        };
+
+        let node = tool_output_node(&event).expect("tool output node");
+        let text = node
+            .display_lines(120, DisplayMode::Scrollback)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("• browser"), "{text}");
+        assert!(
+            text.contains(
+                "page: login.gusto.com/realms/zenpayroll/protocol/openid-connect/auth?..."
+            ),
+            "{text}"
+        );
+        assert!(text.contains("Gusto Login - Payroll"), "{text}");
+        assert!(text.contains("1 image artifact"), "{text}");
+        assert!(text.contains("1 file artifact"), "{text}");
+        assert!(!text.contains("targetId"), "{text}");
+        assert!(!text.contains("client_id=zenpayroll"), "{text}");
+        assert!(!text.contains("readyState"), "{text}");
+    }
+
+    #[test]
+    fn browser_script_screenshot_image_label_names_capture_source() {
+        let state = test_workbench_state();
+        let event = EventRecord {
+            seq: 10,
+            id: "event-10".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.image".to_string(),
+            payload: serde_json::json!({
+                "name": "browser_script",
+                "image": {
+                    "path": "/tmp/hn_front_page.png",
+                    "mime_type": "image/png",
+                    "label": "hn_front_page",
+                    "source": "screenshot"
+                }
+            }),
+        };
+
+        assert_eq!(
+            tool_image_label(&event, &state),
+            "screenshot: hn_front_page"
+        );
+    }
+
+    #[test]
+    fn browser_script_emit_image_label_names_attachment_source() {
+        let state = test_workbench_state();
+        let event = EventRecord {
+            seq: 11,
+            id: "event-11".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.image".to_string(),
+            payload: serde_json::json!({
+                "name": "browser_script",
+                "image": {
+                    "path": "/tmp/diagnostic.png",
+                    "mime_type": "image/png",
+                    "label": "diagnostic",
+                    "source": "emit_image"
+                }
+            }),
+        };
+
+        assert_eq!(
+            tool_image_label(&event, &state),
+            "attached image: diagnostic"
+        );
+    }
+
+    #[test]
+    fn legacy_browser_script_image_label_stays_specific() {
+        let state = test_workbench_state();
+        let event = EventRecord {
+            seq: 12,
+            id: "event-12".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.image".to_string(),
+            payload: serde_json::json!({
+                "name": "browser_script",
+                "image": {
+                    "path": "/tmp/latest_screenshot.png",
+                    "mime_type": "image/png",
+                    "label": "latest_screenshot"
+                }
+            }),
+        };
+
+        assert_eq!(
+            tool_image_label(&event, &state),
+            "browser image: latest_screenshot"
+        );
+    }
+
+    #[test]
+    fn browser_script_summary_suppresses_running_transport_text() {
+        let event = EventRecord {
+            seq: 9,
+            id: "event-9".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.output".to_string(),
+            payload: serde_json::json!({
+                "name": "browser_script",
+                "text": "browser_script is still running.\nrun_id: bs-secret\nNext: observe this run again.",
+                "summary": [{
+                    "kind": "inspected",
+                    "message": "Sampled 5 comments from current thread"
+                }]
+            }),
+        };
+
+        let node = tool_output_node(&event).expect("tool output node");
+        let text = node
+            .display_lines(120, DisplayMode::Scrollback)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(
+            text.contains("Sampled 5 comments from current thread"),
+            "{text}"
+        );
+        assert!(!text.contains("inspected Sampled"), "{text}");
+        assert!(!text.contains("browser_script is still running"), "{text}");
+        assert!(!text.contains("bs-secret"), "{text}");
+    }
+
+    #[test]
+    fn browser_script_raw_text_fallback_is_bounded() {
+        let line = format!(
+            "{{'url': 'https://login.example.test/realms/acme/protocol/openid-connect/auth?client_id=zenpayroll&state={}', 'target': {{'targetId': '{}'}}}}",
+            "x".repeat(240),
+            "y".repeat(240)
+        );
+
+        let preview = browser_script_text_preview_lines(&line);
+
+        assert_eq!(preview.len(), 1);
+        assert!(preview[0].chars().count() <= 180, "{preview:?}");
+        assert!(preview[0].ends_with("..."), "{preview:?}");
+    }
+
+    #[test]
+    fn browser_script_running_text_fallback_hides_run_id() {
+        let preview = browser_script_text_preview_lines(
+            "browser_script is still running.\nNo new output in the last 50 ms.\nrun_id: bs-secret\nNext: observe this run again.",
+        );
+
+        assert!(preview.is_empty(), "{preview:?}");
+        assert!(!preview.join("\n").contains("bs-secret"));
+    }
+
+    #[test]
+    fn browser_script_partial_text_fallback_drops_runtime_instructions() {
+        let preview = browser_script_text_preview_lines(
+            "chunk one\n\nbrowser_script is still running.\nrun_id: bs-secret\nNext: observe this run again.",
+        );
+
+        assert_eq!(preview, vec!["chunk one"]);
+        assert!(!preview.join("\n").contains("bs-secret"));
     }
 
     #[test]

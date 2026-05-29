@@ -10094,8 +10094,10 @@ wire_api = "responses"
         app.selected_session_id = Some(session.id);
 
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("image "));
-        assert!(screen.contains("latest_screenshot.png"), "{screen}");
+        assert!(
+            screen.contains("browser image: latest_screenshot"),
+            "{screen}"
+        );
         assert!(!screen.contains("received image artifact"), "{screen}");
         Ok(())
     }
