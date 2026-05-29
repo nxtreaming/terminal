@@ -53,6 +53,7 @@ drain_events()
 http_get(url, **kwargs)
 
 copy_artifact(path, kind="file")
+emit_output(value, label=None)
 emit_image(path, label=None)
 artifact_root()
 outputs_dir()
@@ -76,6 +77,33 @@ Usage guidance:
 - Screenshot/image artifacts are sent as `input_image` content to the next model turn. The user does not see those pixels inline in the terminal; describe what you see or provide the saved artifact path when the user asks for the screenshot.
 - If a script emits screenshots/images and then fails, the next model turn still receives the images alongside the failure diagnosis. Use those pixels to decide the next smaller retry.
 - If a running script emits screenshots/images before it finishes, `observe` returns those images as soon as they are available. Use the pixels to guide the next observe/retry.
+- Use `emit_output(value, label="...")` for structured observations that the next model turn may need, such as `page_info()`, extracted rows, selected DOM state, or API responses. The full value stays model-visible.
+- When a script emits labeled structured output, add a `# browser_summary:` JSON comment block at the top of the script that maps each emitted label to the compact transcript summary. Write the code/labels first mentally, then place or update this block before submitting the tool call; the runtime parses the whole script before execution.
+- Summary values may be literals, JSONPath-like selectors such as `$.url`, or template strings such as `Read ${$.length} employee rows`. Missing summary specs fall back to a generic `Recorded <label>` summary while preserving the full output.
+- Prefer this pattern over printing page or extraction objects:
+
+```python
+# browser_summary:
+# {
+#   "page_info": {
+#     "kind": "page",
+#     "url": "$.url",
+#     "title": "$.title"
+#   },
+#   "employee_rows": {
+#     "kind": "extracted",
+#     "message": "Read ${$.length} employee rows"
+#   }
+# }
+
+info = page_info()
+emit_output(info, label="page_info")
+
+rows = [{"name": "Ada"}, {"name": "Grace"}]
+emit_output(rows, label="employee_rows")
+```
+
+- Keep `print(...)` for short debug/status text only. Do not print large page, DOM, network, or extraction objects when `emit_output(...)` can carry the full value.
 - Prefer coordinate clicks for visible UI: screenshot, inspect pixels, `click_at_xy(x, y)`, wait, screenshot again.
 - Use `js(...)` for DOM inspection and raw `cdp(...)` for lower-level browser actions.
 - For real user forms, act like a browser user: screenshot, click the visible field/control, type with `type_text(...)`, `press_key(...)`, or `fill_input(...)`, then screenshot or otherwise verify. Use coordinate clicks for checkboxes, radios, buttons, dropdowns, and custom controls. Do not assign `element.value`, `element.checked`, `selectedIndex`, React private state, or MutationObserver restore loops on live forms. Do not synthesize `input`, `change`, `click`, or keyboard events in page JavaScript to make a form look filled. Those anti-patterns can desynchronize framework state from the visible DOM.

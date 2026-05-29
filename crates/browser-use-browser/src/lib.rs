@@ -56,6 +56,8 @@ pub struct BrowserScriptOutput {
     #[serde(default)]
     pub outputs: Vec<Value>,
     #[serde(default)]
+    pub summary: Vec<Value>,
+    #[serde(default)]
     pub artifacts: Vec<Value>,
     #[serde(default)]
     pub images: Vec<Value>,
@@ -235,6 +237,7 @@ struct BrowserScriptRun {
 struct BrowserScriptDelta {
     text: String,
     outputs: Vec<Value>,
+    summary: Vec<Value>,
     artifacts: Vec<Value>,
     images: Vec<Value>,
     browser_events: Vec<Value>,
@@ -368,6 +371,7 @@ pub fn start_browser_script(
                 next_observe_ms: Some(BROWSER_SCRIPT_DEFAULT_OBSERVE_MS),
                 text,
                 outputs: std::mem::take(&mut delta.outputs),
+                summary: std::mem::take(&mut delta.summary),
                 artifacts: std::mem::take(&mut delta.artifacts),
                 images: std::mem::take(&mut delta.images),
                 browser_events: std::mem::take(&mut delta.browser_events),
@@ -558,6 +562,7 @@ fn finish_browser_script_run(
             diagnosis: Some(browser_script_failure_diagnosis(&run.session_id, &error)),
             error: Some(error),
             outputs: std::mem::take(&mut delta.outputs),
+            summary: std::mem::take(&mut delta.summary),
             artifacts: std::mem::take(&mut delta.artifacts),
             images: std::mem::take(&mut delta.images),
             browser_events: std::mem::take(&mut delta.browser_events),
@@ -589,6 +594,7 @@ fn finish_browser_script_run(
             diagnosis: Some(browser_script_failure_diagnosis(&run.session_id, &error)),
             error: Some(error),
             outputs: std::mem::take(&mut delta.outputs),
+            summary: std::mem::take(&mut delta.summary),
             artifacts: std::mem::take(&mut delta.artifacts),
             images: std::mem::take(&mut delta.images),
             browser_events: std::mem::take(&mut delta.browser_events),
@@ -623,6 +629,9 @@ fn finish_browser_script_run(
     }
     if !delta.outputs.is_empty() {
         response.outputs = std::mem::take(&mut delta.outputs);
+    }
+    if !delta.summary.is_empty() {
+        response.summary = std::mem::take(&mut delta.summary);
     }
     if !delta.artifacts.is_empty() {
         response.artifacts = std::mem::take(&mut delta.artifacts);
@@ -670,6 +679,7 @@ fn finish_cancelled_browser_script_run(mut run: BrowserScriptRun) -> Result<Brow
         run_id: Some(run.id),
         text,
         outputs: std::mem::take(&mut delta.outputs),
+        summary: std::mem::take(&mut delta.summary),
         artifacts: std::mem::take(&mut delta.artifacts),
         images: std::mem::take(&mut delta.images),
         browser_events: std::mem::take(&mut delta.browser_events),
@@ -743,6 +753,7 @@ impl BrowserScriptDelta {
     fn has_content(&self) -> bool {
         !self.text.is_empty()
             || !self.outputs.is_empty()
+            || !self.summary.is_empty()
             || !self.artifacts.is_empty()
             || !self.images.is_empty()
             || !self.browser_events.is_empty()
@@ -774,6 +785,7 @@ fn browser_script_running_output(
             );
         }
         output.outputs = std::mem::take(&mut delta.outputs);
+        output.summary = std::mem::take(&mut delta.summary);
         output.artifacts = std::mem::take(&mut delta.artifacts);
         output.images = std::mem::take(&mut delta.images);
         output.browser_events = std::mem::take(&mut delta.browser_events);
@@ -821,6 +833,9 @@ fn drain_browser_script_delta(run: &mut BrowserScriptRun) -> Result<BrowserScrip
             "output" => delta
                 .outputs
                 .push(value.get("output").cloned().unwrap_or(value)),
+            "summary" => delta
+                .summary
+                .push(value.get("summary").cloned().unwrap_or(value)),
             "artifact" => {
                 if let Some(artifact) = value.get("artifact").cloned() {
                     delta.artifacts.push(artifact);
@@ -1272,6 +1287,8 @@ fn dispatch_script_runtime(session_id: &str, argv: &[String]) -> Result<Value> {
                 "status": output.status.unwrap_or_else(|| "cancelled".to_string()),
                 "run_id": output.run_id,
                 "text": output.text,
+                "outputs": output.outputs,
+                "summary": output.summary,
                 "images": output.images,
                 "artifacts": output.artifacts,
             }))
@@ -4238,6 +4255,7 @@ ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
 OUTPUTS_DIR = CWD
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
+__USER_CODE = base64.b64decode({encoded_code:?}).decode()
 
 def _stream_event(event):
     try:
@@ -4285,6 +4303,7 @@ def _scan_artifact_files():
 
 __initial_artifact_files = _scan_artifact_files()
 __outputs = []
+__summary = []
 __artifacts = []
 __images = []
 
@@ -4294,6 +4313,135 @@ def _jsonable(value):
         return value
     except TypeError:
         return repr(value)
+
+def _parse_browser_summary_specs(source):
+    lines = source.splitlines()
+    block = []
+    in_block = False
+    for line in lines[:80]:
+        stripped = line.strip()
+        if not in_block:
+            if stripped.startswith('# browser_summary:'):
+                inline = stripped[len('# browser_summary:'):].strip()
+                if inline:
+                    block.append(inline)
+                in_block = True
+                continue
+            if stripped == "" or stripped.startswith('#!') or stripped.startswith('#'):
+                continue
+            break
+        if stripped.startswith('#'):
+            content = stripped[1:]
+            if content.startswith(" "):
+                content = content[1:]
+            block.append(content)
+            continue
+        break
+    if not block:
+        return {{}}
+    try:
+        parsed = json.loads("\n".join(block))
+    except Exception:
+        return {{}}
+    return parsed if isinstance(parsed, dict) else {{}}
+
+__browser_summary_specs = _parse_browser_summary_specs(__USER_CODE)
+
+def _path_get(value, path):
+    if path == "$":
+        return value
+    if not isinstance(path, str) or not path.startswith("$."):
+        return None
+    current = value
+    for part in path[2:].split("."):
+        if part == "length":
+            try:
+                current = len(current)
+            except Exception:
+                return None
+            continue
+        while "[" in part and part.endswith("]"):
+            field, _, index_text = part.partition("[")
+            if field:
+                if not isinstance(current, dict) or field not in current:
+                    return None
+                current = current[field]
+            try:
+                index = int(index_text[:-1])
+                current = current[index]
+            except Exception:
+                return None
+            part = ""
+        if not part:
+            continue
+        if isinstance(current, dict) and part in current:
+            current = current[part]
+        else:
+            return None
+    return current
+
+def _render_summary_value(template, output_value):
+    if not isinstance(template, str):
+        return _jsonable(template)
+    if template.startswith("$"):
+        return _jsonable(_path_get(output_value, template))
+    out = template
+    while "${{" in out:
+        start = out.find("${{")
+        end = out.find("}}", start + 2)
+        if end == -1:
+            break
+        path = out[start + 2:end]
+        value = _path_get(output_value, path)
+        out = out[:start] + ("" if value is None else str(value)) + out[end + 1:]
+    return out
+
+def _summary_from_output(label, output_value):
+    if label is None:
+        return None
+    label_text = str(label)
+    spec = __browser_summary_specs.get(label_text)
+    if spec is None:
+        return {{"kind": "observed", "message": f"Recorded {{label_text}}", "output_label": label_text}}
+    if isinstance(spec, str):
+        return {{"kind": spec, "output_label": label_text}}
+    if not isinstance(spec, dict):
+        return {{"kind": "observed", "message": f"Recorded {{label_text}}", "output_label": label_text}}
+    record = {{}}
+    for key, template in spec.items():
+        record[str(key)] = _render_summary_value(template, output_value)
+    record.setdefault("kind", "summary")
+    record.setdefault("output_label", label_text)
+    return record
+
+def emit_output(value, label=None):
+    output_value = _jsonable(value)
+    record = {{"value": output_value}}
+    if label is not None:
+        record["label"] = str(label)
+        summary_record = _summary_from_output(label, output_value)
+        if summary_record is not None:
+            record["summary"] = summary_record
+    __outputs.append(record)
+    _stream_event({{"type": "output", "output": record}})
+    if label is not None and record.get("summary") is not None:
+        __summary.append(record["summary"])
+        _stream_event({{"type": "summary", "summary": record["summary"]}})
+    return record
+
+def emit_summary(kind, message=None, **fields):
+    if isinstance(kind, dict):
+        record = dict(kind)
+        record.setdefault("kind", "summary")
+    else:
+        record = {{"kind": str(kind)}}
+        if message is not None:
+            record["message"] = str(message)
+        for key, value in fields.items():
+            record[str(key)] = _jsonable(value)
+    __summary.append(record)
+    _stream_event({{"type": "summary", "summary": record}})
+    return record
 
 def _bridge(payload):
     with socket.create_connection(("127.0.0.1", BRIDGE_PORT), timeout=120) as sock:
@@ -4362,7 +4510,7 @@ def copy_artifact(path, kind="file"):
 
 def emit_image(path, label=None):
     path = pathlib.Path(path).expanduser().resolve()
-    meta = {{"path": str(path), "mime_type": "image/png", "detail": "auto", "label": label}}
+    meta = {{"path": str(path), "mime_type": "image/png", "detail": "auto", "label": label, "source": "emit_image"}}
     __images.append(meta)
     _stream_event({{"type": "image", "image": meta}})
     return meta
@@ -4407,8 +4555,7 @@ def load_agent_helpers():
     return helper.exists()
 
 def _run_user_code():
-    code = base64.b64decode({encoded_code:?}).decode()
-    exec(compile(code, "<browser_script>", "exec"), globals())
+    exec(compile(__USER_CODE, "<browser_script>", "exec"), globals())
 
 stdout = _BrowserScriptStream("stdout")
 stderr = _BrowserScriptStream("stderr")
@@ -4435,6 +4582,7 @@ result = {{
     "error": error,
     "data": {{"domain_skills": globals().get("__last_domain_skills", [])}} if globals().get("__last_domain_skills") else {{}},
     "outputs": __outputs,
+    "summary": __summary,
     "artifacts": __artifacts,
     "images": __images,
     "browser_events": [],
@@ -4881,6 +5029,122 @@ print(session_metadata()["outputs_dir"])
                 "artifact path should be absolute: {artifact}"
             );
         }
+    }
+
+    #[test]
+    fn browser_script_summary_comment_maps_output_to_display_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-summary-comment",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+# browser_summary:
+# {
+#   "page_info": {
+#     "kind": "page",
+#     "url": "$.url",
+#     "title": "$.title"
+#   }
+# }
+info = {"url": "https://example.test/path?token=secret", "title": "Example Page"}
+emit_output(info, label="page_info")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(
+            output.text.trim().is_empty(),
+            "structured output should not require stdout text: {:?}",
+            output.text
+        );
+        assert_eq!(output.outputs.len(), 1, "{:?}", output.outputs);
+        assert_eq!(
+            output.outputs[0].get("label").and_then(Value::as_str),
+            Some("page_info")
+        );
+        assert_eq!(
+            output.outputs[0]
+                .pointer("/value/url")
+                .and_then(Value::as_str),
+            Some("https://example.test/path?token=secret")
+        );
+        assert_eq!(
+            output.outputs[0]
+                .pointer("/summary/output_label")
+                .and_then(Value::as_str),
+            Some("page_info")
+        );
+        assert_eq!(output.summary.len(), 1, "{:?}", output.summary);
+        assert_eq!(
+            output.summary[0].get("kind").and_then(Value::as_str),
+            Some("page")
+        );
+        assert_eq!(
+            output.summary[0]
+                .get("output_label")
+                .and_then(Value::as_str),
+            Some("page_info")
+        );
+        assert_eq!(
+            output.summary[0].get("title").and_then(Value::as_str),
+            Some("Example Page")
+        );
+    }
+
+    #[test]
+    fn browser_script_emit_output_defaults_to_lossless_recorded_summary() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-output-default-summary",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+emit_output([{"name": "Ada"}, {"name": "Grace"}], label="rows")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert_eq!(output.outputs.len(), 1, "{:?}", output.outputs);
+        assert_eq!(output.outputs[0]["label"], "rows");
+        assert_eq!(output.outputs[0]["value"][0]["name"], "Ada");
+        assert_eq!(output.summary.len(), 1, "{:?}", output.summary);
+        assert_eq!(output.summary[0]["kind"], "observed");
+        assert_eq!(output.summary[0]["message"], "Recorded rows");
+        assert_eq!(output.summary[0]["output_label"], "rows");
+    }
+
+    #[test]
+    fn browser_script_summary_comment_renders_template_values() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-summary-template",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+# browser_summary:
+# {
+#   "rows": {
+#     "kind": "extracted",
+#     "message": "Read ${$.length} rows"
+#   }
+# }
+emit_output([{"name": "Ada"}, {"name": "Grace"}], label="rows")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert_eq!(output.outputs.len(), 1, "{:?}", output.outputs);
+        assert_eq!(output.summary.len(), 1, "{:?}", output.summary);
+        assert_eq!(output.summary[0]["kind"], "extracted");
+        assert_eq!(output.summary[0]["message"], "Read 2 rows");
+        assert_eq!(output.summary[0]["output_label"], "rows");
     }
 
     #[test]
@@ -5403,6 +5667,63 @@ print("finished")
         assert_eq!(
             started.images[0].get("label").and_then(Value::as_str),
             Some("before failure")
+        );
+        assert_eq!(
+            started.images[0].get("source").and_then(Value::as_str),
+            Some("emit_image")
+        );
+        let run_id = started.run_id.as_deref().unwrap();
+        let _ = cancel_browser_script(session_id, run_id);
+    }
+
+    #[test]
+    fn browser_script_observe_returns_summary_before_final_result() {
+        let temp = tempfile::tempdir().unwrap();
+        let session_id = "script-observe-summary";
+        let code = r#"
+# browser_summary:
+# {
+#   "page_info": {
+#     "kind": "page",
+#     "url": "$.url",
+#     "title": "$.title"
+#   }
+# }
+import time
+info = {"url": "https://example.test/start", "title": "Start"}
+emit_output(info, label="page_info")
+time.sleep(1.2)
+print("finished")
+"#;
+        let started = start_browser_script(
+            session_id,
+            temp.path(),
+            temp.path().join("artifacts"),
+            code,
+            5,
+        )
+        .unwrap();
+
+        assert_eq!(started.status.as_deref(), Some("running"));
+        assert_eq!(started.outputs.len(), 1, "{:?}", started.outputs);
+        assert_eq!(
+            started.outputs[0].get("label").and_then(Value::as_str),
+            Some("page_info")
+        );
+        assert_eq!(started.summary.len(), 1, "{:?}", started.summary);
+        assert_eq!(
+            started.summary[0].get("kind").and_then(Value::as_str),
+            Some("page")
+        );
+        assert_eq!(
+            started.summary[0]
+                .get("output_label")
+                .and_then(Value::as_str),
+            Some("page_info")
+        );
+        assert_eq!(
+            started.summary[0].get("url").and_then(Value::as_str),
+            Some("https://example.test/start")
         );
         let run_id = started.run_id.as_deref().unwrap();
         let _ = cancel_browser_script(session_id, run_id);

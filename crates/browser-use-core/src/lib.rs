@@ -21625,7 +21625,7 @@ fn dispatch_browser_script_tool(
             browser_use_browser::cancel_browser_script(&session.id, run_id)?
         }
     };
-    record_browser_script_response_events(store, &session.id, &response)?;
+    record_browser_script_response_events(store, &session.id, &call.id, &response)?;
     if response.ok {
         store.append_event(
             &session.id,
@@ -25992,9 +25992,7 @@ fn browser_script_tool_message_content(
         if !response.text.trim().is_empty() {
             parts.push(response.text.trim().to_string());
         }
-        if !response.data.is_null() && response.data != serde_json::json!({}) {
-            parts.push(format!("data: {}", response.data));
-        }
+        parts.extend(browser_script_structured_message_parts(response));
         if parts.is_empty() {
             "browser_script completed".to_string()
         } else {
@@ -26024,15 +26022,19 @@ fn browser_script_running_message(response: &browser_use_browser::BrowserScriptO
             response.next_observe_ms.unwrap_or(1_000)
         ));
     }
+    parts.extend(browser_script_structured_message_parts(response));
     parts.join("\n")
 }
 
 fn browser_script_cancelled_message(response: &browser_use_browser::BrowserScriptOutput) -> String {
+    let mut parts = Vec::new();
     if response.text.trim().is_empty() {
-        "browser_script cancelled.".to_string()
+        parts.push("browser_script cancelled.".to_string());
     } else {
-        response.text.trim().to_string()
+        parts.push(response.text.trim().to_string());
     }
+    parts.extend(browser_script_structured_message_parts(response));
+    parts.join("\n")
 }
 
 fn browser_script_failure_message(response: &browser_use_browser::BrowserScriptOutput) -> String {
@@ -26050,7 +26052,30 @@ fn browser_script_failure_message(response: &browser_use_browser::BrowserScriptO
     } else if response.diagnosis.is_none() {
         parts.push("Details: unknown browser_script error".to_string());
     }
+    parts.extend(browser_script_structured_message_parts(response));
     parts.join("\n")
+}
+
+fn browser_script_structured_message_parts(
+    response: &browser_use_browser::BrowserScriptOutput,
+) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !response.outputs.is_empty() {
+        parts.push(format!(
+            "outputs: {}",
+            Value::Array(response.outputs.clone())
+        ));
+    }
+    if !response.summary.is_empty() {
+        parts.push(format!(
+            "summary: {}",
+            Value::Array(response.summary.clone())
+        ));
+    }
+    if !response.data.is_null() && response.data != serde_json::json!({}) {
+        parts.push(format!("data: {}", response.data));
+    }
+    parts
 }
 
 fn browser_script_error_detail(error: &str) -> String {
@@ -26164,6 +26189,7 @@ fn record_python_response_final_event_with_budget(
 pub fn record_browser_script_response_events(
     store: &Store,
     session_id: &str,
+    tool_call_id: &str,
     response: &browser_use_browser::BrowserScriptOutput,
 ) -> Result<()> {
     for browser_event in &response.browser_events {
@@ -26175,7 +26201,13 @@ pub fn record_browser_script_response_events(
         .filter_map(|image| image.get("path").and_then(Value::as_str))
         .collect::<std::collections::HashSet<_>>();
     for image in &response.images {
-        record_tool_image(store, session_id, "browser_script", image)?;
+        record_tool_image_with_call_id(
+            store,
+            session_id,
+            "browser_script",
+            Some(tool_call_id),
+            image,
+        )?;
     }
     for artifact in &response.artifacts {
         let Some(path) = artifact.get("path").and_then(Value::as_str) else {
@@ -26184,19 +26216,29 @@ pub fn record_browser_script_response_events(
         if image_paths.contains(path) {
             continue;
         }
-        record_tool_artifact(store, session_id, "browser_script", artifact)?;
+        record_tool_artifact_with_call_id(
+            store,
+            session_id,
+            "browser_script",
+            Some(tool_call_id),
+            artifact,
+        )?;
     }
+    let transcript_text = browser_script_transcript_text(response);
     store.append_event(
         session_id,
         "tool.output",
         serde_json::json!({
-                "name": "browser_script",
-                "ok": response.ok,
-                "status": response.status,
-                "run_id": response.run_id,
-                "next_observe_ms": response.next_observe_ms,
-                "text": response.text,
-                "data": response.data,
+            "name": "browser_script",
+            "tool_call_id": tool_call_id,
+            "ok": response.ok,
+            "status": response.status,
+            "run_id": response.run_id,
+            "next_observe_ms": response.next_observe_ms,
+            "text": transcript_text,
+            "data": response.data,
+            "outputs": response.outputs,
+            "summary": response.summary,
             "images": response.images,
             "artifacts": response.artifacts,
             "error": response.error,
@@ -26204,6 +26246,28 @@ pub fn record_browser_script_response_events(
         }),
     )?;
     Ok(())
+}
+
+fn browser_script_transcript_text(response: &browser_use_browser::BrowserScriptOutput) -> String {
+    if response.text.trim().is_empty() {
+        return String::new();
+    }
+    response
+        .text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.trim().is_empty())
+        .filter(|line| !is_browser_script_transport_line(line))
+        .collect::<Vec<_>>()
+        .join("\n")
+}
+
+fn is_browser_script_transport_line(line: &str) -> bool {
+    let line = line.trim_start();
+    line == "browser_script is still running."
+        || line.starts_with("run_id:")
+        || line.starts_with("Next:")
+        || line.starts_with("Next step:")
 }
 
 pub fn record_python_worker_event(
@@ -26332,14 +26396,24 @@ fn record_python_image(store: &Store, session_id: &str, image: &Value) -> Result
 }
 
 fn record_tool_image(store: &Store, session_id: &str, name: &str, image: &Value) -> Result<()> {
-    let event = store.append_event(
-        session_id,
-        "tool.image",
-        serde_json::json!({
-            "name": name,
-            "image": image,
-        }),
-    )?;
+    record_tool_image_with_call_id(store, session_id, name, None, image)
+}
+
+fn record_tool_image_with_call_id(
+    store: &Store,
+    session_id: &str,
+    name: &str,
+    tool_call_id: Option<&str>,
+    image: &Value,
+) -> Result<()> {
+    let mut payload = serde_json::json!({
+        "name": name,
+        "image": image,
+    });
+    if let Some(tool_call_id) = tool_call_id {
+        payload["tool_call_id"] = Value::String(tool_call_id.to_string());
+    }
+    let event = store.append_event(session_id, "tool.image", payload)?;
     if let Some(path) = image.get("path").and_then(Value::as_str) {
         store.record_artifact(
             session_id,
@@ -26363,6 +26437,16 @@ fn record_tool_artifact(
     name: &str,
     artifact: &Value,
 ) -> Result<()> {
+    record_tool_artifact_with_call_id(store, session_id, name, None, artifact)
+}
+
+fn record_tool_artifact_with_call_id(
+    store: &Store,
+    session_id: &str,
+    name: &str,
+    tool_call_id: Option<&str>,
+    artifact: &Value,
+) -> Result<()> {
     let Some(path) = artifact.get("path").and_then(Value::as_str) else {
         return Ok(());
     };
@@ -26370,14 +26454,14 @@ fn record_tool_artifact(
         .get("kind")
         .and_then(Value::as_str)
         .unwrap_or("file");
-    let event = store.append_event(
-        session_id,
-        "artifact.created",
-        serde_json::json!({
-            "name": name,
-            "artifact": artifact,
-        }),
-    )?;
+    let mut payload = serde_json::json!({
+        "name": name,
+        "artifact": artifact,
+    });
+    if let Some(tool_call_id) = tool_call_id {
+        payload["tool_call_id"] = Value::String(tool_call_id.to_string());
+    }
+    let event = store.append_event(session_id, "artifact.created", payload)?;
     store.record_artifact(
         session_id,
         Some(event.seq),
@@ -26533,6 +26617,139 @@ mod tests {
         assert!(message.contains("run_id: bs-test"));
         assert!(message.contains("action=\"observe\""));
         assert!(message.contains("observe_timeout_ms=1000"));
+    }
+
+    #[test]
+    fn browser_script_structured_outputs_are_model_visible() {
+        let response = browser_use_browser::BrowserScriptOutput {
+            ok: true,
+            status: Some("running".to_string()),
+            run_id: Some("bs-structured".to_string()),
+            next_observe_ms: Some(1_000),
+            text: "browser_script is still running.".to_string(),
+            outputs: vec![serde_json::json!({
+                "label": "page_info",
+                "value": {
+                    "url": "https://login.example.test/realms/acme?token=secret",
+                    "title": "Login"
+                }
+            })],
+            summary: vec![serde_json::json!({
+                "kind": "page",
+                "url": "https://login.example.test/realms/acme?token=secret",
+                "title": "Login"
+            })],
+            ..Default::default()
+        };
+
+        let message = browser_script_tool_message_content(&response);
+
+        assert!(message.contains("action=\"observe\""));
+        assert!(message.contains("outputs:"));
+        assert!(message.contains("page_info"));
+        assert!(message.contains("https://login.example.test/realms/acme?token=secret"));
+        assert!(message.contains("summary:"));
+    }
+
+    #[test]
+    fn browser_script_response_events_preserve_call_id_and_structured_channels() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let image_path = temp.path().join("shot.png");
+        let artifact_path = temp.path().join("result.json");
+        std::fs::write(&image_path, [0x89, b'P', b'N', b'G'])?;
+        std::fs::write(&artifact_path, br#"{"ok":true}"#)?;
+        let response = browser_use_browser::BrowserScriptOutput {
+            ok: true,
+            status: Some("finished".to_string()),
+            run_id: Some("bs-structured".to_string()),
+            text: "{'url': 'https://login.example.test/realms/acme?token=secret'}".to_string(),
+            outputs: vec![serde_json::json!({
+                "label": "page_info",
+                "value": {
+                    "url": "https://login.example.test/realms/acme?token=secret",
+                    "title": "Login"
+                }
+            })],
+            summary: vec![serde_json::json!({
+                "kind": "page",
+                "url": "https://login.example.test/realms/acme?token=secret",
+                "title": "Login"
+            })],
+            images: vec![serde_json::json!({
+                "path": image_path.display().to_string(),
+                "mime_type": "image/png",
+                "label": "page"
+            })],
+            artifacts: vec![serde_json::json!({
+                "path": artifact_path.display().to_string(),
+                "kind": "file",
+                "mime": "application/json"
+            })],
+            ..Default::default()
+        };
+
+        record_browser_script_response_events(&store, &session.id, "call-browser-1", &response)?;
+
+        let events = store.events_for_session(&session.id)?;
+        let output = events
+            .iter()
+            .find(|event| event.event_type == "tool.output")
+            .context("tool.output event")?;
+        assert_eq!(output.payload["tool_call_id"], "call-browser-1");
+        assert_eq!(output.payload["outputs"][0]["label"], "page_info");
+        assert_eq!(output.payload["summary"][0]["kind"], "page");
+        let image = events
+            .iter()
+            .find(|event| event.event_type == "tool.image")
+            .context("tool.image event")?;
+        assert_eq!(image.payload["tool_call_id"], "call-browser-1");
+        let artifact = events
+            .iter()
+            .find(|event| event.event_type == "artifact.created")
+            .context("artifact.created event")?;
+        assert_eq!(artifact.payload["tool_call_id"], "call-browser-1");
+        Ok(())
+    }
+
+    #[test]
+    fn browser_script_response_events_strip_transport_text_from_transcript() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let response = browser_use_browser::BrowserScriptOutput {
+            ok: true,
+            status: Some("running".to_string()),
+            run_id: Some("bs-secret".to_string()),
+            next_observe_ms: Some(1_000),
+            text: "chunk one\n\nbrowser_script is still running.\nrun_id: bs-secret\nNext: observe this run again.".to_string(),
+            summary: vec![serde_json::json!({
+                "kind": "extracted",
+                "message": "Read 7 HN discussion threads"
+            })],
+            ..Default::default()
+        };
+
+        let model_message = browser_script_tool_message_content(&response);
+        record_browser_script_response_events(&store, &session.id, "call-browser-1", &response)?;
+
+        let events = store.events_for_session(&session.id)?;
+        let output = events
+            .iter()
+            .find(|event| event.event_type == "tool.output")
+            .context("tool.output event")?;
+
+        assert_eq!(output.payload["text"], "chunk one");
+        assert!(!output.payload["text"]
+            .as_str()
+            .unwrap_or_default()
+            .contains("bs-secret"));
+        assert!(
+            model_message.contains("bs-secret"),
+            "model-visible output should still include observe instructions: {model_message}"
+        );
+        Ok(())
     }
 
     #[test]

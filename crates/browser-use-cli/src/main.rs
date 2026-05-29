@@ -1754,6 +1754,7 @@ fn python(store: &Store, task_id: &str, code: String) -> Result<()> {
 
 fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
+    let tool_call_id = format!("browser_script-cli-{task_id}");
     if let Some(cdp_url) = std::env::var("BU_CDP_URL")
         .ok()
         .filter(|url| !url.trim().is_empty())
@@ -1773,6 +1774,7 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
         "tool.started",
         serde_json::json!({
             "name": "browser_script",
+            "tool_call_id": tool_call_id,
             "arguments": { "code": code.clone() },
         }),
     )?;
@@ -1783,12 +1785,12 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
         &code,
         30,
     )?;
-    record_browser_script_response_events(store, task_id, &response)?;
+    record_browser_script_response_events(store, task_id, &tool_call_id, &response)?;
     if response.ok {
         store.append_event(
             task_id,
             "tool.finished",
-            serde_json::json!({ "name": "browser_script" }),
+            serde_json::json!({ "name": "browser_script", "tool_call_id": tool_call_id }),
         )?;
         print!("{}", response.text);
         return Ok(());
@@ -1798,6 +1800,7 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
         "tool.failed",
         serde_json::json!({
             "name": "browser_script",
+            "tool_call_id": tool_call_id,
             "error": response.error,
         }),
     )?;
