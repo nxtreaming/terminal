@@ -5766,49 +5766,6 @@ fn append_session_config_snapshot_event(
     Ok(())
 }
 
-fn config_has_any_override(options: &AgentRunOptions, keys: &[&str], prefixes: &[String]) -> bool {
-    config_override_pairs_have_any_override(&options.config_overrides, keys, prefixes)
-        || options
-            .session_thread_config
-            .as_ref()
-            .is_some_and(|value| toml_value_has_any_override(value, "", keys, prefixes))
-}
-
-fn config_override_pairs_have_any_override(
-    overrides: &[(String, toml::Value)],
-    keys: &[&str],
-    prefixes: &[String],
-) -> bool {
-    overrides
-        .iter()
-        .any(|(key, _)| config_path_matches(key, keys, prefixes))
-}
-
-fn toml_value_has_any_override(
-    value: &toml::Value,
-    prefix: &str,
-    keys: &[&str],
-    prefixes: &[String],
-) -> bool {
-    let Some(table) = value.as_table() else {
-        return false;
-    };
-    table.iter().any(|(key, value)| {
-        let path = if prefix.is_empty() {
-            key.clone()
-        } else {
-            format!("{prefix}.{key}")
-        };
-        config_path_matches(&path, keys, prefixes)
-            || toml_value_has_any_override(value, &path, keys, prefixes)
-    })
-}
-
-fn config_path_matches(key: &str, keys: &[&str], prefixes: &[String]) -> bool {
-    keys.iter().any(|candidate| key == *candidate)
-        || prefixes.iter().any(|prefix| key.starts_with(prefix))
-}
-
 fn should_use_snapshot_model_settings(
     options: &AgentRunOptions,
     snapshot: &SessionConfigSnapshot,
