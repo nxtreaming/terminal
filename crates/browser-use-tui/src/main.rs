@@ -103,6 +103,7 @@ const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
+const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
 const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
@@ -1662,14 +1663,36 @@ impl App {
         let store = Store::open_with_notifier(&args.state_dir, store_tx)?;
         seed_demo_if_requested(&store, args.seed_demo.as_deref())?;
         let state_cache = AppStateCache::hydrate(&store, &args.browser)?;
-        let selected_session_id = if args.select_latest {
+        // /reload sets BUT_REEXEC_SESSION_ID in the re-execed process's env so
+        // the new UI resumes whatever session the user had open, instead of
+        // starting fresh. Consume the var here so nested /reloads don't
+        // accidentally pin the wrong session forever.
+        let reexec_session_id = std::env::var(REEXEC_SESSION_ENV)
+            .ok()
+            .filter(|value| !value.is_empty());
+        let resumed_from_reexec = reexec_session_id.is_some();
+        if resumed_from_reexec {
+            std::env::remove_var(REEXEC_SESSION_ENV);
+        }
+        // Only honour the env var if the named session actually exists in the
+        // store — a stale id would silently drop the user on the welcome
+        // surface and look like resume is broken.
+        let reexec_session_id = reexec_session_id.filter(|id| {
             state_cache
                 .sessions
-                .first()
-                .map(|session| session.id.clone())
-        } else {
-            None
-        };
+                .iter()
+                .any(|session| session.id.as_str() == id.as_str())
+        });
+        let selected_session_id = reexec_session_id.or_else(|| {
+            if args.select_latest {
+                state_cache
+                    .sessions
+                    .first()
+                    .map(|session| session.id.clone())
+            } else {
+                None
+            }
+        });
         let surface = args.overlay.map(Into::into).unwrap_or(Surface::Main);
         let current_dir = std::env::current_dir()?;
         let config_overrides = parse_config_overrides(&args.config_overrides)?;
@@ -1794,6 +1817,13 @@ impl App {
             history_filter: String::new(),
         };
         app.refresh_cached_projection();
+        if resumed_from_reexec {
+            app.status_notice = Some(if app.selected_session_id.is_some() {
+                "Resumed previous session after reload.".to_string()
+            } else {
+                "Previous session no longer available; starting fresh.".to_string()
+            });
+        }
         Ok(app)
     }
 
@@ -3490,6 +3520,18 @@ impl App {
             }
             KeyEvent {
                 code: KeyCode::Tab, ..
+            } if self.is_slash_palette_active() => {
+                // Tab autocompletes the highlighted slash command (drop the
+                // leading "/") instead of opening the history surface. The
+                // user is mid-typing a command — opening history would steal
+                // focus and discard their partial filter.
+                if let Some(item) = self.slash_palette_items().get(self.selected_row).copied() {
+                    self.palette_filter = item.command.trim_start_matches('/').to_string();
+                    self.clamp_slash_palette_selection();
+                }
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
             } if self.queue_current_composer_followup()? => {}
             KeyEvent {
                 code: KeyCode::Tab, ..
@@ -3758,10 +3800,17 @@ impl App {
     }
 
     fn should_capture_mouse(&self) -> bool {
-        self.should_capture_welcome_mouse()
-            || (self.surface == Surface::Main
-                && !self.is_slash_palette_active()
-                && self.composer_input_rect.get().is_some())
+        // Mouse capture is disabled to give the host terminal back native
+        // drag-to-select, mouse-wheel scrollback, and copy-on-selection.
+        // Trade-off: click-to-place-cursor in the composer and click-on-
+        // welcome-logo no longer fire (the events go to the terminal, not us).
+        // Use keyboard navigation (arrows / Alt+arrows / Home / End) instead.
+        // To restore mouse capture, set this back to:
+        //   self.should_capture_welcome_mouse()
+        //     || (self.surface == Surface::Main
+        //         && !self.is_slash_palette_active()
+        //         && self.composer_input_rect.get().is_some())
+        false
     }
 
     fn handle_composer_click(&mut self, column: u16, row: u16) -> bool {
@@ -4112,7 +4161,23 @@ impl App {
     }
 
     fn request_reexec(&mut self) -> Result<()> {
+        // Close the slash palette and any other overlay BEFORE the exec so
+        // the last frame painted into the inline area (which the host
+        // terminal pushes into scrollback) doesn't keep the palette
+        // popup visible after the new process draws on top.
+        self.close_slash_palette();
         self.status_notice = Some("Reloading browser-use terminal...".to_string());
+        // Hand the currently-open session through to the re-execed UI so
+        // /reload behaves like "reload + resume" instead of dropping the
+        // user back at a fresh transcript.
+        match self.selected_session_id.as_deref() {
+            Some(session_id) if !session_id.is_empty() => {
+                std::env::set_var(REEXEC_SESSION_ENV, session_id);
+            }
+            _ => {
+                std::env::remove_var(REEXEC_SESSION_ENV);
+            }
+        }
         request_process_reexec()
     }
 
