@@ -9575,196 +9575,9 @@ fn latest_compaction_checkpoint(events: &[EventRecord]) -> Option<CompactionChec
     })
 }
 
-pub fn rollback_filtered_event_records(events: &[EventRecord]) -> Vec<&EventRecord> {
-    rollback_filtered_events(events)
-}
-
-fn rollback_filtered_events(events: &[EventRecord]) -> Vec<&EventRecord> {
-    let mut messages = Vec::new();
-    rollback_filtered_events_after(events, 0, &mut messages)
-}
-
-fn rollback_filtered_events_after<'a>(
-    events: &'a [EventRecord],
-    after_seq: i64,
-    messages: &mut Vec<Value>,
-) -> Vec<&'a EventRecord> {
-    rollback_filtered_events_after_with_options(events, after_seq, messages, true)
-}
-
-fn rollback_filtered_events_after_for_fork<'a>(
-    events: &'a [EventRecord],
-    after_seq: i64,
-    messages: &mut Vec<Value>,
-) -> Vec<&'a EventRecord> {
-    rollback_filtered_events_after_with_options(events, after_seq, messages, true)
-}
-
-fn rollback_filtered_events_after_with_options<'a>(
-    events: &'a [EventRecord],
-    after_seq: i64,
-    messages: &mut Vec<Value>,
-    count_inter_agent_turns: bool,
-) -> Vec<&'a EventRecord> {
-    let mut replay_events = Vec::new();
-    for event in events.iter().filter(|event| event.seq > after_seq) {
-        if event.event_type == SESSION_ROLLBACK_EVENT {
-            rollback_last_n_user_turns(
-                &mut replay_events,
-                messages,
-                rollback_turn_count(&event.payload),
-                count_inter_agent_turns,
-            );
-        } else {
-            replay_events.push(event);
-        }
-    }
-    replay_events
-}
-
-fn rollback_turn_count(payload: &Value) -> usize {
-    match payload
-        .get("num_turns")
-        .or_else(|| payload.get("turns"))
-        .or_else(|| payload.get("n"))
-        .and_then(Value::as_u64)
-    {
-        Some(count) => usize::try_from(count).unwrap_or(usize::MAX),
-        None => 1,
-    }
-}
-
-fn rollback_last_n_user_turns(
-    events: &mut Vec<&EventRecord>,
-    checkpoint_messages: &mut Vec<Value>,
-    mut count: usize,
-    count_inter_agent_turns: bool,
-) {
-    while count > 0 {
-        if rollback_last_user_event_turn(events, count_inter_agent_turns)
-            || rollback_last_user_message_turn(checkpoint_messages, count_inter_agent_turns)
-        {
-            count -= 1;
-        } else {
-            break;
-        }
-    }
-}
-
-fn rollback_last_user_event_turn(
-    events: &mut Vec<&EventRecord>,
-    count_inter_agent_turns: bool,
-) -> bool {
-    let Some(user_pos) = events
-        .iter()
-        .rposition(|event| is_real_user_event_for_rollback(event, count_inter_agent_turns))
-    else {
-        return false;
-    };
-    let target_seq = events[user_pos].seq;
-    let mut truncate_at = user_pos;
-    while truncate_at > 0 && contextual_event_targets_turn(events[truncate_at - 1], target_seq) {
-        truncate_at -= 1;
-    }
-    events.truncate(truncate_at);
-    true
-}
-
-fn is_real_user_event_for_rollback(event: &EventRecord, count_inter_agent_turns: bool) -> bool {
-    is_real_user_event(event)
-        || (count_inter_agent_turns && agent_message_is_inter_agent_turn_event(event))
-}
-
-fn is_real_user_event(event: &EventRecord) -> bool {
-    matches!(
-        event.event_type.as_str(),
-        "session.input" | "session.followup"
-    )
-}
-
-fn agent_message_is_inter_agent_turn_event(event: &EventRecord) -> bool {
-    matches!(
-        event.event_type.as_str(),
-        "agent.message" | "agent.mailbox_input"
-    ) && event
-        .payload
-        .get("content")
-        .and_then(Value::as_str)
-        .is_some()
-}
-
-fn contextual_event_targets_turn(event: &EventRecord, target_seq: i64) -> bool {
-    matches!(
-        event.event_type.as_str(),
-        "workspace.context"
-            | MODEL_SWITCH_CONTEXT_EVENT
-            | PERSONALITY_CONTEXT_EVENT
-            | COLLABORATION_CONTEXT_EVENT
-            | GENERATED_IMAGE_CONTEXT_EVENT
-    ) && event.payload.get("before_seq").and_then(Value::as_i64) == Some(target_seq)
-}
-
-fn rollback_last_user_message_turn(
-    messages: &mut Vec<Value>,
-    count_inter_agent_turns: bool,
-) -> bool {
-    let Some(user_pos) = messages
-        .iter()
-        .rposition(|message| is_user_message_for_rollback(message, count_inter_agent_turns))
-    else {
-        return false;
-    };
-    let has_prior_real_user = messages[..user_pos]
-        .iter()
-        .any(|message| is_user_message_for_rollback(message, count_inter_agent_turns));
-    let mut truncate_at = user_pos;
-    if has_prior_real_user {
-        while truncate_at > 0 && is_contextual_provider_message(&messages[truncate_at - 1]) {
-            truncate_at -= 1;
-        }
-    }
-    messages.truncate(truncate_at);
-    true
-}
-
-fn is_user_message_for_rollback(message: &Value, count_inter_agent_turns: bool) -> bool {
-    is_real_user_message(message)
-        || (count_inter_agent_turns && provider_message_is_inter_agent_instruction(message))
-}
-
-fn is_real_user_message(message: &Value) -> bool {
-    message.get("role").and_then(Value::as_str) == Some("user")
-        && message.get("name").is_none()
-        && !is_turn_aborted_message(message)
-        && !is_skill_context_message(message)
-        && !is_subagent_notification_context_message(message)
-}
-
-fn is_contextual_provider_message(message: &Value) -> bool {
-    if is_turn_aborted_message(message) {
-        return true;
-    }
-    matches!(
-        message.get("name").and_then(Value::as_str),
-        Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
-            | Some(PERMISSIONS_CONTEXT_MESSAGE_NAME)
-            | Some(MODEL_SWITCH_CONTEXT_MESSAGE_NAME)
-            | Some(PERSONALITY_CONTEXT_MESSAGE_NAME)
-            | Some(COLLABORATION_CONTEXT_MESSAGE_NAME)
-            | Some(MENTION_CONTEXT_MESSAGE_NAME)
-            | Some(GENERATED_IMAGE_CONTEXT_MESSAGE_NAME)
-    )
-}
-
-fn provider_history_has_open_turn(messages: &[Value]) -> bool {
-    let Some(user_pos) = messages
-        .iter()
-        .rposition(|message| is_user_message_for_rollback(message, true))
-    else {
-        return false;
-    };
-    !messages[user_pos + 1..].iter().any(is_turn_aborted_message)
-}
+mod rollback;
+pub use rollback::rollback_filtered_event_records;
+pub(crate) use rollback::*;
 
 fn inter_agent_provider_message_from_event(event: &EventRecord) -> Option<Value> {
     let content = event.payload.get("content").and_then(Value::as_str)?;
@@ -10515,7 +10328,7 @@ fn turn_aborted_user_message() -> Value {
     })
 }
 
-fn is_turn_aborted_message(message: &Value) -> bool {
+pub(crate) fn is_turn_aborted_message(message: &Value) -> bool {
     matches!(
         message.get("role").and_then(Value::as_str),
         Some("user") | Some("developer")
@@ -11239,7 +11052,7 @@ fn app_connector_ids_from_linked_text(text: &str) -> Vec<String> {
         .unwrap_or_default()
 }
 
-fn is_skill_context_message(message: &Value) -> bool {
+pub(crate) fn is_skill_context_message(message: &Value) -> bool {
     message.get("role").and_then(Value::as_str) == Some("user")
         && message_content_text(message)
             .trim_start()
@@ -11251,7 +11064,7 @@ fn is_mention_context_message(message: &Value) -> bool {
         && message.get("name").and_then(Value::as_str) == Some(MENTION_CONTEXT_MESSAGE_NAME)
 }
 
-fn is_subagent_notification_context_message(message: &Value) -> bool {
+pub(crate) fn is_subagent_notification_context_message(message: &Value) -> bool {
     message.get("role").and_then(Value::as_str) == Some("user")
         && is_subagent_notification_text(&message_content_text(message))
 }
@@ -23051,7 +22864,7 @@ fn provider_message_is_fork_turn_boundary(message: &Value) -> bool {
         && message_content_is_trigger_turn_inter_agent_envelope(&message_content_text(message))
 }
 
-fn provider_message_is_inter_agent_instruction(message: &Value) -> bool {
+pub(crate) fn provider_message_is_inter_agent_instruction(message: &Value) -> bool {
     if message.get("role").and_then(Value::as_str) != Some("assistant") {
         return false;
     }
@@ -46020,6 +45833,5 @@ command = "explicit-mcp"
         install_process_crypto_provider();
     }
 }
-
 
 
