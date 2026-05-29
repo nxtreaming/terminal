@@ -12,14 +12,14 @@
 Legend: `[ ]` not started · `[~]` in progress · `[x]` implemented **and** parity/e2e tests green. A phase is done only when every box under it (including its Gate) is `[x]`. Nothing gets `[x]` until it runs and passes tests (Rule 8). Keep this list in sync as WPs land.
 
 **Phase 0 — Carve**
-- [ ] 0.1 Module/crate skeleton (carve `lib.rs` → submodules/crates; sync; no behavior change)
+- [~] 0.1 Module/crate skeleton — **9/17 modules carved** (constants, images, auth, goals, memory_citations, rollback, codex_headers, review, config_overrides; all green, 488 tests pass, lib.rs 47.3k→45.5k). Tangled core remains: events/context/compact/session/persistence/agents_md/hooks/skills/plugins/subagents/turn/providers_glue (need shared-dep untangling).
 - [ ] 0.2 Freeze interfaces (provider/route, ToolRuntime/Approvable/Sandboxable, context, store, errors)
 - [ ] 0.3 Parity-test harness (cassettes, fixtures, corpus scaffold)
 - [ ] **Gate 0** — compiles (sync), modules carved, interfaces frozen, harness runs
 
 **Phase 1 — `browser-use-llm`**
 - [x] 1.1 `schema/` (LlmRequest/Message/ContentPart/LlmEvent/Usage/ids/options/error) — 5 round-trip tests green
-- [ ] 1.2 `route/` traits + client + Lifecycle + ToolStream
+- [~] 1.2 `route/` traits + client + Lifecycle + ToolStream — **Lifecycle + ToolStream done** (10 tests; pure stream-normalization state machines). `route/` traits + async client pending.
 - [ ] 1.3 `protocols/openai_responses`
 - [ ] 1.4 `protocols/openai_chat` (Ollama/OpenRouter/DeepSeek/Fireworks)
 - [ ] 1.5 `protocols/anthropic_messages` (+ Claude-Code OAuth)
