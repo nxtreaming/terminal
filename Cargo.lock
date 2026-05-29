@@ -284,6 +284,14 @@ dependencies = [
 ]
 
 [[package]]
+name = "browser-use-llm"
+version = "0.1.2"
+dependencies = [
+ "serde",
+ "serde_json",
+]
+
+[[package]]
 name = "browser-use-protocol"
 version = "0.1.2"
 dependencies = [
