@@ -9,7 +9,10 @@ use crate::constants::{
 };
 use crate::token_budget_to_char_budget;
 
-pub(crate) fn image_url_context_budget_replacement(url: &str, detail: Option<&str>) -> Option<String> {
+pub(crate) fn image_url_context_budget_replacement(
+    url: &str,
+    detail: Option<&str>,
+) -> Option<String> {
     parse_base64_image_data_url_payload(url)?;
     let estimated_bytes = if detail.is_some_and(|detail| detail.eq_ignore_ascii_case("original")) {
         estimate_original_image_context_bytes(url).unwrap_or(RESIZED_IMAGE_CONTEXT_BYTES_ESTIMATE)

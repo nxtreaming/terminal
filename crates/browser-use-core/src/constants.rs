@@ -211,16 +211,20 @@ pub(crate) const BROWSER_USE_TERMINAL_MANAGED_CONFIG_SYSTEM_PATH: &str =
 pub(crate) const BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_SOURCE: &str =
     "com.browseruse.terminal:config_toml_base64";
 #[cfg(all(target_os = "macos", not(test)))]
-pub(crate) const BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_APPLICATION_ID: &str = "com.browseruse.terminal";
+pub(crate) const BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_APPLICATION_ID: &str =
+    "com.browseruse.terminal";
 #[cfg(all(target_os = "macos", not(test)))]
 pub(crate) const BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_KEY: &str = "config_toml_base64";
 pub(crate) const PROJECT_BROWSER_USE_TERMINAL_DIR: &str = ".browser-use";
 #[cfg(all(unix, not(test)))]
-pub(crate) const SYSTEM_BROWSER_USE_TERMINAL_CONFIG_PATH: &str = "/etc/browser-use-terminal/config.toml";
+pub(crate) const SYSTEM_BROWSER_USE_TERMINAL_CONFIG_PATH: &str =
+    "/etc/browser-use-terminal/config.toml";
 #[cfg(test)]
-pub(crate) const TEST_BROWSER_USE_TERMINAL_SYSTEM_CONFIG_ENV: &str = "BROWSER_USE_TEST_SYSTEM_CONFIG";
+pub(crate) const TEST_BROWSER_USE_TERMINAL_SYSTEM_CONFIG_ENV: &str =
+    "BROWSER_USE_TEST_SYSTEM_CONFIG";
 #[cfg(test)]
-pub(crate) const TEST_BROWSER_USE_TERMINAL_MANAGED_CONFIG_ENV: &str = "BROWSER_USE_TEST_MANAGED_CONFIG";
+pub(crate) const TEST_BROWSER_USE_TERMINAL_MANAGED_CONFIG_ENV: &str =
+    "BROWSER_USE_TEST_MANAGED_CONFIG";
 #[cfg(test)]
 pub(crate) const TEST_BROWSER_USE_TERMINAL_MANAGED_PREFERENCES_CONFIG_BASE64_ENV: &str =
     "BROWSER_USE_TEST_MANAGED_PREFERENCES_CONFIG_BASE64";

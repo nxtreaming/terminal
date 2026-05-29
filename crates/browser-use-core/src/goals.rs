@@ -439,7 +439,10 @@ pub(crate) fn budget_limited_goal_context_message_if_needed(
     Ok(Some(message))
 }
 
-pub(crate) fn goal_continuation_prompt(events: &[EventRecord], goal: &ThreadGoalSnapshot) -> String {
+pub(crate) fn goal_continuation_prompt(
+    events: &[EventRecord],
+    goal: &ThreadGoalSnapshot,
+) -> String {
     let usage = goal_usage_payload(events, goal);
     let tokens_used = usage
         .get("tokens_used")
@@ -462,7 +465,10 @@ pub(crate) fn goal_continuation_prompt(events: &[EventRecord], goal: &ThreadGoal
         .replace("{remaining_tokens}", &remaining_tokens)
 }
 
-pub(crate) fn goal_budget_limit_prompt(events: &[EventRecord], goal: &ThreadGoalSnapshot) -> String {
+pub(crate) fn goal_budget_limit_prompt(
+    events: &[EventRecord],
+    goal: &ThreadGoalSnapshot,
+) -> String {
     let usage = goal_usage_payload(events, goal);
     let tokens_used = usage
         .get("tokens_used")

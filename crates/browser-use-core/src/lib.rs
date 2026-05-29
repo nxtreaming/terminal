@@ -21,6 +21,8 @@ use browser_use_protocol::{
     failure_from_events, sanitized_agent_context_from_events, session_result_from_events,
     EventRecord, ModelEvent, SessionMeta, SessionStatus, ToolCall,
 };
+#[cfg(test)]
+use browser_use_providers::CodexAuth;
 use browser_use_providers::{
     browser_agent_instructions_for_model_and_personality_with_catalog, bundled_model_catalog,
     default_permissions_instructions,
@@ -49,8 +51,6 @@ use tools::{
     MultiAgentToolFamily, MultiAgentToolSpecConfig, ShellToolSpecConfig, SpawnAgentRoleDescription,
     ToolHandlerKind, ToolRegistry, ToolRouter,
 };
-#[cfg(test)]
-use browser_use_providers::CodexAuth;
 
 mod constants;
 pub(crate) use constants::*;
@@ -10116,7 +10116,9 @@ fn active_goal_context_message_from_events(events: &[EventRecord]) -> Option<Val
     )))
 }
 
-pub(crate) fn budget_limited_goal_context_message_from_events(events: &[EventRecord]) -> Option<Value> {
+pub(crate) fn budget_limited_goal_context_message_from_events(
+    events: &[EventRecord],
+) -> Option<Value> {
     let goal = latest_thread_goal_from_events(events)?;
     if goal.status != "budget_limited" {
         return None;
@@ -45533,5 +45535,3 @@ command = "explicit-mcp"
         install_process_crypto_provider();
     }
 }
-
-

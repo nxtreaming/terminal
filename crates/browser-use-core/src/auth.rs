@@ -65,7 +65,10 @@ fn codex_auth_from_explicit_env() -> Option<CodexAuth> {
     })
 }
 
-pub(crate) fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesProvider> {
+pub(crate) fn anthropic_provider(
+    store: &Store,
+    model: String,
+) -> Result<AnthropicMessagesProvider> {
     let base_url = setting_or_env_or_default(
         store,
         "auth.anthropic.base_url",
@@ -213,7 +216,10 @@ fn is_claude_code_account(account: &str) -> bool {
     matches!(account, "Claude Code login" | "Claude Code subscription")
 }
 
-pub(crate) fn openrouter_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
+pub(crate) fn openrouter_provider(
+    store: &Store,
+    model: String,
+) -> Result<OpenAICompatibleChatProvider> {
     let api_key = stored_or_env(
         store,
         "auth.openrouter.api_key",
@@ -231,7 +237,10 @@ pub(crate) fn openrouter_provider(store: &Store, model: String) -> Result<OpenAI
     ))
 }
 
-pub(crate) fn deepseek_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
+pub(crate) fn deepseek_provider(
+    store: &Store,
+    model: String,
+) -> Result<OpenAICompatibleChatProvider> {
     let api_key = stored_or_env(
         store,
         "auth.deepseek.api_key",
@@ -290,7 +299,11 @@ pub(crate) fn stored_codex_managed_auth(store: &Store) -> Result<Option<CodexMan
     )))
 }
 
-pub(crate) fn stored_or_env(store: &Store, setting_key: &str, env_names: &[&str]) -> Result<Option<String>> {
+pub(crate) fn stored_or_env(
+    store: &Store,
+    setting_key: &str,
+    env_names: &[&str],
+) -> Result<Option<String>> {
     if let Some(value) = store.get_setting(setting_key)? {
         if !value.trim().is_empty() {
             return Ok(Some(value));
