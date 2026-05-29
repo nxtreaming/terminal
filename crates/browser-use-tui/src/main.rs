@@ -6320,13 +6320,13 @@ fn maybe_emit_native_transcript(
     let defer_open_tail = session.status.is_active() && !has_live_streaming_output;
 
     if !app.native_history.is_active_for(Some(&session_id)) {
-        // No session header card — the transcript starts straight with
-        // the conversation content.
+        // The session opens with a committed header block (small BU mark,
+        // "Browser Use Terminal", cwd) above the conversation content.
         let emission =
             transcript::terminal_scrollback_emission_since(&model, 0, width, defer_open_tail);
-        if !emission.lines.is_empty() {
-            insert_initial_native_lines(terminal, emission.lines)?;
-        }
+        let mut lines = crate::welcome::session_header_lines(width);
+        lines.extend(emission.lines);
+        insert_initial_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session_with_group(session_id, emission.last_seq, None);
         maybe_emit_native_live_stream(terminal, app, &model, width)?;
@@ -8336,7 +8336,10 @@ mod redesign_tests {
         assert!(screen.contains("• subagent repo-explorer finished"));
         assert!(!screen.contains("• answer"));
         assert!(!screen.contains("Purpose: Rust-first terminal workbench"));
-        assert!(!screen.contains("crates/browser-use-tui"));
+        // The child result body must not blob into the parent transcript. Match
+        // the result's own text, not the bare crate path — the session header's
+        // cwd line legitimately shows the working directory.
+        assert!(!screen.contains("owns the UI"));
         assert!(!screen.contains("helper finished: Repository summary"));
         assert!(!screen.contains("**Purpose:**"));
         Ok(())

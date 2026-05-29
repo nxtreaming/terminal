@@ -509,7 +509,8 @@ def smoke_interactive_terminal(binary: Path) -> None:
         tmux_send(session, "Escape")
         after_slash = capture_after_idle(session, "main-after-slash-palette", visible_only=True)
         assert_contains(after_slash, "Type to steer the agent", "slash escape should restore main composer")
-        assert_not_contains(after_slash, "/browser", "slash escape should close the overlay")
+        assert_not_contains(after_slash, "> bro", "slash escape should clear the slash filter")
+        assert_not_contains(after_slash, "↑↓ navigate", "slash escape should close the overlay")
         tmux_send_literal(session, "/model")
         tmux_send(session, "Enter")
         model = wait_for(session, "Choose the model and provider for this session", "model-panel")
@@ -1300,7 +1301,7 @@ def smoke_short_completed_history_has_live_preview(binary: Path) -> None:
         tmux_send(session, "/")
         slash = wait_for(session, "/task", "short-done-slash-palette")
         assert_contains(slash, "/history", "slash palette should open on completed history")
-        assert_contains(slash, "Top 5 Hacker News posts", "slash palette should layer over completed transcript")
+        assert_contains(slash, "Example story", "slash palette should layer over completed transcript")
         assert_contains(slash, "Ask a follow-up", "slash palette should layer over composer")
         assert_not_contains(slash, "filter actions", "slash palette should not show a redundant filter prompt")
         assert_row_gap_at_most(

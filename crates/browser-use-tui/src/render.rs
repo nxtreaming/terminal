@@ -2313,6 +2313,7 @@ fn work_lines(
     product_state: ProductState,
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
+    out.extend(crate::welcome::session_header_lines(width));
     if let Some(notice) = app.status_notice.as_ref() {
         out.push(Line::from(Span::styled(notice.clone(), muted())));
         out.push(Line::from(""));

@@ -325,6 +325,20 @@ pub fn welcome_lines(
     out
 }
 
+// ─────────────────────── Session header ───────────────────────
+const SESSION_TITLE: &str = "Browser Use Terminal";
+
+/// Header block for an individual session: the product title and cwd, left-
+/// aligned. Rendered as plain committed scrollback text, so it sits at the top
+/// of the conversation and scrolls away naturally as the session grows.
+pub fn session_header_lines(_width: u16) -> Vec<Line<'static>> {
+    vec![
+        Line::from(Span::styled(SESSION_TITLE.to_string(), bold())),
+        Line::from(Span::styled(short_cwd(), muted())),
+        Line::from(""),
+    ]
+}
+
 /// Current working directory as a friendly short label. Replaces the home
 /// prefix with `~` so paths like `/home/foo/projects/bar` render as
 /// `~/projects/bar`.
@@ -349,6 +363,29 @@ fn shorten_cwd(cwd: &Path, home: Option<&Path>) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn session_header_is_left_aligned_title_and_cwd() {
+        let lines = session_header_lines(80);
+        let text: Vec<String> = lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect::<String>()
+            })
+            .collect();
+        // Visualize during `cargo test -- --nocapture`.
+        for line in &text {
+            println!("|{}|", line.trim_end());
+        }
+        // Text-only header: title flush-left on the first row, then the cwd.
+        assert!(text[0].starts_with("Browser Use Terminal"));
+        assert!(text
+            .iter()
+            .any(|line| line.contains('~') || line.contains('/')));
+    }
 
     #[test]
     fn cwd_shortening_only_applies_to_real_home_children() {
