@@ -79,32 +79,29 @@ impl fmt::Debug for Route {
 }
 
 // ===========================================================================
-// Typed-error helpers (retryability, server hints, constructors)
+// Typed-error helpers (constructors + retry classification)
 // ===========================================================================
 
-/// Retry-classification + construction helpers layered on the canonical
-/// [`LlmError`]. The schema sets `retryable` at construction from the reason;
-/// these helpers add the executor-side concerns (server `Retry-After`, status
-/// codes) without changing the schema.
+/// Construction helpers for the canonical [`LlmError`] by failure category.
+///
+/// The schema sets `retryable` at construction from the reason; these are thin
+/// named constructors so the executor can build typed errors without repeating
+/// the `LlmError::new(reason, ..)` boilerplate. The server `Retry-After` hint is
+/// deliberately *not* stored on the error (the schema has no field for it and it
+/// must never leak through `Display`); it is threaded separately via the
+/// retry-loop's `Option<u64>` and [`Outcome::Fail`]'s `retry_after_ms`.
 trait LlmErrorExt {
     /// A transport-layer failure (connection reset, DNS, TLS, ...).
     fn transport(message: impl Into<String>) -> LlmError;
     /// A 5xx / provider-internal failure.
     fn provider_internal(message: impl Into<String>) -> LlmError;
-    /// A rate-limit (429), optionally carrying a server-suggested delay (ms).
-    fn rate_limit(message: impl Into<String>, retry_after_ms: Option<u64>) -> LlmError;
+    /// A rate-limit (429) failure.
+    fn rate_limit(message: impl Into<String>) -> LlmError;
     /// An authentication / authorization failure (401 / 403).
     fn authentication(message: impl Into<String>) -> LlmError;
     /// A non-retryable bad-request style failure (4xx other than auth/429).
     fn invalid_request(message: impl Into<String>) -> LlmError;
-    /// The server-suggested retry delay (ms), if recorded in `request_id`/state.
-    fn server_retry_after_ms(&self) -> Option<u64>;
 }
-
-/// We thread a server `Retry-After` hint through the error so the retry loop can
-/// honour it without a side-channel. It is stashed as a sentinel suffix on the
-/// message only when present; the structured accessor parses it back out.
-const RETRY_AFTER_MARKER: &str = "\u{0}retry_after_ms=";
 
 impl LlmErrorExt for LlmError {
     fn transport(message: impl Into<String>) -> LlmError {
@@ -113,36 +110,14 @@ impl LlmErrorExt for LlmError {
     fn provider_internal(message: impl Into<String>) -> LlmError {
         LlmError::new(LlmErrorReason::ProviderInternal, message)
     }
-    fn rate_limit(message: impl Into<String>, retry_after_ms: Option<u64>) -> LlmError {
-        let mut err = LlmError::new(LlmErrorReason::RateLimit, message);
-        if let Some(ms) = retry_after_ms {
-            // Stash the hint structurally on `status` is not possible (u16); use
-            // a private marker on the message that `server_retry_after_ms`
-            // recovers and that redaction/Display never expose to users.
-            err.message = format!("{}{RETRY_AFTER_MARKER}{ms}", err.message);
-        }
-        err
+    fn rate_limit(message: impl Into<String>) -> LlmError {
+        LlmError::new(LlmErrorReason::RateLimit, message)
     }
     fn authentication(message: impl Into<String>) -> LlmError {
         LlmError::new(LlmErrorReason::Authentication, message)
     }
     fn invalid_request(message: impl Into<String>) -> LlmError {
         LlmError::new(LlmErrorReason::InvalidRequest, message)
-    }
-    fn server_retry_after_ms(&self) -> Option<u64> {
-        let idx = self.message.find(RETRY_AFTER_MARKER)?;
-        self.message[idx + RETRY_AFTER_MARKER.len()..]
-            .trim()
-            .parse::<u64>()
-            .ok()
-    }
-}
-
-/// The user-facing message with any internal `Retry-After` sentinel stripped.
-fn clean_message(err: &LlmError) -> &str {
-    match err.message.find(RETRY_AFTER_MARKER) {
-        Some(idx) => &err.message[..idx],
-        None => &err.message,
     }
 }
 
@@ -158,7 +133,7 @@ fn is_retryable(err: &LlmError) -> bool {
 }
 
 /// Map an HTTP status code (and best-effort body) onto a typed [`LlmError`].
-fn error_for_status(status: u16, retry_after_ms: Option<u64>, body: &str) -> LlmError {
+fn error_for_status(status: u16, body: &str) -> LlmError {
     let snippet = body.trim();
     let msg = if snippet.is_empty() {
         format!("HTTP {status}")
@@ -167,7 +142,7 @@ fn error_for_status(status: u16, retry_after_ms: Option<u64>, body: &str) -> Llm
     };
     let mut err = match status {
         401 | 403 => LlmError::authentication(msg),
-        429 => LlmError::rate_limit(msg, retry_after_ms),
+        429 => LlmError::rate_limit(msg),
         500..=599 => LlmError::provider_internal(msg),
         _ => LlmError::invalid_request(msg),
     };
@@ -249,16 +224,19 @@ impl RetryPolicy {
                         outcome: PlanOutcome::Success,
                     };
                 }
-                Outcome::Fail(err) => {
+                Outcome::Fail {
+                    error,
+                    retry_after_ms,
+                } => {
                     let last_attempt = attempt + 1 >= max;
-                    if !is_retryable(&err) || last_attempt {
+                    if !is_retryable(&error) || last_attempt {
                         return RetryPlan {
                             attempts: attempt + 1,
                             delays,
-                            outcome: PlanOutcome::Failed(err),
+                            outcome: PlanOutcome::Failed(error),
                         };
                     }
-                    let hint = err.server_retry_after_ms().map(Duration::from_millis);
+                    let hint = retry_after_ms.map(Duration::from_millis);
                     delays.push(self.backoff(attempt, hint));
                 }
             }
@@ -295,8 +273,32 @@ fn deterministic_jitter(seed: u64, attempt: u32, base_ms: u64) -> u64 {
 pub enum Outcome {
     /// The attempt would succeed.
     Success,
-    /// The attempt would fail with this error.
-    Fail(LlmError),
+    /// The attempt would fail with this error, optionally carrying a
+    /// server-suggested retry delay (ms) parsed from the response headers.
+    Fail {
+        /// The typed failure.
+        error: LlmError,
+        /// Server `Retry-After` / `retry-after-ms` hint, if any.
+        retry_after_ms: Option<u64>,
+    },
+}
+
+impl Outcome {
+    /// A failure with no server retry hint.
+    pub fn fail(error: LlmError) -> Self {
+        Outcome::Fail {
+            error,
+            retry_after_ms: None,
+        }
+    }
+
+    /// A failure carrying a server retry hint (ms).
+    pub fn fail_after(error: LlmError, retry_after_ms: u64) -> Self {
+        Outcome::Fail {
+            error,
+            retry_after_ms: Some(retry_after_ms),
+        }
+    }
 }
 
 /// The resolved outcome of a [`RetryPlan`].
@@ -637,13 +639,14 @@ impl ModelClient {
     }
 
     /// Send the request once, returning the response on a 2xx status or a typed
-    /// error otherwise. Retried failures bubble up to [`send_with_retry`].
+    /// error (plus any server retry hint) otherwise. Retried failures bubble up
+    /// to [`send_with_retry`].
     async fn send_once(
         &self,
         url: &str,
         headers: &[(String, String)],
         body: &Value,
-    ) -> Result<reqwest::Response, LlmError> {
+    ) -> Result<reqwest::Response, (LlmError, Option<u64>)> {
         let mut builder = self.http.post(url).json(body);
         for (k, v) in headers {
             builder = builder.header(k.as_str(), v.as_str());
@@ -651,18 +654,18 @@ impl ModelClient {
         let resp = builder
             .send()
             .await
-            .map_err(|e| LlmError::transport(scrub(&e.to_string())))?;
+            .map_err(|e| (LlmError::transport(scrub(&e.to_string())), None))?;
 
         let status = resp.status();
         if status.is_success() {
             return Ok(resp);
         }
 
-        // Non-2xx: collect headers for rate-limit hints, then the body snippet.
+        // Non-2xx: collect headers for the rate-limit hint, then the body snippet.
         let info = RateLimitInfo::from_headers(&header_map(resp.headers()));
         let code = status.as_u16();
         let text = resp.text().await.unwrap_or_default();
-        Err(error_for_status(code, info.retry_after_ms, &scrub(&text)))
+        Err((error_for_status(code, &scrub(&text)), info.retry_after_ms))
     }
 
     /// Send with retry/backoff, honouring the configured [`RetryPolicy`].
@@ -677,12 +680,12 @@ impl ModelClient {
         for attempt in 0..max {
             match self.send_once(url, headers, body).await {
                 Ok(resp) => return Ok(resp),
-                Err(err) => {
+                Err((err, retry_after_ms)) => {
                     let last_attempt = attempt + 1 >= max;
                     if !is_retryable(&err) || last_attempt {
                         return Err(err);
                     }
-                    let hint = err.server_retry_after_ms().map(Duration::from_millis);
+                    let hint = retry_after_ms.map(Duration::from_millis);
                     let delay = self.retry.backoff(attempt, hint);
                     last_err = Some(err);
                     tokio::time::sleep(delay).await;
@@ -960,8 +963,8 @@ mod tests {
     #[test]
     fn plan_retries_then_succeeds_with_exponential_delays() {
         let outcomes = vec![
-            Outcome::Fail(LlmError::transport("net")),
-            Outcome::Fail(LlmError::provider_internal("500")),
+            Outcome::fail(LlmError::transport("net")),
+            Outcome::fail(LlmError::provider_internal("500")),
             Outcome::Success,
         ];
         let plan = fixed_policy().plan(&outcomes);
@@ -976,7 +979,7 @@ mod tests {
 
     #[test]
     fn plan_stops_immediately_on_non_retryable() {
-        let outcomes = vec![Outcome::Fail(LlmError::authentication("401"))];
+        let outcomes = vec![Outcome::fail(LlmError::authentication("401"))];
         let plan = fixed_policy().plan(&outcomes);
         assert_eq!(plan.attempts, 1);
         assert!(plan.delays.is_empty());
@@ -988,7 +991,7 @@ mod tests {
 
     #[test]
     fn plan_exhausts_budget_on_persistent_failure() {
-        let err = || Outcome::Fail(LlmError::provider_internal("500"));
+        let err = || Outcome::fail(LlmError::provider_internal("500"));
         let outcomes = vec![err(), err(), err(), err(), err()];
         let plan = fixed_policy().plan(&outcomes);
         assert_eq!(plan.attempts, 5);
@@ -1011,7 +1014,7 @@ mod tests {
     #[test]
     fn plan_honors_retry_after_hint() {
         let outcomes = vec![
-            Outcome::Fail(LlmError::rate_limit("429", Some(2500))),
+            Outcome::fail_after(LlmError::rate_limit("429"), 2500),
             Outcome::Success,
         ];
         let plan = fixed_policy().plan(&outcomes);
@@ -1176,16 +1179,14 @@ mod tests {
     }
 
     #[test]
-    fn rate_limit_error_does_not_expose_retry_marker() {
-        // The internal Retry-After sentinel must not leak through Display.
-        let err = LlmError::rate_limit("HTTP 429: slow down", Some(1200));
-        assert_eq!(err.server_retry_after_ms(), Some(1200));
-        assert_eq!(clean_message(&err), "HTTP 429: slow down");
+    fn rate_limit_error_message_is_clean() {
+        // The error message is the plain HTTP snippet; the server Retry-After
+        // hint is carried structurally (via Outcome / the retry loop), never
+        // smuggled into the message or leaked through Display.
+        let err = LlmError::rate_limit("HTTP 429: slow down");
+        assert_eq!(err.message, "HTTP 429: slow down");
         let shown = format!("{err}");
-        assert!(
-            !shown.contains("retry_after_ms="),
-            "leaked sentinel: {shown}"
-        );
+        assert!(!shown.contains("retry_after_ms="), "leaked hint: {shown}");
     }
 
     // --- status -> error mapping ----------------------------------------
@@ -1193,27 +1194,26 @@ mod tests {
     #[test]
     fn maps_status_codes_to_typed_errors() {
         assert_eq!(
-            error_for_status(401, None, "").reason,
+            error_for_status(401, "").reason,
             LlmErrorReason::Authentication
         );
         assert_eq!(
-            error_for_status(403, None, "").reason,
+            error_for_status(403, "").reason,
             LlmErrorReason::Authentication
         );
-        let rl = error_for_status(429, Some(1200), "slow down");
+        let rl = error_for_status(429, "slow down");
         assert_eq!(rl.reason, LlmErrorReason::RateLimit);
-        assert_eq!(rl.server_retry_after_ms(), Some(1200));
         assert_eq!(rl.status, Some(429));
         assert_eq!(
-            error_for_status(500, None, "").reason,
+            error_for_status(500, "").reason,
             LlmErrorReason::ProviderInternal
         );
         assert_eq!(
-            error_for_status(503, None, "").reason,
+            error_for_status(503, "").reason,
             LlmErrorReason::ProviderInternal
         );
         assert_eq!(
-            error_for_status(400, None, "bad").reason,
+            error_for_status(400, "bad").reason,
             LlmErrorReason::InvalidRequest
         );
     }
@@ -1222,7 +1222,7 @@ mod tests {
     fn error_retryability_matches_taxonomy() {
         assert!(is_retryable(&LlmError::transport("x")));
         assert!(is_retryable(&LlmError::provider_internal("x")));
-        assert!(is_retryable(&LlmError::rate_limit("x", None)));
+        assert!(is_retryable(&LlmError::rate_limit("x")));
         assert!(!is_retryable(&LlmError::authentication("x")));
         assert!(!is_retryable(&LlmError::invalid_request("x")));
         assert!(!is_retryable(&LlmError::new(LlmErrorReason::Decode, "x")));

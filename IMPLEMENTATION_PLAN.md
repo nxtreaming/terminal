@@ -19,7 +19,7 @@ Legend: `[ ]` not started · `[~]` in progress · `[x]` implemented **and** pari
 
 **Phase 1 — `browser-use-llm`**
 - [x] 1.1 `schema/` (LlmRequest/Message/ContentPart/LlmEvent/Usage/ids/options/error) — 5 round-trip tests green
-- [~] 1.2 `route/` traits + client + Lifecycle + ToolStream — **route traits (Protocol/ProtocolStream/Endpoint/Auth) + Lifecycle + ToolStream + SSE framing all done** (26 tests, pure/sync). Only the **async client/executor is pending — deferred to Phase 2** (the workspace is still sync; the client integrates when the engine goes async).
+- [x] 1.2 `route/` traits + client + Lifecycle + ToolStream — traits + Lifecycle/ToolStream/SSE framing + **async ModelClient/executor** all done (retry/backoff, rate-limit parse, secret redaction, network-free `decode_chunks` test). `6708ac4`.
 - [x] 1.3 `protocols/openai_responses` — build_body + SSE decoder via Lifecycle/ToolStream; 6 fixture tests
 - [x] 1.4 `protocols/openai_chat` (Ollama/OpenRouter/DeepSeek/Fireworks) — 5 fixture tests (tool calls correlated by stream index)
 - [x] 1.5 `protocols/anthropic_messages` — Messages wire format (system-block array, thinking-signature round-trip, event-named SSE); 9 fixture tests. *(Claude-Code OAuth is auth, not wire format — lands with the auth/client layer.)*
