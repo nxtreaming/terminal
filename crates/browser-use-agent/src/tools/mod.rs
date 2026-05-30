@@ -29,4 +29,6 @@ pub use crate::decision::ToolParallelism;
 #[cfg(test)]
 mod approval_tests;
 #[cfg(test)]
+mod orchestrator_tests;
+#[cfg(test)]
 mod sandbox_tests;
