@@ -11,6 +11,7 @@ pub(crate) struct Composer {
     local_images: Vec<PathBuf>,
     cursor: usize,
     preferred_column: Option<usize>,
+    visible_wrapped_start_hint: Option<usize>,
 }
 
 impl Composer {
@@ -23,6 +24,7 @@ impl Composer {
         self.local_images.clear();
         self.cursor = 0;
         self.preferred_column = None;
+        self.visible_wrapped_start_hint = None;
     }
 
     pub(crate) fn take_trimmed(&mut self) -> String {
@@ -64,11 +66,16 @@ impl Composer {
         self.cursor
     }
 
+    pub(crate) fn cursor_index(&self) -> usize {
+        self.cursor
+    }
+
     pub(crate) fn set_input(&mut self, value: String) {
         self.text = value;
         self.local_images.clear();
         self.cursor = self.input_len();
         self.preferred_column = None;
+        self.visible_wrapped_start_hint = None;
     }
 
     #[cfg(test)]
@@ -134,73 +141,9 @@ impl Composer {
         let (visual_row, visual_col) = self.cursor_visual_row_col_wrapped(content_width);
         let visible_start = self.visible_wrapped_line_start(max_lines, width);
         (
-            visual_col.saturating_add(2) as u16,
+            visual_col.saturating_add(2).min(width.saturating_sub(1)) as u16,
             visual_row.saturating_sub(visible_start) as u16,
         )
-    }
-
-    pub(crate) fn set_cursor_from_wrapped_position(
-        &mut self,
-        max_lines: usize,
-        width: usize,
-        row: usize,
-        col: usize,
-    ) -> bool {
-        if self.is_empty() {
-            self.cursor = 0;
-            self.preferred_column = None;
-            return true;
-        }
-        let content_width = width.saturating_sub(2).max(1);
-        let visible_start = self.visible_wrapped_line_start(max_lines, width);
-        let target_row = visible_start.saturating_add(row);
-        let target_col = col.saturating_sub(2);
-        let image_width = self.image_width(!self.text.is_empty());
-        let mut visual_row = 0usize;
-        let mut line_start = 0usize;
-
-        for (logical_idx, line) in self.text.split('\n').enumerate() {
-            let line_len = line.chars().count();
-            let wrap_width = if logical_idx == 0 {
-                content_width.saturating_sub(image_width).max(1)
-            } else {
-                content_width
-            };
-            let line_visual_rows = wrapped_line_count(line, wrap_width);
-            if target_row < visual_row.saturating_add(line_visual_rows) {
-                let row_in_line = target_row.saturating_sub(visual_row);
-                let col_in_line = if logical_idx == 0 && row_in_line == 0 {
-                    target_col.saturating_sub(image_width)
-                } else {
-                    target_col
-                };
-                // Clip the click to the visible content of THIS visual row.
-                // For wrapped logical lines, position == row_end is *visually*
-                // the start of the next wrapped row (no character separates
-                // soft-wrapped rows), so clicking past end-of-row would render
-                // the cursor one row below where the user clicked. Clamp one
-                // position earlier when there is a next visual row, so cursor
-                // stays on the clicked row.
-                let row_start = row_in_line.saturating_mul(wrap_width);
-                let row_end = row_start.saturating_add(wrap_width).min(line_len);
-                let is_last_visual_row_of_line = row_in_line.saturating_add(1) >= line_visual_rows;
-                let click_max = if is_last_visual_row_of_line {
-                    row_end
-                } else {
-                    row_end.saturating_sub(1).max(row_start)
-                };
-                let line_col = row_start.saturating_add(col_in_line).min(click_max);
-                self.cursor = line_start.saturating_add(line_col).min(self.input_len());
-                self.preferred_column = None;
-                return true;
-            }
-            visual_row = visual_row.saturating_add(line_visual_rows);
-            line_start = line_start.saturating_add(line_len).saturating_add(1);
-        }
-
-        self.cursor = self.input_len();
-        self.preferred_column = None;
-        true
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -424,6 +367,12 @@ impl Composer {
         }
         let (cursor_visual_row, _) = self.cursor_visual_row_col_wrapped(content_width);
         let max_start = line_count.saturating_sub(max_lines);
+        if let Some(start) = self.visible_wrapped_start_hint {
+            let start = start.min(max_start);
+            if cursor_visual_row >= start && cursor_visual_row < start.saturating_add(max_lines) {
+                return start;
+            }
+        }
         cursor_visual_row
             .saturating_sub(max_lines.saturating_sub(1))
             .min(max_start)
@@ -936,56 +885,6 @@ mod tests {
     }
 
     #[test]
-    fn click_position_maps_to_wrapped_multiline_cursor() {
-        let mut composer = Composer::default();
-        composer.set_input("first line\nsecond word\nthird".to_string());
-
-        assert!(composer.set_cursor_from_wrapped_position(4, 40, 1, 2 + "second ".chars().count()));
-        assert_eq!(composer.cursor(), "first line\nsecond ".chars().count());
-
-        assert!(composer.set_cursor_from_wrapped_position(4, 40, 2, 2 + "thi".chars().count()));
-        assert_eq!(
-            composer.cursor(),
-            "first line\nsecond word\nthi".chars().count()
-        );
-    }
-
-    #[test]
-    fn click_past_end_of_line_clips_to_that_line_end() {
-        // Plain (non-wrapped) lines: clicking far past the end of a short
-        // logical line must stop at the end of that line, not bleed into
-        // the next logical line.
-        let mut composer = Composer::default();
-        composer.set_input("first line\nsecond word\nthird".to_string());
-
-        // Click on row 0 ("first line") way past the visible end.
-        assert!(composer.set_cursor_from_wrapped_position(4, 80, 0, 60));
-        assert_eq!(composer.cursor(), "first line".chars().count());
-
-        // Click on row 1 ("second word") way past the visible end.
-        assert!(composer.set_cursor_from_wrapped_position(4, 80, 1, 60));
-        assert_eq!(
-            composer.cursor(),
-            "first line\nsecond word".chars().count()
-        );
-
-        // Wrapped logical line: clicking past the end of visual row 0
-        // must land at the end of that visual row, NOT at the end of the
-        // whole logical line (which would be on a later visual row).
-        let mut composer = Composer::default();
-        // width=8, prompt "> " takes 2 cols => content/wrap width = 6.
-        // "abcdefghij" wraps into "abcdef" and "ghij".
-        composer.set_input("abcdefghij".to_string());
-        // Click on row 0 at the rightmost in-rect column (col 7, past 'f').
-        assert!(composer.set_cursor_from_wrapped_position(4, 8, 0, 7));
-        assert_eq!(composer.cursor(), "abcdef".chars().count());
-        // Click on row 1 past the end of "ghij" still pins to end of row 1
-        // (which is also the end of the logical line here).
-        assert!(composer.set_cursor_from_wrapped_position(4, 8, 1, 7));
-        assert_eq!(composer.cursor(), "abcdefghij".chars().count());
-    }
-
-    #[test]
     fn ctrl_w_keeps_whitespace_delimited_shell_behavior() {
         let mut composer = Composer::default();
 
@@ -1016,11 +915,11 @@ mod tests {
         composer.set_input("abcdef".to_string());
 
         assert_eq!(composer.render_lines_wrapped(1, 8, "placeholder").len(), 1);
-        assert_eq!(composer.cursor_position_wrapped(1, 8), (8, 0));
+        assert_eq!(composer.cursor_position_wrapped(1, 8), (7, 0));
 
         composer.set_input("abcdefghijkl".to_string());
         assert_eq!(composer.render_lines_wrapped(2, 8, "placeholder").len(), 2);
-        assert_eq!(composer.cursor_position_wrapped(2, 8), (8, 1));
+        assert_eq!(composer.cursor_position_wrapped(2, 8), (7, 1));
     }
 
     #[test]

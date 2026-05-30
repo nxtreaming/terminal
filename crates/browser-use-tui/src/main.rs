@@ -98,6 +98,27 @@ use settings::{
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
 const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+
+// ── Home-screen typewriter examples ──────────────────────────────────────────
+const HOME_EXAMPLES: &[&str] = &[
+    "get the star count of browser-use/browser-use",
+    "find the top Hacker News post and its points",
+    "what's the weather in Tokyo right now?",
+];
+
+/// Typewriter cadence constants (all in milliseconds).
+const TYPEWRITER_CHAR_INTERVAL_MS: u64 = 33;
+const TYPEWRITER_HOLD_MS: u64 = 2000;
+const TYPEWRITER_ERASE_INTERVAL_MS: u64 = 8;
+/// Redraw budget while typewriter is animating (keeps it smooth after logo settles).
+/// Must be <= the fastest cadence (erase) so fast erasing isn't quantized to a
+/// slower poll rate.
+const TYPEWRITER_TICK_INTERVAL: Duration = Duration::from_millis(8);
+
+/// Synthetic assistant nudge shown when user submits a task with no API key.
+const NO_KEY_NUDGE_TEXT: &str = "It looks like you don't have an API key set up yet. \
+You can get one free at cloud.browser-use.com and run this on DeepSeek V4 for \
+free — or add your own key with /auth.";
 const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
@@ -113,7 +134,13 @@ const SESSION_MODEL_SELECTION_EVENT: &str = "session.model_selection";
 pub(crate) const SESSION_QUEUED_FOLLOWUP_EVENT: &str = "session.queued_followup";
 const SESSION_QUEUED_FOLLOWUP_SENT_EVENT: &str = "session.queued_followup.sent";
 const SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT: &str = "session.queued_followup.cancelled";
+pub(crate) const SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT: &str = "session.followup.pending";
+const SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT: &str = "session.followup.interrupt_sent";
+pub(crate) const SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT: &str = "session.followup.cancelled";
 const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
+pub(crate) const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
+const FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN: &str = "after_current_turn";
+pub(crate) const PENDING_FOLLOWUP_INTERRUPT_REASON: &str = "pending follow-up interrupt";
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -513,7 +540,7 @@ fn display_text_for_local_images_and_text(image_count: usize, text: &str) -> Opt
     }
 }
 
-fn event_payload_text(event: &EventRecord) -> Option<String> {
+pub(crate) fn event_payload_text(event: &EventRecord) -> Option<String> {
     user_input_display_text_from_payload(&event.payload)
 }
 
@@ -543,7 +570,9 @@ fn queued_followup_marker_seq(event: &EventRecord) -> Option<i64> {
         .and_then(serde_json::Value::as_i64)
 }
 
-fn pending_queued_followup_events_from_events(events: &[EventRecord]) -> Vec<&EventRecord> {
+pub(crate) fn pending_queued_followup_events_from_events(
+    events: &[EventRecord],
+) -> Vec<&EventRecord> {
     let closed = events
         .iter()
         .filter(|event| {
@@ -558,6 +587,118 @@ fn pending_queued_followup_events_from_events(events: &[EventRecord]) -> Vec<&Ev
         .iter()
         .filter(|event| {
             event.event_type == SESSION_QUEUED_FOLLOWUP_EVENT && !closed.contains(&event.seq)
+        })
+        .collect()
+}
+
+fn followup_delivery_is(event: &EventRecord, delivery: &str) -> bool {
+    event
+        .payload
+        .get("delivery")
+        .and_then(serde_json::Value::as_str)
+        == Some(delivery)
+}
+
+pub(crate) fn active_followup_is_after_next_tool_call(event: &EventRecord) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        "session.followup" | SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+    ) && followup_delivery_is(event, FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL)
+}
+
+fn active_followup_interrupted_marker_seqs(event: &EventRecord) -> Vec<i64> {
+    if event.event_type != SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT {
+        return Vec::new();
+    }
+    active_followup_marker_seqs(event)
+}
+
+fn active_followup_cancelled_marker_seqs(event: &EventRecord) -> Vec<i64> {
+    if event.event_type != SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT {
+        return Vec::new();
+    }
+    active_followup_marker_seqs(event)
+}
+
+fn active_followup_marker_seqs(event: &EventRecord) -> Vec<i64> {
+    if let Some(seq) = event
+        .payload
+        .get("followup_seq")
+        .or_else(|| event.payload.get("seq"))
+        .and_then(serde_json::Value::as_i64)
+    {
+        return vec![seq];
+    }
+    event
+        .payload
+        .get("followup_seqs")
+        .and_then(serde_json::Value::as_array)
+        .map(|seqs| {
+            seqs.iter()
+                .filter_map(serde_json::Value::as_i64)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn active_followup_is_closed_by_event(event: &EventRecord, followup_seq: i64) -> bool {
+    if event.seq <= followup_seq {
+        return false;
+    }
+    if active_followup_interrupted_marker_seqs(event).contains(&followup_seq)
+        || active_followup_cancelled_marker_seqs(event).contains(&followup_seq)
+    {
+        return true;
+    }
+    if event.event_type == "agent.turn_queue_drained" {
+        let drained_session_messages = event
+            .payload
+            .get("session_messages")
+            .and_then(serde_json::Value::as_u64)
+            .unwrap_or_default();
+        let last_seq = event
+            .payload
+            .get("last_seq")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        return drained_session_messages > 0 && last_seq >= followup_seq;
+    }
+    false
+}
+
+pub(crate) fn active_followup_is_cancelled_in_events(
+    events: &[EventRecord],
+    followup_seq: i64,
+) -> bool {
+    events.iter().any(|event| {
+        event.seq > followup_seq
+            && active_followup_cancelled_marker_seqs(event).contains(&followup_seq)
+    })
+}
+
+pub(crate) fn active_followup_is_pending_in_events(
+    events: &[EventRecord],
+    followup_seq: i64,
+) -> bool {
+    let Some(followup) = events
+        .iter()
+        .find(|event| event.seq == followup_seq && active_followup_is_after_next_tool_call(event))
+    else {
+        return false;
+    };
+    !events
+        .iter()
+        .any(|event| active_followup_is_closed_by_event(event, followup.seq))
+}
+
+pub(crate) fn pending_active_followup_events_from_events(
+    events: &[EventRecord],
+) -> Vec<&EventRecord> {
+    events
+        .iter()
+        .filter(|event| {
+            active_followup_is_after_next_tool_call(event)
+                && active_followup_is_pending_in_events(events, event.seq)
         })
         .collect()
 }
@@ -584,6 +725,121 @@ struct SessionModelSelection {
     backend: AgentBackend,
     model_provider_id: Option<String>,
 }
+
+// ── Typewriter animation ──────────────────────────────────────────────────────
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum TypewriterPhase {
+    Typing,
+    Holding,
+    Erasing,
+}
+
+/// Animation state for the home-screen cycling placeholder examples.
+#[derive(Debug)]
+struct TypewriterState {
+    /// Index into HOME_EXAMPLES.
+    pub example_idx: usize,
+    pub phase: TypewriterPhase,
+    /// Number of characters of the current example currently "shown".
+    pub chars_shown: usize,
+    /// Timestamp of the last character advance/erase.
+    pub last_advance: Instant,
+    /// When true, typewriter is active and placeholder should animate.
+    pub active: bool,
+}
+
+impl TypewriterState {
+    fn new() -> Self {
+        Self {
+            example_idx: 0,
+            phase: TypewriterPhase::Typing,
+            chars_shown: 0,
+            last_advance: Instant::now(),
+            active: true,
+        }
+    }
+
+    fn stop(&mut self) {
+        self.active = false;
+    }
+
+    /// Current example string.
+    fn current_example(&self) -> &'static str {
+        HOME_EXAMPLES[self.example_idx % HOME_EXAMPLES.len()]
+    }
+
+    /// The placeholder substring to display (chars_shown characters of current example).
+    /// NOTE: HOME_EXAMPLES are ASCII, so chars().count() == len(), but we use
+    /// char-safe slicing here to stay correct if examples are ever non-ASCII.
+    pub fn placeholder_text(&self) -> &str {
+        let example = self.current_example();
+        // Return a byte-safe prefix by counting chars.
+        let char_count = self.chars_shown.min(example.chars().count());
+        // Find the byte index for char_count chars.
+        let byte_end = example
+            .char_indices()
+            .nth(char_count)
+            .map(|(i, _)| i)
+            .unwrap_or(example.len());
+        &example[..byte_end]
+    }
+
+    /// Advance the animation by one tick. Returns true if a redraw is needed.
+    pub fn tick(&mut self) -> bool {
+        if !self.active {
+            return false;
+        }
+        let example = self.current_example();
+        let total_chars = example.chars().count();
+
+        match self.phase {
+            TypewriterPhase::Typing => {
+                if self.last_advance.elapsed().as_millis() < TYPEWRITER_CHAR_INTERVAL_MS as u128 {
+                    return false;
+                }
+                self.last_advance = Instant::now();
+                if self.chars_shown < total_chars {
+                    self.chars_shown += 1;
+                } else {
+                    // Fully typed — transition to holding.
+                    self.phase = TypewriterPhase::Holding;
+                }
+                true
+            }
+            TypewriterPhase::Holding => {
+                if self.last_advance.elapsed().as_millis() < TYPEWRITER_HOLD_MS as u128 {
+                    return false;
+                }
+                self.last_advance = Instant::now();
+                self.phase = TypewriterPhase::Erasing;
+                false
+            }
+            TypewriterPhase::Erasing => {
+                if self.last_advance.elapsed().as_millis() < TYPEWRITER_ERASE_INTERVAL_MS as u128 {
+                    return false;
+                }
+                self.last_advance = Instant::now();
+                if self.chars_shown > 0 {
+                    self.chars_shown -= 1;
+                } else {
+                    // Fully erased — advance to next example.
+                    self.example_idx = (self.example_idx + 1) % HOME_EXAMPLES.len();
+                    self.phase = TypewriterPhase::Typing;
+                }
+                true
+            }
+        }
+    }
+}
+
+impl Default for TypewriterState {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
 
 struct App {
     store: Store,
@@ -636,6 +892,12 @@ struct App {
     /// typing while the History popup is open and cleared whenever the surface
     /// opens or closes. Empty string means "show everything".
     history_filter: String,
+    /// Home-screen typewriter example animation state.
+    typewriter: TypewriterState,
+    /// Session id of a nudge session waiting for auth to complete. When set,
+    /// the next successful auth automatically starts the agent for that session
+    /// so the user's preserved task runs without any extra keypress.
+    pending_auth_resume: Option<String>,
 }
 
 #[derive(Debug)]
@@ -1815,6 +2077,8 @@ impl App {
             palette_open: false,
             palette_filter: String::new(),
             history_filter: String::new(),
+            typewriter: TypewriterState::default(),
+            pending_auth_resume: None,
         };
         app.refresh_cached_projection();
         if resumed_from_reexec {
@@ -1973,10 +2237,11 @@ impl App {
         pending_queued_followup_events_from_events(events)
     }
 
-    pub(crate) fn queued_followup_is_pending(&self, session_id: &str, queued_seq: i64) -> bool {
-        self.pending_queued_followup_events(self.cached_events_for_session(session_id))
-            .into_iter()
-            .any(|event| event.seq == queued_seq)
+    pub(crate) fn active_followup_is_pending(&self, session_id: &str, followup_seq: i64) -> bool {
+        active_followup_is_pending_in_events(
+            self.cached_events_for_session(session_id),
+            followup_seq,
+        )
     }
 
     fn flush_ready_queued_followups(&mut self) -> Result<bool> {
@@ -2028,6 +2293,9 @@ impl App {
                 )
             })
             .filter_map(|event| {
+                if active_followup_is_cancelled_in_events(events, event.seq) {
+                    return None;
+                }
                 event_payload_text(event).map(|text| MessageActionRow {
                     seq: event.seq,
                     kind: MessageActionKind::Submitted,
@@ -2077,6 +2345,12 @@ impl App {
             ) {
                 return None;
             }
+            if active_followup_is_pending_in_events(&events, event.seq) {
+                return None;
+            }
+            if active_followup_is_cancelled_in_events(&events, event.seq) {
+                return None;
+            }
             event_payload_text(event).map(|text| MessageActionRow {
                 seq: event.seq,
                 kind: MessageActionKind::Submitted,
@@ -2101,6 +2375,50 @@ impl App {
                 )
         });
         Ok(Some((session_id, row, has_prior_submitted_message)))
+    }
+
+    fn latest_reclaimable_queued_followup(&mut self) -> Result<Option<MessageActionRow>> {
+        if !self.composer.is_empty() {
+            return Ok(None);
+        }
+        self.refresh_state_cache_from_store()?;
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(None);
+        };
+        let events = self.store.events_for_session(&session_id)?;
+        Ok(pending_queued_followup_events_from_events(&events)
+            .into_iter()
+            .rev()
+            .find_map(|event| {
+                event_payload_text(event).map(|text| MessageActionRow {
+                    seq: event.seq,
+                    kind: MessageActionKind::Queued,
+                    text,
+                    followup: true,
+                })
+            }))
+    }
+
+    fn latest_reclaimable_pending_active_followup(&mut self) -> Result<Option<MessageActionRow>> {
+        if !self.composer.is_empty() {
+            return Ok(None);
+        }
+        self.refresh_state_cache_from_store()?;
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(None);
+        };
+        let events = self.store.events_for_session(&session_id)?;
+        Ok(pending_active_followup_events_from_events(&events)
+            .into_iter()
+            .rev()
+            .find_map(|event| {
+                event_payload_text(event).map(|text| MessageActionRow {
+                    seq: event.seq,
+                    kind: MessageActionKind::Submitted,
+                    text,
+                    followup: true,
+                })
+            }))
     }
 
     fn empty_workbench_state_with_failure(&self) -> WorkbenchState {
@@ -2787,6 +3105,16 @@ impl App {
             }
             return Ok(());
         }
+        // Auth-nudge: when the account is not ready, route ALL submissions
+        // (including follow-ups to a non-running session) through the nudge
+        // path so we never dispatch work to an agent that can't start.
+        let account_not_ready = !self.account_ready(&self.account)?
+            || (self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()?);
+        if account_not_ready {
+            let submission = self.take_composer_submission();
+            self.inject_no_key_nudge(submission)?;
+            return Ok(());
+        }
         if let Some(session) = self
             .selected_session_id
             .as_deref()
@@ -2825,6 +3153,36 @@ impl App {
         } else {
             self.dispatch(AppCommand::StartTask(submission.text))?;
         }
+        Ok(())
+    }
+
+    /// Create a session with the user's task, inject a synthetic assistant
+    /// nudge message (as a `session.notice` event — non-terminal), and
+    /// navigate to that session. Does NOT start the agent loop.
+    /// Sets `pending_auth_resume` so the next successful auth automatically
+    /// starts the agent for this session.
+    fn inject_no_key_nudge(&mut self, submission: UserSubmission) -> Result<()> {
+        let cwd = std::env::current_dir()?;
+        let session = self.store.create_session(None, &cwd)?;
+        // Record the user's task as the standard input event (preserved for retry).
+        self.store.append_event(
+            &session.id,
+            "session.input",
+            typed_user_input_payload_for_submission_for_cwd(&submission, &cwd)?,
+        )?;
+        // Inject the nudge as a non-terminal assistant-style message so the
+        // transcript renders it without marking the session completed/done.
+        // session.notice is NOT listed in has_terminal_session_event, so the
+        // session remains resumable and won't appear as a completed run.
+        self.store.append_event(
+            &session.id,
+            "session.notice",
+            serde_json::json!({ "text": NO_KEY_NUDGE_TEXT }),
+        )?;
+        self.prompt_history.record_submission(&submission.text);
+        self.selected_session_id = Some(session.id.clone());
+        self.pending_auth_resume = Some(session.id.clone());
+        self.native_history.reset_with_clear();
         Ok(())
     }
 
@@ -3056,11 +3414,17 @@ impl App {
         if let Some(options) = options.as_ref() {
             let _ = self.refresh_prompt_history_for(Path::new(&session.cwd), options);
         }
-        self.store.append_event(
-            &session_id,
-            "session.followup",
-            typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?,
-        )?;
+        let mut payload =
+            typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
+        if active {
+            payload["delivery"] = serde_json::json!(FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL);
+        }
+        let event_type = if active {
+            SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+        } else {
+            "session.followup"
+        };
+        self.store.append_event(&session_id, event_type, payload)?;
         self.prompt_history.record_submission(&submission.text);
         if let Some(options) = options.as_ref() {
             self.maybe_append_message_history(
@@ -3090,7 +3454,7 @@ impl App {
         }
         let mut payload =
             typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
-        payload["delivery"] = serde_json::json!("after_current_turn");
+        payload["delivery"] = serde_json::json!(FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN);
         self.store
             .append_event(&session_id, SESSION_QUEUED_FOLLOWUP_EVENT, payload)?;
         self.prompt_history.record_submission(&submission.text);
@@ -3142,7 +3506,12 @@ impl App {
                 }));
                 match result {
                     Ok(Ok(())) => {}
-                    Ok(Err(error)) => eprintln!("agent thread failed: {error:#}"),
+                    Ok(Err(error)) => record_agent_failure(
+                        failure_state_dir,
+                        failure_session_id,
+                        failure_notifier,
+                        format!("agent thread failed: {error:#}"),
+                    ),
                     Err(panic) => record_agent_panic(
                         failure_state_dir,
                         failure_session_id,
@@ -3241,7 +3610,11 @@ impl App {
         .max(1)
     }
 
-    fn cancel_queued_followup(&mut self, row: &MessageActionRow) -> Result<()> {
+    fn cancel_queued_followup_with_reason(
+        &mut self,
+        row: &MessageActionRow,
+        reason: &str,
+    ) -> Result<()> {
         let Some(session_id) = self.selected_session_id.as_deref() else {
             return Ok(());
         };
@@ -3250,10 +3623,34 @@ impl App {
             SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT,
             serde_json::json!({
                 "queued_seq": row.seq,
-                "reason": "removed from message selector",
+                "reason": reason,
             }),
         )?;
         self.status_notice = Some("Removed queued follow-up.".to_string());
+        Ok(())
+    }
+
+    fn cancel_queued_followup(&mut self, row: &MessageActionRow) -> Result<()> {
+        self.cancel_queued_followup_with_reason(row, "removed from message selector")
+    }
+
+    fn cancel_pending_active_followup_with_reason(
+        &mut self,
+        row: &MessageActionRow,
+        reason: &str,
+    ) -> Result<()> {
+        let Some(session_id) = self.selected_session_id.as_deref() else {
+            return Ok(());
+        };
+        self.store.append_event(
+            session_id,
+            SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT,
+            serde_json::json!({
+                "followup_seq": row.seq,
+                "reason": reason,
+            }),
+        )?;
+        self.status_notice = Some("Removed pending follow-up.".to_string());
         Ok(())
     }
 
@@ -3299,6 +3696,34 @@ impl App {
         Ok(true)
     }
 
+    fn reclaim_latest_queued_followup(&mut self) -> Result<bool> {
+        let Some(row) = self.latest_reclaimable_queued_followup()? else {
+            return Ok(false);
+        };
+        self.cancel_queued_followup_with_reason(&row, "reclaimed from escape")?;
+        self.composer.set_input(row.text);
+        self.close_surface();
+        self.escape_stop_until = None;
+        self.quit_hint_until = None;
+        self.status_notice = Some("Queued follow-up returned to composer.".to_string());
+        self.refresh_state_cache_from_store()?;
+        Ok(true)
+    }
+
+    fn reclaim_latest_pending_active_followup(&mut self) -> Result<bool> {
+        let Some(row) = self.latest_reclaimable_pending_active_followup()? else {
+            return Ok(false);
+        };
+        self.cancel_pending_active_followup_with_reason(&row, "reclaimed from escape")?;
+        self.composer.set_input(row.text);
+        self.close_surface();
+        self.escape_stop_until = None;
+        self.quit_hint_until = None;
+        self.status_notice = Some("Pending follow-up returned to composer.".to_string());
+        self.refresh_state_cache_from_store()?;
+        Ok(true)
+    }
+
     fn edit_selected_message(&mut self) -> Result<()> {
         let Some(row) = self.selected_message_action_row() else {
             return Ok(());
@@ -3331,6 +3756,12 @@ impl App {
     }
 
     fn handle_main_escape(&mut self) -> Result<()> {
+        if self.reclaim_latest_pending_active_followup()? {
+            return Ok(());
+        }
+        if self.reclaim_latest_queued_followup()? {
+            return Ok(());
+        }
         if self.escape_stop_is_pending() {
             self.open_message_actions()?;
             self.quit_hint_until = None;
@@ -3535,6 +3966,14 @@ impl App {
             } if self.queue_current_composer_followup()? => {}
             KeyEvent {
                 code: KeyCode::Tab, ..
+            } if self.is_home_examples_active() => {
+                // Accept the full current typewriter example into the composer
+                // instead of opening History. Only fires on the home screen
+                // while the typewriter is active (empty composer, no history).
+                self.accept_typewriter_example();
+            }
+            KeyEvent {
+                code: KeyCode::Tab, ..
             } => self.open_surface(Surface::History),
             KeyEvent {
                 code: KeyCode::F(1),
@@ -3679,9 +4118,7 @@ impl App {
             // Selection resets to the top of the filtered list whenever the
             // filter changes so the highlight is never pointing at a row that
             // just got filtered out.
-            KeyEvent { .. }
-                if self.surface == Surface::History && is_popup_clear_key(key) =>
-            {
+            KeyEvent { .. } if self.surface == Surface::History && is_popup_clear_key(key) => {
                 self.history_filter.clear();
                 self.selected_row = 0;
             }
@@ -3692,9 +4129,8 @@ impl App {
             } if self.surface == Surface::History
                 && !modifiers.contains(KeyModifiers::CONTROL)
                 && !modifiers.contains(KeyModifiers::ALT)
-                && !modifiers.intersects(
-                    KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
-                ) =>
+                && !modifiers
+                    .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META) =>
             {
                 self.history_filter.push(ch);
                 self.selected_row = 0;
@@ -3792,6 +4228,67 @@ impl App {
         self.surface == Surface::Main && self.selected_session_id.is_none()
     }
 
+    /// True when the home-screen typewriter examples should be animating.
+    /// Conditions: home screen + composer empty + no session history.
+    pub(crate) fn is_home_examples_active(&self) -> bool {
+        if !self.typewriter.active {
+            return false;
+        }
+        if !self.is_welcome_surface() {
+            return false;
+        }
+        if !self.composer.is_empty() {
+            return false;
+        }
+        // History empty means no sessions exist yet.
+        self.state_cache.sessions.is_empty()
+    }
+
+    /// True when the typewriter is in the Holding phase (full example shown, no cursor).
+    pub(crate) fn is_typewriter_holding(&self) -> bool {
+        matches!(self.typewriter.phase, TypewriterPhase::Holding)
+    }
+
+    /// The current typewriter placeholder substring (no block cursor appended).
+    pub(crate) fn typewriter_placeholder_text(&self) -> &str {
+        self.typewriter.placeholder_text()
+    }
+
+    /// Tick the typewriter animation. Returns true if a redraw is needed.
+    fn tick_typewriter(&mut self) -> bool {
+        if !self.is_home_examples_active() {
+            return false;
+        }
+        self.typewriter.tick()
+    }
+
+    /// Stop the typewriter (e.g. when user types a char or leaves home).
+    fn stop_typewriter(&mut self) {
+        self.typewriter.stop();
+    }
+
+    /// Accept the currently-displayed example into the composer (Tab key on home).
+    fn accept_typewriter_example(&mut self) {
+        let full = HOME_EXAMPLES[self.typewriter.example_idx % HOME_EXAMPLES.len()].to_string();
+        self.composer.set_input(full);
+        self.typewriter.stop();
+    }
+
+    /// The placeholder string to show in the composer when on the home screen.
+    pub fn home_placeholder(&self) -> String {
+        // is_home_examples_active() already checks typewriter.active.
+        if self.is_home_examples_active() {
+            let text = self.typewriter.placeholder_text();
+            // Append a dim block-cursor only during Typing so a fully-typed
+            // example reads cleanly as "Tab to accept" during Holding.
+            if matches!(self.typewriter.phase, TypewriterPhase::Typing) {
+                return format!("{text}▌");
+            }
+            return text.to_string();
+        }
+        "Tell the browser what to do...".to_string()
+    }
+
     fn should_capture_welcome_mouse(&self) -> bool {
         self.is_welcome_surface()
             && self.composer.is_empty()
@@ -3800,39 +4297,64 @@ impl App {
     }
 
     fn should_capture_mouse(&self) -> bool {
-        // Mouse capture is disabled to give the host terminal back native
-        // drag-to-select, mouse-wheel scrollback, and copy-on-selection.
-        // Trade-off: click-to-place-cursor in the composer and click-on-
-        // welcome-logo no longer fire (the events go to the terminal, not us).
-        // Use keyboard navigation (arrows / Alt+arrows / Home / End) instead.
-        // To restore mouse capture, set this back to:
-        //   self.should_capture_welcome_mouse()
-        //     || (self.surface == Surface::Main
-        //         && !self.is_slash_palette_active()
-        //         && self.composer_input_rect.get().is_some())
-        false
+        self.should_capture_welcome_mouse()
     }
 
-    fn handle_composer_click(&mut self, column: u16, row: u16) -> bool {
-        if self.surface != Surface::Main || self.is_slash_palette_active() {
-            return false;
-        }
-        let Some(rect) = self.composer_input_rect.get() else {
-            return false;
+    fn trace_mouse_event(
+        &self,
+        kind: &str,
+        column: u16,
+        row: u16,
+        before_cursor: usize,
+        logo_handled: bool,
+    ) {
+        let Some(path) = std::env::var_os("BUT_MOUSE_TRACE").filter(|path| !path.is_empty()) else {
+            return;
         };
-        if column < rect.x
-            || column >= rect.x.saturating_add(rect.width)
-            || row < rect.y
-            || row >= rect.y.saturating_add(rect.height)
+        let rect = self.composer_input_rect.get();
+        let local = rect.and_then(|rect| {
+            if column < rect.x
+                || column >= rect.x.saturating_add(rect.width)
+                || row < rect.y
+                || row >= rect.y.saturating_add(rect.height)
+            {
+                None
+            } else {
+                Some(serde_json::json!({
+                    "column": column.saturating_sub(rect.x),
+                    "row": row.saturating_sub(rect.y),
+                }))
+            }
+        });
+        let line_lengths = self
+            .composer
+            .input()
+            .split('\n')
+            .map(|line| line.chars().count())
+            .collect::<Vec<_>>();
+        let payload = serde_json::json!({
+            "kind": kind,
+            "column": column,
+            "row": row,
+            "composer_rect": rect.map(|rect| serde_json::json!({
+                "x": rect.x,
+                "y": rect.y,
+                "width": rect.width,
+                "height": rect.height,
+            })),
+            "local": local,
+            "before_cursor": before_cursor,
+            "after_cursor": self.composer.cursor_index(),
+            "logo_handled": logo_handled,
+            "line_lengths": line_lengths,
+        });
+        if let Ok(mut file) = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(path)
         {
-            return false;
+            let _ = writeln!(file, "{payload}");
         }
-        self.composer.set_cursor_from_wrapped_position(
-            rect.height.max(1) as usize,
-            rect.width as usize,
-            row.saturating_sub(rect.y) as usize,
-            column.saturating_sub(rect.x) as usize,
-        )
     }
 
     fn handle_welcome_logo_click(&mut self, column: u16, row: u16) -> bool {
@@ -4054,6 +4576,34 @@ impl App {
         self.advance_after_auth()
     }
 
+    /// If a nudge session is waiting for auth, start its agent and navigate to
+    /// it. Clears `pending_auth_resume`. Must be called only when auth is ready.
+    fn maybe_resume_pending_nudge_session(&mut self) -> Result<()> {
+        let Some(session_id) = self.pending_auth_resume.take() else {
+            return Ok(());
+        };
+        // Ensure the session still exists and hasn't been completed already.
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(());
+        };
+        if session.status.is_active() {
+            // Agent already running — just navigate.
+            self.selected_session_id = Some(session_id);
+            self.native_history.reset_with_clear();
+            return Ok(());
+        }
+        // Mark it running so the agent thread can start.
+        self.store.append_event(
+            &session_id,
+            "session.status",
+            serde_json::json!({ "status": "running" }),
+        )?;
+        self.selected_session_id = Some(session_id.clone());
+        self.native_history.reset_with_clear();
+        self.start_agent_for_session(session_id)?;
+        Ok(())
+    }
+
     fn resume_selected_history(&mut self) -> Result<()> {
         let state = self.workbench_state()?.clone();
         if let Some(session_id) = self.selected_history_session_id(&state) {
@@ -4259,6 +4809,9 @@ impl App {
             }
         }
         self.close_surface();
+        // If a nudge session is waiting for auth, start it now that the
+        // account and model are confirmed ready.
+        self.maybe_resume_pending_nudge_session()?;
         Ok(())
     }
 
@@ -4580,6 +5133,10 @@ impl App {
         let handled = self.composer.handle_key(key);
         if handled && self.composer.input() != before {
             self.prompt_history.reset_navigation();
+            // Any change to the composer on the home screen stops the typewriter.
+            if self.is_welcome_surface() && self.typewriter.active {
+                self.stop_typewriter();
+            }
         }
         if handled && self.is_slash_palette_active() {
             self.clamp_slash_palette_selection();
@@ -4678,6 +5235,7 @@ impl App {
             } else {
                 self.close_surface();
             }
+            self.maybe_resume_pending_nudge_session()?;
             return Ok(());
         }
         self.store
@@ -5891,7 +6449,20 @@ fn record_agent_panic(
     notifier: Option<StoreNotifier>,
     message: String,
 ) {
-    let error = format!("agent thread panicked: {message}");
+    record_agent_failure(
+        state_dir,
+        session_id,
+        notifier,
+        format!("agent thread panicked: {message}"),
+    );
+}
+
+fn record_agent_failure(
+    state_dir: PathBuf,
+    session_id: String,
+    notifier: Option<StoreNotifier>,
+    error: String,
+) {
     if let Ok(store) = Store::open_with_optional_notifier(state_dir, notifier) {
         let _ = store.append_event(
             &session_id,
@@ -6036,6 +6607,7 @@ fn run_terminal(mut app: App) -> Result<()> {
         let mut last_fallback_refresh = Instant::now();
         let mut last_anim_tick = Instant::now();
         let mut last_live_spinner_tick = Instant::now();
+        let mut last_typewriter_tick = Instant::now();
         let mut pending_resize_at: Option<Instant> = None;
         loop {
             if reload_requested
@@ -6079,6 +6651,11 @@ fn run_terminal(mut app: App) -> Result<()> {
             if app.should_animate_live_spinner() {
                 poll_interval = poll_interval.min(LIVE_SPINNER_TICK_INTERVAL);
             }
+            // Keep redrawing while the typewriter is animating even after the
+            // logo physics settle to rest (logo stops driving redraws then).
+            if app.is_home_examples_active() {
+                poll_interval = poll_interval.min(TYPEWRITER_TICK_INTERVAL);
+            }
             if !event::poll(poll_interval)? {
                 // Animate the welcome-screen logo by advancing the anim and
                 // triggering a redraw every ~70ms while the welcome surface
@@ -6094,6 +6671,16 @@ fn run_terminal(mut app: App) -> Result<()> {
                     app.tick_live_spinner();
                     draw_needed = true;
                     last_live_spinner_tick = Instant::now();
+                }
+                // Advance the typewriter placeholder animation while on the home screen
+                // with an empty composer and no session history.
+                if app.is_home_examples_active()
+                    && last_typewriter_tick.elapsed() >= TYPEWRITER_TICK_INTERVAL
+                {
+                    if app.tick_typewriter() {
+                        draw_needed = true;
+                    }
+                    last_typewriter_tick = Instant::now();
                 }
                 continue;
             }
@@ -6481,17 +7068,30 @@ fn handle_terminal_event(
             Ok(false)
         }
         TermEvent::Mouse(MouseEvent {
-            kind: MouseEventKind::Down(_),
-            column,
-            row,
-            ..
+            kind, column, row, ..
         }) => {
-            app.handle_composer_click(column, row);
-            app.handle_welcome_logo_click(column, row);
+            let kind_label = mouse_event_kind_label(kind);
+            let before_cursor = app.composer.cursor_index();
+            let logo_handled = matches!(kind, MouseEventKind::Down(_))
+                && app.handle_welcome_logo_click(column, row);
+            app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
             Ok(false)
         }
         TermEvent::Resize(_, _) => Ok(false),
         _ => Ok(false),
+    }
+}
+
+fn mouse_event_kind_label(kind: MouseEventKind) -> &'static str {
+    match kind {
+        MouseEventKind::Down(_) => "down",
+        MouseEventKind::Up(_) => "up",
+        MouseEventKind::Drag(_) => "drag",
+        MouseEventKind::Moved => "moved",
+        MouseEventKind::ScrollDown => "scroll_down",
+        MouseEventKind::ScrollUp => "scroll_up",
+        MouseEventKind::ScrollLeft => "scroll_left",
+        MouseEventKind::ScrollRight => "scroll_right",
     }
 }
 
@@ -6642,7 +7242,7 @@ fn maybe_emit_native_transcript(
             transcript::terminal_scrollback_emission_since(&model, 0, width, defer_open_tail);
         let mut lines = crate::welcome::session_header_lines(width);
         lines.extend(emission.lines);
-        insert_initial_native_lines(terminal, lines)?;
+        insert_native_lines(terminal, lines)?;
         app.native_history
             .reset_for_session_with_group(session_id, emission.last_seq, None);
         maybe_emit_native_live_stream(terminal, app, &model, width)?;
@@ -7018,13 +7618,6 @@ fn apply_native_hyperlinks(buf: &mut Buffer, area: Rect, hyperlinks: &[NativeHyp
     }
 }
 
-fn insert_initial_native_lines(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    lines: Vec<Line<'static>>,
-) -> Result<()> {
-    insert_native_lines(terminal, lines)
-}
-
 fn restore_terminal(mut target: impl io::Write) -> Result<()> {
     disable_raw_mode()?;
     execute!(
@@ -7397,31 +7990,14 @@ mod redesign_tests {
     }
 
     #[test]
-    fn composer_click_maps_to_multiline_cursor_position() -> Result<()> {
+    fn composer_does_not_enable_mouse_capture() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
-        app.set_input("first line\nsecond word\nthird".to_string());
+        app.set_input("first line\n\nthird".to_string());
         let _screen = render_dump(&mut app)?;
-        let rect = app
-            .composer_input_rect
-            .get()
-            .context("composer input rect")?;
 
-        assert!(app.should_capture_mouse());
-        assert!(app.handle_composer_click(
-            rect.x.saturating_add(2 + "second ".chars().count() as u16),
-            rect.y.saturating_add(1),
-        ));
-        assert_eq!(app.composer.cursor(), "first line\nsecond ".chars().count());
-
-        assert!(app.handle_composer_click(
-            rect.x.saturating_add(2 + "thi".chars().count() as u16),
-            rect.y.saturating_add(2),
-        ));
-        assert_eq!(
-            app.composer.cursor(),
-            "first line\nsecond word\nthi".chars().count()
-        );
+        assert!(app.composer_input_rect.get().is_some());
+        assert!(!app.should_capture_mouse());
         Ok(())
     }
 
@@ -8254,7 +8830,17 @@ mod redesign_tests {
         assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
         assert!(app.status_notice.is_none());
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Tell the browser what to do"));
+        // After setup the home screen shows either the typewriter example placeholder
+        // (when history is empty) or the static "Tell the browser what to do..." text.
+        // Both indicate the ready state — verify the composer prompt area is present.
+        assert!(
+            screen.contains("Tell the browser what to do")
+                || screen.contains("> ▌")
+                || screen.contains("> get")
+                || screen.contains("> find")
+                || screen.contains("> what"),
+            "ready home screen should show composer prompt; screen:\n{screen}"
+        );
         assert!(!screen.contains("Model set to"));
         Ok(())
     }
@@ -8357,12 +8943,42 @@ mod redesign_tests {
 
             app.set_input("open example.com".to_string());
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-            assert_eq!(app.surface, Surface::ApiKey);
-            assert_eq!(app.store.list_sessions()?.len(), 0);
-            assert!(app
-                .status_notice
-                .as_deref()
-                .is_some_and(|notice| notice.contains("Browser Use cloud key is missing")));
+            // When both the account and browser cloud key are missing, the nudge
+            // intercepts the submit: a session is created with the user task + a
+            // synthetic assistant message, and the agent loop is NOT started.
+            let sessions = app.store.list_sessions()?;
+            assert_eq!(sessions.len(), 1, "nudge should create exactly one session");
+            let session_id = &sessions[0].id;
+            let events = app.store.events_for_session(session_id)?;
+            assert!(
+                events.iter().any(|e| e.event_type == "session.input"),
+                "session.input should be present"
+            );
+            // The nudge is a non-terminal session.notice (NOT session.done) so
+            // the session stays resumable after the user authenticates.
+            assert!(
+                !events.iter().any(|e| e.event_type == "session.done"),
+                "nudge session must NOT have session.done — it must stay resumable"
+            );
+            let notice_event = events
+                .iter()
+                .find(|e| e.event_type == "session.notice")
+                .expect("session.notice should be present for the nudge");
+            let nudge_text = notice_event
+                .payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("");
+            assert!(
+                nudge_text.contains("cloud.browser-use.com"),
+                "nudge should mention cloud.browser-use.com"
+            );
+            // pending_auth_resume should be set to allow auto-resume after auth.
+            assert_eq!(
+                app.pending_auth_resume.as_deref(),
+                Some(session_id.as_str()),
+                "pending_auth_resume should point to the nudge session"
+            );
             Ok(())
         })();
         if let Some(value) = saved {
@@ -8546,6 +9162,10 @@ mod redesign_tests {
     fn idle_and_completed_screens_stay_top_aligned() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
+        // Pin the model name so this layout test is stable regardless of what
+        // AGENTS.md or env-var mutations from parallel tests resolve to.
+        app.model = "GPT-5.5".to_string();
+        app.model_configured = true;
         app.args.height = 44;
         let running_session = app.store.create_session(None, std::env::current_dir()?)?;
         app.store.append_event(
@@ -10487,7 +11107,11 @@ wire_api = "responses"
 
         let screen = render_dump(&mut app)?;
         assert!(
-            screen.contains("browser image: latest_screenshot"),
+            screen.contains("• read image") && screen.contains("t_screenshot.png"),
+            "{screen}"
+        );
+        assert!(
+            !screen.contains("browser image: latest_screenshot"),
             "{screen}"
         );
         assert!(!screen.contains("received image artifact"), "{screen}");
@@ -11332,6 +11956,66 @@ wire_api = "responses"
         assert!(
             composer_row.saturating_sub(live_row) <= 8,
             "live reasoning and composer should not be separated by a large blank gap\n{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn live_status_appearing_does_not_shift_composer_mouse_rect() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 28;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect the repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        let committed_seq = app
+            .store
+            .events_for_session(&session.id)?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or_default();
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I checked the top-level files and docs."}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id.clone(), committed_seq);
+        app.drain_store_notifications()?;
+
+        let streaming_screen = render_dump(&mut app)?;
+        assert!(streaming_screen.contains("I checked the top-level files and docs."));
+        assert!(!streaming_screen.contains("Thinking..."));
+        let streaming_rect = app
+            .composer_input_rect
+            .get()
+            .context("streaming composer rect")?;
+
+        app.store.append_event(
+            &session.id,
+            "model.response.output_item.completed",
+            serde_json::json!({"item_type": "message", "phase": "commentary"}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let status_screen = render_dump(&mut app)?;
+        assert!(status_screen.contains("Thinking..."));
+        let status_rect = app
+            .composer_input_rect
+            .get()
+            .context("status composer rect")?;
+        assert_eq!(
+            status_rect.y, streaming_rect.y,
+            "live status row should fill reserved space instead of moving the composer\nbefore:\n{streaming_screen}\nafter:\n{status_screen}"
         );
         Ok(())
     }
@@ -12262,8 +12946,25 @@ wire_api = "responses"
         app.set_input("steer before the next tool".to_string());
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         let events = app.store.events_for_session(&running.id)?;
+        let steer = events
+            .iter()
+            .find(|event| {
+                event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+                    && event.payload["text"] == "steer before the next tool"
+            })
+            .context("pending steer")?;
+        assert_eq!(
+            steer.payload["delivery"],
+            FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL
+        );
+        assert!(active_followup_is_pending_in_events(&events, steer.seq));
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Messages to be submitted after next tool call"));
+        assert!(screen.contains("press esc to dequeue"));
+        assert!(screen.contains("↳ steer before the next tool"), "{screen}");
+        assert!(!screen.contains("> steer before the next tool"), "{screen}");
         assert!(events.iter().any(|event| {
-            event.event_type == "session.followup"
+            event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
                 && event.payload["text"] == "steer before the next tool"
         }));
 
@@ -12283,7 +12984,7 @@ wire_api = "responses"
                 .iter()
                 .filter(|event| event.event_type == "session.followup")
                 .count(),
-            1
+            0
         );
 
         app.store.append_event(
@@ -12301,6 +13002,321 @@ wire_api = "responses"
             event.event_type == "session.followup"
                 && event.payload["text"] == "after the current turn"
                 && event.payload["queued_from_seq"] == queued
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn active_followup_preview_clears_after_turn_queue_drain() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "tool.started",
+            serde_json::json!({"name": "exec_command"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        app.set_input("adjust before next tool".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        let followup_seq = events
+            .iter()
+            .find(|event| {
+                event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+                    && event.payload["text"] == "adjust before next tool"
+            })
+            .context("pending active follow-up")?
+            .seq;
+        assert!(active_followup_is_pending_in_events(&events, followup_seq));
+        let pending = render_dump(&mut app)?;
+        assert!(pending.contains("Messages to be submitted after next tool call"));
+        assert!(pending.contains("↳ adjust before next tool"), "{pending}");
+        assert!(!pending.contains("> adjust before next tool"), "{pending}");
+
+        app.store.append_event(
+            &running.id,
+            "session.followup",
+            serde_json::json!({
+                "text": "adjust before next tool",
+                "pending_from_seq": followup_seq,
+            }),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "agent.turn_queue_drained",
+            serde_json::json!({
+                "phase": "after_tool_outputs",
+                "session_messages": 1,
+                "mailbox_messages": 0,
+                "last_seq": followup_seq,
+            }),
+        )?;
+        app.drain_store_notifications()?;
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(!active_followup_is_pending_in_events(&events, followup_seq));
+        let drained = render_dump(&mut app)?;
+        assert!(!drained.contains("Messages to be submitted after next tool call"));
+        assert!(drained.contains("> adjust before next tool"), "{drained}");
+        Ok(())
+    }
+
+    #[test]
+    fn active_followup_commits_at_drain_position_not_submit_position() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "answer before steer"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        app.set_input("steer after output".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        let pending_seq = events
+            .iter()
+            .find(|event| {
+                event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+                    && event.payload["text"] == "steer after output"
+            })
+            .context("pending active follow-up")?
+            .seq;
+
+        app.store.append_event(
+            &running.id,
+            "file.read",
+            serde_json::json!({"path": "README.md"}),
+        )?;
+        let committed = app.store.append_event(
+            &running.id,
+            "session.followup",
+            serde_json::json!({
+                "text": "steer after output",
+                "pending_from_seq": pending_seq,
+            }),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "agent.turn_queue_drained",
+            serde_json::json!({
+                "phase": "after_tool_outputs",
+                "session_messages": 1,
+                "mailbox_messages": 0,
+                "last_seq": committed.seq,
+            }),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "answer after steer"}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        let read_idx = screen.find("read README.md").context("read row")?;
+        let prompt_idx = screen
+            .find("> steer after output")
+            .context("follow-up prompt")?;
+        let answer_idx = screen.find("answer after steer").context("new answer")?;
+        assert!(
+            read_idx < prompt_idx,
+            "committed follow-up should render after earlier tool output\n{screen}"
+        );
+        assert!(
+            prompt_idx < answer_idx,
+            "new answer should render after committed follow-up\n{screen}"
+        );
+        assert!(
+            !screen.contains("Messages to be submitted after next tool call"),
+            "{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn active_followup_preview_stays_below_live_streaming_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        app.set_input("anchored steer".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        app.store.append_event(
+            &running.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "I'll inspect the repo before using tools."}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        let streaming_idx = screen
+            .find("I'll inspect the repo before using tools.")
+            .context("streaming assistant text")?;
+        let pending_idx = screen
+            .find("Messages to be submitted after next tool call")
+            .context("pending active follow-up preview")?;
+        let detail_idx = screen.find("↳ anchored steer").context("pending detail")?;
+
+        assert!(
+            streaming_idx < pending_idx,
+            "pending preview should stay below live assistant text\n{screen}"
+        );
+        assert!(
+            pending_idx < detail_idx,
+            "pending detail should stay attached to its preview\n{screen}"
+        );
+        assert!(!screen.contains("> anchored steer"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn escape_reclaims_pending_active_followup_before_delivery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "tool.started",
+            serde_json::json!({"name": "exec_command"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        app.set_input("edit this steer".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        let followup_seq = events
+            .iter()
+            .find(|event| {
+                event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+                    && event.payload["text"] == "edit this steer"
+            })
+            .context("pending active follow-up")?
+            .seq;
+        assert!(active_followup_is_pending_in_events(&events, followup_seq));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert_eq!(app.composer.input(), "edit this steer");
+        assert!(!app.escape_stop_is_pending());
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(!active_followup_is_pending_in_events(&events, followup_seq));
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT
+                && event.payload["followup_seq"].as_i64() == Some(followup_seq)
+                && event.payload["reason"] == "reclaimed from escape"
+        }));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT));
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.cancel_requested"));
+        assert_eq!(
+            app.store
+                .load_session(&running.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(!screen.contains("Messages to be submitted after next tool call"));
+        assert!(screen.contains("> edit this steer"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn escape_once_reclaims_latest_queued_followup_before_delivery() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        app.set_input("first queued".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+        app.set_input("second queued".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&running.id)?;
+        let second_queued = events
+            .iter()
+            .find(|event| {
+                event.event_type == SESSION_QUEUED_FOLLOWUP_EVENT
+                    && event.payload["text"] == "second queued"
+            })
+            .context("second queued follow-up")?
+            .seq;
+        assert_eq!(pending_queued_followup_events_from_events(&events).len(), 2);
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        assert_eq!(app.composer.input(), "second queued");
+        assert_eq!(app.surface, Surface::Main);
+        assert!(!app.escape_stop_is_pending());
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("> second queued"));
+        assert!(screen.contains("queued follow-up  first queued"));
+        assert!(
+            !screen.contains("queued follow-up  second queued"),
+            "{screen}"
+        );
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT
+                && event.payload["queued_seq"] == second_queued
+                && event.payload["reason"] == "reclaimed from escape"
+        }));
+        let pending_texts = pending_queued_followup_events_from_events(&events)
+            .into_iter()
+            .filter_map(event_payload_text)
+            .collect::<Vec<_>>();
+        assert_eq!(pending_texts, vec!["first queued"]);
+
+        app.store.append_event(
+            &running.id,
+            "session.done",
+            serde_json::json!({"result": "done"}),
+        )?;
+        app.drain_store_notifications()?;
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.followup" && event.payload["text"] == "first queued"
+        }));
+        assert!(!events.iter().any(|event| {
+            event.event_type == "session.followup" && event.payload["text"] == "second queued"
         }));
         Ok(())
     }
@@ -12369,8 +13385,7 @@ wire_api = "responses"
         app.selected_session_id = Some(running.id.clone());
         app.set_input("queued draft".to_string());
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?);
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+        app.open_message_actions()?;
         assert_eq!(app.surface, Surface::Messages);
         let queued_selector = render_dump(&mut app)?;
         assert!(queued_selector.contains("Del:cancel queued"));
@@ -12602,6 +13617,244 @@ wire_api = "responses"
         assert_eq!(app.surface, Surface::Main);
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("stopped"));
+        Ok(())
+    }
+
+    // ── Home-screen typewriter tests ────────────────────────────────────────
+
+    #[test]
+    fn home_placeholder_uses_static_when_history_non_empty() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // Add a session so history is non-empty.
+        let cwd = std::env::current_dir()?;
+        let session = app.store.create_session(None, &cwd)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "hello"}),
+        )?;
+        app.state_cache = AppStateCache::hydrate(&app.store, &app.browser)?;
+        // Home screen, empty composer, but history is non-empty — typewriter should not fire.
+        assert!(app.composer.is_empty());
+        assert!(!app.state_cache.sessions.is_empty());
+        assert!(!app.is_home_examples_active());
+        // Placeholder should be the static fallback.
+        assert_eq!(app.home_placeholder(), "Tell the browser what to do...");
+        Ok(())
+    }
+
+    #[test]
+    fn home_placeholder_shows_typewriter_when_no_history() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // No sessions — typewriter should be active.
+        assert!(app.state_cache.sessions.is_empty());
+        assert!(app.composer.is_empty());
+        assert!(app.is_home_examples_active());
+        // placeholder_text starts empty (chars_shown=0) then grows.
+        assert_eq!(app.typewriter.chars_shown, 0);
+        // After a tick the char count should advance (force phase to Typing and elapsed enough).
+        // Fake time by directly advancing chars_shown.
+        app.typewriter.chars_shown = 5;
+        app.typewriter.phase = TypewriterPhase::Typing;
+        let ph = app.home_placeholder();
+        // Should contain first 5 chars of first example + trailing cursor.
+        let expected_prefix: String = HOME_EXAMPLES[0].chars().take(5).collect();
+        assert!(ph.starts_with(&expected_prefix), "placeholder: {:?}", ph);
+        Ok(())
+    }
+
+    #[test]
+    fn typewriter_tick_advances_phase_and_wraps() {
+        let mut tw = TypewriterState::new();
+        let example_len = HOME_EXAMPLES[0].chars().count();
+
+        // Advance through all chars of first example plus one extra tick to
+        // trigger the Holding transition (the phase switches when chars_shown
+        // already equals total on entry, not when it just reached it).
+        for _ in 0..=example_len {
+            tw.last_advance = Instant::now() - Duration::from_millis(500);
+            tw.tick();
+        }
+        // Should have reached Holding now.
+        assert_eq!(
+            tw.phase,
+            TypewriterPhase::Holding,
+            "expected Holding after typing all chars"
+        );
+        assert_eq!(tw.chars_shown, example_len);
+
+        // Transition to Erasing.
+        tw.last_advance = Instant::now() - Duration::from_millis(3000);
+        tw.tick();
+        assert_eq!(tw.phase, TypewriterPhase::Erasing);
+
+        // Erase all chars — need example_len erases, then one more to advance idx.
+        for _ in 0..=example_len {
+            tw.last_advance = Instant::now() - Duration::from_millis(500);
+            tw.tick();
+        }
+        // Should have advanced to the next example and be back to Typing.
+        assert_eq!(
+            tw.example_idx, 1,
+            "should advance to next example after full erase"
+        );
+        assert_eq!(tw.phase, TypewriterPhase::Typing);
+        assert_eq!(tw.chars_shown, 0);
+
+        // Check wrap-around after the last example.
+        tw.example_idx = HOME_EXAMPLES.len() - 1;
+        tw.phase = TypewriterPhase::Erasing;
+        tw.chars_shown = 0;
+        tw.last_advance = Instant::now() - Duration::from_millis(500);
+        tw.tick();
+        assert_eq!(tw.example_idx, 0, "should wrap back to first example");
+    }
+
+    #[test]
+    fn tab_accepts_full_current_example_into_composer() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // Confirm home + no history + typewriter active.
+        assert!(app.is_home_examples_active());
+        // Advance the typewriter mid-word so chars_shown != full length.
+        app.typewriter.chars_shown = 3;
+        app.typewriter.phase = TypewriterPhase::Typing;
+        // Simulate Tab key — should accept the first example (idx=0).
+        app.handle_key(KeyEvent::new(KeyCode::Tab, KeyModifiers::NONE))?;
+        // Composer should contain exactly HOME_EXAMPLES[0] (the full string, not 3 chars).
+        assert_eq!(app.composer.input(), HOME_EXAMPLES[0]);
+        // Typewriter should be stopped.
+        assert!(!app.typewriter.active);
+        // home_examples should no longer be active.
+        assert!(!app.is_home_examples_active());
+        Ok(())
+    }
+
+    #[test]
+    fn submit_without_key_creates_session_with_nudge_and_no_agent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        // Create an app with NO account key set up (account_ready returns false).
+        let mut app = App::new(args(&temp))?;
+        // Mark setup complete so we reach the submit path.
+        app.setup_complete = true;
+        app.model_configured = true;
+        app.store.set_setting("setup.complete", "1")?;
+        // Use ACCOUNT_DEEPSEEK which requires auth.deepseek.api_key — not set in test.
+        app.account = ACCOUNT_DEEPSEEK.to_string();
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.store.set_setting("browser", BROWSER_LOCAL_CHROME)?;
+        // Verify account is not ready.
+        assert!(!app.account_ready(&app.account)?);
+        // Set a task in the composer.
+        app.composer
+            .set_input("check the weather in Tokyo".to_string());
+        assert!(!app.composer.is_empty());
+        // Submit — should create a session but NOT start the agent.
+        app.submit()?;
+        // Session should have been selected.
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("session should be selected after nudge submit")?;
+        let events = app.store.events_for_session(&session_id)?;
+        // session.input must contain the user's task (preserved for retry).
+        let input_event = events
+            .iter()
+            .find(|e| e.event_type == "session.input")
+            .context("session.input event should exist")?;
+        assert!(
+            input_event
+                .payload
+                .get("text")
+                .and_then(|v| v.as_str())
+                .unwrap_or("")
+                .contains("Tokyo"),
+            "session.input should preserve the user task"
+        );
+        // session.notice must contain the nudge text (non-terminal assistant node).
+        let notice_event = events
+            .iter()
+            .find(|e| e.event_type == "session.notice")
+            .context("session.notice event should exist for nudge")?;
+        let notice_text = notice_event
+            .payload
+            .get("text")
+            .and_then(|v| v.as_str())
+            .unwrap_or("");
+        assert!(
+            notice_text.contains("cloud.browser-use.com"),
+            "nudge should mention cloud.browser-use.com"
+        );
+        assert!(notice_text.contains("/auth"), "nudge should mention /auth");
+        // There must be NO session.done — the session must remain resumable.
+        assert!(
+            !events.iter().any(|e| e.event_type == "session.done"),
+            "nudge session must NOT have a session.done event"
+        );
+        // pending_auth_resume must point to this session.
+        assert_eq!(
+            app.pending_auth_resume.as_deref(),
+            Some(session_id.as_str()),
+            "pending_auth_resume should be set to the nudge session id"
+        );
+        // Composer should be cleared.
+        assert!(app.composer.is_empty());
+        Ok(())
+    }
+
+    #[test]
+    fn auth_success_starts_agent_for_pending_nudge_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = App::new(args(&temp))?;
+        app.setup_complete = true;
+        app.model_configured = true;
+        app.store.set_setting("setup.complete", "1")?;
+        // Use ACCOUNT_DEEPSEEK — no key set, so account_ready is false.
+        app.account = ACCOUNT_DEEPSEEK.to_string();
+        app.browser = BROWSER_LOCAL_CHROME.to_string();
+        app.store.set_setting("browser", BROWSER_LOCAL_CHROME)?;
+        assert!(!app.account_ready(&app.account)?);
+        // Simulate the nudge: set pending_auth_resume manually to a real session.
+        let cwd = std::env::current_dir()?;
+        let session = app.store.create_session(None, &cwd)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({ "text": "check the weather in Tokyo" }),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.notice",
+            serde_json::json!({ "text": NO_KEY_NUDGE_TEXT }),
+        )?;
+        app.pending_auth_resume = Some(session.id.clone());
+        // Now simulate auth success by saving a real key and calling
+        // maybe_resume_pending_nudge_session directly (the seam we can test
+        // without spawning real agent threads in tests).
+        // First verify pending_auth_resume is set.
+        assert_eq!(
+            app.pending_auth_resume.as_deref(),
+            Some(session.id.as_str())
+        );
+        // Call the resume helper — in tests start_agent_for_session uses
+        // AgentBackend::None (no model configured for deepseek in this test
+        // context), so it returns early without spawning a real thread.
+        // What we assert is that pending_auth_resume is cleared and the session
+        // is selected after the call.
+        app.maybe_resume_pending_nudge_session()?;
+        // pending_auth_resume must be cleared.
+        assert!(
+            app.pending_auth_resume.is_none(),
+            "pending_auth_resume should be cleared after resume"
+        );
+        // The nudge session should be selected.
+        assert_eq!(
+            app.selected_session_id.as_deref(),
+            Some(session.id.as_str()),
+            "nudge session should be selected after resume"
+        );
         Ok(())
     }
 }

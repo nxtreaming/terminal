@@ -19,9 +19,11 @@ use crate::theme::{
 };
 
 use super::{
-    user_input_display_text_from_payload, App, PendingRequestUserInput, RequestUserInputFocus,
-    RequestUserInputQuestion, RequestUserInputState, REQUEST_USER_INPUT_OTHER_LABEL,
-    SESSION_QUEUED_FOLLOWUP_EVENT,
+    active_followup_is_after_next_tool_call, active_followup_is_cancelled_in_events,
+    active_followup_is_pending_in_events, user_input_display_text_from_payload, App,
+    PendingRequestUserInput, RequestUserInputFocus, RequestUserInputQuestion,
+    RequestUserInputState, PENDING_FOLLOWUP_INTERRUPT_REASON, REQUEST_USER_INPUT_OTHER_LABEL,
+    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
 };
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
@@ -96,6 +98,11 @@ enum TranscriptKind {
         group: String,
         lines: Vec<String>,
         style: NodeStyle,
+    },
+    ToolImage {
+        path: Option<String>,
+        label: Option<String>,
+        took_screenshot: bool,
     },
     ActiveStatus {
         group: String,
@@ -175,6 +182,13 @@ impl TranscriptNode {
                 lines,
                 style,
             } => grouped_lines(group, lines, *style, width),
+            TranscriptKind::ToolImage {
+                path,
+                label,
+                took_screenshot,
+            } => {
+                tool_image_display_lines(path.as_deref(), label.as_deref(), *took_screenshot, width)
+            }
             TranscriptKind::Error { text } => grouped_lines(
                 "error",
                 &[friendly_error_message(text)],
@@ -243,6 +257,11 @@ impl TranscriptNode {
                 }));
                 out
             }
+            TranscriptKind::ToolImage {
+                path,
+                label,
+                took_screenshot,
+            } => tool_image_plain_lines(path.as_deref(), label.as_deref(), *took_screenshot),
             TranscriptKind::Error { text } => {
                 vec![
                     "• error".to_string(),
@@ -259,12 +278,16 @@ impl TranscriptNode {
     }
 
     fn is_terminal_scrollback_transient(&self) -> bool {
-        matches!(
-            &self.kind,
+        match &self.kind {
+            TranscriptKind::PendingStatus { .. } => true,
             TranscriptKind::Timeline { group, style, .. }
                 if group == "thinking"
-                    || (*style == NodeStyle::Thought && group.starts_with("thought"))
-        )
+                    || (*style == NodeStyle::Thought && group.starts_with("thought")) =>
+            {
+                true
+            }
+            _ => false,
+        }
     }
 
     fn is_active_viewport_placeholder(&self) -> bool {
@@ -409,6 +432,24 @@ impl TranscriptNode {
                         .iter()
                         .any(|node| matches!(node.kind, TranscriptKind::PendingStatus { .. }))
             }),
+            _ => false,
+        }
+    }
+
+    fn has_streaming_without_pending_status(&self) -> bool {
+        match &self.kind {
+            TranscriptKind::Stack { nodes } => {
+                let has_streaming = nodes
+                    .iter()
+                    .any(|node| matches!(node.kind, TranscriptKind::StreamingAssistant { .. }));
+                let has_pending_status = nodes
+                    .iter()
+                    .any(|node| matches!(node.kind, TranscriptKind::PendingStatus { .. }));
+                has_streaming && !has_pending_status
+                    || nodes
+                        .iter()
+                        .any(TranscriptNode::has_streaming_without_pending_status)
+            }
             _ => false,
         }
     }
@@ -582,6 +623,12 @@ pub(crate) fn has_shimmering_live_status(model: Option<&TranscriptModel>) -> boo
         .is_some_and(TranscriptNode::has_shimmering_live_status)
 }
 
+pub(crate) fn active_viewport_needs_status_row_reserve(model: Option<&TranscriptModel>) -> bool {
+    model
+        .and_then(|model| model.active.as_ref())
+        .is_some_and(TranscriptNode::has_streaming_without_pending_status)
+}
+
 pub(crate) fn model_plain_text(model: &TranscriptModel) -> String {
     let mut out = String::new();
     for node in &model.committed {
@@ -613,7 +660,9 @@ fn cells_to_lines<'a>(
             let gap = previous_kind
                 .map(|previous| gap_lines_between(previous, &node.kind))
                 .unwrap_or(0);
-            out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
+            if gap > 0 {
+                out.extend(std::iter::repeat_with(|| Line::from("")).take(gap));
+            }
         }
         out.extend(node.display_lines(width, mode));
         previous_kind = Some(&node.kind);
@@ -667,6 +716,16 @@ fn committed_node_for_event(
     let id = format!("{}:{}", event.session_id, event.seq);
     match event.event_type.as_str() {
         "session.input" | "session.followup" => {
+            if event.event_type == "session.followup"
+                && app.active_followup_is_pending(root.id.as_str(), event.seq)
+            {
+                return None;
+            }
+            if event.event_type == "session.followup"
+                && active_followup_is_cancelled_in_events(events, event.seq)
+            {
+                return None;
+            }
             let text = payload_string(event, "text")?;
             Some(TranscriptNode {
                 id,
@@ -678,18 +737,23 @@ fn committed_node_for_event(
                 },
             })
         }
-        SESSION_QUEUED_FOLLOWUP_EVENT => {
-            if !app.queued_followup_is_pending(root.id.as_str(), event.seq) {
+        SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT => None,
+        SESSION_QUEUED_FOLLOWUP_EVENT => None,
+        // session.notice: a synthetic non-terminal assistant message (e.g. the
+        // no-API-key nudge). Rendered like an assistant turn but does NOT count
+        // as a terminal event, so the session stays resumable.
+        "session.notice" => {
+            let text = payload_string(event, "text")?;
+            if text.trim().is_empty() {
                 return None;
             }
-            let text = payload_string(event, "text")?;
             Some(TranscriptNode {
                 id,
                 seq: event.seq,
                 revision: event.seq.max(0) as u64,
-                kind: TranscriptKind::PendingStatus {
-                    status: "queued follow-up".to_string(),
-                    detail: Some(text),
+                kind: TranscriptKind::Assistant {
+                    markdown: text,
+                    source: source_for_state(state),
                 },
             })
         }
@@ -745,6 +809,19 @@ fn committed_node_for_event(
             ))
         }
         "session.cancelled" => {
+            if event
+                .payload
+                .get("reason")
+                .and_then(serde_json::Value::as_str)
+                == Some(PENDING_FOLLOWUP_INTERRUPT_REASON)
+            {
+                return Some(timeline_node(
+                    event,
+                    "interrupted",
+                    vec!["Pending follow-up sent immediately.".to_string()],
+                    NodeStyle::Muted,
+                ));
+            }
             let node = TranscriptNode {
                 id,
                 seq: event.seq,
@@ -785,12 +862,7 @@ fn committed_node_for_event(
         "model.tool_call" | "tool.started" | "tool.finished" => None,
         "tool.batch_started" | "tool.batch_result" | "tool.batch_finished" => None,
         "tool.output" => tool_output_node(event),
-        "tool.image" => Some(timeline_node(
-            event,
-            "image",
-            vec![tool_image_label(event, state)],
-            NodeStyle::Normal,
-        )),
+        "tool.image" => Some(tool_image_node(event)),
         "tool.failed" => Some(timeline_node(
             event,
             "error",
@@ -1391,10 +1463,11 @@ fn pending_followup_active_node(
     root: &SessionMeta,
     events: &[EventRecord],
 ) -> Option<TranscriptNode> {
-    let latest_followup = events
-        .iter()
-        .rev()
-        .find(|event| event.session_id == root.id && event.event_type == "session.followup")?;
+    let latest_followup = events.iter().rev().find(|event| {
+        event.session_id == root.id
+            && event.event_type == "session.followup"
+            && !active_followup_is_after_next_tool_call(event)
+    })?;
     let has_prior_scrollback = events
         .iter()
         .filter(|event| event.seq < latest_followup.seq)
@@ -1529,15 +1602,21 @@ fn pending_followup_status(events: &[EventRecord], after_seq: i64) -> String {
 fn current_turn_events(events: &[EventRecord]) -> &[EventRecord] {
     let start = events
         .iter()
-        .rposition(|event| {
-            matches!(
-                event.event_type.as_str(),
-                "session.input" | "session.followup"
-            )
-        })
+        .rposition(|event| event_starts_visible_turn(events, event))
         .map(|idx| idx.saturating_add(1))
         .unwrap_or(0);
     events.get(start..).unwrap_or_default()
+}
+
+fn event_starts_visible_turn(events: &[EventRecord], event: &EventRecord) -> bool {
+    match event.event_type.as_str() {
+        "session.input" => true,
+        "session.followup" => {
+            !active_followup_is_pending_in_events(events, event.seq)
+                && !active_followup_is_cancelled_in_events(events, event.seq)
+        }
+        _ => false,
+    }
 }
 
 fn active_node_for_event(
@@ -1984,10 +2063,75 @@ fn artifact_created_node(event: &EventRecord, _state: &WorkbenchState) -> Option
         .unwrap_or("artifact");
     Some(timeline_node(
         event,
-        "artifact",
+        "artifacts created",
         vec![format!("{kind} {path}")],
         NodeStyle::Normal,
     ))
+}
+
+fn tool_image_node(event: &EventRecord) -> TranscriptNode {
+    let image = event.payload.get("image");
+    let path = image
+        .and_then(|image| image.get("path"))
+        .and_then(serde_json::Value::as_str)
+        .map(ToOwned::to_owned);
+    let label = image
+        .and_then(|image| image.get("label"))
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|label| !label.is_empty())
+        .map(ToOwned::to_owned);
+    TranscriptNode {
+        id: format!("{}:{}", event.session_id, event.seq),
+        seq: event.seq,
+        revision: event.seq.max(0) as u64,
+        kind: TranscriptKind::ToolImage {
+            path,
+            label,
+            took_screenshot: image
+                .and_then(|image| image.get("source"))
+                .and_then(serde_json::Value::as_str)
+                == Some("screenshot"),
+        },
+    }
+}
+
+fn tool_image_display_lines(
+    path: Option<&str>,
+    label: Option<&str>,
+    took_screenshot: bool,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let line = path
+        .map(ToOwned::to_owned)
+        .or_else(|| label.map(|label| format!("image: {label}")))
+        .unwrap_or_else(|| "image attached".to_string());
+    let group = if took_screenshot {
+        "took screenshot"
+    } else {
+        "read image"
+    };
+    grouped_lines(group, &[line], NodeStyle::Normal, width)
+}
+
+fn tool_image_plain_lines(
+    path: Option<&str>,
+    label: Option<&str>,
+    took_screenshot: bool,
+) -> Vec<String> {
+    let line = path
+        .map(ToOwned::to_owned)
+        .or_else(|| label.map(|label| format!("image: {label}")))
+        .unwrap_or_else(|| "image attached".to_string());
+    let header = if took_screenshot {
+        "• took screenshot"
+    } else {
+        "• read image"
+    };
+    vec![
+        header.to_string(),
+        format!("{GROUP_VALUE_LAST_PREFIX}{line}"),
+    ]
 }
 
 fn active_tool_status(name: &str) -> Option<(&'static str, &'static str)> {
