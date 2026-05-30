@@ -8,6 +8,7 @@
 
 pub mod apply_patch;
 pub mod shell;
+pub mod update_plan;
 pub mod view_image;
 
 #[cfg(test)]
@@ -15,8 +16,13 @@ mod apply_patch_tests;
 #[cfg(test)]
 mod shell_tests;
 #[cfg(test)]
+mod update_plan_tests;
+#[cfg(test)]
 mod view_image_tests;
 
 pub use apply_patch::{ApplyPatchApprovalKey, ApplyPatchRequest, ApplyPatchTool};
 pub use shell::{ShellApprovalKey, ShellRequest, ShellTool};
+pub use update_plan::{
+    PlanItem, PlanStatus, UpdatePlanApprovalKey, UpdatePlanRequest, UpdatePlanTool,
+};
 pub use view_image::{ViewImageApprovalKey, ViewImageRequest, ViewImageTool};
