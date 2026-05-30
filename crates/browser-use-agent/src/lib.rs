@@ -34,6 +34,7 @@ pub mod goals;
 pub mod guardian;
 pub mod history;
 pub mod hooks;
+pub mod infra;
 pub mod mcp;
 pub mod network;
 pub mod prompts;
