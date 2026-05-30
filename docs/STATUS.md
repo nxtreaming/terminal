@@ -162,3 +162,4 @@ FINAL CUTOVER (TUI/CLI: browser-use-core → browser-use-agent; retire core) = [
 ## Tools port (on decodex, M3 core complete @ a21047b base)
 - [x] T-shell — async shell/exec tool over ToolRuntime seam (tokio::process, 10s default timeout/exit124, 1MiB cap, simple rm-rf denylist; full tree-sitter denylist TODO) — 212 tests
 - [x] T-apply_patch — async V4A apply_patch over ToolRuntime seam (envelope+hunks, path-safety reject-outside-root; fuzzy-match/turn_diff_tracker/metadata-denylist deferred) — 231 tests
+- [x] T-view_image — sync/serial (INTENTIONAL divergence, parallel_safe=false), blocking std::fs::read, base64 data-url in ExecOutput.stdout (resize/structured-content deferred) — 244 tests
