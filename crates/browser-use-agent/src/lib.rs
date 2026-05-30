@@ -14,12 +14,14 @@
 //! - [`decision`] — PURE sync decision core (the unit-test surface).
 //! - [`events`]   — sync `EventSink` fan-out + pure stream-event mapper.
 //! - [`context`]  — `ContextManager` + real token accounting (pure core + thin async).
+//! - [`compact`]  — model-based context compaction (codex `compact.rs` parity).
 //! - [`tools`]    — `ToolOrchestrator` + runtime/approval/sandbox seam.
 //! - [`turn`]     — the async turn loop + in-turn tool dispatch.
 //! - [`task`]     — async task driver / lifecycle.
 //! - [`session`]  — lifecycle, resume-by-replay, fork/rollback.
 //! - [`testkit`]  — deterministic fakes shared by every WP's tests.
 
+pub mod compact;
 pub mod config;
 pub mod context;
 pub mod decision;
