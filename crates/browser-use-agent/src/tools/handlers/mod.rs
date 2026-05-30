@@ -9,6 +9,7 @@
 pub mod apply_patch;
 pub mod request_user_input;
 pub mod shell;
+pub mod tool_search;
 pub mod update_plan;
 pub mod view_image;
 
@@ -18,6 +19,8 @@ mod apply_patch_tests;
 mod request_user_input_tests;
 #[cfg(test)]
 mod shell_tests;
+#[cfg(test)]
+mod tool_search_tests;
 #[cfg(test)]
 mod update_plan_tests;
 #[cfg(test)]
@@ -29,6 +32,9 @@ pub use request_user_input::{
     RequestUserInputTool, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 pub use shell::{ShellApprovalKey, ShellRequest, ShellTool};
+pub use tool_search::{
+    ToolSearchApprovalKey, ToolSearchEntry, ToolSearchMatch, ToolSearchRequest, ToolSearchTool,
+};
 pub use update_plan::{
     PlanItem, PlanStatus, UpdatePlanApprovalKey, UpdatePlanRequest, UpdatePlanTool,
 };
