@@ -25,3 +25,8 @@ pub use sandbox::{
 
 /// Re-export for callers that classify dispatch parallelism.
 pub use crate::decision::ToolParallelism;
+
+#[cfg(test)]
+mod approval_tests;
+#[cfg(test)]
+mod sandbox_tests;
