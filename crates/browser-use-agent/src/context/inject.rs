@@ -7,23 +7,46 @@
 //! their *usage* so the accounting/normalization surface and the injection
 //! surface share a single source of truth.
 //!
-//! ## Parity notes
+//! ## Single source of truth for context-message shapes (A4/A6 debt resolution)
 //!
-//! The frozen contract names two upstream parity sources: codex
-//! `context_manager/updates.rs` (the reference_context / settings-update diff)
-//! and the legacy `browser-use-core` context-message builders /
-//! `move_workspace_context_before_first_user`. Neither source tree is present in
-//! this checkout (the codex repo is absent and the Rust `browser-use-core` in
-//! this worktree carries none of the Python-derived context-message
-//! machinery — it has no `*_CONTEXT_MESSAGE_NAME` constants, no
-//! `move_workspace_context_before_first_user`, and no `reference_context`). The
-//! only surviving ground truth is the constant *string values* (already copied
-//! into [`super::constants`] by WP-A3). The message *shape* and the diff
-//! behavior below therefore follow the documented frozen contract and the
-//! provider-message Value convention used throughout
-//! [`super::assembly`] (items are `{"type":"message","role":..,"content":..}`,
-//! contextual ones additionally tagged with `name`). See the work-package
-//! report for the parity caveat.
+//! The legacy-faithful context-message builders live (privately) in
+//! `browser-use-core/src/lib.rs` (`workspace_context_message`,
+//! `permissions_context_message`, `model_switch_context_message`, …,
+//! `move_workspace_context_before_first_user_message`, lib.rs ~9676-9935) and
+//! were duplicated verbatim into [`crate::session::reconstruct`] (WP-A6) as
+//! private fns. WP-A4 originally emitted *generic*, field-agnostic Value-diff
+//! context messages here that were **not** byte-identical to those builders.
+//!
+//! WP-B2 reconciles the divergence: [`build_context_message`] /
+//! [`context_message_name`] / [`move_workspace_context_before_first_user`] below
+//! now reproduce the EXACT same `{role, name, content}` Value shapes the legacy
+//! builders produce (cross-checked against
+//! `/home/exedev/new-core/terminal-decodex/crates/browser-use-core/src/lib.rs`).
+//! `context::inject` is now the single source of truth for these shapes.
+//!
+//! NOTE: `session::reconstruct` still keeps its own private copies (it is
+//! read-only for this WP); a follow-up should make `reconstruct` import these
+//! builders from `inject` rather than re-defining them. The shapes are now
+//! reconcilable byte-for-byte, so that import is mechanical.
+//!
+//! ### Legacy shape table (verbatim)
+//!
+//! | builder | role | content |
+//! |---|---|---|
+//! | `workspace_context_message(Vec<String>)` | `user` | array, one `{type:"input_text",text}` per section |
+//! | `permissions_context_message` | `developer` | `[{type:"input_text",text}]` |
+//! | `multi_agent_usage_hint_context_message` | `developer` | `[{type:"input_text",text}]` |
+//! | `model_switch_context_message` | `developer` | `[{type:"input_text",text}]` |
+//! | `personality_context_message` | `developer` | `[{type:"input_text",text}]` |
+//! | `collaboration_context_message` | `developer` | `[{type:"input_text",text}]` |
+//! | `generated_image_context_message` | `developer` | `[{type:"input_text",text}]` |
+//! | `goal_context_message` | `user` | `[{type:"input_text",text}]` |
+//! | `hook_context_message` | `developer` | bare trimmed string + `hook_event_name` field |
+//!
+//! `typed_mention_context` has no dedicated `text` builder in legacy (mention
+//! messages are passed through from the event payload); we materialize it with
+//! the developer/content-array convention shared by the other developer-channel
+//! contexts so [`is_contextual_message`] still recognizes it.
 
 use serde_json::{json, Value};
 
@@ -94,19 +117,65 @@ const ALL_CONTEXT_MESSAGE_NAMES: &[&str] = &[
     HOOK_CONTEXT_MESSAGE_NAME,
 ];
 
-/// Build the provider message Value for a context message.
+/// The provider role each context kind is emitted with, byte-identical to the
+/// legacy builders. Workspace + goal are `user`; everything else is `developer`.
 ///
-/// Shape: a user-role provider message whose textual `content` is `text` and
-/// which carries the kind's `name` tag — the discriminator
-/// [`is_contextual_message`] keys off. This mirrors the
-/// `{"type":"message","role":..,"content":..}` shape that
-/// [`super::assembly`] estimates/normalizes over.
+/// Ground: legacy `browser-use-core/src/lib.rs` builders (workspace 9687, goal
+/// 9798 are `"user"`; permissions/multi-agent/model-switch/personality/
+/// collaboration/generated-image/hook are `"developer"`).
+fn context_message_role(k: ContextKind) -> &'static str {
+    match k {
+        ContextKind::WorkspaceEnv
+        | ContextKind::WorkspaceAgents
+        | ContextKind::WorkspaceUserShell
+        | ContextKind::Goal => "user",
+        ContextKind::Permissions
+        | ContextKind::MultiAgentUsageHint
+        | ContextKind::ModelSwitch
+        | ContextKind::Personality
+        | ContextKind::GeneratedImage
+        | ContextKind::Collaboration
+        | ContextKind::Mention
+        | ContextKind::Hook => "developer",
+    }
+}
+
+/// Build the provider message Value for a context message, byte-identical to the
+/// legacy-faithful builders in `browser-use-core`.
+///
+/// The common shape is `{role, name, content:[{type:"input_text",text}]}` — the
+/// exact output of `workspace_context_message`/`permissions_context_message`/…
+/// in legacy `lib.rs`. The two exceptions follow legacy verbatim:
+///   * [`ContextKind::Hook`] uses a *bare trimmed string* `content` and adds a
+///     `hook_event_name` field (legacy `hook_context_message`, lib.rs:7452).
+///     The hook event name is not knowable from a free-text `text` argument, so
+///     it is omitted here (a reconstruct caller that has the event will set it);
+///     the role/name/`content` (trimmed string) still match legacy exactly.
+///   * Workspace kinds wrap the single section into the one-element
+///     `input_text` array `workspace_context_message(vec![text])` produces.
 pub fn build_context_message(k: ContextKind, text: String) -> Item {
+    let role = context_message_role(k);
+    let name = context_message_name(k);
+
+    if matches!(k, ContextKind::Hook) {
+        // Legacy `hook_context_message`: bare trimmed string content + the
+        // `hook_event_name` tag. The event name isn't carried by `text`; leave
+        // it absent (callers with the event populate it). Role/name/content
+        // (trimmed) are byte-identical to legacy.
+        return json!({
+            "role": role,
+            "name": name,
+            "content": text.trim(),
+        });
+    }
+
     json!({
-        "type": "message",
-        "role": "user",
-        "name": context_message_name(k),
-        "content": text,
+        "role": role,
+        "name": name,
+        "content": [{
+            "type": "input_text",
+            "text": text,
+        }],
     })
 }
 
@@ -122,67 +191,141 @@ fn item_context_name(i: &Item) -> Option<&str> {
     i.get("name").and_then(Value::as_str)
 }
 
-/// True iff `i` is a workspace-context or permissions-context message — the
-/// items repositioned by [`move_workspace_context_before_first_user`].
-fn is_workspace_or_permissions_context(i: &Item) -> bool {
-    matches!(
-        item_context_name(i),
-        Some(WORKSPACE_CONTEXT_MESSAGE_NAME) | Some(PERMISSIONS_CONTEXT_MESSAGE_NAME)
-    )
-}
-
-/// True iff `i` is a real user-authored message (a turn boundary): a `user`-role
-/// message that is *not* itself an injected contextual message.
-fn is_real_user_message(i: &Item) -> bool {
-    i.get("role").and_then(Value::as_str) == Some("user") && !is_contextual_message(i)
-}
-
-/// Reposition workspace/permissions context to immediately before the first real
-/// user message (codex/core behavior).
+/// The textual content of a message, joining `input_text` parts.
 ///
-/// All `workspace_context` and `permissions_context` items are extracted (in
-/// their original relative order) and re-inserted as a block directly before the
-/// first real user message. When there is no real user message yet, the block is
-/// re-appended at the end (preserving relative order). When
-/// `inject_default_permissions` is `false`, `permissions_context` items are
-/// dropped entirely rather than repositioned.
+/// Ground: legacy `message_content_text` (lib.rs:10455): string content is
+/// returned as-is; an array joins each part's `text` (falling back to the bare
+/// part-as-string) with `"\n"`; everything else stringifies.
+fn message_content_text(message: &Item) -> String {
+    match message.get("content") {
+        Some(Value::String(text)) => text.clone(),
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        Some(value) => value.to_string(),
+        None => String::new(),
+    }
+}
+
+/// True iff `i` is a workspace-context message (legacy `is_workspace_context_message`).
+fn is_workspace_context_message(i: &Item) -> bool {
+    item_context_name(i) == Some(WORKSPACE_CONTEXT_MESSAGE_NAME)
+}
+
+/// True iff `i` is a permissions-context message (legacy `is_permissions_context_message`).
+fn is_permissions_context_message(i: &Item) -> bool {
+    item_context_name(i) == Some(PERMISSIONS_CONTEXT_MESSAGE_NAME)
+}
+
+/// True iff a workspace-context content section is the environment block, which
+/// legacy floats to the *end* of the workspace sections.
+///
+/// Ground: legacy `is_environment_context_section` (lib.rs:9937).
+fn is_environment_context_section(content: &str) -> bool {
+    content.contains("<environment_context>")
+}
+
+/// Reposition workspace/permissions context to immediately before the first
+/// user message, **collapsing** them into the canonical legacy block shape.
+///
+/// This is now byte-identical to legacy
+/// `move_workspace_context_before_first_user_message` (lib.rs:9889-9935):
+///   * all workspace-context sections are gathered (non-empty, trimmed),
+///     with any `<environment_context>` section floated to the end;
+///   * all permissions-context sections are gathered (non-empty);
+///   * if both are empty, the messages pass through unchanged;
+///   * otherwise a single rebuilt **permissions** block (sections joined by
+///     `"\n\n"`) and a single rebuilt **workspace** block are spliced in
+///     immediately before the first `user`-role message (or appended at the end
+///     when there is none), in that order.
+///
+/// The `inject_default_permissions` flag drops the rebuilt permissions block
+/// when `false` (parity with the reducer's `initial_context` path, which only
+/// emits a default-permissions message when the flag is set).
 pub fn move_workspace_context_before_first_user(
     items: &mut Vec<Item>,
     inject_default_permissions: bool,
 ) {
-    // Pull out the context block, preserving relative order. Permissions context
-    // is dropped when default-permission injection is disabled.
-    let mut moved: Vec<Item> = Vec::new();
-    let mut remaining: Vec<Item> = Vec::with_capacity(items.len());
-    for item in items.drain(..) {
-        if is_workspace_or_permissions_context(&item) {
-            let is_permissions = item_context_name(&item) == Some(PERMISSIONS_CONTEXT_MESSAGE_NAME);
-            if is_permissions && !inject_default_permissions {
-                // drop
-                continue;
+    let mut context_sections: Vec<String> = Vec::new();
+    let mut environment_context_section: Option<String> = None;
+    let mut permissions_sections: Vec<String> = Vec::new();
+    let mut other_messages: Vec<Item> = Vec::with_capacity(items.len());
+
+    for message in std::mem::take(items) {
+        if is_workspace_context_message(&message) {
+            let content = message_content_text(&message);
+            if !content.trim().is_empty() {
+                if is_environment_context_section(&content) {
+                    environment_context_section = Some(content);
+                } else {
+                    context_sections.push(content);
+                }
             }
-            moved.push(item);
+        } else if is_permissions_context_message(&message) {
+            let content = message_content_text(&message);
+            if !content.trim().is_empty() {
+                permissions_sections.push(content);
+            }
         } else {
-            remaining.push(item);
+            other_messages.push(message);
         }
     }
 
-    if moved.is_empty() {
-        *items = remaining;
+    if let Some(environment_context_section) = environment_context_section {
+        context_sections.push(environment_context_section);
+    }
+
+    // Permissions are dropped entirely when default-permission injection is off.
+    if !inject_default_permissions {
+        permissions_sections.clear();
+    }
+
+    if context_sections.is_empty() && permissions_sections.is_empty() {
+        *items = other_messages;
         return;
     }
 
-    // Find the first real user message in the remaining items.
-    let insert_at = remaining
+    let insert_at = other_messages
         .iter()
-        .position(is_real_user_message)
-        .unwrap_or(remaining.len());
+        .position(|message| message.get("role").and_then(Value::as_str) == Some("user"))
+        .unwrap_or(other_messages.len());
 
-    let mut rebuilt: Vec<Item> = Vec::with_capacity(remaining.len() + moved.len());
-    rebuilt.extend(remaining.drain(..insert_at));
-    rebuilt.append(&mut moved);
-    rebuilt.extend(remaining.drain(..));
-    *items = rebuilt;
+    let mut insert_messages: Vec<Item> = Vec::new();
+    if !permissions_sections.is_empty() {
+        insert_messages.push(build_permissions_context_message(
+            permissions_sections.join("\n\n"),
+        ));
+    }
+    if !context_sections.is_empty() {
+        insert_messages.push(build_workspace_context_message(context_sections));
+    }
+    other_messages.splice(insert_at..insert_at, insert_messages);
+    *items = other_messages;
+}
+
+/// Legacy `permissions_context_message` (lib.rs:9752), byte-identical.
+fn build_permissions_context_message(text: String) -> Item {
+    build_context_message(ContextKind::Permissions, text)
+}
+
+/// Legacy `workspace_context_message(Vec<String>)` (lib.rs:9676), byte-identical:
+/// a `user`-role message whose `content` is one `input_text` part per section.
+fn build_workspace_context_message(sections: Vec<String>) -> Item {
+    let content = sections
+        .into_iter()
+        .map(|text| json!({ "type": "input_text", "text": text }))
+        .collect::<Vec<_>>();
+    json!({
+        "role": "user",
+        "name": WORKSPACE_CONTEXT_MESSAGE_NAME,
+        "content": content,
+    })
 }
 
 /// Baseline snapshot of the per-turn settings the model is "told about".
@@ -210,10 +353,11 @@ pub struct TurnContextItem(pub serde_json::Value);
 ///
 /// Each update item is a [`ContextKind::ModelSwitch`]-tagged context message
 /// (the `model_switch_context` channel codex uses for settings updates) whose
-/// `content` is a stable, human-readable one-liner and which additionally
-/// carries a structured `update` object (`{field, old, new}`) for machine
-/// consumers. Items are emitted in the sorted-key order of the changed fields so
-/// the output is deterministic.
+/// `content` is the legacy `model_switch_context_message` `input_text` array
+/// carrying a stable, human-readable one-liner, and which additionally carries a
+/// structured `update` object (`{field, old, new}`) for machine consumers. Items
+/// are emitted in the sorted-key order of the changed fields so the output is
+/// deterministic.
 pub fn build_settings_update_items(
     prev: Option<&TurnContextItem>,
     next: &TurnContextItem,
@@ -247,23 +391,28 @@ pub fn build_settings_update_items(
 }
 
 /// Build a single settings-update context item for one changed field.
+///
+/// Uses the legacy `model_switch_context_message` shape
+/// (`{role:"developer", name:"model_switch_context", content:[{input_text}]}`)
+/// for the message envelope and appends a structured `update` object.
 fn build_settings_update_item(field: &str, old: &Value, new: &Value) -> Item {
     let content = format!(
         "{field} changed from {} to {}",
         render_scalar(old),
         render_scalar(new)
     );
-    json!({
-        "type": "message",
-        "role": "user",
-        "name": MODEL_SWITCH_CONTEXT_MESSAGE_NAME,
-        "content": content,
-        "update": {
-            "field": field,
-            "old": old,
-            "new": new,
-        },
-    })
+    let mut item = build_context_message(ContextKind::ModelSwitch, content);
+    if let Some(obj) = item.as_object_mut() {
+        obj.insert(
+            "update".to_string(),
+            json!({
+                "field": field,
+                "old": old,
+                "new": new,
+            }),
+        );
+    }
+    item
 }
 
 /// Render a JSON value for the human-readable update sentence: strings without
