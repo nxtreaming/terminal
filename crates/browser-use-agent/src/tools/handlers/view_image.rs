@@ -108,12 +108,26 @@ pub const VIEW_IMAGE_STDOUT_PREFIX: &str = "view_image:";
 /// resolved under the workspace root. `cwd` overrides [`ToolCtx::cwd`] as the
 /// root (and the path-safety boundary), mirroring [`super::shell::ShellRequest`]
 /// / [`super::apply_patch::ApplyPatchRequest`].
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// # Wire shape (model-facing args)
+///
+/// ```json
+/// { "path": "screenshots/page.png" }
+/// ```
+///
+/// Deserializes directly from the model's argument object. The `path` field name
+/// matches codex's `ViewImageArgs { path }`
+/// (`core/src/tools/handlers/view_image.rs:53-58`) and the legacy `view_image`
+/// arg (`browser-use-core/src/tools/files.rs`). `cwd` is not part of the model's
+/// wire args (codex resolves under the session cwd); it defaults to `None` so
+/// deserialization of `{ "path": ... }` succeeds.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct ViewImageRequest {
     /// Path to the local image file, resolved under the workspace root.
     pub path: PathBuf,
     /// Workspace root the path is resolved under. When `None`, the
     /// [`ToolCtx::cwd`] is used.
+    #[serde(default)]
     pub cwd: Option<PathBuf>,
 }
 

@@ -69,18 +69,35 @@ pub const DEFAULT_PYTHON_SESSION_ID: &str = "default";
 /// shape (`code` plus an optional timeout). `session_id` / `cwd` / `artifact_dir`
 /// are carried so the adapter stays thin (it forwards them unchanged); each
 /// falls back to a sensible default when `None`.
-#[derive(Debug, Clone, PartialEq)]
+///
+/// # Wire shape (model-facing args)
+///
+/// ```json
+/// { "code": "print(1+1)", "timeout_secs": 30 }
+/// ```
+///
+/// Deserializes directly from the model's argument object. The `code` field name
+/// matches the legacy python tool arg (`browser-use-core/src/lib.rs`
+/// `dispatch_python_tool`); only `code` is required. `session_id` / `cwd` /
+/// `artifact_dir` / `timeout_secs` are carried-but-optional plumbing fields
+/// (the router/orchestrator supplies cwd/artifact_dir), each `#[serde(default)]`
+/// so deserialization of `{ "code": ... }` succeeds.
+#[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct PythonRequest {
     /// The Python source code to execute in the worker.
     pub code: String,
     /// Worker session id (persistent namespace). When `None`,
     /// [`DEFAULT_PYTHON_SESSION_ID`].
+    #[serde(default)]
     pub session_id: Option<String>,
     /// Working directory for the snippet. When `None`, the [`ToolCtx::cwd`].
+    #[serde(default)]
     pub cwd: Option<std::path::PathBuf>,
     /// Directory for run artifacts. When `None`, the effective cwd.
+    #[serde(default)]
     pub artifact_dir: Option<std::path::PathBuf>,
     /// Optional timeout in seconds for this snippet.
+    #[serde(default)]
     pub timeout_secs: Option<f64>,
 }
 
