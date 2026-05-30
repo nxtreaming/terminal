@@ -14,3 +14,12 @@ bytes.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros"] }
+tempfile.workspace = true
+
+[features]
+# DEV/TEST ONLY: the codex `~/.codex/auth.json` reader (`auth::codex`). The
+# codex/ChatGPT backend (chatgpt.com/backend-api) is being CUT from production,
+# so this is not a production code path — it is gated off by default and exists
+# only so a developer can manually smoke-test the streaming stack against a local
+# codex login. Build/test it with `--features codex-dev`.
+codex-dev = []

@@ -33,3 +33,10 @@ futures-util.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 tempfile.workspace = true
+
+[features]
+# Opt-in flag gating the live multi-provider smoke test so it is never compiled
+# into the default `cargo test` binary. The live call needs a real provider key
+# in the environment (OPENAI_API_KEY / ANTHROPIC_API_KEY / LLM_BROWSER_*). Run:
+#   cargo test -p browser-use-agent --features live -- --ignored live_model_smoke
+live = []
