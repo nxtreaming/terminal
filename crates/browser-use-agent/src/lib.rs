@@ -32,6 +32,7 @@ pub mod hooks;
 pub mod mcp;
 pub mod prompts;
 pub mod rollout;
+pub mod sandbox_backends;
 pub mod session;
 pub mod skills;
 pub mod subagents;
