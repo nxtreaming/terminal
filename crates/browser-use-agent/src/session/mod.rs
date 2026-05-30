@@ -7,6 +7,8 @@
 
 pub mod notifier;
 pub mod reconstruct;
+#[cfg(test)]
+mod reconstruct_tests;
 pub mod resume;
 pub mod rollback;
 pub mod sink;
