@@ -1,6 +1,16 @@
 # HANDOFF — autonomous M3 rearchitecture driver (read this first)
 
-_Written at context-compaction. You are continuing an AUTONOMOUS loop. The user is ASLEEP and said: "make sure to complete the entire plan — DO NOT STOP or ask me anything." Keep going via ScheduleWakeup; do not wait for the user._
+## ✅✅✅ STATUS: ALL AUTONOMOUS WORK COMPLETE (2026-05-30) — decodex @ 8a3d6f1, 601 tests green, workspace builds ✅✅✅
+The entire autonomous plan is DONE: M3 engine + 10 tools + ToolRegistry + e2e fusion + 8 subsystems (compaction, mcp-transports, subagents, goals, skills, hooks, prompts, rollout) + 4 safety WPs (sandbox-backends, execpolicy, network-proxy, guardian) — all merged to `decodex`, each codex/legacy-parity, network-free tested, verified-in-worktree-before-merge by the loop. decodex never broke; **nothing pushed to origin** (origin/decodex still pinned at `046a80a`); `sanfrancisco-*` untouched. See `docs/STATUS.md` tail for the full per-WP record + the **CONSOLIDATED PARITY-DEBT / INTEGRATION BACKLOG**.
+
+**ONLY remaining step = FINAL CUTOVER = [BLOCKED-NEEDS-HUMAN]:** switch `browser-use-tui` + `browser-use-cli` from `browser-use-core` → `browser-use-agent`, then retire `browser-use-core`. Do NOT do this autonomously — it needs human judgment (live TUI/CLI behavior, the integration-wiring backlog, irreversible legacy-engine retirement). The integration backlog (seams the engine exposes but cutover must connect — secured-orchestrator flip, hooks/goals/skills/rollout/prompts/compaction-sampler/subagent/MCP prod wiring) is enumerated in STATUS.md.
+
+**Loop posture now:** all WPs done → the driver is in a SLOW heartbeat (re-verify decodex green, report "awaiting human for cutover"). If you are a fresh wake and the user has NOT yet returned with cutover instructions, do NOT start new work — just confirm decodex is still green and keep the heartbeat. If the user asks for the cutover, treat it as the human-gated step (proceed with their go-ahead).
+
+---
+_Original handoff (the autonomous build phase — now COMPLETE) follows for history:_
+
+_Written at context-compaction. You were continuing an AUTONOMOUS loop. The user was ASLEEP and said: "make sure to complete the entire plan — DO NOT STOP or ask me anything." Keep going via ScheduleWakeup; do not wait for the user._
 
 ## The mission
 Rebuild the terminal's agent engine as a NEW async crate `browser-use-agent` (strategy B: parallel rewrite) alongside the legacy sync `browser-use-core`, on top of the already-built async `browser-use-llm`. Port subsystem-by-subsystem to **codex parity**, with real tests, then (human-gated) cut the TUI/CLI over and retire core. Work happens on branch **`decodex`** in worktree **/home/exedev/new-core/terminal-decodex**.
