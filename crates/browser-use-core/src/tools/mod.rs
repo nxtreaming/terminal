@@ -39,6 +39,7 @@ pub(crate) enum ToolHandlerKind {
     Done,
     Browser,
     BrowserScript,
+    SubmitCaptureCuration,
     Python,
     ShellCommand,
     ExecCommand,
@@ -490,6 +491,10 @@ impl ToolRegistry {
         );
         registry.register(browser_tool_spec(), ToolHandlerKind::Browser);
         registry.register(browser_script_tool_spec(), ToolHandlerKind::BrowserScript);
+        registry.register(
+            submit_capture_curation_tool_spec(),
+            ToolHandlerKind::SubmitCaptureCuration,
+        );
         registry.register(done_tool_spec(), ToolHandlerKind::Done);
         match multi_agent_config.family {
             MultiAgentToolFamily::Disabled => {}
@@ -1653,6 +1658,47 @@ fn browser_script_tool_spec() -> ToolSpec {
                     "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 1000."
                 }
             },
+            "additionalProperties": false
+        }),
+        output_schema: None,
+        freeform: None,
+    }
+}
+
+fn submit_capture_curation_tool_spec() -> ToolSpec {
+    ToolSpec {
+        name: "submit_capture_curation".to_string(),
+        namespace: None,
+        namespace_description: None,
+        description: "Finalize the visual summary of this browser task. Review the capture \
+contact sheet you were shown (each pane is labeled with its frame seq) and select the frames \
+that best tell the story of what happened, dropping redundant or uninformative ones. For each \
+chosen frame give its seq and a short caption, ordered as they should play. Set confirmation_seq \
+to the single frame that proves the task succeeded (e.g. the final result/receipt). This builds \
+the summary GIF and confirmation still the user sees."
+            .to_string(),
+        input_schema: serde_json::json!({
+            "type": "object",
+            "properties": {
+                "frames": {
+                    "type": "array",
+                    "description": "Chosen frames in playback order.",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "seq": {"type": "integer", "description": "Frame seq from the contact sheet."},
+                            "caption": {"type": "string", "description": "Short caption for this frame."}
+                        },
+                        "required": ["seq", "caption"],
+                        "additionalProperties": false
+                    }
+                },
+                "confirmation_seq": {
+                    "type": "integer",
+                    "description": "Seq of the frame that confirms task success."
+                }
+            },
+            "required": ["frames", "confirmation_seq"],
             "additionalProperties": false
         }),
         output_schema: None,
