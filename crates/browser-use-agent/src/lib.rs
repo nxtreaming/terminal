@@ -31,6 +31,7 @@ pub mod execpolicy;
 pub mod goals;
 pub mod guardian;
 pub mod hooks;
+pub mod infra;
 pub mod mcp;
 pub mod network;
 pub mod prompts;
