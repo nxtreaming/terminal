@@ -2486,17 +2486,6 @@ impl CdpDispatcher {
             Err(_) => bail!("CDP {method} timed out"),
         }
     }
-
-    fn shutdown(&self) {
-        let _ = self
-            .tx
-            .lock()
-            .expect("cdp tx lock poisoned")
-            .send(CdpDispatchCmd::Shutdown);
-        if let Some(handle) = self.reader.lock().expect("cdp reader lock poisoned").take() {
-            let _ = handle.join();
-        }
-    }
 }
 
 impl Drop for CdpDispatcher {

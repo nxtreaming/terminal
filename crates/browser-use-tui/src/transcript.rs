@@ -3544,45 +3544,6 @@ fn plural(count: usize) -> &'static str {
     }
 }
 
-fn tool_image_label(event: &EventRecord, state: &WorkbenchState) -> String {
-    let image = event.payload.get("image");
-    let path = image
-        .and_then(|image| image.get("path"))
-        .and_then(serde_json::Value::as_str);
-    let label = image
-        .and_then(|image| image.get("label"))
-        .and_then(serde_json::Value::as_str)
-        .map(str::trim)
-        .filter(|label| !label.is_empty());
-    let source = image
-        .and_then(|image| image.get("source"))
-        .and_then(serde_json::Value::as_str);
-    let target = label
-        .map(ToOwned::to_owned)
-        .or_else(|| path.map(|path| display_path(path, state)));
-    match source {
-        Some("screenshot") => target
-            .map(|target| format!("screenshot: {target}"))
-            .unwrap_or_else(|| "screenshot captured".to_string()),
-        Some("emit_image") => target
-            .map(|target| format!("attached image: {target}"))
-            .unwrap_or_else(|| "attached image".to_string()),
-        _ => event
-            .payload
-            .get("name")
-            .and_then(serde_json::Value::as_str)
-            .is_some_and(|name| name == "browser_script")
-            .then(|| {
-                target
-                    .clone()
-                    .map(|target| format!("browser image: {target}"))
-                    .unwrap_or_else(|| "browser image attached".to_string())
-            })
-            .or_else(|| target.map(|target| format!("image: {target}")))
-            .unwrap_or_else(|| "received image artifact".to_string()),
-    }
-}
-
 fn browser_event_label(event: &EventRecord) -> String {
     match event.event_type.as_str() {
         "browser.reconnected" => "browser reconnected",
@@ -3942,83 +3903,6 @@ mod tests {
         assert!(!text.contains("targetId"), "{text}");
         assert!(!text.contains("client_id=zenpayroll"), "{text}");
         assert!(!text.contains("readyState"), "{text}");
-    }
-
-    #[test]
-    fn browser_script_screenshot_image_label_names_capture_source() {
-        let state = test_workbench_state();
-        let event = EventRecord {
-            seq: 10,
-            id: "event-10".to_string(),
-            session_id: "session".to_string(),
-            ts_ms: 0,
-            event_type: "tool.image".to_string(),
-            payload: serde_json::json!({
-                "name": "browser_script",
-                "image": {
-                    "path": "/tmp/hn_front_page.png",
-                    "mime_type": "image/png",
-                    "label": "hn_front_page",
-                    "source": "screenshot"
-                }
-            }),
-        };
-
-        assert_eq!(
-            tool_image_label(&event, &state),
-            "screenshot: hn_front_page"
-        );
-    }
-
-    #[test]
-    fn browser_script_emit_image_label_names_attachment_source() {
-        let state = test_workbench_state();
-        let event = EventRecord {
-            seq: 11,
-            id: "event-11".to_string(),
-            session_id: "session".to_string(),
-            ts_ms: 0,
-            event_type: "tool.image".to_string(),
-            payload: serde_json::json!({
-                "name": "browser_script",
-                "image": {
-                    "path": "/tmp/diagnostic.png",
-                    "mime_type": "image/png",
-                    "label": "diagnostic",
-                    "source": "emit_image"
-                }
-            }),
-        };
-
-        assert_eq!(
-            tool_image_label(&event, &state),
-            "attached image: diagnostic"
-        );
-    }
-
-    #[test]
-    fn legacy_browser_script_image_label_stays_specific() {
-        let state = test_workbench_state();
-        let event = EventRecord {
-            seq: 12,
-            id: "event-12".to_string(),
-            session_id: "session".to_string(),
-            ts_ms: 0,
-            event_type: "tool.image".to_string(),
-            payload: serde_json::json!({
-                "name": "browser_script",
-                "image": {
-                    "path": "/tmp/latest_screenshot.png",
-                    "mime_type": "image/png",
-                    "label": "latest_screenshot"
-                }
-            }),
-        };
-
-        assert_eq!(
-            tool_image_label(&event, &state),
-            "browser image: latest_screenshot"
-        );
     }
 
     #[test]
