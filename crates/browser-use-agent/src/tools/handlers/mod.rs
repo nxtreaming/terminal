@@ -8,6 +8,7 @@
 
 pub mod apply_patch;
 pub mod browser;
+pub mod mcp;
 pub mod python;
 pub mod request_user_input;
 pub mod shell;
@@ -20,6 +21,8 @@ pub mod web_search;
 mod apply_patch_tests;
 #[cfg(test)]
 mod browser_tests;
+#[cfg(test)]
+mod mcp_tests;
 #[cfg(test)]
 mod python_tests;
 #[cfg(test)]
@@ -37,6 +40,10 @@ mod web_search_tests;
 
 pub use apply_patch::{ApplyPatchApprovalKey, ApplyPatchRequest, ApplyPatchTool};
 pub use browser::{BrowserAction, BrowserApprovalKey, BrowserRequest, BrowserTool};
+pub use mcp::{
+    mcp_result_tool_content, McpApprovalKey, McpCallResult, McpClient, McpTool, McpToolCallRequest,
+    MCP_ERROR_EXIT_CODE, MCP_EVENT_RESULT_MAX_CHARS,
+};
 pub use python::{PythonApprovalKey, PythonBackend, PythonRequest, PythonTool};
 pub use request_user_input::{
     RequestUserInputApprovalKey, RequestUserInputRequest, RequestUserInputResponse,
