@@ -75,3 +75,40 @@ so they're loop-safe; later cutover steps are human-gated):
 - FINAL (human-gated): switch TUI/CLI to the new engine; retire `browser-use-core`.
 
 See `IMPLEMENTATION_PLAN.md` for the full WP list and `REARCHITECTURE.md` for the design.
+
+---
+
+## M3 progress log (browser-use-agent, on `decodex`)
+
+Build mechanics that WORK: one sub-agent per WP, each in its own `decodex-3-<wp>` worktree forked
+from the current `decodex` tip, committing ONLY to its own branch. Main loop merges one at a time
+(`--no-ff`, disjoint files → clean), runs `timeout cargo test -p browser-use-agent` green, then
+removes the worktree+branch. NEVER two committers on `decodex`. NEVER batch git mutations in one
+parallel block (that caused every mishap — wrong-SHA worktrees, deleted branches). Verify SHAs with
+`git rev-parse` before use. Detect dead agents (branch HEAD unmoved + file still `unimplemented!()`)
+and relaunch; recover orphaned commits via `git merge <dangling-sha>` if a branch ref was lost.
+
+**Wave 0:** [x] WP-A0 frozen scaffold (`fc36a73`, 38 files)
+**Wave 1 (pure decision cores) — COMPLETE, 134 tests green @ `2a79f5d`:**
+- [x] A1 loop_decision+retry (`b8f0e99`, 20t)  · [x] A2 tool seam+decisions (`b40af45`, 36t)
+- [x] A3 context accounting/assembly (`119e856`, 36t) · [x] A5 events mapper (`037ceb3`, 16t)
+- [x] A6 session reducer+rollback (`6466fcb`, recovered from orphan, 6t) · [x] A4 context inject (`6edf672`, 21t)
+
+**PARITY DEBT to reconcile before cutover (logged, not blocking):**
+- **A4 vs A6 duplication:** `context/inject.rs` (A4) emits *generic field-agnostic Value-diff* context
+  messages; `session/reconstruct.rs` (A6) has the *legacy-faithful* builders (`workspace_context_message`,
+  `permissions_context_message`, `model_switch_context_message`, `move_workspace_context_before_first_user_message`).
+  Two impls of the same concept; A4's shapes are NOT byte-identical to legacy. RESOLUTION: when the
+  ContextManager async wrapper (B2) is built, make `inject` reuse the reconstruct builders (single source
+  of truth) and drop A4's divergent shapes, OR promote the legacy builders to `context::inject` and have
+  reconstruct call them. Pick one; add a golden test that inject output == reconstruct builder output.
+- A1 `backoff_ms` deterministic (codex jitters — apply jitter in B5 sampling I/O layer).
+- A3 `non_last_reasoning` filter approximated on Value currency; A3 `strip_images` removes vs codex placeholder text.
+- A6: `default_permissions_instructions` placeholder; helper-session prompt text inline (not byte-identical
+  to the `.md` templates); image-replay disk-IO branch omitted from the pure reducer (belongs in async layer).
+
+**Wave 2 (async wrappers — each delegates to a merged Wave-1 pure core; own worktree each):** STARTING
+- B1 tools/orchestrator.rs (needs A2) · B2 context/mod.rs async wrapper (needs A3+A4; resolve the debt above)
+- B3 events/store_sink.rs (needs A5) · B4 session/{mod,sink,resume,notifier}.rs (needs A6)
+- B5 turn/sampling.rs (needs A1+A5)
+**Wave 3 (integration):** C1 turn/dispatch.rs · C2 turn/{loop_driver,mod}.rs · C3 task/{driver,abort,lifecycle}.rs
