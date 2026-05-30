@@ -43,8 +43,8 @@ provenance is unconfirmed.** Verify with `cargo test` (with a `timeout`) before 
 **Milestone 1 — finish & land the LLM crate (low-risk, next):**
 1. [x] Restore verified baseline + fix scrub() (`8481788`)
 2. [x] Integrate WP 1.7 facades (`providers/` files only; 89 crate tests green; `7f63ef2`)
-3. [ ] Integrate WP 1.8 tool_runtime (`tool.rs` + `tool_runtime.rs`; re-verify)
-4. [ ] `timeout 300 cargo test -p browser-use-llm` green → milestone done
+3. [x] Integrate WP 1.8 tool_runtime (`tool.rs` + `tool_runtime.rs`; 102 crate tests green; `2ef9e29`)
+4. [x] `timeout 300 cargo test -p browser-use-llm` green → **MILESTONE 1 DONE** (102 tests, <1s, no hang)
 
 **Milestone 2 — finish the carve** (serial; extract remaining cohesive modules that don't need async).
 
