@@ -28,6 +28,7 @@ pub mod decision;
 pub mod error;
 pub mod events;
 pub mod goals;
+pub mod hooks;
 pub mod mcp;
 pub mod session;
 pub mod skills;
