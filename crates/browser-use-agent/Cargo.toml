@@ -24,4 +24,4 @@ futures-util.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
-tempfile = "3"
+tempfile.workspace = true
