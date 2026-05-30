@@ -27,6 +27,7 @@ pub mod context;
 pub mod decision;
 pub mod error;
 pub mod events;
+pub mod execpolicy;
 pub mod goals;
 pub mod hooks;
 pub mod mcp;
