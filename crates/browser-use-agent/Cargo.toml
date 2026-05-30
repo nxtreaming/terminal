@@ -13,6 +13,7 @@ version.workspace = true
 browser-use-browser = { path = "../browser-use-browser" }
 browser-use-llm = { path = "../browser-use-llm" }
 browser-use-protocol = { path = "../browser-use-protocol" }
+browser-use-python-worker = { path = "../browser-use-python-worker" }
 browser-use-store = { path = "../browser-use-store" }
 anyhow.workspace = true
 async-trait.workspace = true
