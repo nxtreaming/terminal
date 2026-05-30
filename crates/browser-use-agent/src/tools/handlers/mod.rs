@@ -8,6 +8,7 @@
 
 pub mod apply_patch;
 pub mod browser;
+pub mod python;
 pub mod request_user_input;
 pub mod shell;
 pub mod tool_search;
@@ -19,6 +20,8 @@ pub mod web_search;
 mod apply_patch_tests;
 #[cfg(test)]
 mod browser_tests;
+#[cfg(test)]
+mod python_tests;
 #[cfg(test)]
 mod request_user_input_tests;
 #[cfg(test)]
@@ -34,6 +37,7 @@ mod web_search_tests;
 
 pub use apply_patch::{ApplyPatchApprovalKey, ApplyPatchRequest, ApplyPatchTool};
 pub use browser::{BrowserAction, BrowserApprovalKey, BrowserRequest, BrowserTool};
+pub use python::{PythonApprovalKey, PythonBackend, PythonRequest, PythonTool};
 pub use request_user_input::{
     RequestUserInputApprovalKey, RequestUserInputRequest, RequestUserInputResponse,
     RequestUserInputTool, UserInputAnswer, UserInputOption, UserInputQuestion,
