@@ -9,6 +9,8 @@ pub mod store_sink;
 
 #[cfg(test)]
 mod map_tests;
+#[cfg(test)]
+mod store_sink_tests;
 
 use serde_json::Value;
 

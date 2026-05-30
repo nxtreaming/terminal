@@ -227,6 +227,7 @@ dependencies = [
  "futures-util",
  "serde",
  "serde_json",
+ "tempfile",
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
