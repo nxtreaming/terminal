@@ -9,7 +9,9 @@
 //! every protocol lowers to / normalizes from. It has no provider, no I/O, and
 //! no `async` — it is pure data and is intentionally testable in isolation.
 pub mod protocols;
+pub mod providers;
 pub mod route;
 pub mod schema;
 
+pub use providers::{Anthropic, AnthropicConfig, OpenAi, OpenAiCompatible, OpenAiConfig};
 pub use schema::*;
