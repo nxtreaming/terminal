@@ -222,6 +222,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "base64",
+ "bm25",
  "browser-use-llm",
  "browser-use-protocol",
  "browser-use-store",
