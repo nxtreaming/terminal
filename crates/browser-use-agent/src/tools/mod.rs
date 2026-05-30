@@ -4,6 +4,7 @@
 //! Landlock/seccomp provider lands later behind the same trait surface.
 
 pub mod approval;
+pub mod handlers;
 pub mod orchestrator;
 pub mod runtime;
 pub mod sandbox;
