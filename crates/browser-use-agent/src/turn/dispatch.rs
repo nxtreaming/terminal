@@ -51,6 +51,11 @@ use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
 
 use crate::decision::{self, ToolParallelism};
+use crate::tools::approval::AskForApproval;
+use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
+use crate::tools::registry::ToolRegistry;
+use crate::tools::runtime::{Approver, AutoApprover, ToolCtx};
+use crate::tools::sandbox::{NoneSandboxProvider, SandboxProvider};
 
 /// Runs a single tool call to completion, producing the `Message` to record.
 ///
@@ -125,6 +130,114 @@ impl CallRunner for OrchestratorRunner {
         // contract intact in the meantime.
         let _ = self.supports_parallel_tool_calls;
         result_message_for(&call, "tool routing not yet wired", true)
+    }
+}
+
+/// The REAL production [`CallRunner`]: routes each tool call through a
+/// [`ToolRegistry`].
+///
+/// This un-stubs the dispatch path STATUS.md flagged
+/// (`docs/STATUS.md`: "OrchestratorRunner is a placeholder that records
+/// tool-result Messages rather than routing real per-tool Req/Out through
+/// ToolOrchestrator::run"). A model-emitted `ContentPart::ToolCall { name, input }`
+/// is dispatched BY NAME through the registry, which deserializes `input` into
+/// the matching handler's typed `Req` and runs it THROUGH the
+/// [`ToolOrchestrator`] (approval/sandbox/escalation policy). The
+/// [`ExecOutput`](crate::tools::ExecOutput) is rendered into the tool-result
+/// [`Message`] the dispatcher records, and the per-call [`parallel_safe`] is the
+/// registry's own per-tool flag (falling back to the static name heuristic for
+/// unregistered names).
+///
+/// Generic over the orchestrator seams `(S, A)`, defaulting to the `None`/auto
+/// seams. Parity: codex `core/src/tools/router.rs::dispatch_tool_call`
+/// (look the handler up by name, error if unknown, run under the orchestrator).
+pub struct RegistryRunner<S = NoneSandboxProvider, A = AutoApprover>
+where
+    S: SandboxProvider,
+    A: Approver,
+{
+    registry: Arc<ToolRegistry<S, A>>,
+    orchestrator: Arc<ToolOrchestrator<S, A>>,
+    ctx: ToolCtx,
+    env: TurnEnv,
+    policy: AskForApproval,
+}
+
+impl<S, A> RegistryRunner<S, A>
+where
+    S: SandboxProvider,
+    A: Approver,
+{
+    /// Construct a runner over a registry, orchestrator, per-turn context/env,
+    /// and the active approval policy.
+    pub fn new(
+        registry: Arc<ToolRegistry<S, A>>,
+        orchestrator: Arc<ToolOrchestrator<S, A>>,
+        ctx: ToolCtx,
+        env: TurnEnv,
+        policy: AskForApproval,
+    ) -> Self {
+        Self {
+            registry,
+            orchestrator,
+            ctx,
+            env,
+            policy,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl<S, A> CallRunner for RegistryRunner<S, A>
+where
+    S: SandboxProvider + 'static,
+    A: Approver + 'static,
+{
+    fn parallel_safe(&self, call: &ContentPart) -> bool {
+        // Prefer the registered tool's own `parallel_safe`; fall back to the
+        // conservative serial default for calls whose tool isn't registered (an
+        // unknown name then errors serially, under the write guard).
+        match call {
+            ContentPart::ToolCall { name, .. } => {
+                self.registry.parallel_safe(name).unwrap_or(false)
+            }
+            _ => false,
+        }
+    }
+
+    async fn run(&self, call: ContentPart) -> Message {
+        match &call {
+            ContentPart::ToolCall { name, input, .. } => {
+                match self
+                    .registry
+                    .dispatch(
+                        name,
+                        input,
+                        &self.ctx,
+                        &self.env,
+                        self.policy,
+                        &self.orchestrator,
+                    )
+                    .await
+                {
+                    Ok(output) => {
+                        // Non-zero exit (or stderr) is a tool-level failure; the
+                        // model-facing text prefers stdout, else stderr.
+                        let is_error = output.exit_code != 0;
+                        let text = if !output.stdout.is_empty() {
+                            output.stdout
+                        } else {
+                            output.stderr
+                        };
+                        result_message_for(&call, &text, is_error)
+                    }
+                    // An unknown tool or a deserialize/approval/sandbox error is
+                    // surfaced as an error tool-result so the turn loop records it.
+                    Err(err) => result_message_for(&call, &format!("{err:?}"), true),
+                }
+            }
+            _ => result_message_for(&call, "not a tool call", true),
+        }
     }
 }
 

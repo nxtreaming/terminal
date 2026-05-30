@@ -6,6 +6,7 @@
 pub mod approval;
 pub mod handlers;
 pub mod orchestrator;
+pub mod registry;
 pub mod runtime;
 pub mod sandbox;
 
@@ -13,6 +14,7 @@ pub use approval::{
     ApprovalStore, AskForApproval, ExecApprovalRequirement, GranularApprovalConfig, ReviewDecision,
 };
 pub use orchestrator::{OrchestratorRunResult, ToolOrchestrator, TurnEnv};
+pub use registry::{DynTool, ToolAdapter, ToolRegistry};
 pub use runtime::{
     build_denial_reason, default_exec_approval_requirement, map_decision, plan_attempts,
     sandbox_override_for_first_attempt, Approvable, ApprovalRequest, Approver, AttemptPlan,
