@@ -31,6 +31,7 @@ pub mod execpolicy;
 pub mod goals;
 pub mod hooks;
 pub mod mcp;
+pub mod network;
 pub mod prompts;
 pub mod rollout;
 pub mod sandbox_backends;
