@@ -167,3 +167,4 @@ FINAL CUTOVER (TUI/CLI: browser-use-core → browser-use-agent; retire core) = [
 - [x] T-request_user_input — async (request side; host round-trip deferred), codex questions/options wire shape + normalize validation, parallel_safe=false — 269 tests
 - [x] T-tool_search — async BM25 deferred-tool ranking (codex bm25 2.3.2 SearchEngine, default limit 8, parallel_safe=true matches codex; registry/catalog wiring deferred) — 280 tests
 - [x] T-web_search — hosted/provider-executed config+declaration (codex web_search.rs display helpers, mode Disabled/Enabled, passthrough run no real HTTP, parallel_safe=true) — 302 tests
+- [x] T-browser — thin adapter over browser-use-browser (BrowserBackend trait + FakeBackend for tests; command/execute/observe/cancel; parallel_safe=false; sanctioned divergence, no codex analog) — 314 tests
