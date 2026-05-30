@@ -197,3 +197,7 @@ ToolRegistry requires Req: DeserializeOwned. Deserialize-derived: update_plan, r
 
 ## INTEGRATION: fusion merged — turn runs tools end-to-end
 - [x] I-fusion — SamplingDriver fuses ToolDispatcher (Option A): sample→dispatch tool calls (model order, parallel/serial gate)→record outputs→re-sample; FusionRecorder seam; 347 tests. Remaining: a concrete TurnState+FusionRecorder over the live ContextManager/Session (session-integration WP).
+
+## ✅ INTEGRATION COMPLETE — all 10 tools registered + dispatchable, decodex, 365 tests
+- [x] I-derives — Deserialize on all 6 remaining Reqs (shell/apply_patch/view_image/python via direct derive; browser/mcp via WireArgs+From adapter); default_registry wires all 10 with parity ToolDefinitions + parallel_safe flags — 365 tests. The async engine is now functionally whole (engine + 10 tools + registry + e2e dispatch).
+NEXT: SUBSYSTEMS (codex parity, one at a time): compaction(model-based) → MCP transports → subagents → goals → skills/plugins → hooks → prompts(de-brand) → rollout. THEN safety (sandbox/execpolicy/network/guardian). Cutover=[BLOCKED-NEEDS-HUMAN].
