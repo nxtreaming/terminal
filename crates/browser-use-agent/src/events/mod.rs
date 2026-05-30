@@ -7,6 +7,9 @@ pub mod map;
 pub mod names;
 pub mod store_sink;
 
+#[cfg(test)]
+mod map_tests;
+
 use serde_json::Value;
 
 #[derive(Clone, Debug, PartialEq)]
