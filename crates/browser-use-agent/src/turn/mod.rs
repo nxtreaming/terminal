@@ -7,6 +7,8 @@ pub mod sampling;
 #[cfg(test)]
 mod dispatch_tests;
 #[cfg(test)]
+mod fusion_tests;
+#[cfg(test)]
 mod loop_tests;
 #[cfg(test)]
 mod sampling_tests;
@@ -54,5 +56,8 @@ pub trait TurnObserver: Send + Sync + 'static {
     fn on_lifecycle(&self, ev: crate::task::TurnLifecycleEvent);
 }
 
-pub use dispatch::{RegistryRunner, ToolDispatchResult, ToolDispatcher};
+pub use dispatch::{
+    CallRunner, OrchestratorRunner, RegistryRunner, ToolDispatchResult, ToolDispatcher,
+};
 pub use loop_driver::TurnLoop;
+pub use sampling::FusionRecorder;

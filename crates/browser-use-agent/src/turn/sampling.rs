@@ -56,14 +56,16 @@ use std::sync::Arc;
 
 use browser_use_llm::route::{ModelClient, Route};
 use browser_use_llm::schema::{
-    FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message, Usage,
+    ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
+    MessageRole, Usage,
 };
 use futures_util::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::decision::{self, RetryAction, SamplingOutcome};
 use crate::events::{self, EventSink, TurnCtx};
-use crate::turn::SamplingDriver;
+use crate::turn::dispatch::ToolDispatcher;
+use crate::turn::{CallRunner, SamplingDriver};
 use crate::AgentError;
 
 /// A normalized model event stream: the exact shape [`ModelClient::stream`]
@@ -259,8 +261,29 @@ fn apply_jitter(delay_ms: u64, jitter: bool) -> u64 {
     (delay_ms as f64 * factor) as u64
 }
 
-/// Default [`SamplingDriver`]: stream + retry over the pure decision core.
-pub struct ModelSamplingDriver<T: SamplingTransport> {
+/// Default [`SamplingDriver`]: stream + retry over the pure decision core, with
+/// optional **fused tool dispatch** (WP-I-fusion).
+///
+/// ## Fusion (codex `try_run_turn` / `try_run_sampling_request` parity)
+/// Codex fuses the model stream and tool dispatch inside one sampling step. This
+/// driver does the same when a [`ToolDispatcher`] + [`FusionRecorder`] are
+/// attached via [`ModelSamplingDriver::with_fusion`]: after the stream finishes,
+/// it records the assistant message, dispatches the tool calls the model emitted
+/// (in model order, through the [`ToolDispatcher`]'s parallel/serial gate),
+/// records each tool output back into the shared conversation, and reports
+/// `model_needs_follow_up = true` iff at least one tool ran. The
+/// [`TurnLoop`](crate::turn::loop_driver::TurnLoop) is unchanged: it re-samples
+/// while follow-up is requested, and on the next iteration its
+/// `clone_history_for_prompt` sees the recorded tool outputs.
+///
+/// Without fusion configured ([`ModelSamplingDriver::new`]), the driver is the
+/// text-only WP-B5 sampler: it reports follow-up iff the model emitted ≥1 tool
+/// call but neither dispatches nor records (the loop's history is owned
+/// elsewhere). Both shapes share the exact same stream/retry/cancel core.
+pub struct ModelSamplingDriver<
+    T: SamplingTransport,
+    R: CallRunner = crate::turn::OrchestratorRunner,
+> {
     transport: T,
     sink: Arc<dyn EventSink>,
     ctx: TurnCtx,
@@ -268,12 +291,23 @@ pub struct ModelSamplingDriver<T: SamplingTransport> {
     max_retries: u32,
     /// Whether to apply I/O-layer jitter to the post-decision backoff sleep.
     jitter: bool,
+    /// Fused dispatcher: runs the tool calls the model emitted (model order +
+    /// parallel/serial gate). `None` = text-only sampler (WP-B5 behavior).
+    dispatcher: Option<Arc<ToolDispatcher<R>>>,
+    /// Where dispatched outputs (and the assistant message) are recorded so the
+    /// next sampling iteration sees them. `None` unless fusion is configured.
+    recorder: Option<Arc<dyn FusionRecorder>>,
 }
 
 impl<T: SamplingTransport> ModelSamplingDriver<T> {
-    /// Build a driver. `ctx` carries session/model identity for emitted events.
-    /// The transport owns the per-turn [`LlmRequest`] / [`Route`] (see
-    /// [`ModelClientTransport`]); the driver only threads the input through.
+    /// Build a text-only driver (no tool dispatch). `ctx` carries session/model
+    /// identity for emitted events. The transport owns the per-turn
+    /// [`LlmRequest`] / [`Route`] (see [`ModelClientTransport`]); the driver only
+    /// threads the input through.
+    ///
+    /// Tool calls the model emits set `model_needs_follow_up` but are NOT
+    /// executed; attach a dispatcher with [`ModelSamplingDriver::with_fusion`]
+    /// for the fused path.
     pub fn new(transport: T, sink: Arc<dyn EventSink>, ctx: TurnCtx, max_retries: u32) -> Self {
         Self {
             transport,
@@ -281,9 +315,39 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             ctx,
             max_retries,
             jitter: true,
+            dispatcher: None,
+            recorder: None,
         }
     }
 
+    /// Attach the fused dispatch path: tool calls the model emits are dispatched
+    /// through `dispatcher` and their outputs (plus the assistant message) are
+    /// recorded into `recorder` so the loop re-samples with them in context
+    /// (codex `try_run_turn`).
+    ///
+    /// This **rebinds the runner type parameter** from the default
+    /// `OrchestratorRunner` (which [`new`](ModelSamplingDriver::new) produces) to
+    /// the dispatcher's concrete `R2`, consuming the text-only driver and
+    /// returning a fused `ModelSamplingDriver<T, R2>`. Chainable with
+    /// [`without_jitter`](ModelSamplingDriver::without_jitter).
+    pub fn with_fusion<R2: CallRunner + 'static>(
+        self,
+        dispatcher: Arc<ToolDispatcher<R2>>,
+        recorder: Arc<dyn FusionRecorder>,
+    ) -> ModelSamplingDriver<T, R2> {
+        ModelSamplingDriver {
+            transport: self.transport,
+            sink: self.sink,
+            ctx: self.ctx,
+            max_retries: self.max_retries,
+            jitter: self.jitter,
+            dispatcher: Some(dispatcher),
+            recorder: Some(recorder),
+        }
+    }
+}
+
+impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     /// Disable I/O-layer jitter (deterministic sleeps). Used by tests.
     pub fn without_jitter(mut self) -> Self {
         self.jitter = false;
@@ -306,8 +370,15 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
                 acc.full_text.push_str(&delta);
                 StreamProgress::Continue
             }
-            LlmEvent::ToolCall { .. } => {
-                acc.tool_call_count += 1;
+            LlmEvent::ToolCall { id, name, input } => {
+                // Capture the actual call (model order) so the fused dispatch can
+                // run it; the count is derived from this vec's length.
+                acc.tool_calls.push(ContentPart::ToolCall {
+                    id,
+                    name,
+                    input,
+                    provider_metadata: None,
+                });
                 StreamProgress::Continue
             }
             LlmEvent::Finish {
@@ -329,7 +400,10 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
 #[derive(Default)]
 struct TurnAccumulator {
     full_text: String,
-    tool_call_count: usize,
+    /// The tool calls the model emitted, in model order. The length doubles as
+    /// the "did the model request follow-up" signal (codex
+    /// `!tool_calls.is_empty()`); the calls themselves feed the fused dispatch.
+    tool_calls: Vec<ContentPart>,
     #[allow(dead_code)]
     usage: Option<Usage>,
     finish_reason: Option<FinishReason>,
@@ -343,7 +417,55 @@ enum StreamProgress {
     Done,
 }
 
-impl<T: SamplingTransport + 'static> SamplingDriver for ModelSamplingDriver<T> {
+/// Records the assistant message + dispatched tool outputs back into the shared
+/// conversation state (codex `try_run_turn` records the function-call and its
+/// output into history before re-sampling).
+///
+/// This is the seam that closes the fusion loop without changing the frozen
+/// [`SamplingDriver`] signature (which receives no [`TurnState`]): the fused
+/// [`ModelSamplingDriver`] holds an `Arc<dyn FusionRecorder>` pointing at the
+/// SAME conversation buffer the [`TurnLoop`] reads via
+/// [`TurnState::clone_history_for_prompt`], so the next iteration re-samples
+/// with the tool outputs in context. Production backs it with the
+/// `ContextManager`/`Session`-backed `TurnState`; tests back it with an
+/// in-memory `Vec` recorder.
+///
+/// [`SamplingDriver`]: crate::turn::SamplingDriver
+/// [`TurnState`]: crate::turn::TurnState
+/// [`TurnState::clone_history_for_prompt`]: crate::turn::TurnState::clone_history_for_prompt
+/// [`TurnLoop`]: crate::turn::loop_driver::TurnLoop
+#[async_trait::async_trait]
+pub trait FusionRecorder: Send + Sync {
+    /// Append `messages` (assistant turn, then tool-result turn) to the shared
+    /// conversation, in order.
+    async fn record(&self, messages: &[Message]);
+}
+
+/// Extract the model's tool calls from accumulated assistant content, in the
+/// order the model emitted them (codex preserves model order through dispatch).
+fn extract_tool_calls(parts: &[ContentPart]) -> Vec<ContentPart> {
+    parts
+        .iter()
+        .filter(|p| matches!(p, ContentPart::ToolCall { .. }))
+        .cloned()
+        .collect()
+}
+
+/// Assemble the assistant `Message` recorded for this turn: its streamed text
+/// (if any) followed by the tool calls it emitted, in model order. Mirrors codex
+/// recording the assistant function-call item before its outputs.
+fn assistant_message(full_text: &str, tool_calls: &[ContentPart]) -> Message {
+    let mut content: Vec<ContentPart> = Vec::new();
+    if !full_text.is_empty() {
+        content.push(ContentPart::text(full_text));
+    }
+    content.extend(tool_calls.iter().cloned());
+    Message::new(MessageRole::Assistant, content)
+}
+
+impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
+    for ModelSamplingDriver<T, R>
+{
     async fn run_sampling_request(
         &self,
         input: Vec<Message>,
@@ -406,10 +528,47 @@ impl<T: SamplingTransport + 'static> SamplingDriver for ModelSamplingDriver<T> {
             }
 
             // ---- assemble the outcome (codex parity) ----
-            let model_needs_follow_up = decision::needs_follow_up(acc.tool_call_count >= 1, false);
+            let last_agent_message = (!acc.full_text.is_empty()).then(|| acc.full_text.clone());
+
+            // Fused tool dispatch (codex `try_run_turn` / `try_run_sampling_request`):
+            // when a dispatcher + recorder are configured AND the model emitted
+            // ≥1 tool call, record the assistant message, run the calls in model
+            // order through the dispatcher, record their outputs, and report
+            // follow-up so the loop re-samples with those outputs in context.
+            let tool_calls = extract_tool_calls(&acc.tool_calls);
+            let model_needs_follow_up =
+                match (&self.dispatcher, &self.recorder, tool_calls.is_empty()) {
+                    // Fused path with at least one tool call.
+                    (Some(dispatcher), Some(recorder), false) => {
+                        // 1. Record the assistant message (text + tool calls), so the
+                        //    recorded transcript carries the call before its output.
+                        let assistant = assistant_message(&acc.full_text, &tool_calls);
+                        recorder.record(std::slice::from_ref(&assistant)).await;
+
+                        // 2. Dispatch in model order through the parallel/serial gate.
+                        let result = dispatcher
+                            .dispatch_ordered(tool_calls, cancel.clone())
+                            .await;
+
+                        // 3. Record each tool output (already in model order).
+                        if !result.outputs_in_order.is_empty() {
+                            recorder.record(&result.outputs_in_order).await;
+                        }
+
+                        // follow-up iff a tool actually ran (codex re-samples after
+                        // feeding tool outputs back into history).
+                        decision::needs_follow_up(result.needs_follow_up, false)
+                    }
+                    // Text-only sampler, OR fusion configured but no tool call: the
+                    // model is done (no dispatch). `model_needs_follow_up` still
+                    // reflects whether the model emitted a call so a non-fused driver
+                    // signals the loop the same way it did pre-fusion (WP-B5).
+                    _ => decision::needs_follow_up(!acc.tool_calls.is_empty(), false),
+                };
+
             return Ok(SamplingOutcome {
                 model_needs_follow_up,
-                last_agent_message: (!acc.full_text.is_empty()).then_some(acc.full_text),
+                last_agent_message,
                 finish_reason: acc.finish_reason,
             });
         }

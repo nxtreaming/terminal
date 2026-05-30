@@ -150,7 +150,7 @@ schema/route/protocols/providers/tool-runtime (Wave 1 llm + cores) → orchestra
 ### What is FUNCTIONAL vs STUBBED at M3-core-complete (honest)
 The control-flow + decision logic is codex-faithful and tested, but several bodies are intentionally stubbed pending their own WPs:
 - Compaction body: control flow (compact-then-continue) is parity-correct; the model summarizer is a TurnState::compact() hook (no-op default) — real WP pending.
-- SamplingDriver↔ToolDispatcher are SEPARATE seams; a production SamplingDriver must fuse dispatch (run tool calls, record outputs) — wiring pending the toolset WP.
+- SamplingDriver↔ToolDispatcher fusion is now WIRED (WP-I-fusion): the production `ModelSamplingDriver::with_fusion(dispatcher, recorder)` runs the model's tool calls through the `ToolDispatcher` (model order + parallel/serial gate) and records the assistant message + tool outputs via a `FusionRecorder` into the shared conversation, reporting `model_needs_follow_up` so the `TurnLoop` re-samples. The frozen `TurnLoop`/`SamplingDriver`/`SamplingOutcome` are unchanged; a text-only `ModelSamplingDriver::new` (no dispatcher) still exists. Remaining: production wiring of the `FusionRecorder` over the real `ContextManager`/`Session`-backed `TurnState` (the toolset/session integration WP).
 - OrchestratorRunner is a placeholder that records tool-result Messages rather than routing real per-tool Req/Out through ToolOrchestrator::run — pending toolset WP.
 - No real tools yet (shell/apply_patch/browser/etc.), no real model HTTP call exercised end-to-end, no sandbox/guardian/network.
 - Logging: crate has no tracing facade; hard-abort/store-error paths surface via events/return, not logs.
@@ -177,6 +177,26 @@ NEXT: INTEGRATION (real ToolRegistry/ToolSet dispatching all 10 by name + deferr
 
 ## INTEGRATION: ToolRegistry merged — decodex, 351 tests
 - [x] I-registry — real ToolRegistry (DynTool trait-objects, dispatch-by-name, model_visible_definitions, deferred catalog) + ToolDispatcher routes through registry via orchestrator — 351 tests
+<<<<<<< HEAD
 
 ### GAP (must fix): registry only dispatches 4/10 tools
 ToolRegistry requires Req: DeserializeOwned. Deserialize-derived: update_plan, request_user_input, tool_search, web_search. NOT yet: shell, apply_patch, view_image, browser, python, mcp (derive only Clone/Debug/PartialEq). FOLLOW-UP WP (after fusion): add #[derive(Deserialize)] (+serde rename to camelCase wire names matching codex/legacy) to those 6 Request types + register them. browser/mcp Req are parsed/namespaced forms — may need a raw-args adapter. Until then those 6 tools are built+unit-tested but NOT reachable via the registry/dispatch path.
+||||||| 5626f8a
+=======
+
+## INTEGRATION: turn-loop ↔ sampling ↔ dispatch ↔ context fused — decodex-3-i-fusion
+- [x] I-fusion — a turn now runs tools end-to-end. The production `ModelSamplingDriver`
+  gained an optional fused path (`with_fusion(dispatcher, recorder)`, Option A per
+  DESIGN.md): after streaming the model response it records the assistant message,
+  dispatches the emitted tool calls through the `ToolDispatcher` (model order +
+  parallel/serial gate), records each tool output via a new `FusionRecorder` seam into
+  the SAME conversation the `TurnLoop` re-samples from, and reports
+  `model_needs_follow_up=true` iff a tool ran; when the model emits no tool call the turn
+  completes. Frozen `TurnLoop`/`SamplingDriver`/`SamplingOutcome`/`TurnState` unchanged;
+  text-only `ModelSamplingDriver::new` retained. New `turn/fusion_tests.rs` proves the
+  end-to-end loop (sample→dispatch→record→re-sample→complete), multi-call model-order
+  recording, and the zero-tool one-iteration regression. (Crate-local agent tests green.)
+>>>>>>> decodex-3-i-fusion
+
+## INTEGRATION: fusion merged — turn runs tools end-to-end
+- [x] I-fusion — SamplingDriver fuses ToolDispatcher (Option A): sample→dispatch tool calls (model order, parallel/serial gate)→record outputs→re-sample; FusionRecorder seam; 347 tests. Remaining: a concrete TurnState+FusionRecorder over the live ContextManager/Session (session-integration WP).
