@@ -54,5 +54,5 @@ pub trait TurnObserver: Send + Sync + 'static {
     fn on_lifecycle(&self, ev: crate::task::TurnLifecycleEvent);
 }
 
-pub use dispatch::{ToolDispatchResult, ToolDispatcher};
+pub use dispatch::{RegistryRunner, ToolDispatchResult, ToolDispatcher};
 pub use loop_driver::TurnLoop;

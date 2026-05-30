@@ -337,3 +337,173 @@ async fn needs_follow_up_true_when_calls_dispatched_false_for_empty() {
     assert!(empty.outputs_in_order.is_empty());
     assert_eq!(empty_runner.runs_started(), 0);
 }
+
+// ---- (6) end-to-end: registry-backed RegistryRunner through the dispatcher --
+
+mod registry_e2e {
+    use std::sync::Arc;
+
+    use browser_use_llm::schema::{ContentPart, Message, ToolDefinition};
+    use serde_json::json;
+    use tokio_util::sync::CancellationToken;
+
+    use crate::tools::approval::AskForApproval;
+    use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
+    use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
+    use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
+    use crate::tools::registry::ToolRegistry;
+    use crate::tools::sandbox::FileSystemSandboxPolicy;
+    use crate::tools::ToolCtx;
+    use crate::turn::dispatch::{RegistryRunner, ToolDispatcher};
+
+    fn def(name: &str) -> ToolDefinition {
+        ToolDefinition {
+            name: name.to_string(),
+            description: name.to_string(),
+            input_schema: json!({ "type": "object" }),
+        }
+    }
+
+    fn env() -> TurnEnv {
+        TurnEnv {
+            file_system_sandbox_policy: FileSystemSandboxPolicy {
+                restricted: false,
+                denied_read: false,
+            },
+            managed_network_active: false,
+            strict_auto_review: false,
+            use_guardian: false,
+        }
+    }
+
+    fn ctx() -> ToolCtx {
+        ToolCtx {
+            call_id: "c".to_string(),
+            tool_name: "t".to_string(),
+            cwd: std::path::PathBuf::from("/tmp"),
+        }
+    }
+
+    fn tool_call(id: &str, name: &str, input: serde_json::Value) -> ContentPart {
+        ContentPart::ToolCall {
+            id: id.to_string(),
+            name: name.to_string(),
+            input,
+            provider_metadata: None,
+        }
+    }
+
+    /// The recorded tool-result text + error flag for a dispatched output.
+    fn result_of(msg: &Message) -> (String, bool) {
+        for part in &msg.content {
+            if let ContentPart::ToolResult {
+                content, is_error, ..
+            } = part
+            {
+                let text = content
+                    .iter()
+                    .filter_map(|p| match p {
+                        ContentPart::Text { text } => Some(text.clone()),
+                        _ => None,
+                    })
+                    .collect::<Vec<_>>()
+                    .join("");
+                return (text, *is_error);
+            }
+        }
+        (String::new(), false)
+    }
+
+    fn result_call_id(msg: &Message) -> String {
+        for part in &msg.content {
+            if let ContentPart::ToolResult { tool_call_id, .. } = part {
+                return tool_call_id.clone();
+            }
+        }
+        String::new()
+    }
+
+    #[tokio::test]
+    async fn registry_runner_dispatches_tool_calls_in_model_order() {
+        // Build a real registry with two Deserialize-able handlers, wrap it in the
+        // RegistryRunner, and dispatch two tool calls end-to-end through the
+        // dispatcher. Outputs are recorded in model order regardless of timing.
+        let mut registry = ToolRegistry::new();
+        registry.register::<_, UpdatePlanRequest>(
+            "update_plan",
+            def("update_plan"),
+            false,
+            UpdatePlanTool::new(),
+        );
+        registry.register::<_, ToolSearchRequest>(
+            "tool_search",
+            def("tool_search"),
+            true,
+            ToolSearchTool::new(vec![ToolSearchEntry::new(
+                "kubernetes",
+                "manage clusters",
+                ["ns"],
+            )]),
+        );
+
+        let runner = RegistryRunner::new(
+            Arc::new(registry),
+            Arc::new(ToolOrchestrator::stub()),
+            ctx(),
+            env(),
+            AskForApproval::Never,
+        );
+        let dispatcher = ToolDispatcher::with_runner(runner, /* model_supports */ true);
+
+        let calls = vec![
+            tool_call(
+                "1",
+                "update_plan",
+                json!({ "plan": [{"step": "do it", "status": "pending"}] }),
+            ),
+            tool_call("2", "tool_search", json!({ "query": "kubernetes" })),
+        ];
+
+        let out = dispatcher
+            .dispatch_ordered(calls, CancellationToken::new())
+            .await;
+        assert_eq!(out.outputs_in_order.len(), 2);
+        assert!(out.needs_follow_up);
+
+        // Output 0: update_plan, in model order, success.
+        assert_eq!(result_call_id(&out.outputs_in_order[0]), "1");
+        let (text0, err0) = result_of(&out.outputs_in_order[0]);
+        assert!(!err0, "update_plan should succeed: {text0}");
+        assert!(text0.contains("Plan updated:"), "got: {text0}");
+
+        // Output 1: tool_search, in model order, success.
+        assert_eq!(result_call_id(&out.outputs_in_order[1]), "2");
+        let (text1, err1) = result_of(&out.outputs_in_order[1]);
+        assert!(!err1, "tool_search should succeed: {text1}");
+        assert!(text1.contains("kubernetes"), "got: {text1}");
+    }
+
+    #[tokio::test]
+    async fn registry_runner_reports_unknown_tool_as_error_result() {
+        let registry: ToolRegistry = ToolRegistry::new();
+        let runner = RegistryRunner::new(
+            Arc::new(registry),
+            Arc::new(ToolOrchestrator::stub()),
+            ctx(),
+            env(),
+            AskForApproval::Never,
+        );
+        let dispatcher = ToolDispatcher::with_runner(runner, true);
+
+        let out = dispatcher
+            .dispatch_ordered(
+                vec![tool_call("1", "ghost", json!({}))],
+                CancellationToken::new(),
+            )
+            .await;
+        assert_eq!(out.outputs_in_order.len(), 1);
+        let (text, err) = result_of(&out.outputs_in_order[0]);
+        assert!(err, "unknown tool must be an error result");
+        assert!(text.contains("unknown tool `ghost`"), "got: {text}");
+    }
+}
