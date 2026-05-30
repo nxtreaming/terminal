@@ -30,6 +30,7 @@ pub mod events;
 pub mod goals;
 pub mod mcp;
 pub mod session;
+pub mod skills;
 pub mod subagents;
 pub mod task;
 pub mod testkit;
