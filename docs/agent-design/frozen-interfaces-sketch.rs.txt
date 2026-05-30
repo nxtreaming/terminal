@@ -1,0 +1,476 @@
+// ============================================================================
+// crate browser-use-agent — FROZEN INTERFACE (compiling stubs).
+// Built on browser-use-llm (schema/route/tool/tool_runtime), browser-use-protocol,
+// browser-use-store (write-sink only). Decision logic is PURE sync; async layers
+// are thin orchestration that delegate every branch to a decision:: fn.
+// Stubs use `unimplemented!()` / trivial returns so the crate compiles before WPs.
+// ============================================================================
+
+// ===== error.rs =====
+#[derive(Debug, thiserror::Error)]
+pub enum AgentError {
+    #[error("turn aborted")] TurnAborted,                 // turn.rs:357 — reported via TurnAborted event, not here
+    #[error("context window exceeded")] ContextWindowExceeded,
+    #[error("usage limit reached")] UsageLimitReached,
+    #[error("invalid image request")] InvalidImageRequest,
+    #[error("provider error: {0}")] Provider(String),
+    #[error("tool error: {0}")] Tool(String),
+    #[error(transparent)] Store(anyhow::Error),
+    #[error(transparent)] Other(#[from] anyhow::Error),
+}
+impl AgentError { pub fn is_retryable(&self) -> bool { matches!(self, Self::Provider(_)) } }
+
+// ===== config.rs (pure data snapshot, shared) =====
+#[derive(Clone, Debug)]
+pub struct AgentConfig {
+    pub model: String, pub provider: String,
+    pub approval_policy: tools::AskForApproval,
+    pub stream_max_retries: u32,
+    pub server_reasoning_included: bool,         // history.rs:303-332 selects token branch
+    pub supports_parallel_tool_calls: bool,      // turn.rs:872
+    pub supports_image_input: bool,              // normalize strip_images gate
+    pub auto_compact_scope_limit: i64,
+    pub model_context_window: Option<i64>,
+    pub agent_interrupt_message_enabled: bool,   // tasks/mod.rs:74
+    pub multi_agent_v2: bool,
+}
+
+// ============================================================================
+// decision/ — PURE SYNC. No tokio, no I/O, no &self. The unit-test surface.
+// ============================================================================
+pub mod decision {
+    use browser_use_llm::schema::FinishReason;
+
+    // ---- loop_decision.rs (turn.rs:168-355, 677) ----
+    #[derive(Debug, Clone, Default)]
+    pub struct SamplingOutcome {
+        pub model_needs_follow_up: bool,            // turn.rs:250
+        pub last_agent_message: Option<String>,
+        pub finish_reason: Option<FinishReason>,
+    }
+    #[derive(Debug, Clone)]
+    pub struct TokenStatus {
+        pub auto_compact_scope_tokens: i64,
+        pub auto_compact_scope_limit: i64,
+        pub full_context_window_limit_reached: bool,
+        pub token_limit_reached: bool,              // scope>=limit || full_window (turn.rs:677-678)
+    }
+    pub fn needs_follow_up(model_nfu: bool, has_pending_input: bool) -> bool { model_nfu || has_pending_input } // turn.rs:255
+    pub fn token_limit_reached(scope: i64, limit: i64, full: bool) -> bool { scope >= limit || full }           // turn.rs:677
+    pub fn should_compact_mid_turn(tlr: bool, nfu: bool) -> bool { tlr && nfu }                                 // turn.rs:282
+    pub fn can_drain_after_compact(model_nfu: bool) -> bool { !model_nfu }                                       // turn.rs:306
+    pub fn initial_can_drain(turn_has_fresh_input: bool) -> bool { !turn_has_fresh_input }                       // turn.rs:168
+
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum LoopStep { CompactThenContinue { can_drain_next: bool }, Continue, Complete }
+    pub fn classify_loop_step(out: &SamplingOutcome, has_pending_input: bool, st: &TokenStatus) -> LoopStep {
+        let nfu = needs_follow_up(out.model_needs_follow_up, has_pending_input);
+        if should_compact_mid_turn(st.token_limit_reached, nfu) {
+            LoopStep::CompactThenContinue { can_drain_next: can_drain_after_compact(out.model_needs_follow_up) }
+        } else if nfu { LoopStep::Continue } else { LoopStep::Complete }
+    }
+
+    // ---- retry.rs (turn.rs:924-1021) ----
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum RetryAction { Fail, SwitchTransport, Backoff { delay_ms: u64 } }
+    pub fn retry_decision(retries: u32, max: u32, retryable: bool, can_switch_transport: bool,
+                          requested_delay_ms: Option<u64>) -> RetryAction {
+        if !retryable { return RetryAction::Fail; }
+        if retries >= max { return if can_switch_transport { RetryAction::SwitchTransport } else { RetryAction::Fail }; }
+        RetryAction::Backoff { delay_ms: requested_delay_ms.unwrap_or(backoff_ms(retries)) }
+    }
+    pub fn backoff_ms(retries: u32) -> u64 { 200u64.saturating_mul(1u64 << retries.min(6)) } // deterministic, pure
+
+    // ---- tool_decision.rs (sandboxing.rs:202-334 + orchestrator.rs:145-388) ----
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub enum ToolParallelism { Parallel, Serial }   // Parallel=RwLock read, Serial=RwLock write
+    pub fn classify_parallelism(parallel_safe: bool, model_supports: bool) -> ToolParallelism {
+        if parallel_safe && model_supports { ToolParallelism::Parallel } else { ToolParallelism::Serial }
+    }
+    // default_exec_approval_requirement / sandbox_override_for_first_attempt / plan_attempts / map_decision
+    // are declared in the tools:: module (they reference its enums) but stay PURE — see tools below.
+}
+
+// ============================================================================
+// events/ — sync EventSink fan-out + PURE LlmEvent->protocol mapper.
+// The seam the turn loop calls WITHOUT .await so its logic stays testable.
+// ============================================================================
+pub mod events {
+    use serde_json::Value;
+    use browser_use_protocol::ModelUsage;
+    use browser_use_llm::schema::{LlmEvent, Usage};
+
+    #[derive(Clone, Debug, PartialEq)]
+    pub struct PendingEvent { pub session_id: String, pub event_type: String, pub payload: Value }
+    impl PendingEvent {
+        pub fn new(session_id: impl Into<String>, ty: impl Into<String>, payload: Value) -> Self {
+            Self { session_id: session_id.into(), event_type: ty.into(), payload }
+        }
+    }
+    /// Synchronous, infallible fan-out. Real impl = StoreSink; tests = Vec recorder.
+    pub trait EventSink: Send + Sync { fn emit(&self, ev: PendingEvent); }
+    pub struct TeeSink(pub Vec<std::sync::Arc<dyn EventSink>>);
+    impl EventSink for TeeSink { fn emit(&self, ev: PendingEvent) { for s in &self.0 { s.emit(ev.clone()); } } }
+
+    #[derive(Clone, Debug)]
+    pub struct TurnCtx { pub session_id: String, pub model: String, pub provider: String, pub turn_idx: usize, pub attempt: usize }
+
+    // ---- PURE map.rs ----
+    pub fn map_llm_event(_ctx: &TurnCtx, _ev: &LlmEvent) -> Vec<PendingEvent> { unimplemented!() }
+    pub fn usage_to_model_usage(_u: &Usage) -> ModelUsage { unimplemented!() }              // computed_total() fallback when total==0
+    pub fn token_count_payload(_usage: &ModelUsage, _prev_total: &Value, _window: Option<i64>, _turn_idx: usize) -> Value { unimplemented!() }
+    pub struct ResultFilePtr { pub url: Option<String>, pub path: Option<String>, pub bytes: Option<u64> }
+    pub fn session_done_payload(_result: Option<&str>, _result_file: Option<&ResultFilePtr>) -> Value { unimplemented!() }
+
+    pub mod names {
+        pub const SESSION_INPUT: &str = "session.input";
+        pub const SESSION_FOLLOWUP: &str = "session.followup";
+        pub const SESSION_DONE: &str = "session.done";
+        pub const SESSION_FAILED: &str = "session.failed";
+        pub const TASK_STARTED: &str = "task_started";    // CODEX_TURN_STARTED_EVENT
+        pub const TASK_COMPLETE: &str = "task_complete";  // CODEX_TURN_COMPLETE_EVENT
+        pub const TURN_ABORTED: &str = "turn_aborted";    // CODEX_TURN_ABORTED_EVENT
+        pub const TOKEN_COUNT: &str = "token_count";      // CODEX_TOKEN_COUNT_EVENT
+        pub const STREAM_ERROR: &str = "stream_error";    // CODEX_STREAM_ERROR_EVENT
+        pub const MODEL_TURN_REQUEST: &str = "model.turn.request";
+        pub const MODEL_TURN_RETRY: &str = "model.turn.retry";
+        pub const MODEL_TURN_ERROR: &str = "model.turn.error";
+        pub const MODEL_STREAM_DELTA: &str = "model.stream_delta";
+        pub const MODEL_THINKING_DELTA: &str = "model.thinking_delta";
+        pub const TOOL_STARTED: &str = "tool.started";
+        pub const TOOL_OUTPUT: &str = "tool.output";
+        pub const TOOL_FAILED: &str = "tool.failed";
+        pub const TOOL_IMAGE: &str = "tool.image";
+        pub const TOOL_OUTPUT_SPILLED: &str = "tool.output_spilled";
+        pub const ARTIFACT_CREATED: &str = "artifact.created";
+        pub const DEFAULT_TOOL_OUTPUT_TEXT_TOKENS: usize = 2_500; // core constants.rs:10
+    }
+
+    // ---- store_sink.rs (async writer task; the ONLY EventSink that touches the DB) ----
+    pub struct ArtifactSpec { pub kind: String, pub path: String, pub mime: String, pub metadata: serde_json::Value }
+    pub struct StoreSink { /* tx: UnboundedSender<StoreOp> */ }
+    impl StoreSink {
+        pub fn spawn(_store: std::sync::Arc<browser_use_store::Store>) -> (Self, tokio::task::JoinHandle<()>) { unimplemented!() }
+        pub fn emit_and_record(&self, _ev: PendingEvent, _art: ArtifactSpec) { unimplemented!() } // append_event THEN record_artifact(seq)
+    }
+    impl EventSink for StoreSink { fn emit(&self, _ev: PendingEvent) { unimplemented!() } }
+}
+
+// ============================================================================
+// context/ — ContextManager + REAL token accounting. Pure core, thin async wrapper.
+// `Item` == browser-use-protocol canonical transcript item (ResponseItem equivalent).
+// Until protocol exposes it, the frozen surface aliases serde_json::Value (legacy currency).
+// ============================================================================
+pub mod context {
+    use browser_use_llm::schema::{Usage, Message};
+    pub type Item = serde_json::Value;          // FROZEN ALIAS; swap to protocol::ResponseItem when available (open q)
+    pub type InputModality = browser_use_llm::schema::ContentPart; // modality probe; real enum lives in route capabilities
+
+    pub mod accounting {
+        use super::*;
+        pub const APPROX_BYTES_PER_TOKEN: i64 = 4;
+        pub const RESIZED_IMAGE_BYTES_ESTIMATE: i64 = 7_373;
+        pub fn approx_tokens_from_byte_count_i64(_b: i64) -> i64 { unimplemented!() } // <=0 =>0 else dceil4
+        pub fn approx_bytes_for_tokens(_t: usize) -> usize { unimplemented!() }       // t*4
+        pub fn estimate_reasoning_length(_len: usize) -> usize { unimplemented!() }   // *3/4 -650 sat
+        pub fn estimate_encrypted_function_output_length(_len: usize) -> usize { unimplemented!() } // *9 dceil16
+        #[derive(Clone, Copy, Default, Debug, PartialEq, Eq)]
+        pub struct TokenUsage { pub input: i64, pub cached_input: i64, pub output: i64, pub reasoning_output: i64, pub total: i64 }
+        impl TokenUsage {
+            pub fn from_llm_usage(_u: &Usage) -> Self { unimplemented!() }            // total=in+out+reasoning if 0 (excl cached)
+            pub fn add(&self, _o: &Self) -> Self { unimplemented!() }
+        }
+        #[derive(Clone, Default, Debug, PartialEq, Eq)]
+        pub struct TokenUsageInfo { pub total: TokenUsage, pub last: TokenUsage, pub model_context_window: Option<i64> }
+        impl TokenUsageInfo {
+            pub fn new_or_append(_prev: Option<&TokenUsageInfo>, _last: Option<&TokenUsage>, _window: Option<i64>) -> Option<TokenUsageInfo> { unimplemented!() }
+            pub fn fill_to_context_window(&mut self, _window: i64) { unimplemented!() }
+            pub fn full_context_window(_window: i64) -> Self { unimplemented!() }
+        }
+    }
+
+    pub mod assembly {
+        use super::*;
+        pub fn estimate_item_model_visible_bytes(_i: &Item) -> i64 { unimplemented!() }
+        pub fn estimate_item_token_count(_i: &Item) -> i64 { unimplemented!() }
+        pub fn is_api_message(_i: &Item) -> bool { unimplemented!() }
+        pub fn is_model_generated_item(_i: &Item) -> bool { unimplemented!() }
+        pub fn is_user_turn_boundary(_i: &Item) -> bool { unimplemented!() }
+        pub fn is_codex_generated_item(_i: &Item) -> bool { unimplemented!() }
+        #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+        pub enum TruncationPolicy { Bytes(usize), Tokens(usize) }
+        impl TruncationPolicy { pub fn byte_budget(self) -> usize { unimplemented!() } pub fn scale(self, _f: f64) -> Self { unimplemented!() } }
+        pub fn truncate_text(_t: &str, _p: TruncationPolicy) -> String { unimplemented!() }
+        pub fn process_item(_i: &Item, _p: TruncationPolicy) -> Item { unimplemented!() }  // outputs get p*1.2
+        pub fn ensure_call_outputs_present(_items: &mut Vec<Item>) { unimplemented!() }
+        pub fn remove_orphan_outputs(_items: &mut Vec<Item>) { unimplemented!() }
+        pub fn strip_images_when_unsupported(_supports_image: bool, _items: &mut [Item]) { unimplemented!() }
+        pub fn remove_corresponding_for(_items: &mut Vec<Item>, _removed: &Item) { unimplemented!() }
+        pub fn for_prompt(_items: Vec<Item>, _supports_image: bool) -> Vec<Item> { unimplemented!() } // ensure->orphan->strip
+        #[derive(Clone, Copy, Default, Debug)]
+        pub struct TotalTokenUsageBreakdown {
+            pub last_api_response_total_tokens: i64,
+            pub all_history_items_model_visible_bytes: i64,
+            pub estimated_tokens_since_last_api_response: i64,
+            pub estimated_bytes_since_last_api_response: i64,
+        }
+        pub fn total_token_usage(_items: &[Item], _info: Option<&accounting::TokenUsageInfo>, _server_reasoning_included: bool) -> i64 { unimplemented!() }
+        pub fn total_token_usage_breakdown(_items: &[Item], _info: Option<&accounting::TokenUsageInfo>) -> TotalTokenUsageBreakdown { unimplemented!() }
+    }
+
+    pub mod inject {
+        use super::*;
+        #[derive(Clone, Copy, Debug)]
+        pub enum ContextKind { WorkspaceEnv, WorkspaceAgents, WorkspaceUserShell, Permissions, MultiAgentUsageHint, ModelSwitch, Personality, Goal, GeneratedImage, Collaboration, Mention, Hook }
+        pub fn context_message_name(_k: ContextKind) -> &'static str { unimplemented!() } // == core constants.rs values
+        pub fn build_context_message(_k: ContextKind, _text: String) -> Item { unimplemented!() }
+        pub fn is_contextual_message(_i: &Item) -> bool { unimplemented!() }             // keyed off `name`
+        pub fn move_workspace_context_before_first_user(_items: &mut Vec<Item>, _inject_default_permissions: bool) { unimplemented!() }
+        #[derive(Clone, Debug)] pub struct TurnContextItem(pub serde_json::Value);     // baseline snapshot (open q: fields)
+        pub fn build_settings_update_items(_prev: Option<&TurnContextItem>, _next: &TurnContextItem) -> Vec<Item> { unimplemented!() }
+    }
+
+    /// Async wrapper — the ONLY !pure surface. browser-use-store = WRITE-SINK + notify.
+    pub struct ContextManager { /* items, history_version, token_info, reference_context_item, sink */ }
+    impl ContextManager {
+        pub fn new() -> Self { unimplemented!() }
+        pub fn record_items<I: IntoIterator<Item = Item>>(&mut self, _items: I, _p: assembly::TruncationPolicy) { unimplemented!() }
+        pub fn snapshot_for_prompt(&self, _supports_image: bool) -> Vec<Item> { unimplemented!() }
+        pub fn lower_to_messages(&self, _items: &[Item]) -> Vec<Message> { unimplemented!() } // Item -> browser-use-llm Message for LlmRequest
+        pub fn update_token_info(&mut self, _u: &accounting::TokenUsage, _window: Option<i64>) { unimplemented!() }
+        pub fn set_token_usage_full(&mut self, _window: i64) { unimplemented!() }
+        pub fn total_token_usage(&self, _server_reasoning_included: bool) -> i64 { unimplemented!() }
+        pub fn breakdown(&self) -> assembly::TotalTokenUsageBreakdown { unimplemented!() }
+        pub fn history_version(&self) -> u64 { unimplemented!() }
+        pub async fn persist_snapshot(&self) -> anyhow::Result<()> { unimplemented!() }   // write+notify, never read back
+    }
+}
+
+// ============================================================================
+// tools/ — ToolOrchestrator + runtime/approval/sandbox seam (sandbox=None initially).
+// ============================================================================
+pub mod tools {
+    use std::path::{Path, PathBuf};
+    use crate::decision::ToolParallelism;
+
+    // ---- approval.rs ----
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum AskForApproval { Never, OnFailure, OnRequest, UnlessTrusted, Granular(GranularApprovalConfig) }
+    #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+    pub struct GranularApprovalConfig { pub sandbox_approval: bool }
+    impl GranularApprovalConfig { pub fn allows_sandbox_approval(&self) -> bool { self.sandbox_approval } }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub enum ReviewDecision { Approved, ApprovedForSession, Denied, Abort, TimedOut }
+    impl ReviewDecision { pub fn is_approved(self) -> bool { matches!(self, Self::Approved | Self::ApprovedForSession) } }
+    #[derive(Clone, Debug, PartialEq, Eq)]
+    pub enum ExecApprovalRequirement { Skip { bypass_sandbox: bool }, NeedsApproval { reason: Option<String> }, Forbidden { reason: String } }
+    #[derive(Default)] pub struct ApprovalStore { /* HashMap<String, ReviewDecision> */ }
+    impl ApprovalStore {
+        pub fn get<K: serde::Serialize>(&self, _k: &K) -> Option<ReviewDecision> { unimplemented!() }
+        pub fn put<K: serde::Serialize>(&mut self, _k: K, _v: ReviewDecision) { unimplemented!() }
+    }
+
+    // ---- sandbox.rs (stub now, real Landlock/seccomp later) ----
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum SandboxType { None, Restricted }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum SandboxPreference { Auto, Never }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum SandboxPermissions { UseDefault, RequireEscalated, WithAdditionalPermissions }
+    impl SandboxPermissions { pub fn requires_escalated_permissions(&self) -> bool { matches!(self, Self::RequireEscalated) } }
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum SandboxOverride { NoOverride, BypassSandboxFirstAttempt }
+    #[derive(Clone, Debug)] pub struct FileSystemSandboxPolicy { pub restricted: bool, pub denied_read: bool }
+    impl FileSystemSandboxPolicy { pub fn is_restricted(&self) -> bool { self.restricted } pub fn has_denied_read_restrictions(&self) -> bool { self.denied_read } }
+    pub struct SandboxLaunch { pub sandbox: SandboxType, pub cancel: Option<tokio_util::sync::CancellationToken> }
+    pub trait SandboxProvider: Send + Sync {
+        fn select_initial(&self, fs: &FileSystemSandboxPolicy, pref: SandboxPreference, managed_network: bool) -> SandboxType;
+        fn prepare(&self, sandbox: SandboxType, cwd: &Path, perms: SandboxPermissions) -> SandboxLaunch;
+    }
+    pub struct NoneSandboxProvider;     // stub: select_initial->None, prepare->unsandboxed
+    impl SandboxProvider for NoneSandboxProvider {
+        fn select_initial(&self, _fs: &FileSystemSandboxPolicy, _p: SandboxPreference, _m: bool) -> SandboxType { SandboxType::None }
+        fn prepare(&self, _s: SandboxType, _cwd: &Path, _p: SandboxPermissions) -> SandboxLaunch { SandboxLaunch { sandbox: SandboxType::None, cancel: None } }
+    }
+
+    // ---- runtime.rs (the trait stack a tool implements ONCE) ----
+    pub struct ToolCtx { pub call_id: String, pub tool_name: String, pub cwd: PathBuf }
+    pub struct SandboxAttempt<'a> { pub sandbox: SandboxType, pub permissions: SandboxPermissions, pub enforce_managed_network: bool, pub launch: &'a SandboxLaunch, pub cancel: Option<tokio_util::sync::CancellationToken> }
+    #[derive(Debug)] pub struct ExecOutput { pub exit_code: i32, pub stdout: String, pub stderr: String }
+    #[derive(Debug)] pub struct NetworkPolicyDecision { pub host: String }
+    #[derive(Debug)] pub struct SandboxDenial { pub output: ExecOutput, pub network_policy_decision: Option<NetworkPolicyDecision> }
+    #[derive(Debug)] pub enum ToolError { Rejected(String), Sandboxed(SandboxDenial), Other(anyhow::Error) }
+    pub struct ApprovalRequest<'a> { pub ctx: &'a ToolCtx, pub reason: Option<String>, pub guardian_review_id: Option<String> }
+    pub struct PermissionRequestPayload(pub serde_json::Value);
+
+    pub trait Approvable<Req> {
+        type ApprovalKey: std::hash::Hash + Eq + Clone + std::fmt::Debug + serde::Serialize;
+        fn approval_keys(&self, req: &Req) -> Vec<Self::ApprovalKey>;
+        fn sandbox_permissions(&self, _req: &Req) -> SandboxPermissions { SandboxPermissions::UseDefault }
+        fn exec_approval_requirement(&self, _req: &Req) -> Option<ExecApprovalRequirement> { None }
+        fn should_bypass_approval(&self, policy: AskForApproval, already_approved: bool) -> bool { already_approved || matches!(policy, AskForApproval::Never) } // sandboxing.rs:305
+        fn wants_no_sandbox_approval(&self, policy: AskForApproval) -> bool {                                                                                    // sandboxing.rs:320
+            matches!(policy, AskForApproval::OnFailure | AskForApproval::UnlessTrusted)
+        }
+        fn permission_request_payload(&self, _req: &Req) -> Option<PermissionRequestPayload> { None }
+    }
+    pub trait Sandboxable { fn sandbox_preference(&self) -> SandboxPreference; fn escalate_on_failure(&self) -> bool { true } }
+    #[async_trait::async_trait]
+    pub trait ToolRuntime<Req: Send + Sync, Out: Send>: Approvable<Req> + Sandboxable + Send + Sync {
+        fn parallel_safe(&self, _req: &Req) -> bool { false }                          // -> decision::classify_parallelism
+        async fn run(&self, req: &Req, attempt: &SandboxAttempt<'_>, ctx: &ToolCtx) -> Result<Out, ToolError>;
+    }
+    #[async_trait::async_trait]
+    pub trait Approver: Send + Sync { async fn review(&self, payload: ApprovalRequest<'_>) -> ReviewDecision; }
+    pub struct AutoApprover;  // stub
+    #[async_trait::async_trait]
+    impl Approver for AutoApprover { async fn review(&self, _p: ApprovalRequest<'_>) -> ReviewDecision { ReviewDecision::Approved } }
+
+    // ---- PURE decision fns (sandboxing.rs:202-334, orchestrator.rs:145-388) — live here for enum access ----
+    pub fn default_exec_approval_requirement(_policy: AskForApproval, _fs: &FileSystemSandboxPolicy) -> ExecApprovalRequirement { unimplemented!() }
+    pub fn sandbox_override_for_first_attempt(_perms: SandboxPermissions, _req: &ExecApprovalRequirement, _fs: &FileSystemSandboxPolicy) -> SandboxOverride { unimplemented!() }
+    pub fn map_decision(_d: ReviewDecision, _guardian_review_id: Option<&str>) -> Result<(), ToolError> { unimplemented!() }
+    pub fn build_denial_reason(_host: Option<&str>) -> String { unimplemented!() }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub enum DenialAction { Return, RetryNone { needs_reapproval: bool } }
+    #[derive(Debug, Clone, PartialEq, Eq)]
+    pub struct AttemptPlan { pub needs_initial_approval: bool, pub initial_sandbox: SandboxType, pub on_denial: DenialAction }
+    /// PURE state machine factoring orchestrator.rs:145-388 into a decision table.
+    pub fn plan_attempts(_requirement: &ExecApprovalRequirement, _ovr: SandboxOverride, _escalate_on_failure: bool, _wants_no_sandbox: bool, _should_bypass: bool, _strict_auto_review: bool, _already_approved: bool, _net_denial: bool) -> AttemptPlan { unimplemented!() }
+
+    // ---- orchestrator.rs ----
+    pub struct TurnEnv { pub file_system_sandbox_policy: FileSystemSandboxPolicy, pub managed_network_active: bool, pub strict_auto_review: bool, pub use_guardian: bool }
+    pub struct OrchestratorRunResult<Out> { pub output: Out }
+    pub struct ToolOrchestrator<S: SandboxProvider, A: Approver> { /* sandbox, approver, approvals: tokio::Mutex<ApprovalStore> */ _s: std::marker::PhantomData<(S, A)> }
+    impl ToolOrchestrator<NoneSandboxProvider, AutoApprover> {
+        pub fn stub() -> Self { unimplemented!() }   // sandbox=None + auto-approve path
+    }
+    impl<S: SandboxProvider, A: Approver> ToolOrchestrator<S, A> {
+        pub async fn run<Req, Out, T>(&self, _tool: &T, _req: &Req, _ctx: &ToolCtx, _env: &TurnEnv, _policy: AskForApproval) -> Result<OrchestratorRunResult<Out>, ToolError>
+        where T: ToolRuntime<Req, Out>, Req: Send + Sync, Out: Send { unimplemented!() }
+    }
+    pub use crate::decision::ToolParallelism as _ToolParallelism; // re-export for callers
+}
+
+// ============================================================================
+// turn/ — async turn loop + in-turn tool dispatch.
+// ============================================================================
+pub mod turn {
+    use crate::{decision, events::TurnCtx};
+    use browser_use_llm::schema::Message;
+    use tokio_util::sync::CancellationToken;
+
+    /// Reads/writes conversation state. Impl over ContextManager+Session; tests use InMemoryTurnState.
+    pub trait TurnState: Send + Sync + 'static {
+        fn clone_history_for_prompt(&self) -> impl std::future::Future<Output = Vec<Message>> + Send;
+        fn record_items(&self, items: &[Message]) -> impl std::future::Future<Output = ()> + Send;
+        fn has_pending_input(&self) -> impl std::future::Future<Output = bool> + Send;
+        fn take_pending_input(&self) -> impl std::future::Future<Output = Vec<Message>> + Send;
+        fn token_status(&self) -> impl std::future::Future<Output = decision::TokenStatus> + Send;
+    }
+    /// One sampling round-trip + ordered tool dispatch (turn.rs:892/1655/1873). Returns SamplingOutcome.
+    pub trait SamplingDriver: Send + Sync + 'static {
+        fn run_sampling_request(&self, input: Vec<Message>, cancel: CancellationToken)
+            -> impl std::future::Future<Output = Result<decision::SamplingOutcome, crate::AgentError>> + Send;
+    }
+    /// Side-effect sink for the loop (delegates to events::EventSink + lifecycle).
+    pub trait TurnObserver: Send + Sync + 'static {
+        fn on_lifecycle(&self, ev: crate::task::TurnLifecycleEvent);
+    }
+
+    pub struct TurnLoop<St, Sd, Ob> { _s: std::marker::PhantomData<(St, Sd, Ob)> }
+    impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
+        pub fn new(_state: St, _sampler: Sd, _observer: Ob) -> Self { unimplemented!() }
+        /// Unbounded driver (turn.rs:214-397). No max-turns counter. Returns last_agent_message.
+        pub async fn run(&self, _ctx: TurnCtx, _turn_has_fresh_input: bool, _cancel: CancellationToken) -> Result<Option<String>, crate::AgentError> { unimplemented!() }
+    }
+
+    pub struct ToolDispatchResult { pub outputs_in_order: Vec<Message>, pub needs_follow_up: bool }
+    pub struct ToolDispatcher { /* gate: Arc<tokio::sync::RwLock<()>>, toolset */ }
+    impl ToolDispatcher {
+        pub fn new() -> Self { unimplemented!() }
+        /// FuturesOrdered + RwLock gate (turn.rs:106 + parallel.rs); records in MODEL order; honors cancel + drains.
+        pub async fn dispatch_ordered(&self, _calls: Vec<browser_use_llm::schema::ContentPart>, _cancel: CancellationToken) -> ToolDispatchResult { unimplemented!() }
+    }
+}
+
+// ============================================================================
+// task/ — async task driver / lifecycle.
+// ============================================================================
+pub mod task {
+    use tokio_util::sync::CancellationToken;
+    pub const GRACEFULL_INTERRUPTION_TIMEOUT_MS: u64 = 100; // tasks/mod.rs:64
+
+    #[derive(Debug, Clone, PartialEq, Eq)] pub enum TurnAbortReason { Interrupted, Replaced, Error }
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)] pub enum InterruptedTurnHistoryMarker { Disabled, ContextualUser, Developer }
+    impl InterruptedTurnHistoryMarker {
+        pub fn from_config(_interrupt_enabled: bool, _multi_agent_v2: bool) -> Self { unimplemented!() } // tasks/mod.rs:74
+    }
+    #[derive(Debug, Clone, PartialEq, Eq)] pub enum TaskKind { Regular, Compact, Review }
+    #[derive(Debug, Clone)]
+    pub enum TurnLifecycleEvent {
+        TurnStarted { turn_id: String },
+        TurnComplete { turn_id: String, last_agent_message: Option<String> },
+        TurnAborted { turn_id: String, reason: TurnAbortReason },
+    }
+    pub trait SessionTask: Send + Sync + 'static {
+        fn kind(&self) -> TaskKind;
+        fn run(self: std::sync::Arc<Self>, cancel: CancellationToken) -> impl std::future::Future<Output = Option<String>> + Send;
+        fn abort(&self) -> impl std::future::Future<Output = ()> + Send { async {} }
+    }
+    pub struct TaskDriver { /* active_turn: Mutex<Option<ActiveTurn>>, observer */ }
+    impl TaskDriver {
+        pub fn new() -> Self { unimplemented!() }
+        pub async fn spawn_task<T: SessionTask>(&self, _task: T) { unimplemented!() }       // abort_all(Replaced) + start (tasks/mod.rs:301)
+        pub async fn start_task<T: SessionTask>(&self, _task: T) { unimplemented!() }       // TurnStarted, tokio::spawn, done Notify
+        pub async fn abort_all_tasks(&self, _reason: TurnAbortReason) { unimplemented!() }  // graceful 100ms then handle.abort (tasks/mod.rs:846)
+    }
+}
+
+// ============================================================================
+// session/ — lifecycle, resume-by-replay, fork/rollback (PURE reducer + thin async).
+// ============================================================================
+pub mod session {
+    use crate::context::Item as ProviderMessage; // legacy currency = serde_json::Value
+    use browser_use_protocol::EventRecord;
+    use std::path::Path;
+
+    // ---- PURE reducer (lib.rs:8863-9646, rollback.rs:23-203) ----
+    pub fn provider_messages_from_events(_events: &[EventRecord]) -> Vec<ProviderMessage> { unimplemented!() }
+    pub fn provider_messages_from_events_for_fork(_events: &[EventRecord]) -> Vec<ProviderMessage> { unimplemented!() }
+    pub struct CompactionReplayState { pub seq: i64, pub messages: Vec<ProviderMessage>, pub initial_context_already_in_history: bool }
+    pub fn latest_compaction_replacement_history(_events: &[EventRecord]) -> Option<CompactionReplayState> { unimplemented!() }
+    pub fn provider_messages_from_event_slice(_events: &[&EventRecord], _messages: &mut Vec<ProviderMessage>, _has_checkpoint: bool, _include_agent_messages: bool) -> Vec<ProviderMessage> { unimplemented!() }
+    pub fn initial_context_messages_from_events(_events: &[EventRecord], _first_user_seq: Option<i64>, _include_all_anchored: bool, _inject_default_permissions: bool) -> Vec<ProviderMessage> { unimplemented!() }
+    pub fn rollback_filtered_events_after<'a>(_events: &'a [EventRecord], _after_seq: i64, _messages: &mut Vec<ProviderMessage>) -> Vec<&'a EventRecord> { unimplemented!() }
+    pub fn rollback_filtered_events_after_for_fork<'a>(_events: &'a [EventRecord], _after_seq: i64, _messages: &mut Vec<ProviderMessage>) -> Vec<&'a EventRecord> { unimplemented!() }
+    pub fn rollback_turn_count(_payload: &serde_json::Value) -> usize { unimplemented!() }
+    pub fn is_real_user_event(_e: &EventRecord) -> bool { unimplemented!() }
+    pub fn provider_history_has_open_turn(_messages: &[ProviderMessage]) -> bool { unimplemented!() }
+    pub fn is_persistable_event(_ty: &str, _payload: &serde_json::Value) -> bool { unimplemented!() } // policy.rs:17-221 mapped
+
+    // ---- write-sink boundary (store as SINK only) ----
+    pub struct SessionId(pub String);
+    pub type EventSeq = i64;
+    #[async_trait::async_trait]
+    pub trait EventSink: Send + Sync {                           // runtime: append-only, NEVER read
+        async fn append_event(&self, session: &SessionId, ty: &str, payload: serde_json::Value) -> anyhow::Result<EventSeq>;
+        async fn create_child_session(&self, parent: &SessionId, cwd: &Path, agent_path: Option<&str>) -> anyhow::Result<SessionId>;
+    }
+    #[async_trait::async_trait]
+    pub trait EventSource: Send + Sync {                         // resume/fork-time ONLY
+        async fn events_for_session(&self, session: &SessionId) -> anyhow::Result<Vec<EventRecord>>;
+        async fn events_after_seq(&self, session: &SessionId, after: EventSeq) -> anyhow::Result<Vec<EventRecord>>;
+    }
+    pub trait EventNotifier: Send + Sync { fn subscribe(&self) -> tokio::sync::broadcast::Receiver<browser_use_store::StoreNotification>; }
+
+    // ---- async lifecycle (thin: read once -> pure reduce -> install) ----
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)] pub enum SessionStatus { Running, Done, Failed, Cancelled }
+    pub enum ForkMode { None, LastN(usize), All, Summary }
+    pub struct Session { /* id, history: Vec<ProviderMessage>, sink, status, last_seq */ }
+    impl Session {
+        pub async fn create(_parent: Option<SessionId>, _cwd: std::path::PathBuf, _sink: std::sync::Arc<dyn EventSink>) -> anyhow::Result<Self> { unimplemented!() }
+        pub async fn resume(_id: SessionId, _src: std::sync::Arc<dyn EventSource>, _sink: std::sync::Arc<dyn EventSink>) -> anyhow::Result<Self> { unimplemented!() }
+        pub async fn fork(&self, _src: std::sync::Arc<dyn EventSource>, _sink: std::sync::Arc<dyn EventSink>, _mode: ForkMode) -> anyhow::Result<Self> { unimplemented!() }
+        pub async fn rollback(&mut self, _num_turns: usize, _src: std::sync::Arc<dyn EventSource>) -> anyhow::Result<EventSeq> { unimplemented!() }
+        pub fn history(&self) -> &[ProviderMessage] { unimplemented!() }
+        pub fn status(&self) -> SessionStatus { unimplemented!() }
+    }
+    pub async fn wait_for_events_after_seq(_n: &dyn EventNotifier, _src: &dyn EventSource, _s: &SessionId, _after: EventSeq) -> anyhow::Result<Vec<EventRecord>> { unimplemented!() }
+}
