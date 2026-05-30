@@ -413,15 +413,25 @@ pub fn redact_headers(headers: &[(String, String)]) -> Vec<(String, String)> {
 /// against credential echoes) in its error `Display`. This strips known
 /// credential tokens so they cannot leak into [`LlmError`] messages.
 fn scrub(msg: &str) -> String {
+    const REPLACEMENT: &str = "Bearer <redacted>";
     let mut out = msg.to_string();
     for marker in ["Bearer ", "bearer "] {
-        while let Some(pos) = out.find(marker) {
-            let tail = &out[pos + marker.len()..];
-            let end = tail
+        // Advance a search cursor past each replacement so we never re-match the
+        // "Bearer " inside our own "Bearer <redacted>" output — that self-match
+        // was an infinite loop that hung the test binaries.
+        let mut search_from = 0;
+        while let Some(rel) = out[search_from..].find(marker) {
+            let pos = search_from + rel;
+            let token_start = pos + marker.len();
+            let end = out[token_start..]
                 .find(|c: char| c.is_whitespace())
-                .map(|e| pos + marker.len() + e)
+                .map(|e| token_start + e)
                 .unwrap_or(out.len());
-            out.replace_range(pos..end, "Bearer <redacted>");
+            out.replace_range(pos..end, REPLACEMENT);
+            search_from = pos + REPLACEMENT.len();
+            if search_from >= out.len() {
+                break;
+            }
         }
     }
     out
