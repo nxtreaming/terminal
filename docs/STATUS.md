@@ -134,3 +134,27 @@ Wave-2 parity debt still open (revisit pre-cutover): B5 transport-switch is a no
 - C1 turn/dispatch.rs — FuturesOrdered ordered tool dispatch + RwLock parallel/serial gate (needs B1)
 - C2 turn/{loop_driver,mod}.rs — the unbounded turn loop wiring decision::classify_loop_step + sampling + dispatch + context (needs A1+B5+C1+B2)
 - C3 task/{driver,abort,lifecycle}.rs — task driver, spawn/abort, graceful-100ms-then-hard, lifecycle events (needs C2+B4+B3)
+
+---
+
+## ✅ M3 CORE ENGINE COMPLETE — decodex @ 8d40ff0, 194 tests green, full workspace builds
+
+Wave 3 (integration spine) merged:
+- [x] C1 turn/dispatch.rs — FuturesOrdered ordered dispatch + RwLock parallel/serial gate (`fc45445`)
+- [x] C2 turn/{loop_driver,mod}.rs — unbounded decision-driven turn loop, NO max-turns (`41ce0c9`)
+- [x] C3 task/{driver,abort,lifecycle}.rs — one-active-task spawn/replace, graceful-100ms-then-hard abort, TurnStarted/Complete/Aborted lifecycle, InterruptedTurnHistoryMarker (`ae6e291`)
+
+The new async `browser-use-agent` crate now has the full engine skeleton wired:
+schema/route/protocols/providers/tool-runtime (Wave 1 llm + cores) → orchestrator/context/store-sink/session/sampling (Wave 2) → dispatch/turn-loop/task-driver (Wave 3). 194 unit/integration tests, all pure/scripted (no network), green.
+
+### What is FUNCTIONAL vs STUBBED at M3-core-complete (honest)
+The control-flow + decision logic is codex-faithful and tested, but several bodies are intentionally stubbed pending their own WPs:
+- Compaction body: control flow (compact-then-continue) is parity-correct; the model summarizer is a TurnState::compact() hook (no-op default) — real WP pending.
+- SamplingDriver↔ToolDispatcher are SEPARATE seams; a production SamplingDriver must fuse dispatch (run tool calls, record outputs) — wiring pending the toolset WP.
+- OrchestratorRunner is a placeholder that records tool-result Messages rather than routing real per-tool Req/Out through ToolOrchestrator::run — pending toolset WP.
+- No real tools yet (shell/apply_patch/browser/etc.), no real model HTTP call exercised end-to-end, no sandbox/guardian/network.
+- Logging: crate has no tracing facade; hard-abort/store-error paths surface via events/return, not logs.
+
+### NEXT (autonomous, one WP at a time, isolated worktrees, verify-before-merge):
+TOOLS PORT → SUBSYSTEMS (compaction model-based, MCP transports, subagents, goals, skills/plugins, hooks+PermissionRequest, prompts de-brand, rollout) → SAFETY (sandbox/execpolicy/network/guardian).
+FINAL CUTOVER (TUI/CLI: browser-use-core → browser-use-agent; retire core) = [BLOCKED-NEEDS-HUMAN] — do NOT do autonomously.
