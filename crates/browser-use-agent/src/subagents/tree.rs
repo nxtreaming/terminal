@@ -127,30 +127,44 @@ fn collect_into(
 
 /// Canonicalize a human-supplied agent reference relative to `current_agent_path`.
 ///
-/// Ported verbatim from legacy `canonical_agent_reference` (lib.rs:22313):
+/// Ported from legacy `canonical_agent_reference` (lib.rs:22313). The legacy
+/// grammar is preserved exactly:
 /// - trim, strip a single leading `@`, trim again;
 /// - empty -> the current path;
+/// - the bare keyword `root` (or `/root`) -> [`ROOT_AGENT_PATH`];
 /// - absolute (`/…`) -> returned unchanged;
-/// - `.` / `self` -> the current path;
-/// - `..` -> the parent of the current path (or [`ROOT_AGENT_PATH`] if none);
+/// - `parent` (case-insensitive) -> the parent of the current path
+///   (or [`ROOT_AGENT_PATH`] if none);
 /// - otherwise relative -> `{current_agent_path}/{reference}`.
+///
+/// We additionally accept the path-style synonyms `..` (== `parent`) and
+/// `.`/`self` (== the current path); these are not in legacy but cannot collide
+/// with a real agent task name, so they extend the grammar without dropping any
+/// legacy behavior.
 pub fn canonical_agent_reference(reference: &str, current_agent_path: &str) -> String {
     let reference = reference.trim().trim_start_matches('@').trim();
     if reference.is_empty() {
         return current_agent_path.to_string();
     }
+    // Legacy: the bare keyword `root`/`/root` always resolves to the tree root.
+    if reference == "root" || reference == "/root" {
+        return ROOT_AGENT_PATH.to_string();
+    }
     if reference.starts_with('/') {
         return reference.to_string();
     }
-    if reference == "." || reference == "self" {
-        return current_agent_path.to_string();
-    }
-    if reference == ".." {
+    // Legacy: `parent` (case-insensitive) walks one level up; `..` is our synonym.
+    if reference.eq_ignore_ascii_case("parent") || reference == ".." {
         return parent_path_of(current_agent_path)
             .unwrap_or(ROOT_AGENT_PATH)
             .to_string();
     }
-    format!("{current_agent_path}/{reference}")
+    // Convenience synonyms for the current node (additions, not in legacy).
+    if reference == "." || reference == "self" {
+        return current_agent_path.to_string();
+    }
+    let normalized = current_agent_path.trim_end_matches('/');
+    format!("{normalized}/{reference}")
 }
 
 /// Resolve an agent reference (mention, path, `.`/`..`/`self`, or nickname)
@@ -163,9 +177,10 @@ pub fn canonical_agent_reference(reference: &str, current_agent_path: &str) -> S
 /// 2. canonicalize the reference relative to `current_agent_path`
 ///    ([`canonical_agent_reference`]);
 /// 3. match the canonical path exactly against the collected tree (root
-///    included);
+///    included), skipping `closed` agents — legacy filters
+///    `.filter(|agent| agent.status != "closed")` (lib.rs:22463);
 /// 4. as a convenience fallback (legacy resolves nicknames via a separate
-///    lookup), match a unique agent `nickname` case-sensitively.
+///    lookup), match a unique non-closed agent `nickname` case-sensitively.
 ///
 /// Returns `None` when nothing matches.
 pub fn resolve_agent_reference_in_tree(
@@ -178,17 +193,22 @@ pub fn resolve_agent_reference_in_tree(
     let canonical = canonical_agent_reference(reference, current_agent_path);
     let tree = collect_agent_tree(registry, &root_path);
 
-    // Exact canonical-path match (the legacy primary resolution).
-    if let Some(node) = tree.iter().find(|n| n.record.agent_path == canonical) {
+    // Exact canonical-path match (the legacy primary resolution), skipping
+    // closed agents to match legacy `status != "closed"` filtering.
+    if let Some(node) = tree
+        .iter()
+        .find(|n| n.record.status != AgentStatus::Closed && n.record.agent_path == canonical)
+    {
         return Some(node.record.clone());
     }
 
-    // Nickname fallback: a single agent whose nickname equals the raw (trimmed,
-    // de-@'d) reference token.
+    // Nickname fallback: a single non-closed agent whose nickname equals the raw
+    // (trimmed, de-@'d) reference token.
     let token = reference.trim().trim_start_matches('@').trim();
     if !token.is_empty() {
         let mut hits = tree
             .iter()
+            .filter(|n| n.record.status != AgentStatus::Closed)
             .filter(|n| n.record.nickname.as_deref() == Some(token));
         if let Some(node) = hits.next() {
             if hits.next().is_none() {
@@ -322,6 +342,39 @@ mod tree_unit_tests {
         assert_eq!(canonical_agent_reference("..", "/root/alpha"), "/root");
         assert_eq!(canonical_agent_reference("..", "/root"), ROOT_AGENT_PATH);
         assert_eq!(canonical_agent_reference("", "/root/alpha"), "/root/alpha");
+        // Legacy keyword grammar: `root` and `parent` (case-insensitive).
+        assert_eq!(canonical_agent_reference("root", "/root/alpha"), "/root");
+        assert_eq!(canonical_agent_reference("@root", "/root/alpha"), "/root");
+        assert_eq!(canonical_agent_reference("/root", "/root/alpha"), "/root");
+        assert_eq!(canonical_agent_reference("parent", "/root/alpha"), "/root");
+        assert_eq!(
+            canonical_agent_reference("PARENT", "/root/alpha/leaf"),
+            "/root/alpha"
+        );
+        assert_eq!(
+            canonical_agent_reference("parent", "/root"),
+            ROOT_AGENT_PATH
+        );
+    }
+
+    #[test]
+    fn resolve_skips_closed_agents() {
+        let r = registry();
+        // Close the leaf; the legacy resolver filters `status != "closed"`.
+        assert!(r.update_status("/root/alpha/leaf", AgentStatus::Closed));
+        // Exact-path resolution must now miss the closed agent.
+        assert!(
+            resolve_agent_reference_in_tree(&r, "/root", "/root/alpha/leaf").is_none(),
+            "closed agent must not resolve by path"
+        );
+        // Nickname resolution must also skip the closed agent.
+        assert!(
+            resolve_agent_reference_in_tree(&r, "/root", "worker").is_none(),
+            "closed agent must not resolve by nickname"
+        );
+        // A still-open sibling resolves normally.
+        let beta = resolve_agent_reference_in_tree(&r, "/root", "@beta").unwrap();
+        assert_eq!(beta.agent_path, "/root/beta");
     }
 
     #[test]
