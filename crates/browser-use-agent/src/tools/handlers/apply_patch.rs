@@ -82,12 +82,26 @@ const HUNK_MARKER: &str = "@@";
 ///
 /// `patch` is the full V4A envelope text; `cwd` overrides [`ToolCtx::cwd`] as the
 /// workspace root the patch is applied under (and the path-safety boundary).
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// # Wire shape (model-facing args)
+///
+/// ```json
+/// { "patch": "*** Begin Patch\n*** Add File: a.txt\n+hi\n*** End Patch" }
+/// ```
+///
+/// Deserializes directly from the model's argument object. The `patch` field name
+/// matches codex's apply-patch argument (`core/src/tools/handlers/apply_patch.rs`
+/// / `apply-patch/src/parser.rs`) and the legacy spec
+/// (`browser-use-core/src/tools/mod.rs` / `files.rs`). `cwd` is not part of the
+/// model's wire args (codex applies under the session cwd); it defaults to `None`
+/// so deserialization of `{ "patch": ... }` succeeds.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct ApplyPatchRequest {
     /// The full V4A patch text, including the `*** Begin Patch` / `*** End Patch`
     /// envelope.
     pub patch: String,
     /// Workspace root to apply under. When `None`, the [`ToolCtx::cwd`] is used.
+    #[serde(default)]
     pub cwd: Option<PathBuf>,
 }
 
