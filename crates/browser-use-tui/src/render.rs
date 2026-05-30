@@ -22,8 +22,9 @@ use crate::theme::*;
 use crate::transcript;
 
 use super::{
-    collaboration_mode_label, App, MessageActionKind, ProductState, RequestUserInputFocus,
-    SetupResultKind, Surface,
+    collaboration_mode_label, event_payload_text, pending_active_followup_events_from_events,
+    pending_queued_followup_events_from_events, App, MessageActionKind, ProductState,
+    RequestUserInputFocus, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -223,10 +224,15 @@ fn render_main(
         && !layout_surface.is_bottom_pane();
     let attach_bottom_to_body =
         native_scrollback_active && !body.is_empty() && !layout_surface.is_bottom_pane();
+    let reserve_live_status_row = attach_bottom_to_body
+        && transcript::active_viewport_needs_status_row_reserve(transcript_model.as_ref());
+    let layout_body_len = body
+        .len()
+        .saturating_add(usize::from(reserve_live_status_row));
     let (body_area, bottom_area, footer_area) = main_layout_areas(
         area,
         bottom_h,
-        body.len(),
+        layout_body_len,
         show_footer,
         pin_bottom,
         attach_bottom_to_body,
@@ -415,8 +421,15 @@ fn main_bottom_height_for(
 
 fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> u16 {
     let visual_input_lines = composer_visual_input_lines(app, width.saturating_sub(4).max(1));
+    let preview_lines = pending_followup_preview_lines(
+        app,
+        app.selected_session_id.as_deref(),
+        composer_preview_width(width),
+    )
+    .len()
+    .min(PENDING_FOLLOWUP_PREVIEW_MAX_LINES) as u16;
     // top border + input rows + bottom border + status row beneath.
-    visual_input_lines + 3
+    preview_lines + visual_input_lines + 3
 }
 
 /// Visual rows the input area inside the fused composer should occupy.
@@ -425,12 +438,141 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
 /// off-screen.
 const COMPOSER_INPUT_MIN_ROWS: u16 = 3;
 const COMPOSER_INPUT_MAX_ROWS: u16 = 10;
+const PENDING_FOLLOWUP_PREVIEW_MAX_LINES: usize = 8;
 
 fn composer_visual_input_lines(app: &App, input_area_width: u16) -> u16 {
     let visual_input_lines = app
         .composer
         .visual_line_count_wrapped(input_area_width as usize) as u16;
     visual_input_lines.clamp(COMPOSER_INPUT_MIN_ROWS, COMPOSER_INPUT_MAX_ROWS)
+}
+
+fn composer_preview_width(width: u16) -> u16 {
+    width.saturating_sub(4).max(1)
+}
+
+fn pending_followup_preview_lines(
+    app: &App,
+    session_id: Option<&str>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let events = app.cached_events_for_session(session_id);
+    let pending_active = pending_active_followup_events_from_events(events)
+        .into_iter()
+        .filter_map(event_payload_text)
+        .collect::<Vec<_>>();
+    let pending_queued = pending_queued_followup_events_from_events(events)
+        .into_iter()
+        .filter_map(event_payload_text)
+        .collect::<Vec<_>>();
+    if pending_active.is_empty() && pending_queued.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    if !pending_active.is_empty() {
+        push_wrapped_preview_line(
+            &mut lines,
+            "• ",
+            "  ",
+            "Messages to be submitted after next tool call (press esc to dequeue and edit)",
+            width,
+            muted(),
+        );
+        for message in pending_active {
+            push_limited_wrapped_preview_line(&mut lines, "  ↳ ", "    ", &message, width, muted());
+        }
+    }
+
+    if !pending_queued.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        for message in pending_queued {
+            let label = format!("queued follow-up  {message}");
+            push_limited_wrapped_preview_line(&mut lines, "• ", "  ", &label, width, muted());
+        }
+    }
+
+    lines
+}
+
+fn push_limited_wrapped_preview_line(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    continuation_prefix: &str,
+    text: &str,
+    width: u16,
+    style: Style,
+) {
+    const MAX_LINES_PER_MESSAGE: usize = 3;
+    let start = lines.len();
+    push_wrapped_preview_line(lines, prefix, continuation_prefix, text, width, style);
+    let added = lines.len().saturating_sub(start);
+    if added > MAX_LINES_PER_MESSAGE {
+        lines.truncate(start + MAX_LINES_PER_MESSAGE);
+        if let Some(last) = lines.last_mut() {
+            *last = Line::from(vec![
+                Span::styled(continuation_prefix.to_string(), dim()),
+                Span::styled("...".to_string(), style),
+            ]);
+        }
+    }
+}
+
+fn push_wrapped_preview_line(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    continuation_prefix: &str,
+    text: &str,
+    width: u16,
+    style: Style,
+) {
+    let mut first_visual = true;
+    let source_lines = if text.is_empty() {
+        vec![""]
+    } else {
+        text.lines().collect::<Vec<_>>()
+    };
+    for source_line in source_lines {
+        let chars = source_line.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            let active_prefix = if first_visual {
+                prefix
+            } else {
+                continuation_prefix
+            };
+            lines.push(Line::from(vec![Span::styled(
+                active_prefix.to_string(),
+                dim(),
+            )]));
+            first_visual = false;
+            continue;
+        }
+
+        let mut offset = 0;
+        while offset < chars.len() {
+            let active_prefix = if first_visual {
+                prefix
+            } else {
+                continuation_prefix
+            };
+            let budget = (width as usize)
+                .saturating_sub(active_prefix.chars().count())
+                .max(1);
+            let end = offset.saturating_add(budget).min(chars.len());
+            let chunk = chars[offset..end].iter().collect::<String>();
+            lines.push(Line::from(vec![
+                Span::styled(active_prefix.to_string(), dim()),
+                Span::styled(chunk, style),
+            ]));
+            first_visual = false;
+            offset = end;
+        }
+    }
 }
 
 fn render_bottom_pane(
@@ -468,8 +610,7 @@ fn render_bottom_pane(
         if data_h > 0 && app.selected_row >= data_h {
             let skip = app.selected_row + 1 - data_h;
             let head: Vec<Line<'static>> = lines.iter().take(header_reserved).cloned().collect();
-            let tail: Vec<Line<'static>> =
-                lines.into_iter().skip(header_reserved + skip).collect();
+            let tail: Vec<Line<'static>> = lines.into_iter().skip(header_reserved + skip).collect();
             lines = head;
             lines.extend(tail);
         }
@@ -685,8 +826,7 @@ fn render_surface_popup_box(
         if data_h > 0 && app.selected_row >= data_h {
             let skip = app.selected_row + 1 - data_h;
             let head: Vec<Line<'static>> = lines.iter().take(header_reserved).cloned().collect();
-            let tail: Vec<Line<'static>> =
-                lines.into_iter().skip(header_reserved + skip).collect();
+            let tail: Vec<Line<'static>> = lines.into_iter().skip(header_reserved + skip).collect();
             lines = head;
             lines.extend(tail);
         }
@@ -1223,6 +1363,44 @@ fn render_composer(
     if area.width == 0 || area.height == 0 {
         return;
     }
+    let session_id = state
+        .current_session
+        .as_ref()
+        .map(|session| session.id.as_str())
+        .or(app.selected_session_id.as_deref());
+    let mut preview_lines =
+        pending_followup_preview_lines(app, session_id, composer_preview_width(area.width));
+    if preview_lines.len() > PENDING_FOLLOWUP_PREVIEW_MAX_LINES {
+        preview_lines.truncate(PENDING_FOLLOWUP_PREVIEW_MAX_LINES);
+    }
+    let min_composer_h = COMPOSER_INPUT_MIN_ROWS.saturating_add(2).min(area.height);
+    let preview_h = (preview_lines.len() as u16)
+        .min(area.height.saturating_sub(min_composer_h))
+        .min(PENDING_FOLLOWUP_PREVIEW_MAX_LINES as u16);
+    if preview_h > 0 {
+        let preview_area = Rect {
+            x: area.x.saturating_add(2),
+            y: area.y,
+            width: composer_preview_width(area.width),
+            height: preview_h,
+        };
+        frame.render_widget(
+            Paragraph::new(preview_lines)
+                .style(Style::default().fg(text()))
+                .wrap(Wrap { trim: false }),
+            preview_area,
+        );
+    }
+
+    let area = Rect {
+        y: area.y.saturating_add(preview_h),
+        height: area.height.saturating_sub(preview_h),
+        ..area
+    };
+    if area.width == 0 || area.height == 0 {
+        app.composer_input_rect.set(None);
+        return;
+    }
     let input_inner_w = area.width.saturating_sub(4).max(1);
     let input_h = composer_visual_input_lines(app, input_inner_w);
     let box_h = input_h.saturating_add(2).min(area.height);
@@ -1538,7 +1716,10 @@ fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &W
     let pending_request = current_session
         .filter(|session| session.status.is_active())
         .and_then(|session| app.pending_request_user_input(&session.id));
-    let placeholder = if pending_request.is_some() {
+    // Compute the home placeholder separately so it can own a String when
+    // the typewriter produces a dynamic substring.
+    let home_placeholder_owned: String;
+    let placeholder: &str = if pending_request.is_some() {
         if app
             .request_input
             .as_ref()
@@ -1553,17 +1734,31 @@ fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &W
     } else if current_session.is_some() {
         "Ask a follow-up..."
     } else {
-        "Tell the browser what to do..."
+        // Home screen — delegate to App which knows whether typewriter is active.
+        home_placeholder_owned = app.home_placeholder();
+        &home_placeholder_owned
     };
     let max_lines = area.height.max(1) as usize;
     // While the slash palette is open, the popup is the input — render the
     // composer as if it were empty (just the placeholder, no `/text`) and
     // skip cursor placement here so the popup owns it.
     let palette_owns_input = app.is_slash_palette_active();
+    // During the Holding phase the full example is shown and the hint should
+    // appear inline, clearly attached to the animated placeholder.
+    let show_inline_hint =
+        !palette_owns_input && app.is_home_examples_active() && app.is_typewriter_holding();
     let lines: Vec<Line<'static>> = if palette_owns_input {
         vec![Line::from(vec![
             Span::styled("> ", dim()),
             Span::styled(placeholder.to_string(), dim()),
+        ])]
+    } else if show_inline_hint {
+        // Render manually so we can append the hint span without affecting
+        // cursor_position_wrapped (composer is empty in this state).
+        vec![Line::from(vec![
+            Span::styled("> ", dim()),
+            Span::styled(app.typewriter_placeholder_text().to_string(), dim()),
+            Span::styled("  ⇥ tab to use", accent()),
         ])]
     } else {
         app.composer
