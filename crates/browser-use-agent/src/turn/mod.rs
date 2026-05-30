@@ -4,6 +4,9 @@ pub mod dispatch;
 pub mod loop_driver;
 pub mod sampling;
 
+#[cfg(test)]
+mod sampling_tests;
+
 use crate::decision;
 use browser_use_llm::schema::Message;
 use tokio_util::sync::CancellationToken;
