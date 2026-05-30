@@ -42,7 +42,7 @@ provenance is unconfirmed.** Verify with `cargo test` (with a `timeout`) before 
 
 **Milestone 1 — finish & land the LLM crate (low-risk, next):**
 1. [x] Restore verified baseline + fix scrub() (`8481788`)
-2. [ ] Integrate WP 1.7 facades (cherry-pick `providers/` files only; re-verify)
+2. [x] Integrate WP 1.7 facades (`providers/` files only; 89 crate tests green; `7f63ef2`)
 3. [ ] Integrate WP 1.8 tool_runtime (`tool.rs` + `tool_runtime.rs`; re-verify)
 4. [ ] `timeout 300 cargo test -p browser-use-llm` green → milestone done
 
