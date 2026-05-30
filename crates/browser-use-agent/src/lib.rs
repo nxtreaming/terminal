@@ -30,6 +30,7 @@ pub mod events;
 pub mod execpolicy;
 pub mod goals;
 pub mod guardian;
+pub mod history;
 pub mod hooks;
 pub mod mcp;
 pub mod network;
