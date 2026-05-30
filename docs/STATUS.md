@@ -158,3 +158,6 @@ The control-flow + decision logic is codex-faithful and tested, but several bodi
 ### NEXT (autonomous, one WP at a time, isolated worktrees, verify-before-merge):
 TOOLS PORT → SUBSYSTEMS (compaction model-based, MCP transports, subagents, goals, skills/plugins, hooks+PermissionRequest, prompts de-brand, rollout) → SAFETY (sandbox/execpolicy/network/guardian).
 FINAL CUTOVER (TUI/CLI: browser-use-core → browser-use-agent; retire core) = [BLOCKED-NEEDS-HUMAN] — do NOT do autonomously.
+
+## Tools port (on decodex, M3 core complete @ a21047b base)
+- [x] T-shell — async shell/exec tool over ToolRuntime seam (tokio::process, 10s default timeout/exit124, 1MiB cap, simple rm-rf denylist; full tree-sitter denylist TODO) — 212 tests
