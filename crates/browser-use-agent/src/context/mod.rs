@@ -12,6 +12,8 @@ pub mod inject;
 pub mod normalize;
 
 #[cfg(test)]
+mod inject_tests;
+#[cfg(test)]
 mod tests_accounting;
 
 use browser_use_llm::schema::Message;
