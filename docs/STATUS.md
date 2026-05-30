@@ -174,3 +174,6 @@ FINAL CUTOVER (TUI/CLI: browser-use-core → browser-use-agent; retire core) = [
 ## ✅ TOOLS PHASE COMPLETE — decodex, 332 tests green, 10 handlers
 shell, apply_patch, view_image(sync/serial), update_plan, request_user_input, tool_search, web_search, browser, python, mcp.
 NEXT: INTEGRATION (real ToolRegistry/ToolSet dispatching all 10 by name + deferred catalog for tool_search; then wire ToolDispatcher→registry, SamplingDriver↔ToolDispatcher fusion, OrchestratorRunner real per-tool routing — un-stubs M3-core). THEN subsystems (compaction model-based, MCP transports, subagents, goals, skills/plugins, hooks+PermissionRequest, prompts de-brand, rollout). THEN safety (sandbox/execpolicy/network/guardian). FINAL cutover = [BLOCKED-NEEDS-HUMAN].
+
+## INTEGRATION: ToolRegistry merged — decodex, 351 tests
+- [x] I-registry — real ToolRegistry (DynTool trait-objects, dispatch-by-name, model_visible_definitions, deferred catalog) + ToolDispatcher routes through registry via orchestrator — 351 tests
