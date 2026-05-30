@@ -81,18 +81,34 @@ const TRUNCATION_MARKER: &str = "\n[output truncated: exceeded 1 MiB byte cap]";
 /// Field shape follows codex `ShellRequest`/`ExecParams` (core/src/tools/runtimes/shell.rs:48-64,
 /// exec.rs:83-96): a tokenized command vector, an optional working directory, an
 /// optional timeout, and an environment-variable map.
-#[derive(Clone, Debug, PartialEq, Eq)]
+///
+/// # Wire shape (model-facing args)
+///
+/// ```json
+/// { "command": ["bash", "-lc", "echo hi"], "cwd": "/repo", "timeout_ms": 5000 }
+/// ```
+///
+/// Deserializes directly from the model's argument object. The field names match
+/// codex's `ExecParams` JSON (`command`/`cwd`/`timeout_ms`/`env`, exec.rs:83-96)
+/// and the legacy shell spec (`browser-use-core/src/tools/mod.rs`). All fields
+/// except `command` are optional on the wire: `cwd`/`timeout_ms` default to
+/// `None` and `env` defaults to an empty map (codex `ExecParams.env` is likewise
+/// an absent-means-empty map).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct ShellRequest {
     /// The command and its arguments, already tokenized (argv-style). The first
     /// element is the program; the rest are arguments.
     pub command: Vec<String>,
     /// Working directory to run in. When `None`, the [`ToolCtx::cwd`] is used.
+    #[serde(default)]
     pub cwd: Option<PathBuf>,
     /// Per-command timeout in milliseconds. When `None`,
     /// [`DEFAULT_SHELL_COMMAND_TIMEOUT_MS`] is used.
+    #[serde(default)]
     pub timeout_ms: Option<u64>,
     /// Extra environment variables to set for the child process. Layered on top
     /// of the inherited environment (codex `ExecParams.env`).
+    #[serde(default)]
     pub env: HashMap<String, String>,
 }
 

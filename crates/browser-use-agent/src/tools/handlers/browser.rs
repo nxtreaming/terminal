@@ -96,7 +96,20 @@ pub enum BrowserAction {
 /// The browser-use-browser fns are session-scoped and need a working directory
 /// plus an artifact directory; those identifiers are carried here so the adapter
 /// stays thin (it forwards them unchanged).
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Deserialization (via [`BrowserWireArgs`])
+///
+/// The model's JSON arg object is FLAT (`action`/`session_id`/`script`/… — see
+/// [`BrowserWireArgs`]), whereas this `Req` holds a tagged [`BrowserAction`] enum
+/// and carried plumbing. So `BrowserRequest` deserializes THROUGH the flat wire
+/// args: `#[serde(from = "BrowserWireArgs")]` runs the
+/// [`From<BrowserWireArgs>`](BrowserRequest::from) adapter after deserializing the
+/// model object. This makes `BrowserRequest: Deserialize`, so the tool registers
+/// with the registry's plain `register` (the registry deserializes the model
+/// object straight into `BrowserRequest`). Behavior is unchanged — the adapter
+/// only reshapes the already-parsed fields.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "BrowserWireArgs")]
 pub struct BrowserRequest {
     /// The action to perform.
     pub action: BrowserAction,
@@ -158,6 +171,114 @@ impl BrowserRequest {
     fn effective_observe_ms(&self) -> u64 {
         self.observe_timeout_ms
             .unwrap_or(DEFAULT_OBSERVE_TIMEOUT_MS)
+    }
+}
+
+/// Model-facing wire arguments for the browser tool.
+///
+/// [`BrowserRequest`] is a PARSED form: its [`BrowserAction`] is an internally
+/// tagged enum whose payload fields differ per variant, and the request carries
+/// plumbing fields (`cwd`/`artifact_dir`) the model never sets. So the registry
+/// cannot deserialize a `BrowserRequest` directly. Instead this flat
+/// `BrowserWireArgs` matches the JSON the model actually emits and an
+/// [`From<BrowserWireArgs>`](BrowserRequest::from) adapter parses it into the
+/// typed request (the registry registers the tool over `BrowserWireArgs`).
+///
+/// # Wire shape (model-facing args)
+///
+/// ```json
+/// { "action": "execute", "session_id": "s1", "script": "...", "background": false }
+/// { "action": "command", "session_id": "s1", "command": "go https://example.com" }
+/// { "action": "observe", "session_id": "s1", "run_id": "r1" }
+/// { "action": "cancel",  "session_id": "s1", "run_id": "r1" }
+/// ```
+///
+/// The variants mirror the existing [`BrowserAction`] cases and the legacy
+/// model-facing browser paths (the hidden `browser <cmd>` command path and the
+/// `browser_execute`/`observe`/`cancel` script paths; see the module docs and
+/// legacy `browser-use-core/src/tools/mod.rs`). `cwd` / `artifact_dir` are
+/// carried-but-optional plumbing fields the router supplies; the per-action
+/// payload fields (`command` / `script` / `run_id`) are validated by the `From`
+/// adapter against the chosen `action`.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct BrowserWireArgs {
+    /// Which browser operation to perform.
+    pub action: BrowserActionKind,
+    /// Browser session id the action is bound to.
+    pub session_id: String,
+    /// Command string for the `command` action.
+    #[serde(default)]
+    pub command: Option<String>,
+    /// Script body for the `execute` action.
+    #[serde(default)]
+    pub script: Option<String>,
+    /// Whether an `execute` runs in the background (observe later).
+    #[serde(default)]
+    pub background: bool,
+    /// Run identifier for the `observe` / `cancel` actions.
+    #[serde(default)]
+    pub run_id: Option<String>,
+    /// Working directory for the browser runtime.
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// Directory for run artifacts.
+    #[serde(default)]
+    pub artifact_dir: Option<PathBuf>,
+    /// Script timeout in seconds (script paths only).
+    #[serde(default)]
+    pub timeout_secs: Option<u64>,
+    /// Observe poll window in milliseconds (observe path only).
+    #[serde(default)]
+    pub observe_timeout_ms: Option<u64>,
+}
+
+/// The `action` discriminator of [`BrowserWireArgs`], mirroring the
+/// [`BrowserAction`] variants.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum BrowserActionKind {
+    /// Hidden `browser <cmd>` command path.
+    Command,
+    /// `browser_execute` script path.
+    Execute,
+    /// Poll an in-flight run.
+    Observe,
+    /// Cancel an in-flight run.
+    Cancel,
+}
+
+impl From<BrowserWireArgs> for BrowserRequest {
+    /// Parse the flat model wire args into the typed [`BrowserRequest`].
+    ///
+    /// A payload field missing for the chosen `action` defaults to an empty
+    /// string; the tool's `run` validation then rejects it with the same
+    /// "must not be empty" error it uses for an explicitly-empty value (so a
+    /// malformed call surfaces a clean rejection rather than a deserialize
+    /// failure).
+    fn from(w: BrowserWireArgs) -> Self {
+        let action = match w.action {
+            BrowserActionKind::Command => BrowserAction::Command {
+                command: w.command.unwrap_or_default(),
+            },
+            BrowserActionKind::Execute => BrowserAction::Execute {
+                script: w.script.unwrap_or_default(),
+                background: w.background,
+            },
+            BrowserActionKind::Observe => BrowserAction::Observe {
+                run_id: w.run_id.unwrap_or_default(),
+            },
+            BrowserActionKind::Cancel => BrowserAction::Cancel {
+                run_id: w.run_id.unwrap_or_default(),
+            },
+        };
+        BrowserRequest {
+            action,
+            session_id: w.session_id,
+            cwd: w.cwd,
+            artifact_dir: w.artifact_dir,
+            timeout_secs: w.timeout_secs,
+            observe_timeout_ms: w.observe_timeout_ms,
+        }
     }
 }
 

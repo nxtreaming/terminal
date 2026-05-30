@@ -116,7 +116,17 @@ pub const MCP_ERROR_EXIT_CODE: i32 = 1;
 /// `(server, tool)` + `arguments`. The model-facing function name is namespaced;
 /// the caller (the registry/router, a later WP) splits it before constructing
 /// this request, so the handler receives the already-resolved `server` / `tool`.
-#[derive(Debug, Clone, PartialEq, Eq)]
+///
+/// # Deserialization (via [`McpWireArgs`])
+///
+/// `server` / `tool` are split out of the namespaced function NAME (not the
+/// model's argument object), so this `Req` deserializes THROUGH the resolved flat
+/// [`McpWireArgs`] object: `#[serde(from = "McpWireArgs")]` runs the
+/// [`From<McpWireArgs>`](McpToolCallRequest::from) adapter after deserializing the
+/// resolved args. This makes `McpToolCallRequest: Deserialize`, so the tool
+/// registers with the registry's plain `register`. Behavior is unchanged.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+#[serde(from = "McpWireArgs")]
 pub struct McpToolCallRequest {
     /// The MCP server the tool lives on (the first segment after `mcp__`).
     pub server: String,
@@ -170,6 +180,53 @@ impl McpToolCallRequest {
             None
         } else {
             Some(self.arguments.clone())
+        }
+    }
+}
+
+/// Model-facing wire arguments for the MCP dispatch handler.
+///
+/// [`McpToolCallRequest`] is a PARSED form: its `server` / `tool` are split out
+/// of the namespaced `mcp__<server>__<tool>` function NAME (not present in the
+/// model's argument object), and `read_only` is resolved from the server's tool
+/// listing. So the registry cannot deserialize a `McpToolCallRequest` directly
+/// from the model's argument object. Instead this `McpWireArgs` matches a flat
+/// object carrying the resolved `server` / `tool` plus the call `arguments`, and
+/// an [`From<McpWireArgs>`](McpToolCallRequest::from) adapter builds the typed
+/// request (the registry registers the tool over `McpWireArgs`).
+///
+/// # Wire shape (router-resolved args)
+///
+/// ```json
+/// { "server": "memory", "tool": "create_entities", "arguments": { /* ... */ } }
+/// ```
+///
+/// Parity: legacy `dispatch_mcp_tool(server, tool, arguments, ..)`
+/// (`browser-use-core/src/lib.rs:13398-13403`) and codex's `(server, tool)` +
+/// `arguments` (codex `core/src/mcp_tool_call.rs`). `arguments` defaults to
+/// `Value::Null` ("no arguments") and `read_only` defaults to `false` (serial),
+/// matching [`McpToolCallRequest::new`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
+pub struct McpWireArgs {
+    /// The MCP server the tool lives on.
+    pub server: String,
+    /// The tool name on that server.
+    pub tool: String,
+    /// The JSON arguments object for the call (`Value::Null` = no arguments).
+    #[serde(default)]
+    pub arguments: Value,
+    /// Whether the server advertised this tool as read-only (parallel-safe).
+    #[serde(default)]
+    pub read_only: bool,
+}
+
+impl From<McpWireArgs> for McpToolCallRequest {
+    fn from(w: McpWireArgs) -> Self {
+        McpToolCallRequest {
+            server: w.server,
+            tool: w.tool,
+            arguments: w.arguments,
+            read_only: w.read_only,
         }
     }
 }

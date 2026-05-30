@@ -20,32 +20,40 @@
 //! registry maps an advertised name to `(handler, spec)`: the spec is not
 //! derived from the handler trait either.
 //!
-//! ## FOLLOW-UP: six handler `Req` types are not yet `Deserialize`
+//! ## All ten handlers register (registry gap closed)
 //!
 //! [`register`](ToolRegistry::register) requires the handler's `Req` to be
 //! [`DeserializeOwned`] so the registry can build it from the model-emitted JSON
-//! `input`. Of the ten handlers, only FOUR derive `serde::Deserialize` today —
-//! `update_plan`, `request_user_input`, `tool_search`, `web_search`. The other
-//! SIX — `shell` ([`ShellRequest`]), `apply_patch` ([`ApplyPatchRequest`]),
-//! `view_image` ([`ViewImageRequest`]), `browser` ([`BrowserRequest`]),
-//! `python` ([`PythonRequest`]), and `mcp` ([`McpToolCallRequest`]) — derive
-//! only `Clone, Debug, PartialEq, [Eq]` and therefore CANNOT be registered yet.
-//! Per this WP's contract the handler files are read-only here, so adding
-//! `#[derive(serde::Deserialize)]` to those six `Req` structs is a one-line
-//! follow-up in each handler file (TODO(WP-I-registry-followup): derive
-//! `serde::Deserialize` for `ShellRequest`/`ApplyPatchRequest`/`ViewImageRequest`/
-//! `BrowserRequest`/`PythonRequest`/`McpToolCallRequest` — several use
-//! non-string-keyed fields, e.g. `ShellRequest.env: HashMap`, which deserialize
-//! fine; `BrowserRequest`/`McpToolCallRequest` need a `from`/adapter shape since
-//! their `Req` is a parsed/namespaced form, not the raw model arg object).
-//! Until those derives land, only the four Deserialize-able tools register.
+//! `input`. All ten handlers now satisfy that, so ALL TEN register via the single
+//! [`register`](ToolRegistry::register) path:
+//!
+//! * EIGHT have a `Req` that maps DIRECTLY to the model's argument object: the
+//!   four originally-`Deserialize` tools (`update_plan`, `request_user_input`,
+//!   `tool_search`, `web_search`) plus `shell` ([`ShellRequest`]),
+//!   `apply_patch` ([`ApplyPatchRequest`]), `view_image` ([`ViewImageRequest`]),
+//!   and `python` ([`PythonRequest`]) — each now derives `serde::Deserialize`
+//!   with `#[serde(default)]` on the carried-but-optional plumbing fields so the
+//!   MODEL's argument object deserializes cleanly.
+//! * TWO carry a PARSED / namespaced `Req` that is not a direct match for the
+//!   model's JSON: `browser` ([`BrowserRequest`]) and `mcp`
+//!   ([`McpToolCallRequest`]). Each defines a small `Deserialize`-able wire-args
+//!   struct ([`BrowserWireArgs`] / [`McpWireArgs`]) that matches the model object,
+//!   plus an `impl From<Wire> for Req`, and the `Req` deserializes THROUGH it via
+//!   `#[serde(from = "…WireArgs")]`. That makes the `Req` itself `Deserialize`, so
+//!   it registers through the same `register` path (no separate adapter needed).
+//!
+//! See [`crate::tools::registry::definitions`] for the per-tool
+//! [`ToolDefinition`] (name + description + input schema) supplied at
+//! registration, and [`default_registry`] for a registry preloaded with all ten.
 //!
 //! [`ShellRequest`]: crate::tools::handlers::shell::ShellRequest
 //! [`ApplyPatchRequest`]: crate::tools::handlers::apply_patch::ApplyPatchRequest
 //! [`ViewImageRequest`]: crate::tools::handlers::view_image::ViewImageRequest
 //! [`BrowserRequest`]: crate::tools::handlers::browser::BrowserRequest
+//! [`BrowserWireArgs`]: crate::tools::handlers::browser::BrowserWireArgs
 //! [`PythonRequest`]: crate::tools::handlers::python::PythonRequest
 //! [`McpToolCallRequest`]: crate::tools::handlers::mcp::McpToolCallRequest
+//! [`McpWireArgs`]: crate::tools::handlers::mcp::McpWireArgs
 //!
 //! ## Parity
 //!
@@ -197,6 +205,93 @@ where
         // Route through the orchestrator so approval/sandbox/escalation policy
         // applies uniformly (parity with codex router.rs, where dispatch goes
         // through the handler under the orchestrator's policy wrapper).
+        let result = orchestrator.run(&self.tool, &req, ctx, env, policy).await?;
+        Ok(result.output)
+    }
+}
+
+/// Adapter that lifts a typed [`ToolRuntime<Req, ExecOutput>`] into a [`DynTool`]
+/// when the MODEL's wire arguments are a DIFFERENT type `Wire` than the handler's
+/// `Req`, bridged by `Wire: Into<Req>`.
+///
+/// Two handlers (`browser`, `mcp`) take a PARSED / namespaced `Req` that is not a
+/// direct match for the model's JSON argument object (the browser `Req` carries a
+/// tagged [`BrowserAction`] enum; the mcp `Req` carries `server`/`tool` split out
+/// of the namespaced function NAME). For those, we deserialize a small
+/// `Wire`-args struct that matches the model JSON and convert it into the typed
+/// `Req` via [`From`]. The orchestrator still runs the typed `Req`, so
+/// approval/sandbox policy and behavior are unchanged.
+///
+/// [`BrowserAction`]: crate::tools::handlers::browser::BrowserAction
+pub struct WireToolAdapter<T, Wire, Req> {
+    tool: T,
+    name: String,
+    definition: ToolDefinition,
+    parallel_safe: bool,
+    _wire: PhantomData<fn() -> Wire>,
+    _req: PhantomData<fn() -> Req>,
+}
+
+impl<T, Wire, Req> WireToolAdapter<T, Wire, Req> {
+    /// Wrap a typed handler whose model wire args are `Wire` (convertible into
+    /// the handler's `Req`).
+    pub fn new(
+        tool: T,
+        name: impl Into<String>,
+        definition: ToolDefinition,
+        parallel_safe: bool,
+    ) -> Self {
+        Self {
+            tool,
+            name: name.into(),
+            definition,
+            parallel_safe,
+            _wire: PhantomData,
+            _req: PhantomData,
+        }
+    }
+}
+
+#[async_trait]
+impl<T, Wire, Req, S, A> DynTool<S, A> for WireToolAdapter<T, Wire, Req>
+where
+    Wire: DeserializeOwned + Send + Sync + Into<Req>,
+    Req: Send + Sync,
+    T: ToolRuntime<Req, ExecOutput> + Send + Sync,
+    <T as Approvable<Req>>::ApprovalKey: Send + Sync,
+    S: SandboxProvider,
+    A: Approver,
+{
+    fn name(&self) -> &str {
+        &self.name
+    }
+
+    fn definition(&self) -> ToolDefinition {
+        self.definition.clone()
+    }
+
+    fn parallel_safe(&self) -> bool {
+        self.parallel_safe
+    }
+
+    async fn call(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+        env: &TurnEnv,
+        policy: AskForApproval,
+        orchestrator: &ToolOrchestrator<S, A>,
+    ) -> Result<ExecOutput, ToolError> {
+        // Deserialize the MODEL's wire-args type, then convert into the handler's
+        // parsed `Req`. A deserialize failure surfaces as `ToolError::Other`
+        // naming the offending tool (same shape as `ToolAdapter::call`).
+        let wire: Wire = serde_json::from_value(input.clone()).map_err(|source| {
+            ToolError::Other(anyhow::anyhow!(
+                "tool `{}`: invalid arguments: {source}",
+                self.name
+            ))
+        })?;
+        let req: Req = wire.into();
         let result = orchestrator.run(&self.tool, &req, ctx, env, policy).await?;
         Ok(result.output)
     }
@@ -354,6 +449,327 @@ where
             .field("deferred", &self.deferred.len())
             .finish()
     }
+}
+
+/// Model-facing [`ToolDefinition`] builders for each of the ten handlers.
+///
+/// The registry takes a tool's name + description + input schema at registration
+/// (it does NOT derive them from the handler trait — see the module docs). These
+/// builders centralize the parity-grounded schema shape for each tool so the
+/// dispatch loop (and tests) register a consistent definition. Each schema is a
+/// JSON-Schema object mirroring the codex/legacy tool spec the field names come
+/// from. Field names match the handlers' `Req` / wire-args structs.
+pub mod definitions {
+    use browser_use_llm::schema::ToolDefinition;
+    use serde_json::json;
+
+    /// `shell`: argv command + optional cwd/timeout/env. Parity: codex
+    /// `ExecParams` (core/src/exec.rs:83-96) / legacy shell spec
+    /// (`browser-use-core/src/tools/mod.rs`).
+    pub fn shell() -> ToolDefinition {
+        ToolDefinition {
+            name: "shell".to_string(),
+            description: "Run a shell command (argv-style) and capture its output.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "command": {
+                        "type": "array",
+                        "items": { "type": "string" },
+                        "description": "Command and arguments, argv-style (first element is the program)."
+                    },
+                    "cwd": { "type": "string", "description": "Working directory (defaults to the session cwd)." },
+                    "timeout_ms": { "type": "integer", "description": "Per-command timeout in milliseconds." },
+                    "env": {
+                        "type": "object",
+                        "additionalProperties": { "type": "string" },
+                        "description": "Extra environment variables for the child process."
+                    }
+                },
+                "required": ["command"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `apply_patch`: a V4A patch envelope. Parity: codex apply-patch
+    /// (`apply-patch/src/parser.rs`) / legacy `browser-use-core/src/tools/files.rs`.
+    pub fn apply_patch() -> ToolDefinition {
+        ToolDefinition {
+            name: "apply_patch".to_string(),
+            description: "Apply a V4A patch envelope to files under the workspace root."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "patch": {
+                        "type": "string",
+                        "description": "The full V4A patch text (*** Begin Patch ... *** End Patch)."
+                    }
+                },
+                "required": ["patch"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `view_image`: a local image path. Parity: codex `ViewImageArgs { path }`
+    /// (core/src/tools/handlers/view_image.rs:53-58) / legacy `view_image`
+    /// (`files.rs`).
+    pub fn view_image() -> ToolDefinition {
+        ToolDefinition {
+            name: "view_image".to_string(),
+            description: "Read a local image file and return it as model-visible image content."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "path": { "type": "string", "description": "Path to a local image (png/jpeg/gif/webp)." }
+                },
+                "required": ["path"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `browser`: a tagged browser action. Parity: browser-use's browser tool
+    /// (the hidden `browser <cmd>` command path + the `browser_execute` /
+    /// `observe` / `cancel` script paths; legacy
+    /// `browser-use-core/src/tools/mod.rs`).
+    pub fn browser() -> ToolDefinition {
+        ToolDefinition {
+            name: "browser".to_string(),
+            description:
+                "Drive the browser: run a command, execute a script, or observe/cancel a run."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["command", "execute", "observe", "cancel"],
+                        "description": "Which browser operation to perform."
+                    },
+                    "session_id": { "type": "string", "description": "Browser session id." },
+                    "command": { "type": "string", "description": "Command string for the `command` action." },
+                    "script": { "type": "string", "description": "Script body for the `execute` action." },
+                    "background": { "type": "boolean", "description": "Run an `execute` in the background." },
+                    "run_id": { "type": "string", "description": "Run id for `observe`/`cancel`." },
+                    "timeout_secs": { "type": "integer", "description": "Script timeout in seconds." },
+                    "observe_timeout_ms": { "type": "integer", "description": "Observe poll window in ms." }
+                },
+                "required": ["action", "session_id"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `python`: a Python snippet + optional timeout. Parity: legacy
+    /// `dispatch_python_tool` (`browser-use-core/src/lib.rs`).
+    pub fn python() -> ToolDefinition {
+        ToolDefinition {
+            name: "python".to_string(),
+            description: "Run a Python snippet in a persistent worker and return its output."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "code": { "type": "string", "description": "The Python source to execute." },
+                    "session_id": { "type": "string", "description": "Worker session id (persistent namespace)." },
+                    "timeout_secs": { "type": "number", "description": "Optional timeout in seconds." }
+                },
+                "required": ["code"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `mcp`: a resolved MCP `tools/call`. Parity: legacy
+    /// `dispatch_mcp_tool(server, tool, arguments, ..)`
+    /// (`browser-use-core/src/lib.rs:13398-13403`) / codex
+    /// `core/src/mcp_tool_call.rs`.
+    pub fn mcp() -> ToolDefinition {
+        ToolDefinition {
+            name: "mcp".to_string(),
+            description: "Call a tool on a connected MCP server.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "server": { "type": "string", "description": "The MCP server name." },
+                    "tool": { "type": "string", "description": "The tool name on that server." },
+                    "arguments": { "type": "object", "description": "JSON arguments for the call." },
+                    "read_only": { "type": "boolean", "description": "Whether the tool is read-only (parallel-safe)." }
+                },
+                "required": ["server", "tool"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `update_plan`: the structured plan. Parity: codex `UpdatePlanArgs`
+    /// (core/src/tools/handlers/plan.rs) / legacy `UpdatePlanArgs`.
+    pub fn update_plan() -> ToolDefinition {
+        ToolDefinition {
+            name: "update_plan".to_string(),
+            description: "Record a structured task plan the model is tracking.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "plan": {
+                        "type": "array",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "step": { "type": "string" },
+                                "status": {
+                                    "type": "string",
+                                    "enum": ["pending", "in_progress", "completed"]
+                                }
+                            },
+                            "required": ["step", "status"]
+                        }
+                    }
+                },
+                "required": ["plan"],
+                "additionalProperties": true
+            }),
+        }
+    }
+
+    /// `request_user_input`: ask the user a question. Parity: legacy
+    /// request_user_input spec (`browser-use-core/src/tools/mod.rs`).
+    pub fn request_user_input() -> ToolDefinition {
+        ToolDefinition {
+            name: "request_user_input".to_string(),
+            description: "Ask the user for input and pause until they respond.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "prompt": { "type": "string", "description": "The question to ask the user." }
+                },
+                "required": ["prompt"],
+                "additionalProperties": true
+            }),
+        }
+    }
+
+    /// `tool_search`: BM25 over the deferred catalog. Parity: legacy
+    /// `tool_search` args `{ query, limit? }`
+    /// (`browser-use-core/src/tools/mod.rs`).
+    pub fn tool_search() -> ToolDefinition {
+        ToolDefinition {
+            name: "tool_search".to_string(),
+            description: "Search the deferred tool catalog by free-text query.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The free-text query." },
+                    "limit": { "type": "integer", "description": "Max ranked entries to return." }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `web_search`: a hosted/passthrough web search. Parity: codex
+    /// `WebSearchArgs { query }` / legacy web_search args.
+    pub fn web_search() -> ToolDefinition {
+        ToolDefinition {
+            name: "web_search".to_string(),
+            description: "Search the web for a free-text query.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "query": { "type": "string", "description": "The free-text search query." }
+                },
+                "required": ["query"],
+                "additionalProperties": false
+            }),
+        }
+    }
+}
+
+/// Build a [`ToolRegistry`] preloaded with all ten handlers, each carrying its
+/// parity-grounded [`ToolDefinition`] and static `parallel_safe` flag.
+///
+/// This is the single place the dispatch loop wires the full tool set. Eight
+/// tools register directly; `browser` and `mcp` register via
+/// [`register_with_wire`](ToolRegistry::register_with_wire) over their
+/// `WireArgs` types. The browser/python/mcp handlers need an injected backend
+/// (they would otherwise reach the OS), so those are supplied by the caller.
+///
+/// `parallel_safe` per tool: `tool_search` / `web_search` = `true` (pure /
+/// read-only); `shell` / `apply_patch` / `view_image` / `browser` / `python` /
+/// `update_plan` / `request_user_input` = `false` (serial). `mcp` is registered
+/// `false` here (a serial default); its per-request read-only hint still drives
+/// the handler's own [`ToolRuntime::parallel_safe`](crate::tools::ToolRuntime::parallel_safe).
+#[allow(clippy::too_many_arguments)]
+pub fn default_registry<S, A>(
+    shell: crate::tools::handlers::shell::ShellTool,
+    apply_patch: crate::tools::handlers::apply_patch::ApplyPatchTool,
+    view_image: crate::tools::handlers::view_image::ViewImageTool,
+    browser: crate::tools::handlers::browser::BrowserTool,
+    python: crate::tools::handlers::python::PythonTool,
+    mcp: crate::tools::handlers::mcp::McpTool,
+    update_plan: crate::tools::handlers::update_plan::UpdatePlanTool,
+    request_user_input: crate::tools::handlers::request_user_input::RequestUserInputTool,
+    tool_search: crate::tools::handlers::tool_search::ToolSearchTool,
+    web_search: crate::tools::handlers::web_search::WebSearchTool,
+) -> ToolRegistry<S, A>
+where
+    S: SandboxProvider,
+    A: Approver,
+{
+    use crate::tools::handlers::apply_patch::ApplyPatchRequest;
+    use crate::tools::handlers::browser::BrowserRequest;
+    use crate::tools::handlers::mcp::McpToolCallRequest;
+    use crate::tools::handlers::python::PythonRequest;
+    use crate::tools::handlers::request_user_input::RequestUserInputRequest;
+    use crate::tools::handlers::shell::ShellRequest;
+    use crate::tools::handlers::tool_search::ToolSearchRequest;
+    use crate::tools::handlers::update_plan::UpdatePlanRequest;
+    use crate::tools::handlers::view_image::ViewImageRequest;
+    use crate::tools::handlers::web_search::WebSearchRequest;
+
+    let mut reg = ToolRegistry::new();
+
+    reg.register::<_, ShellRequest>("shell", definitions::shell(), false, shell);
+    reg.register::<_, ApplyPatchRequest>(
+        "apply_patch",
+        definitions::apply_patch(),
+        false,
+        apply_patch,
+    );
+    reg.register::<_, ViewImageRequest>("view_image", definitions::view_image(), false, view_image);
+    reg.register::<_, PythonRequest>("python", definitions::python(), false, python);
+    // `browser` / `mcp` carry a parsed / namespaced `Req`; each deserializes
+    // THROUGH its `WireArgs` via `#[serde(from = "…WireArgs")]`, so the plain
+    // `register` path works (the registry deserializes the model object straight
+    // into the `Req`).
+    reg.register::<_, BrowserRequest>("browser", definitions::browser(), false, browser);
+    reg.register::<_, McpToolCallRequest>("mcp", definitions::mcp(), false, mcp);
+    reg.register::<_, UpdatePlanRequest>(
+        "update_plan",
+        definitions::update_plan(),
+        false,
+        update_plan,
+    );
+    reg.register::<_, RequestUserInputRequest>(
+        "request_user_input",
+        definitions::request_user_input(),
+        false,
+        request_user_input,
+    );
+    reg.register::<_, ToolSearchRequest>(
+        "tool_search",
+        definitions::tool_search(),
+        true,
+        tool_search,
+    );
+    reg.register::<_, WebSearchRequest>("web_search", definitions::web_search(), true, web_search);
+
+    reg
 }
 
 #[cfg(test)]
