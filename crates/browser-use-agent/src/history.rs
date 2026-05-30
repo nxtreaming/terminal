@@ -73,7 +73,7 @@ pub struct MessageHistoryConfig {
 /// Resolve the directory that holds the persisted terminal state.
 ///
 /// Honors `BROWSER_USE_TERMINAL_HOME` and otherwise falls back to
-/// `~/.browser-use/terminal`, mirroring the core crate exactly.
+/// `~/.browser-use-terminal`, mirroring the core crate exactly.
 pub fn browser_use_terminal_home_dir() -> Option<PathBuf> {
     if let Ok(custom) = std::env::var("BROWSER_USE_TERMINAL_HOME") {
         let trimmed = custom.trim();
@@ -81,10 +81,11 @@ pub fn browser_use_terminal_home_dir() -> Option<PathBuf> {
             return Some(PathBuf::from(trimmed));
         }
     }
-    // Legacy parity: browser-use-core's `browser_use_terminal_home_dir`
-    // (lib.rs:19003) resolves to `$HOME/.browser_use_terminal` — a single,
-    // underscored component. Existing history files live there.
-    home_dir().map(|home| home.join(".browser_use_terminal"))
+    // Legacy parity: browser-use-core resolves to `$HOME/.browser-use-terminal`
+    // — a single, hyphenated component (constants.rs:189
+    // BROWSER_USE_TERMINAL_HOME_DIR). Existing history files live there; the
+    // path must match the legacy value exactly.
+    home_dir().map(|home| home.join(".browser-use-terminal"))
 }
 
 /// Best-effort home-directory lookup using only `std`.
