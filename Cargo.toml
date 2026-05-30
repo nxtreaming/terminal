@@ -30,6 +30,7 @@ clap = { version = "4", features = ["derive"] }
 crossterm = "0.29"
 futures-util = "0.3"
 ignore = "0.4"
+rand = "0.9"
 iana-time-zone = "0.1"
 image = { version = "0.25", default-features = false, features = ["png", "jpeg", "gif", "webp"] }
 ratatui = { version = "0.30", default-features = false, features = ["crossterm_0_29"] }

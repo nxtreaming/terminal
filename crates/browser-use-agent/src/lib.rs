@@ -27,6 +27,7 @@ pub mod context;
 pub mod decision;
 pub mod error;
 pub mod events;
+pub mod mcp;
 pub mod session;
 pub mod task;
 pub mod testkit;
