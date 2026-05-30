@@ -191,6 +191,7 @@ const SESSION_BASE_INSTRUCTIONS_EVENT: &str = "session.base_instructions";
 const SESSION_REVIEW_MODE_EVENT: &str = "session.review";
 const SESSION_CONFIG_SNAPSHOT_EVENT: &str = "session.config_snapshot";
 const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
+const SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT: &str = "session.followup.pending";
 const CONTEXT_BASELINE_EVENT: &str = "context.baseline";
 const CODEX_TURN_STARTED_EVENT: &str = "task_started";
 const CODEX_TURN_COMPLETE_EVENT: &str = "task_complete";
@@ -3201,6 +3202,74 @@ fn merge_object_properties(target: &mut Value, source: Value) {
     target.extend(source);
 }
 
+const CAPTURE_CURATION_PROMPT: &str = "The browser task is complete. Below is a contact sheet of \
+screenshots captured during the run; each pane is labeled with its frame seq. Build the user's \
+visual summary by calling submit_capture_curation: pick the frames (by seq) that best tell the \
+story of what happened, in order; drop redundant, blank, or uninformative frames; give each a \
+short caption; and set confirmation_seq to the single frame that proves the task succeeded. Call \
+submit_capture_curation now — do not write any other reply.";
+
+/// Opt-in: inject a forced LLM curation turn at task completion. OFF by default
+/// because injecting a turn into the live loop after the task finished can make
+/// the model spin (it calls the tool, then has nothing to do, and the empty-turn
+/// path keeps requesting turns until the provider-turn cap → session failure).
+/// The deterministic fallback recording is always produced regardless. Re-enable
+/// only once curation runs as an isolated post-run call.
+fn force_curation_turn_enabled() -> bool {
+    std::env::var("LLM_BROWSER_FORCE_CURATION")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+/// Guarantee a recording exists when the agent captured browser frames. Builds
+/// the deterministic uncurated summary GIF unless LLM curation already produced
+/// one (a `capture.curation` event). No frames -> no-op (session never browsed).
+fn ensure_fallback_capture_recording(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+) -> Result<()> {
+    let events = store.events_for_session(&session.id)?;
+    if events
+        .iter()
+        .any(|event| event.event_type == "capture.curation")
+    {
+        return Ok(());
+    }
+    match browser_use_browser::build_uncurated_summary_gif(std::path::Path::new(
+        &session.artifact_root,
+    )) {
+        Ok(Some(gif_path)) => {
+            store.append_event(
+                &session.id,
+                "capture.curation",
+                serde_json::json!({
+                    "source": "fallback_uncurated",
+                    "gif_path": gif_path.display().to_string(),
+                }),
+            )?;
+            record_tool_artifact(
+                store,
+                &session.id,
+                "capture",
+                &serde_json::json!({
+                    "path": gif_path.display().to_string(),
+                    "kind": "summary_gif",
+                    "mime_type": "image/gif",
+                }),
+            )?;
+        }
+        Ok(None) => {}
+        Err(error) => {
+            store.append_event(
+                &session.id,
+                "capture.recording_failed",
+                serde_json::json!({ "error": format!("{error:#}") }),
+            )?;
+        }
+    }
+    Ok(())
+}
+
 fn run_loaded_session_with_provider<P: ModelProvider>(
     store: &Store,
     provider: &P,
@@ -4296,6 +4365,47 @@ fn run_loaded_session_with_provider<P: ModelProvider>(
                             step_span.set_ok();
                             continue;
                         }
+                        // Forced post-hoc capture curation: if this task captured
+                        // browser frames and the model can see images, inject ONE
+                        // more turn that shows the contact sheet and asks the model
+                        // to call submit_capture_curation (builds the summary GIF).
+                        // Guarded by a one-shot event so we never loop.
+                        if force_curation_turn_enabled() && model_request_info.supports_image_input
+                        {
+                            let prior_events = store.events_for_session(&session.id)?;
+                            let curation_handled = prior_events.iter().any(|event| {
+                                matches!(
+                                    event.event_type.as_str(),
+                                    "capture.curation" | "capture.curation_requested"
+                                )
+                            });
+                            if !curation_handled {
+                                if let Some(sheet) = browser_use_browser::capture_contact_sheet(
+                                    std::path::Path::new(&session.artifact_root),
+                                    browser_use_browser::StitchCaps::default(),
+                                )? {
+                                    let data_url = format!(
+                                        "data:image/jpeg;base64,{}",
+                                        general_purpose::STANDARD.encode(&sheet)
+                                    );
+                                    store.append_event(
+                                        &session.id,
+                                        "capture.curation_requested",
+                                        serde_json::json!({ "turn_idx": turn_idx }),
+                                    )?;
+                                    messages.push(serde_json::json!({
+                                        "role": "user",
+                                        "content": [
+                                            {"type": "input_text", "text": CAPTURE_CURATION_PROMPT},
+                                            {"type": "input_image", "image_url": data_url},
+                                        ],
+                                    }));
+                                    step_span.set_ok();
+                                    continue;
+                                }
+                            }
+                        }
+                        ensure_fallback_capture_recording(store, &session)?;
                         append_memory_citation_events(
                             store,
                             &session.id,
@@ -8434,26 +8544,36 @@ fn append_new_external_session_messages_with_phase(
 ) -> Result<ActiveTurnQueueDrain> {
     let mut appended_user_events = 0_usize;
     let session_events = store.events_for_session(session_id)?;
+    let deferred_after_next_seq = session_events
+        .iter()
+        .filter(|event| event.seq > *last_seq)
+        .filter(|event| pending_after_next_tool_call_followup(&session_events, event))
+        .filter(|_| !active_turn_phase_accepts_after_next_tool_call(phase))
+        .map(|event| event.seq)
+        .min();
     let max_seen_seq = session_events
         .iter()
         .filter(|event| event.seq > *last_seq)
+        .filter(|event| deferred_after_next_seq.map_or(true, |seq| event.seq < seq))
         .map(|event| event.seq)
         .max();
     let mut checkpoint_messages = Vec::new();
     let mut events =
         rollback_filtered_events_after(&session_events, *last_seq, &mut checkpoint_messages)
             .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "session.input" | "session.followup"
-                )
-            })
+            .filter(|event| session_event_is_active_turn_queue_input(&session_events, event, phase))
             .collect::<Vec<_>>();
     events.sort_by_key(|event| event.seq);
     for event in events {
         *last_seq = (*last_seq).max(event.seq);
-        messages.extend(session_event_user_messages(&event.payload));
+        if event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT {
+            let committed =
+                append_committed_followup_for_pending_active_input(store, session_id, event)?;
+            *last_seq = (*last_seq).max(committed.seq);
+            messages.extend(session_event_user_messages(&committed.payload));
+        } else {
+            messages.extend(session_event_user_messages(&event.payload));
+        }
         appended_user_events += 1;
     }
     if let Some(max_seen_seq) = max_seen_seq {
@@ -8536,6 +8656,113 @@ fn append_new_external_session_messages_with_phase(
         deferred_trigger_mailbox_messages,
         last_seq: *last_seq,
     })
+}
+
+fn session_event_is_active_turn_queue_input(
+    events: &[EventRecord],
+    event: &EventRecord,
+    phase: &str,
+) -> bool {
+    match event.event_type.as_str() {
+        "session.input" => true,
+        "session.followup" | SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT => {
+            !after_next_tool_call_followup_is_cancelled(events, event.seq)
+                && (!pending_after_next_tool_call_followup(events, event)
+                    || active_turn_phase_accepts_after_next_tool_call(phase))
+        }
+        _ => false,
+    }
+}
+
+fn append_committed_followup_for_pending_active_input(
+    store: &Store,
+    session_id: &str,
+    event: &EventRecord,
+) -> Result<EventRecord> {
+    let mut payload = event.payload.clone();
+    if let Some(object) = payload.as_object_mut() {
+        object.remove("delivery");
+        object.insert("pending_from_seq".to_string(), serde_json::json!(event.seq));
+    }
+    store.append_event(session_id, "session.followup", payload)
+}
+
+fn active_turn_phase_accepts_after_next_tool_call(phase: &str) -> bool {
+    matches!(
+        phase,
+        "after_tool_outputs"
+            | "after_tool_call"
+            | "after_parallel_tool_batch"
+            | "after_streaming_tool_call"
+    )
+}
+
+fn pending_after_next_tool_call_followup(events: &[EventRecord], followup: &EventRecord) -> bool {
+    if !matches!(
+        followup.event_type.as_str(),
+        "session.followup" | SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+    ) {
+        return false;
+    }
+    if !followup_delivery_is_after_next_tool_call(followup) {
+        return false;
+    }
+    !events
+        .iter()
+        .any(|event| event_closes_after_next_tool_call_followup(event, followup.seq))
+}
+
+fn after_next_tool_call_followup_is_cancelled(events: &[EventRecord], followup_seq: i64) -> bool {
+    events.iter().any(|event| {
+        event.seq > followup_seq
+            && event.event_type == "session.followup.cancelled"
+            && followup_marker_seqs(event).contains(&followup_seq)
+    })
+}
+
+fn followup_delivery_is_after_next_tool_call(event: &EventRecord) -> bool {
+    event.payload.get("delivery").and_then(Value::as_str) == Some("after_next_tool_call")
+}
+
+fn event_closes_after_next_tool_call_followup(event: &EventRecord, followup_seq: i64) -> bool {
+    if event.seq <= followup_seq {
+        return false;
+    }
+    match event.event_type.as_str() {
+        "agent.turn_queue_drained" => {
+            let drained_session_messages = event
+                .payload
+                .get("session_messages")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let last_seq = event
+                .payload
+                .get("last_seq")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            drained_session_messages > 0 && last_seq >= followup_seq
+        }
+        "session.followup.interrupt_sent" => followup_marker_seqs(event).contains(&followup_seq),
+        "session.followup.cancelled" => followup_marker_seqs(event).contains(&followup_seq),
+        _ => false,
+    }
+}
+
+fn followup_marker_seqs(event: &EventRecord) -> Vec<i64> {
+    if let Some(seq) = event
+        .payload
+        .get("followup_seq")
+        .or_else(|| event.payload.get("seq"))
+        .and_then(Value::as_i64)
+    {
+        return vec![seq];
+    }
+    event
+        .payload
+        .get("followup_seqs")
+        .and_then(Value::as_array)
+        .map(|seqs| seqs.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+        .unwrap_or_default()
 }
 
 fn should_defer_mailbox_delivery_at_answer_boundary(
@@ -8649,6 +8876,7 @@ fn active_turn_pending_queue_input(
     store: &Store,
     session_id: &str,
     last_external_session_message_seq: i64,
+    phase: &str,
 ) -> Result<ActiveTurnQueuePending> {
     let events = store.events_for_session(session_id)?;
     let mut checkpoint_messages = Vec::new();
@@ -8658,12 +8886,7 @@ fn active_turn_pending_queue_input(
         &mut checkpoint_messages,
     )
     .into_iter()
-    .filter(|event| {
-        matches!(
-            event.event_type.as_str(),
-            "session.input" | "session.followup"
-        )
-    })
+    .filter(|event| session_event_is_active_turn_queue_input(&events, event, phase))
     .count();
     let mailbox = store.messages_for_agent(session_id)?;
     let mailbox_messages = mailbox.len();
@@ -8731,6 +8954,7 @@ impl StreamingToolScheduler {
             store,
             &self.session.id,
             self.active_queue_last_session_message_seq,
+            "before_tool_call",
         )?
         .is_empty()
             || tool_call_has_matching_hooks(runtime_hooks, call)
@@ -12349,6 +12573,7 @@ fn dispatch_tool_calls_for_turn_with_streaming<P: ModelProvider>(
                         store,
                         &session.id,
                         active_queue_last_session_message_seq,
+                        "after_streaming_tool_call",
                     )?
                     .is_empty()
                 {
@@ -12367,6 +12592,7 @@ fn dispatch_tool_calls_for_turn_with_streaming<P: ModelProvider>(
                 store,
                 &session.id,
                 active_queue_last_session_message_seq,
+                "before_streaming_tool_result",
             )?;
             if !pending_before_streaming_result.is_empty() {
                 streaming_tool_scheduler.discard_all(store, "active_turn_queue_pause")?;
@@ -12487,6 +12713,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
             store,
             &session.id,
             active_queue_last_session_message_seq,
+            "before_tool_call",
         )?;
         if !pending.is_empty() {
             store.append_event(
@@ -12537,6 +12764,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
                 store,
                 &session.id,
                 active_queue_last_session_message_seq,
+                "after_parallel_tool_batch",
             )?;
             if !pending.is_empty() {
                 store.append_event(
@@ -12589,6 +12817,7 @@ fn dispatch_tool_calls_for_turn<P: ModelProvider>(
             store,
             &session.id,
             active_queue_last_session_message_seq,
+            "after_tool_call",
         )?;
         if !pending.is_empty() {
             store.append_event(
@@ -13245,6 +13474,9 @@ fn dispatch_tool_call<P: ModelProvider>(
             options.python_tool_timeout_seconds,
             tool_output_token_budget,
         ),
+        ToolHandlerKind::SubmitCaptureCuration => {
+            dispatch_submit_capture_curation_tool(store, session, call, tool_output_token_budget)
+        }
         ToolHandlerKind::Python => dispatch_python_tool(
             store,
             session,
@@ -21662,6 +21894,136 @@ fn dispatch_browser_script_tool(
     })
 }
 
+fn dispatch_submit_capture_curation_tool(
+    store: &Store,
+    session: &browser_use_protocol::SessionMeta,
+    call: &ToolCall,
+    tool_output_token_budget: usize,
+) -> Result<ToolDispatchOutcome> {
+    store.append_event(
+        &session.id,
+        "tool.started",
+        serde_json::json!({
+            "name": "submit_capture_curation",
+            "tool_call_id": call.id,
+            "arguments": call.arguments,
+        }),
+    )?;
+
+    let selection: Vec<browser_use_browser::CurationSelection> = call
+        .arguments
+        .get("frames")
+        .and_then(Value::as_array)
+        .map(|frames| {
+            frames
+                .iter()
+                .filter_map(|frame| {
+                    let seq = frame.get("seq").and_then(Value::as_u64)? as u32;
+                    let caption = frame
+                        .get("caption")
+                        .and_then(Value::as_str)
+                        .unwrap_or_default()
+                        .to_string();
+                    Some(browser_use_browser::CurationSelection { seq, caption })
+                })
+                .collect()
+        })
+        .unwrap_or_default();
+    let confirmation_seq = call
+        .arguments
+        .get("confirmation_seq")
+        .and_then(Value::as_u64)
+        .map(|seq| seq as u32);
+
+    let message = match browser_use_browser::build_curated_gif(
+        std::path::Path::new(&session.artifact_root),
+        &selection,
+        confirmation_seq,
+    ) {
+        Ok(result) => {
+            store.append_event(
+                &session.id,
+                "capture.curation",
+                serde_json::json!({
+                    "tool_call_id": call.id,
+                    "frames": call.arguments.get("frames").cloned().unwrap_or(Value::Null),
+                    "confirmation_seq": confirmation_seq,
+                    "gif_path": result.gif_path.display().to_string(),
+                    "confirmation_path": result
+                        .confirmation_path
+                        .as_ref()
+                        .map(|path| path.display().to_string()),
+                    "frames_used": result.frames_used,
+                }),
+            )?;
+            record_tool_artifact(
+                store,
+                &session.id,
+                "submit_capture_curation",
+                &serde_json::json!({
+                    "path": result.gif_path.display().to_string(),
+                    "kind": "summary_gif",
+                    "mime_type": "image/gif",
+                }),
+            )?;
+            if let Some(confirmation) = &result.confirmation_path {
+                record_tool_artifact(
+                    store,
+                    &session.id,
+                    "submit_capture_curation",
+                    &serde_json::json!({
+                        "path": confirmation.display().to_string(),
+                        "kind": "confirmation_still",
+                        "mime_type": "image/jpeg",
+                    }),
+                )?;
+            }
+            store.append_event(
+                &session.id,
+                "tool.finished",
+                serde_json::json!({
+                    "name": "submit_capture_curation",
+                    "tool_call_id": call.id,
+                }),
+            )?;
+            format!(
+                "Saved summary GIF ({} frame(s)) to {}{}",
+                result.frames_used,
+                result.gif_path.display(),
+                result
+                    .confirmation_path
+                    .as_ref()
+                    .map(|path| format!("; confirmation still: {}", path.display()))
+                    .unwrap_or_default()
+            )
+        }
+        Err(error) => {
+            store.append_event(
+                &session.id,
+                "tool.failed",
+                serde_json::json!({
+                    "name": "submit_capture_curation",
+                    "tool_call_id": call.id,
+                    "error": format!("{error:#}"),
+                }),
+            )?;
+            format!("capture curation failed: {error:#}")
+        }
+    };
+
+    Ok(ToolDispatchOutcome {
+        finished: false,
+        messages: vec![tool_content_message(
+            store,
+            session,
+            call,
+            "submit_capture_curation",
+            Value::String(message),
+            tool_output_token_budget,
+        )?],
+    })
+}
+
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum BrowserScriptAction {
     Start,
@@ -22122,6 +22484,7 @@ fn dispatch_done_tool(
     if !result_uses_file {
         append_memory_citation_events(store, &session.id, "done.result", &requested_result_raw)?;
     }
+    ensure_fallback_capture_recording(store, session)?;
     store.append_event(&session.id, "session.done", done_payload)?;
     Ok(ToolDispatchOutcome {
         finished: true,
@@ -36802,6 +37165,158 @@ for line in sys.stdin:
     }
 
     #[test]
+    fn provider_loop_delivers_after_next_tool_call_followup_after_tool_outputs() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        std::fs::write(temp.path().join("first.txt"), "first")?;
+        std::fs::write(temp.path().join("second.txt"), "second")?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "read files unless steered after one"}),
+        )?;
+        let provider = AfterNextFollowupBeforeSecondToolProvider {
+            state_dir: store.state_dir().to_path_buf(),
+            session_id: session.id.clone(),
+            attempts: std::sync::Mutex::new(0),
+        };
+
+        let session_id = run_existing_session_with_provider(
+            &store,
+            &provider,
+            &session.id,
+            AgentRunOptions::default(),
+        )?;
+
+        assert_eq!(session_id, session.id);
+        let events = store.events_for_session(&session.id)?;
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| event.event_type == "file.read")
+                .count(),
+            2
+        );
+        assert!(!events.iter().any(|event| {
+            event.event_type == "agent.turn_queue_pause"
+                && event.payload["phase"] == "before_tool_call"
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "agent.turn_queue_drained"
+                && event.payload["phase"] == "after_tool_outputs"
+                && event.payload["session_messages"] == 1
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.done" && event.payload["result"] == "handled after tool"
+        }));
+        Ok(())
+    }
+
+    #[test]
+    fn active_turn_queue_does_not_deliver_reclaimed_after_next_followup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let input = store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        let followup = store.append_event(
+            &session.id,
+            SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+            serde_json::json!({
+                "text": "edit before delivery",
+                "delivery": "after_next_tool_call",
+            }),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.followup.cancelled",
+            serde_json::json!({
+                "followup_seq": followup.seq,
+                "reason": "reclaimed from escape",
+            }),
+        )?;
+
+        let mut messages = Vec::new();
+        let mut last_seq = input.seq;
+        let drain = append_new_external_session_messages_with_phase(
+            &store,
+            &session.id,
+            &mut messages,
+            &mut last_seq,
+            "after_tool_outputs",
+            Some(0),
+        )?;
+
+        assert_eq!(drain.session_messages, 0);
+        assert!(messages.is_empty());
+        assert!(last_seq > followup.seq);
+        Ok(())
+    }
+
+    #[test]
+    fn active_turn_queue_commits_pending_followup_when_drained() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path().join("state"))?;
+        let session = store.create_session(None, temp.path())?;
+        let input = store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "run"}),
+        )?;
+        let tool_output = store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "README.md"}),
+        )?;
+        let pending = store.append_event(
+            &session.id,
+            SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+            serde_json::json!({
+                "text": "steer after tool",
+                "delivery": "after_next_tool_call",
+            }),
+        )?;
+
+        let mut messages = Vec::new();
+        let mut last_seq = input.seq;
+        let drain = append_new_external_session_messages_with_phase(
+            &store,
+            &session.id,
+            &mut messages,
+            &mut last_seq,
+            "after_tool_outputs",
+            Some(0),
+        )?;
+
+        assert_eq!(drain.session_messages, 1);
+        assert_eq!(messages.len(), 1);
+        assert_eq!(messages[0]["content"], "steer after tool");
+        let events = store.events_for_session(&session.id)?;
+        let committed = events
+            .iter()
+            .find(|event| {
+                event.event_type == "session.followup"
+                    && event.payload["text"] == "steer after tool"
+            })
+            .context("committed follow-up")?;
+        assert!(
+            committed.seq > tool_output.seq,
+            "committed follow-up should be ordered after previous tool output"
+        );
+        assert_eq!(
+            committed.payload["pending_from_seq"].as_i64(),
+            Some(pending.seq)
+        );
+        assert!(committed.payload.get("delivery").is_none());
+        assert!(last_seq >= committed.seq);
+        Ok(())
+    }
+
+    #[test]
     fn provider_loop_defers_queue_only_mailbox_at_answer_boundary_like_codex() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path().join("state"))?;
@@ -37036,6 +37551,67 @@ for line in sys.stdin:
                         name: "done".to_string(),
                         namespace: None,
                         arguments: serde_json::json!({"result": "paused stale tools"}),
+                    },
+                },
+                ModelEvent::Done,
+            ])
+        }
+    }
+
+    struct AfterNextFollowupBeforeSecondToolProvider {
+        state_dir: std::path::PathBuf,
+        session_id: String,
+        attempts: std::sync::Mutex<usize>,
+    }
+
+    impl ModelProvider for AfterNextFollowupBeforeSecondToolProvider {
+        fn provider_name(&self) -> &str {
+            "after-next-followup-before-second-tool"
+        }
+
+        fn model_name(&self) -> &str {
+            "after-next-followup-before-second-tool"
+        }
+
+        fn start_turn(&self, _turn: ProviderTurn) -> Result<Vec<ModelEvent>> {
+            let mut attempts = self.attempts.lock().expect("attempt lock");
+            *attempts += 1;
+            if *attempts == 1 {
+                Store::open(&self.state_dir)?.append_event(
+                    &self.session_id,
+                    "session.followup",
+                    serde_json::json!({
+                        "text": "steer after first read",
+                        "delivery": "after_next_tool_call",
+                    }),
+                )?;
+                return Ok(vec![
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "read_first_before_after_next".to_string(),
+                            name: "read_file".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "path": "first.txt" }),
+                        },
+                    },
+                    ModelEvent::ToolCall {
+                        call: ToolCall {
+                            id: "read_second_stale_after_next".to_string(),
+                            name: "read_file".to_string(),
+                            namespace: None,
+                            arguments: serde_json::json!({ "path": "second.txt" }),
+                        },
+                    },
+                    ModelEvent::Done,
+                ]);
+            }
+            Ok(vec![
+                ModelEvent::ToolCall {
+                    call: ToolCall {
+                        id: "done_after_after_next_followup".to_string(),
+                        name: "done".to_string(),
+                        namespace: None,
+                        arguments: serde_json::json!({"result": "handled after tool"}),
                     },
                 },
                 ModelEvent::Done,
