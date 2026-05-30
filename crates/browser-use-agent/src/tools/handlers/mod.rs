@@ -8,11 +8,15 @@
 
 pub mod apply_patch;
 pub mod shell;
+pub mod view_image;
 
 #[cfg(test)]
 mod apply_patch_tests;
 #[cfg(test)]
 mod shell_tests;
+#[cfg(test)]
+mod view_image_tests;
 
 pub use apply_patch::{ApplyPatchApprovalKey, ApplyPatchRequest, ApplyPatchTool};
 pub use shell::{ShellApprovalKey, ShellRequest, ShellTool};
+pub use view_image::{ViewImageApprovalKey, ViewImageRequest, ViewImageTool};
