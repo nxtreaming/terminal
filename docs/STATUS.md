@@ -46,8 +46,32 @@ provenance is unconfirmed.** Verify with `cargo test` (with a `timeout`) before 
 3. [x] Integrate WP 1.8 tool_runtime (`tool.rs` + `tool_runtime.rs`; 102 crate tests green; `2ef9e29`)
 4. [x] `timeout 300 cargo test -p browser-use-llm` green → **MILESTONE 1 DONE** (102 tests, <1s, no hang)
 
-**Milestone 2 — finish the carve** (serial; extract remaining cohesive modules that don't need async).
+**Milestone 2 — finish the carve** — ✅ **DONE at its working boundary.**
+- ~16 cohesive modules extracted; `lib.rs` 47.3k → 44.3k; `browser-use-core` 488 tests green at `ecfd2bf`.
+- A further pass found ~4 more async-free extractable clusters (`response_items`, `model_catalog_remote`,
+  `task_analytics`, `image_artifacts`) BUT could not land them due to **branch contention** (two
+  committers on `decodex` raced — the loop driver + the carve sub-agent), so it reset to the green
+  baseline `ecfd2bf`. **Root-cause fix going forward:** never run a sub-agent that commits to `decodex`
+  while the loop also commits to `decodex`. Sub-agents commit on their OWN branch/worktree only.
+- Those 4 clusters are deferred — they'll fall out naturally during the **B: parallel rewrite** below,
+  so we are NOT going to keep poking the monolith on `decodex`.
+- The async-bound residue (context, compact, session, events, agents_md, hooks, skills, plugins,
+  subagents, the turn loop, providers_glue) is M3 work.
 
-**Milestone 3+ — the async engine** (the hard, serial part): turn loop → context/real-tokens → orchestrator seam → session. One WP at a time, each verified+merged before the next. This is where parity work lives. NOT a loop; deliberate.
+**Milestone 3 — the async engine — STRATEGY CHOSEN: (B) PARALLEL REWRITE.**
+Build a NEW async engine crate (`browser-use-agent`, working name) alongside the existing sync
+`browser-use-core`, on top of the frozen async `browser-use-llm`. Port subsystem-by-subsystem with
+codex-parity tests; cut over (TUI/CLI switch from core → agent) only at the end. **Why B fits now:** a
+new crate = brand-new files = ZERO contention with the monolith — which is exactly the failure mode that
+kept biting us. Sub-agents can even work disjoint *new* files safely.
+M3 sub-plan (each its own WP, verified+committed before the next; the FIRST few are isolated new files,
+so they're loop-safe; later cutover steps are human-gated):
+- 3.1 scaffold `browser-use-agent` crate (deps: tokio, browser-use-llm, browser-use-protocol, browser-use-store) — compiles empty, 0 tests.
+- 3.2 async turn loop (codex parity: unbounded loop on needs_follow_up, CancellationToken, FuturesOrdered) — pure logic + scripted-source tests, no real I/O.
+- 3.3 context manager with REAL token accounting (per-provider `Usage` from browser-use-llm).
+- 3.4 ToolOrchestrator/ToolRuntime/Approvable/Sandboxable seam (sandbox=None stub) — additive new files.
+- 3.5 session/resume over SQLite as a write-sink + event-notify.
+- 3.6+ port tools, then subsystems, then safety (Phases 3–6 of IMPLEMENTATION_PLAN), each on the new crate.
+- FINAL (human-gated): switch TUI/CLI to the new engine; retire `browser-use-core`.
 
 See `IMPLEMENTATION_PLAN.md` for the full WP list and `REARCHITECTURE.md` for the design.
