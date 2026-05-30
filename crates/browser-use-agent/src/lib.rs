@@ -29,6 +29,7 @@ pub mod error;
 pub mod events;
 pub mod mcp;
 pub mod session;
+pub mod subagents;
 pub mod task;
 pub mod testkit;
 pub mod tools;
