@@ -12,6 +12,7 @@ pub mod shell;
 pub mod tool_search;
 pub mod update_plan;
 pub mod view_image;
+pub mod web_search;
 
 #[cfg(test)]
 mod apply_patch_tests;
@@ -25,6 +26,8 @@ mod tool_search_tests;
 mod update_plan_tests;
 #[cfg(test)]
 mod view_image_tests;
+#[cfg(test)]
+mod web_search_tests;
 
 pub use apply_patch::{ApplyPatchApprovalKey, ApplyPatchRequest, ApplyPatchTool};
 pub use request_user_input::{
@@ -39,3 +42,7 @@ pub use update_plan::{
     PlanItem, PlanStatus, UpdatePlanApprovalKey, UpdatePlanRequest, UpdatePlanTool,
 };
 pub use view_image::{ViewImageApprovalKey, ViewImageRequest, ViewImageTool};
+pub use web_search::{
+    web_search_action_detail, web_search_detail, WebSearchAction, WebSearchApprovalKey,
+    WebSearchConfig, WebSearchMode, WebSearchRequest, WebSearchTool,
+};
