@@ -5,6 +5,8 @@ pub mod loop_driver;
 pub mod sampling;
 
 #[cfg(test)]
+mod dispatch_tests;
+#[cfg(test)]
 mod sampling_tests;
 
 use crate::decision;
