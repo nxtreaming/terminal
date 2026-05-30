@@ -11,6 +11,9 @@ pub mod image_estimate;
 pub mod inject;
 pub mod normalize;
 
+#[cfg(test)]
+mod tests_accounting;
+
 use browser_use_llm::schema::Message;
 
 /// FROZEN ALIAS; swap to `protocol::ResponseItem` when available (open q).
