@@ -27,6 +27,7 @@ pub mod context;
 pub mod decision;
 pub mod error;
 pub mod events;
+pub mod goals;
 pub mod mcp;
 pub mod session;
 pub mod subagents;
