@@ -16,6 +16,7 @@ browser-use-store = { path = "../browser-use-store" }
 anyhow.workspace = true
 async-trait.workspace = true
 base64.workspace = true
+bm25.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 thiserror.workspace = true
