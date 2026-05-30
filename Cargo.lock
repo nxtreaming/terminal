@@ -219,12 +219,17 @@ dependencies = [
 name = "browser-use-agent"
 version = "0.1.2"
 dependencies = [
+ "anyhow",
+ "async-trait",
  "browser-use-llm",
  "browser-use-protocol",
+ "browser-use-store",
  "futures-util",
  "serde",
  "serde_json",
+ "thiserror 1.0.69",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]

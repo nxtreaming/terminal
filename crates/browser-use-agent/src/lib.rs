@@ -6,14 +6,33 @@
 //! codex-parity tests, and the TUI/CLI are switched over to this engine only
 //! once parity is reached. Until then `browser-use-core` remains the live engine.
 //!
-//! WP 3.1 (this commit) is an empty, compiling scaffold — no behavior yet.
+//! This module tree is the **frozen interface scaffold** (WP-A0): every type,
+//! trait, and function signature is the contract later work packages fill in.
+//! Bodies are `unimplemented!()` / trivial; only the shapes are load-bearing.
 //!
-//! Planned module layout (added per later WPs):
-//! - `turn`    — the async turn loop (codex parity: unbounded loop on
-//!               needs-follow-up, `CancellationToken`, `FuturesOrdered` tool sched)
-//! - `context` — context manager with REAL token accounting (per-provider `Usage`)
-//! - `orchestrator` — `ToolOrchestrator` + `ToolRuntime`/`Approvable`/`Sandboxable`
-//! - `session` — session lifecycle + resume over SQLite as a write-sink
+//! Layering:
+//! - [`decision`] — PURE sync decision core (the unit-test surface).
+//! - [`events`]   — sync `EventSink` fan-out + pure stream-event mapper.
+//! - [`context`]  — `ContextManager` + real token accounting (pure core + thin async).
+//! - [`tools`]    — `ToolOrchestrator` + runtime/approval/sandbox seam.
+//! - [`turn`]     — the async turn loop + in-turn tool dispatch.
+//! - [`task`]     — async task driver / lifecycle.
+//! - [`session`]  — lifecycle, resume-by-replay, fork/rollback.
+//! - [`testkit`]  — deterministic fakes shared by every WP's tests.
+
+pub mod config;
+pub mod context;
+pub mod decision;
+pub mod error;
+pub mod events;
+pub mod session;
+pub mod task;
+pub mod testkit;
+pub mod tools;
+pub mod turn;
+
+pub use config::AgentConfig;
+pub use error::AgentError;
 
 #[cfg(test)]
 mod tests {
