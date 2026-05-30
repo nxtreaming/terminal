@@ -7,6 +7,8 @@ pub mod sampling;
 #[cfg(test)]
 mod dispatch_tests;
 #[cfg(test)]
+mod loop_tests;
+#[cfg(test)]
 mod sampling_tests;
 
 use crate::decision;
@@ -21,6 +23,20 @@ pub trait TurnState: Send + Sync + 'static {
     fn has_pending_input(&self) -> impl std::future::Future<Output = bool> + Send;
     fn take_pending_input(&self) -> impl std::future::Future<Output = Vec<Message>> + Send;
     fn token_status(&self) -> impl std::future::Future<Output = decision::TokenStatus> + Send;
+
+    /// Mid-turn compaction hook, invoked by [`TurnLoop`] on a
+    /// [`decision::LoopStep::CompactThenContinue`] step (codex `turn.rs:282`).
+    ///
+    /// The real model-based compaction work package is not built yet, so the
+    /// default body is a no-op: the loop's CONTROL FLOW around compaction is
+    /// codex-faithful (compact-then-continue, drain gate set per the decision)
+    /// even while the compaction body is a stub. The production `TurnState`
+    /// (over `ContextManager` + `Session`) overrides this to summarize history
+    /// and reset token accounting; the loop tests override it to assert the hook
+    /// fired exactly when `token_limit_reached && needs_follow_up`.
+    fn compact(&self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
 }
 
 /// One sampling round-trip + ordered tool dispatch (`turn.rs:892/1655/1873`).
