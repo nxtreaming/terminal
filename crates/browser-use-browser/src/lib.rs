@@ -5252,6 +5252,77 @@ print("bs4 available", bs4.__version__)
     }
 
     #[test]
+    fn browser_script_raw_cdp_mouse_press_auto_highlights() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-raw-cdp-highlight",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+events = []
+
+def _bridge(message):
+    if message["kind"] == "cdp":
+        events.append((message["method"], message["params"]))
+    return {}
+
+cdp("Input.dispatchMouseEvent", type="mousePressed", x=31, y=47, button="left", clickCount=1)
+assert events[0][0] == "Runtime.evaluate", events
+runtime = [params["expression"] for method, params in events if method == "Runtime.evaluate"]
+assert any("elementFromPoint" in expr for expr in runtime), runtime
+assert any("data-browser-use-terminal-highlight" in expr for expr in runtime), runtime
+assert any("#3b82f6" in expr for expr in runtime), runtime
+assert any('"duration": 1000' in expr for expr in runtime), runtime
+assert events[-1] == (
+    "Input.dispatchMouseEvent",
+    {"type": "mousePressed", "x": 31, "y": 47, "button": "left", "clickCount": 1},
+), events
+print("raw cdp highlight ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("raw cdp highlight ok"));
+    }
+
+    #[test]
+    fn browser_script_click_at_xy_emits_accent_highlight_before_mouse_events() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-click-highlight",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r##"
+events = []
+
+def _bridge(message):
+    if message["kind"] == "cdp":
+        events.append((message["method"], message["params"]))
+    return {}
+
+click_at_xy(17, 29)
+assert events[0][0] == "Runtime.evaluate", events
+runtime = [params["expression"] for method, params in events if method == "Runtime.evaluate"]
+assert any("data-browser-use-terminal-highlight" in expr for expr in runtime), runtime
+assert any("#3b82f6" in expr for expr in runtime), runtime
+assert any('"duration": 1000' in expr for expr in runtime), runtime
+mouse = [params for method, params in events if method == "Input.dispatchMouseEvent"]
+assert len(mouse) == 2, events
+assert mouse[0]["type"] == "mousePressed" and mouse[0]["x"] == 17 and mouse[0]["y"] == 29, mouse
+assert mouse[1]["type"] == "mouseReleased", mouse
+print("click highlight ok")
+"##,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("click highlight ok"));
+    }
+
+    #[test]
     fn browser_script_fill_input_uses_cdp_focus_and_input() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -5264,7 +5335,10 @@ events = []
 def js(expression, *args, **kwargs):
     raise AssertionError(f"fill_input should not use page JS: {expression}")
 
-def cdp(method, *args, **kwargs):
+def _bridge(message):
+    assert message["kind"] == "cdp", message
+    method = message["method"]
+    kwargs = message["params"]
     events.append((method, kwargs))
     if method == "DOM.getDocument":
         return {"root": {"nodeId": 1}}
@@ -5286,7 +5360,10 @@ assert mouse[1][1]["type"] == "mouseReleased", mouse
 assert any(event[0] == "Input.dispatchKeyEvent" and event[1].get("key") == "a" for event in events), events
 assert any(event[0] == "Input.dispatchKeyEvent" and event[1].get("key") == "Backspace" for event in events), events
 assert ("Input.insertText", {"text": "ab"}) in events, events
-assert not any(event[0] == "Runtime.evaluate" for event in events), events
+highlight_events = [event for event in events if event[0] == "Runtime.evaluate"]
+assert highlight_events, events
+expressions = [event[1]["expression"] for event in highlight_events]
+assert any("data-browser-use-terminal-highlight" in expr for expr in expressions), highlight_events
 print("fill_input cdp ok")
 "#,
             10,

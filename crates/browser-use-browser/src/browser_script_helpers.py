@@ -20,6 +20,13 @@ from urllib.parse import urlparse
 
 INTERNAL = ("chrome://", "chrome-untrusted://", "devtools://", "chrome-extension://", "about:")
 __last_domain_skills = []
+HIGHLIGHT_ATTR = "data-browser-use-terminal-highlight"
+HIGHLIGHT_CONTAINER_ID = "browser-use-terminal-highlights"
+HIGHLIGHT_ACCENT = "#3b82f6"
+HIGHLIGHT_BOX_DURATION_MS = 1000
+HIGHLIGHT_POINT_DURATION_MS = 1000
+HIGHLIGHT_Z_INDEX = 2147483647
+__auto_highlight_suppressed = 0
 
 
 def _send_meta(meta, **params):
@@ -28,6 +35,7 @@ def _send_meta(meta, **params):
 
 def cdp(method, session_id=None, **params):
     """Raw CDP. Example: cdp("Page.navigate", url="https://example.com")."""
+    _auto_highlight_cdp_action(method, session_id=session_id, params=params)
     return _bridge({"kind": "cdp", "method": method, "session_id": session_id, "params": params})
 
 
@@ -224,6 +232,339 @@ def js(expression, target_id=None, returnByValue=True):
         await_promise=True,
         return_by_value=returnByValue,
     )
+
+
+def _highlight_color(color=None):
+    return color or os.environ.get("BROWSER_USE_TERMINAL_HIGHLIGHT_COLOR") or HIGHLIGHT_ACCENT
+
+
+def _auto_highlight_enabled():
+    if __auto_highlight_suppressed > 0:
+        return False
+    return _truthy_env("BROWSER_USE_TERMINAL_AUTO_HIGHLIGHT", True)
+
+
+def _push_auto_highlight_suppressed():
+    global __auto_highlight_suppressed
+    __auto_highlight_suppressed += 1
+
+
+def _pop_auto_highlight_suppressed():
+    global __auto_highlight_suppressed
+    __auto_highlight_suppressed = max(0, __auto_highlight_suppressed - 1)
+
+
+def _auto_highlight_cdp_action(method, session_id=None, params=None):
+    if not _auto_highlight_enabled():
+        return
+    params = params or {}
+    try:
+        if method == "Input.dispatchMouseEvent":
+            event_type = params.get("type")
+            x = params.get("x")
+            y = params.get("y")
+            if event_type == "mousePressed" and x is not None and y is not None:
+                highlight_element_at_xy(x, y)
+        elif method in ("DOM.focus", "DOM.setFileInputFiles"):
+            node_id = params.get("nodeId")
+            if node_id is not None:
+                highlight_node(node_id)
+    except Exception:
+        pass
+
+
+def remove_highlights():
+    """Remove Browser Use Terminal visual action highlights from the page."""
+    script = f"""
+    (function() {{
+        const container = document.getElementById({json.dumps(HIGHLIGHT_CONTAINER_ID)});
+        if (container) container.remove();
+        document.querySelectorAll('[{HIGHLIGHT_ATTR}]').forEach((el) => el.remove());
+        return true;
+    }})()
+    """
+    try:
+        _runtime_evaluate(script)
+    except Exception:
+        pass
+    return True
+
+
+def _highlight_root_js():
+    return f"""
+    const attrName = {json.dumps(HIGHLIGHT_ATTR)};
+    const containerId = {json.dumps(HIGHLIGHT_CONTAINER_ID)};
+    let root = document.getElementById(containerId);
+    if (!root) {{
+        root = document.createElement('div');
+        root.id = containerId;
+        root.setAttribute(attrName, 'container');
+        root.style.cssText = `
+            position: fixed;
+            inset: 0;
+            pointer-events: none;
+            z-index: {HIGHLIGHT_Z_INDEX};
+            overflow: visible;
+            contain: layout style;
+        `;
+        document.documentElement.appendChild(root);
+    }}
+    """
+
+
+def highlight_box(x, y, width, height, label=None, duration_ms=HIGHLIGHT_BOX_DURATION_MS, color=None):
+    """Pulse a Browser Use Terminal accent outline around a viewport-space box."""
+    if width <= 0 or height <= 0:
+        return False
+    payload = json.dumps(
+        {
+            "x": float(x),
+            "y": float(y),
+            "width": float(width),
+            "height": float(height),
+            "label": None if label is None else str(label),
+            "duration": max(100, int(duration_ms)),
+            "color": _highlight_color(color),
+        }
+    )
+    script = f"""
+    (function() {{
+        const highlight = {payload};
+        {_highlight_root_js()}
+        const box = document.createElement('div');
+        box.setAttribute(attrName, 'box');
+        box.style.cssText = `
+            position: fixed;
+            left: ${{highlight.x}}px;
+            top: ${{highlight.y}}px;
+            width: ${{highlight.width}}px;
+            height: ${{highlight.height}}px;
+            pointer-events: none;
+            box-sizing: border-box;
+            z-index: {HIGHLIGHT_Z_INDEX};
+        `;
+
+        const borderWidth = 3;
+        const cornerSize = Math.max(10, Math.min(24, Math.min(highlight.width, highlight.height) * 0.35));
+        const corners = [
+            ['top', 'left', 'borderTop', 'borderLeft', '-8px', '-8px'],
+            ['top', 'right', 'borderTop', 'borderRight', '8px', '-8px'],
+            ['bottom', 'left', 'borderBottom', 'borderLeft', '-8px', '8px'],
+            ['bottom', 'right', 'borderBottom', 'borderRight', '8px', '8px'],
+        ];
+        for (const [vertical, horizontal, edgeA, edgeB, startX, startY] of corners) {{
+            const corner = document.createElement('div');
+            corner.setAttribute(attrName, 'corner');
+            corner.style.cssText = `
+                position: absolute;
+                ${{vertical}}: -3px;
+                ${{horizontal}}: -3px;
+                width: ${{cornerSize}}px;
+                height: ${{cornerSize}}px;
+                pointer-events: none;
+                transition: transform 140ms ease-out, opacity 220ms ease-out;
+                transform: translate(${{startX}}, ${{startY}});
+                opacity: 0.95;
+            `;
+            corner.style[edgeA] = `${{borderWidth}}px solid ${{highlight.color}}`;
+            corner.style[edgeB] = `${{borderWidth}}px solid ${{highlight.color}}`;
+            box.appendChild(corner);
+            requestAnimationFrame(() => {{
+                corner.style.transform = 'translate(0, 0)';
+            }});
+        }}
+
+        if (highlight.label) {{
+            const label = document.createElement('div');
+            label.setAttribute(attrName, 'label');
+            label.textContent = highlight.label;
+            label.style.cssText = `
+                position: absolute;
+                top: -24px;
+                left: 0;
+                max-width: 240px;
+                padding: 2px 7px;
+                border-radius: 4px;
+                background: ${{highlight.color}};
+                color: #11111b;
+                font: 700 11px/1.35 ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+                white-space: nowrap;
+                overflow: hidden;
+                text-overflow: ellipsis;
+                box-shadow: 0 6px 18px rgba(0,0,0,0.25);
+            `;
+            box.appendChild(label);
+        }}
+
+        root.appendChild(box);
+        setTimeout(() => {{
+            box.style.transition = 'opacity 320ms ease-out';
+            box.style.opacity = '0';
+            setTimeout(() => box.remove(), 340);
+        }}, highlight.duration);
+        return true;
+    }})()
+    """
+    try:
+        _runtime_evaluate(script)
+    except Exception:
+        return False
+    return True
+
+
+def highlight_at_xy(x, y, duration_ms=HIGHLIGHT_POINT_DURATION_MS, color=None):
+    """Pulse a Browser Use Terminal accent marker at viewport-space coordinates."""
+    payload = json.dumps(
+        {
+            "x": float(x),
+            "y": float(y),
+            "duration": max(100, int(duration_ms)),
+            "color": _highlight_color(color),
+        }
+    )
+    script = f"""
+    (function() {{
+        const point = {payload};
+        {_highlight_root_js()}
+        const marker = document.createElement('div');
+        marker.setAttribute(attrName, 'point');
+        marker.style.cssText = `
+            position: fixed;
+            left: ${{point.x}}px;
+            top: ${{point.y}}px;
+            width: 0;
+            height: 0;
+            pointer-events: none;
+            z-index: {HIGHLIGHT_Z_INDEX};
+        `;
+        const ring = document.createElement('div');
+        ring.setAttribute(attrName, 'ring');
+        ring.style.cssText = `
+            position: absolute;
+            left: -15px;
+            top: -15px;
+            width: 30px;
+            height: 30px;
+            border: 3px solid ${{point.color}};
+            border-radius: 50%;
+            opacity: 0;
+            transform: scale(0.35);
+            transition: transform 180ms ease-out, opacity 180ms ease-out;
+            box-shadow: 0 0 0 2px rgba(17,17,27,0.35);
+        `;
+        const dot = document.createElement('div');
+        dot.setAttribute(attrName, 'dot');
+        dot.style.cssText = `
+            position: absolute;
+            left: -4px;
+            top: -4px;
+            width: 8px;
+            height: 8px;
+            border-radius: 50%;
+            background: ${{point.color}};
+            opacity: 0;
+            transform: scale(0);
+            transition: transform 120ms ease-out, opacity 120ms ease-out;
+        `;
+        marker.appendChild(ring);
+        marker.appendChild(dot);
+        root.appendChild(marker);
+        requestAnimationFrame(() => {{
+            ring.style.opacity = '0.9';
+            ring.style.transform = 'scale(1)';
+            dot.style.opacity = '1';
+            dot.style.transform = 'scale(1)';
+        }});
+        setTimeout(() => {{
+            ring.style.opacity = '0';
+            ring.style.transform = 'scale(1.7)';
+            dot.style.opacity = '0';
+            setTimeout(() => marker.remove(), 260);
+        }}, point.duration);
+        return true;
+    }})()
+    """
+    try:
+        _runtime_evaluate(script)
+    except Exception:
+        return False
+    return True
+
+
+def highlight_element_at_xy(x, y, duration_ms=HIGHLIGHT_BOX_DURATION_MS, color=None):
+    """Pulse an accent box around the element under viewport-space coordinates."""
+    payload = json.dumps(
+        {
+            "x": float(x),
+            "y": float(y),
+            "duration": max(100, int(duration_ms)),
+            "color": _highlight_color(color),
+        }
+    )
+    script = f"""
+    (function() {{
+        const point = {payload};
+        const target = document.elementFromPoint(point.x, point.y);
+        if (!target || !target.getBoundingClientRect) return false;
+        const rect = target.getBoundingClientRect();
+        if (rect.width <= 1 || rect.height <= 1) return false;
+        {_highlight_root_js()}
+        const box = document.createElement('div');
+        box.setAttribute(attrName, 'box');
+        box.style.cssText = `
+            position: fixed;
+            left: ${{rect.left}}px;
+            top: ${{rect.top}}px;
+            width: ${{rect.width}}px;
+            height: ${{rect.height}}px;
+            pointer-events: none;
+            box-sizing: border-box;
+            z-index: {HIGHLIGHT_Z_INDEX};
+        `;
+        const borderWidth = 3;
+        const cornerSize = Math.max(10, Math.min(24, Math.min(rect.width, rect.height) * 0.35));
+        const corners = [
+            ['top', 'left', 'borderTop', 'borderLeft', '-8px', '-8px'],
+            ['top', 'right', 'borderTop', 'borderRight', '8px', '-8px'],
+            ['bottom', 'left', 'borderBottom', 'borderLeft', '-8px', '8px'],
+            ['bottom', 'right', 'borderBottom', 'borderRight', '8px', '8px'],
+        ];
+        for (const [vertical, horizontal, edgeA, edgeB, startX, startY] of corners) {{
+            const corner = document.createElement('div');
+            corner.setAttribute(attrName, 'corner');
+            corner.style.cssText = `
+                position: absolute;
+                ${{vertical}}: -3px;
+                ${{horizontal}}: -3px;
+                width: ${{cornerSize}}px;
+                height: ${{cornerSize}}px;
+                pointer-events: none;
+                transition: transform 140ms ease-out, opacity 220ms ease-out;
+                transform: translate(${{startX}}, ${{startY}});
+                opacity: 0.95;
+            `;
+            corner.style[edgeA] = `${{borderWidth}}px solid ${{point.color}}`;
+            corner.style[edgeB] = `${{borderWidth}}px solid ${{point.color}}`;
+            box.appendChild(corner);
+            requestAnimationFrame(() => {{
+                corner.style.transform = 'translate(0, 0)';
+            }});
+        }}
+        root.appendChild(box);
+        setTimeout(() => {{
+            box.style.transition = 'opacity 320ms ease-out';
+            box.style.opacity = '0';
+            setTimeout(() => box.remove(), 340);
+        }}, point.duration);
+        return true;
+    }})()
+    """
+    try:
+        if _runtime_evaluate(script):
+            return True
+    except Exception:
+        pass
+    return highlight_at_xy(x, y, duration_ms=duration_ms, color=color)
 
 
 def _truthy_env(name, default=False):
@@ -541,6 +882,7 @@ def _write_b64_artifact(label, data_b64, suffix=".png", mime_type="image/png"):
 
 def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None, **kwargs):
     """Save a PNG of the current viewport and return its local artifact path."""
+    remove_highlights()
     try:
         target_id = (current_tab() or {}).get("targetId")
         if target_id:
@@ -581,9 +923,15 @@ def screenshot_clip(label, x, y, width, height):
     return capture_screenshot(label=label, clip={"x": x, "y": y, "width": width, "height": height, "scale": 1}, attach=True)
 
 
-def click_at_xy(x, y, button="left", clicks=1):
-    cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button=button, clickCount=clicks)
-    cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button=button, clickCount=clicks)
+def click_at_xy(x, y, button="left", clicks=1, highlight=True):
+    if not highlight:
+        _push_auto_highlight_suppressed()
+    try:
+        cdp("Input.dispatchMouseEvent", type="mousePressed", x=x, y=y, button=button, clickCount=clicks)
+        cdp("Input.dispatchMouseEvent", type="mouseReleased", x=x, y=y, button=button, clickCount=clicks)
+    finally:
+        if not highlight:
+            _pop_auto_highlight_suppressed()
     return True
 
 
@@ -721,12 +1069,47 @@ def _quad_center(quad):
     return (min(xs) + max(xs)) / 2, (min(ys) + max(ys)) / 2
 
 
-def _node_center(node_id):
+def _quad_box(quad):
+    if not quad or len(quad) < 8:
+        return None
+    xs = quad[0::2]
+    ys = quad[1::2]
+    width = max(xs) - min(xs)
+    height = max(ys) - min(ys)
+    if width <= 0 or height <= 0:
+        return None
+    return (min(xs), min(ys), width, height)
+
+
+def _node_box(node_id):
     try:
         model = (cdp("DOM.getBoxModel", nodeId=node_id) or {}).get("model") or {}
     except Exception:
         return None
-    return _quad_center(model.get("border")) or _quad_center(model.get("content"))
+    return _quad_box(model.get("border")) or _quad_box(model.get("content"))
+
+
+def _node_center(node_id):
+    box = _node_box(node_id)
+    if not box:
+        return None
+    x, y, width, height = box
+    return x + width / 2, y + height / 2
+
+
+def highlight_node(node_id, label=None, duration_ms=HIGHLIGHT_BOX_DURATION_MS, color=None):
+    box = _node_box(node_id)
+    if not box:
+        return False
+    x, y, width, height = box
+    return highlight_box(x, y, width, height, label=label, duration_ms=duration_ms, color=color)
+
+
+def highlight_selector(selector, timeout=0.0, label=None, duration_ms=HIGHLIGHT_BOX_DURATION_MS, color=None):
+    node_id = _wait_for_selector_node_id(selector, timeout=timeout)
+    if not node_id:
+        return False
+    return highlight_node(node_id, label=label or selector, duration_ms=duration_ms, color=color)
 
 
 def _focus_selector_like_user(selector, timeout=0.0):
