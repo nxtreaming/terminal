@@ -1,12 +1,11 @@
-//! Codex `auth.json` reader — **DEV/TEST VEHICLE ONLY (codex backend is cut).**
+//! Codex (chatgpt.com) login support — **production codex backend reader.**
 //!
-//! The codex/ChatGPT backend (`chatgpt.com/backend-api`) is being **removed from
-//! production**; we cannot rely on it. This module is therefore gated behind the
-//! `codex-dev` Cargo feature and is **never** part of the default build or any
-//! production code path. It exists only so a developer with a local codex login
-//! can manually exercise the streaming stack end-to-end against a real backend
-//! while the multi-provider production path (OpenAI / Anthropic / OpenAI-compat,
-//! resolved from standard env keys) is the one that ships.
+//! The codex/ChatGPT backend (`chatgpt.com/backend-api`) is a supported,
+//! selectable provider: a user who has logged in with the Codex CLI (or imported
+//! those credentials) can run the engine against the ChatGPT-backed backend. This
+//! module is part of the default build; it reads the on-disk OAuth credentials and
+//! builds the [`Route`](crate::route::Route) the engine streams through. It sits
+//! alongside the env-keyed multi-provider path (OpenAI / Anthropic / OpenAI-compat).
 //!
 //! The Codex CLI stores its OAuth credentials in `~/.codex/auth.json`:
 //!
@@ -25,7 +24,7 @@
 //! ```
 //!
 //! For the ChatGPT-backed flow there is **no raw API key** (`OPENAI_API_KEY` is
-//! `null`); the (now-cut) codex backend was reached with `Authorization: Bearer
+//! `null`); the codex backend is reached with `Authorization: Bearer
 //! <access_token>` plus the `chatgpt-account-id` header.
 //!
 //! This module is the honest, offline-testable parser: it reads the file, parses
@@ -254,24 +253,30 @@ fn non_empty(v: Option<String>) -> Option<String> {
     v.filter(|s| !s.trim().is_empty())
 }
 
-/// Build a dev-only [`Route`](crate::route::Route) against the (cut) codex
-/// backend from resolved [`CodexAuth`].
+/// The default codex backend base url (ChatGPT `backend-api`).
 ///
-/// **DEV/TEST ONLY.** This points at `chatgpt.com/backend-api/codex/responses`
-/// — a backend that is being removed from production. It exists purely so a
-/// developer with a local codex login can smoke-test the real streaming stack;
-/// production must use [`crate::providers`] (`OpenAi` / `Anthropic` /
-/// `OpenAiCompatible`) instead. Wire format is the OpenAI Responses SSE protocol;
-/// headers mirror the legacy provider (`Authorization: Bearer`,
-/// `chatgpt-account-id`, `originator`, `OpenAI-Beta`).
-pub fn dev_codex_route(auth: &CodexAuth) -> crate::route::Route {
+/// Parity with the legacy `browser-use-core` codex provider's base url default.
+pub const CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+
+/// Build a [`Route`](crate::route::Route) against the codex (chatgpt.com) backend
+/// from resolved [`CodexAuth`].
+///
+/// This points at `<base_url>/codex/responses` (default
+/// [`CODEX_BASE_URL`]); `base_url` lets a caller override it for a proxy/gateway.
+/// Wire format is the OpenAI Responses SSE protocol; headers mirror the legacy
+/// provider (`Authorization: Bearer`, `chatgpt-account-id`, `originator`,
+/// `OpenAI-Beta`).
+pub fn codex_route(auth: &CodexAuth, base_url: Option<&str>) -> crate::route::Route {
     use crate::protocols::OpenAiResponsesProtocol;
     use crate::route::{Auth, Endpoint, Route};
 
-    const DEV_CODEX_BASE_URL: &str = "https://chatgpt.com/backend-api";
+    let base_url = base_url
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or(CODEX_BASE_URL);
     Route::new(
         Box::new(OpenAiResponsesProtocol::new()),
-        Endpoint::new(DEV_CODEX_BASE_URL, "/codex/responses"),
+        Endpoint::new(base_url, "/codex/responses"),
         Auth::bearer(auth.access_token.clone())
             .and_then(Auth::header("chatgpt-account-id", auth.account_id.clone()))
             .and_then(Auth::header("originator", "browser-use-terminal"))
@@ -410,12 +415,12 @@ mod tests {
     }
 
     #[test]
-    fn dev_codex_route_is_built_but_marked_dev_only() {
-        // The dev-only route targets the (cut) codex backend; assert its shape so
-        // a developer smoke-testing it gets the expected target + headers, and
-        // confirm the token never leaks via Debug.
-        let auth = CodexAuth::new("dev-access", "dev-acct");
-        let route = dev_codex_route(&auth);
+    fn codex_route_targets_chatgpt_backend_with_headers() {
+        // The codex route targets the chatgpt.com backend; assert its shape so a
+        // logged-in user gets the expected target + headers, and confirm the token
+        // never leaks via Debug.
+        let auth = CodexAuth::new("acc-access", "acc-acct");
+        let route = codex_route(&auth, None);
         assert_eq!(
             route.endpoint.url(),
             "https://chatgpt.com/backend-api/codex/responses"
@@ -430,9 +435,29 @@ mod tests {
         };
         assert_eq!(
             header("authorization").as_deref(),
-            Some("Bearer dev-access")
+            Some("Bearer acc-access")
         );
-        assert_eq!(header("chatgpt-account-id").as_deref(), Some("dev-acct"));
-        assert!(!format!("{route:?}").contains("dev-access"));
+        assert_eq!(header("chatgpt-account-id").as_deref(), Some("acc-acct"));
+        assert_eq!(
+            header("originator").as_deref(),
+            Some("browser-use-terminal")
+        );
+        assert!(!format!("{route:?}").contains("acc-access"));
+    }
+
+    #[test]
+    fn codex_route_honors_base_url_override() {
+        let auth = CodexAuth::new("acc-access", "acc-acct");
+        let route = codex_route(&auth, Some("https://proxy.example.com/backend-api"));
+        assert_eq!(
+            route.endpoint.url(),
+            "https://proxy.example.com/backend-api/codex/responses"
+        );
+        // A blank/whitespace override falls back to the default base url.
+        let route = codex_route(&auth, Some("   "));
+        assert_eq!(
+            route.endpoint.url(),
+            "https://chatgpt.com/backend-api/codex/responses"
+        );
     }
 }

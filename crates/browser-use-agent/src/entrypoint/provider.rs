@@ -27,19 +27,24 @@
 //!     id `"deepseek"` (key from `DEEPSEEK_API_KEY`),
 //!   * [`ProviderBackend::Fake`]        → [`ResolvedProvider::Fake`] (no real
 //!     provider; the facade drives it with an offline scripted driver),
-//!   * [`ProviderBackend::Codex`]       → a clear typed error: **codex is cut**.
-//!     We do NOT wire `chatgpt.com`; the cut is deliberate (see module-level docs
-//!     of [`crate::turn::model_path`]).
+//!   * [`ProviderBackend::Codex`]       → [`ProviderChoice::Codex`]: the codex
+//!     (chatgpt.com) backend, resolved from the Codex CLI OAuth login. The access
+//!     token + account id come from env (`CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID`),
+//!     else the credential store (`auth.codex.*`), else `~/.codex/auth.json` (via
+//!     [`browser_use_llm::auth::load_codex_auth`]).
 //!   * [`ProviderBackend::None`]        → a clear typed error (no provider chosen).
 //!
-//! Credentials are read from the process environment, exactly like
-//! [`provider_choice_from_env`](crate::turn::model_path::provider_choice_from_env);
-//! a missing key surfaces as [`ProviderResolveError::MissingCredentials`] (honest,
-//! never a panic, never a silent default to codex).
+//! ## Credential resolution (env, then store)
+//! API keys are resolved env-first, then from the [`Store`] settings the legacy
+//! `auth login <provider> --api-key` command writes (`auth.<provider>.api_key`),
+//! matching the legacy `stored_or_env` precedence. A missing credential surfaces
+//! as [`ProviderResolveError::MissingCredentials`] (honest, never a panic).
 
 use std::sync::Arc;
 
+use browser_use_llm::auth::{load_codex_auth, CodexAuth};
 use browser_use_llm::route::ModelClient;
+use browser_use_store::Store;
 
 use crate::config_overrides::ProviderBackend;
 use crate::config_overrides::ProviderRunConfig;
@@ -77,14 +82,18 @@ pub type RealSamplingDriver = ModelSamplingDriver<ModelClientTransport, Registry
 pub enum ProviderResolveError {
     /// The configured backend has no real provider in this engine.
     ///
-    /// Carries a human-readable reason. The `Codex` backend is cut (chatgpt.com
-    /// is no longer wired); `None` means no backend was selected.
+    /// Carries a human-readable reason. `None` means no backend was selected.
     UnsupportedBackend(String),
-    /// No usable credential was found in the environment for the chosen backend.
+    /// No usable credential was found (env or store) for the chosen backend.
     MissingCredentials(&'static str),
     /// The model route could not be built (e.g. an unknown OpenAI-compatible
     /// provider id). Wraps the real [`ModelPathError`].
     Route(ModelPathError),
+    /// The codex (chatgpt.com) login state exists but could not be resolved
+    /// (e.g. a malformed `~/.codex/auth.json`). Carries the underlying message
+    /// (never the token/file contents — the codex reader keeps secrets out of its
+    /// error strings).
+    Codex(String),
     /// The Python worker subprocess could not be started for the run.
     ///
     /// The legacy run path starts ONE [`PythonWorker`] per run (eager, via
@@ -107,6 +116,9 @@ impl std::fmt::Display for ProviderResolveError {
                 write!(f, "no provider credentials found in environment ({which})")
             }
             ProviderResolveError::Route(e) => write!(f, "{e}"),
+            ProviderResolveError::Codex(why) => {
+                write!(f, "failed to resolve codex login: {why}")
+            }
             ProviderResolveError::PythonWorker(why) => {
                 write!(f, "failed to start python worker: {why}")
             }
@@ -153,44 +165,84 @@ fn env_first(keys: &[&str]) -> Option<String> {
         .find_map(|k| std::env::var(k).ok().filter(|v| !v.trim().is_empty()))
 }
 
-/// Map a [`ProviderBackend`] to a model-path [`ProviderChoice`], reading the
-/// backend's standard credentials from the process environment.
+/// Read a non-empty value from the [`Store`] settings, ignoring read errors
+/// (a store read failure should not block an otherwise-resolvable env credential;
+/// it degrades to "no stored value").
+fn store_first(store: Option<&Store>, key: &str) -> Option<String> {
+    store?
+        .get_setting(key)
+        .ok()
+        .flatten()
+        .filter(|v| !v.trim().is_empty())
+}
+
+/// Resolve a provider API key env-first, then from the [`Store`] settings the
+/// legacy `auth login <provider> --api-key` command writes (`auth.<provider>.api_key`).
+///
+/// Precedence matches the legacy `stored_or_env`: env wins, store is the fallback.
+fn key_env_then_store(
+    env_keys: &[&str],
+    store: Option<&Store>,
+    store_provider: &str,
+) -> Option<String> {
+    env_first(env_keys).or_else(|| store_first(store, &format!("auth.{store_provider}.api_key")))
+}
+
+/// Map a [`ProviderBackend`] to a model-path [`ProviderChoice`], resolving the
+/// backend's credentials env-first, then from the [`Store`] settings.
+///
+/// `store` is the (optional) credential store: when an env key is absent, the
+/// stored `auth.<provider>.api_key` (and codex tokens) are consulted, matching the
+/// legacy `auth login` write path. Pass `None` to resolve from env only.
 ///
 /// Returns:
 ///   * `Ok(Some(choice))` for a real provider with credentials present,
 ///   * `Ok(None)` for [`ProviderBackend::Fake`] (no real provider),
-///   * `Err(..)` for a cut/absent backend or missing credentials.
+///   * `Err(..)` for an absent backend or missing credentials.
 ///
-/// No network I/O — this only reads env and assembles a [`ProviderChoice`].
+/// Only file I/O is the codex `~/.codex/auth.json` fallback (and the store read);
+/// no network I/O — this only assembles a [`ProviderChoice`].
 pub fn provider_choice_for_backend(
     backend: ProviderBackend,
+    store: Option<&Store>,
 ) -> Result<Option<ProviderChoice>, ProviderResolveError> {
     match backend {
         ProviderBackend::Openai => {
-            let api_key = env_first(&["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"]).ok_or(
-                ProviderResolveError::MissingCredentials(
-                    "set OPENAI_API_KEY for the openai backend",
-                ),
-            )?;
+            let api_key = key_env_then_store(
+                &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+                store,
+                "openai",
+            )
+            .ok_or(ProviderResolveError::MissingCredentials(
+                "set OPENAI_API_KEY (or run `auth login openai`) for the openai backend",
+            ))?;
             Ok(Some(ProviderChoice::OpenAiResponses {
                 api_key,
                 base_url: env_first(&["LLM_BROWSER_OPENAI_BASE_URL"]),
             }))
         }
         ProviderBackend::Anthropic => {
-            let api_key = env_first(&["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"])
-                .ok_or(ProviderResolveError::MissingCredentials(
-                    "set ANTHROPIC_API_KEY for the anthropic backend",
-                ))?;
+            let api_key = key_env_then_store(
+                &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+                store,
+                "anthropic",
+            )
+            .ok_or(ProviderResolveError::MissingCredentials(
+                "set ANTHROPIC_API_KEY (or run `auth login anthropic`) for the anthropic backend",
+            ))?;
             Ok(Some(ProviderChoice::Anthropic {
                 api_key,
                 base_url: env_first(&["LLM_BROWSER_ANTHROPIC_BASE_URL"]),
             }))
         }
         ProviderBackend::Openrouter => {
-            let api_key = env_first(&["OPENROUTER_API_KEY", "LLM_BROWSER_OPENAI_COMPAT_API_KEY"])
-                .ok_or(ProviderResolveError::MissingCredentials(
-                "set OPENROUTER_API_KEY for the openrouter backend",
+            let api_key = key_env_then_store(
+                &["OPENROUTER_API_KEY", "LLM_BROWSER_OPENAI_COMPAT_API_KEY"],
+                store,
+                "openrouter",
+            )
+            .ok_or(ProviderResolveError::MissingCredentials(
+                "set OPENROUTER_API_KEY (or run `auth login openrouter`) for the openrouter backend",
             ))?;
             Ok(Some(ProviderChoice::OpenAiCompatibleProvider {
                 provider_id: "openrouter".to_string(),
@@ -198,24 +250,81 @@ pub fn provider_choice_for_backend(
             }))
         }
         ProviderBackend::Deepseek => {
-            let api_key = env_first(&["DEEPSEEK_API_KEY", "LLM_BROWSER_OPENAI_COMPAT_API_KEY"])
-                .ok_or(ProviderResolveError::MissingCredentials(
-                    "set DEEPSEEK_API_KEY for the deepseek backend",
-                ))?;
+            let api_key = key_env_then_store(
+                &["DEEPSEEK_API_KEY", "LLM_BROWSER_OPENAI_COMPAT_API_KEY"],
+                store,
+                "deepseek",
+            )
+            .ok_or(ProviderResolveError::MissingCredentials(
+                "set DEEPSEEK_API_KEY (or run `auth login deepseek`) for the deepseek backend",
+            ))?;
             Ok(Some(ProviderChoice::OpenAiCompatibleProvider {
                 provider_id: "deepseek".to_string(),
                 api_key,
             }))
         }
         ProviderBackend::Fake => Ok(None),
-        // Phase-E note: codex is being removed in the cutover. Do NOT wire
-        // chatgpt.com here; surface a clear typed error instead.
-        ProviderBackend::Codex => Err(ProviderResolveError::UnsupportedBackend(
-            "codex backend is cut: chatgpt.com is no longer wired".to_string(),
-        )),
+        // Codex (chatgpt.com) login: resolve the OAuth access token + account id
+        // from env, then the store, then `~/.codex/auth.json`.
+        ProviderBackend::Codex => Ok(Some(resolve_codex_choice(store)?)),
         ProviderBackend::None => Err(ProviderResolveError::UnsupportedBackend(
             "no provider backend selected".to_string(),
         )),
+    }
+}
+
+/// Resolve the codex (chatgpt.com) [`ProviderChoice`] from, in precedence order:
+///   1. env `CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID`,
+///   2. the credential store (`auth.codex.access_token` + `auth.codex.account_id`),
+///   3. the on-disk Codex CLI login `~/.codex/auth.json` (via [`load_codex_auth`]).
+///
+/// The base url honours `CODEX_BASE_URL` (env), else the stored `auth.codex.base_url`,
+/// else the chatgpt.com default baked into the route builder.
+fn resolve_codex_choice(store: Option<&Store>) -> Result<ProviderChoice, ProviderResolveError> {
+    let base_url =
+        env_first(&["CODEX_BASE_URL"]).or_else(|| store_first(store, "auth.codex.base_url"));
+
+    // (1) explicit env token + account.
+    if let (Some(access_token), Some(account_id)) = (
+        env_first(&["CODEX_ACCESS_TOKEN"]),
+        env_first(&["CODEX_ACCOUNT_ID"]),
+    ) {
+        return Ok(ProviderChoice::Codex {
+            access_token,
+            account_id,
+            base_url,
+        });
+    }
+
+    // (2) store-resolved token + account.
+    if let (Some(access_token), Some(account_id)) = (
+        store_first(store, "auth.codex.access_token"),
+        store_first(store, "auth.codex.account_id"),
+    ) {
+        return Ok(ProviderChoice::Codex {
+            access_token,
+            account_id,
+            base_url,
+        });
+    }
+
+    // (3) on-disk Codex CLI login (`~/.codex/auth.json`).
+    match load_codex_auth() {
+        Ok(Some(CodexAuth {
+            access_token,
+            account_id,
+        })) => Ok(ProviderChoice::Codex {
+            access_token,
+            account_id,
+            base_url,
+        }),
+        // No login present anywhere → honest missing-credentials error.
+        Ok(None) => Err(ProviderResolveError::MissingCredentials(
+            "no codex login found: run `auth import-codex` or log in with the Codex CLI \
+             (~/.codex/auth.json), or set CODEX_ACCESS_TOKEN + CODEX_ACCOUNT_ID",
+        )),
+        // A present-but-malformed auth.json is a typed route/resolution error.
+        Err(e) => Err(ProviderResolveError::Codex(e.to_string())),
     }
 }
 
@@ -230,13 +339,17 @@ pub fn provider_choice_for_backend(
 ///    and [`build_sampling_driver`] wraps it into the live [`ModelSamplingDriver`].
 /// 3. `Fake` short-circuits to [`ResolvedProvider::Fake`].
 ///
-/// `sink` receives the driver's UI events; `ctx` carries the turn's model/provider
-/// identity; `max_retries` is the codex-style stream retry budget; `recorder` is the
-/// [`FusionRecorder`] the fused driver records the assistant message + dispatched
-/// tool outputs through (it must point at the SAME conversation buffer the loop's
-/// `TurnState` re-samples from). No network I/O happens here.
+/// `store` is the (optional) credential store threaded through for env-then-store
+/// key resolution (the caller's `SharedStore`); pass `None` to resolve from env
+/// only. `sink` receives the driver's UI events; `ctx` carries the turn's
+/// model/provider identity; `max_retries` is the codex-style stream retry budget;
+/// `recorder` is the [`FusionRecorder`] the fused driver records the assistant
+/// message + dispatched tool outputs through (it must point at the SAME
+/// conversation buffer the loop's `TurnState` re-samples from). No network I/O
+/// happens here.
 pub fn resolve_provider(
     config: &ProviderRunConfig,
+    store: Option<&Store>,
     sink: Arc<dyn EventSink>,
     ctx: TurnCtx,
     max_retries: u32,
@@ -246,7 +359,7 @@ pub fn resolve_provider(
     // Python worker for a fake/cut/missing-credential run). For a real backend we
     // start the run's single Python worker EAGERLY here, then thread its backend
     // through. `start_python_backend` only runs once we know the route builds.
-    resolve_provider_with_python(config, sink, ctx, max_retries, recorder, None)
+    resolve_provider_with_python(config, store, sink, ctx, max_retries, recorder, None)
 }
 
 /// Start the run's single Python worker subprocess (eager, matching legacy
@@ -286,14 +399,16 @@ fn start_python_backend(
 /// free while still wiring the `python` tool through the real dispatcher.
 fn resolve_provider_with_python(
     config: &ProviderRunConfig,
+    store: Option<&Store>,
     sink: Arc<dyn EventSink>,
     ctx: TurnCtx,
     max_retries: u32,
     recorder: Arc<dyn FusionRecorder>,
     python_backend: Option<Arc<dyn PythonBackend>>,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
-    // (1) backend → credentialed provider choice (Codex/None → Err; Fake → None).
-    let choice = match provider_choice_for_backend(config.backend)? {
+    // (1) backend → credentialed provider choice (env-then-store creds; codex from
+    //     env/store/~/.codex; None → Err; Fake → None).
+    let choice = match provider_choice_for_backend(config.backend, store)? {
         Some(choice) => choice,
         None => return Ok(ResolvedProvider::Fake),
     };
@@ -486,6 +601,12 @@ mod tests {
     use super::*;
     use crate::config_overrides::ProviderRunConfig;
     use crate::events::PendingEvent;
+    use std::sync::Mutex;
+
+    /// Serializes tests that mutate process env (`set_var`/`remove_var`). Cargo
+    /// runs tests in a binary in parallel, so unsynchronized env mutation across
+    /// these credential tests would race; this lock keeps them serial.
+    static ENV_LOCK: Mutex<()> = Mutex::new(());
 
     struct NullSink;
     impl EventSink for NullSink {
@@ -546,11 +667,12 @@ mod tests {
     /// model transport, not the worker.
     #[test]
     fn resolves_real_openai_driver_offline() {
-        // SAFETY: single-threaded test; we set + clear the var around the call.
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("OPENAI_API_KEY", "sk-test-entrypoint");
         let config = ProviderRunConfig::new(ProviderBackend::Openai, "gpt-x");
         let resolved = resolve_provider_with_python(
             &config,
+            None,
             Arc::new(NullSink),
             ctx(),
             3,
@@ -565,10 +687,12 @@ mod tests {
     /// A real Anthropic backend also constructs offline given its key.
     #[test]
     fn resolves_real_anthropic_driver_offline() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("ANTHROPIC_API_KEY", "ak-test-entrypoint");
         let config = ProviderRunConfig::new(ProviderBackend::Anthropic, "claude-x");
         let resolved = resolve_provider_with_python(
             &config,
+            None,
             Arc::new(NullSink),
             ctx(),
             3,
@@ -584,36 +708,125 @@ mod tests {
     #[test]
     fn fake_backend_resolves_to_fake_signal() {
         let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
-        let resolved = resolve_provider(&config, Arc::new(NullSink), ctx(), 3, recorder())
+        let resolved = resolve_provider(&config, None, Arc::new(NullSink), ctx(), 3, recorder())
             .expect("fake must resolve");
         assert!(matches!(resolved, ResolvedProvider::Fake));
     }
 
-    /// The cut codex backend surfaces a clear typed error (chatgpt.com stays cut).
+    /// The codex backend is a REAL provider again: with env codex creds present it
+    /// resolves a live driver offline (no network), targeting chatgpt.com.
     #[test]
-    fn codex_backend_is_cut_with_typed_error() {
-        let config = ProviderRunConfig::new(ProviderBackend::Codex, "codex-model");
-        let err = resolve_provider(&config, Arc::new(NullSink), ctx(), 3, recorder())
-            .expect_err("codex backend must be rejected");
-        match err {
-            ProviderResolveError::UnsupportedBackend(msg) => {
-                assert!(msg.contains("codex"), "message should mention codex: {msg}");
+    fn codex_backend_resolves_real_driver_from_env() {
+        // SAFETY: single-threaded test; set + clear the vars around the call.
+        std::env::set_var("CODEX_ACCESS_TOKEN", "codex-access-test");
+        std::env::set_var("CODEX_ACCOUNT_ID", "codex-acct-test");
+        let config = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.1-codex");
+        let resolved = resolve_provider_with_python(
+            &config,
+            None,
+            Arc::new(NullSink),
+            ctx(),
+            3,
+            recorder(),
+            Some(fake_python()),
+        );
+        std::env::remove_var("CODEX_ACCESS_TOKEN");
+        std::env::remove_var("CODEX_ACCOUNT_ID");
+        assert!(matches!(
+            resolved.expect("codex driver must construct offline"),
+            ResolvedProvider::Real(_)
+        ));
+    }
+
+    /// The codex backend also resolves its OAuth creds from the Store
+    /// (`auth.codex.access_token` / `auth.codex.account_id`) when env is absent —
+    /// proving the store-fallback path for codex.
+    #[test]
+    fn codex_backend_resolves_choice_from_store() {
+        // Env codex creds must be absent for this to exercise the store path.
+        std::env::remove_var("CODEX_ACCESS_TOKEN");
+        std::env::remove_var("CODEX_ACCOUNT_ID");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        store
+            .set_setting("auth.codex.access_token", "stored-codex-access")
+            .unwrap();
+        store
+            .set_setting("auth.codex.account_id", "stored-codex-acct")
+            .unwrap();
+        let choice = provider_choice_for_backend(ProviderBackend::Codex, Some(&store))
+            .expect("codex resolves")
+            .expect("codex is a real provider");
+        match choice {
+            ProviderChoice::Codex {
+                access_token,
+                account_id,
+                ..
+            } => {
+                assert_eq!(access_token, "stored-codex-access");
+                assert_eq!(account_id, "stored-codex-acct");
             }
-            other => panic!("expected UnsupportedBackend, got {other:?}"),
+            other => panic!("expected codex choice, got {other:?}"),
         }
     }
 
-    /// A real backend with NO credentials in the env is an honest typed error,
-    /// not a panic and never a silent default to codex.
+    /// A real backend with NO credentials in env AND none in the store is an honest
+    /// typed error, not a panic.
     #[test]
     fn missing_credentials_is_typed_error() {
         // Ensure the relevant keys are unset for this backend.
         std::env::remove_var("OPENROUTER_API_KEY");
         std::env::remove_var("LLM_BROWSER_OPENAI_COMPAT_API_KEY");
         let config = ProviderRunConfig::new(ProviderBackend::Openrouter, "x");
-        let err = resolve_provider(&config, Arc::new(NullSink), ctx(), 3, recorder())
+        let err = resolve_provider(&config, None, Arc::new(NullSink), ctx(), 3, recorder())
             .expect_err("missing credentials must error");
         assert!(matches!(err, ProviderResolveError::MissingCredentials(_)));
+    }
+
+    /// Env wins over the store: a provider key present in BOTH resolves to the env
+    /// value (legacy `stored_or_env` precedence).
+    #[test]
+    fn env_key_wins_over_store() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::set_var("OPENAI_API_KEY", "env-openai-key");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        store
+            .set_setting("auth.openai.api_key", "stored-openai-key")
+            .unwrap();
+        let choice = provider_choice_for_backend(ProviderBackend::Openai, Some(&store))
+            .expect("resolves")
+            .expect("real provider");
+        std::env::remove_var("OPENAI_API_KEY");
+        match choice {
+            ProviderChoice::OpenAiResponses { api_key, .. } => {
+                assert_eq!(api_key, "env-openai-key", "env must win over store");
+            }
+            other => panic!("expected openai choice, got {other:?}"),
+        }
+    }
+
+    /// Store is the fallback: with the env key absent, the stored
+    /// `auth.<provider>.api_key` resolves the provider (fixes the env-only regression).
+    #[test]
+    fn store_key_is_fallback_when_env_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
+        std::env::remove_var("ANTHROPIC_API_KEY");
+        std::env::remove_var("LLM_BROWSER_ANTHROPIC_API_KEY");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("store");
+        store
+            .set_setting("auth.anthropic.api_key", "stored-anthropic-key")
+            .unwrap();
+        let choice = provider_choice_for_backend(ProviderBackend::Anthropic, Some(&store))
+            .expect("resolves")
+            .expect("real provider");
+        match choice {
+            ProviderChoice::Anthropic { api_key, .. } => {
+                assert_eq!(api_key, "stored-anthropic-key");
+            }
+            other => panic!("expected anthropic choice, got {other:?}"),
+        }
     }
 
     // ---- browser/python tool wiring (network/process free) --------------------

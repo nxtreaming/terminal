@@ -10,13 +10,10 @@
 //! no `async` — it is pure data and is intentionally testable in isolation.
 /// Credential helpers for on-disk login state.
 ///
-/// **DEV/TEST ONLY** and feature-gated (`codex-dev`): the only thing here is the
-/// Codex (`~/.codex/auth.json`) reader, kept solely as a dev smoke-test vehicle.
-/// The codex/ChatGPT backend is being CUT from production, so this is not a
-/// production code path and is not compiled by default. Production credentials
-/// come from standard provider env keys (see `browser-use-agent`'s
-/// `turn::model_path`).
-#[cfg(feature = "codex-dev")]
+/// Holds the Codex (`~/.codex/auth.json`) reader + route builder (chatgpt.com
+/// login support): a supported production backend reached via the Codex CLI OAuth
+/// login. Other providers resolve credentials from standard env keys (see
+/// `browser-use-agent`'s `turn::model_path`).
 pub mod auth;
 pub mod protocols;
 pub mod providers;

@@ -8,20 +8,23 @@
 //! transport stays available for offline tests — this module only adds the
 //! production seam.
 //!
-//! ## No codex/ChatGPT backend
-//! The codex/ChatGPT backend (`chatgpt.com/backend-api`) is **cut**: this module
-//! never targets it and has no dependency on the gated `codex-dev` reader. The
-//! production providers are exactly the ones `browser-use-llm` ships:
+//! ## Providers
+//! The production providers are the ones `browser-use-llm` ships:
 //! - **OpenAI Responses** (`OPENAI_API_KEY`, base override `LLM_BROWSER_OPENAI_BASE_URL`),
 //! - **Anthropic Messages** (`ANTHROPIC_API_KEY`),
 //! - **OpenAI-compatible** (Ollama / OpenRouter / DeepSeek / Fireworks, by id +
-//!   key, or an explicit base url).
+//!   key, or an explicit base url),
+//! - **Codex (chatgpt.com)** via the Codex CLI OAuth login
+//!   ([`ProviderChoice::Codex`]): the credential is an OAuth `access_token` +
+//!   `account_id`, read from `~/.codex/auth.json` (or the credential store), not a
+//!   raw API key. See [`browser_use_llm::auth::codex_route`].
 //!
-//! Credentials come from process env (standard keys), so there is no on-disk
-//! login state to read for production.
+//! Most credentials come from process env (standard keys); codex creds come from
+//! the on-disk codex login state (`CODEX_ACCESS_TOKEN` / `~/.codex/auth.json`).
 
 use std::sync::Arc;
 
+use browser_use_llm::auth::{codex_route, CodexAuth};
 use browser_use_llm::providers::{
     Anthropic, AnthropicConfig, OpenAi, OpenAiCompatible, OpenAiConfig,
 };
@@ -69,6 +72,21 @@ pub enum ProviderChoice {
         /// API key.
         api_key: String,
     },
+    /// The codex (chatgpt.com) backend, reached via the Codex CLI OAuth login.
+    ///
+    /// Unlike the env-keyed providers, the credential is an OAuth `access_token`
+    /// plus the `account_id` sent as the `chatgpt-account-id` header (there is no
+    /// raw API key on the ChatGPT flow). The route targets
+    /// `<base_url>/codex/responses` (default
+    /// [`CODEX_BASE_URL`](browser_use_llm::auth::CODEX_BASE_URL)).
+    Codex {
+        /// The OAuth access token, sent as `Authorization: Bearer <access_token>`.
+        access_token: String,
+        /// The ChatGPT account id, sent as the `chatgpt-account-id` header.
+        account_id: String,
+        /// Optional base-url override (proxy / gateway); default chatgpt.com.
+        base_url: Option<String>,
+    },
 }
 
 /// Errors resolving a production provider route.
@@ -106,11 +124,25 @@ impl std::error::Error for ModelPathError {}
 ///   with `LLM_BROWSER_OPENAI_COMPAT_BASE_URL` || `OPENROUTER_BASE_URL`.
 ///
 /// Returns `Err(MissingCredentials)` when nothing is configured — honest, not a
-/// panic. **Note:** the codex OAuth login is deliberately NOT consulted here; the
-/// codex backend is cut.
+/// panic.
+///
+/// **Codex:** an explicit `CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID` pair in the
+/// env selects the codex (chatgpt.com) backend. The on-disk codex login
+/// (`~/.codex/auth.json`) is resolved by the entrypoint provider, not here (this
+/// env resolver stays free of file I/O); env codex creds take top precedence so a
+/// caller can force the codex backend.
 pub fn provider_choice_from_env() -> Result<ProviderChoice, ModelPathError> {
     let env = |k: &str| std::env::var(k).ok().filter(|v| !v.trim().is_empty());
 
+    if let (Some(access_token), Some(account_id)) =
+        (env("CODEX_ACCESS_TOKEN"), env("CODEX_ACCOUNT_ID"))
+    {
+        return Ok(ProviderChoice::Codex {
+            access_token,
+            account_id,
+            base_url: env("CODEX_BASE_URL"),
+        });
+    }
     if let Some(api_key) = env("LLM_BROWSER_OPENAI_API_KEY").or_else(|| env("OPENAI_API_KEY")) {
         return Ok(ProviderChoice::OpenAiResponses {
             api_key,
@@ -174,6 +206,20 @@ pub fn build_route(choice: &ProviderChoice, model: &str) -> Result<Route, ModelP
             let provider =
                 OpenAiCompatible::configure(provider_id.clone(), base_url.clone(), api_key.clone());
             Ok(provider.chat(model))
+        }
+        ProviderChoice::Codex {
+            access_token,
+            account_id,
+            base_url,
+        } => {
+            // Reuse the `browser-use-llm` codex route builder: it targets
+            // `<base_url>/codex/responses` (default chatgpt.com backend-api) with
+            // the Bearer + `chatgpt-account-id` + `originator` + `OpenAI-Beta`
+            // headers. The model id is carried by the per-turn request (the
+            // Responses protocol does not bind it into the URL).
+            let auth = CodexAuth::new(access_token.clone(), account_id.clone());
+            let _ = model;
+            Ok(codex_route(&auth, base_url.as_deref()))
         }
     }
 }
@@ -304,9 +350,11 @@ mod tests {
         );
     }
 
-    /// No codex/ChatGPT default: a route never targets the cut backend.
+    /// Only the `Codex` variant targets chatgpt.com: the env-keyed providers never
+    /// route to the codex backend, while `Codex` does (and only it).
     #[test]
-    fn no_route_targets_codex_backend() {
+    fn only_codex_variant_targets_codex_backend() {
+        // Non-codex providers must NOT target chatgpt.com / backend-api.
         for choice in [
             ProviderChoice::OpenAiResponses {
                 api_key: "k".into(),
@@ -316,13 +364,52 @@ mod tests {
                 api_key: "k".into(),
                 base_url: None,
             },
+            ProviderChoice::OpenAiCompatibleCustom {
+                provider_id: "x".into(),
+                base_url: "https://llm.internal/v1".into(),
+                api_key: "k".into(),
+            },
         ] {
             let url = build_route(&choice, "m").unwrap().endpoint.url();
             assert!(
                 !url.contains("chatgpt.com") && !url.contains("backend-api"),
-                "production route must not target the codex backend: {url}"
+                "non-codex route must not target the codex backend: {url}"
             );
         }
+
+        // The Codex variant DOES target the chatgpt.com backend-api.
+        let codex = ProviderChoice::Codex {
+            access_token: "acc".into(),
+            account_id: "acct".into(),
+            base_url: None,
+        };
+        let url = build_route(&codex, "m").unwrap().endpoint.url();
+        assert_eq!(url, "https://chatgpt.com/backend-api/codex/responses");
+    }
+
+    /// The codex route carries the Bearer token + `chatgpt-account-id` header and
+    /// honours a base-url override; the token never leaks via Debug.
+    #[test]
+    fn codex_route_has_oauth_headers_and_base_override() {
+        let choice = ProviderChoice::Codex {
+            access_token: "tok-secret".into(),
+            account_id: "acct-123".into(),
+            base_url: Some("https://proxy.example.com/backend-api".into()),
+        };
+        let route = build_route(&choice, "gpt-5.1-codex").unwrap();
+        assert_eq!(
+            route.endpoint.url(),
+            "https://proxy.example.com/backend-api/codex/responses"
+        );
+        assert_eq!(
+            header(&route, "authorization").as_deref(),
+            Some("Bearer tok-secret")
+        );
+        assert_eq!(
+            header(&route, "chatgpt-account-id").as_deref(),
+            Some("acct-123")
+        );
+        assert!(!format!("{route:?}").contains("tok-secret"));
     }
 
     /// Env resolver is honest: with the relevant keys cleared it returns a
