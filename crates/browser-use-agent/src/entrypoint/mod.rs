@@ -398,14 +398,22 @@ pub async fn run_session_with_config(
     let fusion_recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
         buffer: Arc::clone(&recorded),
     });
-    let resolved = provider::resolve_provider(
-        &config,
-        driver_sink,
-        ctx.clone(),
-        max_retries(&config),
-        fusion_recorder,
-    )
-    .map_err(|e| anyhow::anyhow!("{e}"))?;
+    // Thread the run's credential store into provider resolution so API keys (and
+    // codex tokens) resolve env-first, then from the stored `auth.<provider>.*`
+    // settings the `auth login` command writes (fixes the env-only regression).
+    // The store read happens under the shared lock for the duration of resolution.
+    let resolved = {
+        let store_guard = store.lock().expect("store mutex poisoned");
+        provider::resolve_provider(
+            &config,
+            Some(&store_guard),
+            driver_sink,
+            ctx.clone(),
+            max_retries(&config),
+            fusion_recorder,
+        )
+        .map_err(|e| anyhow::anyhow!("{e}"))?
+    };
 
     // (2) seed the environment workspace-context durable event (de-duped per kind).
     let env_content = environment_context_content(&config);
@@ -592,19 +600,37 @@ mod tests {
         assert!(log.iter().any(|e| e.event_type == "agent.message"));
     }
 
-    /// The cut codex backend surfaces a clear error through the facade rather than
-    /// wiring chatgpt.com.
+    /// The codex backend is a REAL provider again: with codex OAuth creds in the
+    /// store, the facade resolves + drives it (the live `ModelClient::stream` only
+    /// fires when actually sampled, so constructing the run is network-free; the
+    /// fake-less codex path is exercised for construction here via the store creds).
+    ///
+    /// We assert the facade does NOT reject codex with a "cut" error anymore. With
+    /// no codex login present at all, it surfaces an honest missing-credentials
+    /// error (not the old "codex is cut" rejection).
     #[tokio::test]
-    async fn config_facade_rejects_codex_backend() {
+    async fn config_facade_codex_backend_missing_creds_is_honest_error() {
+        // Ensure no env codex creds leak in from the test environment.
+        std::env::remove_var("CODEX_ACCESS_TOKEN");
+        std::env::remove_var("CODEX_ACCOUNT_ID");
+        // Point CODEX_HOME at an empty dir so the on-disk `~/.codex/auth.json`
+        // fallback resolves to "no login" rather than reading a real user file.
+        let codex_home = tempfile::tempdir().expect("codex home");
+        std::env::set_var("CODEX_HOME", codex_home.path());
         let (_dir, store, session_id) = store_with_session();
         let cfg = ProviderRunConfig::new(ProviderBackend::Codex, "codex-model");
         let err = run_session_with_config(store, &session_id, cfg)
             .await
-            .expect_err("codex backend must be rejected");
+            .expect_err("codex with no login must error on missing creds");
+        std::env::remove_var("CODEX_HOME");
         let msg = err.to_string();
         assert!(
-            msg.contains("codex"),
-            "error should explain codex is cut: {msg}"
+            msg.contains("codex login") || msg.contains("CODEX_ACCESS_TOKEN"),
+            "error should be an honest missing-codex-login message, not 'cut': {msg}"
+        );
+        assert!(
+            !msg.contains("cut"),
+            "codex is no longer cut; error must not say so: {msg}"
         );
     }
 

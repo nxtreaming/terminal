@@ -124,6 +124,16 @@ enum Command {
         #[arg(long, default_value = "deepseek-v4-pro")]
         model: String,
     },
+    /// Run a task against the codex (chatgpt.com) backend via the Codex CLI login.
+    ///
+    /// Credentials resolve env-first (`CODEX_ACCESS_TOKEN` + `CODEX_ACCOUNT_ID`),
+    /// then the credential store (`auth login codex` / `auth import-codex`), then
+    /// `~/.codex/auth.json`.
+    RunCodex {
+        text: String,
+        #[arg(long, default_value = "gpt-5.1-codex")]
+        model: String,
+    },
     RunOpenaiSession {
         task_id: String,
         #[arg(long)]
@@ -588,6 +598,14 @@ fn main() -> Result<()> {
             &config_overrides,
             collaboration_mode,
         ),
+        Command::RunCodex { text, model } => run_codex(
+            &store,
+            text,
+            model,
+            config_profile.as_deref(),
+            &config_overrides,
+            collaboration_mode,
+        ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
             &store,
             &task_id,
@@ -836,6 +854,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::RunAnthropic { .. } => "run_anthropic",
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
+        Command::RunCodex { .. } => "run_codex",
         Command::RunOpenaiSession { .. } => "run_openai_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
@@ -1382,6 +1401,27 @@ fn run_deepseek(
     collaboration_mode: CollaborationModeKind,
 ) -> Result<()> {
     let config = ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(
+        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
+    );
+    run_new_session_from_config(store, text, config)
+}
+
+/// Run a task against the codex (chatgpt.com) backend.
+///
+/// The codex OAuth credentials are resolved inside the engine
+/// ([`browser_use_agent::entrypoint::provider`]) env-first
+/// (`CODEX_ACCESS_TOKEN`/`CODEX_ACCOUNT_ID`), then from the Store settings the
+/// `auth login codex` / `auth import-codex` commands write
+/// (`auth.codex.access_token` / `auth.codex.account_id`), then `~/.codex/auth.json`.
+fn run_codex(
+    store: &Store,
+    text: String,
+    model: String,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    collaboration_mode: CollaborationModeKind,
+) -> Result<()> {
+    let config = ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(
         cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
     );
     run_new_session_from_config(store, text, config)
