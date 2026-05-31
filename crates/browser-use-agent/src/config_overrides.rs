@@ -312,6 +312,15 @@ impl AgentRunOptions {
     }
 }
 
+/// Default model context-window budget in tokens, used when the caller does not
+/// set one explicitly.
+///
+/// Drives the auto-compaction trigger (compaction fires at 80% of this — codex
+/// `Session::auto_compact_token_limit`). Sized to the gpt-5/-codex family window;
+/// callers that know the real model window should set it via
+/// [`ProviderRunConfig::with_context_window_tokens`].
+pub const DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS: usize = 272_000;
+
 /// The fully-resolved provider/run configuration handed to the engine.
 ///
 /// Mirrors `browser-use-core::ProviderRunConfig` (`lib.rs:142`).
@@ -322,6 +331,11 @@ pub struct ProviderRunConfig {
     pub model_source: RunConfigValueSource,
     pub options: AgentRunOptions,
     pub fake_result: Option<String>,
+    /// The model's context-window budget in tokens. Drives the codex 80%
+    /// auto-compaction trigger (`TokenStatus::from_estimate`). `0` disables
+    /// compaction (unknown budget). Defaults to
+    /// [`DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS`].
+    pub context_window_tokens: usize,
 }
 
 impl ProviderRunConfig {
@@ -332,6 +346,7 @@ impl ProviderRunConfig {
             model_source: RunConfigValueSource::Explicit,
             options: AgentRunOptions::default(),
             fake_result: None,
+            context_window_tokens: DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
         }
     }
 
@@ -347,6 +362,13 @@ impl ProviderRunConfig {
 
     pub fn with_fake_result(mut self, result: impl Into<String>) -> Self {
         self.fake_result = Some(result.into());
+        self
+    }
+
+    /// Set the model context-window budget (tokens) driving the auto-compaction
+    /// trigger. `0` disables compaction.
+    pub fn with_context_window_tokens(mut self, tokens: usize) -> Self {
+        self.context_window_tokens = tokens;
         self
     }
 }
