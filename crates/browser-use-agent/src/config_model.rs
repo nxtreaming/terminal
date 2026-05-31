@@ -56,7 +56,7 @@
 //!   (`"gpt-5.5"`, matching legacy `default_model_for_cwd_with_options`'s final
 //!   `unwrap_or`), surfaced through [`bundled_model_catalog`].
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use anyhow::Result;
 
@@ -172,7 +172,6 @@ pub fn configured_model_for_cwd_with_options(
     config_profile: Option<&str>,
     config_overrides: &[(String, toml::Value)],
 ) -> Result<Option<String>> {
-    let _ = config_profile;
     if let Some(model) = config_override_str(config_overrides, "model") {
         return Ok(non_empty_trimmed(&model));
     }
@@ -180,6 +179,9 @@ pub fn configured_model_for_cwd_with_options(
         if let Some(model) = layer.model {
             return Ok(non_empty_trimmed(&model));
         }
+    }
+    if let Some(model) = config_toml_string(config_profile, "model") {
+        return Ok(non_empty_trimmed(&model));
     }
     Ok(None)
 }
@@ -219,14 +221,20 @@ pub fn configured_model_provider_id_for_cwd_with_options(
     config_profile: Option<&str>,
     config_overrides: &[(String, toml::Value)],
 ) -> Result<Option<String>> {
-    let _ = config_profile;
-    if let Some(provider) = config_override_str(config_overrides, "model_provider_id") {
+    if let Some(provider) = config_override_str(config_overrides, "model_provider_id")
+        .or_else(|| config_override_str(config_overrides, "model_provider"))
+    {
         return Ok(non_empty_trimmed(&provider));
     }
     if let Some(layer) = agents_md_layer_for_cwd(cwd.as_ref()) {
         if let Some(provider) = layer.model_provider_id {
             return Ok(non_empty_trimmed(&provider));
         }
+    }
+    if let Some(provider) = config_toml_string(config_profile, "model_provider")
+        .or_else(|| config_toml_string(config_profile, "model_provider_id"))
+    {
+        return Ok(non_empty_trimmed(&provider));
     }
     Ok(None)
 }
@@ -295,6 +303,37 @@ fn config_override_str(config_overrides: &[(String, toml::Value)], key: &str) ->
         .rev()
         .find(|(k, _)| k == key)
         .and_then(|(_, v)| v.as_str().map(|s| s.to_string()))
+}
+
+/// Read a top-level string `key` from the active profile's
+/// `$BROWSER_USE_TERMINAL_HOME` config file.
+///
+/// The base config lives at `$BROWSER_USE_TERMINAL_HOME/config.toml`
+/// (`~/.browser-use-terminal/config.toml`); a named profile reads
+/// `<name>.config.toml` from the same directory. This mirrors the resolution the
+/// tui settings picker performs in `load_config_model_catalog`, restoring the
+/// `model` / `model_provider` config layer that origin/main resolved here.
+/// Returns `None` when no home dir, file, or key is present.
+fn config_toml_string(config_profile: Option<&str>, key: &str) -> Option<String> {
+    let path = config_toml_path_for_profile(config_profile)?;
+    let contents = std::fs::read_to_string(path).ok()?;
+    let value = contents.parse::<toml::Value>().ok()?;
+    value
+        .get(key)
+        .and_then(toml::Value::as_str)
+        .map(str::to_string)
+}
+
+/// Resolve the config-file path for the active profile under
+/// `$BROWSER_USE_TERMINAL_HOME` (`~/.browser-use-terminal`): the base
+/// `config.toml`, or `<name>.config.toml` for a named profile.
+fn config_toml_path_for_profile(config_profile: Option<&str>) -> Option<PathBuf> {
+    let home = crate::history::browser_use_terminal_home_dir()?;
+    let file_name = match config_profile {
+        Some(profile) if !profile.trim().is_empty() => format!("{}.config.toml", profile.trim()),
+        _ => "config.toml".to_string(),
+    };
+    Some(home.join(file_name))
 }
 
 /// Walk from `cwd` up to the filesystem root, returning the nearest `AGENTS.md`
@@ -588,5 +627,106 @@ mod tests {
             Some("second".to_string())
         );
         assert_eq!(config_override_str(&ov, "absent"), None);
+    }
+
+    /// Serializes the `BROWSER_USE_TERMINAL_HOME` env mutation across the
+    /// config.toml-layer tests (they share process-global env state).
+    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
+        let _guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
+        std::env::set_var("BROWSER_USE_TERMINAL_HOME", home);
+        let result = f();
+        match previous {
+            Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+            None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
+        }
+        result
+    }
+
+    #[test]
+    fn reads_model_and_provider_from_home_config_toml() {
+        let home = temp_dir("home_config");
+        fs::write(
+            home.join("config.toml"),
+            "model = \"configured-corp-model\"\nmodel_provider = \"corp\"\n",
+        )
+        .unwrap();
+        // No AGENTS.md / overrides: the cwd is a separate empty dir.
+        let cwd = temp_dir("home_config_cwd");
+        with_home(&home, || {
+            assert_eq!(
+                configured_model_for_cwd_with_options(&cwd, None, &[]).unwrap(),
+                Some("configured-corp-model".to_string())
+            );
+            assert_eq!(
+                configured_model_provider_id_for_cwd_with_options(&cwd, None, &[]).unwrap(),
+                Some("corp".to_string())
+            );
+        });
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn reads_model_from_named_profile_config_toml() {
+        let home = temp_dir("home_profile");
+        fs::write(home.join("config.toml"), "model = \"base-model\"\n").unwrap();
+        fs::write(
+            home.join("work.config.toml"),
+            "model = \"profile-model\"\nmodel_provider = \"corp\"\n",
+        )
+        .unwrap();
+        let cwd = temp_dir("home_profile_cwd");
+        with_home(&home, || {
+            assert_eq!(
+                configured_model_for_cwd_with_options(&cwd, Some("work"), &[]).unwrap(),
+                Some("profile-model".to_string())
+            );
+            assert_eq!(
+                configured_model_provider_id_for_cwd_with_options(&cwd, Some("work"), &[]).unwrap(),
+                Some("corp".to_string())
+            );
+        });
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn override_beats_home_config_toml_model_but_provider_still_resolves() {
+        let home = temp_dir("home_override");
+        fs::write(
+            home.join("work.config.toml"),
+            "model = \"profile-model\"\nmodel_provider = \"corp\"\n",
+        )
+        .unwrap();
+        let cwd = temp_dir("home_override_cwd");
+        let ov = overrides(&[("model", "override-model")]);
+        with_home(&home, || {
+            assert_eq!(
+                configured_model_for_cwd_with_options(&cwd, Some("work"), &ov).unwrap(),
+                Some("override-model".to_string())
+            );
+            // No provider override -> profile config.toml provider still resolves.
+            assert_eq!(
+                configured_model_provider_id_for_cwd_with_options(&cwd, Some("work"), &ov).unwrap(),
+                Some("corp".to_string())
+            );
+        });
+        let _ = fs::remove_dir_all(&home);
+        let _ = fs::remove_dir_all(&cwd);
+    }
+
+    #[test]
+    fn provider_override_model_provider_key_resolves() {
+        // The TUI/CLI pass `--config model_provider=...`; ensure the resolver
+        // honors that alias (not only `model_provider_id`).
+        let ov = overrides(&[("model_provider", "corp")]);
+        assert_eq!(
+            configured_model_provider_id_for_cwd_with_options(Path::new("/tmp"), None, &ov)
+                .unwrap(),
+            Some("corp".to_string())
+        );
     }
 }
