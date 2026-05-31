@@ -38,6 +38,11 @@ pub struct BrowserCommandOutput {
     pub events: Vec<Value>,
 }
 
+#[derive(Clone, Debug, Default)]
+pub struct BrowserCommandOptions {
+    pub browser_use_api_key: Option<String>,
+}
+
 #[derive(Debug, Default, Deserialize, Serialize)]
 pub struct BrowserScriptOutput {
     pub ok: bool,
@@ -275,6 +280,22 @@ pub fn run_browser_command(
     artifact_dir: impl AsRef<Path>,
     raw_cmd: &str,
 ) -> Result<BrowserCommandOutput> {
+    run_browser_command_with_options(
+        session_id,
+        cwd,
+        artifact_dir,
+        raw_cmd,
+        BrowserCommandOptions::default(),
+    )
+}
+
+pub fn run_browser_command_with_options(
+    session_id: &str,
+    cwd: impl AsRef<Path>,
+    artifact_dir: impl AsRef<Path>,
+    raw_cmd: &str,
+    options: BrowserCommandOptions,
+) -> Result<BrowserCommandOutput> {
     let mut argv = shell_words(raw_cmd)?;
     if argv.first().is_some_and(|arg| arg == "browser") {
         argv.remove(0);
@@ -309,7 +330,13 @@ pub fn run_browser_command(
     let session = sessions.entry(session_id.to_string()).or_default();
     session.session_id = Some(session_id.to_string());
     session.log(format!("browser {}", argv.join(" ")));
-    let content = dispatch_browser_command(session, cwd.as_ref(), artifact_dir.as_ref(), &argv)?;
+    let content = dispatch_browser_command(
+        session,
+        cwd.as_ref(),
+        artifact_dir.as_ref(),
+        &argv,
+        &options,
+    )?;
     let events = session.browser_events();
     let connected = session.connection.is_some();
     drop(sessions);
@@ -1259,6 +1286,7 @@ fn dispatch_browser_command(
     cwd: &Path,
     artifact_dir: &Path,
     argv: &[String],
+    options: &BrowserCommandOptions,
 ) -> Result<Value> {
     match argv.first().map(String::as_str).unwrap_or("help") {
         "help" | "--help" | "-h" => Ok(Value::String(browser_help().to_string())),
@@ -1273,7 +1301,8 @@ fn dispatch_browser_command(
         }
         "connect" => dispatch_connect(session, argv),
         "local" => dispatch_local(session, argv, artifact_dir),
-        "remote" => dispatch_remote(session, argv),
+        "profile" | "profiles" => dispatch_profile(argv, options),
+        "remote" => dispatch_remote(session, argv, options),
         "domain" => dispatch_domain(argv),
         "recover" => dispatch_recover(session, argv),
         "script" => {
@@ -1442,15 +1471,182 @@ fn dispatch_local_profiles(argv: &[String]) -> Result<Value> {
     list_local_profiles()
 }
 
-fn dispatch_remote(session: &mut BrowserSession, argv: &[String]) -> Result<Value> {
+#[derive(Debug)]
+struct ProfileCookieSyncOptions {
+    profile_ref: Option<String>,
+    cloud_profile_id: Option<String>,
+    cloud_profile_name: Option<String>,
+    new_cloud_profile_name: Option<String>,
+    include_domains: Vec<String>,
+    exclude_domains: Vec<String>,
+    all_cookies: bool,
+}
+
+fn profile_cookie_sync_options(argv: &[String]) -> ProfileCookieSyncOptions {
+    ProfileCookieSyncOptions {
+        profile_ref: option_value(argv, "--profile").or_else(|| {
+            argv.get(2)
+                .filter(|value| !value.starts_with("--"))
+                .cloned()
+        }),
+        cloud_profile_id: option_value(argv, "--cloud-profile-id"),
+        cloud_profile_name: option_value(argv, "--cloud-profile-name"),
+        new_cloud_profile_name: option_value(argv, "--new-cloud-profile-name"),
+        include_domains: option_values(argv, "--domain"),
+        exclude_domains: option_values(argv, "--exclude-domain"),
+        all_cookies: has_flag(argv, "--all-cookies"),
+    }
+}
+
+fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions) -> Result<Value> {
+    if !browser_use_api_key_configured(command_options) {
+        return Ok(json!({
+            "status": "needs-auth",
+            "provider": "Browser Use cloud",
+            "missing": "BROWSER_USE_API_KEY",
+            "instructions": [
+                "Open /auth, choose Browser Use cloud, and save a Browser Use API key.",
+                "Alternatively export BROWSER_USE_API_KEY before launching Browser Use Terminal."
+            ],
+            "next_step": "/auth"
+        }));
+    }
+
+    let opts = profile_cookie_sync_options(argv);
+    if opts.cloud_profile_id.is_some() && opts.cloud_profile_name.is_some() {
+        bail!("pass --cloud-profile-id or --cloud-profile-name, not both");
+    }
+    if opts.all_cookies && !opts.include_domains.is_empty() {
+        bail!("pass --all-cookies or --domain filters, not both");
+    }
+
+    let profiles = detect_local_profiles();
+    let Some(profile_ref) = opts.profile_ref.as_deref() else {
+        return Ok(json!({
+            "status": "needs-user-action",
+            "action": "select-local-profile",
+            "default_cookie_scope": "all",
+            "raw_cookie_values_returned": false,
+            "profiles": profiles,
+            "instructions": [
+                "Choose the local Chromium profile whose cookies should be imported.",
+                "All cookies are imported by default. Add --domain only when the user wants a narrower import.",
+                "If no cloud profile is specified, Browser Use Terminal creates one named after the local browser profile."
+            ],
+            "next_step": "browser profile sync --profile <profile-id> --all-cookies"
+        }));
+    };
+
+    let selected = match resolve_local_profile(&profiles, profile_ref) {
+        Ok(profile) => profile,
+        Err(error) => {
+            return Ok(json!({
+                "status": "failed",
+                "profile_ref": profile_ref,
+                "error": format!("{error:#}"),
+                "available_profiles": profiles,
+            }));
+        }
+    };
+
+    let mut cookies = local_profile_cookies(&selected)?;
+    let extracted_cookie_count = cookies.len();
+    cookies = filter_cookies_by_domain(&cookies, &opts.include_domains, &opts.exclude_domains);
+    let cookie_summary = cookie_domain_summary(&cookies);
+    let domain_count = cookie_summary.as_array().map_or(0, Vec::len);
+
+    if cookies.is_empty() {
+        return Ok(json!({
+            "status": "ok",
+            "synced": false,
+            "reason": "no cookies to sync after applying filters",
+            "profile": selected,
+            "raw_cookie_values_returned": false,
+            "extracted_cookie_count": extracted_cookie_count,
+            "synced_cookie_count": 0,
+            "domain_count": 0,
+            "cookie_scope": profile_sync_cookie_scope(&opts),
+            "cookie_summary": cookie_summary,
+        }));
+    }
+
+    let (cloud_profile_id, cloud_profile_name, cloud_profile_created) =
+        resolve_profile_sync_cloud_target(&selected, &opts, command_options)?;
+    let remote_browser = create_cloud_browser_with_options(&cloud_profile_id, 5, command_options)?;
+    let remote_browser_id = remote_browser
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Browser Use API response missing browser id"))?
+        .to_string();
+    let cdp_url = remote_browser
+        .get("cdpUrl")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Browser Use API response missing cdpUrl"))?
+        .to_string();
+    let live_url = remote_browser
+        .get("liveUrl")
+        .and_then(Value::as_str)
+        .map(ToOwned::to_owned);
+
+    let sync_result = (|| -> Result<()> {
+        thread::sleep(Duration::from_secs(3));
+        let ws_url = resolve_ws_from_cdp_url(&cdp_url)?;
+        let mut connection = CdpConnection::connect(&ws_url)?;
+        connection.cdp_set_storage_cookies(&cookies)
+    })();
+    let stop_result = stop_cloud_browser_with_options(&remote_browser_id, command_options);
+    if let Err(error) = sync_result {
+        return Err(error.context("set cookies in Browser Use cloud browser"));
+    }
+    if let Err(error) = stop_result {
+        return Err(error.context("stop Browser Use cloud browser after cookie sync"));
+    }
+
+    Ok(json!({
+        "status": "ok",
+        "synced": true,
+        "profile": selected,
+        "cloud_profile": {
+            "id": cloud_profile_id,
+            "name": cloud_profile_name,
+            "created": cloud_profile_created,
+        },
+        "remote_browser": {
+            "id": remote_browser_id,
+            "live_url": live_url,
+            "stopped": true,
+        },
+        "raw_cookie_values_returned": false,
+        "cookie_scope": profile_sync_cookie_scope(&opts),
+        "extracted_cookie_count": extracted_cookie_count,
+        "synced_cookie_count": cookies.len(),
+        "domain_count": domain_count,
+        "cookie_summary": cookie_summary,
+        "next_step": "Use browser remote start --profile-id <cloud_profile.id> to start a Browser Use cloud browser with these cookies."
+    }))
+}
+
+fn dispatch_remote(
+    session: &mut BrowserSession,
+    argv: &[String],
+    options: &BrowserCommandOptions,
+) -> Result<Value> {
     match argv.get(1).map(String::as_str) {
         Some("start") => session.start_remote_cloud(argv),
         Some("stop") => session.stop_owned_remote(),
         Some("status") => Ok(session.status_json()),
         Some("live-url") => Ok(json!({ "live_url": session.live_url })),
-        Some("profiles") => list_cloud_profiles(),
+        Some("profiles") => list_cloud_profiles_with_options(options),
         Some(other) => bail!("unknown browser remote command: {other}"),
         None => bail!("browser remote requires start, stop, status, live-url, or profiles"),
+    }
+}
+
+fn dispatch_profile(argv: &[String], options: &BrowserCommandOptions) -> Result<Value> {
+    match argv.get(1).map(String::as_str) {
+        Some("sync") => sync_profile_cookies(argv, options),
+        Some(other) => bail!("unknown browser profile command: {other}"),
+        None => bail!("browser profile requires sync"),
     }
 }
 
@@ -2426,6 +2622,56 @@ impl CdpConnection {
             .cloned()
             .unwrap_or_default())
     }
+
+    fn cdp_set_storage_cookies(&mut self, cookies: &[Value]) -> Result<()> {
+        let cookie_params = cookies
+            .iter()
+            .filter_map(cookie_to_cdp_param)
+            .collect::<Vec<_>>();
+        self.call(
+            "Storage.setCookies",
+            None,
+            json!({ "cookies": cookie_params }),
+        )?;
+        Ok(())
+    }
+}
+
+fn cookie_to_cdp_param(cookie: &Value) -> Option<Value> {
+    let name = cookie.get("name").and_then(Value::as_str)?;
+    let value = cookie.get("value").and_then(Value::as_str)?;
+    let domain = cookie.get("domain").and_then(Value::as_str)?;
+    let path = cookie
+        .get("path")
+        .and_then(Value::as_str)
+        .filter(|path| !path.is_empty())
+        .unwrap_or("/");
+    let mut param = serde_json::Map::new();
+    param.insert("name".to_string(), Value::String(name.to_string()));
+    param.insert("value".to_string(), Value::String(value.to_string()));
+    param.insert("domain".to_string(), Value::String(domain.to_string()));
+    param.insert("path".to_string(), Value::String(path.to_string()));
+    if let Some(secure) = cookie.get("secure").and_then(Value::as_bool) {
+        param.insert("secure".to_string(), Value::Bool(secure));
+    }
+    if let Some(http_only) = cookie.get("httpOnly").and_then(Value::as_bool) {
+        param.insert("httpOnly".to_string(), Value::Bool(http_only));
+    }
+    if let Some(same_site) = cookie.get("sameSite").and_then(Value::as_str) {
+        param.insert("sameSite".to_string(), Value::String(same_site.to_string()));
+    }
+    let is_session = cookie
+        .get("session")
+        .and_then(Value::as_bool)
+        .unwrap_or(false);
+    if !is_session {
+        if let Some(expires) = cookie.get("expires").and_then(Value::as_f64) {
+            if expires > 0.0 {
+                param.insert("expires".to_string(), json!(expires));
+            }
+        }
+    }
+    Some(Value::Object(param))
 }
 
 // Multiplexed CDP connection: one websocket, a background reader thread that
@@ -4009,6 +4255,11 @@ fn open_local_profile_url(profile: &LocalBrowserProfile, url: &str) -> Result<()
 }
 
 fn inspect_local_profile_cookies(profile: &LocalBrowserProfile) -> Result<Value> {
+    let cookies = local_profile_cookies(profile)?;
+    Ok(cookie_domain_summary(&cookies))
+}
+
+fn local_profile_cookies(profile: &LocalBrowserProfile) -> Result<Vec<Value>> {
     let temp = tempfile::Builder::new()
         .prefix("but-profile-inspect.")
         .tempdir()
@@ -4022,11 +4273,10 @@ fn inspect_local_profile_cookies(profile: &LocalBrowserProfile) -> Result<Value>
         extra_args: vec!["--no-startup-window".to_string()],
     };
     let (mut managed, http_url) = launch_managed_browser(launch)?;
-    let result = (|| -> Result<Value> {
+    let result = (|| -> Result<Vec<Value>> {
         let ws_url = resolve_ws_from_http(&http_url)?;
         let mut connection = CdpConnection::connect(&ws_url)?;
-        let cookies = connection.cdp_storage_cookies()?;
-        Ok(cookie_domain_summary(&cookies))
+        connection.cdp_storage_cookies()
     })();
     let _ = managed.child.kill();
     let _ = managed.child.wait();
@@ -4160,8 +4410,101 @@ fn cookie_domain_summary(cookies: &[Value]) -> Value {
     Value::Array(rows)
 }
 
-fn list_cloud_profiles() -> Result<Value> {
-    let first = browser_use_api("/profiles?pageSize=100&pageNumber=1", "GET", None)?;
+fn profile_sync_cookie_scope(opts: &ProfileCookieSyncOptions) -> Value {
+    if opts.include_domains.is_empty() && opts.exclude_domains.is_empty() {
+        json!({ "kind": "all" })
+    } else {
+        json!({
+            "kind": "filtered",
+            "include_domains": normalized_domain_list(&opts.include_domains),
+            "exclude_domains": normalized_domain_list(&opts.exclude_domains),
+        })
+    }
+}
+
+fn normalized_domain_list(domains: &[String]) -> Vec<String> {
+    domains
+        .iter()
+        .map(|domain| normalize_cookie_match_domain(domain))
+        .filter(|domain| !domain.is_empty())
+        .collect()
+}
+
+fn filter_cookies_by_domain(
+    cookies: &[Value],
+    include_domains: &[String],
+    exclude_domains: &[String],
+) -> Vec<Value> {
+    if include_domains.is_empty() && exclude_domains.is_empty() {
+        return cookies.to_vec();
+    }
+    let include = normalized_domain_list(include_domains);
+    let exclude = normalized_domain_list(exclude_domains);
+    cookies
+        .iter()
+        .filter(|cookie| {
+            let Some(domain) = cookie.get("domain").and_then(Value::as_str) else {
+                return false;
+            };
+            if !exclude.is_empty() && cookie_domain_matches(domain, &exclude) {
+                return false;
+            }
+            include.is_empty() || cookie_domain_matches(domain, &include)
+        })
+        .cloned()
+        .collect()
+}
+
+fn cookie_domain_matches(cookie_domain: &str, patterns: &[String]) -> bool {
+    let cookie_domain = normalize_cookie_match_domain(cookie_domain);
+    patterns
+        .iter()
+        .any(|pattern| cookie_domain == *pattern || cookie_domain.ends_with(&format!(".{pattern}")))
+}
+
+fn normalize_cookie_match_domain(value: &str) -> String {
+    normalize_domain_like_browser(value)
+        .trim_start_matches('.')
+        .to_string()
+}
+
+fn resolve_profile_sync_cloud_target(
+    profile: &LocalBrowserProfile,
+    opts: &ProfileCookieSyncOptions,
+    command_options: &BrowserCommandOptions,
+) -> Result<(String, String, bool)> {
+    if let Some(profile_id) = opts.cloud_profile_id.as_deref() {
+        return Ok((profile_id.to_string(), profile_id.to_string(), false));
+    }
+    if let Some(profile_name) = opts.cloud_profile_name.as_deref() {
+        let profile_id = resolve_cloud_profile_name_with_options(profile_name, command_options)?;
+        return Ok((profile_id, profile_name.to_string(), false));
+    }
+    let profile_name = opts
+        .new_cloud_profile_name
+        .clone()
+        .unwrap_or_else(|| default_cloud_profile_name(profile));
+    let created = create_cloud_profile_with_options(&profile_name, command_options)?;
+    let profile_id = created
+        .get("id")
+        .and_then(Value::as_str)
+        .ok_or_else(|| anyhow!("Browser Use API profile response missing id"))?
+        .to_string();
+    let profile_name = created
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or(&profile_name)
+        .to_string();
+    Ok((profile_id, profile_name, true))
+}
+
+fn default_cloud_profile_name(profile: &LocalBrowserProfile) -> String {
+    format!("Browser Use - {}", profile.display_name)
+}
+
+fn list_cloud_profiles_with_options(options: &BrowserCommandOptions) -> Result<Value> {
+    let first =
+        browser_use_api_with_options("/profiles?pageSize=100&pageNumber=1", "GET", None, options)?;
     let items = first
         .get("items")
         .and_then(Value::as_array)
@@ -4173,7 +4516,8 @@ fn list_cloud_profiles() -> Result<Value> {
         let Some(id) = profile.get("id").and_then(Value::as_str) else {
             continue;
         };
-        let detail = browser_use_api(&format!("/profiles/{id}"), "GET", None).unwrap_or(profile);
+        let detail = browser_use_api_with_options(&format!("/profiles/{id}"), "GET", None, options)
+            .unwrap_or(profile);
         profiles.push(json!({
             "id": detail.get("id"),
             "name": detail.get("name"),
@@ -4185,8 +4529,47 @@ fn list_cloud_profiles() -> Result<Value> {
     Ok(json!({ "status": "ok", "profiles": profiles }))
 }
 
+fn create_cloud_profile_with_options(name: &str, options: &BrowserCommandOptions) -> Result<Value> {
+    browser_use_api_with_options("/profiles", "POST", Some(json!({ "name": name })), options)
+}
+
+fn create_cloud_browser_with_options(
+    profile_id: &str,
+    timeout_minutes: i64,
+    options: &BrowserCommandOptions,
+) -> Result<Value> {
+    browser_use_api_with_options(
+        "/browsers",
+        "POST",
+        Some(json!({
+            "profileId": profile_id,
+            "timeout": timeout_minutes,
+        })),
+        options,
+    )
+}
+
+fn resolve_ws_from_cdp_url(cdp_url: &str) -> Result<String> {
+    if cdp_url.starts_with("ws://") || cdp_url.starts_with("wss://") {
+        Ok(cdp_url.to_string())
+    } else {
+        resolve_ws_from_http(cdp_url)
+    }
+}
+
+fn browser_use_api_key_configured(options: &BrowserCommandOptions) -> bool {
+    browser_use_api_key(options).is_some()
+}
+
 fn resolve_cloud_profile_name(profile_name: &str) -> Result<String> {
-    let profiles = list_cloud_profiles()?;
+    resolve_cloud_profile_name_with_options(profile_name, &BrowserCommandOptions::default())
+}
+
+fn resolve_cloud_profile_name_with_options(
+    profile_name: &str,
+    options: &BrowserCommandOptions,
+) -> Result<String> {
+    let profiles = list_cloud_profiles_with_options(options)?;
     let matches = profiles
         .get("profiles")
         .and_then(Value::as_array)
@@ -4208,10 +4591,16 @@ fn resolve_cloud_profile_name(profile_name: &str) -> Result<String> {
 }
 
 fn browser_use_api(path: &str, method: &str, body: Option<Value>) -> Result<Value> {
-    let key = std::env::var("BROWSER_USE_API_KEY")
-        .ok()
-        .filter(|value| !value.trim().is_empty())
-        .ok_or_else(|| anyhow!("BROWSER_USE_API_KEY missing"))?;
+    browser_use_api_with_options(path, method, body, &BrowserCommandOptions::default())
+}
+
+fn browser_use_api_with_options(
+    path: &str,
+    method: &str,
+    body: Option<Value>,
+    options: &BrowserCommandOptions,
+) -> Result<Value> {
+    let key = browser_use_api_key(options).ok_or_else(|| anyhow!("BROWSER_USE_API_KEY missing"))?;
     let client = Client::new();
     let url = format!("{BU_API}{path}");
     let request = match method {
@@ -4237,11 +4626,32 @@ fn browser_use_api(path: &str, method: &str, body: Option<Value>) -> Result<Valu
 }
 
 fn stop_cloud_browser(browser_id: &str) -> Result<Value> {
-    browser_use_api(
+    stop_cloud_browser_with_options(browser_id, &BrowserCommandOptions::default())
+}
+
+fn stop_cloud_browser_with_options(
+    browser_id: &str,
+    options: &BrowserCommandOptions,
+) -> Result<Value> {
+    browser_use_api_with_options(
         &format!("/browsers/{browser_id}"),
         "PATCH",
         Some(json!({ "action": "stop" })),
+        options,
     )
+}
+
+fn browser_use_api_key(options: &BrowserCommandOptions) -> Option<String> {
+    options
+        .browser_use_api_key
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            std::env::var("BROWSER_USE_API_KEY")
+                .ok()
+                .filter(|value| !value.trim().is_empty())
+        })
 }
 
 fn run_bridge(
@@ -6393,6 +6803,24 @@ mod tests {
                 values,
             }
         }
+
+        fn unset(keys: &[&'static str]) -> Self {
+            let guard = ENV_LOCK
+                .get_or_init(|| Mutex::new(()))
+                .lock()
+                .expect("env lock poisoned");
+            let values = keys
+                .iter()
+                .map(|key| (*key, std::env::var(key).ok()))
+                .collect::<Vec<_>>();
+            for key in keys {
+                std::env::remove_var(key);
+            }
+            Self {
+                _guard: guard,
+                values,
+            }
+        }
     }
 
     impl Drop for EnvRestore {
@@ -7567,6 +7995,119 @@ print("large response ok", len(data["blob"]))
         assert_eq!(output.content["source"], "rust-local-filesystem");
         assert!(output.content["profiles"].is_array());
         assert!(!output.content.to_string().contains("profile-use"));
+    }
+
+    #[test]
+    fn profile_sync_requires_browser_use_api_key_before_profile_selection() {
+        let _env = EnvRestore::unset(&["BROWSER_USE_API_KEY"]);
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_command(
+            "profile-sync-needs-auth",
+            temp.path(),
+            temp.path(),
+            "browser profile sync --profile google-chrome:Default --all-cookies",
+        )
+        .unwrap();
+        assert_eq!(output.content["status"], "needs-auth");
+        assert_eq!(output.content["next_step"], "/auth");
+    }
+
+    #[test]
+    fn profile_sync_accepts_direct_browser_use_api_key_without_env_mutation() {
+        let _env = EnvRestore::unset(&["BROWSER_USE_API_KEY"]);
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_command_with_options(
+            "profile-sync-direct-key",
+            temp.path(),
+            temp.path(),
+            "browser profile sync --all-cookies",
+            BrowserCommandOptions {
+                browser_use_api_key: Some("test-key".to_string()),
+            },
+        )
+        .unwrap();
+        assert_eq!(output.content["status"], "needs-user-action");
+        assert_eq!(output.content["action"], "select-local-profile");
+        assert!(std::env::var("BROWSER_USE_API_KEY").is_err());
+    }
+
+    #[test]
+    fn profile_sync_without_profile_returns_manual_selection_shape() {
+        let _env = EnvRestore::set(&[("BROWSER_USE_API_KEY", "test-key")]);
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_command(
+            "profile-sync-needs-profile",
+            temp.path(),
+            temp.path(),
+            "browser profile sync --all-cookies",
+        )
+        .unwrap();
+        assert_eq!(output.content["status"], "needs-user-action");
+        assert_eq!(output.content["action"], "select-local-profile");
+        assert_eq!(output.content["default_cookie_scope"], "all");
+        assert_eq!(output.content["raw_cookie_values_returned"], false);
+    }
+
+    #[test]
+    fn profile_sync_default_cloud_profile_name_is_distinct_from_local_profile() {
+        let profile = LocalBrowserProfile {
+            id: "google-chrome:Default".to_string(),
+            browser_name: "Google Chrome".to_string(),
+            browser_path: PathBuf::from("/Applications/Google Chrome.app"),
+            user_data_dir: PathBuf::from("/tmp/chrome"),
+            profile_dir: "Default".to_string(),
+            profile_name: "Reagan".to_string(),
+            profile_path: PathBuf::from("/tmp/chrome/Default"),
+            display_name: "Google Chrome - Reagan".to_string(),
+        };
+
+        assert_eq!(
+            default_cloud_profile_name(&profile),
+            "Browser Use - Google Chrome - Reagan"
+        );
+    }
+
+    #[test]
+    fn cookie_domain_filter_defaults_to_all_and_supports_excludes() {
+        let cookies = vec![
+            json!({ "name": "a", "value": "1", "domain": ".example.com", "path": "/" }),
+            json!({ "name": "b", "value": "2", "domain": "app.example.com", "path": "/" }),
+            json!({ "name": "c", "value": "3", "domain": "tracking.test", "path": "/" }),
+        ];
+        let all = filter_cookies_by_domain(&cookies, &[], &[]);
+        assert_eq!(all.len(), 3);
+
+        let filtered = filter_cookies_by_domain(
+            &cookies,
+            &["example.com".to_string()],
+            &["app.example.com".to_string()],
+        );
+        assert_eq!(filtered.len(), 1);
+        assert_eq!(filtered[0]["name"], "a");
+    }
+
+    #[test]
+    fn cookie_to_cdp_param_matches_storage_setcookies_shape() {
+        let param = cookie_to_cdp_param(&json!({
+            "name": "sid",
+            "value": "secret",
+            "domain": ".example.com",
+            "path": "/",
+            "secure": true,
+            "httpOnly": true,
+            "sameSite": "Lax",
+            "session": false,
+            "expires": 2000.0,
+            "size": 42
+        }))
+        .expect("cookie param");
+        assert_eq!(param["name"], "sid");
+        assert_eq!(param["value"], "secret");
+        assert_eq!(param["domain"], ".example.com");
+        assert_eq!(param["sameSite"], "Lax");
+        assert_eq!(param["expires"], 2000.0);
+        assert!(param.get("size").is_none());
+        assert!(param.get("session").is_none());
     }
 
     #[test]

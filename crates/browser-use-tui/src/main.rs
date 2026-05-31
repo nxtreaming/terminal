@@ -1,5 +1,6 @@
 use std::collections::{HashMap, HashSet};
 use std::fmt;
+use std::fs;
 #[cfg(not(test))]
 use std::io::Read;
 use std::io::{self, Write};
@@ -93,7 +94,7 @@ use settings::{
     model_choices_for_catalog, provider_model_for_display, AgentBackend, ModelChoice,
     ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
     ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_SETTING,
+    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -208,6 +209,7 @@ enum Surface {
     Mode,
     Browser,
     BrowserSelect,
+    CookieSync,
     History,
     Messages,
     Developer,
@@ -224,6 +226,7 @@ impl Surface {
                 | Self::Mode
                 | Self::Browser
                 | Self::BrowserSelect
+                | Self::CookieSync
                 | Self::History
                 | Self::Messages
                 | Self::Developer
@@ -397,6 +400,55 @@ impl Drop for CodexLoginFlow {
     }
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum CookieSyncCommandKind {
+    LoadProfiles,
+    SyncProfile,
+}
+
+#[derive(Debug)]
+struct CookieSyncEvent {
+    kind: CookieSyncCommandKind,
+    result: Result<serde_json::Value, String>,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct CookieSyncProfile {
+    id: String,
+    display_name: String,
+    browser_name: String,
+    profile_name: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum CookieSyncStatus {
+    NeedsAuth,
+    LoadingProfiles,
+    Ready,
+    Syncing,
+    Completed(String),
+    Failed(String),
+}
+
+#[derive(Debug)]
+struct CookieSyncState {
+    status: CookieSyncStatus,
+    profiles: Vec<CookieSyncProfile>,
+    selected_profile_label: Option<String>,
+    rx: Option<mpsc::Receiver<CookieSyncEvent>>,
+}
+
+impl Default for CookieSyncState {
+    fn default() -> Self {
+        Self {
+            status: CookieSyncStatus::NeedsAuth,
+            profiles: Vec::new(),
+            selected_profile_label: None,
+            rx: None,
+        }
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppCommand {
     StartTask(String),
@@ -430,6 +482,7 @@ enum AppCommand {
     SignIn,
     ConfigureTelemetry,
     ChangeBrowser,
+    SyncCookies,
     Reload,
     Update,
     SaveAccount(String),
@@ -877,6 +930,8 @@ struct App {
     setup_result: Option<SetupResult>,
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
     codex_login: Option<CodexLoginFlow>,
+    cookie_sync: CookieSyncState,
+    pending_cookie_sync_after_auth: bool,
     browser_notice: Option<String>,
     status_notice: Option<String>,
     agent_backend: AgentBackend,
@@ -917,6 +972,7 @@ struct AppStateCache {
     sessions: Vec<SessionMeta>,
     events_by_session: HashMap<String, Vec<EventRecord>>,
     last_seq_by_session: HashMap<String, i64>,
+    revision: u64,
     projected: WorkbenchState,
     projection_key: Option<ProjectionKey>,
     dirty_projection: bool,
@@ -944,6 +1000,7 @@ impl AppStateCache {
             sessions,
             events_by_session,
             last_seq_by_session,
+            revision: 0,
             projected: empty_workbench_state(browser),
             projection_key: None,
             dirty_projection: true,
@@ -965,6 +1022,11 @@ impl AppStateCache {
             }
             StoreNotification::SettingsChanged => Ok(false),
         }
+    }
+
+    fn mark_changed(&mut self) {
+        self.revision = self.revision.wrapping_add(1);
+        self.dirty_projection = true;
     }
 
     fn refresh_all(&mut self, store: &Store) -> Result<bool> {
@@ -1011,7 +1073,7 @@ impl AppStateCache {
         }
         let changed = sessions_changed || removed_events || loaded_events;
         if changed {
-            self.dirty_projection = true;
+            self.mark_changed();
         }
         Ok(changed)
     }
@@ -1028,7 +1090,7 @@ impl AppStateCache {
             }
         };
         if changed {
-            self.dirty_projection = true;
+            self.mark_changed();
         }
         Ok(changed)
     }
@@ -1050,7 +1112,7 @@ impl AppStateCache {
             .extend(events);
         self.last_seq_by_session
             .insert(session_id.to_string(), last_seq);
-        self.dirty_projection = true;
+        self.mark_changed();
         Ok(true)
     }
 
@@ -1688,6 +1750,34 @@ fn request_user_input_response_payload(
     })
 }
 
+/// Flatten a `request_user_input` response payload's answers into a single text
+/// string for analytics. Text/choice values only — these answers never carry
+/// image or attachment content, so nothing binary is included.
+fn request_user_input_response_analytics_text(payload: &serde_json::Value) -> String {
+    let Some(answers) = payload
+        .get("answers")
+        .and_then(serde_json::Value::as_object)
+    else {
+        return String::new();
+    };
+    let mut parts = Vec::new();
+    for entry in answers.values() {
+        let Some(values) = entry.get("answers").and_then(serde_json::Value::as_array) else {
+            continue;
+        };
+        for value in values {
+            match value {
+                serde_json::Value::String(text) if !text.trim().is_empty() => {
+                    parts.push(text.clone());
+                }
+                serde_json::Value::String(_) | serde_json::Value::Null => {}
+                other => parts.push(other.to_string()),
+            }
+        }
+    }
+    parts.join(" | ")
+}
+
 fn request_user_input_answer_texts(request: &PendingRequestUserInput, text: &str) -> Vec<String> {
     if let Some(parts) = keyed_request_user_input_answers(request, text) {
         return parts;
@@ -2079,6 +2169,8 @@ impl App {
             setup_result: None,
             claude_code_oauth: None,
             codex_login: None,
+            cookie_sync: CookieSyncState::default(),
+            pending_cookie_sync_after_auth: false,
             browser_notice: None,
             status_notice: None,
             agent_backend,
@@ -2252,6 +2344,67 @@ impl App {
             }
         }
         Ok(changed)
+    }
+
+    fn drain_cookie_sync_notifications(&mut self) -> Result<bool> {
+        let mut events = Vec::new();
+        if let Some(rx) = self.cookie_sync.rx.as_ref() {
+            while let Ok(event) = rx.try_recv() {
+                events.push(event);
+            }
+        }
+        if events.is_empty() {
+            return Ok(false);
+        }
+        self.cookie_sync.rx = None;
+        for event in events {
+            self.apply_cookie_sync_event(event);
+        }
+        Ok(true)
+    }
+
+    fn apply_cookie_sync_event(&mut self, event: CookieSyncEvent) {
+        match event.result {
+            Ok(value) => match event.kind {
+                CookieSyncCommandKind::LoadProfiles => {
+                    self.apply_cookie_sync_profile_load(value);
+                }
+                CookieSyncCommandKind::SyncProfile => {
+                    self.cookie_sync.status =
+                        cookie_sync_result_status(&value).unwrap_or_else(|| {
+                            CookieSyncStatus::Failed("Unexpected cookie sync response.".to_string())
+                        });
+                }
+            },
+            Err(error) => {
+                self.cookie_sync.status = CookieSyncStatus::Failed(error);
+            }
+        }
+    }
+
+    fn apply_cookie_sync_profile_load(&mut self, value: serde_json::Value) {
+        match value.get("status").and_then(serde_json::Value::as_str) {
+            Some("needs-auth") => {
+                self.cookie_sync.status = CookieSyncStatus::NeedsAuth;
+                self.cookie_sync.profiles.clear();
+            }
+            Some("needs-user-action") | Some("ok") => {
+                self.cookie_sync.profiles = cookie_sync_profiles_from_value(&value);
+                self.cookie_sync.status = CookieSyncStatus::Ready;
+            }
+            Some("failed") => {
+                let error = value
+                    .get("error")
+                    .and_then(serde_json::Value::as_str)
+                    .unwrap_or("Cookie sync profile scan failed")
+                    .to_string();
+                self.cookie_sync.status = CookieSyncStatus::Failed(error);
+            }
+            _ => {
+                self.cookie_sync.status =
+                    CookieSyncStatus::Failed("Unexpected cookie sync response.".to_string());
+            }
+        }
     }
 
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
@@ -2762,8 +2915,20 @@ impl App {
             return Ok(());
         };
         let payload = request_user_input_state_response_payload(request, &state);
-        self.store
-            .append_event(session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+        let response_record =
+            self.store
+                .append_event(session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+        product_analytics::capture_user_message(
+            &self.store,
+            "tui",
+            session_id,
+            self.store
+                .load_session(session_id)?
+                .is_some_and(|session| session.parent_id.is_some()),
+            product_analytics::MESSAGE_KIND_REQUEST_INPUT_RESPONSE,
+            response_record.seq,
+            &request_user_input_response_analytics_text(&response_record.payload),
+        );
         self.request_input = None;
         self.composer.clear();
         self.status_notice = None;
@@ -3210,11 +3375,22 @@ impl App {
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session(None, &cwd)?;
         // Record the user's task as the standard input event (preserved for retry).
-        self.store.append_event(
+        let input_record = self.store.append_event(
             &session.id,
             "session.input",
             typed_user_input_payload_for_submission_for_cwd(&submission, &cwd)?,
         )?;
+        // The agent does not run yet (no key); tag this message so blocked,
+        // pre-auth submissions are queryable separately from real runs.
+        product_analytics::capture_user_message_blocked(
+            &self.store,
+            "tui",
+            &session.id,
+            session.parent_id.is_some(),
+            input_record.seq,
+            &submission.text,
+            product_analytics::BLOCKED_REASON_NO_AUTH,
+        );
         // Inject the nudge as a non-terminal assistant-style message so the
         // transcript renders it without marking the session completed/done.
         // session.notice is NOT listed in has_terminal_session_event, so the
@@ -3346,8 +3522,22 @@ impl App {
                     return Ok(());
                 }
                 let payload = request_user_input_response_payload(&request, &text);
-                self.store
-                    .append_event(&session_id, REQUEST_USER_INPUT_RESPONSE_EVENT, payload)?;
+                let response_record = self.store.append_event(
+                    &session_id,
+                    REQUEST_USER_INPUT_RESPONSE_EVENT,
+                    payload,
+                )?;
+                product_analytics::capture_user_message(
+                    &self.store,
+                    "tui",
+                    &session_id,
+                    self.store
+                        .load_session(&session_id)?
+                        .is_some_and(|session| session.parent_id.is_some()),
+                    product_analytics::MESSAGE_KIND_REQUEST_INPUT_RESPONSE,
+                    response_record.seq,
+                    &request_user_input_response_analytics_text(&response_record.payload),
+                );
                 self.request_input = None;
                 self.status_notice = None;
             }
@@ -3396,6 +3586,7 @@ impl App {
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
             AppCommand::ChangeBrowser => self.open_surface(Surface::BrowserSelect),
+            AppCommand::SyncCookies => self.open_cookie_sync()?,
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
@@ -3423,11 +3614,20 @@ impl App {
             &options,
         )?;
         let _ = self.refresh_prompt_history_for(&cwd, &options);
-        self.store.append_event(
+        let input_record = self.store.append_event(
             &session.id,
             "session.input",
             typed_user_input_payload_for_submission_for_cwd(&submission, &cwd)?,
         )?;
+        product_analytics::capture_user_message(
+            &self.store,
+            "tui",
+            &session.id,
+            session.parent_id.is_some(),
+            product_analytics::MESSAGE_KIND_INITIAL,
+            input_record.seq,
+            &submission.text,
+        );
         self.prompt_history.record_submission(&submission.text);
         self.maybe_append_message_history(&session.id, &submission.text, &cwd, &options);
         self.selected_session_id = Some(session.id.clone());
@@ -3469,7 +3669,16 @@ impl App {
         } else {
             "session.followup"
         };
-        self.store.append_event(&session_id, event_type, payload)?;
+        let followup_record = self.store.append_event(&session_id, event_type, payload)?;
+        product_analytics::capture_user_message(
+            &self.store,
+            "tui",
+            &session_id,
+            session.parent_id.is_some(),
+            product_analytics::MESSAGE_KIND_FOLLOWUP,
+            followup_record.seq,
+            &submission.text,
+        );
         self.prompt_history.record_submission(&submission.text);
         if let Some(options) = options.as_ref() {
             self.maybe_append_message_history(
@@ -3500,8 +3709,18 @@ impl App {
         let mut payload =
             typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
         payload["delivery"] = serde_json::json!(FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN);
-        self.store
-            .append_event(&session_id, SESSION_QUEUED_FOLLOWUP_EVENT, payload)?;
+        let followup_record =
+            self.store
+                .append_event(&session_id, SESSION_QUEUED_FOLLOWUP_EVENT, payload)?;
+        product_analytics::capture_user_message(
+            &self.store,
+            "tui",
+            &session_id,
+            session.parent_id.is_some(),
+            product_analytics::MESSAGE_KIND_FOLLOWUP,
+            followup_record.seq,
+            &submission.text,
+        );
         self.prompt_history.record_submission(&submission.text);
         if let Ok(Some(options)) = self.configured_agent_options().map(Some) {
             self.maybe_append_message_history(
@@ -4502,6 +4721,7 @@ impl App {
             Surface::BrowserSelect => {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
+            Surface::CookieSync => self.execute_cookie_sync_selection()?,
             Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
                 0 => self.dispatch(AppCommand::ConfigureTelemetry)?,
@@ -4745,6 +4965,7 @@ impl App {
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
+            PaletteAction::SyncCookies => self.dispatch(AppCommand::SyncCookies)?,
             PaletteAction::Reload => self.dispatch(AppCommand::Reload)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
             PaletteAction::Exit => return Ok(true),
@@ -5293,11 +5514,19 @@ impl App {
             return Ok(());
         }
         if account == BROWSER_USE_CLOUD {
+            let return_to_cookie_sync = self.pending_cookie_sync_after_auth;
             self.store
                 .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, secret.trim())?;
-            self.browser = BROWSER_USE_CLOUD.to_string();
-            self.persist_runtime_settings()?;
+            if !return_to_cookie_sync {
+                self.browser = BROWSER_USE_CLOUD.to_string();
+                self.persist_runtime_settings()?;
+            }
             self.api_key_account = None;
+            self.pending_cookie_sync_after_auth = false;
+            if return_to_cookie_sync {
+                self.open_cookie_sync()?;
+                return Ok(());
+            }
             self.status_notice = Some("Saved Browser Use cloud key.".to_string());
             if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
                 self.complete_setup()?;
@@ -5461,6 +5690,7 @@ impl App {
     fn cancel_auth_entry(&mut self) {
         self.api_key_account = None;
         self.pending_model_after_auth = None;
+        self.pending_cookie_sync_after_auth = false;
         if !self.setup_complete {
             self.setup_pending_account = None;
             self.setup_result = None;
@@ -5503,6 +5733,16 @@ impl App {
         ACCOUNT_CHOICES.len()
     }
 
+    fn cookie_sync_row_count(&self) -> usize {
+        match &self.cookie_sync.status {
+            CookieSyncStatus::Ready => self.cookie_sync.profiles.len().max(1),
+            CookieSyncStatus::NeedsAuth
+            | CookieSyncStatus::Completed(_)
+            | CookieSyncStatus::Failed(_) => 1,
+            CookieSyncStatus::LoadingProfiles | CookieSyncStatus::Syncing => 0,
+        }
+    }
+
     fn request_open_browser(&mut self) -> Result<()> {
         let Some(session_id) = self.selected_session_id.clone() else {
             self.browser_notice = Some("No current browser task yet.".to_string());
@@ -5538,6 +5778,103 @@ impl App {
             serde_json::json!({ "browser": self.browser }),
         )?;
         self.browser_notice = Some("Reconnect requested.".to_string());
+        Ok(())
+    }
+
+    fn open_cookie_sync(&mut self) -> Result<()> {
+        self.open_surface(Surface::CookieSync);
+        self.status_notice = None;
+        self.start_cookie_sync_profile_load()
+    }
+
+    fn start_cookie_sync_profile_load(&mut self) -> Result<()> {
+        let Some(api_key) = self.browser_use_cloud_api_key_value()? else {
+            self.cookie_sync.status = CookieSyncStatus::NeedsAuth;
+            self.cookie_sync.profiles.clear();
+            self.cookie_sync.selected_profile_label = None;
+            self.cookie_sync.rx = None;
+            return Ok(());
+        };
+        self.cookie_sync.status = CookieSyncStatus::LoadingProfiles;
+        self.cookie_sync.profiles.clear();
+        self.cookie_sync.selected_profile_label = None;
+        self.spawn_cookie_sync_command(
+            CookieSyncCommandKind::LoadProfiles,
+            "browser profile sync --all-cookies".to_string(),
+            Some(api_key),
+        )
+    }
+
+    fn execute_cookie_sync_selection(&mut self) -> Result<()> {
+        match &self.cookie_sync.status {
+            CookieSyncStatus::NeedsAuth => self.start_cookie_sync_auth(),
+            CookieSyncStatus::Ready => self.start_cookie_sync_for_selected_profile(),
+            CookieSyncStatus::Completed(_) | CookieSyncStatus::Failed(_) => {
+                self.close_surface();
+                Ok(())
+            }
+            CookieSyncStatus::LoadingProfiles | CookieSyncStatus::Syncing => Ok(()),
+        }
+    }
+
+    fn start_cookie_sync_auth(&mut self) -> Result<()> {
+        self.pending_cookie_sync_after_auth = true;
+        self.start_auth_flow(BROWSER_USE_CLOUD.to_string())
+    }
+
+    fn start_cookie_sync_for_selected_profile(&mut self) -> Result<()> {
+        let Some(profile) = self
+            .cookie_sync
+            .profiles
+            .get(
+                self.selected_row
+                    .min(self.cookie_sync.profiles.len().saturating_sub(1)),
+            )
+            .cloned()
+        else {
+            self.cookie_sync.status =
+                CookieSyncStatus::Failed("No local Chromium profiles found.".to_string());
+            return Ok(());
+        };
+        let Some(api_key) = self.browser_use_cloud_api_key_value()? else {
+            self.cookie_sync.status = CookieSyncStatus::NeedsAuth;
+            return Ok(());
+        };
+        self.cookie_sync.status = CookieSyncStatus::Syncing;
+        self.cookie_sync.selected_profile_label = Some(profile.display_name.clone());
+        let command = format!(
+            "browser profile sync --profile {} --all-cookies",
+            browser_shell_quote_arg(&profile.id)
+        );
+        self.spawn_cookie_sync_command(CookieSyncCommandKind::SyncProfile, command, Some(api_key))
+    }
+
+    fn spawn_cookie_sync_command(
+        &mut self,
+        kind: CookieSyncCommandKind,
+        command: String,
+        api_key: Option<String>,
+    ) -> Result<()> {
+        let cwd = std::env::current_dir()?;
+        let artifact_root = self.store.state_dir().join("cookie-sync-artifacts");
+        fs::create_dir_all(&artifact_root)?;
+        let (tx, rx) = mpsc::channel();
+        thread::Builder::new()
+            .name("browser-use-cookie-sync".to_string())
+            .spawn(move || {
+                let result =
+                    browser_use_core::run_standalone_browser_command_with_browser_use_api_key(
+                        "tui-cookie-sync",
+                        &cwd,
+                        &artifact_root,
+                        &command,
+                        api_key,
+                    )
+                    .map_err(|error| format!("{error:#}"));
+                let _ = tx.send(CookieSyncEvent { kind, result });
+            })
+            .context("spawn cookie sync thread")?;
+        self.cookie_sync.rx = Some(rx);
         Ok(())
     }
 
@@ -5659,6 +5996,7 @@ impl App {
             Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
+            Surface::CookieSync => self.cookie_sync_row_count(),
             Surface::History => self.history_visible_indices()?.len(),
             Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
@@ -5929,14 +6267,21 @@ impl App {
     }
 
     fn browser_use_cloud_key_ready(&self) -> Result<bool> {
-        if self
+        Ok(self.browser_use_cloud_api_key_value()?.is_some())
+    }
+
+    fn browser_use_cloud_api_key_value(&self) -> Result<Option<String>> {
+        if let Some(value) = self
             .store
             .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
-            .is_some_and(|value| !value.trim().is_empty())
+            .filter(|value| !value.trim().is_empty())
         {
-            return Ok(true);
+            return Ok(Some(value));
         }
-        Ok(browser_use_cloud_env_key_present())
+        if browser_use_cloud_env_key_present() {
+            return Ok(std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV).ok());
+        }
+        Ok(None)
     }
 
     fn has_stored_or_env(&self, setting_key: &str, env_names: &[&str]) -> Result<bool> {
@@ -6057,6 +6402,114 @@ fn codex_env_auth_present() -> bool {
         return true;
     }
     std::env::var("LLM_BROWSER_CODEX_AUTH_FILE").is_ok_and(|value| !value.trim().is_empty())
+}
+
+fn cookie_sync_profiles_from_value(value: &serde_json::Value) -> Vec<CookieSyncProfile> {
+    value
+        .get("profiles")
+        .and_then(serde_json::Value::as_array)
+        .into_iter()
+        .flatten()
+        .filter_map(cookie_sync_profile_from_value)
+        .collect()
+}
+
+fn cookie_sync_profile_from_value(value: &serde_json::Value) -> Option<CookieSyncProfile> {
+    let id = value.get("id").and_then(serde_json::Value::as_str)?;
+    let display_name = value
+        .get("display_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(id);
+    let browser_name = value
+        .get("browser_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Browser")
+        .to_string();
+    let profile_name = value
+        .get("profile_name")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or(display_name)
+        .to_string();
+    Some(CookieSyncProfile {
+        id: id.to_string(),
+        display_name: display_name.to_string(),
+        browser_name,
+        profile_name,
+    })
+}
+
+fn cookie_sync_result_status(value: &serde_json::Value) -> Option<CookieSyncStatus> {
+    match value.get("status").and_then(serde_json::Value::as_str) {
+        Some("ok") => Some(CookieSyncStatus::Completed(cookie_sync_success_message(
+            value,
+        ))),
+        Some("needs-auth") => Some(CookieSyncStatus::NeedsAuth),
+        Some("failed") => Some(CookieSyncStatus::Failed(
+            value
+                .get("error")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("Cookie sync failed")
+                .to_string(),
+        )),
+        _ => None,
+    }
+}
+
+fn cookie_sync_success_message(value: &serde_json::Value) -> String {
+    let profile = value
+        .get("profile")
+        .and_then(|profile| profile.get("display_name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("local profile");
+    let cloud_profile = value
+        .get("cloud_profile")
+        .and_then(|profile| profile.get("name"))
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("Browser Use cloud profile");
+    let synced_count = value
+        .get("synced_cookie_count")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0);
+    if value
+        .get("synced")
+        .and_then(serde_json::Value::as_bool)
+        .unwrap_or(false)
+    {
+        format!(
+            "Synced {} cookies.\n\nLocal profile: {profile}\nCloud profile: {cloud_profile}\n\nRemote Browser Use sessions can now reuse local login state.",
+            format_cookie_count(synced_count)
+        )
+    } else {
+        value
+            .get("reason")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("No cookies were synced.")
+            .to_string()
+    }
+}
+
+fn format_cookie_count(count: u64) -> String {
+    let raw = count.to_string();
+    let mut out = String::new();
+    for (idx, ch) in raw.chars().rev().enumerate() {
+        if idx > 0 && idx % 3 == 0 {
+            out.push(',');
+        }
+        out.push(ch);
+    }
+    out.chars().rev().collect()
+}
+
+fn browser_shell_quote_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':' | b'=' | b',')
+        })
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r#"'\''"#))
 }
 
 fn auth_setting_key(account: &str) -> &'static str {
@@ -6690,6 +7143,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_oauth_notifications()?;
             draw_needed |= app.drain_codex_login_notifications()?;
             draw_needed |= app.drain_clipboard_paste_notifications()?;
+            draw_needed |= app.drain_cookie_sync_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -8202,6 +8656,7 @@ mod redesign_tests {
             Surface::Model => "Model",
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
+            Surface::CookieSync => "Cookie Sync",
             Surface::History => "History",
             Surface::Messages => "Messages",
             Surface::Developer => "Developer",
@@ -8418,6 +8873,29 @@ mod redesign_tests {
         );
         assert!(app.composer.is_empty());
         Ok(())
+    }
+
+    #[test]
+    fn request_user_input_response_analytics_text_flattens_answers() {
+        let payload = serde_json::json!({
+            "answers": {
+                "q1": { "answers": ["yes"] },
+                "q2": { "answers": ["option a", "option b"] },
+            }
+        });
+        let text = request_user_input_response_analytics_text(&payload);
+        assert!(text.contains("yes"));
+        assert!(text.contains("option a"));
+        assert!(text.contains("option b"));
+        assert!(text.contains(" | "));
+    }
+
+    #[test]
+    fn request_user_input_response_analytics_text_empty_without_answers() {
+        assert_eq!(
+            request_user_input_response_analytics_text(&serde_json::json!({})),
+            ""
+        );
     }
 
     #[test]
@@ -9138,6 +9616,153 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn sync_cookies_slash_surface_opens_cookie_auth_gate() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+
+            app.dispatch(AppCommand::SyncCookies)?;
+
+            assert_eq!(app.surface, Surface::CookieSync);
+            assert!(matches!(
+                app.cookie_sync.status,
+                CookieSyncStatus::NeedsAuth
+            ));
+            assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+
+            app.execute_surface_selection()?;
+
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+            assert!(app.pending_cookie_sync_after_auth);
+            assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn sync_cookies_completion_labels_local_and_cloud_profiles() {
+        let message = cookie_sync_success_message(&serde_json::json!({
+            "status": "ok",
+            "synced": true,
+            "synced_cookie_count": 7118,
+            "profile": {
+                "display_name": "Google Chrome - Reagan"
+            },
+            "cloud_profile": {
+                "name": "Google Chrome - Reagan"
+            }
+        }));
+
+        assert_eq!(
+            message,
+            "Synced 7,118 cookies.\n\nLocal profile: Google Chrome - Reagan\nCloud profile: Google Chrome - Reagan\n\nRemote Browser Use sessions can now reuse local login state."
+        );
+    }
+
+    #[test]
+    fn sync_cookies_completion_renders_emoji_and_aligned_header() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.open_surface(Surface::CookieSync);
+        app.cookie_sync.status = CookieSyncStatus::Completed("Synced 7 cookies.".to_string());
+
+        let lines = render::cookie_sync_lines(&app, 100);
+        let plain = render::lines_plain_text(&lines);
+        assert!(plain.contains("🎉 Complete"));
+        let count_span = lines
+            .iter()
+            .flat_map(|line| line.spans.iter())
+            .find(|span| span.content.as_ref() == "7")
+            .context("bold cookie count")?;
+        assert!(count_span.style.add_modifier.contains(Modifier::BOLD));
+        let screen = render_dump(&mut app)?;
+        let title_col = screen
+            .lines()
+            .find_map(|line| line.find("Cookie Sync"))
+            .context("Cookie Sync title")?;
+        let body_col = screen
+            .lines()
+            .find_map(|line| line.find("BROWSER USE CLOUD"))
+            .context("Cookie Sync body heading")?;
+        assert_eq!(title_col, body_col);
+        Ok(())
+    }
+
+    #[test]
+    fn sync_cookies_syncing_state_uses_profile_display_name() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = ready_app(&temp).unwrap();
+        app.cookie_sync.status = CookieSyncStatus::Syncing;
+        app.cookie_sync.selected_profile_label = Some("Google Chrome - Reagan".to_string());
+
+        let plain = render::lines_plain_text(&render::cookie_sync_lines(&app, 100));
+
+        assert!(plain.contains("Syncing all cookies from Google Chrome - Reagan"));
+        assert!(!plain.contains("google-chrome:Default"));
+    }
+
+    #[test]
+    fn sync_cookies_syncing_state_wraps_to_actual_narrow_width() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = ready_app(&temp).unwrap();
+        app.cookie_sync.status = CookieSyncStatus::Syncing;
+        app.cookie_sync.selected_profile_label =
+            Some("Alpha Beta Gamma Delta Epsilon Zeta".to_string());
+
+        let plain = render::lines_plain_text(&render::cookie_sync_lines(&app, 18));
+
+        assert!(plain.contains("  Syncing all"));
+        assert!(plain.contains("  cookies from"));
+        assert!(plain.contains("  Alpha Beta"));
+        for line in plain.lines().filter(|line| line.starts_with("  ")) {
+            assert!(
+                line.chars().count() <= 18,
+                "cookie sync line exceeded narrow width: {line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn sync_cookies_completion_message_wraps_without_truncation() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut app = ready_app(&temp).unwrap();
+        app.cookie_sync.status = CookieSyncStatus::Completed(
+            "Synced 7,118 cookies.\n\nLocal profile: Google Chrome - Reagan\nCloud profile: Browser Use - Google Chrome - Reagan.\n\nRemote Browser Use sessions can now reuse local login state."
+                .to_string(),
+        );
+
+        let lines = render::cookie_sync_lines(&app, 52);
+        let plain = render::lines_plain_text(&lines);
+
+        assert!(plain.contains("Cloud profile: Browser Use - Google Chrome"));
+        assert!(plain.contains("Reagan."));
+        assert!(!plain.contains("..."));
+        assert!(plain.contains("Remote Browser Use sessions can now"));
+        let normalized_plain = plain.split_whitespace().collect::<Vec<_>>().join(" ");
+        assert!(normalized_plain.contains("reuse local login state."));
+        assert!(plain.contains("state."));
+        for label in ["Local profile", "Cloud profile"] {
+            let span = lines
+                .iter()
+                .flat_map(|line| line.spans.iter())
+                .find(|span| span.content.as_ref() == label)
+                .unwrap_or_else(|| panic!("missing bold {label} label"));
+            assert!(span.style.add_modifier.contains(Modifier::BOLD));
+        }
     }
 
     #[test]
@@ -10318,6 +10943,7 @@ wire_api = "responses"
             Surface::Mode,
             Surface::Browser,
             Surface::BrowserSelect,
+            Surface::CookieSync,
         ] {
             app.open_surface(surface);
             let count = match surface {
@@ -10325,6 +10951,7 @@ wire_api = "responses"
                 Surface::Model => app.model_choices.len(),
                 Surface::Mode => 2,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
+                Surface::CookieSync => app.cookie_sync_row_count(),
                 _ => unreachable!(),
             };
             assert_nav(&mut app, count)?;
@@ -12892,6 +13519,7 @@ wire_api = "responses"
             Surface::Mode,
             Surface::Browser,
             Surface::BrowserSelect,
+            Surface::CookieSync,
             Surface::Account,
         ] {
             app.open_surface(surface);
