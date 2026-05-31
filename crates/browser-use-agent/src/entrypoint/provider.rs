@@ -780,6 +780,7 @@ mod tests {
     /// value (legacy `stored_or_env` precedence).
     #[test]
     fn env_key_wins_over_store() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("OPENAI_API_KEY", "env-openai-key");
         let dir = tempfile::tempdir().expect("tempdir");
         let store = Store::open(dir.path()).expect("store");
@@ -802,6 +803,7 @@ mod tests {
     /// `auth.<provider>.api_key` resolves the provider (fixes the env-only regression).
     #[test]
     fn store_key_is_fallback_when_env_absent() {
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("LLM_BROWSER_ANTHROPIC_API_KEY");
         let dir = tempfile::tempdir().expect("tempdir");
