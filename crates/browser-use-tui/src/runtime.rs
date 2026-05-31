@@ -1,10 +1,10 @@
 use std::path::PathBuf;
+use std::sync::{Arc, Mutex};
 
 use anyhow::{bail, Result};
-use browser_use_core::{
-    run_existing_session_from_config, AgentRunOptions, CollaborationModeKind, ConfigOverrides,
-    ProviderRunConfig,
-};
+use browser_use_agent::config_overrides::{AgentRunOptions, ConfigOverrides, ProviderRunConfig};
+use browser_use_agent::entrypoint::run_session_with_config;
+use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_store::{Store, StoreNotifier};
 
 use crate::settings::{
@@ -58,13 +58,27 @@ pub(crate) fn run_agent_thread(
             config_overrides,
         ))
         .with_fake_result("Fake result from the Rust TUI agent loop.");
-    let result = run_existing_session_from_config(&store, &session_id, config);
+    // The new async engine takes a `SharedStore` (`Arc<Mutex<Store>>`) and is
+    // driven on a Tokio runtime. `run_agent_thread` runs on a dedicated OS
+    // thread, so we build a current-thread runtime here and block on the run,
+    // preserving the existing thread-per-session model.
+    let shared_store = Arc::new(Mutex::new(store));
+    let runtime = tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()?;
+    let result = runtime.block_on(run_session_with_config(
+        Arc::clone(&shared_store),
+        &session_id,
+        config,
+    ));
     if let Err(error) = result {
-        let _ = store.append_event(
-            &session_id,
-            "session.failed",
-            serde_json::json!({ "error": error.to_string() }),
-        );
+        if let Ok(store) = shared_store.lock() {
+            let _ = store.append_event(
+                &session_id,
+                "session.failed",
+                serde_json::json!({ "error": error.to_string() }),
+            );
+        }
         return Err(error);
     }
     Ok(())
@@ -243,7 +257,7 @@ mod tests {
 
     #[test]
     fn tui_agent_options_pass_profile_and_config_overrides_to_core() {
-        let config_overrides = browser_use_core::parse_config_overrides(&[
+        let config_overrides = browser_use_agent::config_overrides::parse_config_overrides(&[
             "developer_instructions=\"Stay precise.\"".to_string(),
         ])
         .expect("valid config override");

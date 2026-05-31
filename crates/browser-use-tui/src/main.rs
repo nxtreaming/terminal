@@ -10,8 +10,6 @@ use std::os::unix::process::CommandExt;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
-#[cfg(not(test))]
-use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
     mpsc, Arc, Once,
@@ -20,26 +18,33 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use browser_use_core::{
-    cleanup_agent_runtime_state_for_agent_subtree, configured_model_for_cwd_with_options,
-    configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
-    install_process_crypto_provider, model_catalog_for_cwd_with_options, parse_config_overrides,
-    product_analytics, typed_user_input_payload_from_items_for_cwd,
-    typed_user_input_payload_from_text_for_cwd, AgentRunOptions, CollaborationModeKind,
-    ConfigOverrides, MessageHistoryConfig, MessageHistoryPersistence, UnifiedExecShutdownCleanup,
+use browser_use_agent::config_model::{
+    configured_model_for_cwd_with_options, configured_model_provider_id_for_cwd_with_options,
+    default_model_for_cwd_with_options, model_catalog_for_cwd_with_options,
 };
+use browser_use_agent::config_overrides::{
+    parse_config_overrides, AgentRunOptions, ConfigOverrides,
+};
+use browser_use_agent::context::{
+    typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
+};
+use browser_use_agent::history::{MessageHistoryConfig, MessageHistoryPersistence};
+use browser_use_agent::infra::{
+    capture_async, install_process_crypto_provider, UnifiedExecShutdownCleanup,
+};
+use browser_use_agent::prompts::CollaborationModeKind;
+use browser_use_agent::subagents::cleanup_agent_runtime_state_for_agent_subtree;
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
 use browser_use_providers::{
-    claude_code_oauth_authorize_url, claude_code_oauth_pkce, load_codex_auth,
-    load_codex_managed_auth, ClaudeCodeOAuthCredential, CodexAuth,
+    claude_code_oauth_authorize_url, claude_code_oauth_pkce, ClaudeCodeOAuthCredential,
 };
 #[cfg(not(test))]
 use browser_use_providers::{
-    exchange_claude_code_authorization_code, load_codex_auth_file,
-    parse_claude_code_authorization_input, ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST,
-    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    exchange_claude_code_authorization_code, parse_claude_code_authorization_input,
+    ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH,
+    CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_store::{resolve_state_dir, Store, StoreNotification, StoreNotifier};
 use clap::{Parser, ValueEnum};
@@ -90,10 +95,9 @@ use runtime::run_agent_thread;
 use settings::{
     browser_use_cloud_env_key_present, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
-    model_choices_for_catalog, provider_model_for_display, AgentBackend, ModelChoice,
-    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_SETTING,
+    provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES,
+    ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME,
+    BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -103,7 +107,6 @@ const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
-const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
 const COLLABORATION_MODE_SETTING: &str = "collaboration.mode";
 const REQUEST_USER_INPUT_REQUEST_EVENT: &str = "request_user_input.requested";
 const REQUEST_USER_INPUT_RESPONSE_EVENT: &str = "request_user_input.response";
@@ -128,7 +131,7 @@ struct Args {
     /// Override a configuration value. Use a dotted path and TOML value.
     #[arg(short = 'c', long = "config", value_name = "key=value", action = clap::ArgAction::Append)]
     config_overrides: Vec<String>,
-    #[arg(long, default_value = "Codex login")]
+    #[arg(long, default_value = "OpenAI API key")]
     account: String,
     #[arg(long, default_value = "Local Chrome")]
     browser: String,
@@ -339,29 +342,6 @@ struct ClaudeCodeOAuthFlow {
 }
 
 impl Drop for ClaudeCodeOAuthFlow {
-    fn drop(&mut self) {
-        let _ = self.stop_tx.send(());
-    }
-}
-
-#[derive(Debug)]
-enum CodexLoginEvent {
-    Output(String),
-    Finished(Result<CodexAuth, String>),
-}
-
-#[derive(Debug)]
-struct CodexLoginFlow {
-    account: String,
-    output: String,
-    started_at: Instant,
-    stop_tx: mpsc::Sender<()>,
-    rx: mpsc::Receiver<CodexLoginEvent>,
-    #[cfg(test)]
-    event_tx_guard: Option<mpsc::Sender<CodexLoginEvent>>,
-}
-
-impl Drop for CodexLoginFlow {
     fn drop(&mut self) {
         let _ = self.stop_tx.send(());
     }
@@ -609,7 +589,6 @@ struct App {
     setup_pending_account: Option<String>,
     setup_result: Option<SetupResult>,
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
-    codex_login: Option<CodexLoginFlow>,
     browser_notice: Option<String>,
     status_notice: Option<String>,
     agent_backend: AgentBackend,
@@ -1027,7 +1006,7 @@ impl PromptHistoryState {
             return;
         }
 
-        let (log_id, count) = browser_use_core::message_history_metadata(config);
+        let (log_id, count) = browser_use_agent::history::message_history_metadata(config);
         if !self.persistent_initialized
             || self.persistent_log_id != log_id
             || count < self.persistent_count
@@ -1118,8 +1097,11 @@ impl PromptHistoryState {
             return Some(entry.clone());
         }
         let config = config?;
-        let entry =
-            browser_use_core::lookup_message_history_entry(self.persistent_log_id, offset, config)?;
+        let entry = browser_use_agent::history::lookup_message_history_entry(
+            self.persistent_log_id,
+            offset,
+            config,
+        )?;
         if entry.text.trim().is_empty() {
             return None;
         }
@@ -1132,7 +1114,7 @@ impl PromptHistoryState {
             let persistent_entries = config
                 .filter(|_| self.persistent_count > 0)
                 .map(|config| {
-                    browser_use_core::message_history_entries(
+                    browser_use_agent::history::message_history_entries(
                         self.persistent_log_id,
                         self.persistent_count,
                         config,
@@ -1638,7 +1620,7 @@ fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionMode
         .get("account")
         .and_then(serde_json::Value::as_str)
         .map(str::to_string)
-        .unwrap_or_else(|| ACCOUNT_CODEX.to_string());
+        .unwrap_or_else(|| ACCOUNT_OPENAI.to_string());
     let model_provider_id = event
         .payload
         .get("model_provider_id")
@@ -1682,10 +1664,15 @@ impl App {
             .get_setting("agent.backend")?
             .and_then(|value| AgentBackend::from_setting(&value))
             .unwrap_or(args.agent);
-        let model_choices =
-            model_catalog_for_cwd_with_options(&current_dir, config_profile, &config_overrides)
-                .map(|catalog| model_choices_for_catalog(&catalog))
-                .unwrap_or_else(|_| fallback_model_choices());
+        // The model picker is built from the rich `browser_use_providers`
+        // catalog (it exposes the `.presets(..)` API `model_choices_for_catalog`
+        // needs). `browser-use-agent`'s `model_catalog_for_cwd_with_options`
+        // returns a minimal catalog type (slug/display/is_default only) used for
+        // default-model RESOLUTION below, not for driving the picker, so the
+        // picker entries come from the bundled providers catalog. Custom cwd
+        // `model_catalog` config no longer adds picker rows (documented delta).
+        let _ = model_catalog_for_cwd_with_options(&current_dir, config_profile, &config_overrides);
+        let model_choices = fallback_model_choices();
         let stored_model = store.get_setting("model")?;
         let had_stored_model = stored_model.is_some();
         let explicit_model = args
@@ -1703,7 +1690,9 @@ impl App {
         {
             display_and_provider_model_for_input(model, &model_choices)
         } else {
-            let chatgpt_mode = matches!(agent_backend, AgentBackend::Codex);
+            // Codex (ChatGPT) login is removed, so the default-model resolution
+            // always runs in non-chatgpt mode.
+            let chatgpt_mode = false;
             let provider_model = default_model_for_cwd_with_options(
                 &current_dir,
                 config_profile,
@@ -1778,7 +1767,6 @@ impl App {
             setup_pending_account: None,
             setup_result: None,
             claude_code_oauth: None,
-            codex_login: None,
             browser_notice: None,
             status_notice: None,
             agent_backend,
@@ -1870,55 +1858,6 @@ impl App {
         Ok(true)
     }
 
-    fn drain_codex_login_notifications(&mut self) -> Result<bool> {
-        let mut events = Vec::new();
-        if let Some(flow) = self.codex_login.as_ref() {
-            while let Ok(event) = flow.rx.try_recv() {
-                events.push(event);
-            }
-        }
-        if events.is_empty() {
-            return Ok(false);
-        }
-        for event in events {
-            match event {
-                CodexLoginEvent::Output(text) => {
-                    if let Some(flow) = self.codex_login.as_mut() {
-                        flow.output.push_str(&strip_ansi(&text));
-                    }
-                }
-                CodexLoginEvent::Finished(result) => {
-                    let account = self
-                        .codex_login
-                        .as_ref()
-                        .map(|flow| flow.account.clone())
-                        .unwrap_or_else(|| ACCOUNT_CODEX.to_string());
-                    self.codex_login = None;
-                    match result {
-                        Ok(auth) => {
-                            self.store_codex_auth(&auth)?;
-                            self.account = account.clone();
-                            self.persist_runtime_settings()?;
-                            self.show_setup_result(
-                                SetupResultKind::Success,
-                                account,
-                                "Connected with Codex auth.".to_string(),
-                            );
-                        }
-                        Err(error) => {
-                            self.show_setup_result(
-                                SetupResultKind::Failure,
-                                account,
-                                format!("Codex login failed: {error}"),
-                            );
-                        }
-                    }
-                }
-            }
-        }
-        Ok(true)
-    }
-
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
         let mut changed = self.state_cache.refresh_all(&self.store)?;
         if changed {
@@ -1989,23 +1928,24 @@ impl App {
             return Vec::new();
         };
         let events = self.cached_events_for_session(session_id);
-        let mut rows = browser_use_core::rollback_filtered_event_records(events)
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "session.input" | "session.followup"
-                )
-            })
-            .filter_map(|event| {
-                event_payload_text(event).map(|text| MessageActionRow {
-                    seq: event.seq,
-                    kind: MessageActionKind::Submitted,
-                    text,
-                    followup: event.event_type == "session.followup",
+        let mut rows =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(events)
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "session.input" | "session.followup"
+                    )
                 })
-            })
-            .collect::<Vec<_>>();
+                .filter_map(|event| {
+                    event_payload_text(event).map(|text| MessageActionRow {
+                        seq: event.seq,
+                        kind: MessageActionKind::Submitted,
+                        text,
+                        followup: event.event_type == "session.followup",
+                    })
+                })
+                .collect::<Vec<_>>();
         rows.extend(
             self.pending_queued_followup_events(events)
                 .into_iter()
@@ -2039,7 +1979,8 @@ impl App {
             return Ok(None);
         }
         let events = self.store.events_for_session(&session_id)?;
-        let filtered = browser_use_core::rollback_filtered_event_records(&events);
+        let filtered =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events);
         let Some(row) = filtered.iter().rev().find_map(|event| {
             if !matches!(
                 event.event_type.as_str(),
@@ -2673,7 +2614,6 @@ impl App {
             self.setup_pending_account = None;
             self.setup_result = None;
             self.claude_code_oauth = None;
-            self.codex_login = None;
         }
         self.surface = Surface::Main;
         self.selected_row = 0;
@@ -2984,12 +2924,27 @@ impl App {
         let session = self.store.create_session(None, &cwd)?;
         self.append_session_model_selection(&session.id, &selection)?;
         let options = self.configured_agent_options()?;
-        browser_use_core::append_workspace_context_event_with_options(
-            &self.store,
-            &session,
-            &options,
-        )?;
+        // The legacy `append_workspace_context_event_with_options(&store,
+        // &session, &options)` seeded the full workspace context (AGENTS.md /
+        // permissions / collaboration-mode / multi-agent hints) into the durable
+        // log before the run. `browser-use-agent` owns context seeding inside
+        // `run_session_with_config` (it seeds the environment-context event at
+        // run start; full AGENTS.md/permissions assembly lands in Wave-E), and
+        // exposes no `SessionMeta`/`AgentRunOptions` seeder, so the TUI no longer
+        // pre-seeds here. See the cutover report for this behavior delta.
         let _ = self.refresh_prompt_history_for(&cwd, &options);
+        // Record the collaboration mode for the new session before the first
+        // user turn. Legacy emitted this from
+        // `append_workspace_context_event_with_options`; that seeder is gone, so
+        // the TUI (which owns the selected mode) records it directly, preserving
+        // the mode-before-input ordering the engine relies on.
+        self.store.append_event(
+            &session.id,
+            "session.collaboration_mode",
+            serde_json::json!({
+                "mode": collaboration_mode_setting_value(self.collaboration_mode),
+            }),
+        )?;
         self.store.append_event(
             &session.id,
             "session.input",
@@ -3145,7 +3100,11 @@ impl App {
             return Ok(false);
         }
         self.store.request_cancel(&id, "stopped from terminal")?;
-        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id)?;
+        // The new engine takes a per-session teardown closure. Unified-exec /
+        // MCP per-session cleanup is not yet ported into `browser-use-agent`
+        // (its `UnifiedExecShutdownCleanup` drop is the integration point), so
+        // the closure is a no-op here; the Store-driven subtree walk still runs.
+        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |_session_id| 0)?;
         Ok(true)
     }
 
@@ -3196,7 +3155,7 @@ impl App {
         let Some(session_id) = self.selected_session_id.as_deref() else {
             return 1;
         };
-        browser_use_core::rollback_filtered_event_records(
+        browser_use_agent::context::workspace_context::rollback_filtered_event_records(
             self.cached_events_for_session(session_id),
         )
         .into_iter()
@@ -3637,9 +3596,7 @@ impl App {
             // Selection resets to the top of the filtered list whenever the
             // filter changes so the highlight is never pointing at a row that
             // just got filtered out.
-            KeyEvent { .. }
-                if self.surface == Surface::History && is_popup_clear_key(key) =>
-            {
+            KeyEvent { .. } if self.surface == Surface::History && is_popup_clear_key(key) => {
                 self.history_filter.clear();
                 self.selected_row = 0;
             }
@@ -3650,9 +3607,8 @@ impl App {
             } if self.surface == Surface::History
                 && !modifiers.contains(KeyModifiers::CONTROL)
                 && !modifiers.contains(KeyModifiers::ALT)
-                && !modifiers.intersects(
-                    KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META,
-                ) =>
+                && !modifiers
+                    .intersects(KeyModifiers::SUPER | KeyModifiers::HYPER | KeyModifiers::META) =>
             {
                 self.history_filter.push(ch);
                 self.selected_row = 0;
@@ -3894,9 +3850,7 @@ impl App {
             self.close_surface();
             return Ok(());
         };
-        if account == ACCOUNT_CODEX {
-            self.start_codex_auth(account)?;
-        } else if is_claude_code_account(&account) {
+        if is_claude_code_account(&account) {
             self.account = account.clone();
             self.persist_runtime_settings()?;
             if self.account_ready(&account)? {
@@ -3918,9 +3872,7 @@ impl App {
         match result.kind {
             SetupResultKind::Success => self.continue_after_setup_success(result.account),
             SetupResultKind::Failure if self.selected_row.min(1) == 0 => {
-                if result.account == ACCOUNT_CODEX {
-                    self.start_codex_auth(result.account)?;
-                } else if is_claude_code_account(&result.account) {
+                if is_claude_code_account(&result.account) {
                     self.start_claude_code_oauth(result.account)?;
                 } else {
                     self.start_auth_flow(result.account)?;
@@ -3928,16 +3880,11 @@ impl App {
                 Ok(())
             }
             SetupResultKind::Pending if self.selected_row.min(1) == 0 => {
-                if result.account == ACCOUNT_CODEX {
-                    self.reopen_codex_device_auth_url();
-                } else {
-                    self.reopen_claude_code_oauth_url();
-                }
+                self.reopen_claude_code_oauth_url();
                 Ok(())
             }
             SetupResultKind::Pending => {
                 self.claude_code_oauth = None;
-                self.codex_login = None;
                 self.setup_result = None;
                 self.setup_pending_account = None;
                 self.close_surface();
@@ -3965,21 +3912,6 @@ impl App {
                 account,
                 "Could not find a Claude Code login.".to_string(),
             );
-        }
-        Ok(())
-    }
-
-    fn start_codex_auth(&mut self, account: String) -> Result<()> {
-        if self.account_ready(&account)? {
-            self.account = account.clone();
-            self.persist_runtime_settings()?;
-            self.show_setup_result(
-                SetupResultKind::Success,
-                account,
-                "Connected with Codex auth.".to_string(),
-            );
-        } else {
-            self.start_codex_device_login(account)?;
         }
         Ok(())
     }
@@ -4085,7 +4017,7 @@ impl App {
 
     fn run_update(&mut self) -> Result<()> {
         self.status_notice = Some("Checking for browser-use terminal updates...".to_string());
-        product_analytics::capture_async(
+        capture_async(
             &self.store,
             "bu:tui update started",
             serde_json::json!({ "surface": "tui" }),
@@ -4093,7 +4025,7 @@ impl App {
         match run_update_installer() {
             Ok(message) => {
                 self.status_notice = Some(message);
-                product_analytics::capture_async(
+                capture_async(
                     &self.store,
                     "bu:tui update completed",
                     serde_json::json!({ "surface": "tui" }),
@@ -4101,7 +4033,7 @@ impl App {
             }
             Err(error) => {
                 self.status_notice = Some(format!("Update failed: {error:#}"));
-                product_analytics::capture_async(
+                capture_async(
                     &self.store,
                     "bu:tui update failed",
                     serde_json::json!({ "surface": "tui" }),
@@ -4117,10 +4049,6 @@ impl App {
     }
 
     fn save_account(&mut self, account: String) -> Result<()> {
-        if account == ACCOUNT_CODEX {
-            self.start_codex_auth(account)?;
-            return Ok(());
-        }
         self.account = account.clone();
         self.start_auth_flow(account)?;
         Ok(())
@@ -4162,11 +4090,6 @@ impl App {
         self.model_provider_id = Some(model_provider_id_for_backend(choice.backend).to_string());
         self.model_configured = true;
         self.track_model_selected();
-        if self.account == ACCOUNT_CODEX && !self.has_codex_login()? {
-            self.pending_model_after_auth = Some(index);
-            self.start_codex_device_login(self.account.clone())?;
-            return Ok(());
-        }
         self.persist_runtime_settings()?;
         if !self.account_ready(&self.account)? {
             self.pending_model_after_auth = Some(index);
@@ -4232,31 +4155,39 @@ impl App {
         cwd: &Path,
         options: &AgentRunOptions,
     ) {
+        // `browser-use-agent`'s message-history layer takes the resolved
+        // `MessageHistorySettings` directly (it no longer parses AGENTS.md to
+        // derive them), so `options` no longer feeds the persistence config.
+        let _ = options;
         #[cfg(not(test))]
         {
             let session_id = session_id.to_string();
             let text = text.to_string();
             let cwd = cwd.to_path_buf();
-            let options = options.clone();
             std::thread::spawn(move || {
-                let _ = browser_use_core::append_message_history_entry_for_cwd(
+                let _ = browser_use_agent::history::append_message_history_entry_for_cwd(
                     &text,
                     &session_id,
                     &cwd,
-                    &options,
+                    browser_use_agent::history::MessageHistorySettings::default(),
                 );
             });
         }
         #[cfg(test)]
         {
-            let _ = (session_id, text, cwd, options);
+            let _ = (session_id, text, cwd);
         }
     }
 
     fn prompt_history_config(&self) -> Result<Option<MessageHistoryConfig>> {
         let cwd = std::env::current_dir()?;
-        let options = self.configured_agent_options()?;
-        browser_use_core::message_history_config_for_cwd_with_options(&cwd, &options)
+        // Settings are no longer derived from AGENTS.md/run-options by the new
+        // engine; the history layer takes `MessageHistorySettings` directly.
+        let _ = self.configured_agent_options()?;
+        browser_use_agent::history::message_history_config_for_cwd_with_options(
+            &cwd,
+            browser_use_agent::history::MessageHistorySettings::default(),
+        )
     }
 
     fn refresh_prompt_history(&mut self) -> Result<Option<MessageHistoryConfig>> {
@@ -4271,7 +4202,13 @@ impl App {
         cwd: &Path,
         options: &AgentRunOptions,
     ) -> Result<Option<MessageHistoryConfig>> {
-        let config = browser_use_core::message_history_config_for_cwd_with_options(cwd, options)?;
+        // History settings come straight from `MessageHistorySettings` now; the
+        // run-options no longer carry the persistence config.
+        let _ = options;
+        let config = browser_use_agent::history::message_history_config_for_cwd_with_options(
+            cwd,
+            browser_use_agent::history::MessageHistorySettings::default(),
+        )?;
         self.prompt_history
             .refresh_persistent_metadata(config.as_ref());
         Ok(config)
@@ -4637,10 +4574,6 @@ impl App {
 
     fn start_auth_flow(&mut self, account: String) -> Result<()> {
         self.track_auth_provider_selected(&account);
-        if account == ACCOUNT_CODEX {
-            self.start_codex_auth(account)?;
-            return Ok(());
-        }
         if is_claude_code_account(&account) {
             if self.account_ready(&account)? {
                 self.account = account.clone();
@@ -4698,40 +4631,6 @@ impl App {
         };
         let message = match open_external_url(&url) {
             Ok(()) => "Waiting for Claude Code OAuth sign-in.".to_string(),
-            Err(error) => format!("Could not open browser automatically: {error}"),
-        };
-        if let Some(result) = self.setup_result.as_mut() {
-            result.message = message;
-        }
-    }
-
-    fn start_codex_device_login(&mut self, account: String) -> Result<()> {
-        self.api_key_account = None;
-        self.composer.clear();
-        self.codex_login = None;
-        let flow = match start_codex_login_flow(account.clone(), self.args.state_dir.clone()) {
-            Ok(flow) => flow,
-            Err(error) => {
-                self.show_setup_result(
-                    SetupResultKind::Failure,
-                    account,
-                    format!("Could not start Codex login: {error:#}"),
-                );
-                return Ok(());
-            }
-        };
-        self.codex_login = Some(flow);
-        self.show_setup_result(
-            SetupResultKind::Pending,
-            account,
-            "Waiting for Codex device sign-in.".to_string(),
-        );
-        Ok(())
-    }
-
-    fn reopen_codex_device_auth_url(&mut self) {
-        let message = match open_external_url(CODEX_DEVICE_AUTH_URL) {
-            Ok(()) => "Waiting for Codex device sign-in.".to_string(),
             Err(error) => format!("Could not open browser automatically: {error}"),
         };
         if let Some(result) = self.setup_result.as_mut() {
@@ -4854,7 +4753,7 @@ impl App {
         if cfg!(test) {
             return Ok(());
         }
-        product_analytics::capture_async(
+        capture_async(
             &self.store,
             "bu:tui setup completed",
             serde_json::json!({
@@ -4870,7 +4769,7 @@ impl App {
         if cfg!(test) {
             return;
         }
-        product_analytics::capture_async(
+        capture_async(
             &self.store,
             "bu:tui app opened",
             serde_json::json!({
@@ -4886,7 +4785,7 @@ impl App {
         if cfg!(test) {
             return;
         }
-        product_analytics::capture_async(
+        capture_async(
             &self.store,
             "bu:tui model selected",
             serde_json::json!({
@@ -4901,7 +4800,7 @@ impl App {
         if cfg!(test) {
             return;
         }
-        product_analytics::capture_async(
+        capture_async(
             &self.store,
             "bu:tui browser selected",
             serde_json::json!({
@@ -4915,7 +4814,7 @@ impl App {
         if cfg!(test) {
             return;
         }
-        product_analytics::capture_async(
+        capture_async(
             &self.store,
             "bu:tui auth provider selected",
             serde_json::json!({
@@ -5158,7 +5057,6 @@ impl App {
                 &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
             )?,
             account if is_claude_code_account(account) => self.has_claude_code_oauth()?,
-            ACCOUNT_CODEX => self.has_codex_login()?,
             _ => false,
         })
     }
@@ -5197,9 +5095,6 @@ impl App {
                 )? =>
             {
                 Some("DeepSeek API key is missing. Authenticate here before retrying.".to_string())
-            }
-            AgentBackend::Codex if !self.has_codex_login()? => {
-                Some("Codex login is missing. Select Codex login to sign in.".to_string())
             }
             AgentBackend::Anthropic
                 if is_claude_code_account(&selection.account)
@@ -5259,35 +5154,6 @@ impl App {
             .any(|name| std::env::var(name).is_ok_and(|value| !value.trim().is_empty())))
     }
 
-    fn has_codex_login(&self) -> Result<bool> {
-        if self
-            .store
-            .get_setting("auth.codex.access_token")?
-            .is_some_and(|value| !value.trim().is_empty())
-            && self
-                .store
-                .get_setting("auth.codex.account_id")?
-                .is_some_and(|value| !value.trim().is_empty())
-        {
-            return Ok(true);
-        }
-        Ok(load_codex_managed_auth().is_ok()
-            || load_codex_auth().is_ok()
-            || codex_env_auth_present())
-    }
-
-    fn store_codex_auth(&self, auth: &CodexAuth) -> Result<()> {
-        self.store
-            .set_setting("auth.codex.access_token", auth.access_token.trim())?;
-        self.store
-            .set_setting("auth.codex.account_id", auth.account_id.trim())?;
-        self.store.delete_setting("auth.codex.id_token")?;
-        self.store.delete_setting("auth.codex.refresh_token")?;
-        self.store.delete_setting("auth.codex.source_path")?;
-        self.store.delete_setting("auth.codex.last_refresh")?;
-        Ok(())
-    }
-
     fn has_claude_code_oauth(&self) -> Result<bool> {
         Ok(self.has_stored_or_env(
             "auth.claude_code.access_token",
@@ -5319,27 +5185,6 @@ impl App {
             .map(|flow| flow.started_at.elapsed().as_secs())
     }
 
-    pub(crate) fn codex_login_elapsed_seconds(&self) -> Option<u64> {
-        self.codex_login
-            .as_ref()
-            .map(|flow| flow.started_at.elapsed().as_secs())
-    }
-
-    pub(crate) fn codex_login_output_lines(&self) -> Vec<String> {
-        self.codex_login
-            .as_ref()
-            .map(|flow| {
-                flow.output
-                    .lines()
-                    .filter_map(|line| {
-                        let line = line.trim();
-                        (!line.is_empty()).then(|| line.to_string())
-                    })
-                    .collect()
-            })
-            .unwrap_or_default()
-    }
-
     fn laminar_status(&self) -> Result<String> {
         if self
             .store
@@ -5357,15 +5202,6 @@ impl App {
 
 const LAMINAR_API_KEY_SETTING: &str = "telemetry.laminar.api_key";
 
-fn codex_env_auth_present() -> bool {
-    if std::env::var("LLM_BROWSER_CODEX_ACCESS_TOKEN").is_ok_and(|value| !value.trim().is_empty())
-        && std::env::var("LLM_BROWSER_CODEX_ACCOUNT_ID").is_ok_and(|value| !value.trim().is_empty())
-    {
-        return true;
-    }
-    std::env::var("LLM_BROWSER_CODEX_AUTH_FILE").is_ok_and(|value| !value.trim().is_empty())
-}
-
 fn auth_setting_key(account: &str) -> &'static str {
     match account {
         ACCOUNT_OPENAI => "auth.openai.api_key",
@@ -5374,7 +5210,7 @@ fn auth_setting_key(account: &str) -> &'static str {
         ACCOUNT_ANTHROPIC => "auth.anthropic.api_key",
         BROWSER_USE_CLOUD => BROWSER_USE_CLOUD_API_KEY_SETTING,
         account if is_claude_code_account(account) => "auth.claude_code.access_token",
-        _ => "auth.codex.placeholder",
+        _ => "auth.unknown.placeholder",
     }
 }
 
@@ -5392,7 +5228,6 @@ fn auth_secret_label(account: &str) -> &'static str {
 
 fn account_kind(account: &str) -> &'static str {
     match account {
-        ACCOUNT_CODEX => "codex",
         ACCOUNT_OPENAI => "openai",
         ACCOUNT_OPENROUTER => "openrouter",
         ACCOUNT_DEEPSEEK => "deepseek",
@@ -5401,11 +5236,6 @@ fn account_kind(account: &str) -> &'static str {
         account if is_claude_code_account(account) => "claude_code",
         _ => "unknown",
     }
-}
-
-#[cfg(not(test))]
-fn app_codex_home(state_dir: &Path) -> PathBuf {
-    state_dir.join("codex-home")
 }
 
 fn browser_choice_kind(browser: &str) -> &'static str {
@@ -5556,110 +5386,6 @@ fn start_claude_code_oauth_flow(account: String) -> Result<ClaudeCodeOAuthFlow> 
         stop_tx,
         rx,
         browser_open_error: None,
-        event_tx_guard: Some(event_tx),
-    })
-}
-
-#[cfg(not(test))]
-fn start_codex_login_flow(account: String, state_dir: PathBuf) -> Result<CodexLoginFlow> {
-    let codex_home = app_codex_home(&state_dir);
-    std::fs::create_dir_all(&codex_home)
-        .with_context(|| format!("create app Codex home {}", codex_home.display()))?;
-    let auth_path = codex_home.join("auth.json");
-    let mut child = ProcessCommand::new("codex")
-        .args(["login", "--device-auth"])
-        .env("CODEX_HOME", &codex_home)
-        .stdout(Stdio::piped())
-        .stderr(Stdio::piped())
-        .spawn()
-        .context("start `codex login --device-auth`")?;
-    let stdout = child.stdout.take();
-    let stderr = child.stderr.take();
-    let (stop_tx, stop_rx) = mpsc::channel();
-    let (event_tx, rx) = mpsc::channel();
-    if let Some(stdout) = stdout {
-        spawn_codex_output_reader(stdout, event_tx.clone());
-    }
-    if let Some(stderr) = stderr {
-        spawn_codex_output_reader(stderr, event_tx.clone());
-    }
-    thread::Builder::new()
-        .name("browser-use-codex-login".to_string())
-        .spawn(move || loop {
-            if stop_rx.try_recv().is_ok() {
-                let _ = child.kill();
-                let _ = child.wait();
-                let _ = event_tx.send(CodexLoginEvent::Finished(Err(
-                    "Codex device sign-in was cancelled".to_string(),
-                )));
-                return;
-            }
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    let result = if status.success() {
-                        load_codex_auth_file(&auth_path)
-                            .with_context(|| {
-                                format!(
-                                    "load app Codex auth after device sign-in from {}",
-                                    auth_path.display()
-                                )
-                            })
-                            .map_err(|error| format!("{error:#}"))
-                    } else {
-                        Err(format!("`codex login --device-auth` exited with {status}"))
-                    };
-                    let _ = event_tx.send(CodexLoginEvent::Finished(result));
-                    return;
-                }
-                Ok(None) => thread::sleep(Duration::from_millis(100)),
-                Err(error) => {
-                    let _ = event_tx.send(CodexLoginEvent::Finished(Err(format!(
-                        "wait for Codex login process: {error}"
-                    ))));
-                    return;
-                }
-            }
-        })
-        .context("spawn Codex device login watcher")?;
-    Ok(CodexLoginFlow {
-        account,
-        output: String::new(),
-        started_at: Instant::now(),
-        stop_tx,
-        rx,
-    })
-}
-
-#[cfg(not(test))]
-fn spawn_codex_output_reader<R>(mut reader: R, event_tx: mpsc::Sender<CodexLoginEvent>)
-where
-    R: Read + Send + 'static,
-{
-    thread::spawn(move || {
-        let mut buffer = [0_u8; 1024];
-        loop {
-            match reader.read(&mut buffer) {
-                Ok(0) => return,
-                Ok(read) => {
-                    let text = String::from_utf8_lossy(&buffer[..read]).to_string();
-                    let _ = event_tx.send(CodexLoginEvent::Output(text));
-                }
-                Err(_) => return,
-            }
-        }
-    });
-}
-
-#[cfg(test)]
-fn start_codex_login_flow(account: String, _state_dir: PathBuf) -> Result<CodexLoginFlow> {
-    let (stop_tx, _stop_rx) = mpsc::channel();
-    let (event_tx, rx) = mpsc::channel();
-    Ok(CodexLoginFlow {
-        account,
-        output: String::new(),
-        started_at: Instant::now(),
-        stop_tx,
-        rx,
         event_tx_guard: Some(event_tx),
     })
 }
@@ -5908,26 +5634,6 @@ fn unquote_env_value(value: &str) -> String {
     }
 }
 
-fn strip_ansi(input: &str) -> String {
-    let mut output = String::with_capacity(input.len());
-    let mut chars = input.chars().peekable();
-    while let Some(ch) = chars.next() {
-        if ch != '\x1b' {
-            output.push(ch);
-            continue;
-        }
-        if chars.peek() == Some(&'[') {
-            chars.next();
-            for next in chars.by_ref() {
-                if ('@'..='~').contains(&next) {
-                    break;
-                }
-            }
-        }
-    }
-    output
-}
-
 fn print_native_transcript(app: &mut App) -> Result<()> {
     let width = crossterm::terminal::size()
         .map(|(width, _)| width)
@@ -5981,7 +5687,6 @@ fn run_terminal(mut app: App) -> Result<()> {
             }
             draw_needed |= app.drain_store_notifications()?;
             draw_needed |= app.drain_oauth_notifications()?;
-            draw_needed |= app.drain_codex_login_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -7146,12 +6851,18 @@ mod redesign_tests {
             image_path.display().to_string()
         );
         assert_eq!(input.payload["items"][1]["type"], "text");
+        // `browser-use-agent`'s typed-input builder DEFERS local-image inlining
+        // (it has not ported the legacy `prompt_image` module), so a local_image
+        // item lowers to a `[local_image:...]` placeholder text part rather than
+        // a base64 `input_image` part. The structured `items` (asserted above)
+        // still carry the path for the engine to materialize later.
         let content = input.payload["content"].as_array().context("content")?;
+        assert!(content.iter().all(|part| part["type"] != "input_image"));
         assert!(content.iter().any(|part| {
-            part["type"] == "input_image"
-                && part["image_url"]
+            part["type"] == "input_text"
+                && part["text"]
                     .as_str()
-                    .is_some_and(|url| url.starts_with("data:image/png;base64,"))
+                    .is_some_and(|text| text.starts_with("[local_image:"))
         }));
         assert!(content
             .iter()
@@ -7192,46 +6903,6 @@ mod redesign_tests {
 
         assert!(!is_image_paste_shortcut('v', KeyModifiers::NONE));
         assert!(!is_image_paste_shortcut('x', KeyModifiers::SUPER));
-    }
-
-    fn write_tui_model_catalog(app_home: &std::path::Path) -> Result<()> {
-        std::fs::create_dir_all(app_home)?;
-        std::fs::write(
-            app_home.join("catalog.json"),
-            r#"{
-  "models": [
-    {
-      "slug": "hidden-catalog-model",
-      "display_name": "Hidden Catalog Model",
-      "description": "not picker-visible",
-      "visibility": "none",
-      "supported_in_api": true,
-      "priority": 0
-    },
-    {
-      "slug": "chatgpt-only-catalog",
-      "display_name": "ChatGPT Only Catalog",
-      "description": "ChatGPT-only catalog model",
-      "visibility": "list",
-      "supported_in_api": false,
-      "priority": 1
-    },
-    {
-      "slug": "catalog-gpt",
-      "display_name": "Catalog GPT",
-      "description": "Catalog API model",
-      "visibility": "list",
-      "supported_in_api": true,
-      "priority": 2
-    }
-  ]
-}"#,
-        )?;
-        std::fs::write(
-            app_home.join("config.toml"),
-            "model_catalog_json = \"catalog.json\"\n",
-        )?;
-        Ok(())
     }
 
     #[test]
@@ -8129,16 +7800,16 @@ mod redesign_tests {
         assert!(screen.contains("Choose a provider below."));
         assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("CHOOSE PROVIDER"));
-        assert!(screen.contains("Codex login"));
+        // Codex login is removed; OpenAI is the default first provider.
+        assert!(!screen.contains("Codex login"));
+        assert!(screen.contains("OpenAI API key"));
         assert!(!screen.contains("Claude Code subscription"));
         assert!(screen.contains("OpenRouter API key"));
         assert!(screen.contains("click me!"));
         assert!(!screen.contains("click logo"));
         assert!(!screen.contains("CHOOSE MODEL"));
         assert!(!screen.contains("CHOOSE ACCOUNT"));
-        assert!(!screen.contains("with ChatGPT plan"));
         assert!(!screen.contains("with subscription"));
-        assert!(!screen.contains("Qwen, Kimi, DeepSeek"));
         assert!(!screen.contains("step 1/3"));
         assert!(!screen.contains("[needs]"));
 
@@ -8147,10 +7818,6 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("PROVIDERS"));
         assert!(!screen.contains("Tell the browser what to do"));
-        app.store
-            .set_setting("auth.codex.access_token", "codex-test-token")?;
-        app.store
-            .set_setting("auth.codex.account_id", "codex-test-account")?;
 
         // Up/Down navigate the provider rows and wrap around the edges.
         assert_eq!(app.selected_row, 0);
@@ -8167,30 +7834,23 @@ mod redesign_tests {
         }
         assert_eq!(app.selected_row, 0);
 
-        // Default row 0 = Codex login / GPT-5.5. Enter first opens a
-        // confirmation surface instead of completing setup immediately.
+        // Default row 0 = OpenAI API key. Enter first opens a confirmation
+        // surface instead of completing setup immediately.
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Use Codex login?"));
+        assert!(screen.contains("Use OpenAI API key?"));
         assert!(!app.setup_complete);
 
+        // OpenAI is an API-key provider, so confirming routes to the API-key
+        // entry modal rather than an instant "Connected" success.
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::SetupResult);
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Connected with Codex auth."));
+        assert_eq!(app.surface, Surface::ApiKey);
+        assert_eq!(
+            app.api_key_account.as_deref(),
+            Some(settings::ACCOUNT_OPENAI)
+        );
         assert!(!app.setup_complete);
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::Main);
-        assert!(app.setup_complete);
-        assert_eq!(app.account, "Codex login");
-        assert_eq!(app.model, "GPT-5.5");
-        assert_eq!(app.browser, BROWSER_LOCAL_CHROME);
-        assert!(app.status_notice.is_none());
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Tell the browser what to do"));
-        assert!(!screen.contains("Model set to"));
         Ok(())
     }
 
@@ -8219,7 +7879,7 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("PROVIDERS"));
-        assert!(screen.contains("Codex login"));
+        assert!(screen.contains("OpenAI API key"));
         assert!(!screen.contains("Tell the browser what to do"));
         Ok(())
     }
@@ -8354,7 +8014,9 @@ mod redesign_tests {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
         app.open_surface(Surface::Account);
-        app.selected_row = 3;
+        // ACCOUNT_CHOICES is now [OpenAI, Anthropic, OpenRouter, DeepSeek]
+        // (Codex login removed), so OpenRouter is row 2.
+        app.selected_row = 2;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::ApiKey);
         for ch in "sk-or-v1-test".chars() {
@@ -8961,131 +8623,52 @@ mod redesign_tests {
     }
 
     #[test]
-    fn model_selector_uses_active_catalog_presets() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let app_home = temp.path().join("browser-use-terminal-home");
-        write_tui_model_catalog(&app_home)?;
-
-        with_browser_use_terminal_home(&app_home, || -> Result<()> {
-            let mut app = ready_app(&temp)?;
-            app.store.set_setting("auth.codex.access_token", "token")?;
-            app.store.set_setting("auth.codex.account_id", "account")?;
-            app.open_surface(Surface::Model);
-
-            let screen = render_dump(&mut app)?;
-            assert!(screen.contains("ChatGPT Only Catalog"));
-            assert!(screen.contains("Catalog GPT"));
-            assert!(!screen.contains("Hidden Catalog Model"));
-            assert!(!app.model_choices.iter().any(|choice| {
-                choice.account == ACCOUNT_OPENAI && choice.provider_model == "chatgpt-only-catalog"
-            }));
-
-            app.save_model(0)?;
-            assert_eq!(app.provider_model, "chatgpt-only-catalog");
-            assert_eq!(app.model, "ChatGPT Only Catalog");
-            assert_eq!(app.account, ACCOUNT_CODEX);
-            Ok(())
-        })?;
-        Ok(())
-    }
-
-    #[test]
     fn startup_uses_configured_model_and_provider_without_masking_provider() -> Result<()> {
+        // `browser-use-agent`'s config_model resolves the configured model and
+        // provider id from `--config model=` / `model_provider_id=` overrides
+        // (and cwd AGENTS.md `model` blocks). It does not read the legacy
+        // `$BROWSER_USE_TERMINAL_HOME/config.toml` top-level `model`/
+        // `model_provider` keys, so this drives the supported override channel.
         let temp = tempfile::tempdir()?;
-        let app_home = temp.path().join("browser-use-terminal-home");
-        std::fs::create_dir_all(&app_home)?;
-        std::fs::write(
-            app_home.join("config.toml"),
-            r#"
-model = "configured-corp-model"
-model_provider = "corp"
+        let app_args = Args {
+            agent: AgentBackend::Anthropic,
+            config_overrides: vec![
+                "model=\"configured-corp-model\"".to_string(),
+                "model_provider_id=\"corp\"".to_string(),
+            ],
+            ..args(&temp)
+        };
+        let app = App::new(app_args)?;
+        let selection = app.current_model_selection();
 
-[model_providers.corp]
-name = "Corp"
-base_url = "https://corp.example/v1"
-env_key = "CORP_API_KEY"
-wire_api = "responses"
-"#,
-        )?;
-
-        with_browser_use_terminal_home(&app_home, || -> Result<()> {
-            let app_args = Args {
-                agent: AgentBackend::Codex,
-                ..args(&temp)
-            };
-            let app = App::new(app_args)?;
-            let selection = app.current_model_selection();
-
-            assert_eq!(app.model, "configured-corp-model");
-            assert_eq!(selection.provider_model, "configured-corp-model");
-            assert_eq!(selection.backend, AgentBackend::Codex);
-            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
-            Ok(())
-        })?;
+        assert_eq!(app.model, "configured-corp-model");
+        assert_eq!(selection.provider_model, "configured-corp-model");
+        assert_eq!(selection.backend, AgentBackend::Anthropic);
+        assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
         Ok(())
     }
 
     #[test]
-    fn startup_and_workspace_context_use_profile_and_config_overrides() -> Result<()> {
+    fn startup_uses_config_overrides_for_model_and_provider() -> Result<()> {
+        // Workspace-context seeding (AGENTS.md / permissions) moved into the
+        // engine's `run_session_with_config`. `browser-use-agent`'s config_model
+        // also does not read config profiles / config.toml, so this covers the
+        // supported `--config` override channel for model + provider resolution.
         let temp = tempfile::tempdir()?;
-        let app_home = temp.path().join("browser-use-terminal-home");
-        std::fs::create_dir_all(&app_home)?;
-        std::fs::write(
-            app_home.join("config.toml"),
-            r#"
-[model_providers.corp]
-name = "Corp"
-base_url = "https://corp.example/v1"
-env_key = "CORP_API_KEY"
-wire_api = "responses"
-"#,
-        )?;
-        std::fs::write(
-            app_home.join("work.config.toml"),
-            r#"
-model = "profile-model"
-model_provider = "corp"
-"#,
-        )?;
+        let app_args = Args {
+            agent: AgentBackend::Anthropic,
+            config_overrides: vec![
+                "model=\"override-model\"".to_string(),
+                "model_provider_id=\"corp\"".to_string(),
+                "developer_instructions=\"TUI session policy\"".to_string(),
+            ],
+            ..args(&temp)
+        };
+        let app = App::new(app_args)?;
+        let selection = app.current_model_selection();
 
-        with_browser_use_terminal_home(&app_home, || -> Result<()> {
-            let app_args = Args {
-                agent: AgentBackend::Codex,
-                config_profile: Some("work".to_string()),
-                config_overrides: vec![
-                    "model=\"override-model\"".to_string(),
-                    "developer_instructions=\"TUI session policy\"".to_string(),
-                ],
-                ..args(&temp)
-            };
-            let app = App::new(app_args)?;
-            let selection = app.current_model_selection();
-
-            assert_eq!(selection.provider_model, "override-model");
-            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
-
-            let session = app.store.create_session(None, temp.path())?;
-            let options = app.configured_agent_options()?;
-            browser_use_core::append_workspace_context_event_with_options(
-                &app.store, &session, &options,
-            )?;
-            let events = app.store.events_for_session(&session.id)?;
-            let permissions = events
-                .iter()
-                .find(|event| {
-                    event.event_type == "workspace.context"
-                        && event
-                            .payload
-                            .get("kind")
-                            .and_then(serde_json::Value::as_str)
-                            == Some("permissions")
-                })
-                .and_then(|event| event.payload.get("content"))
-                .and_then(serde_json::Value::as_str)
-                .context("permissions workspace context")?;
-            assert!(permissions.contains("TUI session policy"));
-            Ok(())
-        })?;
+        assert_eq!(selection.provider_model, "override-model");
+        assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
         Ok(())
     }
 
@@ -9095,39 +8678,27 @@ model_provider = "corp"
         let store = Store::open(temp.path())?;
         store.set_setting("model", "Stored Model")?;
         store.set_setting("provider.model", "stored-model")?;
-        store.set_setting("provider.id", "codex")?;
+        store.set_setting("provider.id", "openai")?;
         drop(store);
 
-        let app_home = temp.path().join("browser-use-terminal-home");
-        std::fs::create_dir_all(&app_home)?;
-        std::fs::write(
-            app_home.join("config.toml"),
-            r#"
-[model_providers.corp]
-name = "Corp"
-base_url = "https://corp.example/v1"
-env_key = "CORP_API_KEY"
-wire_api = "responses"
-"#,
-        )?;
+        // `--config model=` / `model_provider_id=` overrides win over the stored
+        // selection. (browser-use-agent's config_model reads these override keys;
+        // it does not read config.toml `[model_providers.*]` or the
+        // `model_provider` spelling.)
+        let app_args = Args {
+            agent: AgentBackend::Anthropic,
+            config_overrides: vec![
+                "model=\"override-model\"".to_string(),
+                "model_provider_id=\"corp\"".to_string(),
+            ],
+            ..args(&temp)
+        };
+        let app = App::new(app_args)?;
+        let selection = app.current_model_selection();
 
-        with_browser_use_terminal_home(&app_home, || -> Result<()> {
-            let app_args = Args {
-                agent: AgentBackend::Codex,
-                config_overrides: vec![
-                    "model=\"override-model\"".to_string(),
-                    "model_provider=\"corp\"".to_string(),
-                ],
-                ..args(&temp)
-            };
-            let app = App::new(app_args)?;
-            let selection = app.current_model_selection();
-
-            assert_eq!(selection.display_model, "override-model");
-            assert_eq!(selection.provider_model, "override-model");
-            assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
-            Ok(())
-        })?;
+        assert_eq!(selection.display_model, "override-model");
+        assert_eq!(selection.provider_model, "override-model");
+        assert_eq!(selection.model_provider_id.as_deref(), Some("corp"));
         Ok(())
     }
 
@@ -9135,7 +8706,7 @@ wire_api = "responses"
     fn model_selection_is_session_scoped_for_followups() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = temp.path().join("browser-use-terminal-home");
-        write_tui_model_catalog(&app_home)?;
+        std::fs::create_dir_all(&app_home)?;
 
         with_browser_use_terminal_home(&app_home, || -> Result<()> {
             let mut app = ready_app(&temp)?;
@@ -9153,22 +8724,25 @@ wire_api = "responses"
             )?;
             app.selected_session_id = Some(session.id.clone());
 
-            let openai_catalog_index = app
+            // Pick the first OpenAI (bring-your-own-key) row from the bundled
+            // catalog; the cwd-config catalog no longer feeds the picker.
+            let openai_index = app
                 .model_choices
                 .iter()
-                .position(|choice| {
-                    choice.account == ACCOUNT_OPENAI && choice.provider_model == "catalog-gpt"
-                })
+                .position(|choice| choice.account == ACCOUNT_OPENAI)
                 .context("OpenAI catalog model row")?;
-            app.save_model(openai_catalog_index)?;
+            let expected = app.model_choices[openai_index].clone();
+            app.save_model(openai_index)?;
 
-            app.model = "GPT-5.5".to_string();
-            app.provider_model = "gpt-5.5".to_string();
-            app.account = ACCOUNT_CODEX.to_string();
-            app.agent_backend = AgentBackend::Codex;
+            // Mutate the live (non-session) selection; the followup must still
+            // resolve to the session-scoped selection recorded at save_model.
+            app.model = "Other Model".to_string();
+            app.provider_model = "other-model".to_string();
+            app.account = ACCOUNT_ANTHROPIC.to_string();
+            app.agent_backend = AgentBackend::Anthropic;
 
             let selection = app.session_model_selection_or_current(&session.id)?;
-            assert_eq!(selection.provider_model, "catalog-gpt");
+            assert_eq!(selection.provider_model, expected.provider_model);
             assert_eq!(selection.account, ACCOUNT_OPENAI);
             assert_eq!(selection.backend, AgentBackend::Openai);
             assert_eq!(selection.model_provider_id.as_deref(), Some("openai"));
@@ -9224,7 +8798,9 @@ wire_api = "responses"
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         app.open_surface(Surface::Setup);
-        app.selected_row = 1;
+        // ACCOUNT_CHOICES is now [OpenAI, Anthropic, OpenRouter, DeepSeek]
+        // (Codex login removed), so OpenAI is row 0 and OpenRouter is row 2.
+        app.selected_row = 0;
 
         let screen = render_dump(&mut app)?;
         assert!(!screen.contains("Claude Code subscription"));
@@ -9246,7 +8822,7 @@ wire_api = "responses"
         );
 
         app.open_surface(Surface::Setup);
-        app.selected_row = 3;
+        app.selected_row = 2;
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
         assert_eq!(
@@ -9311,61 +8887,6 @@ wire_api = "responses"
     }
 
     #[test]
-    fn codex_device_login_output_stores_auth_and_uses_default_model() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let mut app = App::new(args(&temp))?;
-
-        app.start_codex_device_login(settings::ACCOUNT_CODEX.to_string())?;
-        assert_eq!(app.surface, Surface::SetupResult);
-        assert_eq!(
-            app.setup_result.as_ref().map(|result| &result.kind),
-            Some(&SetupResultKind::Pending)
-        );
-        let tx = app
-            .codex_login
-            .as_ref()
-            .and_then(|flow| flow.event_tx_guard.as_ref())
-            .expect("test Codex login sender")
-            .clone();
-        tx.send(CodexLoginEvent::Output(
-            "\u{1b}[94mhttps://auth.openai.com/codex/device\u{1b}[0m\n\u{1b}[94mABCD-EFGH\u{1b}[0m\n"
-                .to_string(),
-        ))
-        .expect("send test Codex output");
-
-        assert!(app.drain_codex_login_notifications()?);
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("https://auth.openai.com/codex/device"));
-        assert!(screen.contains("ABCD-EFGH"));
-        assert!(!screen.contains("\u{1b}[94m"));
-
-        tx.send(CodexLoginEvent::Finished(Ok(CodexAuth {
-            access_token: "codex-access".to_string(),
-            account_id: "codex-account".to_string(),
-        })))
-        .expect("send test Codex auth result");
-        assert!(app.drain_codex_login_notifications()?);
-        assert_eq!(
-            app.store.get_setting("auth.codex.access_token")?,
-            Some("codex-access".to_string())
-        );
-        assert_eq!(
-            app.store.get_setting("auth.codex.account_id")?,
-            Some("codex-account".to_string())
-        );
-        let screen = render_dump(&mut app)?;
-        assert!(screen.contains("Connected with Codex auth."));
-        assert!(screen.contains("A default model will be selected automatically."));
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-        assert_eq!(app.surface, Surface::Main);
-        assert!(app.setup_complete);
-        assert_eq!(app.account, settings::ACCOUNT_CODEX);
-        assert_eq!(app.model, "GPT-5.5");
-        Ok(())
-    }
-
-    #[test]
     fn model_selector_hides_claude_code_and_routes_anthropic_to_api_key() -> Result<()> {
         let saved_anthropic = std::env::var("ANTHROPIC_API_KEY").ok();
         let saved_llm_browser = std::env::var("LLM_BROWSER_ANTHROPIC_API_KEY").ok();
@@ -9419,7 +8940,8 @@ wire_api = "responses"
     fn setup_api_key_flow_keeps_key_entry_in_modal_then_confirms_saved() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = App::new(args(&temp))?;
-        app.selected_row = 1;
+        // OpenAI is row 0 now that Codex login is removed.
+        app.selected_row = 0;
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
         assert_eq!(app.surface, Surface::SetupConfirm);
@@ -9735,16 +9257,16 @@ wire_api = "responses"
     fn prompt_history_recalls_persistent_and_local_entries() -> Result<()> {
         let codex_home = tempfile::tempdir()?;
         with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
-            let config = browser_use_core::MessageHistoryConfig {
+            let config = browser_use_agent::history::MessageHistoryConfig {
                 app_home: codex_home.path().to_path_buf(),
-                settings: browser_use_core::MessageHistorySettings::default(),
+                settings: browser_use_agent::history::MessageHistorySettings::default(),
             };
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "older persisted prompt",
                 "session-a",
                 &config,
             )?;
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "newer persisted prompt",
                 "session-b",
                 &config,
@@ -9767,7 +9289,7 @@ wire_api = "responses"
 
             app.set_input(String::new());
             app.prompt_history.record_submission("local newest prompt");
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "local newest prompt",
                 "session-c",
                 &config,
@@ -9801,16 +9323,16 @@ wire_api = "responses"
     fn prompt_history_snapshots_before_local_submission_and_skips_bad_offsets() -> Result<()> {
         let codex_home = tempfile::tempdir()?;
         with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
-            let config = browser_use_core::MessageHistoryConfig {
+            let config = browser_use_agent::history::MessageHistoryConfig {
                 app_home: codex_home.path().to_path_buf(),
-                settings: browser_use_core::MessageHistorySettings::default(),
+                settings: browser_use_agent::history::MessageHistorySettings::default(),
             };
             let temp = tempfile::tempdir()?;
             let mut app = ready_app(&temp)?;
             let options = app.configured_agent_options()?;
             app.refresh_prompt_history_for(temp.path(), &options)?;
             app.prompt_history.record_submission("same-turn prompt");
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "same-turn prompt",
                 "session-a",
                 &config,
@@ -9823,7 +9345,7 @@ wire_api = "responses"
 
             let history_path = codex_home.path().join("history.jsonl");
             std::fs::remove_file(&history_path)?;
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "valid persisted prompt",
                 "session-b",
                 &config,
@@ -9846,17 +9368,21 @@ wire_api = "responses"
     fn prompt_history_ctrl_r_search_accepts_and_restores_drafts() -> Result<()> {
         let codex_home = tempfile::tempdir()?;
         with_browser_use_terminal_home(codex_home.path(), || -> Result<()> {
-            let config = browser_use_core::MessageHistoryConfig {
+            let config = browser_use_agent::history::MessageHistoryConfig {
                 app_home: codex_home.path().to_path_buf(),
-                settings: browser_use_core::MessageHistorySettings::default(),
+                settings: browser_use_agent::history::MessageHistorySettings::default(),
             };
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
                 "find old invoice",
                 "session-a",
                 &config,
             )?;
-            browser_use_core::append_message_history_entry("book hotel", "session-b", &config)?;
-            browser_use_core::append_message_history_entry(
+            browser_use_agent::history::append_message_history_entry(
+                "book hotel",
+                "session-b",
+                &config,
+            )?;
+            browser_use_agent::history::append_message_history_entry(
                 "find newer receipt",
                 "session-c",
                 &config,
@@ -12289,10 +11815,11 @@ wire_api = "responses"
                 && event.payload["action"] == "edit"
                 && event.payload["num_turns"] == 1
         }));
-        let visible = browser_use_core::rollback_filtered_event_records(&events)
-            .into_iter()
-            .filter_map(event_payload_text)
-            .collect::<Vec<_>>();
+        let visible =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
+                .into_iter()
+                .filter_map(event_payload_text)
+                .collect::<Vec<_>>();
         assert_eq!(visible, vec!["initial task"]);
 
         let running = app.store.create_session(None, std::env::current_dir()?)?;
@@ -12361,16 +11888,17 @@ wire_api = "responses"
                 && event.payload["target_seq"] == submitted.seq
                 && event.payload["num_turns"] == 1
         }));
-        let visible_submissions = browser_use_core::rollback_filtered_event_records(&events)
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "session.input" | "session.followup"
-                )
-            })
-            .filter_map(event_payload_text)
-            .collect::<Vec<_>>();
+        let visible_submissions =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "session.input" | "session.followup"
+                    )
+                })
+                .filter_map(event_payload_text)
+                .collect::<Vec<_>>();
         assert!(visible_submissions.is_empty());
         Ok(())
     }
@@ -12412,16 +11940,17 @@ wire_api = "responses"
         );
         assert!(!app.escape_stop_is_pending());
         let events = app.store.events_for_session(&session.id)?;
-        let visible_submissions = browser_use_core::rollback_filtered_event_records(&events)
-            .into_iter()
-            .filter(|event| {
-                matches!(
-                    event.event_type.as_str(),
-                    "session.input" | "session.followup"
-                )
-            })
-            .filter_map(event_payload_text)
-            .collect::<Vec<_>>();
+        let visible_submissions =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(&events)
+                .into_iter()
+                .filter(|event| {
+                    matches!(
+                        event.event_type.as_str(),
+                        "session.input" | "session.followup"
+                    )
+                })
+                .filter_map(event_payload_text)
+                .collect::<Vec<_>>();
         assert_eq!(visible_submissions, vec!["initial task"]);
         Ok(())
     }

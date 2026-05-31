@@ -11,7 +11,7 @@ path = "src/main.rs"
 [dependencies]
 anyhow.workspace = true
 arboard.workspace = true
-browser-use-core = { path = "../browser-use-core" }
+browser-use-agent = { path = "../browser-use-agent" }
 browser-use-providers = { path = "../browser-use-providers" }
 browser-use-protocol = { path = "../browser-use-protocol" }
 browser-use-store = { path = "../browser-use-store" }
@@ -26,5 +26,6 @@ serde_json.workspace = true
 signal-hook = "0.3.18"
 syntect.workspace = true
 tempfile.workspace = true
+tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-util", "sync", "time", "net"] }
 two-face.workspace = true
 unicode-width.workspace = true
