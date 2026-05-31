@@ -22,10 +22,12 @@ bm25.workspace = true
 rand.workspace = true
 regex.workspace = true
 reqwest = { workspace = true, features = ["stream"] }
+rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 sha2.workspace = true
 thiserror.workspace = true
+toml.workspace = true
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "process", "io-util", "sync", "time", "net"] }
 tokio-util.workspace = true
 futures-util.workspace = true
@@ -33,3 +35,10 @@ futures-util.workspace = true
 [dev-dependencies]
 tokio = { workspace = true, features = ["rt-multi-thread", "macros", "sync", "time"] }
 tempfile.workspace = true
+
+[features]
+# Opt-in flag gating the live multi-provider smoke test so it is never compiled
+# into the default `cargo test` binary. The live call needs a real provider key
+# in the environment (OPENAI_API_KEY / ANTHROPIC_API_KEY / LLM_BROWSER_*). Run:
+#   cargo test -p browser-use-agent --features live -- --ignored live_model_smoke
+live = []

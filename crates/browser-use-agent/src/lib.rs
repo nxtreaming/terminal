@@ -23,14 +23,20 @@
 
 pub mod compact;
 pub mod config;
+pub mod config_model;
+pub mod config_overrides;
 pub mod context;
+
 pub mod decision;
+pub mod entrypoint;
 pub mod error;
 pub mod events;
 pub mod execpolicy;
 pub mod goals;
 pub mod guardian;
+pub mod history;
 pub mod hooks;
+pub mod infra;
 pub mod mcp;
 pub mod network;
 pub mod prompts;
@@ -46,6 +52,28 @@ pub mod turn;
 
 pub use config::AgentConfig;
 pub use error::AgentError;
+
+// Config-layer model resolution (Phase-E gap-fill): AGENTS.md / config-profile
+// model + provider-id + catalog resolution for a cwd, ported from
+// browser-use-core. Used by the tui/cli repoint.
+pub use config_model::bundled_model_catalog;
+pub use config_model::configured_model_for_cwd;
+pub use config_model::configured_model_for_cwd_with_options;
+pub use config_model::configured_model_provider_id_for_cwd;
+pub use config_model::configured_model_provider_id_for_cwd_with_options;
+pub use config_model::default_model_for_cwd;
+pub use config_model::default_model_for_cwd_with_options;
+pub use config_model::model_catalog_for_cwd;
+pub use config_model::model_catalog_for_cwd_with_options;
+pub use config_model::FakeAgentOptions;
+pub use config_model::ModelCatalog;
+pub use config_model::ModelCatalogEntry;
+
+// The run-entrypoint facade (Wave-3 cutover): the binary-facing call tui/cli use
+// to run a session on the new async engine. It assembles
+// config -> provider/driver -> context seed -> turn loop -> store persistence and
+// is the first production caller of `turn::model_path::build_sampling_driver`.
+pub use entrypoint::run_session_with_config;
 
 #[cfg(test)]
 mod tests {

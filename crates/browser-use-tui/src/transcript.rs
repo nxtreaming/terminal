@@ -1,4 +1,4 @@
-use browser_use_core::CollaborationModeKind;
+use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_protocol::{
     normalize_result_text, turn_streaming_text_from_events, EventRecord, SessionMeta,
     WorkbenchState,
@@ -418,10 +418,11 @@ pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<Tran
     let session = state.current_session.as_ref()?;
     let raw_events = app.cached_events_for_session(&session.id);
     let last_event_seq = raw_events.last().map(|event| event.seq).unwrap_or_default();
-    let events = browser_use_core::rollback_filtered_event_records(raw_events)
-        .into_iter()
-        .cloned()
-        .collect::<Vec<_>>();
+    let events =
+        browser_use_agent::context::workspace_context::rollback_filtered_event_records(raw_events)
+            .into_iter()
+            .cloned()
+            .collect::<Vec<_>>();
     let events = events.as_slice();
     let mut committed = Vec::new();
     let mut terminal_committed = Vec::new();

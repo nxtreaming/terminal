@@ -657,7 +657,17 @@ impl ModelClient {
         headers: &[(String, String)],
         body: &Value,
     ) -> Result<reqwest::Response, (LlmError, Option<u64>)> {
-        let mut builder = self.http.post(url).json(body);
+        // Serialize the body ourselves and attach it via `.body(..)` rather than
+        // `.json(..)`: reqwest's `.json()` *also* sets a `Content-Type:
+        // application/json` header, and the `headers` list already carries an
+        // explicit `content-type` (from `prepare`). reqwest's `.header()` APPENDS,
+        // so using `.json()` here produced a duplicated
+        // `Content-Type: application/json, application/json`, which strict APIs
+        // (OpenAI) reject with HTTP 400. Setting the body bytes directly keeps the
+        // single `content-type` from the header list as the only one on the wire.
+        let body_bytes = serde_json::to_vec(body)
+            .map_err(|e| (LlmError::transport(scrub(&e.to_string())), None))?;
+        let mut builder = self.http.post(url).body(body_bytes);
         for (k, v) in headers {
             builder = builder.header(k.as_str(), v.as_str());
         }

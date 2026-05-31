@@ -2,6 +2,7 @@
 
 pub mod dispatch;
 pub mod loop_driver;
+pub mod model_path;
 pub mod sampling;
 
 #[cfg(test)]
@@ -60,4 +61,8 @@ pub use dispatch::{
     CallRunner, OrchestratorRunner, RegistryRunner, ToolDispatchResult, ToolDispatcher,
 };
 pub use loop_driver::TurnLoop;
+pub use model_path::{
+    build_route, build_sampling_driver, build_transport, provider_choice_from_env, ModelPathError,
+    ProviderChoice,
+};
 pub use sampling::FusionRecorder;

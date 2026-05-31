@@ -1,5 +1,5 @@
 use anyhow::Result;
-use browser_use_core::CollaborationModeKind;
+use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_protocol::{
     instruction_sources_from_events, startup_warnings_from_events, HistoryRow, TelemetrySummary,
     WorkbenchState,
@@ -15,8 +15,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
-    ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
+    is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_DEEPSEEK,
+    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
 };
 use crate::theme::*;
 use crate::transcript;
@@ -468,8 +468,7 @@ fn render_bottom_pane(
         if data_h > 0 && app.selected_row >= data_h {
             let skip = app.selected_row + 1 - data_h;
             let head: Vec<Line<'static>> = lines.iter().take(header_reserved).cloned().collect();
-            let tail: Vec<Line<'static>> =
-                lines.into_iter().skip(header_reserved + skip).collect();
+            let tail: Vec<Line<'static>> = lines.into_iter().skip(header_reserved + skip).collect();
             lines = head;
             lines.extend(tail);
         }
@@ -685,8 +684,7 @@ fn render_surface_popup_box(
         if data_h > 0 && app.selected_row >= data_h {
             let skip = app.selected_row + 1 - data_h;
             let head: Vec<Line<'static>> = lines.iter().take(header_reserved).cloned().collect();
-            let tail: Vec<Line<'static>> =
-                lines.into_iter().skip(header_reserved + skip).collect();
+            let tail: Vec<Line<'static>> = lines.into_iter().skip(header_reserved + skip).collect();
             lines = head;
             lines.extend(tail);
         }
@@ -1820,18 +1818,12 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
     let account = app
         .setup_pending_account
         .as_deref()
-        .unwrap_or(ACCOUNT_CODEX);
+        .unwrap_or(ACCOUNT_OPENAI);
     let mut lines = vec![
         Line::from(Span::styled(format!("Use {account}?"), bold())),
         Line::from(""),
     ];
-    if account == ACCOUNT_CODEX {
-        lines.extend([
-            Line::from("  Imports your local Codex auth."),
-            Line::from("  Uses GPT-5.5 with your ChatGPT plan."),
-            Line::from("  No API key is required."),
-        ]);
-    } else if is_claude_code_account(account) {
+    if is_claude_code_account(account) {
         if app.account_ready(account).unwrap_or(false) {
             lines.push(Line::from("  Claude Code login found."));
         } else {
@@ -1850,8 +1842,6 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
     let primary_label =
         if is_claude_code_account(account) && !app.account_ready(account).unwrap_or(false) {
             "Open sign-in"
-        } else if account == ACCOUNT_CODEX {
-            "Use Codex auth"
         } else {
             "Continue"
         };
@@ -1899,61 +1889,28 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             selected("Continue", 0, app.selected_row),
         ]);
     } else if is_pending {
-        if result.account == ACCOUNT_CODEX {
-            if let Some(seconds) = app.codex_login_elapsed_seconds() {
-                lines.push(Line::from(Span::styled(
-                    format!("  Waiting for device sign-in ({seconds}s)."),
-                    muted(),
-                )));
-            }
-            let output_lines = app.codex_login_output_lines();
-            if output_lines.is_empty() {
-                lines.push(Line::from("  Starting Codex device sign-in..."));
-            } else {
-                lines.push(Line::from(""));
-                for line in output_lines
-                    .into_iter()
-                    .rev()
-                    .take(8)
-                    .collect::<Vec<_>>()
-                    .into_iter()
-                    .rev()
-                {
-                    push_wrapped_prefixed_text(&mut lines, "  ", &line, width);
-                }
-            }
+        if let Some(seconds) = app.claude_code_oauth_elapsed_seconds() {
+            lines.push(Line::from(Span::styled(
+                format!("  Waiting for callback ({seconds}s)."),
+                muted(),
+            )));
+        }
+        if let Some(error) = app.claude_code_oauth_open_error() {
+            lines.push(Line::from(Span::styled(
+                format!("  Could not open browser automatically: {error}"),
+                failed(),
+            )));
         } else {
-            if let Some(seconds) = app.claude_code_oauth_elapsed_seconds() {
-                lines.push(Line::from(Span::styled(
-                    format!("  Waiting for callback ({seconds}s)."),
-                    muted(),
-                )));
-            }
-            if let Some(error) = app.claude_code_oauth_open_error() {
-                lines.push(Line::from(Span::styled(
-                    format!("  Could not open browser automatically: {error}"),
-                    failed(),
-                )));
-            } else {
-                lines.push(Line::from("  Browser sign-in opened."));
-            }
-            if let Some(url) = app.claude_code_oauth_url() {
-                lines.push(Line::from(""));
-                lines.push(Line::from("  OAuth link:"));
-                push_wrapped_prefixed_text(&mut lines, "    ", url, width);
-            }
+            lines.push(Line::from("  Browser sign-in opened."));
+        }
+        if let Some(url) = app.claude_code_oauth_url() {
+            lines.push(Line::from(""));
+            lines.push(Line::from("  OAuth link:"));
+            push_wrapped_prefixed_text(&mut lines, "    ", url, width);
         }
         lines.extend([
             Line::from(""),
-            selected(
-                if result.account == ACCOUNT_CODEX {
-                    "Open sign-in page"
-                } else {
-                    "Open browser again"
-                },
-                0,
-                app.selected_row,
-            ),
+            selected("Open browser again", 0, app.selected_row),
             selected("Back", 1, app.selected_row),
         ]);
     } else {
@@ -2270,9 +2227,7 @@ fn mode_row(
 }
 
 fn access_label(account: &'static str) -> &'static str {
-    if account == ACCOUNT_CODEX {
-        "Codex login"
-    } else if is_claude_code_account(account) {
+    if is_claude_code_account(account) {
         "Claude Code sub"
     } else {
         account
