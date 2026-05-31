@@ -771,6 +771,117 @@ pub mod definitions {
             }),
         }
     }
+
+    /// `spawn_agent`: delegate a task to a child sub-agent. Parity: codex
+    /// `create_spawn_agent_tool_v2` (`multi_agents_spec.rs:75-109`) — required
+    /// `["task_name", "message"]`; matches
+    /// [`SpawnAgentArgs`](crate::subagents::SpawnAgentArgs) (the request type the
+    /// handler deserializes), which is `deny_unknown_fields`.
+    pub fn spawn_agent() -> ToolDefinition {
+        ToolDefinition {
+            name: "spawn_agent".to_string(),
+            description: "Spawn a sub-agent to work on a delegated task.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "message": {
+                        "type": "string",
+                        "description": "The task/message for the new agent."
+                    },
+                    "task_name": {
+                        "type": "string",
+                        "description": "Short canonical name for the task (lowercase letters, digits, underscores)."
+                    },
+                    "agent_type": {
+                        "type": "string",
+                        "description": "Optional role for the new agent. If omitted, `default` is used."
+                    },
+                    "fork_turns": {
+                        "type": "string",
+                        "description": "`none`, `all`, or a positive integer. Defaults to `all`."
+                    },
+                    "model": {
+                        "type": "string",
+                        "description": "Optional model override for the new agent."
+                    },
+                    "reasoning_effort": {
+                        "type": "string",
+                        "description": "Optional reasoning-effort override for the new agent."
+                    },
+                    "service_tier": {
+                        "type": "string",
+                        "description": "Optional service-tier override for the new agent."
+                    }
+                },
+                "required": ["task_name", "message"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `wait_agent`: EVENT-NOTIFY wait for a child to report news. Parity: codex
+    /// `multi_agents_v2/wait.rs` (the parent blocks on the mailbox, then reads the
+    /// child's status).
+    pub fn wait_agent() -> ToolDefinition {
+        ToolDefinition {
+            name: "wait_agent".to_string(),
+            description: "Wait for a spawned sub-agent to report progress or completion."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_path": {
+                        "type": "string",
+                        "description": "Canonical path of the child agent to wait on (from spawn_agent)."
+                    },
+                    "timeout_secs": {
+                        "type": "integer",
+                        "description": "Optional wait budget in seconds (default 300)."
+                    }
+                },
+                "required": ["agent_path"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `send_input`: deliver a message to a running child agent (codex
+    /// `enqueue_mailbox_communication`).
+    pub fn send_input() -> ToolDefinition {
+        ToolDefinition {
+            name: "send_input".to_string(),
+            description: "Send a message to a running sub-agent.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "agent_path": {
+                        "type": "string",
+                        "description": "Canonical path of the child agent to deliver input to."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "The message/prompt body delivered to the child agent."
+                    }
+                },
+                "required": ["agent_path", "message"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `list_agents`: a read-only snapshot of the live sub-agent registry (codex
+    /// `live_agents`).
+    pub fn list_agents() -> ToolDefinition {
+        ToolDefinition {
+            name: "list_agents".to_string(),
+            description: "List the currently live sub-agents and their statuses.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }
+    }
 }
 
 /// Build a [`ToolRegistry`] preloaded with all eleven handlers, each carrying its
