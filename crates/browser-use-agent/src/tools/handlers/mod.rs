@@ -9,6 +9,7 @@
 pub mod apply_patch;
 pub mod browser;
 pub mod done;
+pub mod goal;
 pub mod mcp;
 pub mod python;
 pub mod request_user_input;

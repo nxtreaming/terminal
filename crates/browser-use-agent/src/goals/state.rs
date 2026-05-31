@@ -155,7 +155,12 @@ pub fn reduce(mut state: GoalState, event: &GoalEvent) -> GoalState {
             time_used_seconds,
         } => {
             state.tokens_used = state.tokens_used.saturating_add(*tokens_used);
-            state.time_used_seconds = *time_used_seconds;
+            // Elapsed seconds ACCUMULATE across responses (parity: legacy
+            // `goal.accounted` folds `time_used_seconds += delta`,
+            // `browser-use-core/src/goals.rs:110-131`). This previously ASSIGNED
+            // the per-response delta, dropping all prior elapsed time; accumulate
+            // it (saturating) so the folded total is the sum over the log.
+            state.time_used_seconds = state.time_used_seconds.saturating_add(*time_used_seconds);
         }
         GoalEvent::Completed => {
             state.status = Some(status::COMPLETE.to_string());

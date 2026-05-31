@@ -463,6 +463,65 @@ pub mod definitions {
     use browser_use_llm::schema::ToolDefinition;
     use serde_json::json;
 
+    /// `get_goal`: report the current thread goal + token-budget usage. Parity:
+    /// codex goal-spec read tool (`goal_spec.rs` / `spec_plan.rs`).
+    pub fn get_goal() -> ToolDefinition {
+        ToolDefinition {
+            name: "get_goal".to_string(),
+            description: "Get the current thread goal, its status, and token-budget usage."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {},
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `create_goal`: set the active thread goal (objective + optional token
+    /// budget). Parity: codex goal-spec create tool.
+    pub fn create_goal() -> ToolDefinition {
+        ToolDefinition {
+            name: "create_goal".to_string(),
+            description: "Set the active thread goal: an objective and an optional token budget."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "The goal objective." },
+                    "goal_id": { "type": "string", "description": "Optional stable id; auto-derived if omitted." },
+                    "token_budget": { "type": "integer", "description": "Optional hard token budget for the goal." },
+                    "turn_idx": { "type": "integer", "description": "Optional turn index the goal was created on." }
+                },
+                "required": ["text"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `update_goal`: update the active goal's status / objective / budget.
+    /// Parity: codex goal-spec update tool.
+    pub fn update_goal() -> ToolDefinition {
+        ToolDefinition {
+            name: "update_goal".to_string(),
+            description: "Update the active thread goal's status, objective text, or token budget."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "status": {
+                        "type": "string",
+                        "enum": ["active", "complete", "blocked", "budget_limited"],
+                        "description": "New goal status."
+                    },
+                    "text": { "type": "string", "description": "New objective text." },
+                    "token_budget": { "type": "integer", "description": "New hard token budget." }
+                },
+                "additionalProperties": false
+            }),
+        }
+    }
+
     /// `shell`: argv command + optional cwd/timeout/env. Parity: codex
     /// `ExecParams` (core/src/exec.rs:83-96) / legacy shell spec
     /// (`browser-use-core/src/tools/mod.rs`).
