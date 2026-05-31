@@ -10,13 +10,54 @@ pub struct SamplingOutcome {
     pub finish_reason: Option<FinishReason>,
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct TokenStatus {
     pub auto_compact_scope_tokens: i64,
     pub auto_compact_scope_limit: i64,
     pub full_context_window_limit_reached: bool,
     /// `scope >= limit || full_window` (`turn.rs:677-678`).
     pub token_limit_reached: bool,
+}
+
+impl TokenStatus {
+    /// `true` when any compaction trigger condition holds (the loop's gate —
+    /// codex `turn.rs:282` reads the soft + hard flags).
+    pub fn needs_compaction(&self) -> bool {
+        self.token_limit_reached || self.full_context_window_limit_reached
+    }
+
+    /// Build a REAL token status from the estimated tokens currently in context
+    /// and the model's context-window budget (codex/legacy `Session` auto-compact
+    /// math) — "compact early and often".
+    ///
+    /// Parity (legacy `browser-use-core::Session`, itself a codex port, in
+    /// `terminal/crates/browser-use-core/src/lib.rs`; codex
+    /// `model_auto_compact_token_limit`):
+    /// - auto-compact limit = `(context_window as f64 * 0.8) as i64` — the limit
+    ///   falls back to **80% of the model context window** when no explicit
+    ///   `model_auto_compact_token_limit` is configured. The trigger therefore
+    ///   fires at 80% of the window, NOT at 100% (compact early and often).
+    /// - `token_limit_reached` (soft auto-compact trigger) =
+    ///   `estimated_tokens >= auto_compact_limit` (codex `total >= limit`).
+    /// - `full_context_window_limit_reached` (hard ceiling) =
+    ///   `estimated_tokens >= context_window`.
+    ///
+    /// `context_window == 0` means the budget is unknown; codex returns `None`
+    /// from the auto-compact limit and never compacts, so this yields a zeroed
+    /// status and the loop's gate never trips.
+    pub fn from_estimate(estimated_tokens: i64, context_window: i64) -> Self {
+        if context_window <= 0 {
+            return Self::default();
+        }
+        // codex/legacy: (context_window as f64 * 0.8) as i64.
+        let auto_compact_limit = (context_window as f64 * 0.8) as i64;
+        Self {
+            auto_compact_scope_tokens: estimated_tokens,
+            auto_compact_scope_limit: auto_compact_limit,
+            full_context_window_limit_reached: estimated_tokens >= context_window,
+            token_limit_reached: estimated_tokens >= auto_compact_limit,
+        }
+    }
 }
 
 /// `turn.rs:255`.
@@ -142,6 +183,42 @@ mod tests {
         assert!(!should_compact_mid_turn(false, true));
         assert!(!should_compact_mid_turn(true, false));
         assert!(should_compact_mid_turn(true, true));
+    }
+
+    // ---- TokenStatus::from_estimate (codex 80%-of-window auto-compact) ----
+    #[test]
+    fn from_estimate_fires_at_80_percent_of_window() {
+        // window 1000 -> auto-compact limit = 800 (context_window * 0.8).
+        let below = TokenStatus::from_estimate(799, 1000);
+        assert!(!below.token_limit_reached, "799 < 800 must not trigger");
+        assert!(!below.full_context_window_limit_reached);
+        assert!(!below.needs_compaction());
+
+        let at = TokenStatus::from_estimate(800, 1000);
+        assert!(at.token_limit_reached, "800 >= 800 must trigger (codex >=)");
+        assert!(at.needs_compaction());
+        assert!(!at.full_context_window_limit_reached, "800 < 1000 window");
+        assert_eq!(at.auto_compact_scope_limit, 800);
+        assert_eq!(at.auto_compact_scope_tokens, 800);
+    }
+
+    #[test]
+    fn from_estimate_sets_full_window_at_ceiling() {
+        let full = TokenStatus::from_estimate(1000, 1000);
+        assert!(full.token_limit_reached);
+        assert!(
+            full.full_context_window_limit_reached,
+            "1000 >= 1000 window is the hard ceiling"
+        );
+        assert!(full.needs_compaction());
+    }
+
+    #[test]
+    fn from_estimate_zero_window_disables_accounting() {
+        // Unknown budget => zeroed status => loop never compacts (codex None=>false).
+        let st = TokenStatus::from_estimate(1_000_000, 0);
+        assert_eq!(st, TokenStatus::default());
+        assert!(!st.needs_compaction());
     }
 
     // ---- can_drain_after_compact (turn.rs:306): !model_nfu ----

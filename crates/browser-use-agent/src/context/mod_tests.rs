@@ -67,6 +67,33 @@ fn record_items_appends_and_snapshot_reflects_them() {
 }
 
 #[test]
+fn estimate_total_tokens_grows_with_history_and_is_zero_when_empty() {
+    // Empty buffer => 0 tokens.
+    let empty = ContextManager::new();
+    assert_eq!(empty.estimate_total_tokens(), 0);
+
+    // A small history has a small (non-zero) estimate.
+    let mut small = ContextManager::new();
+    small.record_items(vec![user_msg("hi")], TruncationPolicy::Bytes(usize::MAX));
+    let small_tokens = small.estimate_total_tokens();
+    assert!(small_tokens > 0, "non-empty history estimates > 0 tokens");
+
+    // A much larger history estimates many more tokens (the byte/4 estimate
+    // scales). ~40_000 bytes / 4 ≈ 10_000 tokens (plus the small JSON envelope).
+    let mut big = ContextManager::new();
+    big.record_items(
+        vec![user_msg(&"x".repeat(40_000))],
+        TruncationPolicy::Bytes(usize::MAX),
+    );
+    let big_tokens = big.estimate_total_tokens();
+    assert!(
+        big_tokens >= 10_000,
+        "≈40k bytes should estimate ≥10k tokens, got {big_tokens}"
+    );
+    assert!(big_tokens > small_tokens);
+}
+
+#[test]
 fn record_items_truncates_oversized_tool_output_at_policy_times_1_2() {
     // A 100-byte tool output under a Bytes(50) policy: process_item truncates
     // function-call outputs at policy*1.2 = 60 bytes, appending the elision
