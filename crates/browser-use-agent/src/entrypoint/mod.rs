@@ -67,6 +67,7 @@ use crate::session::provider_messages_from_events;
 use crate::session::SessionId;
 use crate::session::SharedStore;
 use crate::task::TurnLifecycleEvent;
+use crate::turn::sampling::FusionRecorder;
 use crate::turn::SamplingDriver;
 use crate::turn::TurnLoop;
 use crate::turn::TurnObserver;
@@ -74,6 +75,16 @@ use crate::turn::TurnState;
 use crate::AgentError;
 
 use provider::ResolvedProvider;
+
+/// The shared, in-run conversation buffer that BOTH the loop's [`TurnState`] reads
+/// (via [`StoreTurnState::clone_history_for_prompt`]) AND the fused driver's
+/// [`FusionRecorder`] writes (the assistant message + dispatched tool outputs).
+///
+/// This is the load-bearing fusion seam: holding the same `Arc<Mutex<Vec<Message>>>`
+/// behind both the recorder and the state means a tool output the driver dispatches
+/// re-enters the very next prompt the loop samples (codex `try_run_turn` records the
+/// call + its output into history before re-sampling).
+type RecordedBuffer = Arc<Mutex<Vec<Message>>>;
 
 /// codex `Provider::DEFAULT_STREAM_MAX_RETRIES`. Used when the run config does
 /// not carry a `stream_max_retries` of its own.
@@ -98,17 +109,42 @@ const DEFAULT_STREAM_MAX_RETRIES: u32 = 5;
 struct StoreTurnState {
     store: SharedStore,
     session_id: SessionId,
-    /// Assistant turns recorded this run, so a follow-up prompt sees them.
-    recorded: Mutex<Vec<Message>>,
+    /// Assistant turns + dispatched tool outputs recorded this run, so a follow-up
+    /// prompt sees them. Shared (`Arc`) with the fused driver's [`FusionRecorder`]
+    /// ([`BufferRecorder`]) so what the driver dispatches re-enters the next prompt.
+    recorded: RecordedBuffer,
 }
 
 impl StoreTurnState {
-    fn new(store: SharedStore, session_id: SessionId) -> Self {
+    /// Build the state over a SHARED recorded buffer. The same `Arc` is handed to
+    /// the fused driver's recorder (so dispatched tool outputs land here and are
+    /// re-sampled on the next iteration) and to this state (which reads it into
+    /// every prompt). Pass a fresh buffer for the non-fused (`Fake`) path.
+    fn new(store: SharedStore, session_id: SessionId, recorded: RecordedBuffer) -> Self {
         Self {
             store,
             session_id,
-            recorded: Mutex::new(Vec::new()),
+            recorded,
         }
+    }
+}
+
+/// A [`FusionRecorder`] that appends into a shared [`RecordedBuffer`].
+///
+/// The fused [`ModelSamplingDriver`](crate::turn::sampling::ModelSamplingDriver)
+/// records the assistant message and each dispatched tool output through this; the
+/// same `Arc<Mutex<Vec<Message>>>` backs the run's [`StoreTurnState`], so those
+/// recorded items are exactly what the loop re-samples on its next iteration
+/// (mirrors the test fakes in `turn/fusion_tests.rs`, where one `SharedConversation`
+/// is both the `TurnState` and the `FusionRecorder`).
+struct BufferRecorder {
+    buffer: RecordedBuffer,
+}
+
+#[async_trait::async_trait]
+impl FusionRecorder for BufferRecorder {
+    async fn record(&self, messages: &[Message]) {
+        self.buffer.lock().unwrap().extend_from_slice(messages);
     }
 }
 
@@ -135,6 +171,9 @@ impl TurnState for StoreTurnState {
         let mut msgs = tokio::task::spawn_blocking(move || history_from_store(&store, &session_id))
             .await
             .unwrap_or_default();
+        // The recorded buffer carries this run's assistant turns AND the fused
+        // driver's dispatched tool outputs (both append through the same `Arc`), so
+        // the next prompt sees everything produced so far.
         msgs.extend(self.recorded.lock().unwrap().iter().cloned());
         msgs
     }
@@ -265,14 +304,20 @@ impl EventSink for DiscardSink {
 
 /// Drive a loop run to quiescence with `driver`, over a store-backed state +
 /// observer. Returns the final assistant message (`None` if no text was produced).
+///
+/// `recorded` is the SHARED conversation buffer: for the real fused path it is the
+/// SAME `Arc` the driver's [`FusionRecorder`] writes (so dispatched tool outputs
+/// re-enter the next prompt). The state is built over it AFTER the driver so the
+/// driver/recorder and the loop read/write the one buffer.
 async fn drive_run<Sd: SamplingDriver>(
     store: SharedStore,
     session_id: SessionId,
     ctx: TurnCtx,
     driver: Sd,
     turn_has_fresh_input: bool,
+    recorded: RecordedBuffer,
 ) -> Result<Option<String>, AgentError> {
-    let state = StoreTurnState::new(Arc::clone(&store), session_id.clone());
+    let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded);
 
     // The observer persists the terminal agent message through a synchronous
     // durable sink over the SharedStore. (The async `events::StoreSink` writer
@@ -337,12 +382,30 @@ pub async fn run_session_with_config(
     let session_id = SessionId(session_id.to_string());
     let ctx = turn_ctx(&session_id, &config);
 
+    // The single in-run conversation buffer, shared (by `Arc`) between the fused
+    // driver's `FusionRecorder` (which records the assistant message + dispatched
+    // tool outputs) and the loop's `StoreTurnState` (which reads it into each
+    // prompt). Built FIRST so the recorder can be attached to the driver below and
+    // the SAME buffer handed to `drive_run` for the state — closing the fusion loop.
+    let recorded: RecordedBuffer = Arc::new(Mutex::new(Vec::new()));
+
     // (1) resolve provider → driver. This reaches `build_sampling_driver` for
-    //     every real backend; `Fake` yields the offline-driver signal.
+    //     every real backend; `Fake` yields the offline-driver signal. For a real
+    //     backend the driver is fused with the production tool dispatcher + a
+    //     recorder writing into `recorded`, so model tool-calls EXECUTE and their
+    //     outputs re-enter the prompt.
     let driver_sink: Arc<dyn EventSink> = Arc::new(DiscardSink);
-    let resolved =
-        provider::resolve_provider(&config, driver_sink, ctx.clone(), max_retries(&config))
-            .map_err(|e| anyhow::anyhow!("{e}"))?;
+    let fusion_recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
+        buffer: Arc::clone(&recorded),
+    });
+    let resolved = provider::resolve_provider(
+        &config,
+        driver_sink,
+        ctx.clone(),
+        max_retries(&config),
+        fusion_recorder,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // (2) seed the environment workspace-context durable event (de-duped per kind).
     let env_content = environment_context_content(&config);
@@ -355,7 +418,9 @@ pub async fn run_session_with_config(
     // before any queued steer is drained.
     let turn_has_fresh_input = log_has_user_input(&store, session_id.as_str());
 
-    // (3) drive the loop to quiescence with the resolved driver.
+    // (3) drive the loop to quiescence with the resolved driver. The SAME
+    //     `recorded` buffer the recorder writes is handed to the state, so the
+    //     fused tool outputs re-enter the prompt on the loop's next iteration.
     match resolved {
         ResolvedProvider::Real(driver) => {
             drive_run(
@@ -364,12 +429,15 @@ pub async fn run_session_with_config(
                 ctx,
                 *driver,
                 turn_has_fresh_input,
+                Arc::clone(&recorded),
             )
             .await?;
         }
         ResolvedProvider::Fake => {
             // The fake backend has no real driver; drive offline so the facade is
-            // exercisable end-to-end without a network.
+            // exercisable end-to-end without a network. The recorder is unused here
+            // (the fake driver does not dispatch), but the same buffer is still the
+            // state's record sink so `record_items` works identically.
             let driver = FakeSamplingDriver::new(fake_response_text(&config));
             drive_run(
                 Arc::clone(&store),
@@ -377,6 +445,7 @@ pub async fn run_session_with_config(
                 ctx,
                 driver,
                 turn_has_fresh_input,
+                Arc::clone(&recorded),
             )
             .await?;
         }
@@ -436,7 +505,6 @@ mod tests {
     use crate::config_overrides::ProviderBackend;
     use crate::config_overrides::ProviderRunConfig;
     use browser_use_store::Store;
-    use std::sync::Mutex;
     use tempfile::TempDir;
 
     /// A tempdir-backed `SharedStore` with a fresh session row (the `events` table
@@ -559,7 +627,7 @@ mod tests {
                 .expect("append");
         }
 
-        let state = StoreTurnState::new(Arc::clone(&store), sid);
+        let state = StoreTurnState::new(Arc::clone(&store), sid, Arc::new(Mutex::new(Vec::new())));
         let before = state.clone_history_for_prompt().await;
         assert!(
             !before.is_empty(),
@@ -579,5 +647,195 @@ mod tests {
         );
         assert!(!state.has_pending_input().await);
         assert!(!state.token_status().await.token_limit_reached);
+    }
+
+    // -----------------------------------------------------------------------
+    // Fusion seam: a scripted tool-call drives a REAL registry dispatch, and the
+    // loop re-samples with the tool output in the next prompt — exactly the wiring
+    // `run_session_with_config` assembles (BufferRecorder + StoreTurnState sharing
+    // one buffer + a fused ModelSamplingDriver), but driven offline by a scripted
+    // transport instead of a live ModelClient (so the test is network-free).
+    // -----------------------------------------------------------------------
+
+    use crate::turn::dispatch::{RegistryRunner, ToolDispatcher};
+    use crate::turn::sampling::{EventStream, ModelSamplingDriver, SamplingTransport};
+    use crate::turn::TurnLoop;
+    use browser_use_llm::schema::{
+        ContentPart, FinishReason, LlmError, LlmEvent, LlmRequest, MessageRole, Usage,
+    };
+
+    /// A transport that replays a fixed per-iteration `LlmEvent` script (no
+    /// `ModelClient`, no socket) — the offline analogue of the live transport the
+    /// entrypoint builds. Mirrors `turn/fusion_tests.rs::ScriptedTransport`.
+    struct ScriptedTransport {
+        scripts: Mutex<std::collections::VecDeque<Vec<LlmEvent>>>,
+    }
+
+    impl SamplingTransport for ScriptedTransport {
+        fn open_stream<'a>(&'a self, _req: &LlmRequest) -> Result<EventStream<'a>, LlmError> {
+            let events = self.scripts.lock().unwrap().pop_front().unwrap_or_default();
+            let items: Vec<Result<LlmEvent, LlmError>> = events.into_iter().map(Ok).collect();
+            Ok(Box::pin(::futures_util::stream::iter(items)))
+        }
+    }
+
+    /// A no-op observer for the loop.
+    struct NoopObserver;
+    impl TurnObserver for NoopObserver {
+        fn on_lifecycle(&self, _ev: TurnLifecycleEvent) {}
+    }
+
+    /// Build the production tool dispatcher (registry + orchestrator stub) over a
+    /// shell-only registry, so a scripted `shell` tool-call dispatches for real.
+    fn shell_dispatcher() -> Arc<ToolDispatcher<RegistryRunner>> {
+        use crate::tools::handlers::shell::{ShellRequest, ShellTool};
+        use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
+        use crate::tools::registry::{definitions, ToolRegistry};
+        use crate::tools::runtime::ToolCtx;
+        use crate::tools::sandbox::FileSystemSandboxPolicy;
+
+        let mut reg = ToolRegistry::new();
+        reg.register::<_, ShellRequest>("shell", definitions::shell(), false, ShellTool::new());
+        let runner = RegistryRunner::new(
+            Arc::new(reg),
+            Arc::new(ToolOrchestrator::stub()),
+            ToolCtx {
+                call_id: "c".to_string(),
+                tool_name: "shell".to_string(),
+                cwd: std::env::temp_dir(),
+            },
+            TurnEnv {
+                file_system_sandbox_policy: FileSystemSandboxPolicy {
+                    restricted: false,
+                    denied_read: false,
+                },
+                managed_network_active: false,
+                strict_auto_review: false,
+                use_guardian: false,
+            },
+            crate::tools::approval::AskForApproval::Never,
+        );
+        Arc::new(ToolDispatcher::with_runner(
+            runner, /* model_supports */ true,
+        ))
+    }
+
+    /// Iteration 1's scripted model response emits a `shell` echo tool-call; the
+    /// fused driver dispatches it THROUGH the real registry+orchestrator and the
+    /// `BufferRecorder` writes the assistant message + tool output into the SAME
+    /// buffer the `StoreTurnState` reads. Iteration 2 (whose prompt is built from
+    /// that buffer) emits only text, so the loop completes. Proves the entrypoint's
+    /// fusion seam: scripted tool-call → real dispatch → re-sample sees the output.
+    #[tokio::test]
+    async fn fused_entrypoint_driver_dispatches_and_resamples_with_output() {
+        let (_dir, store, session_id) = store_with_session();
+
+        // The single shared buffer — exactly what `run_session_with_config` wires:
+        // the recorder writes it, the state reads it.
+        let recorded: RecordedBuffer = Arc::new(Mutex::new(Vec::new()));
+        let recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
+            buffer: Arc::clone(&recorded),
+        });
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::clone(&recorded),
+        );
+
+        let ctx = TurnCtx {
+            session_id: session_id.clone(),
+            model: "m".to_string(),
+            provider: "fake".to_string(),
+            turn_idx: 0,
+            attempt: 0,
+        };
+
+        // iter 1: text + a `shell` echo tool-call; iter 2: final text, no tools.
+        let scripts = vec![
+            vec![
+                LlmEvent::TextDelta {
+                    id: "t0".to_string(),
+                    delta: "running shell".to_string(),
+                },
+                LlmEvent::ToolCall {
+                    id: "call-1".to_string(),
+                    name: "shell".to_string(),
+                    input: serde_json::json!({ "command": ["echo", "fusion-ok"] }),
+                },
+                LlmEvent::Finish {
+                    usage: Usage::default(),
+                    finish_reason: Some(FinishReason::Stop),
+                },
+            ],
+            vec![
+                LlmEvent::TextDelta {
+                    id: "t1".to_string(),
+                    delta: "all done".to_string(),
+                },
+                LlmEvent::Finish {
+                    usage: Usage::default(),
+                    finish_reason: Some(FinishReason::Stop),
+                },
+            ],
+        ];
+        let transport = ScriptedTransport {
+            scripts: Mutex::new(scripts.into_iter().collect()),
+        };
+
+        // The fused driver: scripted transport + production dispatcher + the
+        // entrypoint's BufferRecorder, all over the shared buffer.
+        let driver = ModelSamplingDriver::new(transport, Arc::new(DiscardSink), ctx.clone(), 3)
+            .without_jitter()
+            .with_fusion(shell_dispatcher(), recorder);
+
+        let turn = TurnLoop::new(state, driver, NoopObserver);
+        let out = turn
+            .run(
+                ctx,
+                /* turn_has_fresh_input */ false,
+                CancellationToken::new(),
+            )
+            .await
+            .expect("fused entrypoint turn should complete");
+
+        // The loop ran two iterations and returned the final text.
+        assert_eq!(out.as_deref(), Some("all done"));
+
+        // The dispatched shell output landed in the shared buffer (so iteration 2
+        // re-sampled with it). Assert a Tool-role message carrying the echo output.
+        let buf = recorded.lock().unwrap().clone();
+        let tool_texts: Vec<String> = buf
+            .iter()
+            .filter(|m| matches!(m.role, MessageRole::Tool))
+            .flat_map(|m| m.content.iter())
+            .filter_map(|p| match p {
+                ContentPart::ToolResult { content, .. } => Some(
+                    content
+                        .iter()
+                        .filter_map(|c| match c {
+                            ContentPart::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .collect::<Vec<_>>()
+                        .join(""),
+                ),
+                _ => None,
+            })
+            .collect();
+        assert_eq!(
+            tool_texts.len(),
+            1,
+            "exactly one tool output recorded: {buf:?}"
+        );
+        assert!(
+            tool_texts[0].contains("fusion-ok"),
+            "the dispatched shell tool output must re-enter the prompt: {:?}",
+            tool_texts[0]
+        );
+
+        // Transcript shape in the shared buffer: assistant(text+call) then the
+        // tool result — the recorder fed the loop's re-sample buffer in order.
+        let roles: Vec<MessageRole> = buf.iter().map(|m| m.role).collect();
+        assert_eq!(roles, vec![MessageRole::Assistant, MessageRole::Tool]);
     }
 }
