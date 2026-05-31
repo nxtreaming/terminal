@@ -8,9 +8,29 @@ use crate::theme::{accent, dim};
 #[derive(Debug, Default)]
 pub(crate) struct Composer {
     text: String,
-    local_images: Vec<PathBuf>,
+    local_images: Vec<LocalImageDraft>,
     cursor: usize,
     preferred_column: Option<usize>,
+    visible_wrapped_start_hint: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalImageDraft {
+    Ready(PathBuf),
+    Pending { paste_id: u64 },
+}
+
+impl LocalImageDraft {
+    fn path(self) -> Option<PathBuf> {
+        match self {
+            Self::Ready(path) => Some(path),
+            Self::Pending { .. } => None,
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
 }
 
 impl Composer {
@@ -23,6 +43,7 @@ impl Composer {
         self.local_images.clear();
         self.cursor = 0;
         self.preferred_column = None;
+        self.visible_wrapped_start_hint = None;
     }
 
     pub(crate) fn take_trimmed(&mut self) -> String {
@@ -33,7 +54,10 @@ impl Composer {
 
     pub(crate) fn take_submission(&mut self) -> (String, Vec<PathBuf>) {
         let text = self.text.trim().to_string();
-        let local_images = std::mem::take(&mut self.local_images);
+        let local_images = std::mem::take(&mut self.local_images)
+            .into_iter()
+            .filter_map(LocalImageDraft::path)
+            .collect();
         self.clear();
         (text, local_images)
     }
@@ -46,8 +70,45 @@ impl Composer {
         !self.local_images.is_empty()
     }
 
+    pub(crate) fn has_pending_local_images(&self) -> bool {
+        self.local_images.iter().any(LocalImageDraft::is_pending)
+    }
+
     pub(crate) fn attach_image(&mut self, path: PathBuf) {
-        self.local_images.push(path);
+        self.local_images.push(LocalImageDraft::Ready(path));
+    }
+
+    pub(crate) fn attach_pending_image(&mut self, paste_id: u64) {
+        self.local_images
+            .push(LocalImageDraft::Pending { paste_id });
+    }
+
+    pub(crate) fn resolve_pending_image(&mut self, paste_id: u64, path: PathBuf) -> bool {
+        let Some(image) = self.local_images.iter_mut().find(|image| {
+            matches!(
+                image,
+                LocalImageDraft::Pending {
+                    paste_id: candidate
+                } if *candidate == paste_id
+            )
+        }) else {
+            return false;
+        };
+        *image = LocalImageDraft::Ready(path);
+        true
+    }
+
+    pub(crate) fn remove_pending_image(&mut self, paste_id: u64) -> bool {
+        let previous_len = self.local_images.len();
+        self.local_images.retain(|image| {
+            !matches!(
+                image,
+                LocalImageDraft::Pending {
+                    paste_id: candidate
+                } if *candidate == paste_id
+            )
+        });
+        self.local_images.len() != previous_len
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) -> bool {
@@ -64,11 +125,16 @@ impl Composer {
         self.cursor
     }
 
+    pub(crate) fn cursor_index(&self) -> usize {
+        self.cursor
+    }
+
     pub(crate) fn set_input(&mut self, value: String) {
         self.text = value;
         self.local_images.clear();
         self.cursor = self.input_len();
         self.preferred_column = None;
+        self.visible_wrapped_start_hint = None;
     }
 
     #[cfg(test)]
@@ -134,61 +200,9 @@ impl Composer {
         let (visual_row, visual_col) = self.cursor_visual_row_col_wrapped(content_width);
         let visible_start = self.visible_wrapped_line_start(max_lines, width);
         (
-            visual_col.saturating_add(2) as u16,
+            visual_col.saturating_add(2).min(width.saturating_sub(1)) as u16,
             visual_row.saturating_sub(visible_start) as u16,
         )
-    }
-
-    pub(crate) fn set_cursor_from_wrapped_position(
-        &mut self,
-        max_lines: usize,
-        width: usize,
-        row: usize,
-        col: usize,
-    ) -> bool {
-        if self.is_empty() {
-            self.cursor = 0;
-            self.preferred_column = None;
-            return true;
-        }
-        let content_width = width.saturating_sub(2).max(1);
-        let visible_start = self.visible_wrapped_line_start(max_lines, width);
-        let target_row = visible_start.saturating_add(row);
-        let target_col = col.saturating_sub(2);
-        let image_width = self.image_width(!self.text.is_empty());
-        let mut visual_row = 0usize;
-        let mut line_start = 0usize;
-
-        for (logical_idx, line) in self.text.split('\n').enumerate() {
-            let line_len = line.chars().count();
-            let wrap_width = if logical_idx == 0 {
-                content_width.saturating_sub(image_width).max(1)
-            } else {
-                content_width
-            };
-            let line_visual_rows = wrapped_line_count(line, wrap_width);
-            if target_row < visual_row.saturating_add(line_visual_rows) {
-                let row_in_line = target_row.saturating_sub(visual_row);
-                let col_in_line = if logical_idx == 0 && row_in_line == 0 {
-                    target_col.saturating_sub(image_width)
-                } else {
-                    target_col
-                };
-                let line_col = row_in_line
-                    .saturating_mul(wrap_width)
-                    .saturating_add(col_in_line)
-                    .min(line_len);
-                self.cursor = line_start.saturating_add(line_col).min(self.input_len());
-                self.preferred_column = None;
-                return true;
-            }
-            visual_row = visual_row.saturating_add(line_visual_rows);
-            line_start = line_start.saturating_add(line_len).saturating_add(1);
-        }
-
-        self.cursor = self.input_len();
-        self.preferred_column = None;
-        true
     }
 
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
@@ -412,6 +426,12 @@ impl Composer {
         }
         let (cursor_visual_row, _) = self.cursor_visual_row_col_wrapped(content_width);
         let max_start = line_count.saturating_sub(max_lines);
+        if let Some(start) = self.visible_wrapped_start_hint {
+            let start = start.min(max_start);
+            if cursor_visual_row >= start && cursor_visual_row < start.saturating_add(max_lines) {
+                return start;
+            }
+        }
         cursor_visual_row
             .saturating_sub(max_lines.saturating_sub(1))
             .min(max_start)
@@ -924,21 +944,6 @@ mod tests {
     }
 
     #[test]
-    fn click_position_maps_to_wrapped_multiline_cursor() {
-        let mut composer = Composer::default();
-        composer.set_input("first line\nsecond word\nthird".to_string());
-
-        assert!(composer.set_cursor_from_wrapped_position(4, 40, 1, 2 + "second ".chars().count()));
-        assert_eq!(composer.cursor(), "first line\nsecond ".chars().count());
-
-        assert!(composer.set_cursor_from_wrapped_position(4, 40, 2, 2 + "thi".chars().count()));
-        assert_eq!(
-            composer.cursor(),
-            "first line\nsecond word\nthi".chars().count()
-        );
-    }
-
-    #[test]
     fn ctrl_w_keeps_whitespace_delimited_shell_behavior() {
         let mut composer = Composer::default();
 
@@ -969,11 +974,11 @@ mod tests {
         composer.set_input("abcdef".to_string());
 
         assert_eq!(composer.render_lines_wrapped(1, 8, "placeholder").len(), 1);
-        assert_eq!(composer.cursor_position_wrapped(1, 8), (8, 0));
+        assert_eq!(composer.cursor_position_wrapped(1, 8), (7, 0));
 
         composer.set_input("abcdefghijkl".to_string());
         assert_eq!(composer.render_lines_wrapped(2, 8, "placeholder").len(), 2);
-        assert_eq!(composer.cursor_position_wrapped(2, 8), (8, 1));
+        assert_eq!(composer.cursor_position_wrapped(2, 8), (7, 1));
     }
 
     #[test]
@@ -1012,6 +1017,25 @@ mod tests {
         assert!(!rendered.contains("shot.png"));
         assert_eq!(composer.visual_line_count_wrapped(40), 1);
         assert_eq!(composer.cursor_position_wrapped(4, 40), (31, 0));
+    }
+
+    #[test]
+    fn validated_pending_image_renders_and_resolves_to_path() {
+        let mut composer = Composer::default();
+        composer.set_input("describe it".to_string());
+        composer.attach_pending_image(7);
+
+        assert_eq!(
+            plain(composer.render_lines_wrapped(4, 80, "placeholder")),
+            "> [Image 1] describe it\n"
+        );
+        assert!(composer.has_pending_local_images());
+
+        assert!(composer.resolve_pending_image(7, PathBuf::from("/tmp/shot.png")));
+        assert!(!composer.has_pending_local_images());
+        let (text, images) = composer.take_submission();
+        assert_eq!(text, "describe it");
+        assert_eq!(images, vec![PathBuf::from("/tmp/shot.png")]);
     }
 
     #[test]

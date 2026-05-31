@@ -15,15 +15,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_DEEPSEEK,
-    ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
+    is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
+    ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
 };
 use crate::theme::*;
 use crate::transcript;
 
 use super::{
-    collaboration_mode_label, App, MessageActionKind, ProductState, RequestUserInputFocus,
-    SetupResultKind, Surface,
+    collaboration_mode_label, event_payload_text, pending_active_followup_events_from_events,
+    pending_queued_followup_events_from_events, App, CookieSyncStatus, MessageActionKind,
+    ProductState, RequestUserInputFocus, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -223,10 +224,15 @@ fn render_main(
         && !layout_surface.is_bottom_pane();
     let attach_bottom_to_body =
         native_scrollback_active && !body.is_empty() && !layout_surface.is_bottom_pane();
+    let reserve_live_status_row = attach_bottom_to_body
+        && transcript::active_viewport_needs_status_row_reserve(transcript_model.as_ref());
+    let layout_body_len = body
+        .len()
+        .saturating_add(usize::from(reserve_live_status_row));
     let (body_area, bottom_area, footer_area) = main_layout_areas(
         area,
         bottom_h,
-        body.len(),
+        layout_body_len,
         show_footer,
         pin_bottom,
         attach_bottom_to_body,
@@ -404,7 +410,7 @@ fn main_bottom_height_for(
         Surface::Model | Surface::History | Surface::Messages => {
             area.height.saturating_sub(2).max(6)
         }
-        Surface::BrowserSelect => 22,
+        Surface::BrowserSelect | Surface::CookieSync => 22,
         _ => 18,
     };
     // Add room for the surface header, footer, borders, and content margins.
@@ -415,8 +421,15 @@ fn main_bottom_height_for(
 
 fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> u16 {
     let visual_input_lines = composer_visual_input_lines(app, width.saturating_sub(4).max(1));
+    let preview_lines = pending_followup_preview_lines(
+        app,
+        app.selected_session_id.as_deref(),
+        composer_preview_width(width),
+    )
+    .len()
+    .min(PENDING_FOLLOWUP_PREVIEW_MAX_LINES) as u16;
     // top border + input rows + bottom border + status row beneath.
-    visual_input_lines + 3
+    preview_lines + visual_input_lines + 3
 }
 
 /// Visual rows the input area inside the fused composer should occupy.
@@ -425,12 +438,141 @@ fn composer_pane_height(app: &App, _product_state: ProductState, width: u16) -> 
 /// off-screen.
 const COMPOSER_INPUT_MIN_ROWS: u16 = 3;
 const COMPOSER_INPUT_MAX_ROWS: u16 = 10;
+const PENDING_FOLLOWUP_PREVIEW_MAX_LINES: usize = 8;
 
 fn composer_visual_input_lines(app: &App, input_area_width: u16) -> u16 {
     let visual_input_lines = app
         .composer
         .visual_line_count_wrapped(input_area_width as usize) as u16;
     visual_input_lines.clamp(COMPOSER_INPUT_MIN_ROWS, COMPOSER_INPUT_MAX_ROWS)
+}
+
+fn composer_preview_width(width: u16) -> u16 {
+    width.saturating_sub(4).max(1)
+}
+
+fn pending_followup_preview_lines(
+    app: &App,
+    session_id: Option<&str>,
+    width: u16,
+) -> Vec<Line<'static>> {
+    let Some(session_id) = session_id else {
+        return Vec::new();
+    };
+    let events = app.cached_events_for_session(session_id);
+    let pending_active = pending_active_followup_events_from_events(events)
+        .into_iter()
+        .filter_map(event_payload_text)
+        .collect::<Vec<_>>();
+    let pending_queued = pending_queued_followup_events_from_events(events)
+        .into_iter()
+        .filter_map(event_payload_text)
+        .collect::<Vec<_>>();
+    if pending_active.is_empty() && pending_queued.is_empty() {
+        return Vec::new();
+    }
+
+    let mut lines = Vec::new();
+    if !pending_active.is_empty() {
+        push_wrapped_preview_line(
+            &mut lines,
+            "• ",
+            "  ",
+            "Messages to be submitted after next tool call (press esc to dequeue and edit)",
+            width,
+            muted(),
+        );
+        for message in pending_active {
+            push_limited_wrapped_preview_line(&mut lines, "  ↳ ", "    ", &message, width, muted());
+        }
+    }
+
+    if !pending_queued.is_empty() {
+        if !lines.is_empty() {
+            lines.push(Line::from(""));
+        }
+        for message in pending_queued {
+            let label = format!("queued follow-up  {message}");
+            push_limited_wrapped_preview_line(&mut lines, "• ", "  ", &label, width, muted());
+        }
+    }
+
+    lines
+}
+
+fn push_limited_wrapped_preview_line(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    continuation_prefix: &str,
+    text: &str,
+    width: u16,
+    style: Style,
+) {
+    const MAX_LINES_PER_MESSAGE: usize = 3;
+    let start = lines.len();
+    push_wrapped_preview_line(lines, prefix, continuation_prefix, text, width, style);
+    let added = lines.len().saturating_sub(start);
+    if added > MAX_LINES_PER_MESSAGE {
+        lines.truncate(start + MAX_LINES_PER_MESSAGE);
+        if let Some(last) = lines.last_mut() {
+            *last = Line::from(vec![
+                Span::styled(continuation_prefix.to_string(), dim()),
+                Span::styled("...".to_string(), style),
+            ]);
+        }
+    }
+}
+
+fn push_wrapped_preview_line(
+    lines: &mut Vec<Line<'static>>,
+    prefix: &str,
+    continuation_prefix: &str,
+    text: &str,
+    width: u16,
+    style: Style,
+) {
+    let mut first_visual = true;
+    let source_lines = if text.is_empty() {
+        vec![""]
+    } else {
+        text.lines().collect::<Vec<_>>()
+    };
+    for source_line in source_lines {
+        let chars = source_line.chars().collect::<Vec<_>>();
+        if chars.is_empty() {
+            let active_prefix = if first_visual {
+                prefix
+            } else {
+                continuation_prefix
+            };
+            lines.push(Line::from(vec![Span::styled(
+                active_prefix.to_string(),
+                dim(),
+            )]));
+            first_visual = false;
+            continue;
+        }
+
+        let mut offset = 0;
+        while offset < chars.len() {
+            let active_prefix = if first_visual {
+                prefix
+            } else {
+                continuation_prefix
+            };
+            let budget = (width as usize)
+                .saturating_sub(active_prefix.chars().count())
+                .max(1);
+            let end = offset.saturating_add(budget).min(chars.len());
+            let chunk = chars[offset..end].iter().collect::<String>();
+            lines.push(Line::from(vec![
+                Span::styled(active_prefix.to_string(), dim()),
+                Span::styled(chunk, style),
+            ]));
+            first_visual = false;
+            offset = end;
+        }
+    }
 }
 
 fn render_bottom_pane(
@@ -1116,6 +1258,10 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
+        Surface::CookieSync => (
+            "Cookie Sync",
+            "Import local browser cookies to Browser Use cloud",
+        ),
         Surface::History => ("History", "Browse and resume previous tasks"),
         Surface::Messages => (
             "Messages",
@@ -1130,7 +1276,11 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
 /// one-line description — the shared chrome for every dropdown/settings view.
 fn surface_header_lines(surface: Surface, width: u16) -> Vec<Line<'static>> {
     let (title, description) = surface_heading(surface);
-    let indent = " ".repeat(CONTENT_HORIZONTAL_MARGIN as usize);
+    let indent = if surface == Surface::CookieSync {
+        String::new()
+    } else {
+        " ".repeat(CONTENT_HORIZONTAL_MARGIN as usize)
+    };
     vec![
         Line::from(Span::styled("─".repeat(width as usize), accent())),
         Line::from(vec![
@@ -1154,6 +1304,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
+        Surface::CookieSync => "Enter:select | Esc:close",
         Surface::Developer => "Esc:close",
         _ => "Enter:select | Esc:back",
     }
@@ -1193,6 +1344,7 @@ fn surface_lines(
         Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
+        Surface::CookieSync => cookie_sync_lines(app, width),
         Surface::History => history_lines(app, state, width),
         Surface::Messages => message_lines(app, width),
         Surface::Developer => developer_lines(app, state),
@@ -1219,6 +1371,44 @@ fn render_composer(
     _product_state: ProductState,
 ) {
     if area.width == 0 || area.height == 0 {
+        return;
+    }
+    let session_id = state
+        .current_session
+        .as_ref()
+        .map(|session| session.id.as_str())
+        .or(app.selected_session_id.as_deref());
+    let mut preview_lines =
+        pending_followup_preview_lines(app, session_id, composer_preview_width(area.width));
+    if preview_lines.len() > PENDING_FOLLOWUP_PREVIEW_MAX_LINES {
+        preview_lines.truncate(PENDING_FOLLOWUP_PREVIEW_MAX_LINES);
+    }
+    let min_composer_h = COMPOSER_INPUT_MIN_ROWS.saturating_add(2).min(area.height);
+    let preview_h = (preview_lines.len() as u16)
+        .min(area.height.saturating_sub(min_composer_h))
+        .min(PENDING_FOLLOWUP_PREVIEW_MAX_LINES as u16);
+    if preview_h > 0 {
+        let preview_area = Rect {
+            x: area.x.saturating_add(2),
+            y: area.y,
+            width: composer_preview_width(area.width),
+            height: preview_h,
+        };
+        frame.render_widget(
+            Paragraph::new(preview_lines)
+                .style(Style::default().fg(text()))
+                .wrap(Wrap { trim: false }),
+            preview_area,
+        );
+    }
+
+    let area = Rect {
+        y: area.y.saturating_add(preview_h),
+        height: area.height.saturating_sub(preview_h),
+        ..area
+    };
+    if area.width == 0 || area.height == 0 {
+        app.composer_input_rect.set(None);
         return;
     }
     let input_inner_w = area.width.saturating_sub(4).max(1);
@@ -1536,7 +1726,10 @@ fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &W
     let pending_request = current_session
         .filter(|session| session.status.is_active())
         .and_then(|session| app.pending_request_user_input(&session.id));
-    let placeholder = if pending_request.is_some() {
+    // Compute the home placeholder separately so it can own a String when
+    // the typewriter produces a dynamic substring.
+    let home_placeholder_owned: String;
+    let placeholder: &str = if pending_request.is_some() {
         if app
             .request_input
             .as_ref()
@@ -1551,17 +1744,31 @@ fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &W
     } else if current_session.is_some() {
         "Ask a follow-up..."
     } else {
-        "Tell the browser what to do..."
+        // Home screen — delegate to App which knows whether typewriter is active.
+        home_placeholder_owned = app.home_placeholder();
+        &home_placeholder_owned
     };
     let max_lines = area.height.max(1) as usize;
     // While the slash palette is open, the popup is the input — render the
     // composer as if it were empty (just the placeholder, no `/text`) and
     // skip cursor placement here so the popup owns it.
     let palette_owns_input = app.is_slash_palette_active();
+    // During the Holding phase the full example is shown and the hint should
+    // appear inline, clearly attached to the animated placeholder.
+    let show_inline_hint =
+        !palette_owns_input && app.is_home_examples_active() && app.is_typewriter_holding();
     let lines: Vec<Line<'static>> = if palette_owns_input {
         vec![Line::from(vec![
             Span::styled("> ", dim()),
             Span::styled(placeholder.to_string(), dim()),
+        ])]
+    } else if show_inline_hint {
+        // Render manually so we can append the hint span without affecting
+        // cursor_position_wrapped (composer is empty in this state).
+        vec![Line::from(vec![
+            Span::styled("> ", dim()),
+            Span::styled(app.typewriter_placeholder_text().to_string(), dim()),
+            Span::styled("  ⇥ tab to use", accent()),
         ])]
     } else {
         app.composer
@@ -1818,12 +2025,18 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
     let account = app
         .setup_pending_account
         .as_deref()
-        .unwrap_or(ACCOUNT_OPENAI);
+        .unwrap_or(ACCOUNT_CODEX);
     let mut lines = vec![
         Line::from(Span::styled(format!("Use {account}?"), bold())),
         Line::from(""),
     ];
-    if is_claude_code_account(account) {
+    if account == ACCOUNT_CODEX {
+        lines.extend([
+            Line::from("  Imports your local Codex auth."),
+            Line::from("  Uses GPT-5.5 with your ChatGPT plan."),
+            Line::from("  No API key is required."),
+        ]);
+    } else if is_claude_code_account(account) {
         if app.account_ready(account).unwrap_or(false) {
             lines.push(Line::from("  Claude Code login found."));
         } else {
@@ -1842,6 +2055,8 @@ fn setup_confirm_lines(app: &App) -> Vec<Line<'static>> {
     let primary_label =
         if is_claude_code_account(account) && !app.account_ready(account).unwrap_or(false) {
             "Open sign-in"
+        } else if account == ACCOUNT_CODEX {
+            "Use Codex auth"
         } else {
             "Continue"
         };
@@ -1889,28 +2104,61 @@ fn setup_result_lines(app: &App, width: usize) -> Vec<Line<'static>> {
             selected("Continue", 0, app.selected_row),
         ]);
     } else if is_pending {
-        if let Some(seconds) = app.claude_code_oauth_elapsed_seconds() {
-            lines.push(Line::from(Span::styled(
-                format!("  Waiting for callback ({seconds}s)."),
-                muted(),
-            )));
-        }
-        if let Some(error) = app.claude_code_oauth_open_error() {
-            lines.push(Line::from(Span::styled(
-                format!("  Could not open browser automatically: {error}"),
-                failed(),
-            )));
+        if result.account == ACCOUNT_CODEX {
+            if let Some(seconds) = app.codex_login_elapsed_seconds() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Waiting for device sign-in ({seconds}s)."),
+                    muted(),
+                )));
+            }
+            let output_lines = app.codex_login_output_lines();
+            if output_lines.is_empty() {
+                lines.push(Line::from("  Starting Codex device sign-in..."));
+            } else {
+                lines.push(Line::from(""));
+                for line in output_lines
+                    .into_iter()
+                    .rev()
+                    .take(8)
+                    .collect::<Vec<_>>()
+                    .into_iter()
+                    .rev()
+                {
+                    push_wrapped_prefixed_text(&mut lines, "  ", &line, width);
+                }
+            }
         } else {
-            lines.push(Line::from("  Browser sign-in opened."));
-        }
-        if let Some(url) = app.claude_code_oauth_url() {
-            lines.push(Line::from(""));
-            lines.push(Line::from("  OAuth link:"));
-            push_wrapped_prefixed_text(&mut lines, "    ", url, width);
+            if let Some(seconds) = app.claude_code_oauth_elapsed_seconds() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Waiting for callback ({seconds}s)."),
+                    muted(),
+                )));
+            }
+            if let Some(error) = app.claude_code_oauth_open_error() {
+                lines.push(Line::from(Span::styled(
+                    format!("  Could not open browser automatically: {error}"),
+                    failed(),
+                )));
+            } else {
+                lines.push(Line::from("  Browser sign-in opened."));
+            }
+            if let Some(url) = app.claude_code_oauth_url() {
+                lines.push(Line::from(""));
+                lines.push(Line::from("  OAuth link:"));
+                push_wrapped_prefixed_text(&mut lines, "    ", url, width);
+            }
         }
         lines.extend([
             Line::from(""),
-            selected("Open browser again", 0, app.selected_row),
+            selected(
+                if result.account == ACCOUNT_CODEX {
+                    "Open sign-in page"
+                } else {
+                    "Open browser again"
+                },
+                0,
+                app.selected_row,
+            ),
             selected("Back", 1, app.selected_row),
         ]);
     } else {
@@ -2007,13 +2255,6 @@ fn api_key_lines(app: &App) -> Vec<Line<'static>> {
     let account = app.api_key_account.as_deref().unwrap_or("selected account");
     let mut lines = vec![Line::from(Span::styled(auth_secret_label(account), bold()))];
     lines.push(Line::from(""));
-    if account == BROWSER_USE_CLOUD {
-        lines.extend([
-            Line::from("  Browser Use cloud runs a remote browser with live view."),
-            Line::from("  Add this key once, or export BROWSER_USE_API_KEY before launch."),
-            Line::from(""),
-        ]);
-    }
     lines.extend([
         Line::from(format!(
             "  {}",
@@ -2227,7 +2468,9 @@ fn mode_row(
 }
 
 fn access_label(account: &'static str) -> &'static str {
-    if is_claude_code_account(account) {
+    if account == ACCOUNT_CODEX {
+        "Codex login"
+    } else if is_claude_code_account(account) {
         "Claude Code sub"
     } else {
         account
@@ -2268,6 +2511,162 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
             ),
         ]),
     ]);
+    lines
+}
+
+pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let body_width = cookie_sync_body_width(width);
+    let mut lines = vec![
+        Line::from(Span::styled("BROWSER USE CLOUD", muted())),
+        Line::from(""),
+    ];
+    match &app.cookie_sync.status {
+        CookieSyncStatus::NeedsAuth => {
+            lines.push(Line::from("  Browser Use cloud key is missing."));
+            lines.push(Line::from(""));
+            lines.push(selected("Add Browser Use key", 0, app.selected_row));
+        }
+        CookieSyncStatus::LoadingProfiles => {
+            lines.push(Line::from("  Scanning local Chromium profiles..."));
+        }
+        CookieSyncStatus::Ready => {
+            lines.push(kv_line("scope", "all cookies"));
+            lines.push(kv_line("target", "new Browser Use cloud profile"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("LOCAL PROFILES", muted())));
+            lines.push(Line::from(""));
+            if app.cookie_sync.profiles.is_empty() {
+                lines.push(Line::from("  No local Chromium profiles found."));
+            } else {
+                for (idx, profile) in app.cookie_sync.profiles.iter().enumerate() {
+                    lines.push(selected(
+                        &truncate(&profile.display_name, body_width),
+                        idx,
+                        app.selected_row,
+                    ));
+                }
+            }
+        }
+        CookieSyncStatus::Syncing => {
+            let profile = app
+                .cookie_sync
+                .selected_profile_label
+                .as_deref()
+                .unwrap_or("selected profile");
+            push_wrapped_cookie_sync_paragraph(
+                &mut lines,
+                &format!("Syncing all cookies from {profile}..."),
+                body_width,
+            );
+        }
+        CookieSyncStatus::Completed(message) => {
+            lines.push(Line::from(Span::styled("🎉 Complete", bold())));
+            lines.push(Line::from(""));
+            push_completed_cookie_sync_message(&mut lines, message, body_width);
+            lines.push(Line::from(""));
+            lines.push(selected("Close", 0, app.selected_row));
+        }
+        CookieSyncStatus::Failed(error) => {
+            lines.push(Line::from(Span::styled("Failed", bold())));
+            lines.push(Line::from(""));
+            push_wrapped_cookie_sync_message(&mut lines, error, body_width);
+            lines.push(Line::from(""));
+            lines.push(selected("Close", 0, app.selected_row));
+        }
+    }
+    lines
+}
+
+fn cookie_sync_body_width(width: usize) -> usize {
+    width.saturating_sub(4).max(1).min(88)
+}
+
+fn push_completed_cookie_sync_message(lines: &mut Vec<Line<'static>>, message: &str, width: usize) {
+    let mut paragraphs = message.lines();
+    if let Some(first) = paragraphs.next() {
+        if let Some((count, rest)) = synced_cookie_count_fragment(first) {
+            lines.push(Line::from(vec![
+                Span::raw("  Synced "),
+                Span::styled(count.to_string(), bold()),
+                Span::raw(rest.to_string()),
+            ]));
+        } else {
+            push_wrapped_cookie_sync_paragraph(lines, first, width);
+        }
+    }
+    for paragraph in paragraphs {
+        push_wrapped_completed_cookie_sync_paragraph(lines, paragraph, width);
+    }
+}
+
+fn synced_cookie_count_fragment(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix("Synced ")?;
+    let count_len = rest
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_ascii_digit() && ch != ',').then_some(idx))
+        .unwrap_or(rest.len());
+    if count_len == 0 {
+        return None;
+    }
+    Some(rest.split_at(count_len))
+}
+
+fn push_wrapped_completed_cookie_sync_paragraph(
+    lines: &mut Vec<Line<'static>>,
+    message: &str,
+    width: usize,
+) {
+    for line in wrap_cookie_sync_message(message, width) {
+        if let Some((label, rest)) = cookie_sync_profile_label_fragment(&line) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label.to_string(), bold()),
+                Span::raw(rest.to_string()),
+            ]));
+        } else {
+            lines.push(Line::from(format!("  {line}")));
+        }
+    }
+}
+
+fn cookie_sync_profile_label_fragment(value: &str) -> Option<(&str, &str)> {
+    ["Local profile", "Cloud profile"]
+        .into_iter()
+        .find_map(|label| value.strip_prefix(label).map(|rest| (label, rest)))
+}
+
+fn push_wrapped_cookie_sync_message(lines: &mut Vec<Line<'static>>, message: &str, width: usize) {
+    for paragraph in message.lines() {
+        push_wrapped_cookie_sync_paragraph(lines, paragraph, width);
+    }
+}
+
+fn push_wrapped_cookie_sync_paragraph(lines: &mut Vec<Line<'static>>, message: &str, width: usize) {
+    for line in wrap_cookie_sync_message(message, width) {
+        lines.push(Line::from(format!("  {line}")));
+    }
+}
+
+fn wrap_cookie_sync_message(message: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in message.split_whitespace() {
+        let word_len = word.chars().count();
+        let current_len = current.chars().count();
+        if !current.is_empty() && current_len + 1 + word_len > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
     lines
 }
 

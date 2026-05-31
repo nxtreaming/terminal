@@ -4,6 +4,7 @@ use clap::ValueEnum;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 pub(crate) enum AgentBackend {
+    Codex,
     Openai,
     Anthropic,
     Openrouter,
@@ -15,6 +16,7 @@ pub(crate) enum AgentBackend {
 impl AgentBackend {
     pub(crate) fn as_setting(self) -> &'static str {
         match self {
+            Self::Codex => "codex",
             Self::Openai => "openai",
             Self::Anthropic => "anthropic",
             Self::Openrouter => "openrouter",
@@ -26,6 +28,7 @@ impl AgentBackend {
 
     pub(crate) fn from_setting(value: &str) -> Option<Self> {
         match value {
+            "codex" => Some(Self::Codex),
             "openai" => Some(Self::Openai),
             "anthropic" => Some(Self::Anthropic),
             "openrouter" => Some(Self::Openrouter),
@@ -40,6 +43,7 @@ impl AgentBackend {
 impl From<AgentBackend> for ProviderBackend {
     fn from(value: AgentBackend) -> Self {
         match value {
+            AgentBackend::Codex => Self::Codex,
             AgentBackend::Openai => Self::Openai,
             AgentBackend::Anthropic => Self::Anthropic,
             AgentBackend::Openrouter => Self::Openrouter,
@@ -68,6 +72,7 @@ pub(crate) struct ModelChoice {
     pub(crate) group: ModelChoiceGroup,
 }
 
+pub(crate) const ACCOUNT_CODEX: &str = "Codex login";
 pub(crate) const ACCOUNT_CLAUDE_CODE: &str = "Claude Code subscription";
 pub(crate) const ACCOUNT_CLAUDE_CODE_LEGACY: &str = "Claude Code login";
 pub(crate) const ACCOUNT_OPENAI: &str = "OpenAI API key";
@@ -75,7 +80,8 @@ pub(crate) const ACCOUNT_ANTHROPIC: &str = "Anthropic API key";
 pub(crate) const ACCOUNT_OPENROUTER: &str = "OpenRouter API key";
 pub(crate) const ACCOUNT_DEEPSEEK: &str = "DeepSeek API key";
 
-pub(crate) const ACCOUNT_CHOICES: [&str; 4] = [
+pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
+    ACCOUNT_CODEX,
     ACCOUNT_OPENAI,
     ACCOUNT_ANTHROPIC,
     ACCOUNT_OPENROUTER,
@@ -99,8 +105,20 @@ pub(crate) fn is_claude_code_account(account: &str) -> bool {
 
 pub(crate) fn model_choices_for_catalog(catalog: &ModelCatalog) -> Vec<ModelChoice> {
     let mut choices = Vec::new();
-    // Codex login is removed; the API-key presets (OpenAI / bring-your-own-key)
-    // and the static external providers are the only catalog-driven choices now.
+    let chatgpt_presets = catalog.presets(true);
+    choices.extend(
+        chatgpt_presets
+            .iter()
+            .filter(|preset| preset.show_in_picker)
+            .map(|preset| {
+                preset_choice(
+                    preset,
+                    ACCOUNT_CODEX,
+                    AgentBackend::Codex,
+                    ModelChoiceGroup::Recommended,
+                )
+            }),
+    );
     let api_presets = catalog.presets(false);
     choices.extend(
         api_presets
@@ -111,7 +129,7 @@ pub(crate) fn model_choices_for_catalog(catalog: &ModelCatalog) -> Vec<ModelChoi
                     preset,
                     ACCOUNT_OPENAI,
                     AgentBackend::Openai,
-                    ModelChoiceGroup::Recommended,
+                    ModelChoiceGroup::BringYourOwnKey,
                 )
             }),
     );
@@ -132,8 +150,14 @@ fn preset_choice(
     backend: AgentBackend,
     group: ModelChoiceGroup,
 ) -> ModelChoice {
-    let descriptor = if preset.description.trim().is_empty() {
-        "needs key".to_string()
+    let descriptor = if account == ACCOUNT_CODEX && preset.is_default {
+        "best default".to_string()
+    } else if preset.description.trim().is_empty() {
+        if account == ACCOUNT_CODEX {
+            "available".to_string()
+        } else {
+            "needs key".to_string()
+        }
     } else {
         preset.description.trim().to_string()
     };
