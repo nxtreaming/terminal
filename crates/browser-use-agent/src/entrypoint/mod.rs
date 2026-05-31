@@ -347,7 +347,7 @@ fn map_summary_error(e: &browser_use_llm::schema::LlmError) -> AgentError {
 /// compaction then stays disabled and the run keeps its prior (uncompacted)
 /// behavior. No network I/O.
 fn build_compaction_sampler(config: &ProviderRunConfig) -> Option<Arc<dyn DynCompactionSampler>> {
-    let choice = provider::provider_choice_for_backend(config.backend).ok()??;
+    let choice = provider::provider_choice_for_backend(config.backend, None).ok()??;
     let route = crate::turn::build_route(&choice, &config.model).ok()?;
     let client = Arc::new(browser_use_llm::route::ModelClient::default());
     Some(Arc::new(EntrypointSampler {
