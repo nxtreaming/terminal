@@ -826,7 +826,10 @@ mod tests {
     /// resolves a live driver offline (no network), targeting chatgpt.com.
     #[test]
     fn codex_backend_resolves_real_driver_from_env() {
-        // SAFETY: single-threaded test; set + clear the vars around the call.
+        // Serialize with the other env-mutating tests: this sets CODEX_* vars,
+        // and `codex_backend_resolves_choice_from_store` clears them, so without a
+        // shared lock the two race (a flake surfaced under parallel test runs).
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("CODEX_ACCESS_TOKEN", "codex-access-test");
         std::env::set_var("CODEX_ACCOUNT_ID", "codex-acct-test");
         let config = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.1-codex");
@@ -853,6 +856,9 @@ mod tests {
     /// proving the store-fallback path for codex.
     #[test]
     fn codex_backend_resolves_choice_from_store() {
+        // Serialize with the env-setting codex test (see ENV_LOCK note there):
+        // both touch CODEX_* process env, so they must not run concurrently.
+        let _guard = ENV_LOCK.lock().unwrap();
         // Env codex creds must be absent for this to exercise the store path.
         std::env::remove_var("CODEX_ACCESS_TOKEN");
         std::env::remove_var("CODEX_ACCOUNT_ID");
