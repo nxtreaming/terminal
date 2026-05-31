@@ -77,12 +77,13 @@ fn sample_request() -> RequestUserInputRequest {
     )
 }
 
-// ---- (1) a valid question (with and without choices) produces the request ----
+// ---- (1) a valid question produces the ANSWER via the host round-trip ----
 
-// (1a) A valid question WITH choices -> tool produces the structured request
-// payload (prefixed JSON) directly, without blocking.
+// (1a) A valid question WITH choices -> the tool surfaces it to the responder and
+// returns the user's ANSWERS (not the request). The default EchoAutoResponder
+// auto-selects the first option of each question (host-free).
 #[tokio::test]
-async fn valid_question_with_choices_produces_request_payload() {
+async fn valid_question_with_choices_returns_the_answer() {
     let tool = RequestUserInputTool::new();
     let launch = none_launch();
     let attempt = none_attempt(&launch);
@@ -93,19 +94,59 @@ async fn valid_question_with_choices_produces_request_payload() {
     assert!(out.stderr.is_empty());
     assert!(out.stdout.starts_with(REQUEST_USER_INPUT_STDOUT_PREFIX));
 
-    // The payload is the NORMALIZED request (is_other forced true), not an answer.
+    // The payload is the ANSWER (a RequestUserInputResponse keyed by question id),
+    // NOT the request. The default responder selected the first option ("Yes ...").
     let json = out
         .stdout
         .strip_prefix(REQUEST_USER_INPUT_STDOUT_PREFIX)
         .unwrap();
-    let parsed: RequestUserInputRequest = serde_json::from_str(json).unwrap();
-    assert_eq!(parsed.questions.len(), 1);
-    assert_eq!(parsed.questions[0].id, "deploy");
-    assert!(
-        parsed.questions[0].is_other,
-        "normalize forces is_other=true"
+    let answer: RequestUserInputResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(answer.answers.len(), 1);
+    assert_eq!(
+        answer.answers["deploy"].answers,
+        vec!["Yes (Recommended)".to_string()],
+        "default responder auto-selects the first option"
     );
-    assert_eq!(parsed.questions[0].options.as_ref().unwrap().len(), 2);
+    // It is an answer, not a request (the questions array must NOT parse).
+    assert!(serde_json::from_str::<RequestUserInputRequest>(json).is_err());
+}
+
+// (1c) A custom (host-backed) responder's answers flow through verbatim.
+#[tokio::test]
+async fn custom_responder_answers_flow_through() {
+    use super::request_user_input::RequestUserInputResponder;
+    use std::sync::Arc;
+
+    struct FixedResponder;
+    #[async_trait::async_trait]
+    impl RequestUserInputResponder for FixedResponder {
+        async fn respond(
+            &self,
+            request: &RequestUserInputRequest,
+        ) -> Result<RequestUserInputResponse, ToolError> {
+            let mut answers = HashMap::new();
+            for q in &request.questions {
+                answers.insert(
+                    q.id.clone(),
+                    UserInputAnswer {
+                        answers: vec!["custom-answer".to_string()],
+                    },
+                );
+            }
+            Ok(RequestUserInputResponse { answers })
+        }
+    }
+
+    let tool = RequestUserInputTool::with_responder(Arc::new(FixedResponder));
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let out = tool.run(&sample_request(), &attempt, &ctx()).await.unwrap();
+    let json = out
+        .stdout
+        .strip_prefix(REQUEST_USER_INPUT_STDOUT_PREFIX)
+        .unwrap();
+    let answer: RequestUserInputResponse = serde_json::from_str(json).unwrap();
+    assert_eq!(answer.answers["deploy"].answers, vec!["custom-answer"]);
 }
 
 // (1b) Validation accepts the "with choices" and "minimal but well-formed"
@@ -281,13 +322,13 @@ fn response_serde_round_trips_to_codex_wire_shape() {
 // ---- (5) drive one valid call through the orchestrator over the seam ----
 
 #[tokio::test]
-async fn orchestrated_request_completes_under_none_without_blocking() {
+async fn orchestrated_request_returns_the_answer_under_none() {
     let orch = ToolOrchestrator::new(NoneSandboxProvider, AutoApprover);
     let tool = RequestUserInputTool::new();
     let ctx = ctx();
 
-    // `Never` => no approval prompt; the call must return the request payload
-    // without ever blocking for a human (request side only).
+    // `Never` => no approval prompt; the call completes the host round-trip via
+    // the (default) responder and returns the ANSWER.
     let result = orch
         .run(
             &tool,
@@ -309,14 +350,14 @@ async fn orchestrated_request_completes_under_none_without_blocking() {
         "got: {}",
         result.output.stdout
     );
-    // It returned the REQUEST (questions), not a RequestUserInputResponse.
+    // It returned a RequestUserInputResponse (answer), NOT the request (questions).
     let json = result
         .output
         .stdout
         .strip_prefix(REQUEST_USER_INPUT_STDOUT_PREFIX)
         .unwrap();
-    assert!(serde_json::from_str::<RequestUserInputRequest>(json).is_ok());
-    assert!(serde_json::from_str::<RequestUserInputResponse>(json).is_err());
+    assert!(serde_json::from_str::<RequestUserInputResponse>(json).is_ok());
+    assert!(serde_json::from_str::<RequestUserInputRequest>(json).is_err());
 }
 
 #[tokio::test]

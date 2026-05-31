@@ -238,8 +238,22 @@ fn flatten_tool_result(content: &[ContentPart]) -> String {
     text
 }
 
-/// Lower a [`ToolDefinition`] into a Responses function tool.
+/// Lower a [`ToolDefinition`] into a Responses tool entry.
+///
+/// Most tools are plain function tools (`{"type":"function", "name", ...}`).
+/// `web_search` is the EXCEPTION: the OpenAI Responses API rejects it as a
+/// function tool — it is a HOSTED tool that must be emitted as
+/// `{"type":"web_search_preview"}` (no `name`/`description`/`parameters`
+/// wrapper). This mirrors the legacy provider encoding (the
+/// `responses_tools_encode_hosted_web_search_and_image_generation_like_codex`
+/// test) and codex's `ModelClient`, which maps the `web_search` tool to the
+/// Responses hosted `web_search_preview` type.
 fn lower_tool(tool: &ToolDefinition) -> Value {
+    if tool.name == "web_search" {
+        // Hosted tool: the Responses API names it `web_search_preview` and takes
+        // no function envelope.
+        return json!({ "type": "web_search_preview" });
+    }
     json!({
         "type": "function",
         "name": tool.name,
@@ -830,6 +844,68 @@ mod tests {
             input: json!({}),
         }));
         assert!(matches!(events.last(), Some(LlmEvent::Finish { .. })));
+    }
+
+    #[test]
+    fn web_search_encodes_as_hosted_tool_and_shell_stays_flat_function() {
+        let mut request = LlmRequest::new("gpt-5.1-codex", "openai");
+        // A normal function tool (shell) and the hosted web_search tool.
+        request.tools.push(ToolDefinition {
+            name: "shell".to_string(),
+            description: "Run a shell command".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "command": { "type": "array" } },
+                "required": ["command"]
+            }),
+        });
+        request.tools.push(ToolDefinition {
+            name: "web_search".to_string(),
+            description: "Search the web".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": { "query": { "type": "string" } },
+                "required": ["query"]
+            }),
+        });
+
+        let body = OpenAiResponsesProtocol::new()
+            .build_body(&request)
+            .expect("build_body");
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 2);
+
+        // shell: a flat function tool (type=function, with name/parameters).
+        let shell = tools
+            .iter()
+            .find(|t| t["name"] == json!("shell"))
+            .expect("shell tool present");
+        assert_eq!(shell["type"], json!("function"));
+        assert_eq!(shell["name"], json!("shell"));
+        assert_eq!(
+            shell["parameters"]["properties"]["command"]["type"],
+            json!("array")
+        );
+
+        // web_search: the HOSTED shape `{"type":"web_search_preview"}` — no
+        // function wrapper, no `name`, no `parameters`.
+        let web = tools
+            .iter()
+            .find(|t| t["type"] == json!("web_search_preview"))
+            .expect("web_search must encode as web_search_preview");
+        assert_eq!(web, &json!({ "type": "web_search_preview" }));
+        assert!(
+            web.get("name").is_none(),
+            "hosted web_search must not carry a function `name`"
+        );
+        assert!(
+            web.get("parameters").is_none(),
+            "hosted web_search must not carry `parameters`"
+        );
+        assert!(
+            tools.iter().all(|t| t["name"] != json!("web_search")),
+            "web_search must NOT appear as a function tool named web_search"
+        );
     }
 
     #[test]

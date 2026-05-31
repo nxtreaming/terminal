@@ -22,6 +22,7 @@ use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
 use crate::tools::handlers::browser::{
     BrowserBackend, BrowserRequest, BrowserTool, BrowserWireArgs,
 };
+use crate::tools::handlers::done::DoneTool;
 use crate::tools::handlers::mcp::{
     McpCallResult, McpClient, McpTool, McpToolCallRequest, McpWireArgs,
 };
@@ -515,6 +516,7 @@ fn full_registry() -> ToolRegistry {
             ["namespace"],
         )]),
         WebSearchTool::new(WebSearchConfig::enabled()),
+        DoneTool::new(),
     )
 }
 
@@ -528,14 +530,14 @@ fn ctx_at(name: &str, cwd: PathBuf) -> ToolCtx {
 }
 
 #[test]
-fn default_registry_registers_all_ten_tools() {
+fn default_registry_registers_all_eleven_tools() {
     let reg = full_registry();
-    assert_eq!(reg.len(), 10, "all ten tools must register");
+    assert_eq!(reg.len(), 11, "all eleven tools must register");
     let defs = reg.model_visible_definitions();
     assert_eq!(
         defs.len(),
-        10,
-        "model_visible_definitions must list all ten"
+        11,
+        "model_visible_definitions must list all eleven"
     );
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     names.sort_unstable();
@@ -544,6 +546,7 @@ fn default_registry_registers_all_ten_tools() {
         vec![
             "apply_patch",
             "browser",
+            "done",
             "mcp",
             "python",
             "request_user_input",
@@ -581,6 +584,7 @@ fn parallel_safe_flags_match_registration() {
         "mcp",
         "update_plan",
         "request_user_input",
+        "done",
     ] {
         assert_eq!(
             reg.parallel_safe(name),
@@ -1000,4 +1004,105 @@ fn definitions_carry_required_fields_and_names() {
     assert_eq!(definitions::python().input_schema["required"][0], "code");
     assert_eq!(definitions::browser().input_schema["required"][0], "action");
     assert_eq!(definitions::mcp().input_schema["required"][0], "server");
+}
+
+/// REGRESSION (fix 1): the `request_user_input` schema must advertise the shape
+/// the handler ACTUALLY accepts — `{ "questions": [...] }` — NOT the old flat
+/// `{ "prompt": ... }`, which a model would follow and then hit a deserialize
+/// error. The advertised schema's `required`/`properties` and a model-shaped
+/// payload must both line up with `RequestUserInputRequest`.
+#[test]
+fn request_user_input_schema_matches_the_handler_questions_shape() {
+    let schema = definitions::request_user_input().input_schema;
+
+    // The advertised schema requires `questions` (an array), NOT `prompt`.
+    assert_eq!(
+        schema["required"][0], "questions",
+        "schema must require `questions`"
+    );
+    assert!(
+        schema["properties"].get("questions").is_some(),
+        "schema must advertise a `questions` property"
+    );
+    assert_eq!(schema["properties"]["questions"]["type"], "array");
+    // The OLD buggy `prompt` field must be gone (it was never accepted).
+    assert!(
+        schema["properties"].get("prompt").is_none(),
+        "schema must NOT advertise the old `prompt` field"
+    );
+    assert_ne!(
+        schema["required"][0], "prompt",
+        "schema must not require the old `prompt`"
+    );
+    // Each question item advertises id/header/question/options.
+    let item_required = &schema["properties"]["questions"]["items"]["required"];
+    let req_set: Vec<&str> = item_required
+        .as_array()
+        .unwrap()
+        .iter()
+        .map(|v| v.as_str().unwrap())
+        .collect();
+    for field in ["id", "header", "question", "options"] {
+        assert!(
+            req_set.contains(&field),
+            "question item must require `{field}`"
+        );
+    }
+
+    // A MODEL-shaped payload that follows the advertised schema deserializes into
+    // the handler's real `RequestUserInputRequest`.
+    let model_payload = serde_json::json!({
+        "questions": [{
+            "id": "deploy",
+            "header": "Deploy",
+            "question": "Ship it?",
+            "options": [
+                { "label": "Yes", "description": "deploy now" },
+                { "label": "No", "description": "hold off" }
+            ]
+        }]
+    });
+    let parsed: RequestUserInputRequest =
+        serde_json::from_value(model_payload).expect("model `questions` payload must deserialize");
+    assert_eq!(parsed.questions.len(), 1);
+    assert_eq!(parsed.questions[0].id, "deploy");
+    assert_eq!(parsed.questions[0].options.as_ref().unwrap().len(), 2);
+
+    // The OLD advertised payload `{ "prompt": ... }` is NOT what the handler
+    // accepts (proving the old schema was a real correctness bug).
+    let old_payload = serde_json::json!({ "prompt": "Ship it?" });
+    assert!(
+        serde_json::from_value::<RequestUserInputRequest>(old_payload).is_err(),
+        "the old `{{prompt}}` shape must NOT deserialize into the handler's request"
+    );
+}
+
+/// The `done` (completion) tool is registered + dispatches through the registry,
+/// returning its prefixed acknowledgement (fix 3).
+#[tokio::test]
+async fn done_dispatches_through_the_registry() {
+    let reg = full_registry();
+    assert!(reg.contains("done"), "done must be registered");
+    let orch = ToolOrchestrator::stub();
+    let out = reg
+        .dispatch(
+            "done",
+            &serde_json::json!({ "text": "task finished" }),
+            &ctx("done"),
+            &env(),
+            AskForApproval::Never,
+            &orch,
+        )
+        .await
+        .expect("done should dispatch");
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        out.stdout,
+        format!(
+            "{}task finished",
+            crate::tools::handlers::done::DONE_STDOUT_PREFIX
+        )
+    );
+    // done is serial (terminal).
+    assert_eq!(reg.parallel_safe("done"), Some(false));
 }
