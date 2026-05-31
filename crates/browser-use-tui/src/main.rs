@@ -98,10 +98,10 @@ use runtime::run_agent_thread;
 use settings::{
     browser_use_cloud_env_key_present, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
-    provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES,
-    ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES,
-    BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
-    BROWSER_USE_CLOUD_API_KEY_SETTING,
+    model_choices_for_config, provider_model_for_display, AgentBackend, ModelChoice,
+    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
+    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
+    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -2084,13 +2084,13 @@ impl App {
         // `model_choices_for_catalog`. The new `browser-use-agent`
         // `config_model::ModelCatalog` is a minimal resolution-only mirror
         // (slug/display/is_default, no provider presets), so it cannot drive the
-        // rich provider/account picker. We therefore build the picker from the
-        // providers crate's full bundled catalog (the same source
-        // `fallback_model_choices` uses); the cwd-configured model is still
-        // honored as the *default selection* below via
-        // `configured_model_for_cwd_with_options`.
+        // rich provider/account picker. Instead we honor the active profile's
+        // `config.toml` `model_catalog_json` pointer (parsed into the providers
+        // crate's full `ModelCatalog`) when present, falling back to the bundled
+        // catalog otherwise; the cwd-configured model is still honored as the
+        // *default selection* below via `configured_model_for_cwd_with_options`.
         let _ = model_catalog_for_cwd_with_options(&current_dir, config_profile, &config_overrides);
-        let model_choices = fallback_model_choices();
+        let model_choices = model_choices_for_config(config_profile);
         let stored_model = store.get_setting("model")?;
         let had_stored_model = stored_model.is_some();
         let explicit_model = args
@@ -10547,14 +10547,11 @@ mod redesign_tests {
         Ok(())
     }
 
-    // Engine gap: the TUI model picker still builds rows from the providers bundled
-    // catalog (`fallback_model_choices`) and does not load the home/cwd `config.toml`
-    // `model_catalog_json` catalog the fixture writes, so the config-driven presets
-    // (`Catalog GPT` / `ChatGPT Only Catalog`) are unreachable. Wiring this requires a
-    // `model_catalog_json` loader feeding `model_choices_for_catalog`; left ignored
-    // until that catalog-load path is ported.
+    // The TUI model picker honors the active profile's `config.toml`
+    // `model_catalog_json` pointer (parsed into the providers `ModelCatalog` via
+    // `model_choices_for_config`), so the config-driven presets (`Catalog GPT` /
+    // `ChatGPT Only Catalog`) written by `write_tui_model_catalog` drive the rows.
     #[test]
-    #[ignore = "engine: TUI picker does not load config.toml model_catalog_json catalog"]
     fn model_selector_uses_active_catalog_presets() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = temp.path().join("browser-use-terminal-home");
@@ -10744,14 +10741,11 @@ wire_api = "responses"
         Ok(())
     }
 
-    // Engine gap: depends on the cwd/home `config.toml` model_catalog (the
-    // `catalog-gpt` preset written by `write_tui_model_catalog`), which the TUI picker
-    // does not load — it builds rows from the providers bundled catalog instead, so
-    // the `catalog-gpt` OpenAI row does not exist. The session-scoping behavior under
-    // test is sound; only the catalog fixture is unreachable until the
-    // `model_catalog_json` loader is wired into the picker.
+    // The `catalog-gpt` OpenAI row comes from the cwd/home `config.toml`
+    // `model_catalog_json` catalog (written by `write_tui_model_catalog`), now
+    // loaded by the picker via `model_choices_for_config`. This exercises the
+    // session-scoping behavior on top of that config-driven catalog row.
     #[test]
-    #[ignore = "engine: TUI picker does not load config.toml model_catalog_json catalog"]
     fn model_selection_is_session_scoped_for_followups() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = temp.path().join("browser-use-terminal-home");

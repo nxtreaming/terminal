@@ -1,4 +1,5 @@
 use browser_use_agent::config_overrides::ProviderBackend;
+use browser_use_agent::history::browser_use_terminal_home_dir;
 use browser_use_providers::{bundled_model_catalog, ModelCatalog, ModelPresetInfo};
 use clap::ValueEnum;
 
@@ -142,6 +143,53 @@ pub(crate) fn model_choices_for_catalog(catalog: &ModelCatalog) -> Vec<ModelChoi
 
 pub(crate) fn fallback_model_choices() -> Vec<ModelChoice> {
     model_choices_for_catalog(&bundled_model_catalog())
+}
+
+/// Build the model picker rows for the active config profile.
+///
+/// Honors a `config.toml` `model_catalog_json` file pointer: when the active
+/// profile's config (under `$BROWSER_USE_TERMINAL_HOME` / `~/.browser-use-terminal`)
+/// sets `model_catalog_json = "<path>"`, the referenced JSON is parsed into the
+/// providers-crate [`ModelCatalog`] and used to drive the picker. Otherwise (no
+/// config, no pointer, or any load/parse failure) falls back to the bundled
+/// catalog via [`fallback_model_choices`], leaving default users unaffected.
+pub(crate) fn model_choices_for_config(config_profile: Option<&str>) -> Vec<ModelChoice> {
+    match load_config_model_catalog(config_profile) {
+        Some(catalog) => model_choices_for_catalog(&catalog),
+        None => fallback_model_choices(),
+    }
+}
+
+/// Load the providers-crate [`ModelCatalog`] referenced by the active profile's
+/// `config.toml` `model_catalog_json` pointer, if present and parseable.
+///
+/// The base config lives at `$BROWSER_USE_TERMINAL_HOME/config.toml`
+/// (`~/.browser-use-terminal/config.toml`); a named profile reads
+/// `<name>.config.toml` from the same directory. The `model_catalog_json`
+/// pointer is resolved relative to the config file's directory. Returns `None`
+/// when there is no config file, no `model_catalog_json` key, or any read/parse
+/// step fails.
+fn load_config_model_catalog(config_profile: Option<&str>) -> Option<ModelCatalog> {
+    let home = browser_use_terminal_home_dir()?;
+    let config_file = match config_profile {
+        Some(profile) if !profile.trim().is_empty() => format!("{}.config.toml", profile.trim()),
+        _ => "config.toml".to_string(),
+    };
+    let config_path = home.join(config_file);
+    let config_text = std::fs::read_to_string(&config_path).ok()?;
+    let parsed = config_text.parse::<toml::Value>().ok()?;
+    let pointer = parsed.get("model_catalog_json")?.as_str()?.trim();
+    if pointer.is_empty() {
+        return None;
+    }
+    let pointer_path = std::path::Path::new(pointer);
+    let resolved = if pointer_path.is_absolute() {
+        pointer_path.to_path_buf()
+    } else {
+        config_path.parent()?.join(pointer_path)
+    };
+    let json = std::fs::read_to_string(&resolved).ok()?;
+    serde_json::from_str::<ModelCatalog>(&json).ok()
 }
 
 fn preset_choice(

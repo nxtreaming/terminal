@@ -357,6 +357,7 @@ dependencies = [
  "syntect",
  "tempfile",
  "tokio",
+ "toml",
  "two-face",
  "unicode-width",
 ]
