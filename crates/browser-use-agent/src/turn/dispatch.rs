@@ -45,7 +45,7 @@
 
 use std::sync::Arc;
 
-use browser_use_llm::schema::{ContentPart, Message, MessageRole};
+use browser_use_llm::schema::{ContentPart, Message, MessageRole, ToolDefinition};
 use futures_util::stream::{FuturesOrdered, StreamExt};
 use tokio::sync::RwLock;
 use tokio_util::sync::CancellationToken;
@@ -277,6 +277,14 @@ pub struct ToolDispatcher<R: CallRunner = OrchestratorRunner> {
     runner: Arc<R>,
     /// Model-level parallel-tool-calls capability fed to `classify_parallelism`.
     supports_parallel_tool_calls: bool,
+    /// The model-visible tool definitions the registry advertises
+    /// (`ToolRegistry::model_visible_definitions()`), captured at construction so
+    /// the fused [`ModelSamplingDriver`](crate::turn::sampling::ModelSamplingDriver)
+    /// can populate `LlmRequest::tools` WITHOUT reaching through the generic `R`
+    /// (the registry is private inside `RegistryRunner`). Order matches the
+    /// registry's advertised order (name-sorted). Empty for bare/test dispatchers
+    /// built without specs.
+    tool_specs: Vec<ToolDefinition>,
 }
 
 impl ToolDispatcher<OrchestratorRunner> {
@@ -291,12 +299,44 @@ impl<R: CallRunner + 'static> ToolDispatcher<R> {
     /// Build a dispatcher with an explicit [`CallRunner`] and the model's
     /// parallel-tool-calls capability. Used by the production constructor and by
     /// tests (which inject a scripted runner).
+    ///
+    /// Carries NO model-visible tool specs (`tool_specs` empty), so a fused
+    /// driver built over this dispatcher sends no tool definitions. Use
+    /// [`with_runner_and_specs`](ToolDispatcher::with_runner_and_specs) to attach
+    /// the registry's advertised specs so the model receives the tool catalog.
     pub fn with_runner(runner: R, supports_parallel_tool_calls: bool) -> Self {
+        Self::with_runner_and_specs(runner, supports_parallel_tool_calls, Vec::new())
+    }
+
+    /// Build a dispatcher with an explicit [`CallRunner`], the model's
+    /// parallel-tool-calls capability, and the model-visible tool `specs` the
+    /// registry advertises (`ToolRegistry::model_visible_definitions()`).
+    ///
+    /// The `specs` are stored verbatim (same `Vec<ToolDefinition>`, order-stable)
+    /// and exposed via [`tool_specs`](ToolDispatcher::tool_specs) so the fused
+    /// [`ModelSamplingDriver`](crate::turn::sampling::ModelSamplingDriver) can set
+    /// `LlmRequest::tools` on each per-turn request — without the driver needing
+    /// to reach the registry (private inside `RegistryRunner`) through `R`.
+    pub fn with_runner_and_specs(
+        runner: R,
+        supports_parallel_tool_calls: bool,
+        tool_specs: Vec<ToolDefinition>,
+    ) -> Self {
         Self {
             gate: Arc::new(RwLock::new(())),
             runner: Arc::new(runner),
             supports_parallel_tool_calls,
+            tool_specs,
         }
+    }
+
+    /// The model-visible tool definitions this dispatcher carries, in the
+    /// registry's advertised order. Empty unless built via
+    /// [`with_runner_and_specs`](ToolDispatcher::with_runner_and_specs). The fused
+    /// driver copies these into `LlmRequest::tools` so the model can emit tool
+    /// calls (codex sends the tool catalog on every sampling request).
+    pub fn tool_specs(&self) -> &[ToolDefinition] {
+        &self.tool_specs
     }
 
     /// Dispatch the turn's tool `calls`.

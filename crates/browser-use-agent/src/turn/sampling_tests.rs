@@ -9,7 +9,7 @@
 //! so no Cargo manifest change is needed).
 
 use std::sync::atomic::{AtomicUsize, Ordering};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use browser_use_llm::schema::{
     ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
@@ -79,6 +79,38 @@ struct PendingTransport;
 impl SamplingTransport for PendingTransport {
     fn open_stream<'a>(&'a self, _req: &LlmRequest) -> Result<EventStream<'a>, LlmError> {
         Ok(Box::pin(stream::pending()))
+    }
+}
+
+/// A transport that RECORDS the [`LlmRequest`] handed to `open_stream` so a test
+/// can assert the driver threads the real per-turn request (populated input)
+/// through — i.e. the per-call `req` is used, not the empty one seeded at
+/// construction. This is the regression seam for the empty-request bug.
+struct RecordingTransport {
+    /// The requests captured on each `open_stream`, in order.
+    seen: Arc<Mutex<Vec<LlmRequest>>>,
+    /// Canned events to stream back so the driver completes a turn.
+    events: Vec<Result<LlmEvent, LlmError>>,
+}
+
+impl RecordingTransport {
+    fn new(events: Vec<Result<LlmEvent, LlmError>>) -> (Self, Arc<Mutex<Vec<LlmRequest>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                seen: seen.clone(),
+                events,
+            },
+            seen,
+        )
+    }
+}
+
+impl SamplingTransport for RecordingTransport {
+    fn open_stream<'a>(&'a self, req: &LlmRequest) -> Result<EventStream<'a>, LlmError> {
+        // Capture exactly what the driver passed for this open.
+        self.seen.lock().unwrap().push(req.clone());
+        Ok(Box::pin(stream::iter(self.events.clone())))
     }
 }
 
@@ -323,5 +355,262 @@ async fn cancellation_mid_stream_returns_turn_aborted() {
     assert!(
         matches!(err, AgentError::TurnAborted),
         "cancelled turn must return AgentError::TurnAborted, got {err:?}"
+    );
+}
+
+// ---- (5) the driver passes the REAL per-call request to open_stream --------
+
+#[tokio::test]
+async fn driver_passes_populated_per_call_request_to_open_stream() {
+    // Regression for the empty-request bug: the production transport used to ignore
+    // the `req` passed to `open_stream` and stream a fixed request built once with
+    // EMPTY messages, so the provider received no input (HTTP 400). Here a
+    // RecordingTransport captures the request the driver actually hands it; we
+    // assert it carries the populated input messages, not an empty body.
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5).without_jitter();
+
+    let input = user_input();
+    let _ = d
+        .run_sampling_request(input.clone(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "exactly one open for a single successful turn"
+    );
+    let req = &captured[0];
+    // The body the provider would receive MUST be non-empty (the bug shipped an
+    // empty `messages` vec, which the provider rejects).
+    assert!(
+        !req.messages.is_empty(),
+        "open_stream received an EMPTY request — the empty-input bug is back"
+    );
+    // And it must be EXACTLY the input the driver was asked to sample, with the
+    // turn's model/provider identity from `ctx()`.
+    assert_eq!(
+        req.messages, input,
+        "open_stream must receive the driver's per-call input messages verbatim"
+    );
+    // `req.model`/`req.provider` are the `ModelId`/`ProviderId` newtypes; compare
+    // against the same `.into()` conversion `LlmRequest::new` applies to `ctx()`.
+    assert_eq!(
+        req.model,
+        ctx().model.into(),
+        "request carries the turn's model"
+    );
+    assert_eq!(
+        req.provider,
+        ctx().provider.into(),
+        "request carries the turn's provider"
+    );
+}
+
+// ---- (6) each turn installs its OWN request (the cell is per-call) ----------
+
+#[tokio::test]
+async fn each_open_sees_its_own_per_call_request() {
+    // Two opens (retry path): both must capture the same populated per-call
+    // request — proving the installed request is the driver's, not a stale fixed
+    // one. (Mid-stream retry re-opens; we use an open-error retry for simplicity.)
+    let events = vec![text_delta("done"), finish(FinishReason::Stop)];
+    let (transport, seen) = RetryThenRecordTransport::new(events);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5).without_jitter();
+
+    let input = user_input();
+    let _ = d
+        .run_sampling_request(input.clone(), CancellationToken::new())
+        .await
+        .expect("driver should recover and succeed");
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(captured.len(), 2, "one failed open + one successful open");
+    for (i, req) in captured.iter().enumerate() {
+        assert!(
+            !req.messages.is_empty(),
+            "open #{i} received an EMPTY request"
+        );
+        assert_eq!(
+            req.messages, input,
+            "open #{i} must carry the per-call input verbatim"
+        );
+    }
+}
+
+/// A transport that fails the FIRST open with a retryable error, then on the
+/// second open records the request and streams the canned events. Records every
+/// request it is handed (including the one for the failed open).
+struct RetryThenRecordTransport {
+    seen: Arc<Mutex<Vec<LlmRequest>>>,
+    opens: AtomicUsize,
+    events: Vec<Result<LlmEvent, LlmError>>,
+}
+
+impl RetryThenRecordTransport {
+    fn new(events: Vec<Result<LlmEvent, LlmError>>) -> (Self, Arc<Mutex<Vec<LlmRequest>>>) {
+        let seen = Arc::new(Mutex::new(Vec::new()));
+        (
+            Self {
+                seen: seen.clone(),
+                opens: AtomicUsize::new(0),
+                events,
+            },
+            seen,
+        )
+    }
+}
+
+impl SamplingTransport for RetryThenRecordTransport {
+    fn open_stream<'a>(&'a self, req: &LlmRequest) -> Result<EventStream<'a>, LlmError> {
+        // Record the request on every open, including the failing first one — the
+        // driver must hand its real per-call request to each attempt.
+        self.seen.lock().unwrap().push(req.clone());
+        if self.opens.fetch_add(1, Ordering::SeqCst) == 0 {
+            return Err(retryable_err("first open fails, retry"));
+        }
+        let stream: EventStream<'a> = Box::pin(stream::iter(self.events.clone()));
+        Ok(stream)
+    }
+}
+
+// ---- (7) the fused driver advertises the dispatcher's tool specs -----------
+
+/// A trivial [`CallRunner`] for wiring a fused driver in a tool-defs test: it
+/// never actually runs (these tests stream only text, so no tool call is
+/// dispatched) — it exists solely so the driver can be built with a
+/// [`ToolDispatcher`] that carries specs.
+struct NoopRunner;
+
+#[async_trait::async_trait]
+impl crate::turn::dispatch::CallRunner for NoopRunner {
+    fn parallel_safe(&self, _call: &ContentPart) -> bool {
+        false
+    }
+    async fn run(&self, call: ContentPart) -> Message {
+        // Unreachable in these tests (no tool call is emitted), but satisfy the
+        // trait with a benign tool-result so the type checks.
+        let id = match &call {
+            ContentPart::ToolCall { id, .. } => id.clone(),
+            _ => String::new(),
+        };
+        Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: id,
+                content: vec![ContentPart::text("noop")],
+                is_error: false,
+            }],
+        )
+    }
+}
+
+/// A no-op [`FusionRecorder`] (the fused path requires both a dispatcher AND a
+/// recorder; these tests never dispatch, so nothing is ever recorded).
+struct NoopRecorder;
+
+#[async_trait::async_trait]
+impl crate::turn::sampling::FusionRecorder for NoopRecorder {
+    async fn record(&self, _messages: &[Message]) {}
+}
+
+/// A tool definition with an empty input schema; the request only needs the
+/// `name` to be carried through to the wire, so the schema content is irrelevant
+/// to what this test proves.
+fn tool_def(name: &str) -> browser_use_llm::schema::ToolDefinition {
+    browser_use_llm::schema::ToolDefinition {
+        name: name.to_string(),
+        description: String::new(),
+        input_schema: serde_json::json!({"type": "object"}),
+    }
+}
+
+#[tokio::test]
+async fn fused_driver_advertises_dispatcher_tool_specs_on_request() {
+    use crate::turn::dispatch::ToolDispatcher;
+    use crate::turn::sampling::FusionRecorder;
+
+    // The dispatcher carries the SAME `Vec<ToolDefinition>` the registry would
+    // advertise (here: the three product tools, order-stable). The fused driver
+    // must copy these into `LlmRequest::tools` so the model receives the tool
+    // catalog and can actually emit browser/python/shell tool calls — without
+    // this the model gets no tools and fusion never fires on a real turn.
+    let specs = vec![tool_def("browser"), tool_def("python"), tool_def("shell")];
+    let dispatcher = Arc::new(ToolDispatcher::with_runner_and_specs(
+        NoopRunner, /* model_supports */ true, specs,
+    ));
+    // Sanity: the accessor returns exactly what we stored, order-stable.
+    assert_eq!(
+        dispatcher
+            .tool_specs()
+            .iter()
+            .map(|t| t.name.as_str())
+            .collect::<Vec<_>>(),
+        vec!["browser", "python", "shell"],
+        "dispatcher must carry the registry's specs verbatim (order-stable)"
+    );
+
+    // Record the request the driver hands to the transport. The stream is
+    // text-only (no tool call), so nothing is dispatched/recorded — we only care
+    // about the request the driver built.
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let recorder: Arc<dyn FusionRecorder> = Arc::new(NoopRecorder);
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5)
+        .without_jitter()
+        .with_fusion(dispatcher, recorder);
+
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(
+        captured.len(),
+        1,
+        "exactly one open for one successful turn"
+    );
+    let req = &captured[0];
+    // The whole point of this WP: the per-turn request the provider receives now
+    // carries the registered tool definitions.
+    assert!(
+        !req.tools.is_empty(),
+        "fused driver must advertise the dispatcher's tool specs — req.tools is EMPTY"
+    );
+    let names: Vec<&str> = req.tools.iter().map(|t| t.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["browser", "python", "shell"],
+        "req.tools must carry the registered tool names, in the registry's order"
+    );
+}
+
+#[tokio::test]
+async fn text_only_driver_sends_no_tool_specs() {
+    // The text-only driver (no dispatcher) must send NO tools — codex sends the
+    // tool catalog only when the turn's toolset is non-empty, and this is the
+    // counterpart that proves the fused path's behavior is dispatcher-gated.
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5).without_jitter();
+
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    assert_eq!(captured.len(), 1);
+    assert!(
+        captured[0].tools.is_empty(),
+        "a driver with no dispatcher must not advertise any tools"
     );
 }

@@ -446,6 +446,13 @@ fn build_tool_dispatcher(
         PythonTool::with_backend(python_backend),
     );
 
+    // Capture the model-visible tool definitions BEFORE `reg` is moved into the
+    // runner's Arc, so the dispatcher can carry them to the sampling driver (which
+    // sets `LlmRequest::tools` from them). Same Vec the registry advertises
+    // (name-sorted, order-stable) — without this the model receives no tool
+    // definitions and can never emit browser/python/shell tool calls.
+    let specs = reg.model_visible_definitions();
+
     let runner = RegistryRunner::new(
         Arc::new(reg),
         Arc::new(ToolOrchestrator::stub()),
@@ -469,8 +476,8 @@ fn build_tool_dispatcher(
         AskForApproval::Never,
     );
 
-    Arc::new(ToolDispatcher::with_runner(
-        runner, /* supports_parallel_tool_calls */ true,
+    Arc::new(ToolDispatcher::with_runner_and_specs(
+        runner, /* supports_parallel_tool_calls */ true, specs,
     ))
 }
 
