@@ -50,8 +50,12 @@ use crate::config_overrides::ProviderBackend;
 use crate::config_overrides::ProviderRunConfig;
 use crate::events::EventSink;
 use crate::events::TurnCtx;
+use crate::mcp::McpConnectionManager;
+use crate::session::{SessionId, SharedStore};
 use crate::tools::approval::AskForApproval;
+use crate::tools::handlers::mcp::{McpClient, McpTool};
 use crate::tools::handlers::python::PythonBackend;
+use crate::tools::handlers::request_user_input::StoreRoundTripResponder;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::runtime::ToolCtx;
 use crate::tools::sandbox::FileSystemSandboxPolicy;
@@ -354,12 +358,26 @@ pub fn resolve_provider(
     ctx: TurnCtx,
     max_retries: u32,
     recorder: Arc<dyn FusionRecorder>,
+    user_input: Option<(SharedStore, SessionId)>,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
     // The Fake short-circuit lives in the inner builder (so we never spawn a
     // Python worker for a fake/cut/missing-credential run). For a real backend we
     // start the run's single Python worker EAGERLY here, then thread its backend
     // through. `start_python_backend` only runs once we know the route builds.
-    resolve_provider_with_python(config, store, sink, ctx, max_retries, recorder, None)
+    //
+    // `user_input` is the (SharedStore, SessionId) the production `request_user_input`
+    // responder round-trips through (Some on the live run path, None for tests /
+    // headless callers — which fall back to the Echo auto-responder).
+    resolve_provider_with_python(
+        config,
+        store,
+        sink,
+        ctx,
+        max_retries,
+        recorder,
+        None,
+        user_input,
+    )
 }
 
 /// Start the run's single Python worker subprocess (eager, matching legacy
@@ -397,6 +415,7 @@ fn start_python_backend(
 /// Python process — the real-driver-constructs-offline assertion is about the
 /// model transport, not the worker, so injecting a fake keeps it network/process
 /// free while still wiring the `python` tool through the real dispatcher.
+#[allow(clippy::too_many_arguments)]
 fn resolve_provider_with_python(
     config: &ProviderRunConfig,
     store: Option<&Store>,
@@ -405,6 +424,7 @@ fn resolve_provider_with_python(
     max_retries: u32,
     recorder: Arc<dyn FusionRecorder>,
     python_backend: Option<Arc<dyn PythonBackend>>,
+    user_input: Option<(SharedStore, SessionId)>,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
     // (1) backend → credentialed provider choice (env-then-store creds; codex from
     //     env/store/~/.codex; None → Err; Fake → None).
@@ -437,8 +457,10 @@ fn resolve_provider_with_python(
     // It yields the text-only sampler; we then attach the FUSED dispatch path so a
     // model tool-call actually EXECUTES (through the registry + orchestrator) and
     // its output re-enters the prompt via `recorder`, and the loop re-samples.
-    let driver = build_sampling_driver(transport, sink, ctx, max_retries)
-        .with_fusion(build_tool_dispatcher(python_backend), recorder);
+    let driver = build_sampling_driver(transport, sink, ctx, max_retries).with_fusion(
+        build_tool_dispatcher(python_backend, config, user_input),
+        recorder,
+    );
     Ok(ResolvedProvider::Real(Box::new(driver)))
 }
 
@@ -473,10 +495,12 @@ fn resolve_provider_with_python(
 ///     interpreter process).
 ///
 /// `mcp` ([`McpTool::new`] takes an
-/// [`McpClient`](crate::tools::handlers::mcp::McpClient)) is still NOT registered
-/// here — it is handled separately and needs the MCP client manager threaded
-/// through. A model call to `mcp` returns the registry's "unknown tool"
-/// tool-result rather than reaching a default backend.
+/// [`McpClient`](crate::tools::handlers::mcp::McpClient)) is registered ONLY when
+/// the run config supplies one or more `mcp_servers`: this builder connects them
+/// via [`McpConnectionManager::connect_all`] (per-server failure isolation) and
+/// registers the `mcp` tool over the resulting manager. An EMPTY `mcp_servers`
+/// map (the default) registers nothing, preserving prior behavior — a model call
+/// to `mcp` then returns the registry's "unknown tool" tool-result.
 ///
 /// [`BrowserTool::new`]: crate::tools::handlers::browser::BrowserTool::new
 /// [`PythonTool::with_backend`]: crate::tools::handlers::python::PythonTool::with_backend
@@ -497,10 +521,13 @@ fn resolve_provider_with_python(
 ///   are registered serial, so this is safe).
 fn build_tool_dispatcher(
     python_backend: Arc<dyn PythonBackend>,
+    config: &ProviderRunConfig,
+    user_input: Option<(SharedStore, SessionId)>,
 ) -> Arc<ToolDispatcher<RegistryRunner>> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
     use crate::tools::handlers::done::{DoneRequest, DoneTool};
+    use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::{PythonRequest, PythonTool};
     use crate::tools::handlers::request_user_input::{
         RequestUserInputRequest, RequestUserInputTool,
@@ -535,11 +562,22 @@ fn build_tool_dispatcher(
         false,
         UpdatePlanTool::new(),
     );
+    // `request_user_input`: production path round-trips the question/answer
+    // through the session store so the TUI (or any consumer of the
+    // `request_user_input.requested` / `.response` control-channel events) can
+    // surface it to the operator and deliver the answer back. With no store /
+    // session available (tests, headless), fall back to the Echo auto-responder.
+    let request_user_input_tool = match &user_input {
+        Some((store, session_id)) => RequestUserInputTool::with_responder(Arc::new(
+            StoreRoundTripResponder::new(store.clone(), session_id.clone()),
+        )),
+        None => RequestUserInputTool::new(),
+    };
     reg.register::<_, RequestUserInputRequest>(
         "request_user_input",
         definitions::request_user_input(),
         false,
-        RequestUserInputTool::new(),
+        request_user_input_tool,
     );
     // `web_search` is ENABLED (hosted/provider-side). The OpenAI Responses
     // request builder encodes it as the hosted `{"type":"web_search_preview"}`
@@ -564,6 +602,33 @@ fn build_tool_dispatcher(
     // `done`: the completion tool the model calls to declare it has finished, with
     // its final summary. Serial (terminal; must not be reordered).
     reg.register::<_, DoneRequest>("done", definitions::done(), false, DoneTool::new());
+
+    // `mcp`: register the MCP bridge ONLY when servers are configured. An empty
+    // `mcp_servers` map (the default) registers nothing, preserving prior
+    // behavior. Non-empty => connect all servers (per-server failure isolation
+    // inside `connect_all`) and register the single `mcp` tool over the resulting
+    // manager (which implements `McpClient`). Registered `parallel_safe = false`;
+    // the handler's per-request read-only hint still drives its own gate.
+    if !config.options.mcp_servers.is_empty() {
+        match McpConnectionManager::connect_all(config.options.mcp_servers.clone()) {
+            Ok((manager, errors)) => {
+                for (server, err) in &errors {
+                    eprintln!("warning: MCP server '{server}' failed to connect: {err}");
+                }
+                let client: Arc<dyn McpClient> = Arc::new(manager);
+                reg.register::<_, McpToolCallRequest>(
+                    "mcp",
+                    definitions::mcp(),
+                    false,
+                    McpTool::new(client),
+                );
+            }
+            // A runtime-build failure (rare) drops the `mcp` tool rather than
+            // aborting the whole run; a model call to `mcp` then returns "unknown
+            // tool". The other tools are unaffected.
+            Err(e) => eprintln!("warning: failed to start MCP runtime, mcp tool disabled: {e}"),
+        }
+    }
 
     // `tool_search` catalog: populate it from the registry's model-visible
     // definitions so the model can discover the registered tools by free-text
@@ -712,6 +777,7 @@ mod tests {
             3,
             recorder(),
             Some(fake_python()),
+            None,
         )
         .expect("real openai driver must construct offline");
         std::env::remove_var("OPENAI_API_KEY");
@@ -732,6 +798,7 @@ mod tests {
             3,
             recorder(),
             Some(fake_python()),
+            None,
         )
         .expect("real anthropic driver must construct offline");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -742,8 +809,16 @@ mod tests {
     #[test]
     fn fake_backend_resolves_to_fake_signal() {
         let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
-        let resolved = resolve_provider(&config, None, Arc::new(NullSink), ctx(), 3, recorder())
-            .expect("fake must resolve");
+        let resolved = resolve_provider(
+            &config,
+            None,
+            Arc::new(NullSink),
+            ctx(),
+            3,
+            recorder(),
+            None,
+        )
+        .expect("fake must resolve");
         assert!(matches!(resolved, ResolvedProvider::Fake));
     }
 
@@ -751,7 +826,10 @@ mod tests {
     /// resolves a live driver offline (no network), targeting chatgpt.com.
     #[test]
     fn codex_backend_resolves_real_driver_from_env() {
-        // SAFETY: single-threaded test; set + clear the vars around the call.
+        // Serialize with the other env-mutating tests: this sets CODEX_* vars,
+        // and `codex_backend_resolves_choice_from_store` clears them, so without a
+        // shared lock the two race (a flake surfaced under parallel test runs).
+        let _guard = ENV_LOCK.lock().unwrap();
         std::env::set_var("CODEX_ACCESS_TOKEN", "codex-access-test");
         std::env::set_var("CODEX_ACCOUNT_ID", "codex-acct-test");
         let config = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.1-codex");
@@ -763,6 +841,7 @@ mod tests {
             3,
             recorder(),
             Some(fake_python()),
+            None,
         );
         std::env::remove_var("CODEX_ACCESS_TOKEN");
         std::env::remove_var("CODEX_ACCOUNT_ID");
@@ -777,6 +856,9 @@ mod tests {
     /// proving the store-fallback path for codex.
     #[test]
     fn codex_backend_resolves_choice_from_store() {
+        // Serialize with the env-setting codex test (see ENV_LOCK note there):
+        // both touch CODEX_* process env, so they must not run concurrently.
+        let _guard = ENV_LOCK.lock().unwrap();
         // Env codex creds must be absent for this to exercise the store path.
         std::env::remove_var("CODEX_ACCESS_TOKEN");
         std::env::remove_var("CODEX_ACCOUNT_ID");
@@ -812,8 +894,16 @@ mod tests {
         std::env::remove_var("OPENROUTER_API_KEY");
         std::env::remove_var("LLM_BROWSER_OPENAI_COMPAT_API_KEY");
         let config = ProviderRunConfig::new(ProviderBackend::Openrouter, "x");
-        let err = resolve_provider(&config, None, Arc::new(NullSink), ctx(), 3, recorder())
-            .expect_err("missing credentials must error");
+        let err = resolve_provider(
+            &config,
+            None,
+            Arc::new(NullSink),
+            ctx(),
+            3,
+            recorder(),
+            None,
+        )
+        .expect_err("missing credentials must error");
         assert!(matches!(err, ProviderResolveError::MissingCredentials(_)));
     }
 
@@ -1064,7 +1154,69 @@ mod tests {
     /// exercised with a FAKE backend so no real worker is started.
     #[test]
     fn production_builder_accepts_injected_python_backend() {
+        // No MCP servers, no user-input store -> mcp tool absent, Echo responder.
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
         let _dispatcher: Arc<ToolDispatcher<RegistryRunner>> =
-            build_tool_dispatcher(Arc::new(MarkerPythonBackend));
+            build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+    }
+
+    /// An empty `mcp_servers` map registers NO `mcp` tool (prior behavior).
+    #[test]
+    fn empty_mcp_servers_registers_no_mcp_tool() {
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            !names.contains(&"mcp"),
+            "no mcp tool without configured servers"
+        );
+        // The other core tools are still present.
+        assert!(names.contains(&"browser"));
+        assert!(names.contains(&"done"));
+    }
+
+    /// A non-empty `mcp_servers` map registers the `mcp` tool. The stdio server
+    /// command (`true`) connects to nothing useful, but `connect_all`'s per-server
+    /// failure isolation still yields a manager and the registration wiring
+    /// surfaces the `mcp` tool in the dispatcher's specs.
+    #[test]
+    fn nonempty_mcp_servers_registers_mcp_tool() {
+        use crate::mcp::{McpServerConfig, McpServerTransport};
+        let mut servers = std::collections::HashMap::new();
+        servers.insert(
+            "echo".to_string(),
+            McpServerConfig {
+                transport: McpServerTransport::Stdio {
+                    command: "true".to_string(),
+                    args: Vec::new(),
+                    env: std::collections::HashMap::new(),
+                    cwd: None,
+                },
+                startup_timeout_ms: Some(200),
+                tool_timeout_ms: Some(200),
+                enabled_tools: None,
+                disabled_tools: None,
+            },
+        );
+        let options = crate::config_overrides::AgentRunOptions {
+            mcp_servers: servers,
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        assert!(
+            names.contains(&"mcp"),
+            "mcp tool must be registered when servers are configured; got {names:?}"
+        );
     }
 }

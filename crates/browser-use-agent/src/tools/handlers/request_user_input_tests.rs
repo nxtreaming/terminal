@@ -397,3 +397,155 @@ fn request_user_input_is_not_parallel_safe_matches_codex() {
         "request_user_input must match codex: NOT parallel-safe (blocking human interaction)"
     );
 }
+
+// ---- (6) the production StoreRoundTripResponder round-trips via the store ----
+
+/// A tempdir-backed `SharedStore` with a fresh session row (the `events` table
+/// has a FK on `sessions(id)`, so the session must exist before we append).
+/// Returns the `TempDir` so the caller keeps the on-disk sqlite db alive.
+fn store_with_session() -> (tempfile::TempDir, crate::session::SharedStore, String) {
+    use std::sync::Mutex;
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = browser_use_store::Store::open(dir.path()).expect("open store");
+    let session_id = store
+        .create_session(None, std::path::Path::new("/work"))
+        .expect("create session")
+        .id;
+    (dir, std::sync::Arc::new(Mutex::new(store)), session_id)
+}
+
+/// The production [`StoreRoundTripResponder`]: it appends a
+/// `request_user_input.requested` event, then resolves once a matching
+/// `request_user_input.response` event is appended (by the TUI / operator),
+/// returning the answers from that event's payload.
+#[tokio::test]
+async fn store_round_trip_responder_returns_enqueued_answers() {
+    use super::request_user_input::{
+        RequestUserInputResponder, StoreRoundTripResponder, REQUEST_USER_INPUT_REQUESTED_EVENT,
+        REQUEST_USER_INPUT_RESPONSE_DOTTED_EVENT,
+    };
+    use std::time::Duration;
+
+    let (_dir, store, session_id) = store_with_session();
+    let sid = crate::session::SessionId(session_id.clone());
+    let responder =
+        StoreRoundTripResponder::with_timeout(store.clone(), sid, Duration::from_secs(5));
+
+    // Concurrently deliver the operator's answer once the request has been
+    // announced on the control channel (the codex wire shape, keyed by question id).
+    let writer_store = store.clone();
+    let writer_session = session_id.clone();
+    let writer = tokio::spawn(async move {
+        loop {
+            let requested = {
+                let store = writer_store.lock().unwrap();
+                store
+                    .events_for_session(&writer_session)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.event_type == REQUEST_USER_INPUT_REQUESTED_EVENT)
+            };
+            if requested {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let store = writer_store.lock().unwrap();
+        store
+            .append_event(
+                &writer_session,
+                REQUEST_USER_INPUT_RESPONSE_DOTTED_EVENT,
+                serde_json::json!({ "answers": { "deploy": { "answers": ["Yes (Recommended)"] } } }),
+            )
+            .unwrap();
+    });
+
+    let answers = responder
+        .respond(&sample_request())
+        .await
+        .expect("responder resolves");
+    writer.await.unwrap();
+
+    assert_eq!(
+        answers.answers["deploy"].answers,
+        vec!["Yes (Recommended)".to_string()]
+    );
+
+    // The request event carried the questions on the control channel.
+    let store = store.lock().unwrap();
+    let events = store.events_for_session(&session_id).unwrap();
+    assert!(
+        events
+            .iter()
+            .any(|e| e.event_type == REQUEST_USER_INPUT_REQUESTED_EVENT),
+        "the request event must be appended for the TUI/operator"
+    );
+}
+
+/// With no response appended, the responder times out (a clean Rejected error)
+/// rather than blocking forever.
+#[tokio::test]
+async fn store_round_trip_responder_times_out_without_response() {
+    use super::request_user_input::{RequestUserInputResponder, StoreRoundTripResponder};
+    use std::time::Duration;
+
+    let (_dir, store, session_id) = store_with_session();
+    let sid = crate::session::SessionId(session_id);
+    let responder = StoreRoundTripResponder::with_timeout(store, sid, Duration::from_millis(150));
+    let result = responder.respond(&sample_request()).await;
+    assert!(
+        matches!(result, Err(ToolError::Rejected(_))),
+        "no response -> a clean timeout rejection, got {result:?}"
+    );
+}
+
+/// A response written under the simpler flat `{ id: [..] }` answers shape (a
+/// minimal TUI may write this) is still parsed into answers.
+#[tokio::test]
+async fn store_round_trip_responder_parses_flat_answer_shape() {
+    use super::request_user_input::{
+        RequestUserInputResponder, StoreRoundTripResponder, REQUEST_USER_INPUT_REQUESTED_EVENT,
+        REQUEST_USER_INPUT_RESPONSE_DOTTED_EVENT,
+    };
+    use std::time::Duration;
+
+    let (_dir, store, session_id) = store_with_session();
+    let sid = crate::session::SessionId(session_id.clone());
+    let responder =
+        StoreRoundTripResponder::with_timeout(store.clone(), sid, Duration::from_secs(5));
+
+    let writer_store = store.clone();
+    let writer_session = session_id.clone();
+    let writer = tokio::spawn(async move {
+        loop {
+            let requested = {
+                let store = writer_store.lock().unwrap();
+                store
+                    .events_for_session(&writer_session)
+                    .unwrap()
+                    .iter()
+                    .any(|e| e.event_type == REQUEST_USER_INPUT_REQUESTED_EVENT)
+            };
+            if requested {
+                break;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        let store = writer_store.lock().unwrap();
+        store
+            .append_event(
+                &writer_session,
+                REQUEST_USER_INPUT_RESPONSE_DOTTED_EVENT,
+                // Flat shape: id -> array of strings (coerced into UserInputAnswer).
+                serde_json::json!({ "answers": { "deploy": ["No"] } }),
+            )
+            .unwrap();
+    });
+
+    let answers = responder
+        .respond(&sample_request())
+        .await
+        .expect("resolves");
+    writer.await.unwrap();
+    assert_eq!(answers.answers["deploy"].answers, vec!["No".to_string()]);
+}

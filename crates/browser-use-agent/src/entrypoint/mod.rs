@@ -747,6 +747,10 @@ pub async fn run_session_with_config(
     // codex tokens) resolve env-first, then from the stored `auth.<provider>.*`
     // settings the `auth login` command writes (fixes the env-only regression).
     // The store read happens under the shared lock for the duration of resolution.
+    // The production `request_user_input` responder round-trips through the
+    // session store, so hand resolution a clone of the SharedStore handle + the
+    // session id (separate from the borrowed guard used for credential reads).
+    let user_input_ctx = Some((Arc::clone(&store), session_id.clone()));
     let resolved = {
         let store_guard = store.lock().expect("store mutex poisoned");
         provider::resolve_provider(
@@ -756,6 +760,7 @@ pub async fn run_session_with_config(
             ctx.clone(),
             max_retries(&config),
             fusion_recorder,
+            user_input_ctx,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?
     };
