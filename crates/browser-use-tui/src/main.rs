@@ -141,6 +141,8 @@ const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
 pub(crate) const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
 const FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN: &str = "after_current_turn";
 pub(crate) const PENDING_FOLLOWUP_INTERRUPT_REASON: &str = "pending follow-up interrupt";
+const IMAGE_PASTE_PENDING_NOTICE: &str = "Reading pasted image from clipboard.";
+const IMAGE_PASTE_MATERIALIZING_NOTICE: &str = "Preparing pasted image.";
 
 #[derive(Debug, Parser)]
 #[command(name = "but", bin_name = "but")]
@@ -839,11 +841,19 @@ impl Default for TypewriterState {
     }
 }
 
+#[derive(Debug)]
+struct ClipboardPasteEvent {
+    paste_id: u64,
+    result: std::result::Result<PathBuf, String>,
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct App {
     store: Store,
     store_rx: mpsc::Receiver<StoreNotification>,
+    clipboard_paste_tx: mpsc::Sender<ClipboardPasteEvent>,
+    clipboard_paste_rx: mpsc::Receiver<ClipboardPasteEvent>,
     state_cache: AppStateCache,
     args: Args,
     selected_session_id: Option<String>,
@@ -872,6 +882,8 @@ struct App {
     agent_backend: AgentBackend,
     quit_hint_until: Option<Instant>,
     escape_stop_until: Option<Instant>,
+    next_clipboard_paste_id: u64,
+    pending_clipboard_image_pastes: usize,
     native_history: NativeHistoryState,
     welcome_anim: welcome::WelcomeAnim,
     live_spinner_frame: usize,
@@ -1922,6 +1934,7 @@ impl App {
     fn new(mut args: Args) -> Result<Self> {
         args.state_dir = resolve_state_dir(&args.state_dir);
         let (store_tx, store_rx) = mpsc::channel();
+        let (clipboard_paste_tx, clipboard_paste_rx) = mpsc::channel();
         let store = Store::open_with_notifier(&args.state_dir, store_tx)?;
         seed_demo_if_requested(&store, args.seed_demo.as_deref())?;
         let state_cache = AppStateCache::hydrate(&store, &args.browser)?;
@@ -2041,6 +2054,8 @@ impl App {
         let mut app = Self {
             store,
             store_rx,
+            clipboard_paste_tx,
+            clipboard_paste_rx,
             state_cache,
             args,
             selected_session_id,
@@ -2069,6 +2084,8 @@ impl App {
             agent_backend,
             quit_hint_until: None,
             escape_stop_until: None,
+            next_clipboard_paste_id: 1,
+            pending_clipboard_image_pastes: 0,
             native_history: NativeHistoryState::default(),
             welcome_anim: welcome::WelcomeAnim::new(),
             live_spinner_frame: 0,
@@ -2211,6 +2228,30 @@ impl App {
             }
         }
         Ok(true)
+    }
+
+    fn drain_clipboard_paste_notifications(&mut self) -> Result<bool> {
+        let mut changed = false;
+        while let Ok(event) = self.clipboard_paste_rx.try_recv() {
+            changed = true;
+            self.pending_clipboard_image_pastes =
+                self.pending_clipboard_image_pastes.saturating_sub(1);
+            match event.result {
+                Ok(path) => {
+                    self.composer.resolve_pending_image(event.paste_id, path);
+                    if self.pending_clipboard_image_pastes == 0
+                        && self.status_notice.as_deref() == Some(IMAGE_PASTE_MATERIALIZING_NOTICE)
+                    {
+                        self.status_notice = None;
+                    }
+                }
+                Err(error) => {
+                    self.composer.remove_pending_image(event.paste_id);
+                    self.status_notice = Some(format!("Failed to paste image: {error}"));
+                }
+            }
+        }
+        Ok(changed)
     }
 
     fn refresh_state_cache_from_store(&mut self) -> Result<bool> {
@@ -3055,6 +3096,10 @@ impl App {
         }
         let text = self.composer.input().trim().to_string();
         let has_local_images = self.composer.has_local_images();
+        if self.composer.has_pending_local_images() {
+            self.status_notice = Some(IMAGE_PASTE_MATERIALIZING_NOTICE.to_string());
+            return Ok(());
+        }
         if !has_local_images {
             if let Some(plan_text) = text
                 .strip_prefix("/plan")
@@ -4204,13 +4249,38 @@ impl App {
     }
 
     fn paste_image_from_clipboard(&mut self) {
-        match clipboard_paste::paste_image_to_temp_png() {
+        self.status_notice = Some(IMAGE_PASTE_PENDING_NOTICE.to_string());
+
+        let image = match clipboard_paste::read_image_from_clipboard() {
+            Ok(image) => image,
+            Err(error) => {
+                self.status_notice = Some(format!("Failed to paste image: {error}"));
+                return;
+            }
+        };
+
+        match image.into_ready_path_or_rgba() {
             Ok((path, _info)) => {
                 self.composer.attach_image(path);
                 self.prompt_history.reset_navigation();
+                self.status_notice = None;
             }
-            Err(error) => {
-                self.status_notice = Some(format!("Failed to paste image: {error}"));
+            Err(image) => {
+                let paste_id = self.next_clipboard_paste_id;
+                self.next_clipboard_paste_id = self.next_clipboard_paste_id.saturating_add(1);
+                self.pending_clipboard_image_pastes =
+                    self.pending_clipboard_image_pastes.saturating_add(1);
+                self.composer.attach_pending_image(paste_id);
+                self.prompt_history.reset_navigation();
+                self.status_notice = Some(IMAGE_PASTE_MATERIALIZING_NOTICE.to_string());
+
+                let tx = self.clipboard_paste_tx.clone();
+                thread::spawn(move || {
+                    let result = clipboard_paste::materialize_rgba_image_to_temp_png(image)
+                        .map(|(path, _info)| path)
+                        .map_err(|error| error.to_string());
+                    let _ = tx.send(ClipboardPasteEvent { paste_id, result });
+                });
             }
         }
     }
@@ -6619,6 +6689,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_store_notifications()?;
             draw_needed |= app.drain_oauth_notifications()?;
             draw_needed |= app.drain_codex_login_notifications()?;
+            draw_needed |= app.drain_clipboard_paste_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -7814,6 +7885,86 @@ mod redesign_tests {
         assert!(content
             .iter()
             .any(|part| part["type"] == "input_text" && part["text"] == "describe this"));
+        Ok(())
+    }
+
+    #[test]
+    fn pasted_image_label_appears_after_validation_before_materialization() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let image_path = temp.path().join("clipboard.png");
+        write_test_png(&image_path)?;
+
+        app.composer.set_input("describe this".to_string());
+        app.status_notice = Some(IMAGE_PASTE_PENDING_NOTICE.to_string());
+
+        let before_validation = lines_plain_text(&app.composer.render_lines(10, "placeholder"));
+        assert!(!before_validation.contains("[Image 1]"));
+
+        app.pending_clipboard_image_pastes = 1;
+        app.composer.attach_pending_image(42);
+        app.status_notice = Some(IMAGE_PASTE_MATERIALIZING_NOTICE.to_string());
+        let after_validation = lines_plain_text(&app.composer.render_lines(10, "placeholder"));
+        assert!(after_validation.contains("[Image 1]"), "{after_validation}");
+
+        app.submit()?;
+
+        assert!(app.selected_session_id.is_none());
+        assert_eq!(
+            app.status_notice.as_deref(),
+            Some(IMAGE_PASTE_MATERIALIZING_NOTICE)
+        );
+
+        app.clipboard_paste_tx
+            .send(ClipboardPasteEvent {
+                paste_id: 42,
+                result: Ok(image_path.clone()),
+            })
+            .expect("send paste event");
+        assert!(app.drain_clipboard_paste_notifications()?);
+        assert!(app.status_notice.is_none());
+
+        app.submit()?;
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session after submit")?;
+        let events = app.store.events_for_session(&session_id)?;
+        let input = events
+            .iter()
+            .find(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert_eq!(
+            input.payload["items"][0]["path"],
+            image_path.display().to_string()
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn failed_image_materialization_removes_validated_image_label() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.pending_clipboard_image_pastes = 1;
+        app.composer.attach_pending_image(7);
+        let rendered = lines_plain_text(&app.composer.render_lines(10, "placeholder"));
+        assert!(rendered.contains("[Image 1]"), "{rendered}");
+        app.clipboard_paste_tx
+            .send(ClipboardPasteEvent {
+                paste_id: 7,
+                result: Err("could not encode image".to_string()),
+            })
+            .expect("send paste event");
+
+        assert!(app.drain_clipboard_paste_notifications()?);
+        assert!(app.composer.is_empty());
+        let rendered = lines_plain_text(&app.composer.render_lines(10, "placeholder"));
+        assert!(!rendered.contains("[Image 1]"));
+        assert_eq!(
+            app.status_notice.as_deref(),
+            Some("Failed to paste image: could not encode image")
+        );
         Ok(())
     }
 
