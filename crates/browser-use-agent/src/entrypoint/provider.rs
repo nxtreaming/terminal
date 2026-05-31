@@ -618,6 +618,13 @@ fn build_tool_dispatcher(
     // silently dropping the tools (the model still SEES the tools).
     register_subagent_tools(&mut reg, config, &user_input);
 
+    // Goal tools (`get_goal` / `create_goal` / `update_goal`). All three share ONE
+    // `GoalStore` (the event-sourced `GoalManager` + its durable `goal.*` event
+    // sink), registered behind the same registry seam so a `create_goal` is
+    // visible to a later `get_goal`/`update_goal`. The model always SEES the tools
+    // (no config gate), matching how the subagent tools are always advertised.
+    register_goal_tools(&mut reg, &user_input);
+
     // `mcp`: register the MCP bridge ONLY when servers are configured. An empty
     // `mcp_servers` map (the default) registers nothing, preserving prior
     // behavior. Non-empty => connect all servers (per-server failure isolation
@@ -883,6 +890,70 @@ fn register_subagent_tools(
         definitions::list_agents(),
         true,
         ListAgentsTool::new(deps),
+    );
+}
+
+/// Register the goal tool family (`get_goal`, `create_goal`, `update_goal`) into
+/// `reg`, all sharing ONE [`GoalStore`].
+///
+/// The store wraps a [`GoalManager`](crate::goals::GoalManager) whose injected
+/// [`EventSink`] persists durable `goal.*` events: on the live run path it is the
+/// store-backed [`SubagentStoreSink`] (the same `crate::events::EventSink` the
+/// subagent tools use — it appends each event to the session's durable log so the
+/// TUI render / resume-by-replay observe `goal.created` / `goal.updated`), and in
+/// tests/headless it is the no-op [`NoopSubagentSink`]. `create_goal` (and
+/// budget-threshold crossings) emit through the manager's sink automatically;
+/// `update_goal` emits `goal.updated` from its handler.
+///
+/// Mirrors [`register_subagent_tools`]: a shared store + a store-backed event sink
+/// + the session id from the threaded `(SharedStore, SessionId)`.
+fn register_goal_tools(
+    reg: &mut crate::tools::registry::ToolRegistry,
+    user_input: &Option<(SharedStore, SessionId)>,
+) {
+    use crate::tools::handlers::goal::{
+        CreateGoalRequest, CreateGoalTool, GetGoalRequest, GetGoalTool, GoalStore,
+        UpdateGoalRequest, UpdateGoalTool,
+    };
+    use crate::tools::registry::definitions;
+
+    // Durable event sink + session scope: the store-backed sink on the live run
+    // path (durable `goal.*` events appended to the session log), a no-op when no
+    // session store is wired (tests/headless). Reuses the subagent tools' sinks
+    // (both are `crate::events::EventSink`).
+    let (sink, session_id): (Arc<dyn EventSink>, String) = match user_input {
+        Some((store, sid)) => (
+            Arc::new(SubagentStoreSink {
+                store: store.clone(),
+            }),
+            sid.as_str().to_string(),
+        ),
+        None => (Arc::new(NoopSubagentSink), String::new()),
+    };
+
+    // One shared store so create_goal is visible to a later get/update_goal.
+    let store = Arc::new(GoalStore::new(session_id, sink));
+
+    // get_goal: read-only snapshot (parallel-safe).
+    reg.register::<_, GetGoalRequest>(
+        "get_goal",
+        definitions::get_goal(),
+        true,
+        GetGoalTool::new(store.clone()),
+    );
+    // create_goal: mutates the shared state (serial).
+    reg.register::<_, CreateGoalRequest>(
+        "create_goal",
+        definitions::create_goal(),
+        false,
+        CreateGoalTool::new(store.clone()),
+    );
+    // update_goal: mutates the shared state (serial).
+    reg.register::<_, UpdateGoalRequest>(
+        "update_goal",
+        definitions::update_goal(),
+        false,
+        UpdateGoalTool::new(store),
     );
 }
 
@@ -1512,6 +1583,151 @@ mod tests {
         assert!(
             body.get("agent_path").and_then(|v| v.as_str()).is_some(),
             "spawn returns the child handle: {body}"
+        );
+    }
+
+    /// The production dispatcher ALWAYS advertises the three goal tools
+    /// (`get_goal` / `create_goal` / `update_goal`) — the "engine B matches rival
+    /// A on the goals row" registration proof. Passes ONLY because
+    /// `register_goal_tools` is invoked inside `build_tool_dispatcher`.
+    #[test]
+    fn goal_tools_are_registered_in_the_dispatcher() {
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for tool in ["get_goal", "create_goal", "update_goal"] {
+            assert!(
+                names.contains(&tool),
+                "{tool} must be registered in the production dispatcher; got {names:?}"
+            );
+        }
+    }
+
+    /// A `create_goal` call routes from the PRODUCTION registration through the
+    /// dispatcher (BY NAME via `dispatch_ordered`, the same path the turn loop
+    /// uses for a model tool-call) into the shared `GoalStore`: a follow-up
+    /// `get_goal` observes the goal, AND a durable `goal.created` event lands in
+    /// the session store (proving the store-backed event sink is wired, not just
+    /// the tool listed). `update_goal` then emits a durable `goal.updated`.
+    #[tokio::test]
+    async fn create_goal_routes_into_store_and_emits_durable_event() {
+        use browser_use_llm::schema::{ContentPart, MessageRole};
+        use browser_use_store::Store;
+        use tokio_util::sync::CancellationToken;
+
+        // Dispatch a single tool call BY NAME and return its JSON tool output.
+        async fn dispatch_one(
+            dispatcher: &ToolDispatcher<RegistryRunner>,
+            name: &str,
+            input: serde_json::Value,
+        ) -> serde_json::Value {
+            let call = ContentPart::ToolCall {
+                id: format!("call-{name}"),
+                name: name.to_string(),
+                input,
+                provider_metadata: None,
+            };
+            let result = dispatcher
+                .dispatch_ordered(vec![call], CancellationToken::new())
+                .await;
+            let msg = result
+                .outputs_in_order
+                .into_iter()
+                .next()
+                .expect("one tool output");
+            assert_eq!(msg.role, MessageRole::Tool);
+            let text = msg
+                .content
+                .iter()
+                .find_map(|p| match p {
+                    ContentPart::ToolResult {
+                        content, is_error, ..
+                    } => {
+                        assert!(!*is_error, "tool call must succeed: {content:?}");
+                        content.iter().find_map(|c| match c {
+                            ContentPart::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                    }
+                    _ => None,
+                })
+                .expect("a tool-result text part");
+            serde_json::from_str(&text).expect("tool output is JSON")
+        }
+
+        // Read every persisted `event_type` for the session from the store.
+        fn event_types(store: &SharedStore, session_id: &str) -> Vec<String> {
+            store
+                .lock()
+                .unwrap()
+                .events_for_session(session_id)
+                .expect("read events")
+                .into_iter()
+                .map(|e| e.event_type)
+                .collect()
+        }
+
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        // Real durable store on a tempdir; create the session ROW first (the
+        // store MINTS the id) so the store-backed sink's `append_event`
+        // satisfies the events FK on `sessions(id)`.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: SharedStore = Arc::new(std::sync::Mutex::new(
+            Store::open(dir.path()).expect("open store"),
+        ));
+        let session_id = store
+            .lock()
+            .unwrap()
+            .create_session(None, dir.path())
+            .expect("create session row")
+            .id;
+        let session = SessionId(session_id.clone());
+        let dispatcher = build_tool_dispatcher(
+            Arc::new(MarkerPythonBackend),
+            &config,
+            Some((store.clone(), session.clone())),
+        );
+
+        // create_goal routes into the goal store and returns the folded snapshot.
+        let created = dispatch_one(
+            &dispatcher,
+            "create_goal",
+            serde_json::json!({"text": "ship the goals row", "token_budget": 1000}),
+        )
+        .await;
+        assert_eq!(created["active"], true);
+        assert_eq!(created["text"], "ship the goals row");
+        assert_eq!(created["token_budget"], 1000);
+
+        // get_goal observes the SAME shared state (the store is shared).
+        let fetched = dispatch_one(&dispatcher, "get_goal", serde_json::json!({})).await;
+        assert_eq!(fetched["text"], "ship the goals row");
+        assert_eq!(fetched["active"], true);
+
+        // A durable `goal.created` event landed for this session (proving the
+        // store-backed sink — not just the tool listing — is wired).
+        let kinds = event_types(&store, &session_id);
+        assert!(
+            kinds.iter().any(|k| k == "goal.created"),
+            "expected a durable goal.created event, got: {kinds:?}"
+        );
+
+        // update_goal folds + emits a durable `goal.updated` event.
+        let updated = dispatch_one(
+            &dispatcher,
+            "update_goal",
+            serde_json::json!({"status": "complete"}),
+        )
+        .await;
+        assert_eq!(updated["status"], "complete");
+        let kinds = event_types(&store, &session_id);
+        assert!(
+            kinds.iter().any(|k| k == "goal.updated"),
+            "expected a durable goal.updated event, got: {kinds:?}"
         );
     }
 }

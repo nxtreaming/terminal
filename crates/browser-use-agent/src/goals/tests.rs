@@ -90,8 +90,26 @@ fn reduce_sequence_produces_expected_state() {
     assert_eq!(s.token_budget, Some(1000));
     assert_eq!(s.tokens_used, 200); // 120 + 80, accumulated
     assert_eq!(s.created_turn_idx, Some(3));
-    assert_eq!(s.time_used_seconds, 9); // set absolutely, last wins
+    // Elapsed seconds ACCUMULATE across responses (4 + 9), matching the legacy
+    // `goal.accounted` fold (`time_used_seconds += delta`). This previously
+    // ASSIGNED the latest delta (would leave 9), dropping prior elapsed time.
+    assert_eq!(s.time_used_seconds, 13);
     assert!(s.is_active());
+}
+
+#[test]
+fn accounted_accumulates_elapsed_time_not_assigns() {
+    // Regression guard for the reducer fix: two `Accounted` events must SUM their
+    // elapsed seconds (and tokens), not overwrite with the latest delta. Legacy
+    // `goal.accounted` folds `time_used_seconds += delta`
+    // (`browser-use-core/src/goals.rs:110-131`).
+    let sink = Arc::new(RecordingSink::default());
+    let mut mgr = GoalManager::new("s", sink);
+    mgr.set_goal("g", "t", None, None);
+    mgr.record_usage(&usage(100, 0, 20), 5);
+    mgr.record_usage(&usage(100, 0, 20), 7);
+    assert_eq!(mgr.state().tokens_used, 240); // 120 + 120
+    assert_eq!(mgr.state().time_used_seconds, 12); // 5 + 7, accumulated
 }
 
 #[test]
