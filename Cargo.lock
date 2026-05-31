@@ -240,6 +240,7 @@ dependencies = [
  "thiserror 1.0.69",
  "tokio",
  "tokio-util",
+ "toml",
 ]
 
 [[package]]
@@ -380,7 +381,7 @@ version = "0.1.2"
 dependencies = [
  "anyhow",
  "arboard",
- "browser-use-core",
+ "browser-use-agent",
  "browser-use-protocol",
  "browser-use-providers",
  "browser-use-store",
@@ -395,6 +396,7 @@ dependencies = [
  "signal-hook",
  "syntect",
  "tempfile",
+ "tokio",
  "two-face",
  "unicode-width",
 ]
