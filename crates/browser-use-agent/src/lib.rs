@@ -27,6 +27,7 @@ pub mod config_overrides;
 pub mod context;
 
 pub mod decision;
+pub mod entrypoint;
 pub mod error;
 pub mod events;
 pub mod execpolicy;
@@ -50,6 +51,12 @@ pub mod turn;
 
 pub use config::AgentConfig;
 pub use error::AgentError;
+
+// The run-entrypoint facade (Wave-3 cutover): the binary-facing call tui/cli use
+// to run a session on the new async engine. It assembles
+// config -> provider/driver -> context seed -> turn loop -> store persistence and
+// is the first production caller of `turn::model_path::build_sampling_driver`.
+pub use entrypoint::run_session_with_config;
 
 #[cfg(test)]
 mod tests {
