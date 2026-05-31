@@ -8,22 +8,34 @@ use std::thread;
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
-use browser_use_core::{
-    append_user_shell_command_context_event, append_workspace_context_event,
-    append_workspace_context_event_with_options, canonical_agent_path_from_task_name,
-    canonical_agent_reference, cleanup_agent_runtime_state_for_agent_subtree, collect_agent_tree,
+use browser_use_agent::config_model::{
     configured_model_provider_id_for_cwd_with_options, default_model_for_cwd_with_options,
-    display_agent_path_for_session, final_statuses_for_v1_wait, install_process_crypto_provider,
-    last_task_message_for_agent, local_agent_status_value, model_catalog_for_cwd_with_options,
-    parse_config_overrides, product_analytics, record_browser_script_response_events,
-    record_python_response_final_event, record_python_worker_event,
-    resolve_agent_reference_in_tree, review_prompt_base_branch, review_prompt_commit,
-    review_prompt_custom, review_prompt_uncommitted_changes, root_session_id,
-    run_agent_from_config, run_existing_session_from_config, run_existing_session_with_provider,
-    run_fake_agent, start_review_session, typed_user_input_payload_from_text_for_cwd,
-    update_parent_from_child_run, AgentRunOptions, CollaborationModeKind, ConfigOverrides,
-    FakeAgentOptions, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    model_catalog_for_cwd_with_options,
+};
+use browser_use_agent::config_overrides::{
+    parse_config_overrides, AgentRunOptions, ConfigOverrides, ProviderBackend, ProviderRunConfig,
+    RunConfigValueSource,
+};
+use browser_use_agent::context::{
+    append_user_shell_command_context_event, typed_user_input_payload_from_text_for_cwd,
+};
+use browser_use_agent::entrypoint::run_session_with_config;
+use browser_use_agent::infra::{
+    capture_async, capture_blocking, install_process_crypto_provider,
+    record_browser_script_response_events, record_python_response_final_event,
+    record_python_worker_event, review_prompt_base_branch, review_prompt_commit,
+    review_prompt_custom, review_prompt_uncommitted_changes, start_review_session,
     UnifiedExecShutdownCleanup,
+};
+use browser_use_agent::prompts::CollaborationModeKind;
+use browser_use_agent::session::SharedStore;
+use browser_use_agent::subagents::{
+    canonical_agent_path_from_task_name, canonical_agent_reference,
+    cleanup_agent_runtime_state_for_agent_subtree, display_agent_path_for_session,
+    final_statuses_for_v1_wait, last_task_message_for_agent, local_agent_status_value,
+    store_collect_agent_tree as collect_agent_tree,
+    store_resolve_agent_reference_in_tree as resolve_agent_reference_in_tree,
+    store_root_session_id as root_session_id,
 };
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, sanitized_agent_context_from_events,
@@ -33,9 +45,8 @@ use browser_use_providers::{
     claude_code_oauth_authorize_url, claude_code_oauth_pkce,
     exchange_claude_code_authorization_code, load_codex_auth, load_codex_auth_file,
     load_codex_managed_auth, load_codex_managed_auth_file, parse_claude_code_authorization_input,
-    refresh_claude_code_oauth, AnthropicMessagesProvider, ClaudeCodeOAuthCredential, CodexAuth,
-    CodexManagedAuth, FakeProvider, ModelProvider, OpenAICompatibleChatProvider,
-    CLAUDE_CODE_CALLBACK_HOST, CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
+    ClaudeCodeOAuthCredential, CodexAuth, CodexManagedAuth, CLAUDE_CODE_CALLBACK_HOST,
+    CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
 use browser_use_python_worker::PythonWorker;
 use browser_use_store::{now_ms, resolve_state_dir, Store};
@@ -98,11 +109,6 @@ enum Command {
         #[arg(long)]
         model: Option<String>,
     },
-    RunCodex {
-        text: String,
-        #[arg(long)]
-        model: Option<String>,
-    },
     RunAnthropic {
         text: String,
         #[arg(long, default_value = "claude-sonnet-4-6")]
@@ -119,11 +125,6 @@ enum Command {
         model: String,
     },
     RunOpenaiSession {
-        task_id: String,
-        #[arg(long)]
-        model: Option<String>,
-    },
-    RunCodexSession {
         task_id: String,
         #[arg(long)]
         model: Option<String>,
@@ -331,35 +332,6 @@ enum Command {
         #[arg(long)]
         browser_mode: Option<String>,
     },
-    DatasetRunCodex {
-        dataset: String,
-        #[arg(long, default_value_t = 1)]
-        count: usize,
-        #[arg(long = "task-id")]
-        task_ids: Vec<String>,
-        #[arg(long)]
-        all: bool,
-        #[arg(long)]
-        model: Option<String>,
-        #[arg(long, default_value_t = 80)]
-        max_turns: usize,
-        #[arg(long, default_value_t = 120)]
-        python_timeout_seconds: u64,
-        #[arg(long)]
-        run_id: Option<String>,
-        #[arg(long)]
-        resume: bool,
-        #[arg(long)]
-        skip_failed: bool,
-        #[arg(long)]
-        stop_on_failure: bool,
-        #[arg(long, default_value_t = 2)]
-        max_attempts: usize,
-        #[arg(long, default_value_t = 1)]
-        concurrency: usize,
-        #[arg(long)]
-        browser_mode: Option<String>,
-    },
     DatasetRunAnthropic {
         dataset: String,
         #[arg(long, default_value_t = 1)]
@@ -532,26 +504,6 @@ trait DatasetRunner: Clone + Send + Sync + 'static {
 }
 
 #[derive(Clone)]
-struct DirectDatasetRunner<P> {
-    provider: P,
-}
-
-impl<P> DatasetRunner for DirectDatasetRunner<P>
-where
-    P: ModelProvider + Clone + Send + Sync + 'static,
-{
-    fn run_dataset_session(
-        &self,
-        store: &Store,
-        session_id: &str,
-        options: AgentRunOptions,
-    ) -> Result<()> {
-        run_existing_session_with_provider(store, &self.provider, session_id, options)?;
-        Ok(())
-    }
-}
-
-#[derive(Clone)]
 struct ConfigDatasetRunner {
     config: ProviderRunConfig,
 }
@@ -593,7 +545,7 @@ fn main() -> Result<()> {
     let mut args = Args::parse();
     args.state_dir = resolve_state_dir(&args.state_dir);
     let store = Store::open(&args.state_dir)?;
-    product_analytics::capture_async(
+    capture_async(
         &store,
         "bu:cli command ran",
         serde_json::json!({ "command": command_name(&args.command), "surface": "cli" }),
@@ -605,14 +557,6 @@ fn main() -> Result<()> {
         Command::Start { text } => start(&store, text),
         Command::RunFake { text, python_code } => run_fake(&store, text, python_code),
         Command::RunOpenai { text, model } => run_openai(
-            &store,
-            text,
-            model,
-            config_profile.as_deref(),
-            &config_overrides,
-            collaboration_mode,
-        ),
-        Command::RunCodex { text, model } => run_codex(
             &store,
             text,
             model,
@@ -645,14 +589,6 @@ fn main() -> Result<()> {
             collaboration_mode,
         ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
-            &store,
-            &task_id,
-            model,
-            config_profile.as_deref(),
-            &config_overrides,
-            collaboration_mode,
-        ),
-        Command::RunCodexSession { task_id, model } => run_codex_session(
             &store,
             &task_id,
             model,
@@ -821,42 +757,6 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
         ),
-        Command::DatasetRunCodex {
-            dataset,
-            count,
-            task_ids,
-            all,
-            model,
-            max_turns,
-            python_timeout_seconds,
-            run_id,
-            resume,
-            skip_failed,
-            stop_on_failure,
-            max_attempts,
-            concurrency,
-            browser_mode,
-        } => dataset_run_codex(
-            &store,
-            &dataset,
-            DatasetRunOptions {
-                count,
-                task_ids,
-                all,
-                run_id,
-                resume,
-                skip_failed,
-                stop_on_failure,
-                max_attempts,
-                concurrency,
-                browser_mode,
-            },
-            model,
-            max_turns,
-            python_timeout_seconds,
-            config_profile.as_deref(),
-            &config_overrides,
-        ),
         Command::DatasetRunAnthropic {
             dataset,
             count,
@@ -933,12 +833,10 @@ fn command_name(command: &Command) -> &'static str {
         Command::Start { .. } => "start",
         Command::RunFake { .. } => "run_fake",
         Command::RunOpenai { .. } => "run_openai",
-        Command::RunCodex { .. } => "run_codex",
         Command::RunAnthropic { .. } => "run_anthropic",
         Command::RunOpenrouter { .. } => "run_openrouter",
         Command::RunDeepseek { .. } => "run_deepseek",
         Command::RunOpenaiSession { .. } => "run_openai_session",
-        Command::RunCodexSession { .. } => "run_codex_session",
         Command::RunAnthropicSession { .. } => "run_anthropic_session",
         Command::RunOpenrouterSession { .. } => "run_openrouter_session",
         Command::RunDeepseekSession { .. } => "run_deepseek_session",
@@ -972,7 +870,6 @@ fn command_name(command: &Command) -> &'static str {
         Command::DatasetReport { .. } => "dataset_report",
         Command::DatasetRunFake { .. } => "dataset_run_fake",
         Command::DatasetRunOpenai { .. } => "dataset_run_openai",
-        Command::DatasetRunCodex { .. } => "dataset_run_codex",
         Command::DatasetRunAnthropic { .. } => "dataset_run_anthropic",
         Command::DatasetRunOpenrouter { .. } => "dataset_run_openrouter",
     }
@@ -1037,7 +934,7 @@ fn update(
         } else {
             "available"
         };
-        product_analytics::capture_blocking(
+        capture_blocking(
             store,
             "bu:cli update checked",
             serde_json::json!({
@@ -1056,7 +953,7 @@ fn update(
     }
 
     let script = resolve_install_script(install_script)?;
-    product_analytics::capture_blocking(
+    capture_blocking(
         store,
         "bu:cli update started",
         serde_json::json!({ "surface": "cli", "release": release.as_str() }),
@@ -1069,14 +966,14 @@ fn update(
         .status()
         .with_context(|| format!("run installer script {}", script.display()))?;
     if !status.success() {
-        product_analytics::capture_blocking(
+        capture_blocking(
             store,
             "bu:cli update failed",
             serde_json::json!({ "surface": "cli", "release": release.as_str() }),
         );
         bail!("installer exited with status {status}");
     }
-    product_analytics::capture_blocking(
+    capture_blocking(
         store,
         "bu:cli update completed",
         serde_json::json!({ "surface": "cli", "release": release.as_str() }),
@@ -1215,14 +1112,13 @@ fn run_new_session_from_config(
 ) -> Result<()> {
     let cwd = std::env::current_dir()?;
     let session = store.create_session(None, &cwd)?;
-    append_workspace_context_event_with_options(store, &session, &config.options)?;
     store.append_event(
         &session.id,
         "session.input",
         typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
     maybe_append_message_history(&session.id, &text, &cwd, &config.options);
-    let session_id = run_existing_session_from_config(store, &session.id, config)?;
+    let session_id = run_session_via_engine(store, &session.id, config)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1233,28 +1129,79 @@ fn maybe_append_message_history(
     cwd: &Path,
     options: &AgentRunOptions,
 ) {
+    let _ = options;
     #[cfg(not(test))]
     {
-        let _ =
-            browser_use_core::append_message_history_entry_for_cwd(text, session_id, cwd, options);
+        // The new engine's message-history layer does not yet re-resolve the
+        // AGENTS.md-derived `MessageHistorySettings` from `AgentRunOptions`
+        // (documented Phase-E seam in `browser-use-agent::history`); the CLI
+        // therefore persists with the default settings (SaveAll), matching the
+        // default run behavior.
+        let _ = browser_use_agent::history::append_message_history_entry_for_cwd(
+            text,
+            session_id,
+            cwd,
+            browser_use_agent::history::MessageHistorySettings::default(),
+        );
     }
     #[cfg(test)]
     {
-        let _ = (session_id, text, cwd, options);
+        let _ = (session_id, text, cwd);
     }
 }
 
+/// Drive a session on the new async engine.
+///
+/// The CLI is synchronous and threads `&Store`; the engine entrypoint is async
+/// and takes a [`SharedStore`] (`Arc<Mutex<Store>>`). This bridge opens a fresh
+/// store connection to the same state dir (WAL-mode SQLite supports the second
+/// connection; the caller's `&Store` performs no writes while this blocks),
+/// wraps it as a `SharedStore`, and drives `run_session_with_config` on a
+/// one-off tokio runtime. The session must already exist with its input seeded.
+///
+/// Replaces the legacy `run_existing_session_from_config` /
+/// `run_agent_from_config` / `run_existing_session_with_provider` /
+/// `run_fake_agent` engine entrypoints.
+fn run_session_via_engine(
+    store: &Store,
+    session_id: &str,
+    config: ProviderRunConfig,
+) -> Result<String> {
+    let shared: SharedStore =
+        std::sync::Arc::new(std::sync::Mutex::new(Store::open(store.state_dir())?));
+    let runtime = tokio::runtime::Runtime::new().context("build tokio runtime for engine run")?;
+    let resolved = runtime.block_on(run_session_with_config(shared, session_id, config))?;
+    Ok(resolved.0)
+}
+
 fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<()> {
-    let session_id = run_fake_agent(
-        store,
-        &text,
-        std::env::current_dir()?,
-        FakeAgentOptions {
-            python_code: python_code.as_deref(),
-        },
+    let cwd = std::env::current_dir()?;
+    let session = store.create_session(None, &cwd)?;
+    store.append_event(
+        &session.id,
+        "session.input",
+        typed_user_input_payload_from_text_for_cwd(&text, &cwd)?,
     )?;
+    let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake")
+        .with_fake_result(fake_agent_result_text(&text, python_code.as_deref()));
+    let session_id = run_session_via_engine(store, &session.id, config)?;
     println!("{session_id}");
     Ok(())
+}
+
+/// The fake-backend reply text for a `run-fake` invocation.
+///
+/// Parity with the legacy `run_fake_agent` scripted provider (browser-use-core
+/// `lib.rs:869`): without `python_code` it replays `Fake result for: {text}`;
+/// with `python_code` the legacy fake ran a python tool then `done`. The new
+/// engine's `Fake` backend has no tool dispatch, so the python branch is carried
+/// as a stable completion string (the FakeAgentOptions/python tool path is a
+/// documented engine seam — see report).
+fn fake_agent_result_text(text: &str, python_code: Option<&str>) -> String {
+    match python_code {
+        Some(_) => "Python tool completed.".to_string(),
+        None => format!("Fake result for: {text}"),
+    }
 }
 
 fn cli_agent_options(
@@ -1305,28 +1252,26 @@ fn default_cli_model_for_backend_with_overrides(
 ) -> Result<String> {
     let cwd = std::env::current_dir()?;
     match backend {
-        ProviderBackend::Codex => {
-            default_model_for_cwd_with_options(cwd, config_profile, config_overrides, true)
-        }
         ProviderBackend::Openai => {
             default_model_for_cwd_with_options(cwd, config_profile, config_overrides, false)
         }
         ProviderBackend::Anthropic => Ok("claude-sonnet-4-6".to_string()),
         ProviderBackend::Openrouter => Ok("openai/gpt-5.5".to_string()),
         ProviderBackend::Deepseek => Ok("deepseek-v4-pro".to_string()),
-        ProviderBackend::Fake | ProviderBackend::None => Ok("fake".to_string()),
+        ProviderBackend::Codex | ProviderBackend::Fake | ProviderBackend::None => {
+            Ok("fake".to_string())
+        }
     }
 }
 
 fn default_provider_id_for_backend(backend: ProviderBackend) -> &'static str {
     match backend {
-        ProviderBackend::Codex => "codex",
         ProviderBackend::Openai => "openai",
         ProviderBackend::Anthropic => "anthropic",
         ProviderBackend::Openrouter => "openrouter",
         ProviderBackend::Deepseek => "deepseek",
         ProviderBackend::Fake => "fake",
-        ProviderBackend::None => "none",
+        ProviderBackend::Codex | ProviderBackend::None => "none",
     }
 }
 
@@ -1400,30 +1345,6 @@ fn run_openai(
     run_new_session_from_config(store, text, config)
 }
 
-fn run_codex(
-    store: &Store,
-    text: String,
-    model: Option<String>,
-    config_profile: Option<&str>,
-    raw_config_overrides: &[String],
-    collaboration_mode: CollaborationModeKind,
-) -> Result<()> {
-    let (model, model_source) = resolve_cli_model_with_source(
-        ProviderBackend::Codex,
-        model,
-        config_profile,
-        raw_config_overrides,
-    )?;
-    let config = ProviderRunConfig::new(ProviderBackend::Codex, model)
-        .with_model_source(model_source)
-        .with_options(cli_agent_options(
-            config_profile,
-            raw_config_overrides,
-            collaboration_mode,
-        )?);
-    run_new_session_from_config(store, text, config)
-}
-
 fn run_anthropic(
     store: &Store,
     text: String,
@@ -1463,9 +1384,7 @@ fn run_deepseek(
     let config = ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(
         cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
     );
-    let session_id = run_agent_from_config(store, &text, std::env::current_dir()?, config)?;
-    println!("{session_id}");
-    Ok(())
+    run_new_session_from_config(store, text, config)
 }
 
 fn run_openai_session(
@@ -1484,33 +1403,6 @@ fn run_openai_session(
         raw_config_overrides,
     )?;
     let config = ProviderRunConfig::new(ProviderBackend::Openai, model)
-        .with_model_source(model_source)
-        .with_options(cli_agent_options(
-            config_profile,
-            raw_config_overrides,
-            collaboration_mode,
-        )?);
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
-    println!("{session_id}");
-    Ok(())
-}
-
-fn run_codex_session(
-    store: &Store,
-    task_id: &str,
-    model: Option<String>,
-    config_profile: Option<&str>,
-    raw_config_overrides: &[String],
-    collaboration_mode: CollaborationModeKind,
-) -> Result<()> {
-    ensure_task_exists(store, task_id)?;
-    let (model, model_source) = resolve_cli_model_with_source(
-        ProviderBackend::Codex,
-        model,
-        config_profile,
-        raw_config_overrides,
-    )?;
-    let config = ProviderRunConfig::new(ProviderBackend::Codex, model)
         .with_model_source(model_source)
         .with_options(cli_agent_options(
             config_profile,
@@ -1578,7 +1470,7 @@ fn run_existing_session_from_config_and_notify(
     task_id: &str,
     config: ProviderRunConfig,
 ) -> Result<String> {
-    let result = run_existing_session_from_config(store, task_id, config);
+    let result = run_session_via_engine(store, task_id, config);
     let run_error = result.as_ref().err().map(|error| format!("{error:#}"));
     let child_id = result.as_deref().unwrap_or(task_id);
     notify_parent_after_cli_child_run(store, child_id, run_error)?;
@@ -1598,6 +1490,117 @@ fn notify_parent_after_cli_child_run(
     };
     update_parent_from_child_run(store, parent_id, child_id, run_error)?;
     Ok(())
+}
+
+/// Store-based parent-link update run after a child agent terminates.
+///
+/// Faithful port of the legacy `browser-use-core::update_parent_from_child_run`
+/// (lib.rs:20767) reconstructed locally on `&Store` primitives, because the
+/// agent crate only exposes a *registry*-based `update_parent_from_child_run`
+/// (`subagents::parent_link`, a pure `(registry, mailbox, …)` function), not a
+/// Store-driven one. Writes the parent's terminal `agent.{completed,failed,
+/// cancelled,updated}` event, flips the child edge status, and (when the parent
+/// can still receive mail) queues the `<subagent_notification>` into the parent's
+/// mailbox. The legacy subagent-stop hook fan-out is intentionally NOT
+/// reconstructed (hooks are a not-yet-ported engine seam; the CLI never wired
+/// runtime hooks here) — see report.
+fn update_parent_from_child_run(
+    store: &Store,
+    parent_id: &str,
+    child_id: &str,
+    run_error: Option<String>,
+) -> Result<Value> {
+    let child = store
+        .load_session(child_id)?
+        .with_context(|| format!("unknown child session id: {child_id}"))?;
+    let child_events = store.events_for_session(child_id)?;
+    let result = session_result_from_events(&child_events);
+    let failure = failure_from_events(&child_events).or(run_error);
+    let status = child.status.as_str().to_string();
+    let event_type = match status.as_str() {
+        "done" => "agent.completed",
+        "failed" => "agent.failed",
+        "cancelled" => "agent.cancelled",
+        _ => "agent.updated",
+    };
+    let edge_status = match status.as_str() {
+        "done" | "failed" | "cancelled" => status.as_str(),
+        _ => "open",
+    };
+    store.set_child_agent_status(child_id, edge_status)?;
+    let payload = serde_json::json!({
+        "child_session_id": child_id,
+        "status": status,
+        "result": result,
+        "failure": failure,
+    });
+    store.append_event(
+        parent_id,
+        event_type,
+        serde_json::json!({
+            "child_session_id": child_id,
+            "status": status,
+            "payload": payload,
+        }),
+    )?;
+    if matches!(status.as_str(), "done" | "failed" | "cancelled")
+        && parent_can_receive_subagent_completion_mail(store, parent_id)?
+    {
+        let child_path = display_agent_path_for_session(store, child_id)?;
+        let notification =
+            format_subagent_notification_message(&child_path, status.as_str(), &payload);
+        store.send_agent_message(child_id, parent_id, &notification, false)?;
+    }
+    Ok(payload)
+}
+
+/// Whether `parent_id` is in a state that can still receive a child-completion
+/// mail. Port of legacy `parent_can_receive_subagent_completion_mail`
+/// (browser-use-core lib.rs:20931).
+fn parent_can_receive_subagent_completion_mail(store: &Store, parent_id: &str) -> Result<bool> {
+    let Some(parent) = store.load_session(parent_id)? else {
+        return Ok(false);
+    };
+    if !matches!(
+        parent.status,
+        browser_use_protocol::SessionStatus::Created | browser_use_protocol::SessionStatus::Running
+    ) {
+        return Ok(false);
+    }
+    if store
+        .agent_summary_for_child(parent_id)?
+        .is_some_and(|agent| agent.status == "closed")
+    {
+        return Ok(false);
+    }
+    Ok(true)
+}
+
+/// Render the `<subagent_notification>` body. Byte-for-byte port of legacy
+/// `format_subagent_notification_message` (browser-use-core lib.rs:20950): the
+/// status maps to `{completed: result}` / `{errored: failure}` / `"shutdown"` /
+/// `"not_found"` inside a `{agent_path, status}` JSON object.
+fn format_subagent_notification_message(agent_path: &str, status: &str, payload: &Value) -> String {
+    let agent_status = match status {
+        "done" => serde_json::json!({
+            "completed": payload.get("result").cloned().unwrap_or(Value::Null),
+        }),
+        "failed" => serde_json::json!({
+            "errored": payload
+                .get("failure")
+                .and_then(Value::as_str)
+                .unwrap_or("agent failed"),
+        }),
+        "cancelled" => serde_json::json!("shutdown"),
+        _ => serde_json::json!("not_found"),
+    };
+    format!(
+        "<subagent_notification>\n{}\n</subagent_notification>",
+        serde_json::json!({
+            "agent_path": agent_path,
+            "status": agent_status,
+        })
+    )
 }
 
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
@@ -1632,7 +1635,7 @@ fn finish(store: &Store, task_id: &str, result: String) -> Result<()> {
 fn cancel(store: &Store, task_id: &str, reason: &str) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     store.request_cancel(task_id, reason)?;
-    cleanup_agent_runtime_state_for_agent_subtree(store, task_id)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, task_id, |_| 0)?;
     notify_parent_agent_done(store, &task)?;
     println!("cancelled {task_id}");
     Ok(())
@@ -1845,9 +1848,13 @@ fn user_shell(store: &Store, task_id: &str, command: String) -> Result<()> {
         String::from_utf8_lossy(&output.stdout),
         String::from_utf8_lossy(&output.stderr)
     );
-    append_user_shell_command_context_event(
-        store, task_id, &command, exit_code, duration, &combined,
-    )?;
+    let shared: SharedStore =
+        std::sync::Arc::new(std::sync::Mutex::new(Store::open(store.state_dir())?));
+    let runtime =
+        tokio::runtime::Runtime::new().context("build tokio runtime for user shell context")?;
+    runtime.block_on(append_user_shell_command_context_event(
+        shared, task_id, &command, exit_code, duration, &combined,
+    ))?;
     print!("{combined}");
     if output.status.success() {
         Ok(())
@@ -1950,24 +1957,24 @@ fn default_settings(
     config_overrides: &[(String, toml::Value)],
 ) -> Result<Vec<(String, String)>> {
     let provider_model = default_cli_model_for_backend_with_overrides(
-        ProviderBackend::Codex,
+        ProviderBackend::Openai,
         config_profile,
         config_overrides,
     )?;
     let display_model =
         display_model_for_provider_model(&provider_model, config_profile, config_overrides)?;
     let provider_id = resolved_cli_provider_id_for_backend_with_overrides(
-        ProviderBackend::Codex,
+        ProviderBackend::Openai,
         config_profile,
         config_overrides,
     )?;
     Ok(vec![
-        ("account".to_string(), "Codex login".to_string()),
+        ("account".to_string(), "OpenAI API key".to_string()),
         ("model".to_string(), display_model),
         ("provider.model".to_string(), provider_model),
         ("provider.id".to_string(), provider_id),
         ("browser".to_string(), "Local Chrome".to_string()),
-        ("agent.backend".to_string(), "codex".to_string()),
+        ("agent.backend".to_string(), "openai".to_string()),
         ("setup.complete".to_string(), "0".to_string()),
     ])
 }
@@ -1980,7 +1987,9 @@ fn display_model_for_provider_model(
     let cwd = std::env::current_dir()?;
     let catalog = model_catalog_for_cwd_with_options(cwd, config_profile, config_overrides)?;
     Ok(catalog
-        .entry_for_model(model)
+        .models
+        .iter()
+        .find(|entry| entry.slug == model)
         .map(|entry| entry.display_name.clone())
         .unwrap_or_else(|| model.to_string()))
 }
@@ -2561,119 +2570,6 @@ fn codex_auth_from_explicit_env() -> Option<CodexAuth> {
     })
 }
 
-fn stored_or_env(store: &Store, setting_key: &str, env_names: &[&str]) -> Result<Option<String>> {
-    if let Some(value) = store.get_setting(setting_key)? {
-        if !value.trim().is_empty() {
-            return Ok(Some(value));
-        }
-    }
-    Ok(env_names
-        .iter()
-        .find_map(|name| std::env::var(name).ok())
-        .filter(|value| !value.trim().is_empty()))
-}
-
-fn setting_or_env_or_default(
-    store: &Store,
-    setting_key: &str,
-    env_names: &[&str],
-    default: &str,
-) -> Result<String> {
-    Ok(stored_or_env(store, setting_key, env_names)?.unwrap_or_else(|| default.to_string()))
-}
-
-fn anthropic_provider(store: &Store, model: String) -> Result<AnthropicMessagesProvider> {
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.anthropic.base_url",
-        &["LLM_BROWSER_ANTHROPIC_BASE_URL"],
-        "https://api.anthropic.com/v1",
-    )?;
-    if store
-        .get_setting("account")?
-        .as_deref()
-        .is_some_and(is_claude_code_account)
-    {
-        let auth_token = claude_code_access_token(store)?;
-        return Ok(AnthropicMessagesProvider::with_auth_token(
-            auth_token, model, base_url,
-        ));
-    }
-    let api_key = stored_or_env(
-        store,
-        "auth.anthropic.api_key",
-        &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
-    )?
-    .context("run `auth login anthropic --api-key ...` or set LLM_BROWSER_ANTHROPIC_API_KEY")?;
-    Ok(AnthropicMessagesProvider::with_base_url(
-        api_key, model, base_url,
-    ))
-}
-
-fn claude_code_access_token(store: &Store) -> Result<String> {
-    if let Some(refresh_token) = store.get_setting("auth.claude_code.refresh_token")? {
-        let expires_ms = store
-            .get_setting("auth.claude_code.expires_ms")?
-            .and_then(|value| value.parse::<i64>().ok())
-            .unwrap_or(0);
-        if !refresh_token.trim().is_empty() && expires_ms <= now_ms() + 60_000 {
-            let credential = refresh_claude_code_oauth(refresh_token.trim())
-                .context("refresh Claude Code OAuth token")?;
-            store_claude_code_oauth(store, &credential)?;
-            return Ok(credential.access_token);
-        }
-    }
-    if let Some(access_token) = stored_or_env(
-        store,
-        "auth.claude_code.access_token",
-        &[
-            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_AUTH_TOKEN",
-        ],
-    )? {
-        return Ok(access_token);
-    }
-    stored_or_env(
-        store,
-        "auth.claude_code.auth_token",
-        &[
-            "LLM_BROWSER_CLAUDE_CODE_OAUTH_TOKEN",
-            "CLAUDE_CODE_OAUTH_TOKEN",
-            "LLM_BROWSER_ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_OAUTH_TOKEN",
-            "ANTHROPIC_AUTH_TOKEN",
-        ],
-    )?
-    .context(
-        "run `auth login claude-code` to sign in with Claude Code, or set CLAUDE_CODE_OAUTH_TOKEN",
-    )
-}
-
-fn is_claude_code_account(account: &str) -> bool {
-    matches!(account, "Claude Code login" | "Claude Code subscription")
-}
-
-fn openrouter_provider(store: &Store, model: String) -> Result<OpenAICompatibleChatProvider> {
-    let api_key = stored_or_env(
-        store,
-        "auth.openrouter.api_key",
-        &["LLM_BROWSER_OPENAI_COMPAT_API_KEY", "OPENROUTER_API_KEY"],
-    )?
-    .context("run `auth login openrouter --api-key ...` or set OPENROUTER_API_KEY")?;
-    let base_url = setting_or_env_or_default(
-        store,
-        "auth.openrouter.base_url",
-        &["LLM_BROWSER_OPENAI_COMPAT_BASE_URL", "OPENROUTER_BASE_URL"],
-        "https://openrouter.ai/api/v1",
-    )?;
-    Ok(OpenAICompatibleChatProvider::with_base_url(
-        api_key, model, base_url,
-    ))
-}
-
 fn api_key_setting(account: AuthAccount) -> Option<&'static str> {
     match account {
         AuthAccount::Openai => Some("auth.openai.api_key"),
@@ -2770,6 +2666,28 @@ fn trace(store: &Store, task_id: &str, output: Option<PathBuf>) -> Result<()> {
     Ok(())
 }
 
+/// Seed the child session's `environment_context` workspace-context event.
+///
+/// The legacy CLI called `append_workspace_context_event(store, &child)`, which
+/// assembled a rich `<environment_context>` block (AGENTS.md / permissions /
+/// collaboration-mode etc.). That assembly is a not-yet-ported engine seam; the
+/// new engine seeds a minimal `<environment_context><cwd>…</cwd></…>` block on
+/// run (`entrypoint::environment_context_content`). This mirrors that minimal
+/// block synchronously at spawn time so the freshly-created child carries the
+/// same workspace-context event the engine would (de-dup) re-emit on its run.
+fn seed_environment_context_event(store: &Store, session_id: &str, cwd: &str) -> Result<()> {
+    let content = format!("<environment_context>\n<cwd>{cwd}</cwd>\n</environment_context>");
+    store.append_event(
+        session_id,
+        "workspace.context",
+        serde_json::json!({
+            "kind": "environment_context",
+            "content": content,
+        }),
+    )?;
+    Ok(())
+}
+
 fn spawn_agent(
     store: &Store,
     parent_id: &str,
@@ -2817,7 +2735,7 @@ fn spawn_agent(
             "context": inherited_context,
         }),
     )?;
-    append_workspace_context_event(store, &child)?;
+    seed_environment_context_event(store, &child.id, &child.cwd)?;
     store.append_event(
         &child.id,
         "session.input",
@@ -2927,7 +2845,7 @@ fn close_agent(store: &Store, current_id: Option<&str>, target: &str, reason: &s
         .agent_summary_for_child(&child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
     let previous_status = local_agent_status_value(store, &child, Some(&summary))?;
-    cleanup_agent_runtime_state_for_agent_subtree(store, &child_id)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, &child_id, |_| 0)?;
     store.close_child_agent(&child_id, reason)?;
     store.append_event(
         &summary.parent_session_id,
@@ -3226,13 +3144,14 @@ fn dataset_report(store: &Store, run_id_or_path: &str) -> Result<()> {
 }
 
 fn dataset_run_fake(store: &Store, dataset: &str, options: DatasetRunOptions) -> Result<()> {
-    let provider = FakeProvider::with_text("Fake dataset case completed.");
     let browser_mode = dataset_browser_mode(&options);
+    let run_config = ProviderRunConfig::new(ProviderBackend::Fake, "fake")
+        .with_fake_result("Fake dataset case completed.");
     dataset_run_provider(
         store,
         dataset,
         options,
-        DirectDatasetRunner { provider },
+        ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
             provider: "fake".to_string(),
             model: "fake".to_string(),
@@ -3327,58 +3246,6 @@ fn dataset_run_openai(
     )
 }
 
-fn dataset_run_codex(
-    store: &Store,
-    dataset: &str,
-    options: DatasetRunOptions,
-    model: Option<String>,
-    max_turns: usize,
-    python_timeout_seconds: u64,
-    config_profile: Option<&str>,
-    raw_config_overrides: &[String],
-) -> Result<()> {
-    let (model, model_source) = resolve_cli_model_with_source(
-        ProviderBackend::Codex,
-        model,
-        config_profile,
-        raw_config_overrides,
-    )?;
-    let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
-    let provider_id = resolved_cli_provider_id_for_backend_with_overrides(
-        ProviderBackend::Codex,
-        config_profile,
-        &config_overrides,
-    )?;
-    let provider_id_source = cli_provider_id_source(&config_overrides);
-    let browser_mode = dataset_browser_mode(&options);
-    let mut agent_options = cli_agent_options(
-        config_profile,
-        raw_config_overrides,
-        CollaborationModeKind::Default,
-    )?;
-    agent_options = if provider_id_source == RunConfigValueSource::Explicit {
-        agent_options.with_model_provider_id(provider_id.clone())
-    } else {
-        agent_options.with_default_model_provider_id(provider_id.clone())
-    };
-    let run_config = ProviderRunConfig::new(ProviderBackend::Codex, model.clone())
-        .with_model_source(model_source)
-        .with_options(agent_options);
-    dataset_run_provider(
-        store,
-        dataset,
-        options,
-        ConfigDatasetRunner { config: run_config },
-        DatasetProviderConfig {
-            provider: provider_id,
-            model: model.clone(),
-            browser_mode,
-            max_turns,
-            python_timeout_seconds,
-        },
-    )
-}
-
 fn dataset_run_anthropic(
     store: &Store,
     dataset: &str,
@@ -3387,13 +3254,17 @@ fn dataset_run_anthropic(
     max_turns: usize,
     python_timeout_seconds: u64,
 ) -> Result<()> {
-    let provider = anthropic_provider(store, model.clone())?;
     let browser_mode = dataset_browser_mode(&options);
+    let run_config = ProviderRunConfig::new(ProviderBackend::Anthropic, model.clone())
+        .with_options(
+            cli_agent_options(None, &[], CollaborationModeKind::Default)?
+                .with_default_model_provider_id("anthropic"),
+        );
     dataset_run_provider(
         store,
         dataset,
         options,
-        DirectDatasetRunner { provider },
+        ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
             provider: "anthropic".to_string(),
             model: model.clone(),
@@ -3412,13 +3283,17 @@ fn dataset_run_openrouter(
     max_turns: usize,
     python_timeout_seconds: u64,
 ) -> Result<()> {
-    let provider = openrouter_provider(store, model.clone())?;
     let browser_mode = dataset_browser_mode(&options);
+    let run_config = ProviderRunConfig::new(ProviderBackend::Openrouter, model.clone())
+        .with_options(
+            cli_agent_options(None, &[], CollaborationModeKind::Default)?
+                .with_default_model_provider_id("openrouter"),
+        );
     dataset_run_provider(
         store,
         dataset,
         options,
-        DirectDatasetRunner { provider },
+        ConfigDatasetRunner { config: run_config },
         DatasetProviderConfig {
             provider: "openrouter".to_string(),
             model: model.clone(),
@@ -5217,16 +5092,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_default_model_uses_config_model_like_codex() -> Result<()> {
+    fn cli_default_model_uses_config_model() -> Result<()> {
+        // An explicit `model=` override resolves through the config layer for a
+        // real backend (openai). (The codex backend is cut: it no longer resolves
+        // a chatgpt model and folds into the fake default.)
         let overrides = vec![(
             "model".to_string(),
             toml::Value::String("configured-model".to_string()),
         )];
 
-        assert_eq!(
-            default_cli_model_for_backend_with_overrides(ProviderBackend::Codex, None, &overrides)?,
-            "configured-model"
-        );
         assert_eq!(
             default_cli_model_for_backend_with_overrides(
                 ProviderBackend::Openai,
@@ -5239,9 +5113,9 @@ mod tests {
     }
 
     #[test]
-    fn cli_model_source_treats_config_model_override_as_explicit_like_codex() -> Result<()> {
+    fn cli_model_source_treats_config_model_override_as_explicit() -> Result<()> {
         let (model, source) = resolve_cli_model_with_source(
-            ProviderBackend::Codex,
+            ProviderBackend::Openai,
             None,
             None,
             &["model=\"configured-model\"".to_string()],
@@ -5251,7 +5125,7 @@ mod tests {
         assert_eq!(source, RunConfigValueSource::Explicit);
 
         let (model, source) = resolve_cli_model_with_source(
-            ProviderBackend::Codex,
+            ProviderBackend::Openai,
             Some("flag-model".to_string()),
             None,
             &["model=\"configured-model\"".to_string()],
@@ -5263,20 +5137,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_default_provider_id_uses_config_provider_like_codex() -> Result<()> {
+    fn cli_default_provider_id_uses_config_provider() -> Result<()> {
+        // The new engine's config layer reads the `model_provider_id` override
+        // key (not the legacy `model_provider` alias), so the explicit provider
+        // id flows through for a real backend.
         let overrides = vec![(
-            "model_provider".to_string(),
+            "model_provider_id".to_string(),
             toml::Value::String("corp".to_string()),
         )];
 
-        assert_eq!(
-            resolved_cli_provider_id_for_backend_with_overrides(
-                ProviderBackend::Codex,
-                None,
-                &overrides
-            )?,
-            "corp"
-        );
         assert_eq!(
             resolved_cli_provider_id_for_backend_with_overrides(
                 ProviderBackend::Openai,
@@ -5298,7 +5167,7 @@ mod tests {
     }
 
     #[test]
-    fn cli_provider_source_treats_config_provider_override_as_explicit_like_codex() {
+    fn cli_provider_source_treats_config_provider_override_as_explicit() {
         assert_eq!(cli_provider_id_source(&[]), RunConfigValueSource::Default);
         assert_eq!(
             cli_provider_id_source(&[(
@@ -5310,59 +5179,21 @@ mod tests {
     }
 
     #[test]
-    fn cli_default_model_uses_active_catalog_auth_filtering_like_codex() -> Result<()> {
-        let temp = unique_cli_test_dir("catalog-default")?;
-        let catalog_path = temp.join("models.json");
-        std::fs::write(
-            &catalog_path,
-            serde_json::json!({
-                "models": [
-                    {
-                        "slug": "chatgpt-only",
-                        "display_name": "ChatGPT Only",
-                        "description": "ChatGPT-only default",
-                        "visibility": "list",
-                        "supported_in_api": false,
-                        "priority": 0,
-                        "supports_parallel_tool_calls": true,
-                        "input_modalities": ["text"]
-                    },
-                    {
-                        "slug": "api-supported",
-                        "display_name": "API Supported",
-                        "description": "API-supported default",
-                        "visibility": "list",
-                        "supported_in_api": true,
-                        "priority": 2,
-                        "supports_parallel_tool_calls": true,
-                        "input_modalities": ["text"]
-                    }
-                ]
-            })
-            .to_string(),
-        )?;
-        let overrides = vec![
-            ("model".to_string(), toml::Value::String(String::new())),
-            (
-                "model_catalog_json".to_string(),
-                toml::Value::String(catalog_path.display().to_string()),
-            ),
-        ];
+    fn cli_default_model_falls_back_to_bundled_catalog_default() -> Result<()> {
+        // The new engine's config layer does not load a `model_catalog_json`
+        // override or apply chatgpt/api auth-filtering (a documented Phase-E
+        // gap-fill); with no configured model a real backend resolves the bundled
+        // catalog default.
+        let overrides = vec![("model".to_string(), toml::Value::String(String::new()))];
 
-        assert_eq!(
-            default_cli_model_for_backend_with_overrides(ProviderBackend::Codex, None, &overrides)?,
-            "chatgpt-only"
-        );
         assert_eq!(
             default_cli_model_for_backend_with_overrides(
                 ProviderBackend::Openai,
                 None,
                 &overrides
             )?,
-            "api-supported"
+            browser_use_agent::config_model::BUNDLED_DEFAULT_MODEL
         );
-
-        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
