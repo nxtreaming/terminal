@@ -23,8 +23,8 @@ use crate::transcript;
 
 use super::{
     collaboration_mode_label, event_payload_text, pending_active_followup_events_from_events,
-    pending_queued_followup_events_from_events, App, MessageActionKind, ProductState,
-    RequestUserInputFocus, SetupResultKind, Surface,
+    pending_queued_followup_events_from_events, App, CookieSyncStatus, MessageActionKind,
+    ProductState, RequestUserInputFocus, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -410,7 +410,7 @@ fn main_bottom_height_for(
         Surface::Model | Surface::History | Surface::Messages => {
             area.height.saturating_sub(2).max(6)
         }
-        Surface::BrowserSelect => 22,
+        Surface::BrowserSelect | Surface::CookieSync => 22,
         _ => 18,
     };
     // Add room for the surface header, footer, borders, and content margins.
@@ -1258,6 +1258,10 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
+        Surface::CookieSync => (
+            "Cookie Sync",
+            "Import local browser cookies to Browser Use cloud",
+        ),
         Surface::History => ("History", "Browse and resume previous tasks"),
         Surface::Messages => (
             "Messages",
@@ -1272,7 +1276,11 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
 /// one-line description — the shared chrome for every dropdown/settings view.
 fn surface_header_lines(surface: Surface, width: u16) -> Vec<Line<'static>> {
     let (title, description) = surface_heading(surface);
-    let indent = " ".repeat(CONTENT_HORIZONTAL_MARGIN as usize);
+    let indent = if surface == Surface::CookieSync {
+        String::new()
+    } else {
+        " ".repeat(CONTENT_HORIZONTAL_MARGIN as usize)
+    };
     vec![
         Line::from(Span::styled("─".repeat(width as usize), accent())),
         Line::from(vec![
@@ -1296,6 +1304,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
+        Surface::CookieSync => "Enter:select | Esc:close",
         Surface::Developer => "Esc:close",
         _ => "Enter:select | Esc:back",
     }
@@ -1335,6 +1344,7 @@ fn surface_lines(
         Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
+        Surface::CookieSync => cookie_sync_lines(app, width),
         Surface::History => history_lines(app, state, width),
         Surface::Messages => message_lines(app, width),
         Surface::Developer => developer_lines(app, state),
@@ -2245,13 +2255,6 @@ fn api_key_lines(app: &App) -> Vec<Line<'static>> {
     let account = app.api_key_account.as_deref().unwrap_or("selected account");
     let mut lines = vec![Line::from(Span::styled(auth_secret_label(account), bold()))];
     lines.push(Line::from(""));
-    if account == BROWSER_USE_CLOUD {
-        lines.extend([
-            Line::from("  Browser Use cloud runs a remote browser with live view."),
-            Line::from("  Add this key once, or export BROWSER_USE_API_KEY before launch."),
-            Line::from(""),
-        ]);
-    }
     lines.extend([
         Line::from(format!(
             "  {}",
@@ -2508,6 +2511,162 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
             ),
         ]),
     ]);
+    lines
+}
+
+pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
+    let body_width = cookie_sync_body_width(width);
+    let mut lines = vec![
+        Line::from(Span::styled("BROWSER USE CLOUD", muted())),
+        Line::from(""),
+    ];
+    match &app.cookie_sync.status {
+        CookieSyncStatus::NeedsAuth => {
+            lines.push(Line::from("  Browser Use cloud key is missing."));
+            lines.push(Line::from(""));
+            lines.push(selected("Add Browser Use key", 0, app.selected_row));
+        }
+        CookieSyncStatus::LoadingProfiles => {
+            lines.push(Line::from("  Scanning local Chromium profiles..."));
+        }
+        CookieSyncStatus::Ready => {
+            lines.push(kv_line("scope", "all cookies"));
+            lines.push(kv_line("target", "new Browser Use cloud profile"));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled("LOCAL PROFILES", muted())));
+            lines.push(Line::from(""));
+            if app.cookie_sync.profiles.is_empty() {
+                lines.push(Line::from("  No local Chromium profiles found."));
+            } else {
+                for (idx, profile) in app.cookie_sync.profiles.iter().enumerate() {
+                    lines.push(selected(
+                        &truncate(&profile.display_name, body_width),
+                        idx,
+                        app.selected_row,
+                    ));
+                }
+            }
+        }
+        CookieSyncStatus::Syncing => {
+            let profile = app
+                .cookie_sync
+                .selected_profile_label
+                .as_deref()
+                .unwrap_or("selected profile");
+            push_wrapped_cookie_sync_paragraph(
+                &mut lines,
+                &format!("Syncing all cookies from {profile}..."),
+                body_width,
+            );
+        }
+        CookieSyncStatus::Completed(message) => {
+            lines.push(Line::from(Span::styled("🎉 Complete", bold())));
+            lines.push(Line::from(""));
+            push_completed_cookie_sync_message(&mut lines, message, body_width);
+            lines.push(Line::from(""));
+            lines.push(selected("Close", 0, app.selected_row));
+        }
+        CookieSyncStatus::Failed(error) => {
+            lines.push(Line::from(Span::styled("Failed", bold())));
+            lines.push(Line::from(""));
+            push_wrapped_cookie_sync_message(&mut lines, error, body_width);
+            lines.push(Line::from(""));
+            lines.push(selected("Close", 0, app.selected_row));
+        }
+    }
+    lines
+}
+
+fn cookie_sync_body_width(width: usize) -> usize {
+    width.saturating_sub(4).max(1).min(88)
+}
+
+fn push_completed_cookie_sync_message(lines: &mut Vec<Line<'static>>, message: &str, width: usize) {
+    let mut paragraphs = message.lines();
+    if let Some(first) = paragraphs.next() {
+        if let Some((count, rest)) = synced_cookie_count_fragment(first) {
+            lines.push(Line::from(vec![
+                Span::raw("  Synced "),
+                Span::styled(count.to_string(), bold()),
+                Span::raw(rest.to_string()),
+            ]));
+        } else {
+            push_wrapped_cookie_sync_paragraph(lines, first, width);
+        }
+    }
+    for paragraph in paragraphs {
+        push_wrapped_completed_cookie_sync_paragraph(lines, paragraph, width);
+    }
+}
+
+fn synced_cookie_count_fragment(value: &str) -> Option<(&str, &str)> {
+    let rest = value.strip_prefix("Synced ")?;
+    let count_len = rest
+        .char_indices()
+        .find_map(|(idx, ch)| (!ch.is_ascii_digit() && ch != ',').then_some(idx))
+        .unwrap_or(rest.len());
+    if count_len == 0 {
+        return None;
+    }
+    Some(rest.split_at(count_len))
+}
+
+fn push_wrapped_completed_cookie_sync_paragraph(
+    lines: &mut Vec<Line<'static>>,
+    message: &str,
+    width: usize,
+) {
+    for line in wrap_cookie_sync_message(message, width) {
+        if let Some((label, rest)) = cookie_sync_profile_label_fragment(&line) {
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled(label.to_string(), bold()),
+                Span::raw(rest.to_string()),
+            ]));
+        } else {
+            lines.push(Line::from(format!("  {line}")));
+        }
+    }
+}
+
+fn cookie_sync_profile_label_fragment(value: &str) -> Option<(&str, &str)> {
+    ["Local profile", "Cloud profile"]
+        .into_iter()
+        .find_map(|label| value.strip_prefix(label).map(|rest| (label, rest)))
+}
+
+fn push_wrapped_cookie_sync_message(lines: &mut Vec<Line<'static>>, message: &str, width: usize) {
+    for paragraph in message.lines() {
+        push_wrapped_cookie_sync_paragraph(lines, paragraph, width);
+    }
+}
+
+fn push_wrapped_cookie_sync_paragraph(lines: &mut Vec<Line<'static>>, message: &str, width: usize) {
+    for line in wrap_cookie_sync_message(message, width) {
+        lines.push(Line::from(format!("  {line}")));
+    }
+}
+
+fn wrap_cookie_sync_message(message: &str, width: usize) -> Vec<String> {
+    let mut lines = Vec::new();
+    let mut current = String::new();
+    for word in message.split_whitespace() {
+        let word_len = word.chars().count();
+        let current_len = current.chars().count();
+        if !current.is_empty() && current_len + 1 + word_len > width {
+            lines.push(std::mem::take(&mut current));
+        }
+        if !current.is_empty() {
+            current.push(' ');
+        }
+        current.push_str(word);
+    }
+    if !current.is_empty() {
+        lines.push(current);
+    }
+    if lines.is_empty() {
+        lines.push(String::new());
+    }
     lines
 }
 

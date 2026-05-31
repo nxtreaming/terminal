@@ -7,6 +7,7 @@ pub(crate) enum PaletteAction {
     PlanMode,
     ChooseModel,
     Authenticate,
+    SyncCookies,
     Reload,
     Update,
     Exit,
@@ -19,7 +20,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 6] = [
+const VISIBLE_ITEMS: [PaletteItem; 7] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -49,6 +50,11 @@ const VISIBLE_ITEMS: [PaletteItem; 6] = [
         command: "/model",
         description: "choose model and provider",
         action: PaletteAction::ChooseModel,
+    },
+    PaletteItem {
+        command: "/sync-cookies",
+        description: "sync local cookies",
+        action: PaletteAction::SyncCookies,
     },
 ];
 
@@ -105,5 +111,13 @@ mod tests {
     #[test]
     fn reload_is_available_as_hidden_command() {
         assert_eq!(selected_action("/reload", 0), Some(PaletteAction::Reload));
+    }
+
+    #[test]
+    fn sync_cookies_is_available_from_short_filter() {
+        assert_eq!(
+            selected_action("/sync", 0),
+            Some(PaletteAction::SyncCookies)
+        );
     }
 }
