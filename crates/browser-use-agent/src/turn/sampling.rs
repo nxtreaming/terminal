@@ -491,6 +491,44 @@ fn extract_tool_calls(parts: &[ContentPart]) -> Vec<ContentPart> {
         .collect()
 }
 
+/// The completion tool's model-visible name. A model call to this tool declares
+/// the task finished; the fused driver treats it as TERMINAL (no follow-up), so
+/// the turn loop stops instead of re-sampling. Mirrors the `done` handler's
+/// [`DONE_TOOL_NAME`](crate::tools::handlers::done::DONE_TOOL_NAME).
+const DONE_TOOL_NAME: &str = "done";
+
+/// Whether any of `tool_calls` is a call to the completion (`done`) tool.
+///
+/// When the model calls `done`, it has declared the turn complete: the fused
+/// driver dispatches the call (so the `done` summary is recorded into history),
+/// then reports `model_needs_follow_up = false` so the loop terminates instead
+/// of re-sampling. This is the engine-side terminal signal the `done` handler's
+/// module doc flagged as deferred ("wiring the loop to treat a successful `done`
+/// output as terminal needs the loop's classifier") — wired here.
+fn calls_done_tool(tool_calls: &[ContentPart]) -> bool {
+    tool_calls
+        .iter()
+        .any(|p| matches!(p, ContentPart::ToolCall { name, .. } if name == DONE_TOOL_NAME))
+}
+
+/// The final summary carried by the model's `done` call, if any.
+///
+/// Reads the `text` field from the first `done` tool call's JSON arguments
+/// (matching the `done` handler's `DoneRequest { text }`). Returns `None` when
+/// there is no `done` call or it carried no (non-empty) summary, so the caller
+/// only overrides the turn result when there is a real message to surface.
+fn done_summary(tool_calls: &[ContentPart]) -> Option<String> {
+    tool_calls.iter().find_map(|p| match p {
+        ContentPart::ToolCall { name, input, .. } if name == DONE_TOOL_NAME => input
+            .get("text")
+            .and_then(|t| t.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string),
+        _ => None,
+    })
+}
+
 /// Assemble the assistant `Message` recorded for this turn: its streamed text
 /// (if any) followed by the tool calls it emitted, in model order. Mirrors codex
 /// recording the assistant function-call item before its outputs.
@@ -579,7 +617,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
             }
 
             // ---- assemble the outcome (codex parity) ----
-            let last_agent_message = (!acc.full_text.is_empty()).then(|| acc.full_text.clone());
+            let mut last_agent_message = (!acc.full_text.is_empty()).then(|| acc.full_text.clone());
 
             // Fused tool dispatch (codex `try_run_turn` / `try_run_sampling_request`):
             // when a dispatcher + recorder are configured AND the model emitted
@@ -591,6 +629,17 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 match (&self.dispatcher, &self.recorder, tool_calls.is_empty()) {
                     // Fused path with at least one tool call.
                     (Some(dispatcher), Some(recorder), false) => {
+                        // A `done` call declares the turn finished: dispatch it (so the
+                        // summary is recorded) but report NO follow-up, terminating the
+                        // loop. Detect it BEFORE the calls vec is consumed by dispatch.
+                        let is_terminal = calls_done_tool(&tool_calls);
+                        // Surface the `done` summary as the turn result when the model
+                        // declared completion via `done` and streamed no other text, so
+                        // the loop returns the summary (codex keeps the final message).
+                        if is_terminal && last_agent_message.is_none() {
+                            last_agent_message = done_summary(&tool_calls);
+                        }
+
                         // 1. Record the assistant message (text + tool calls), so the
                         //    recorded transcript carries the call before its output.
                         let assistant = assistant_message(&acc.full_text, &tool_calls);
@@ -606,9 +655,15 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                             recorder.record(&result.outputs_in_order).await;
                         }
 
-                        // follow-up iff a tool actually ran (codex re-samples after
-                        // feeding tool outputs back into history).
-                        decision::needs_follow_up(result.needs_follow_up, false)
+                        // A `done` call is TERMINAL: the model declared completion, so
+                        // the loop must stop even though a tool ran. Otherwise, follow-up
+                        // iff a tool actually ran (codex re-samples after feeding tool
+                        // outputs back into history).
+                        if is_terminal {
+                            false
+                        } else {
+                            decision::needs_follow_up(result.needs_follow_up, false)
+                        }
                     }
                     // Text-only sampler, OR fusion configured but no tool call: the
                     // model is done (no dispatch). `model_needs_follow_up` still

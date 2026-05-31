@@ -3548,6 +3548,9 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         analytics_source: Some("cli".to_string()),
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),
+        // No MCP servers wired from the CLI dataset path yet (a `[mcp_servers]`
+        // config loader is a follow-up); empty keeps the `mcp` tool unregistered.
+        mcp_servers: std::collections::HashMap::new(),
     };
     let mut run_error = runner
         .run_dataset_session(store, &session_id, agent_options)
