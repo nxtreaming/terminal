@@ -28,6 +28,7 @@ use serde_json::Value;
 
 use crate::mcp::McpServerConfig;
 use crate::prompts::CollaborationModeKind;
+use crate::tools::AskForApproval;
 
 /// Legacy `browser-use-core::constants::DEFAULT_MAX_CONTEXT_CHARS`
 /// (`constants.rs:9`). Reproduced verbatim so [`AgentRunOptions::default`]
@@ -178,6 +179,23 @@ pub struct AgentRunOptions {
     /// TUI/CLI from a `[mcp_servers]` config table (a TOML loader is a follow-up;
     /// the registration wiring is live as soon as this map is non-empty).
     pub mcp_servers: HashMap<String, McpServerConfig>,
+    /// How aggressively the agent asks before running a gated tool call.
+    ///
+    /// Drives the production tool dispatcher's approval routing
+    /// ([`crate::entrypoint::provider::build_tool_dispatcher`]): the default
+    /// [`AskForApproval::Never`] preserves the prior non-interactive behavior
+    /// (tools auto-approve, no prompt), while any non-`Never` policy routes each
+    /// gated call through the orchestrator's [`Approver`](crate::tools::runtime::Approver)
+    /// seam, which can deny. (OS-level sandbox enforcement is intentionally NOT
+    /// driven by this field — the production wiring uses a permissive sandbox seam.)
+    pub approval_policy: AskForApproval,
+    /// Whether the guardian LLM-reviewer safety gate is active for gated tool
+    /// calls under a non-`Never` [`approval_policy`](Self::approval_policy).
+    ///
+    /// Default `false` keeps the permissive (allow-everything) reviewer; setting
+    /// it `true` selects the fail-closed denying reviewer so a non-`Never` policy
+    /// actually blocks gated calls (the guardian review path).
+    pub use_guardian: bool,
 }
 
 impl Default for AgentRunOptions {
@@ -208,6 +226,10 @@ impl Default for AgentRunOptions {
             analytics_provider_kind: None,
             analytics_model: None,
             mcp_servers: HashMap::new(),
+            // Default preserves the prior non-interactive behavior: tools
+            // auto-approve, the approver is never consulted.
+            approval_policy: AskForApproval::Never,
+            use_guardian: false,
         }
     }
 }
@@ -325,6 +347,19 @@ impl AgentRunOptions {
     /// Configure the MCP servers exposed via the model-callable `mcp` tool.
     pub fn with_mcp_servers(mut self, servers: HashMap<String, McpServerConfig>) -> Self {
         self.mcp_servers = servers;
+        self
+    }
+
+    /// Set the tool approval policy (default [`AskForApproval::Never`]).
+    pub fn with_approval_policy(mut self, policy: AskForApproval) -> Self {
+        self.approval_policy = policy;
+        self
+    }
+
+    /// Enable (or disable) the fail-closed guardian reviewer for gated tool
+    /// calls under a non-`Never` approval policy.
+    pub fn with_guardian(mut self, use_guardian: bool) -> Self {
+        self.use_guardian = use_guardian;
         self
     }
 }
@@ -595,6 +630,9 @@ mod tests {
         assert!(options.analytics_provider_kind.is_none());
         assert!(options.analytics_model.is_none());
         assert!(options.mcp_servers.is_empty());
+        // Approval defaults preserve prior non-interactive behavior.
+        assert_eq!(options.approval_policy, AskForApproval::Never);
+        assert!(!options.use_guardian);
     }
 
     #[test]

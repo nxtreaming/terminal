@@ -106,3 +106,41 @@ pub trait GuardianReviewer: Send + Sync + 'static {
     /// Returning `Err` is treated as fail-closed (deny) by the guardian.
     async fn review(&self, req: &GuardianRequest) -> Result<GuardianVerdict, ReviewerError>;
 }
+
+/// A non-network reviewer that returns the SAME fixed verdict for every request.
+///
+/// This is the production-usable headless reviewer (distinct from the test-only
+/// `FixedReviewer` in `guardian/tests.rs`): a real run with no interactive human
+/// and no model-backed reviewer wired can still drive the guardian gate with a
+/// deterministic policy — [`StaticReviewer::allow`] permits every gated call (the
+/// approver is still consulted — the routing is live), while
+/// [`StaticReviewer::deny`] fails closed and blocks them. It never errors, so the
+/// guardian's fail-closed error branch is not exercised by this reviewer.
+pub struct StaticReviewer {
+    verdict: GuardianVerdict,
+}
+
+impl StaticReviewer {
+    /// A reviewer that allows every gated call.
+    pub fn allow() -> Self {
+        Self {
+            verdict: GuardianVerdict::Allow,
+        }
+    }
+
+    /// A reviewer that denies every gated call with `reason`.
+    pub fn deny(reason: impl Into<String>) -> Self {
+        Self {
+            verdict: GuardianVerdict::Deny {
+                reason: reason.into(),
+            },
+        }
+    }
+}
+
+#[async_trait]
+impl GuardianReviewer for StaticReviewer {
+    async fn review(&self, _req: &GuardianRequest) -> Result<GuardianVerdict, ReviewerError> {
+        Ok(self.verdict.clone())
+    }
+}
