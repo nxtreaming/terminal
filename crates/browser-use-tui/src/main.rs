@@ -3626,6 +3626,18 @@ impl App {
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session(None, &cwd)?;
         self.append_session_model_selection(&session.id, &selection)?;
+        // Record the collaboration mode for the session BEFORE the first user
+        // turn, so the engine sees the plan-mode context ahead of `session.input`
+        // (origin/main seeded the plan-mode workspace context at session start).
+        if self.collaboration_mode == CollaborationModeKind::Plan {
+            self.store.append_event(
+                &session.id,
+                "session.collaboration_mode",
+                serde_json::json!({
+                    "mode": collaboration_mode_setting_value(self.collaboration_mode),
+                }),
+            )?;
+        }
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
         let _ = self.refresh_prompt_history_for(&cwd, &options);
@@ -8783,17 +8795,11 @@ mod redesign_tests {
         }
     }
 
-    // Engine gap: origin/main's high-level workspace-context *builder*
-    // (`browser-use-core::append_workspace_context_event_with_options`) emitted a
-    // `plan_mode`-kind `workspace.context` event when the collaboration mode was
-    // Plan. The new engine renamed that symbol to a low-level single-event
-    // appender and does not port the plan-mode block builder, so this event is
-    // not emitted at session start. The TUI-side adapter
-    // (`append_workspace_context_event_blocking`) can only reconstruct the
-    // developer-instructions block from `AgentRunOptions`. Left in place
-    // (ignored) until the engine ports the plan-mode workspace-context block.
+    // `/plan` flips collaboration mode to Plan; `start_task_submission` then
+    // records the `session.collaboration_mode` event before the `session.input`
+    // turn, so the engine sees the plan-mode context ahead of the first user
+    // message.
     #[test]
-    #[ignore = "engine drops the plan_mode workspace-context block builder"]
     fn plan_slash_command_starts_task_with_plan_mode_context() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -10580,13 +10586,11 @@ mod redesign_tests {
         Ok(())
     }
 
-    // Engine gap: `browser_use_agent::config_model::configured_model_for_cwd_with_options`
-    // intentionally does NOT read the cwd `config.toml` `model =` layer (only
-    // AGENTS.md + `--config` overrides — see its doc comment), so a config.toml
-    // model is no longer resolved at startup. This origin/main test asserts the
-    // dropped config.toml model-resolution; left in place (ignored) until ported.
+    // `browser_use_agent::config_model::configured_model*_for_cwd_with_options`
+    // resolve the active profile's `$BROWSER_USE_TERMINAL_HOME/config.toml`
+    // `model` / `model_provider` layer, so a home `config.toml` model/provider is
+    // honored at startup without masking the provider id.
     #[test]
-    #[ignore = "engine configured_model_for_cwd_with_options drops config.toml model layer"]
     fn startup_uses_configured_model_and_provider_without_masking_provider() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = temp.path().join("browser-use-terminal-home");
@@ -10622,15 +10626,11 @@ wire_api = "responses"
         Ok(())
     }
 
-    // Engine gap: this asserts both the cwd `config.toml` `model_provider` layer
-    // (dropped by engine `configured_model_provider_id_for_cwd_with_options`,
-    // which only reads AGENTS.md + `--config` overrides) and the high-level
-    // permissions workspace-context builder. Neither is ported to
-    // browser-use-agent; the TUI-side adapter can only emit the
-    // developer-instructions override. Left in place (ignored) until the engine
-    // ports the config.toml model/provider layer + workspace-context builders.
+    // The profile `<name>.config.toml` `model_provider` layer is resolved by the
+    // engine (override `model` wins over it without masking the provider), and the
+    // TUI adapter emits the `developer_instructions` override as a `permissions`
+    // workspace-context block.
     #[test]
-    #[ignore = "engine drops config.toml model_provider layer + workspace-context builders"]
     fn startup_and_workspace_context_use_profile_and_config_overrides() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = temp.path().join("browser-use-terminal-home");
@@ -10692,14 +10692,10 @@ model_provider = "corp"
         Ok(())
     }
 
-    // Engine gap: startup model resolution no longer reads the cwd `config.toml`
-    // `model =` layer (engine `configured_model_for_cwd_with_options` only honors
-    // AGENTS.md + `--config` overrides), so the config.toml-vs-stored-vs-override
-    // precedence this origin/main test exercises is not fully reproducible on the
-    // new engine. Left in place (ignored) until the config.toml model layer is
-    // ported to browser-use-agent.
+    // Startup model precedence: explicit `--config model`/`model_provider`
+    // overrides beat the stored model selection, with the engine's config.toml
+    // layer resolved underneath.
     #[test]
-    #[ignore = "engine drops config.toml model layer; startup model precedence differs"]
     fn startup_config_overrides_beat_stored_model_selection() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let store = Store::open(temp.path())?;
