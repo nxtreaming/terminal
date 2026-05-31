@@ -149,6 +149,28 @@ impl ContextManager {
         assembly::total_token_usage_breakdown(&self.items, self.token_info.as_ref())
     }
 
+    /// Estimate the total tokens of the WHOLE current buffer, from the model-
+    /// visible byte size of every item (codex `all_history_items_model_visible_bytes`
+    /// → tokens via `approx_tokens_from_byte_count` = `bytes.div_ceil(4)`).
+    ///
+    /// This is the size-of-the-conversation estimate the auto-compaction trigger
+    /// compares to the context window. Unlike [`total_token_usage`], it does NOT
+    /// depend on a server `Usage` having arrived (a store-seeded manager with no
+    /// API response yet still reports a real size) and it counts the ENTIRE
+    /// prompt, not just the items after the last model turn. Returned as `i64` for
+    /// [`crate::decision::TokenStatus::from_estimate`].
+    ///
+    /// Ground: codex `context_manager` byte/token math —
+    /// `estimate_item_model_visible_bytes` per item (`assembly.rs`),
+    /// `approx_tokens_from_byte_count_i64 = bytes.div_ceil(4)` (`accounting.rs`,
+    /// memory note `APPROX_CHARS_PER_TOKEN = 4`).
+    ///
+    /// [`total_token_usage`]: ContextManager::total_token_usage
+    pub fn estimate_total_tokens(&self) -> i64 {
+        let bytes = self.breakdown().all_history_items_model_visible_bytes;
+        accounting::approx_tokens_from_byte_count_i64(bytes)
+    }
+
     /// The monotonic history version (bumped on every mutation).
     pub fn history_version(&self) -> u64 {
         self.history_version

@@ -49,15 +49,19 @@
 
 pub mod provider;
 
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
 use browser_use_llm::schema::Message;
 use tokio_util::sync::CancellationToken;
 
+use crate::compact::{run_compaction, CompactionSampler, COMPACT_USER_MESSAGE_MAX_TOKENS};
 use crate::config_overrides::ProviderRunConfig;
+use crate::context::assembly::TruncationPolicy;
 use crate::context::workspace_context::append_environment_context_event;
-use crate::context::ContextManager;
+use crate::context::{ContextManager, Item};
 use crate::decision::SamplingOutcome;
 use crate::decision::TokenStatus;
 use crate::events::EventSink;
@@ -94,18 +98,30 @@ type RecordedBuffer = Arc<Mutex<Vec<Message>>>;
 /// the facade uses codex's default budget. Wave-E threads the real value through.
 const DEFAULT_STREAM_MAX_RETRIES: u32 = 5;
 
-/// A minimal [`TurnState`] backed by the session's durable event log.
+/// A [`TurnState`] backed by the session's durable event log, with REAL codex-
+/// parity token accounting + model-based compaction.
 ///
 /// It lowers the durable history (reduced to provider messages, then lowered to
 /// typed [`Message`]s through the pure [`ContextManager`]) into each turn's prompt,
-/// and records assistant turns back into an in-memory buffer for the rest of the
-/// run.
+/// and records assistant turns + dispatched tool outputs back into an in-memory
+/// buffer (the fusion seam) for the rest of the run.
 ///
-/// Phase-E seam: the production `TurnState` is `ContextManager`-backed with token
-/// accounting, mid-turn compaction (`compact`), and a pending steer/input queue.
-/// This impl has no pending-input queue (`has_pending_input` is always false and
-/// `take_pending_input` is empty) and a zeroed [`TokenStatus`] (so the loop's
-/// compaction gate never trips). Wave-E replaces it with the real state.
+/// ## Token accounting + compaction (this WP)
+/// - [`token_status`](TurnState::token_status) estimates the CURRENT prompt's
+///   tokens (`ContextManager::estimate_total_tokens`, `bytes.div_ceil(4)` per
+///   item) and compares to the 80%-of-window auto-compact limit
+///   ([`TokenStatus::from_estimate`], codex `Session::auto_compact_token_limit`).
+///   "Compact early and often": the trigger fires at 80%, well before the
+///   provider would reject for length.
+/// - [`compact`](TurnState::compact) runs the model-based no-tools summary pass
+///   ([`run_compaction`]) and INSTALLS the codex-parity `[preserved recent user
+///   messages] + [PREFIX + summary]` as a `compacted` override that REPLACES the
+///   durable-log prompt for the rest of the run. The recorded fusion buffer is
+///   cleared (its content is now folded into the summary), so the next prompt is
+///   small again and the loop continues.
+///
+/// Phase-E seam: a pending steer/input queue is still not wired
+/// (`has_pending_input` is always false). Wave-E adds it.
 struct StoreTurnState {
     store: SharedStore,
     session_id: SessionId,
@@ -113,6 +129,18 @@ struct StoreTurnState {
     /// prompt sees them. Shared (`Arc`) with the fused driver's [`FusionRecorder`]
     /// ([`BufferRecorder`]) so what the driver dispatches re-enters the next prompt.
     recorded: RecordedBuffer,
+    /// The model context-window budget (tokens). Drives the 80% auto-compact
+    /// trigger via [`TokenStatus::from_estimate`]. `0` disables compaction.
+    context_window_tokens: i64,
+    /// The model-based summary pass for [`compact`](TurnState::compact). `None`
+    /// disables compaction (the no-sampler / `Fake` path); the production run sets
+    /// a real [`EntrypointSampler`].
+    compaction_sampler: Option<Arc<dyn DynCompactionSampler>>,
+    /// Once compaction has run, the compacted replacement history (codex
+    /// `[preserved users] + [PREFIX + summary]`, lowered to typed messages). When
+    /// `Some`, it REPLACES the durable-log prompt; later recorded turns are
+    /// appended after it. `None` until the first compaction.
+    compacted: Mutex<Option<Vec<Message>>>,
 }
 
 impl StoreTurnState {
@@ -120,12 +148,63 @@ impl StoreTurnState {
     /// the fused driver's recorder (so dispatched tool outputs land here and are
     /// re-sampled on the next iteration) and to this state (which reads it into
     /// every prompt). Pass a fresh buffer for the non-fused (`Fake`) path.
+    ///
+    /// Compaction is OFF by default (no sampler, `0` window). Enable it with
+    /// [`with_compaction`](StoreTurnState::with_compaction).
     fn new(store: SharedStore, session_id: SessionId, recorded: RecordedBuffer) -> Self {
         Self {
             store,
             session_id,
             recorded,
+            context_window_tokens: 0,
+            compaction_sampler: None,
+            compacted: Mutex::new(None),
         }
+    }
+
+    /// Enable REAL token accounting + model-based compaction against a context
+    /// window, driven by `sampler` for the no-tools summary pass.
+    fn with_compaction(
+        mut self,
+        context_window_tokens: i64,
+        sampler: Arc<dyn DynCompactionSampler>,
+    ) -> Self {
+        self.context_window_tokens = context_window_tokens;
+        self.compaction_sampler = Some(sampler);
+        self
+    }
+
+    /// Assemble the current prompt as typed [`Message`]s (synchronously). The base
+    /// is the compacted override when present, else the lowered durable log; this
+    /// run's recorded turns are appended.
+    fn assemble_prompt_blocking(&self) -> Vec<Message> {
+        let mut msgs = match self.compacted.lock().unwrap().as_ref() {
+            Some(compacted) => compacted.clone(),
+            None => {
+                let session_id = self.session_id.as_str().to_string();
+                history_from_store(&self.store, &session_id)
+            }
+        };
+        msgs.extend(self.recorded.lock().unwrap().iter().cloned());
+        msgs
+    }
+
+    /// Lower the CURRENT prompt history to provider-message [`Item`]s (the shape
+    /// [`run_compaction`] consumes).
+    fn current_prompt_items(&self) -> Vec<Item> {
+        self.assemble_prompt_blocking()
+            .iter()
+            .map(message_to_provider_item)
+            .collect()
+    }
+
+    /// Estimate the current prompt's tokens via a fresh [`ContextManager`] over the
+    /// lowered prompt items (`bytes.div_ceil(4)` per item — codex byte/token math).
+    fn estimate_prompt_tokens(&self) -> i64 {
+        let items = self.current_prompt_items();
+        let mut mgr = ContextManager::new();
+        mgr.record_items(items, TruncationPolicy::Bytes(usize::MAX));
+        mgr.estimate_total_tokens()
     }
 }
 
@@ -148,6 +227,137 @@ impl FusionRecorder for BufferRecorder {
     }
 }
 
+/// The live [`CompactionSampler`]: drives the real [`ModelClient`] for the
+/// no-tools summary pass (codex's compact task streams `OutputItemDone`/`Completed`
+/// only and never dispatches tools).
+///
+/// It builds a tool-free [`LlmRequest`] from the conversation-so-far + the
+/// summarization prompt (already appended by [`run_compaction`]), opens the model
+/// stream, and concatenates the assistant `TextDelta`s as the summary text. This
+/// is the production analogue of the scripted sampler the compaction tests inject;
+/// it shares the run's model + route, so the summary uses the same model as the
+/// conversation (codex parity).
+struct EntrypointSampler {
+    client: Arc<browser_use_llm::route::ModelClient>,
+    route: browser_use_llm::route::Route,
+    model: String,
+    provider: String,
+}
+
+impl CompactionSampler for EntrypointSampler {
+    async fn summarize(
+        &self,
+        request: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> Result<String, AgentError> {
+        use browser_use_llm::schema::{LlmEvent, LlmRequest};
+        use futures_util::StreamExt;
+
+        // Tool-free request (tools deliberately empty — the summary pass must not
+        // call tools). `request` already carries the history + the summarization
+        // prompt as its final user message (assembled by `run_compaction`).
+        let mut req = LlmRequest::new(self.model.clone(), self.provider.clone());
+        req.messages = request;
+
+        // Open the model stream. `ModelClient::stream` is async; the entrypoint
+        // runs on the multi-thread runtime, so we await it directly here.
+        let mut stream = match self.client.stream(&self.route, &req).await {
+            Ok(s) => s,
+            Err(e) => return Err(map_summary_error(&e)),
+        };
+
+        // Concatenate assistant text. Tool calls (if any) are ignored — the compact
+        // pass never dispatches. Cancellation aborts the pass.
+        let mut summary = String::new();
+        loop {
+            let next = tokio::select! {
+                _ = cancel.cancelled() => return Err(AgentError::TurnAborted),
+                ev = stream.next() => ev,
+            };
+            match next {
+                Some(Ok(LlmEvent::TextDelta { delta, .. })) => summary.push_str(&delta),
+                Some(Ok(_)) => {}
+                Some(Err(e)) => return Err(map_summary_error(&e)),
+                None => break,
+            }
+        }
+        Ok(summary)
+    }
+}
+
+/// Object-safe ("dyn-compatible") view of [`CompactionSampler`].
+///
+/// [`CompactionSampler::summarize`] returns `impl Future` (native RPITIT), which
+/// is NOT object-safe, so `Arc<dyn CompactionSampler>` is impossible. The
+/// [`StoreTurnState`] holds the summary pass behind a trait object (it is built in
+/// one of two branches — real vs. disabled — so a generic would fan out through
+/// `drive_run`), so this boxes the future to make it storable. A blanket impl
+/// makes every concrete [`CompactionSampler`] usable here, and a forwarding
+/// [`CompactionSampler`] impl on `dyn DynCompactionSampler` lets the trait object
+/// feed straight back into [`run_compaction`]'s `S: CompactionSampler + ?Sized`.
+trait DynCompactionSampler: Send + Sync {
+    fn summarize_boxed(
+        &self,
+        request: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<String, AgentError>> + Send + '_>>;
+}
+
+impl<T: CompactionSampler> DynCompactionSampler for T {
+    fn summarize_boxed(
+        &self,
+        request: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> Pin<Box<dyn Future<Output = Result<String, AgentError>> + Send + '_>> {
+        Box::pin(self.summarize(request, cancel))
+    }
+}
+
+impl CompactionSampler for dyn DynCompactionSampler + '_ {
+    fn summarize(
+        &self,
+        request: Vec<Message>,
+        cancel: CancellationToken,
+    ) -> impl Future<Output = Result<String, AgentError>> + Send {
+        self.summarize_boxed(request, cancel)
+    }
+}
+
+/// Map an [`LlmError`] from the summary pass to an [`AgentError`]. A
+/// context-window-exceeded condition becomes [`AgentError::ContextWindowExceeded`]
+/// so [`run_compaction`] can drop the oldest item and retry (codex
+/// `remove_first_item` loop); everything else becomes a provider error.
+fn map_summary_error(e: &browser_use_llm::schema::LlmError) -> AgentError {
+    use browser_use_llm::schema::LlmErrorReason;
+    let looks_like_window = e.reason == LlmErrorReason::InvalidRequest && {
+        let m = e.message.to_ascii_lowercase();
+        m.contains("context") && m.contains("window")
+    };
+    if looks_like_window {
+        AgentError::ContextWindowExceeded
+    } else {
+        AgentError::Provider(e.to_string())
+    }
+}
+
+/// Build the live [`EntrypointSampler`] for a real backend, reusing the same
+/// offline route construction the main driver uses
+/// ([`provider::provider_choice_for_backend`] + [`build_route`](crate::turn::build_route)).
+/// Returns `None` when the backend has no real provider (Fake) or no credentials —
+/// compaction then stays disabled and the run keeps its prior (uncompacted)
+/// behavior. No network I/O.
+fn build_compaction_sampler(config: &ProviderRunConfig) -> Option<Arc<dyn DynCompactionSampler>> {
+    let choice = provider::provider_choice_for_backend(config.backend).ok()??;
+    let route = crate::turn::build_route(&choice, &config.model).ok()?;
+    let client = Arc::new(browser_use_llm::route::ModelClient::default());
+    Some(Arc::new(EntrypointSampler {
+        client,
+        route,
+        model: config.model.clone(),
+        provider: format!("{:?}", config.backend).to_ascii_lowercase(),
+    }))
+}
+
 /// Lower a session's durable event log into typed prompt messages: blocking store
 /// read + pure reduce ([`provider_messages_from_events`]) + pure lower
 /// ([`ContextManager::lower_to_messages`]). Runs synchronously; the caller wraps
@@ -165,6 +375,14 @@ fn history_from_store(store: &SharedStore, session_id: &str) -> Vec<Message> {
 
 impl TurnState for StoreTurnState {
     async fn clone_history_for_prompt(&self) -> Vec<Message> {
+        // Once compacted, the prompt base is the compacted override (codex's
+        // replaced history); otherwise it is the lowered durable log. The recorded
+        // buffer (this run's assistant turns + the fused driver's dispatched tool
+        // outputs) is appended either way, so tool outputs always re-enter the next
+        // prompt (the fusion seam is preserved across compaction).
+        if self.compacted.lock().unwrap().is_some() {
+            return self.assemble_prompt_blocking();
+        }
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
         // The durable read is synchronous (rusqlite); run it off the async runtime.
@@ -193,19 +411,138 @@ impl TurnState for StoreTurnState {
     }
 
     async fn token_status(&self) -> TokenStatus {
-        // Phase-E seam: real token accounting (and thus compaction triggering) is
-        // not wired yet — a zeroed status never trips the loop's compaction gate
-        // (`token_limit_reached == false`, scope below limit).
-        TokenStatus {
-            auto_compact_scope_tokens: 0,
-            auto_compact_scope_limit: i64::MAX,
-            full_context_window_limit_reached: false,
-            token_limit_reached: false,
+        // REAL codex-parity accounting (this WP). With compaction disabled (no
+        // sampler / zero window) this yields a zeroed status, so the loop's
+        // compaction gate never trips (the `Fake`/no-sampler path keeps its old
+        // behavior). Otherwise estimate the current prompt's tokens and compare to
+        // the 80%-of-window auto-compact limit.
+        if self.compaction_sampler.is_none() || self.context_window_tokens <= 0 {
+            return TokenStatus::default();
+        }
+        let estimated = self.estimate_prompt_tokens();
+        TokenStatus::from_estimate(estimated, self.context_window_tokens)
+    }
+
+    async fn compact(&self) {
+        // codex: ask the model to write a handoff summary, then REPLACE history
+        // with `[preserved recent user messages] + [PREFIX + summary]`.
+        let Some(sampler) = self.compaction_sampler.clone() else {
+            return; // compaction disabled — keep the loop's no-op default.
+        };
+
+        // Snapshot the current prompt as provider-message items (codex
+        // `clone_history`): the durable log (or the prior compacted override) plus
+        // this run's recorded turns.
+        let items = self.current_prompt_items();
+
+        // Model-based no-tools summary pass + codex-parity compacted-history
+        // assembly (preserved recent user messages capped at 20k tokens + the
+        // PREFIX'd summary). On failure, leave history untouched (codex propagates
+        // the error; here we simply do not replace), so the loop's control flow is
+        // unchanged.
+        let compacted = match run_compaction(
+            &items,
+            sampler.as_ref(),
+            COMPACT_USER_MESSAGE_MAX_TOKENS,
+            CancellationToken::new(),
+        )
+        .await
+        {
+            Ok(c) => c,
+            Err(_) => return,
+        };
+
+        // Lower the compacted items to typed prompt messages and INSTALL them as
+        // the override; clear the recorded buffer (its content is now folded into
+        // the summary). The next `clone_history_for_prompt` returns the small
+        // compacted prompt + any turns recorded AFTER this point — so the estimate
+        // drops back below the auto-compact limit and the loop continues (codex
+        // `replace_compacted_history` + `recompute_token_usage`).
+        let lowered = ContextManager::new().lower_to_messages(&compacted.items);
+        *self.compacted.lock().unwrap() = Some(lowered);
+        self.recorded.lock().unwrap().clear();
+    }
+}
+
+/// Lower a typed [`Message`] back to a provider-message [`Item`] (`Value`) for the
+/// token estimate + the [`run_compaction`] input. Mirrors `compact::message_to_item`
+/// (the `ContextManager` buffer shape): text/media/tool calls become a role-tagged
+/// object; a tool-result lowers to a `tool` item keyed by `tool_call_id`.
+fn message_to_provider_item(message: &Message) -> Item {
+    use browser_use_llm::schema::{ContentPart, MessageRole};
+    use serde_json::{json, Value};
+
+    let role = match message.role {
+        MessageRole::System => "system",
+        MessageRole::Developer => "developer",
+        MessageRole::User => "user",
+        MessageRole::Assistant => "assistant",
+        MessageRole::Tool => "tool",
+    };
+
+    // Tool-result messages -> a `tool` item carrying the textual output.
+    if message.role == MessageRole::Tool {
+        if let Some(ContentPart::ToolResult {
+            tool_call_id,
+            content,
+            ..
+        }) = message.content.first()
+        {
+            let text = content
+                .iter()
+                .filter_map(|p| match p {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            return json!({
+                "role": "tool",
+                "tool_call_id": tool_call_id,
+                "content": text,
+            });
         }
     }
 
-    // Phase-E seam: `compact` keeps the trait default (no-op); the real
-    // model-based compaction body lands with the ContextManager-backed TurnState.
+    let mut content_parts: Vec<Value> = Vec::new();
+    let mut tool_calls: Vec<Value> = Vec::new();
+    for part in &message.content {
+        match part {
+            ContentPart::Text { text } => {
+                content_parts.push(json!({ "type": "text", "text": text }));
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => {
+                content_parts.push(json!({
+                    "type": "image",
+                    "mime_type": mime_type,
+                    "data": data,
+                    "url": url,
+                }));
+            }
+            ContentPart::ToolCall {
+                id, name, input, ..
+            } => {
+                tool_calls.push(json!({
+                    "id": id,
+                    "name": name,
+                    "arguments": input,
+                }));
+            }
+            ContentPart::ToolResult { .. } | ContentPart::Reasoning { .. } => {}
+        }
+    }
+
+    let mut obj = serde_json::Map::new();
+    obj.insert("role".to_string(), json!(role));
+    obj.insert("content".to_string(), Value::Array(content_parts));
+    if !tool_calls.is_empty() {
+        obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
+    }
+    Value::Object(obj)
 }
 
 /// A [`TurnObserver`] that maps loop lifecycle into the durable UI event log.
@@ -316,8 +653,16 @@ async fn drive_run<Sd: SamplingDriver>(
     driver: Sd,
     turn_has_fresh_input: bool,
     recorded: RecordedBuffer,
+    compaction: Option<(i64, Arc<dyn DynCompactionSampler>)>,
 ) -> Result<Option<String>, AgentError> {
     let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded);
+    // Enable REAL token accounting + model-based compaction when a sampler is
+    // available (the real backend path). The Fake/no-credential path passes `None`
+    // and keeps the inert (never-compacts) behavior.
+    let state = match compaction {
+        Some((window, sampler)) => state.with_compaction(window, sampler),
+        None => state,
+    };
 
     // The observer persists the terminal agent message through a synchronous
     // durable sink over the SharedStore. (The async `events::StoreSink` writer
@@ -429,8 +774,15 @@ pub async fn run_session_with_config(
     // (3) drive the loop to quiescence with the resolved driver. The SAME
     //     `recorded` buffer the recorder writes is handed to the state, so the
     //     fused tool outputs re-enter the prompt on the loop's next iteration.
+    // The real path enables codex-parity compaction: real token accounting (the
+    // 80%-of-window auto-compact trigger) + a model-based summary pass over the
+    // SAME backend/model (`build_compaction_sampler`). Long runs auto-summarize
+    // before hitting the context window. A backend with no real provider/
+    // credentials yields `None` and compaction stays disabled.
     match resolved {
         ResolvedProvider::Real(driver) => {
+            let compaction = build_compaction_sampler(&config)
+                .map(|sampler| (config.context_window_tokens as i64, sampler));
             drive_run(
                 Arc::clone(&store),
                 session_id.clone(),
@@ -438,6 +790,7 @@ pub async fn run_session_with_config(
                 *driver,
                 turn_has_fresh_input,
                 Arc::clone(&recorded),
+                compaction,
             )
             .await?;
         }
@@ -445,7 +798,8 @@ pub async fn run_session_with_config(
             // The fake backend has no real driver; drive offline so the facade is
             // exercisable end-to-end without a network. The recorder is unused here
             // (the fake driver does not dispatch), but the same buffer is still the
-            // state's record sink so `record_items` works identically.
+            // state's record sink so `record_items` works identically. Compaction is
+            // disabled (no real model to summarize with).
             let driver = FakeSamplingDriver::new(fake_response_text(&config));
             drive_run(
                 Arc::clone(&store),
@@ -454,6 +808,7 @@ pub async fn run_session_with_config(
                 driver,
                 turn_has_fresh_input,
                 Arc::clone(&recorded),
+                None,
             )
             .await?;
         }
