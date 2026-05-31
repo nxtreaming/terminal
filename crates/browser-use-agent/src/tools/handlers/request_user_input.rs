@@ -90,11 +90,36 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::time::Duration;
 
+use crate::session::{SessionId, SharedStore};
 use crate::tools::runtime::{
     Approvable, ExecOutput, SandboxAttempt, Sandboxable, ToolCtx, ToolError, ToolRuntime,
 };
 use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
+
+/// Durable control-channel event name appended when the model asks the operator
+/// for input. The TUI consumes this to render the prompt to the human.
+///
+/// This is the DOTTED name the TUI keys on
+/// (`browser-use-tui/src/main.rs`: `REQUEST_USER_INPUT_REQUEST_EVENT =
+/// "request_user_input.requested"`), distinct from the legacy underscore-form
+/// [`REQUEST_USER_INPUT_REQUEST_EVENT`] kept above for the legacy carve.
+pub const REQUEST_USER_INPUT_REQUESTED_EVENT: &str = "request_user_input.requested";
+
+/// Durable control-channel event name the operator's answer is delivered on.
+///
+/// Matches the TUI's `REQUEST_USER_INPUT_RESPONSE_EVENT =
+/// "request_user_input.response"`. The [`StoreRoundTripResponder`] waits for
+/// this event and parses the answers from its payload.
+pub const REQUEST_USER_INPUT_RESPONSE_DOTTED_EVENT: &str = "request_user_input.response";
+
+/// Payload key the request event carries the (validated, normalized) questions
+/// under. Mirrors the TUI's `REQUEST_USER_INPUT_REQUEST_KEY`.
+pub const REQUEST_USER_INPUT_REQUEST_KEY: &str = "request_user_input_request";
+
+/// How often the store round-trip responder polls for a response event.
+const RESPONSE_POLL_INTERVAL: Duration = Duration::from_millis(100);
 
 /// The tool name surfaced to the model.
 ///
@@ -357,6 +382,169 @@ impl RequestUserInputResponder for EchoAutoResponder {
         }
         Ok(RequestUserInputResponse { answers })
     }
+}
+
+/// Production responder that round-trips through the durable session store.
+///
+/// On [`respond`](RequestUserInputResponder::respond) it appends a
+/// [`REQUEST_USER_INPUT_REQUESTED_EVENT`] event carrying the questions, then
+/// waits for a matching [`REQUEST_USER_INPUT_RESPONSE_DOTTED_EVENT`] event
+/// (appended by the TUI / operator) and returns the answers it carries — exactly
+/// the codex/legacy `request_user_input` round-trip
+/// (`browser-use-core/src/request_user_input.rs:141-163`), now over the new
+/// engine's [`SharedStore`].
+///
+/// The store exposes no async change notification at this layer, so this polls
+/// [`Store::events_for_session`](browser_use_store::Store::events_for_session) at
+/// [`RESPONSE_POLL_INTERVAL`]. Each blocking store read runs on
+/// [`spawn_blocking`](tokio::task::spawn_blocking) so the async runtime is never
+/// stalled and the store mutex is never held across an `.await`. An optional
+/// timeout bounds the wait; `None` waits indefinitely (the operator may take any
+/// amount of time to answer, matching the legacy blocking behavior).
+pub struct StoreRoundTripResponder {
+    store: SharedStore,
+    session_id: SessionId,
+    timeout: Option<Duration>,
+}
+
+impl StoreRoundTripResponder {
+    /// Build a responder that waits indefinitely for the operator's answer.
+    pub fn new(store: SharedStore, session_id: SessionId) -> Self {
+        Self {
+            store,
+            session_id,
+            timeout: None,
+        }
+    }
+
+    /// Build a responder that gives up after `timeout` without an answer.
+    pub fn with_timeout(store: SharedStore, session_id: SessionId, timeout: Duration) -> Self {
+        Self {
+            store,
+            session_id,
+            timeout: Some(timeout),
+        }
+    }
+
+    /// Snapshot the session's events (blocking store read, off the async runtime).
+    async fn read_events(&self) -> Result<Vec<browser_use_protocol::EventRecord>, ToolError> {
+        let store = Arc::clone(&self.store);
+        let session_id = self.session_id.as_str().to_string();
+        tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| {
+                ToolError::Other(anyhow::anyhow!("request_user_input: store mutex poisoned"))
+            })?;
+            store
+                .events_for_session(&session_id)
+                .map_err(|e| ToolError::Other(anyhow::anyhow!(e)))
+        })
+        .await
+        .map_err(|e| {
+            ToolError::Other(anyhow::anyhow!("request_user_input: store read task: {e}"))
+        })?
+    }
+
+    /// Append the request event (blocking store write, off the async runtime).
+    async fn append_request(&self, payload: serde_json::Value) -> Result<(), ToolError> {
+        let store = Arc::clone(&self.store);
+        let session_id = self.session_id.as_str().to_string();
+        tokio::task::spawn_blocking(move || {
+            let store = store.lock().map_err(|_| {
+                ToolError::Other(anyhow::anyhow!("request_user_input: store mutex poisoned"))
+            })?;
+            store
+                .append_event(&session_id, REQUEST_USER_INPUT_REQUESTED_EVENT, payload)
+                .map(|_| ())
+                .map_err(|e| ToolError::Other(anyhow::anyhow!(e)))
+        })
+        .await
+        .map_err(|e| {
+            ToolError::Other(anyhow::anyhow!("request_user_input: store write task: {e}"))
+        })?
+    }
+}
+
+#[async_trait::async_trait]
+impl RequestUserInputResponder for StoreRoundTripResponder {
+    async fn respond(
+        &self,
+        request: &RequestUserInputRequest,
+    ) -> Result<RequestUserInputResponse, ToolError> {
+        // Snapshot the log length first so we only ever match a response that
+        // arrives AFTER this request, never a stale one from a prior round-trip.
+        let baseline = self.read_events().await?.len();
+
+        // Announce the request on the durable control channel for the TUI/operator.
+        // Carry the questions both under the TUI's key and inline, so either
+        // consumer shape can render them.
+        let questions = serde_json::to_value(&request.questions)
+            .map_err(|e| ToolError::Other(anyhow::anyhow!(e)))?;
+        let payload = serde_json::json!({
+            REQUEST_USER_INPUT_REQUEST_KEY: { "questions": questions.clone() },
+            "questions": questions,
+        });
+        self.append_request(payload).await?;
+
+        // Wait for the operator's response event.
+        let deadline = self.timeout.map(|t| std::time::Instant::now() + t);
+        loop {
+            let events = self.read_events().await?;
+            if let Some(answers) = find_response(&events, baseline) {
+                return Ok(answers);
+            }
+            if let Some(deadline) = deadline {
+                if std::time::Instant::now() >= deadline {
+                    return Err(ToolError::Rejected(
+                        "request_user_input timed out waiting for a response".to_string(),
+                    ));
+                }
+            }
+            tokio::time::sleep(RESPONSE_POLL_INTERVAL).await;
+        }
+    }
+}
+
+/// Scan `events` for a response event at or after `from_index`, returning the
+/// parsed answers it carries.
+fn find_response(
+    events: &[browser_use_protocol::EventRecord],
+    from_index: usize,
+) -> Option<RequestUserInputResponse> {
+    events
+        .iter()
+        .skip(from_index)
+        .find(|e| e.event_type == REQUEST_USER_INPUT_RESPONSE_DOTTED_EVENT)
+        .map(|e| answers_from_payload(&e.payload))
+}
+
+/// Parse a response event payload into a [`RequestUserInputResponse`].
+///
+/// Accepts the codex wire shape `{ "answers": { id: { "answers": [..] } } }`
+/// directly; tolerates a flat `{ "answers": { id: ["..", ".."] } }` shape (a
+/// simpler TUI may write the latter) by coercing each value into an
+/// [`UserInputAnswer`]. Unknown shapes yield an empty answer set rather than
+/// erroring, so a malformed operator response never poisons the run.
+fn answers_from_payload(payload: &serde_json::Value) -> RequestUserInputResponse {
+    // Fast path: the exact codex wire shape deserializes directly.
+    if let Ok(parsed) = serde_json::from_value::<RequestUserInputResponse>(payload.clone()) {
+        return parsed;
+    }
+    let mut answers = HashMap::new();
+    if let Some(map) = payload.get("answers").and_then(|v| v.as_object()) {
+        for (id, value) in map {
+            let list = value
+                .as_array()
+                .map(|arr| {
+                    arr.iter()
+                        .filter_map(|v| v.as_str().map(str::to_string))
+                        .collect::<Vec<_>>()
+                })
+                .or_else(|| value.as_str().map(|s| vec![s.to_string()]))
+                .unwrap_or_default();
+            answers.insert(id.clone(), UserInputAnswer { answers: list });
+        }
+    }
+    RequestUserInputResponse { answers }
 }
 
 /// The async `request_user_input` tool.

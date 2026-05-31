@@ -19,12 +19,14 @@
 //! `CollaborationModeKind` is intentionally NOT redefined here — it already lives
 //! in [`crate::prompts`] and is reused so the two engines agree on the mode set.
 
+use std::collections::HashMap;
 use std::sync::Arc;
 
 use anyhow::{anyhow, bail, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::mcp::McpServerConfig;
 use crate::prompts::CollaborationModeKind;
 
 /// Legacy `browser-use-core::constants::DEFAULT_MAX_CONTEXT_CHARS`
@@ -168,6 +170,14 @@ pub struct AgentRunOptions {
     pub analytics_source: Option<String>,
     pub analytics_provider_kind: Option<String>,
     pub analytics_model: Option<String>,
+    /// MCP servers to connect to and expose via the model-callable `mcp` tool.
+    ///
+    /// Empty (the default) registers no `mcp` tool, preserving prior behavior.
+    /// Each entry maps a logical server name (the `{server}` segment of an
+    /// `mcp__{server}__{tool}` call) to its launch config. Populated by the
+    /// TUI/CLI from a `[mcp_servers]` config table (a TOML loader is a follow-up;
+    /// the registration wiring is live as soon as this map is non-empty).
+    pub mcp_servers: HashMap<String, McpServerConfig>,
 }
 
 impl Default for AgentRunOptions {
@@ -197,6 +207,7 @@ impl Default for AgentRunOptions {
             analytics_source: None,
             analytics_provider_kind: None,
             analytics_model: None,
+            mcp_servers: HashMap::new(),
         }
     }
 }
@@ -308,6 +319,12 @@ impl AgentRunOptions {
 
     pub fn with_analytics_source(mut self, source: impl Into<String>) -> Self {
         self.analytics_source = Some(source.into());
+        self
+    }
+
+    /// Configure the MCP servers exposed via the model-callable `mcp` tool.
+    pub fn with_mcp_servers(mut self, servers: HashMap<String, McpServerConfig>) -> Self {
+        self.mcp_servers = servers;
         self
     }
 }
@@ -577,6 +594,7 @@ mod tests {
         assert!(options.analytics_source.is_none());
         assert!(options.analytics_provider_kind.is_none());
         assert!(options.analytics_model.is_none());
+        assert!(options.mcp_servers.is_empty());
     }
 
     #[test]
