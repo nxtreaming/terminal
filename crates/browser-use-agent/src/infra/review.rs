@@ -13,6 +13,80 @@
 
 use std::path::Path;
 
+use browser_use_store::Store;
+
+use crate::context::user_input::typed_user_input_payload_from_text_for_cwd;
+
+/// Durable event type marking a session as review-mode. Exact literal from legacy
+/// `browser-use-core` (`SESSION_REVIEW_MODE_EVENT`, constants.rs:101).
+const SESSION_REVIEW_MODE_EVENT: &str = "session.review_mode";
+
+/// Durable event type carrying a session's base system instructions. Exact literal
+/// from legacy `browser-use-core` (`SESSION_BASE_INSTRUCTIONS_EVENT`,
+/// constants.rs).
+const SESSION_BASE_INSTRUCTIONS_EVENT: &str = "session.base_instructions";
+
+/// Create a fresh review-mode session in `store`, seeded with `prompt`, and return its
+/// id.
+///
+/// Parity: legacy `browser-use-core::review::start_review_session`
+/// (`crates/browser-use-core/src/review.rs:59`). The faithful event sequence is:
+///   1. create a root session for `cwd`;
+///   2. append a `session.review_mode` event with the review tool restrictions;
+///   3. append a `session.base_instructions` event carrying
+///      [`review_base_instructions`] (source `"review"`);
+///   4. append the `session.input` event with the typed user-input payload built from
+///      `prompt` for `cwd` (reusing
+///      [`crate::context::user_input::typed_user_input_payload_from_text_for_cwd`]).
+///
+/// ## Deferred vs legacy
+///
+/// Legacy additionally derives `AgentRunOptions` via `review_mode_options(...)` and
+/// calls `append_workspace_context_event_with_options(store, &session, &options)` to
+/// assemble + append the per-section workspace-context events (AGENTS.md, environment,
+/// permissions, …). Both `AgentRunOptions` and that section-assembly orchestration live
+/// outside the agent crate (the agent crate's `append_workspace_context_event_with_options`
+/// is the leaf de-dup variant, not the assembler). So this faithful-minimal port writes
+/// the review-mode + base-instructions + typed-input events — the durable markers that
+/// make a session review-mode and seed its first turn — and leaves the workspace-context
+/// assembly to be wired when `AgentRunOptions` lands. The `review_tool_restrictions`
+/// payload is byte-identical to legacy.
+pub fn start_review_session(
+    store: &Store,
+    prompt: &str,
+    cwd: impl AsRef<Path>,
+) -> anyhow::Result<String> {
+    let cwd = cwd.as_ref();
+    let session = store.create_session(None, cwd)?;
+    store.append_event(
+        &session.id,
+        SESSION_REVIEW_MODE_EVENT,
+        serde_json::json!({
+            "kind": "review",
+            "review_tool_restrictions": {
+                "goals": false,
+                "multi_agent": false,
+                "web_search": false,
+                "image_generation": false
+            },
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        SESSION_BASE_INSTRUCTIONS_EVENT,
+        serde_json::json!({
+            "base_instructions": review_base_instructions(),
+            "source": "review",
+        }),
+    )?;
+    store.append_event(
+        &session.id,
+        "session.input",
+        typed_user_input_payload_from_text_for_cwd(prompt, cwd)?,
+    )?;
+    Ok(session.id)
+}
+
 /// User-facing prompt to review the working tree (staged + unstaged + untracked).
 ///
 /// Mirrors `browser-use-core::review::review_prompt_uncommitted_changes`
@@ -202,5 +276,66 @@ mod tests {
     #[test]
     fn base_instructions_delegate_to_canonical_prompt() {
         assert_eq!(review_base_instructions(), crate::prompts::review_prompt());
+    }
+
+    #[test]
+    fn start_review_session_writes_review_events_and_input() {
+        use browser_use_store::Store;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(dir.path()).expect("open store");
+
+        let session_id = start_review_session(&store, "Review my changes", dir.path())
+            .expect("start review session");
+
+        let events = store
+            .events_for_session(&session_id)
+            .expect("events for session");
+        let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
+        // `Store::create_session` itself records a leading `session.created` event, so
+        // the three markers `start_review_session` writes are the tail of the log, in
+        // this order.
+        assert_eq!(
+            &types[types.len() - 3..],
+            &[
+                SESSION_REVIEW_MODE_EVENT,
+                SESSION_BASE_INSTRUCTIONS_EVENT,
+                "session.input",
+            ]
+        );
+
+        // The three review markers we appended, in order (skipping the store prelude).
+        let review_idx = types.len() - 3;
+        let events = &events[review_idx..];
+
+        // Review-mode event carries the byte-identical tool restrictions.
+        let review = &events[0];
+        assert_eq!(review.payload["kind"], "review");
+        assert_eq!(review.payload["review_tool_restrictions"]["goals"], false);
+        assert_eq!(
+            review.payload["review_tool_restrictions"]["multi_agent"],
+            false
+        );
+        assert_eq!(
+            review.payload["review_tool_restrictions"]["web_search"],
+            false
+        );
+        assert_eq!(
+            review.payload["review_tool_restrictions"]["image_generation"],
+            false
+        );
+
+        // Base-instructions event delegates to the canonical review prompt.
+        let base = &events[1];
+        assert_eq!(base.payload["source"], "review");
+        assert_eq!(
+            base.payload["base_instructions"],
+            crate::prompts::review_prompt()
+        );
+
+        // The seeded user input carries the typed payload built from the prompt.
+        let input = &events[2];
+        assert_eq!(input.payload["text"], "Review my changes");
+        assert_eq!(input.payload["content"], "Review my changes");
     }
 }

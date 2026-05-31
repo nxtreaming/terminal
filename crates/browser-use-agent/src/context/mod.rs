@@ -22,7 +22,20 @@ pub mod constants;
 pub mod image_estimate;
 pub mod inject;
 pub mod normalize;
+pub mod user_input;
 pub mod workspace_context;
+
+/// Surface the durable workspace-context append helpers at the `context` module root so
+/// the tui/cli can reach them without naming the `workspace_context` submodule. These
+/// already exist in [`workspace_context`]; this only re-exports them.
+pub use workspace_context::{
+    append_user_shell_command_context_event, append_workspace_context_event,
+};
+
+/// Surface the typed `session.input` payload builders at the `context` module root.
+pub use user_input::{
+    typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
+};
 
 #[cfg(test)]
 mod inject_tests;
