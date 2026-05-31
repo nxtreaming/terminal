@@ -9,7 +9,7 @@
 //! mirroring the `update_plan` tool's structure (`tools/handlers/update_plan.rs`),
 //! which is the closest analog: a non-FS, validate-and-return tool.
 //!
-//! # Request side only — host round-trip is DEFERRED (TODO)
+//! # Host round-trip via a pluggable [`RequestUserInputResponder`]
 //!
 //! In codex the handler does NOT compute the answer itself: it normalizes the
 //! args and calls `session.request_user_input(turn, call_id, args).await`, which
@@ -21,29 +21,35 @@
 //! (`browser-use-core/src/request_user_input.rs:141-163`). That prompt→response
 //! round-trip lives in the session/host layer.
 //!
-//! The new `browser-use-agent` crate does NOT yet have that UI/host wiring, so
-//! this WP models the **request side only**: it
-//! [validates](validate_request_user_input) the args (faithful to codex's
-//! `normalize_request_user_input_args`,
-//! `core/src/tools/handlers/request_user_input_spec.rs:99-115`), normalizes them
-//! (forcing `is_other = true` on every question, exactly as codex/legacy do), and
-//! emits the structured "user input requested" payload as JSON into
-//! [`ExecOutput::stdout`] (prefixed with [`REQUEST_USER_INPUT_STDOUT_PREFIX`] so a
-//! later host-aware layer can recognize it). It does NOT read stdin and does NOT
-//! block waiting for a human.
+//! The new `browser-use-agent` engine has no answer-channel seam on `ToolCtx` /
+//! `TurnEnv` (those carry only `call_id`/`tool_name`/`cwd` and the sandbox /
+//! network / guardian flags), and threading one through the orchestrator's `run`
+//! would require editing files this WP does not own (`entrypoint/mod.rs`, the
+//! `ToolCtx` struct). So the round-trip is modeled with a mechanism this WP DOES
+//! own: the tool holds a pluggable [`RequestUserInputResponder`]. `run`
+//! [validates](validate_request_user_input) + normalizes the args (faithful to
+//! codex's `normalize_request_user_input_args`,
+//! `core/src/tools/handlers/request_user_input_spec.rs:99-115`, forcing
+//! `is_other = true` on every question), then AWAITS the responder for the user's
+//! [`RequestUserInputResponse`] and returns the serialized ANSWERS (prefixed with
+//! [`REQUEST_USER_INPUT_STDOUT_PREFIX`]) — the codex/legacy behavior of returning
+//! the answer to the model, not the request masquerading as an answer.
 //!
-//! TODO(WP-T-request_user_input-host-roundtrip): wire `run` to a real
-//! session/host channel that surfaces the request (the
-//! [`REQUEST_USER_INPUT_REQUEST_EVENT`] event), blocks for the user's
-//! [`RequestUserInputResponse`] (the [`REQUEST_USER_INPUT_RESPONSE_EVENT`] event),
-//! and returns the serialized response as codex/legacy do
-//! (`core/src/tools/handlers/request_user_input.rs:65-87`;
-//! `browser-use-core/src/request_user_input.rs:141-163`). The codex root-thread
-//! gate ("request_user_input can only be used by the root thread",
+//! The default responder ([`EchoAutoResponder`]) is a deterministic auto-answer
+//! (the first option of each question), keeping tests network/host-free while
+//! still exercising the request→answer round-trip. A real host injects its own
+//! responder via [`RequestUserInputTool::with_responder`] (the
+//! `build_tool_dispatcher` seam).
+//!
+//! CROSS-FILE NOTE: a *real* blocking-on-the-human round-trip still needs the
+//! entrypoint (`entrypoint/mod.rs`) to construct + inject a responder backed by
+//! the host's UI channel (the [`REQUEST_USER_INPUT_REQUEST_EVENT`] /
+//! [`REQUEST_USER_INPUT_RESPONSE_EVENT`] events). The codex root-thread gate
+//! ("request_user_input can only be used by the root thread",
 //! `request_user_input.rs:54-58`) and the mode-availability gate
 //! (`request_user_input_unavailable_message`) are likewise session-layer concerns
-//! deferred here. Until then `run` returns the request representation, not the
-//! answer.
+//! the entrypoint owns. This WP provides the responder seam + a default
+//! auto-responder; wiring the host's real responder is the entrypoint's job.
 //!
 //! # Parity grounding (file:line)
 //!
@@ -83,6 +89,7 @@
 //! legacy event shapes.
 
 use std::collections::HashMap;
+use std::sync::Arc;
 
 use crate::tools::runtime::{
     Approvable, ExecOutput, SandboxAttempt, Sandboxable, ToolCtx, ToolError, ToolRuntime,
@@ -296,18 +303,99 @@ pub fn validate_request_user_input(
     Ok(req)
 }
 
+/// The host's answer channel for the `request_user_input` round-trip.
+///
+/// Codex parity: `session.request_user_input(...).await` (codex
+/// `core/src/tools/handlers/request_user_input.rs:65-87`) and the legacy
+/// `wait_for_request_user_input_response`
+/// (`browser-use-core/src/request_user_input.rs:141-163`): surface the questions
+/// to the UI/host and block for the user's [`RequestUserInputResponse`]. This
+/// trait is the engine's seam for that — the entrypoint injects a real host-backed
+/// responder; tests / offline runs use the default [`EchoAutoResponder`].
+#[async_trait::async_trait]
+pub trait RequestUserInputResponder: Send + Sync {
+    /// Surface the (already-validated, normalized) `request` to the host and
+    /// AWAIT the user's answers. The returned [`RequestUserInputResponse`] is keyed
+    /// by each question's `id`.
+    async fn respond(
+        &self,
+        request: &RequestUserInputRequest,
+    ) -> Result<RequestUserInputResponse, ToolError>;
+}
+
+/// The default responder: a deterministic auto-answer that selects the FIRST
+/// option of each question.
+///
+/// This keeps tests / offline runs network- and host-free while still exercising
+/// the real request→answer round-trip (the tool returns ANSWERS, not the request).
+/// A real host replaces this via [`RequestUserInputTool::with_responder`].
+#[derive(Clone, Debug, Default)]
+pub struct EchoAutoResponder;
+
+#[async_trait::async_trait]
+impl RequestUserInputResponder for EchoAutoResponder {
+    async fn respond(
+        &self,
+        request: &RequestUserInputRequest,
+    ) -> Result<RequestUserInputResponse, ToolError> {
+        // Auto-select the first option of each question (the request is already
+        // validated to have non-empty options for every question).
+        let mut answers = HashMap::new();
+        for question in &request.questions {
+            let first = question
+                .options
+                .as_ref()
+                .and_then(|opts| opts.first())
+                .map(|opt| opt.label.clone())
+                .unwrap_or_default();
+            answers.insert(
+                question.id.clone(),
+                UserInputAnswer {
+                    answers: vec![first],
+                },
+            );
+        }
+        Ok(RequestUserInputResponse { answers })
+    }
+}
+
 /// The async `request_user_input` tool.
 ///
-/// Stateless; cheap to clone/construct. Performs no I/O and reads no stdin (see
-/// the module doc: this WP implements the request side only; the host round-trip
-/// is deferred).
-#[derive(Clone, Debug, Default)]
-pub struct RequestUserInputTool;
+/// Holds a pluggable [`RequestUserInputResponder`] (the host answer channel). The
+/// default is the deterministic [`EchoAutoResponder`]; a real host injects its own
+/// via [`with_responder`](RequestUserInputTool::with_responder). Cheap to clone
+/// (the responder is shared behind an [`Arc`]). Performs no filesystem I/O.
+#[derive(Clone)]
+pub struct RequestUserInputTool {
+    responder: Arc<dyn RequestUserInputResponder>,
+}
+
+impl std::fmt::Debug for RequestUserInputTool {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The responder is opaque (a trait object); show only the tool tag.
+        f.debug_struct("RequestUserInputTool").finish()
+    }
+}
+
+impl Default for RequestUserInputTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl RequestUserInputTool {
-    /// Construct a new `request_user_input` tool.
+    /// Construct a new `request_user_input` tool with the default
+    /// [`EchoAutoResponder`] (deterministic auto-answer; host-free).
     pub fn new() -> Self {
-        Self
+        Self {
+            responder: Arc::new(EchoAutoResponder),
+        }
+    }
+
+    /// Construct the tool with a real host-backed [`RequestUserInputResponder`]
+    /// (the production seam the dispatcher/entrypoint injects).
+    pub fn with_responder(responder: Arc<dyn RequestUserInputResponder>) -> Self {
+        Self { responder }
     }
 }
 
@@ -392,19 +480,22 @@ impl ToolRuntime<RequestUserInputRequest, ExecOutput> for RequestUserInputTool {
         // is_other forced true). A violation is a clean `Rejected`.
         let normalized = validate_request_user_input(req.clone())?;
 
-        // HOST ROUND-TRIP DEFERRED (see the module doc). Codex would now call
-        // `session.request_user_input(...).await` and BLOCK for the user's
-        // `RequestUserInputResponse`
+        // HOST ROUND-TRIP. Codex calls `session.request_user_input(...).await` and
+        // BLOCKS for the user's `RequestUserInputResponse`
         // (`core/src/tools/handlers/request_user_input.rs:65-87`); the legacy carve
         // appends a request event and blocks in
         // `wait_for_request_user_input_response`
-        // (`browser-use-core/src/request_user_input.rs:141-163`). The new crate has
-        // no UI/host wiring yet, so we emit the structured REQUEST payload (NOT the
-        // answer) into stdout, prefixed so a later host-aware layer can recognize
-        // it and complete the round-trip. We do NOT read stdin / block.
-        let payload = serde_json::to_string(&normalized).map_err(|err| {
+        // (`browser-use-core/src/request_user_input.rs:141-163`). We model that with
+        // the pluggable responder: surface the normalized questions to the host and
+        // AWAIT the answers. The default `EchoAutoResponder` auto-answers (host-free
+        // for tests); a real host injects its own responder.
+        let response = self.responder.respond(&normalized).await?;
+
+        // Return the ANSWERS to the model (codex/legacy behavior), prefixed so a
+        // host-aware layer can recognize the completed round-trip.
+        let payload = serde_json::to_string(&response).map_err(|err| {
             ToolError::Other(anyhow::anyhow!(
-                "failed to serialize request_user_input request: {err}"
+                "failed to serialize request_user_input response: {err}"
             ))
         })?;
 

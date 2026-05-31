@@ -455,9 +455,12 @@ fn resolve_provider_with_python(
 ///
 /// ## Which tools are wired here
 /// The registry registers the backend-free handlers — `shell`, `apply_patch`,
-/// `view_image`, `update_plan`, `request_user_input`, `tool_search` (empty
-/// catalog), `web_search` (disabled) — plus the two product-surface tools that
-/// drive real subsystems:
+/// `view_image`, `update_plan`, `request_user_input` (default
+/// [`EchoAutoResponder`](crate::tools::handlers::request_user_input::EchoAutoResponder)),
+/// `done`, `tool_search` (catalog populated from the registered tools' defs),
+/// `web_search` (ENABLED; the Responses builder encodes it as the hosted
+/// `web_search_preview` tool) — plus the two product-surface tools that drive
+/// real subsystems:
 ///   * `browser` ([`BrowserTool::new`]): standalone — the production
 ///     [`RealBackend`](crate::tools::handlers::browser::RealBackend) wraps the
 ///     `browser-use-browser` crate and manages CDP sessions internally (keyed by
@@ -497,12 +500,13 @@ fn build_tool_dispatcher(
 ) -> Arc<ToolDispatcher<RegistryRunner>> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
+    use crate::tools::handlers::done::{DoneRequest, DoneTool};
     use crate::tools::handlers::python::{PythonRequest, PythonTool};
     use crate::tools::handlers::request_user_input::{
         RequestUserInputRequest, RequestUserInputTool,
     };
     use crate::tools::handlers::shell::{ShellRequest, ShellTool};
-    use crate::tools::handlers::tool_search::{ToolSearchRequest, ToolSearchTool};
+    use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
     use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
     use crate::tools::handlers::view_image::{ViewImageRequest, ViewImageTool};
     use crate::tools::handlers::web_search::{WebSearchConfig, WebSearchRequest, WebSearchTool};
@@ -537,17 +541,14 @@ fn build_tool_dispatcher(
         false,
         RequestUserInputTool::new(),
     );
-    reg.register::<_, ToolSearchRequest>(
-        "tool_search",
-        definitions::tool_search(),
-        true,
-        ToolSearchTool::new(Vec::new()),
-    );
+    // `web_search` is ENABLED (hosted/provider-side). The OpenAI Responses
+    // request builder encodes it as the hosted `{"type":"web_search_preview"}`
+    // tool (see `browser-use-llm` `openai_responses.rs::lower_tool`).
     reg.register::<_, WebSearchRequest>(
         "web_search",
         definitions::web_search(),
         true,
-        WebSearchTool::new(WebSearchConfig::disabled()),
+        WebSearchTool::new(WebSearchConfig::enabled()),
     );
     // `browser`: standalone production backend (`browser-use-browser`, internal
     // session management). parallel_safe = false (single CDP connection).
@@ -559,6 +560,39 @@ fn build_tool_dispatcher(
         definitions::python(),
         false,
         PythonTool::with_backend(python_backend),
+    );
+    // `done`: the completion tool the model calls to declare it has finished, with
+    // its final summary. Serial (terminal; must not be reordered).
+    reg.register::<_, DoneRequest>("done", definitions::done(), false, DoneTool::new());
+
+    // `tool_search` catalog: populate it from the registry's model-visible
+    // definitions so the model can discover the registered tools by free-text
+    // query (legacy `deferred_tool_search_entries`; codex's `ToolSearchInfo`
+    // catalog). We use the registered tools' definitions (name + description +
+    // schema property names) as the searchable catalog — the obvious in-crate
+    // source. (When a deferred MCP / dynamic-tool source lands, it extends this
+    // catalog; for now the registered tools are the catalog. See REPORT.) We
+    // register tool_search LAST so the catalog reflects every other tool, then
+    // mirror the same entries as the registry's deferred set.
+    let catalog: Vec<ToolSearchEntry> = reg
+        .model_visible_definitions()
+        .iter()
+        .map(|def| {
+            let props: Vec<String> = def
+                .input_schema
+                .get("properties")
+                .and_then(|p| p.as_object())
+                .map(|m| m.keys().cloned().collect())
+                .unwrap_or_default();
+            ToolSearchEntry::new(def.name.clone(), def.description.clone(), props)
+        })
+        .collect();
+    reg.set_deferred_search_entries(catalog.clone());
+    reg.register::<_, ToolSearchRequest>(
+        "tool_search",
+        definitions::tool_search(),
+        true,
+        ToolSearchTool::new(catalog),
     );
 
     // Capture the model-visible tool definitions BEFORE `reg` is moved into the

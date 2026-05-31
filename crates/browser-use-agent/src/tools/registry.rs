@@ -636,19 +636,78 @@ pub mod definitions {
         }
     }
 
-    /// `request_user_input`: ask the user a question. Parity: legacy
-    /// request_user_input spec (`browser-use-core/src/tools/mod.rs`).
+    /// `request_user_input`: ask the user one to three short questions, each with
+    /// mutually-exclusive options, and pause until they respond.
+    ///
+    /// Parity: codex `RequestUserInputArgs { questions:
+    /// Vec<RequestUserInputQuestion> }` (`protocol/src/request_user_input.rs`),
+    /// where each question carries `id`, `header`, `question`, the camelCase
+    /// `isOther` / `isSecret` flags, and an `options` array of `{ label,
+    /// description }`. The schema MUST match what the handler actually accepts —
+    /// [`RequestUserInputRequest`](crate::tools::handlers::request_user_input::RequestUserInputRequest),
+    /// which deserializes `{ "questions": [...] }`, NOT a flat `{ "prompt": ... }`
+    /// (the old schema advertised a shape the handler rejects — a real
+    /// correctness bug).
     pub fn request_user_input() -> ToolDefinition {
         ToolDefinition {
             name: "request_user_input".to_string(),
-            description: "Ask the user for input and pause until they respond.".to_string(),
+            description: "Ask the user one to three short questions (each with \
+                          mutually-exclusive options) and pause until they respond."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "prompt": { "type": "string", "description": "The question to ask the user." }
+                    "questions": {
+                        "type": "array",
+                        "description": "The questions to show the user (prefer 1, do not exceed 3).",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "id": {
+                                    "type": "string",
+                                    "description": "Stable snake_case identifier for mapping the answer."
+                                },
+                                "header": {
+                                    "type": "string",
+                                    "description": "Short header label shown in the UI (12 or fewer chars)."
+                                },
+                                "question": {
+                                    "type": "string",
+                                    "description": "Single-sentence prompt shown to the user."
+                                },
+                                "isOther": {
+                                    "type": "boolean",
+                                    "description": "Whether to add a free-form \"Other\" option (forced true on normalize)."
+                                },
+                                "isSecret": {
+                                    "type": "boolean",
+                                    "description": "Whether the answer is a secret (masked input)."
+                                },
+                                "options": {
+                                    "type": "array",
+                                    "description": "The mutually-exclusive choices (required, non-empty).",
+                                    "items": {
+                                        "type": "object",
+                                        "properties": {
+                                            "label": {
+                                                "type": "string",
+                                                "description": "User-facing label (1-5 words)."
+                                            },
+                                            "description": {
+                                                "type": "string",
+                                                "description": "One short sentence explaining the impact if selected."
+                                            }
+                                        },
+                                        "required": ["label", "description"]
+                                    }
+                                }
+                            },
+                            "required": ["id", "header", "question", "options"]
+                        }
+                    }
                 },
-                "required": ["prompt"],
-                "additionalProperties": true
+                "required": ["questions"],
+                "additionalProperties": false
             }),
         }
     }
@@ -672,6 +731,30 @@ pub mod definitions {
         }
     }
 
+    /// `done`: the completion tool the model calls to declare the task finished,
+    /// carrying its final summary. Parity: codex/legacy completion (`done`) tool
+    /// (`{ "text"?: string }`). The handler's
+    /// [`DoneRequest`](crate::tools::handlers::done::DoneRequest) accepts an
+    /// optional `text` summary.
+    pub fn done() -> ToolDefinition {
+        ToolDefinition {
+            name: "done".to_string(),
+            description:
+                "Signal that the task is finished, with an optional final summary message."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "text": {
+                        "type": "string",
+                        "description": "The final summary message describing what was accomplished."
+                    }
+                },
+                "additionalProperties": false
+            }),
+        }
+    }
+
     /// `web_search`: a hosted/passthrough web search. Parity: codex
     /// `WebSearchArgs { query }` / legacy web_search args.
     pub fn web_search() -> ToolDefinition {
@@ -690,10 +773,10 @@ pub mod definitions {
     }
 }
 
-/// Build a [`ToolRegistry`] preloaded with all ten handlers, each carrying its
+/// Build a [`ToolRegistry`] preloaded with all eleven handlers, each carrying its
 /// parity-grounded [`ToolDefinition`] and static `parallel_safe` flag.
 ///
-/// This is the single place the dispatch loop wires the full tool set. Eight
+/// This is the single place the dispatch loop wires the full tool set. Nine
 /// tools register directly; `browser` and `mcp` register via
 /// [`register_with_wire`](ToolRegistry::register_with_wire) over their
 /// `WireArgs` types. The browser/python/mcp handlers need an injected backend
@@ -716,6 +799,7 @@ pub fn default_registry<S, A>(
     request_user_input: crate::tools::handlers::request_user_input::RequestUserInputTool,
     tool_search: crate::tools::handlers::tool_search::ToolSearchTool,
     web_search: crate::tools::handlers::web_search::WebSearchTool,
+    done: crate::tools::handlers::done::DoneTool,
 ) -> ToolRegistry<S, A>
 where
     S: SandboxProvider,
@@ -723,6 +807,7 @@ where
 {
     use crate::tools::handlers::apply_patch::ApplyPatchRequest;
     use crate::tools::handlers::browser::BrowserRequest;
+    use crate::tools::handlers::done::DoneRequest;
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::PythonRequest;
     use crate::tools::handlers::request_user_input::RequestUserInputRequest;
@@ -768,6 +853,8 @@ where
         tool_search,
     );
     reg.register::<_, WebSearchRequest>("web_search", definitions::web_search(), true, web_search);
+    // `done`: the completion tool. Serial (terminal; must not be reordered).
+    reg.register::<_, DoneRequest>("done", definitions::done(), false, done);
 
     reg
 }
