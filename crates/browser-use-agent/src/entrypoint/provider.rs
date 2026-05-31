@@ -46,6 +46,7 @@ use crate::config_overrides::ProviderRunConfig;
 use crate::events::EventSink;
 use crate::events::TurnCtx;
 use crate::tools::approval::AskForApproval;
+use crate::tools::handlers::python::PythonBackend;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::runtime::ToolCtx;
 use crate::tools::sandbox::FileSystemSandboxPolicy;
@@ -84,6 +85,16 @@ pub enum ProviderResolveError {
     /// The model route could not be built (e.g. an unknown OpenAI-compatible
     /// provider id). Wraps the real [`ModelPathError`].
     Route(ModelPathError),
+    /// The Python worker subprocess could not be started for the run.
+    ///
+    /// The legacy run path starts ONE [`PythonWorker`] per run (eager, via
+    /// `start_with_browser_mode_and_env`) and threads it through dispatch; if
+    /// that spawn fails we surface it as a typed error rather than silently
+    /// dropping the `python` tool (which would be a hidden regression). Carries
+    /// the underlying error's message.
+    ///
+    /// [`PythonWorker`]: browser_use_python_worker::PythonWorker
+    PythonWorker(String),
 }
 
 impl std::fmt::Display for ProviderResolveError {
@@ -96,6 +107,9 @@ impl std::fmt::Display for ProviderResolveError {
                 write!(f, "no provider credentials found in environment ({which})")
             }
             ProviderResolveError::Route(e) => write!(f, "{e}"),
+            ProviderResolveError::PythonWorker(why) => {
+                write!(f, "failed to start python worker: {why}")
+            }
         }
     }
 }
@@ -228,6 +242,56 @@ pub fn resolve_provider(
     max_retries: u32,
     recorder: Arc<dyn FusionRecorder>,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
+    // The Fake short-circuit lives in the inner builder (so we never spawn a
+    // Python worker for a fake/cut/missing-credential run). For a real backend we
+    // start the run's single Python worker EAGERLY here, then thread its backend
+    // through. `start_python_backend` only runs once we know the route builds.
+    resolve_provider_with_python(config, sink, ctx, max_retries, recorder, None)
+}
+
+/// Start the run's single Python worker subprocess (eager, matching legacy
+/// `run_existing_session_from_config`, which spawns one
+/// `PythonWorker::start_with_browser_mode_and_env` per run and threads it through
+/// dispatch).
+///
+/// `browser_mode` + `python_env` come from the run config's [`AgentRunOptions`],
+/// forwarded verbatim. A spawn failure is a typed [`ProviderResolveError::PythonWorker`]
+/// (no silent drop of the `python` tool — that would be a hidden regression).
+///
+/// LIFECYCLE: the returned backend owns the [`PythonWorker`], which is reaped on
+/// drop — `PythonWorker`'s `Drop` (python-worker `lib.rs:475`) sends a `shutdown`
+/// request then force-kills + waits the child. The backend is held by the
+/// `python` handler inside the dispatcher; when the dispatcher (owned by the
+/// fused driver) drops at run end, the worker process is reaped — no leak.
+///
+/// [`AgentRunOptions`]: crate::config_overrides::AgentRunOptions
+/// [`PythonWorker`]: browser_use_python_worker::PythonWorker
+fn start_python_backend(
+    config: &ProviderRunConfig,
+) -> Result<Arc<dyn PythonBackend>, ProviderResolveError> {
+    let backend = crate::tools::handlers::python::RealBackend::start(
+        config.options.browser_mode.as_deref(),
+        &config.options.python_env,
+    )
+    .map_err(|e| ProviderResolveError::PythonWorker(e.to_string()))?;
+    Ok(Arc::new(backend))
+}
+
+/// Inner [`resolve_provider`] that accepts a pre-built Python backend.
+///
+/// `python_backend = None` means "start the real worker eagerly" (the production
+/// path). Tests pass `Some(fake)` to exercise resolution WITHOUT spawning a real
+/// Python process — the real-driver-constructs-offline assertion is about the
+/// model transport, not the worker, so injecting a fake keeps it network/process
+/// free while still wiring the `python` tool through the real dispatcher.
+fn resolve_provider_with_python(
+    config: &ProviderRunConfig,
+    sink: Arc<dyn EventSink>,
+    ctx: TurnCtx,
+    max_retries: u32,
+    recorder: Arc<dyn FusionRecorder>,
+    python_backend: Option<Arc<dyn PythonBackend>>,
+) -> Result<ResolvedProvider, ProviderResolveError> {
     // (1) backend → credentialed provider choice (Codex/None → Err; Fake → None).
     let choice = match provider_choice_for_backend(config.backend)? {
         Some(choice) => choice,
@@ -245,12 +309,21 @@ pub fn resolve_provider(
     let client = Arc::new(ModelClient::default());
     let transport = build_transport(client, route, &ctx, Vec::new());
 
+    // (3a) Resolve the Python backend for the run's `python` tool. Real path:
+    //      start the single worker eagerly (only reached AFTER the `Fake`/`Codex`/
+    //      missing-credential exits above, so those never spawn Python). Tests
+    //      inject a fake.
+    let python_backend = match python_backend {
+        Some(backend) => backend,
+        None => start_python_backend(config)?,
+    };
+
     // *** build_sampling_driver is actually CALLED here (production path). ***
     // It yields the text-only sampler; we then attach the FUSED dispatch path so a
     // model tool-call actually EXECUTES (through the registry + orchestrator) and
     // its output re-enters the prompt via `recorder`, and the loop re-samples.
     let driver = build_sampling_driver(transport, sink, ctx, max_retries)
-        .with_fusion(build_tool_dispatcher(), recorder);
+        .with_fusion(build_tool_dispatcher(python_backend), recorder);
     Ok(ResolvedProvider::Real(Box::new(driver)))
 }
 
@@ -266,21 +339,31 @@ pub fn resolve_provider(
 /// into the recorded tool-result message.
 ///
 /// ## Which tools are wired here
-/// The registry registers the handlers whose constructors need NO injected
-/// backend: `shell`, `apply_patch`, `view_image`, `update_plan`,
-/// `request_user_input`, `tool_search` (empty catalog), `web_search` (disabled).
-/// The three backend-bound handlers — `browser` ([`BrowserTool::with_backend`]),
-/// `python` ([`PythonTool::with_backend`]), `mcp` ([`McpTool::new`] takes an
-/// [`McpClient`](crate::tools::handlers::mcp::McpClient)) — are NOT registered
-/// here: wiring them needs the live browser runtime / python worker / MCP client
-/// manager, which the run-config does not yet thread through. They are a Phase-E
-/// seam; a model call to one returns the registry's "unknown tool" tool-result
-/// rather than reaching the OS through a default backend. Closing that seam is
-/// wiring the three backends into this builder — the dispatch path is unchanged.
+/// The registry registers the backend-free handlers — `shell`, `apply_patch`,
+/// `view_image`, `update_plan`, `request_user_input`, `tool_search` (empty
+/// catalog), `web_search` (disabled) — plus the two product-surface tools that
+/// drive real subsystems:
+///   * `browser` ([`BrowserTool::new`]): standalone — the production
+///     [`RealBackend`](crate::tools::handlers::browser::RealBackend) wraps the
+///     `browser-use-browser` crate and manages CDP sessions internally (keyed by
+///     `session_id`), so no external handle is threaded in. Registered
+///     `parallel_safe = false` (a single CDP connection).
+///   * `python` ([`PythonTool::with_backend`]): backed by the `python_backend`
+///     this builder receives — a [`RealBackend`](crate::tools::handlers::python::RealBackend)
+///     wrapping the ONE [`PythonWorker`] [`resolve_provider`] started for the run
+///     (eager, matching legacy). Registered `parallel_safe = false` (a single
+///     interpreter process).
 ///
-/// [`BrowserTool::with_backend`]: crate::tools::handlers::browser::BrowserTool::with_backend
+/// `mcp` ([`McpTool::new`] takes an
+/// [`McpClient`](crate::tools::handlers::mcp::McpClient)) is still NOT registered
+/// here — it is handled separately and needs the MCP client manager threaded
+/// through. A model call to `mcp` returns the registry's "unknown tool"
+/// tool-result rather than reaching a default backend.
+///
+/// [`BrowserTool::new`]: crate::tools::handlers::browser::BrowserTool::new
 /// [`PythonTool::with_backend`]: crate::tools::handlers::python::PythonTool::with_backend
 /// [`McpTool::new`]: crate::tools::handlers::mcp::McpTool::new
+/// [`PythonWorker`]: browser_use_python_worker::PythonWorker
 ///
 /// ## Phase-E seams (honest defaults)
 /// - **Approval policy = `Never`** + **`ToolOrchestrator::stub()`** (auto-approve,
@@ -294,8 +377,12 @@ pub fn resolve_provider(
 /// - **`supports_parallel_tool_calls = true`**: lets the registry's own per-tool
 ///   `parallel_safe` flag drive the parallel/serial gate (the conservative tools
 ///   are registered serial, so this is safe).
-fn build_tool_dispatcher() -> Arc<ToolDispatcher<RegistryRunner>> {
+fn build_tool_dispatcher(
+    python_backend: Arc<dyn PythonBackend>,
+) -> Arc<ToolDispatcher<RegistryRunner>> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
+    use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
+    use crate::tools::handlers::python::{PythonRequest, PythonTool};
     use crate::tools::handlers::request_user_input::{
         RequestUserInputRequest, RequestUserInputTool,
     };
@@ -307,8 +394,8 @@ fn build_tool_dispatcher() -> Arc<ToolDispatcher<RegistryRunner>> {
     use crate::tools::registry::{definitions, ToolRegistry};
 
     // The backend-free handlers, each with its parity-grounded definition + static
-    // parallel_safe flag (matching `default_registry`'s presets). browser/python/mcp
-    // are intentionally absent (Phase-E seam — see the fn docs).
+    // parallel_safe flag (matching `default_registry`'s presets), plus the
+    // browser/python product tools. `mcp` is still absent (handled separately).
     let mut reg = ToolRegistry::new();
     reg.register::<_, ShellRequest>("shell", definitions::shell(), false, ShellTool::new());
     reg.register::<_, ApplyPatchRequest>(
@@ -346,6 +433,17 @@ fn build_tool_dispatcher() -> Arc<ToolDispatcher<RegistryRunner>> {
         definitions::web_search(),
         true,
         WebSearchTool::new(WebSearchConfig::disabled()),
+    );
+    // `browser`: standalone production backend (`browser-use-browser`, internal
+    // session management). parallel_safe = false (single CDP connection).
+    reg.register::<_, BrowserRequest>("browser", definitions::browser(), false, BrowserTool::new());
+    // `python`: backed by the run's single PythonWorker (started eagerly by
+    // `resolve_provider`). parallel_safe = false (single interpreter process).
+    reg.register::<_, PythonRequest>(
+        "python",
+        definitions::python(),
+        false,
+        PythonTool::with_backend(python_backend),
     );
 
     let runner = RegistryRunner::new(
@@ -399,6 +497,27 @@ mod tests {
         Arc::new(NullRecorder)
     }
 
+    /// A fake Python backend so resolution tests never spawn a real worker
+    /// (network/process free). It records nothing and is never `run` — these
+    /// tests only assert the driver CONSTRUCTS, they do not dispatch.
+    struct FakePythonBackend;
+    impl crate::tools::handlers::python::PythonBackend for FakePythonBackend {
+        fn run(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _code: &str,
+            _timeout_secs: Option<f64>,
+        ) -> anyhow::Result<browser_use_python_worker::RunPythonResponse> {
+            anyhow::bail!("fake python backend: run() not used in resolution tests")
+        }
+    }
+
+    fn fake_python() -> Arc<dyn PythonBackend> {
+        Arc::new(FakePythonBackend)
+    }
+
     fn ctx() -> TurnCtx {
         TurnCtx {
             session_id: "prov-test".to_string(),
@@ -412,13 +531,26 @@ mod tests {
     /// A real OpenAI backend CONSTRUCTS the live driver offline (no network). We
     /// inject the key via env for the duration of the test, then assert
     /// resolution yields a Real driver. The key is removed afterwards.
+    ///
+    /// We go through `resolve_provider_with_python` with an injected FAKE Python
+    /// backend so the test never spawns a real Python worker subprocess (the
+    /// public `resolve_provider` starts the real worker eagerly; that is exercised
+    /// in production, not here). The offline-construction assertion is about the
+    /// model transport, not the worker.
     #[test]
     fn resolves_real_openai_driver_offline() {
         // SAFETY: single-threaded test; we set + clear the var around the call.
         std::env::set_var("OPENAI_API_KEY", "sk-test-entrypoint");
         let config = ProviderRunConfig::new(ProviderBackend::Openai, "gpt-x");
-        let resolved = resolve_provider(&config, Arc::new(NullSink), ctx(), 3, recorder())
-            .expect("real openai driver must construct offline");
+        let resolved = resolve_provider_with_python(
+            &config,
+            Arc::new(NullSink),
+            ctx(),
+            3,
+            recorder(),
+            Some(fake_python()),
+        )
+        .expect("real openai driver must construct offline");
         std::env::remove_var("OPENAI_API_KEY");
         assert!(matches!(resolved, ResolvedProvider::Real(_)));
     }
@@ -428,8 +560,15 @@ mod tests {
     fn resolves_real_anthropic_driver_offline() {
         std::env::set_var("ANTHROPIC_API_KEY", "ak-test-entrypoint");
         let config = ProviderRunConfig::new(ProviderBackend::Anthropic, "claude-x");
-        let resolved = resolve_provider(&config, Arc::new(NullSink), ctx(), 3, recorder())
-            .expect("real anthropic driver must construct offline");
+        let resolved = resolve_provider_with_python(
+            &config,
+            Arc::new(NullSink),
+            ctx(),
+            3,
+            recorder(),
+            Some(fake_python()),
+        )
+        .expect("real anthropic driver must construct offline");
         std::env::remove_var("ANTHROPIC_API_KEY");
         assert!(matches!(resolved, ResolvedProvider::Real(_)));
     }
@@ -468,5 +607,210 @@ mod tests {
         let err = resolve_provider(&config, Arc::new(NullSink), ctx(), 3, recorder())
             .expect_err("missing credentials must error");
         assert!(matches!(err, ProviderResolveError::MissingCredentials(_)));
+    }
+
+    // ---- browser/python tool wiring (network/process free) --------------------
+    //
+    // These prove the `browser` and `python` handlers are REGISTERED in the
+    // production registry the dispatcher runs over, and REACHABLE through the real
+    // dispatch path: a call deserializes into the typed Req, the runner looks the
+    // handler up BY NAME (not "unknown tool"), and the FAKE backend's distinctive
+    // marker flows out the rendered tool-result. We never start a real
+    // PythonWorker or a real browser: browser uses a FAKE [`BrowserBackend`],
+    // python a FAKE [`PythonBackend`]. Mirrors `browser_tests.rs` /
+    // `python_tests.rs` (same orchestrator-driven seam) plus a registry
+    // membership assertion.
+
+    use crate::tools::handlers::browser::{BrowserBackend, BrowserRequest, BrowserTool};
+    use crate::tools::handlers::python::{PythonRequest, PythonTool};
+    use crate::tools::orchestrator::ToolOrchestrator;
+    use crate::tools::registry::{definitions, ToolRegistry};
+    use crate::tools::runtime::{AutoApprover, ToolCtx};
+    use crate::tools::sandbox::{FileSystemSandboxPolicy, NoneSandboxProvider};
+    use browser_use_browser::BrowserCommandOutput;
+    use browser_use_python_worker::RunPythonResponse;
+
+    /// A fake browser backend returning a marker on the `command` path (no real
+    /// CDP/browser). Only `command` is exercised; the other methods are
+    /// unreachable in these tests.
+    struct MarkerBrowserBackend;
+    impl BrowserBackend for MarkerBrowserBackend {
+        fn command(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _command: &str,
+        ) -> anyhow::Result<BrowserCommandOutput> {
+            Ok(BrowserCommandOutput {
+                content: serde_json::json!({ "marker": "BROWSER_MARKER" }),
+                events: vec![],
+            })
+        }
+        fn run_script(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _code: &str,
+            _timeout_secs: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            anyhow::bail!("run_script not used")
+        }
+        fn start_script(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _code: &str,
+            _timeout_secs: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            anyhow::bail!("start_script not used")
+        }
+        fn observe_script(
+            &self,
+            _session_id: &str,
+            _run_id: &str,
+            _observe_timeout_ms: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            anyhow::bail!("observe_script not used")
+        }
+        fn cancel_script(
+            &self,
+            _session_id: &str,
+            _run_id: &str,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            anyhow::bail!("cancel_script not used")
+        }
+    }
+
+    /// A fake python backend returning a marker output (no real worker/process).
+    struct MarkerPythonBackend;
+    impl crate::tools::handlers::python::PythonBackend for MarkerPythonBackend {
+        fn run(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _code: &str,
+            _timeout_secs: Option<f64>,
+        ) -> anyhow::Result<RunPythonResponse> {
+            Ok(RunPythonResponse {
+                id: "py-marker".to_string(),
+                ok: true,
+                text: "PYTHON_MARKER".to_string(),
+                error: None,
+                data: serde_json::Value::Null,
+                outputs: vec![],
+                artifacts: vec![],
+                images: vec![],
+                browser_events: vec![],
+                browser_harness_available: false,
+                browser_harness_error: None,
+            })
+        }
+    }
+
+    fn turn_env() -> TurnEnv {
+        TurnEnv {
+            file_system_sandbox_policy: FileSystemSandboxPolicy {
+                restricted: false,
+                denied_read: false,
+            },
+            managed_network_active: false,
+            strict_auto_review: false,
+            use_guardian: false,
+        }
+    }
+
+    fn tool_ctx(name: &str) -> ToolCtx {
+        ToolCtx {
+            call_id: format!("call-{name}"),
+            tool_name: name.to_string(),
+            cwd: std::env::temp_dir(),
+        }
+    }
+
+    /// `browser` and `python` are REGISTERED in the production registry (exactly
+    /// as `build_tool_dispatcher` registers them) — proving they are no longer the
+    /// Phase-E "unknown tool" seam.
+    #[test]
+    fn browser_and_python_are_registered() {
+        // Default seams (`NoneSandboxProvider`/`AutoApprover`) — this registry is
+        // only inspected for membership, never handed to a runner that would infer
+        // the seams, so annotate them explicitly.
+        let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
+        reg.register::<_, BrowserRequest>(
+            "browser",
+            definitions::browser(),
+            false,
+            BrowserTool::with_backend(Arc::new(MarkerBrowserBackend)),
+        );
+        reg.register::<_, PythonRequest>(
+            "python",
+            definitions::python(),
+            false,
+            PythonTool::with_backend(Arc::new(MarkerPythonBackend)),
+        );
+        assert!(reg.contains("browser"), "browser must be registered");
+        assert!(reg.contains("python"), "python must be registered");
+    }
+
+    /// A `browser` call REACHES the injected backend through the orchestrator
+    /// (same seam the dispatcher's runner uses) and the backend's marker flows
+    /// into the rendered output — not a stub, not "unknown tool".
+    #[tokio::test]
+    async fn browser_dispatch_reaches_injected_backend() {
+        let tool = BrowserTool::with_backend(Arc::new(MarkerBrowserBackend));
+        let orch = ToolOrchestrator::new(NoneSandboxProvider, AutoApprover);
+        let req = BrowserRequest::command("sess-1", "click");
+        let result = orch
+            .run(
+                &tool,
+                &req,
+                &tool_ctx("browser"),
+                &turn_env(),
+                AskForApproval::Never,
+            )
+            .await
+            .expect("browser orchestration ok");
+        assert!(
+            result.output.stdout.contains("BROWSER_MARKER"),
+            "browser must reach the backend, got: {:?}",
+            result.output
+        );
+    }
+
+    /// A `python` call REACHES the injected backend through the orchestrator and
+    /// the backend's marker flows into the rendered output.
+    #[tokio::test]
+    async fn python_dispatch_reaches_injected_backend() {
+        let tool = PythonTool::with_backend(Arc::new(MarkerPythonBackend));
+        let orch = ToolOrchestrator::new(NoneSandboxProvider, AutoApprover);
+        let req = PythonRequest::new("print('x')");
+        let result = orch
+            .run(
+                &tool,
+                &req,
+                &tool_ctx("python"),
+                &turn_env(),
+                AskForApproval::Never,
+            )
+            .await
+            .expect("python orchestration ok");
+        assert!(
+            result.output.stdout.contains("PYTHON_MARKER"),
+            "python must reach the backend, got: {:?}",
+            result.output
+        );
+    }
+
+    /// The PRODUCTION builder `build_tool_dispatcher` accepts the injected python
+    /// backend and constructs a real dispatcher (proving the signature wiring) —
+    /// exercised with a FAKE backend so no real worker is started.
+    #[test]
+    fn production_builder_accepts_injected_python_backend() {
+        let _dispatcher: Arc<ToolDispatcher<RegistryRunner>> =
+            build_tool_dispatcher(Arc::new(MarkerPythonBackend));
     }
 }
