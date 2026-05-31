@@ -36,13 +36,15 @@
 //! agent crate yet, so the cwd is accepted (for signature parity and future wiring)
 //! but the plain-mention materialization is a no-op here. Explicit `skill` items
 //! still produce `skill_context_messages` (that path reads only the item's own
-//! `SKILL.md`). Local-image inlining (`push_collab_local_image_parts`, which needs the
-//! legacy `prompt_image` module) is likewise deferred: a `local_image` item renders the
-//! same legacy text marker rather than inlining the image bytes.
+//! `SKILL.md`). Local-image inlining (`push_collab_local_image_parts`) IS ported: a
+//! `local_image` item now reads the file, base64-encodes it, and emits the
+//! `input_image` data-URL content part (see [`local_image_data_url`]); only the
+//! legacy `prompt_image` resize normalization is omitted.
 
 use std::collections::HashSet;
 use std::path::Path;
 
+use base64::Engine as _;
 use serde_json::Value;
 
 /// The structured collaboration input legacy assembles before serializing the
@@ -395,11 +397,11 @@ fn collab_item_allows_preview_fallback(item: &Value) -> bool {
 /// Append an item's provider content parts. Parity: legacy
 /// `collab_item_content_parts` (lib.rs:21604).
 ///
-/// `local_image` differs from legacy in the deferred case: legacy
-/// `push_collab_local_image_parts` inlines the image bytes via the `prompt_image`
-/// module (not in the agent crate). Here it emits the same legacy text marker the
-/// preview uses, so the typed shape stays text-only rather than referencing a missing
-/// module.
+/// `local_image` matches legacy `push_collab_local_image_parts`: it reads the local
+/// file, base64-encodes it, and emits the `input_image` data-URL part (see
+/// [`local_image_data_url`]); only the legacy resize normalization is omitted. If the
+/// file is unreadable or the extension is not a supported image type, it falls back to
+/// the legacy text marker.
 fn collab_item_content_parts(item: &Value, parts: &mut Vec<Value>) {
     match item.get("type").and_then(Value::as_str) {
         Some("text") => {
@@ -429,11 +431,30 @@ fn collab_item_content_parts(item: &Value, parts: &mut Vec<Value>) {
             }
         }
         Some("local_image") => {
-            // Deferred: legacy inlines the image via `prompt_image`. Emit the marker.
-            parts.push(serde_json::json!({
-                "type": "input_text",
-                "text": collab_item_preview(item),
-            }));
+            // Parity: legacy `push_collab_local_image_parts` inlines the image bytes
+            // as an `input_image` data URL. We read the local file, base64-encode it
+            // with the standard alphabet, and emit a `data:<mime>;base64,<...>` part
+            // (the same data-URL shape as `view_image::encode_data_url`). When the
+            // file is unreadable or has an unknown image extension, fall back to the
+            // legacy text marker so the typed shape still references the attachment.
+            if let Some(image_url) = item
+                .get("path")
+                .and_then(Value::as_str)
+                .filter(|path| !path.is_empty())
+                .and_then(|path| local_image_data_url(Path::new(path)))
+            {
+                push_collab_image_parts(
+                    parts,
+                    None,
+                    image_url,
+                    item.get("detail").and_then(Value::as_str).unwrap_or("high"),
+                );
+            } else {
+                parts.push(serde_json::json!({
+                    "type": "input_text",
+                    "text": collab_item_preview(item),
+                }));
+            }
         }
         Some("skill") | Some("mention") => {}
         _ => {
@@ -468,6 +489,21 @@ fn push_collab_image_parts(
         "type": "input_text",
         "text": "</image>",
     }));
+}
+
+/// Read a local image file and encode it as a `data:<mime>;base64,<...>` URL.
+///
+/// Parity: legacy `push_collab_local_image_parts` -> `PromptImage` data-url shape
+/// (`data:<mime>;base64,<standard-base64>`), minus the resize normalization. The
+/// MIME is keyed off the extension via the shared
+/// [`crate::tools::handlers::view_image::mime_from_extension`] helper (png, jpeg,
+/// gif, webp). Returns `None` for unreadable files or unsupported extensions so the
+/// caller can fall back to the legacy text marker.
+fn local_image_data_url(path: &Path) -> Option<String> {
+    let mime = crate::tools::handlers::view_image::mime_from_extension(path)?;
+    let bytes = std::fs::read(path).ok()?;
+    let encoded = base64::engine::general_purpose::STANDARD.encode(&bytes);
+    Some(format!("data:{mime};base64,{encoded}"))
 }
 
 // ---- item-derived metadata (skill ctx / connectors / plugin mentions) ----

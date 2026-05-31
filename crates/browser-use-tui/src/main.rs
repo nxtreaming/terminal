@@ -8409,15 +8409,12 @@ mod redesign_tests {
         result
     }
 
-    // Engine gap: the new engine's `typed_user_input_payload_from_items_for_cwd`
-    // (browser-use-agent `context/user_input.rs`) does not port the legacy
-    // base64 image expansion — it records the `items`/`text` payload but never
-    // emits the `content` array with `input_image` data URLs. This origin/main
-    // test asserts that base64 `content`; left in place (ignored) until the
-    // engine ports prompt-image expansion. The composer-side image attachment
-    // and rendering it exercises are otherwise unchanged.
+    // The new engine's `typed_user_input_payload_from_items_for_cwd`
+    // (browser-use-agent `context/user_input.rs`) now ports the legacy base64
+    // image expansion: a `local_image` item is read, base64-encoded, and emitted
+    // in the `content` array as an `input_image` data URL alongside the recorded
+    // `items`/`text` payload.
     #[test]
-    #[ignore = "engine typed_user_input payload drops base64 input_image content"]
     fn submit_attached_image_as_local_image_item() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -10550,14 +10547,14 @@ mod redesign_tests {
         Ok(())
     }
 
-    // Engine gap: the new `browser-use-agent` `config_model::ModelCatalog` is a
-    // minimal resolution-only mirror (slug/display/is_default; no provider
-    // presets) and does not read a cwd `config.toml` model_catalog, so the model
-    // picker is driven by the providers crate's bundled catalog rather than a
-    // per-cwd catalog. This origin/main test asserts the dropped config-driven
-    // catalog behavior; left in place (ignored) until the engine ports it.
+    // Engine gap: the TUI model picker still builds rows from the providers bundled
+    // catalog (`fallback_model_choices`) and does not load the home/cwd `config.toml`
+    // `model_catalog_json` catalog the fixture writes, so the config-driven presets
+    // (`Catalog GPT` / `ChatGPT Only Catalog`) are unreachable. Wiring this requires a
+    // `model_catalog_json` loader feeding `model_choices_for_catalog`; left ignored
+    // until that catalog-load path is ported.
     #[test]
-    #[ignore = "engine config_model::ModelCatalog drops cwd config.toml catalog presets"]
+    #[ignore = "engine: TUI picker does not load config.toml model_catalog_json catalog"]
     fn model_selector_uses_active_catalog_presets() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = temp.path().join("browser-use-terminal-home");
@@ -10747,15 +10744,14 @@ wire_api = "responses"
         Ok(())
     }
 
-    // Engine gap: depends on the cwd `config.toml` model_catalog (the
-    // `catalog-gpt` preset written by `write_tui_model_catalog`), which the new
-    // engine's resolution-only `config_model::ModelCatalog` does not load — the
-    // model picker is built from the providers bundled catalog instead, so the
-    // `catalog-gpt` row does not exist. The session-scoping behavior under test
-    // is sound; only the catalog fixture is unreachable. Left in place (ignored)
-    // until the engine ports cwd config.toml catalog presets.
+    // Engine gap: depends on the cwd/home `config.toml` model_catalog (the
+    // `catalog-gpt` preset written by `write_tui_model_catalog`), which the TUI picker
+    // does not load — it builds rows from the providers bundled catalog instead, so
+    // the `catalog-gpt` OpenAI row does not exist. The session-scoping behavior under
+    // test is sound; only the catalog fixture is unreachable until the
+    // `model_catalog_json` loader is wired into the picker.
     #[test]
-    #[ignore = "engine config_model::ModelCatalog drops cwd config.toml catalog presets"]
+    #[ignore = "engine: TUI picker does not load config.toml model_catalog_json catalog"]
     fn model_selection_is_session_scoped_for_followups() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let app_home = temp.path().join("browser-use-terminal-home");
