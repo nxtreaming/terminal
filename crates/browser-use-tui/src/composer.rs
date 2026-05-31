@@ -8,10 +8,29 @@ use crate::theme::{accent, dim};
 #[derive(Debug, Default)]
 pub(crate) struct Composer {
     text: String,
-    local_images: Vec<PathBuf>,
+    local_images: Vec<LocalImageDraft>,
     cursor: usize,
     preferred_column: Option<usize>,
     visible_wrapped_start_hint: Option<usize>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum LocalImageDraft {
+    Ready(PathBuf),
+    Pending { paste_id: u64 },
+}
+
+impl LocalImageDraft {
+    fn path(self) -> Option<PathBuf> {
+        match self {
+            Self::Ready(path) => Some(path),
+            Self::Pending { .. } => None,
+        }
+    }
+
+    fn is_pending(&self) -> bool {
+        matches!(self, Self::Pending { .. })
+    }
 }
 
 impl Composer {
@@ -35,7 +54,10 @@ impl Composer {
 
     pub(crate) fn take_submission(&mut self) -> (String, Vec<PathBuf>) {
         let text = self.text.trim().to_string();
-        let local_images = std::mem::take(&mut self.local_images);
+        let local_images = std::mem::take(&mut self.local_images)
+            .into_iter()
+            .filter_map(LocalImageDraft::path)
+            .collect();
         self.clear();
         (text, local_images)
     }
@@ -48,8 +70,45 @@ impl Composer {
         !self.local_images.is_empty()
     }
 
+    pub(crate) fn has_pending_local_images(&self) -> bool {
+        self.local_images.iter().any(LocalImageDraft::is_pending)
+    }
+
     pub(crate) fn attach_image(&mut self, path: PathBuf) {
-        self.local_images.push(path);
+        self.local_images.push(LocalImageDraft::Ready(path));
+    }
+
+    pub(crate) fn attach_pending_image(&mut self, paste_id: u64) {
+        self.local_images
+            .push(LocalImageDraft::Pending { paste_id });
+    }
+
+    pub(crate) fn resolve_pending_image(&mut self, paste_id: u64, path: PathBuf) -> bool {
+        let Some(image) = self.local_images.iter_mut().find(|image| {
+            matches!(
+                image,
+                LocalImageDraft::Pending {
+                    paste_id: candidate
+                } if *candidate == paste_id
+            )
+        }) else {
+            return false;
+        };
+        *image = LocalImageDraft::Ready(path);
+        true
+    }
+
+    pub(crate) fn remove_pending_image(&mut self, paste_id: u64) -> bool {
+        let previous_len = self.local_images.len();
+        self.local_images.retain(|image| {
+            !matches!(
+                image,
+                LocalImageDraft::Pending {
+                    paste_id: candidate
+                } if *candidate == paste_id
+            )
+        });
+        self.local_images.len() != previous_len
     }
 
     pub(crate) fn insert_paste(&mut self, text: &str) -> bool {
@@ -958,6 +1017,25 @@ mod tests {
         assert!(!rendered.contains("shot.png"));
         assert_eq!(composer.visual_line_count_wrapped(40), 1);
         assert_eq!(composer.cursor_position_wrapped(4, 40), (31, 0));
+    }
+
+    #[test]
+    fn validated_pending_image_renders_and_resolves_to_path() {
+        let mut composer = Composer::default();
+        composer.set_input("describe it".to_string());
+        composer.attach_pending_image(7);
+
+        assert_eq!(
+            plain(composer.render_lines_wrapped(4, 80, "placeholder")),
+            "> [Image 1] describe it\n"
+        );
+        assert!(composer.has_pending_local_images());
+
+        assert!(composer.resolve_pending_image(7, PathBuf::from("/tmp/shot.png")));
+        assert!(!composer.has_pending_local_images());
+        let (text, images) = composer.take_submission();
+        assert_eq!(text, "describe it");
+        assert_eq!(images, vec![PathBuf::from("/tmp/shot.png")]);
     }
 
     #[test]
