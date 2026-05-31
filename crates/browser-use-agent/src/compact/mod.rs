@@ -63,6 +63,8 @@ use crate::AgentError;
 
 #[cfg(test)]
 mod tests;
+#[cfg(test)]
+mod threshold_tests;
 
 /// The "CONTEXT CHECKPOINT COMPACTION" instruction sent as the final user message
 /// of the summary request (codex `core/templates/compact/prompt.md`, referenced by
