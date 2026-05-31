@@ -13,6 +13,7 @@ pub mod mcp;
 pub mod python;
 pub mod request_user_input;
 pub mod shell;
+pub mod subagent;
 pub mod tool_search;
 pub mod update_plan;
 pub mod view_image;
@@ -54,6 +55,10 @@ pub use request_user_input::{
     RequestUserInputTool, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
 pub use shell::{ShellApprovalKey, ShellRequest, ShellTool};
+pub use subagent::{
+    ListAgentsRequest, ListAgentsTool, SendInputRequest, SendInputTool, SpawnAgentTool,
+    SubagentToolDeps, WaitAgentRequest, WaitAgentTool,
+};
 pub use tool_search::{
     ToolSearchApprovalKey, ToolSearchEntry, ToolSearchMatch, ToolSearchRequest, ToolSearchTool,
 };

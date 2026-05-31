@@ -48,10 +48,16 @@ use browser_use_store::Store;
 
 use crate::config_overrides::ProviderBackend;
 use crate::config_overrides::ProviderRunConfig;
+use crate::config_overrides::{ChildAgentRunRequest, ChildAgentRunner};
 use crate::events::EventSink;
+use crate::events::PendingEvent;
 use crate::events::TurnCtx;
 use crate::mcp::McpConnectionManager;
 use crate::session::{SessionId, SharedStore};
+use crate::subagents::manager::{
+    ChildHandle, ChildSpawner, ChildSpec, ParentContext, SubagentError, SubagentManager,
+};
+use crate::subagents::role::AgentConfigLayer;
 use crate::tools::approval::AskForApproval;
 use crate::tools::handlers::mcp::{McpClient, McpTool};
 use crate::tools::handlers::python::PythonBackend;
@@ -603,6 +609,15 @@ fn build_tool_dispatcher(
     // its final summary. Serial (terminal; must not be reordered).
     reg.register::<_, DoneRequest>("done", definitions::done(), false, DoneTool::new());
 
+    // Subagent orchestration tools (`spawn_agent` / `wait_agent` / `send_input` /
+    // `list_agents`). All four share ONE `SubagentManager` (live-agent registry +
+    // EVENT-NOTIFY mailbox + depth enforcement + the `ChildSpawner` seam). The
+    // child spawner is bridged from the run config's `child_agent_runner` so
+    // spawned children inherit the parent's provider/model; when none is configured
+    // the spawner returns an honest "subagents not configured" error rather than
+    // silently dropping the tools (the model still SEES the tools).
+    register_subagent_tools(&mut reg, config, &user_input);
+
     // `mcp`: register the MCP bridge ONLY when servers are configured. An empty
     // `mcp_servers` map (the default) registers nothing, preserving prior
     // behavior. Non-empty => connect all servers (per-server failure isolation
@@ -693,6 +708,188 @@ fn build_tool_dispatcher(
     Arc::new(ToolDispatcher::with_runner_and_specs(
         runner, /* supports_parallel_tool_calls */ true, specs,
     ))
+}
+
+/// Bridges the run config's [`ChildAgentRunner`] (a `Fn(ChildAgentRunRequest) ->
+/// Result<()>` that *launches* a child) into the subagents [`ChildSpawner`] seam.
+///
+/// The legacy `child_agent_runner` is fire-and-forget: it spawns the child run
+/// (inheriting the parent's provider/model via the request fields) and returns.
+/// The subagents [`SubagentManager`] tracks the child's lifecycle through the
+/// registry + mailbox, so this adapter maps the [`ChildSpec`] onto a
+/// [`ChildAgentRunRequest`], invokes the runner, and returns a [`ChildHandle`]
+/// for the just-launched child. A runner error becomes a [`SubagentError`].
+struct ChildAgentRunnerSpawner {
+    runner: ChildAgentRunner,
+    parent_session_id: String,
+}
+
+#[async_trait::async_trait]
+impl ChildSpawner for ChildAgentRunnerSpawner {
+    async fn spawn_child(&self, spec: ChildSpec) -> Result<ChildHandle, SubagentError> {
+        let request = ChildAgentRunRequest {
+            parent_session_id: self.parent_session_id.clone(),
+            // The child's session id is its canonical agent id (unique per spawn).
+            child_session_id: spec.agent_id.clone(),
+            // Child inherits the resolved config (provider/tier folded into the
+            // role layer); surface the model + reasoning/tier overrides the
+            // legacy runner consumes.
+            model: Some(spec.config.model.clone()),
+            reasoning_effort: spec.config.reasoning_effort.clone(),
+            service_tier: spec.config.service_tier.clone(),
+            config_overrides: Vec::new(),
+        };
+        self.runner
+            .run(request)
+            .map_err(|e| SubagentError(format!("child_agent_runner failed: {e}")))?;
+        Ok(ChildHandle {
+            agent_path: spec.agent_path,
+            agent_id: spec.agent_id,
+        })
+    }
+}
+
+/// A [`ChildSpawner`] that always errors: the fallback when the run config
+/// supplies no `child_agent_runner`. Spawning then returns an honest "subagents
+/// not configured" error rather than the tools being silently absent — the model
+/// still SEES `spawn_agent` (so it can attempt delegation) but gets a clear
+/// failure when no runner is wired (e.g. headless/test runs).
+struct UnconfiguredChildSpawner;
+
+#[async_trait::async_trait]
+impl ChildSpawner for UnconfiguredChildSpawner {
+    async fn spawn_child(&self, _spec: ChildSpec) -> Result<ChildHandle, SubagentError> {
+        Err(SubagentError(
+            "subagents are not configured for this run (no child_agent_runner)".to_string(),
+        ))
+    }
+}
+
+/// A durable [`EventSink`] over a [`SharedStore`]: appends each `subagent.*`
+/// lifecycle event under the shared lock so the TUI's subagent render sees the
+/// transition. Best-effort (append errors are swallowed, matching
+/// [`EventSink::emit`]'s infallible contract).
+struct SubagentStoreSink {
+    store: SharedStore,
+}
+
+impl EventSink for SubagentStoreSink {
+    fn emit(&self, ev: PendingEvent) {
+        if let Ok(store) = self.store.lock() {
+            let _ = store.append_event(&ev.session_id, &ev.event_type, ev.payload);
+        }
+    }
+}
+
+/// A no-op [`EventSink`] for runs without a session store (tests / headless):
+/// lifecycle events are dropped, but spawn/wait/send still function.
+struct NoopSubagentSink;
+
+impl EventSink for NoopSubagentSink {
+    fn emit(&self, _ev: PendingEvent) {}
+}
+
+/// Register the four subagent orchestration tools (`spawn_agent`, `wait_agent`,
+/// `send_input`, `list_agents`) into `reg`, all sharing ONE [`SubagentManager`].
+///
+/// The manager's [`ChildSpawner`] is bridged from
+/// `config.options.child_agent_runner` via [`ChildAgentRunnerSpawner`]; spawned
+/// children therefore inherit the parent's provider/model from whatever the
+/// entrypoint wired into that runner. When the run config carries no runner,
+/// [`UnconfiguredChildSpawner`] is used so a spawn attempt fails honestly.
+/// Lifecycle events are persisted through a store-backed [`SubagentStoreSink`]
+/// when a session store is available (the live run path), else dropped via
+/// [`NoopSubagentSink`] (tests/headless).
+fn register_subagent_tools(
+    reg: &mut crate::tools::registry::ToolRegistry,
+    config: &ProviderRunConfig,
+    user_input: &Option<(SharedStore, SessionId)>,
+) {
+    use crate::subagents::spawn::SpawnAgentArgs;
+    use crate::tools::handlers::subagent::{
+        ListAgentsRequest, ListAgentsTool, SendInputRequest, SendInputTool, SpawnAgentTool,
+        SubagentToolDeps, WaitAgentRequest, WaitAgentTool,
+    };
+    use crate::tools::registry::definitions;
+
+    let parent_session_id = user_input
+        .as_ref()
+        .map(|(_, sid)| sid.as_str().to_string())
+        .unwrap_or_default();
+
+    // The child-runner seam (parent's provider/model inheritance) or an honest
+    // error fallback when no runner is configured.
+    let spawner: Arc<dyn ChildSpawner> = match &config.options.child_agent_runner {
+        Some(runner) => Arc::new(ChildAgentRunnerSpawner {
+            runner: runner.clone(),
+            parent_session_id,
+        }),
+        None => Arc::new(UnconfiguredChildSpawner),
+    };
+    let manager = Arc::new(SubagentManager::new(spawner));
+
+    // The parent context the children hang off: `/root`, depth 0, with the run's
+    // model + provider as the base config so role layering preserves them.
+    let parent = ParentContext {
+        agent_path: "/root".to_string(),
+        depth: 0,
+        base_config: AgentConfigLayer::base(config.model.clone(), provider_label(config)),
+    };
+
+    // Durable lifecycle sink + session scope: the store-backed sink on the live
+    // run path, a no-op when no session store is wired.
+    let (sink, session_id): (Arc<dyn EventSink>, String) = match user_input {
+        Some((store, sid)) => (
+            Arc::new(SubagentStoreSink {
+                store: store.clone(),
+            }),
+            sid.as_str().to_string(),
+        ),
+        None => (Arc::new(NoopSubagentSink), String::new()),
+    };
+
+    let deps = SubagentToolDeps {
+        manager,
+        parent,
+        sink,
+        session_id,
+    };
+
+    // spawn_agent: parallel-safe (each spawn mints a handle + hands off; the child
+    // runs on its own task).
+    reg.register::<_, SpawnAgentArgs>(
+        "spawn_agent",
+        definitions::spawn_agent(),
+        true,
+        SpawnAgentTool::new(deps.clone()),
+    );
+    // wait_agent: parallel-safe (blocks on the shared mailbox + reads the registry).
+    reg.register::<_, WaitAgentRequest>(
+        "wait_agent",
+        definitions::wait_agent(),
+        true,
+        WaitAgentTool::new(deps.clone()),
+    );
+    // send_input: parallel-safe (enqueues onto the mailbox).
+    reg.register::<_, SendInputRequest>(
+        "send_input",
+        definitions::send_input(),
+        true,
+        SendInputTool::new(deps.clone()),
+    );
+    // list_agents: parallel-safe (read-only registry snapshot).
+    reg.register::<_, ListAgentsRequest>(
+        "list_agents",
+        definitions::list_agents(),
+        true,
+        ListAgentsTool::new(deps),
+    );
+}
+
+/// Best-effort wire-provider label for the child's base config (mirrors the
+/// entrypoint's backend->label derivation).
+fn provider_label(config: &ProviderRunConfig) -> String {
+    format!("{:?}", config.backend).to_ascii_lowercase()
 }
 
 #[cfg(test)]
@@ -1217,6 +1414,104 @@ mod tests {
         assert!(
             names.contains(&"mcp"),
             "mcp tool must be registered when servers are configured; got {names:?}"
+        );
+    }
+
+    /// The production dispatcher ALWAYS advertises the four subagent
+    /// orchestration tools (no config gate — the model can always attempt
+    /// delegation; a spawn fails honestly when no child runner is wired). This is
+    /// the "engine B matches rival A on the subagents row" registration proof.
+    #[test]
+    fn subagent_tools_are_registered_in_the_dispatcher() {
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for tool in ["spawn_agent", "wait_agent", "send_input", "list_agents"] {
+            assert!(
+                names.contains(&tool),
+                "{tool} must be registered in the production dispatcher; got {names:?}"
+            );
+        }
+    }
+
+    /// A `spawn_agent` call routes from the production registration into the
+    /// `SubagentManager` and reaches the configured `child_agent_runner`, then
+    /// returns the child's handle. This exercises the same registration
+    /// `register_subagent_tools` installs, dispatched by NAME through the registry
+    /// (the path the production `RegistryRunner` uses for a model tool-call), with
+    /// a recording runner so it is offline.
+    #[tokio::test]
+    async fn spawn_agent_routes_through_registration_to_child_runner() {
+        use crate::config_overrides::{AgentRunOptions, ChildAgentRunner};
+        use crate::tools::orchestrator::ToolOrchestrator;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::runtime::ToolCtx;
+        use crate::tools::sandbox::FileSystemSandboxPolicy;
+        use std::sync::atomic::{AtomicBool, Ordering};
+
+        // A fire-and-forget child runner that records it was invoked and asserts
+        // the child inherits the parent's model on the request (standing in for the
+        // real task-driver-backed runner the live entrypoint wires).
+        static INVOKED: AtomicBool = AtomicBool::new(false);
+        INVOKED.store(false, Ordering::SeqCst);
+        let runner = ChildAgentRunner::new(|req| {
+            assert_eq!(req.model.as_deref(), Some("fake-model"));
+            INVOKED.store(true, Ordering::SeqCst);
+            Ok(())
+        });
+        let options = AgentRunOptions {
+            child_agent_runner: Some(runner),
+            ..AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+
+        // Build the production registration into a registry, then dispatch a
+        // spawn_agent call BY NAME through it (the same `dispatch` the production
+        // RegistryRunner calls), under the auto-approve stub orchestrator.
+        let mut reg: ToolRegistry = ToolRegistry::new();
+        register_subagent_tools(&mut reg, &config, &None);
+        assert!(reg.contains("spawn_agent"));
+
+        let orch = ToolOrchestrator::stub();
+        let env = TurnEnv {
+            file_system_sandbox_policy: FileSystemSandboxPolicy {
+                restricted: false,
+                denied_read: false,
+            },
+            managed_network_active: false,
+            strict_auto_review: false,
+            use_guardian: false,
+        };
+        let ctx = ToolCtx {
+            call_id: "c".to_string(),
+            tool_name: "spawn_agent".to_string(),
+            cwd: std::env::temp_dir(),
+        };
+        let out = reg
+            .dispatch(
+                "spawn_agent",
+                &serde_json::json!({ "task_name": "explore", "message": "go" }),
+                &ctx,
+                &env,
+                AskForApproval::Never,
+                &orch,
+            )
+            .await
+            .expect("spawn_agent should route and run");
+        assert_eq!(out.exit_code, 0, "spawn should succeed: {out:?}");
+        assert!(
+            INVOKED.load(Ordering::SeqCst),
+            "the configured child runner must be invoked"
+        );
+        let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+        assert!(
+            body.get("agent_path").and_then(|v| v.as_str()).is_some(),
+            "spawn returns the child handle: {body}"
         );
     }
 }
