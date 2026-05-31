@@ -740,7 +740,7 @@ mod tests {
         std::env::remove_var("CODEX_ACCESS_TOKEN");
         std::env::remove_var("CODEX_ACCOUNT_ID");
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Store::open_at(dir.path().join("store.sqlite3")).expect("store");
+        let store = Store::open(dir.path()).expect("store");
         store
             .set_setting("auth.codex.access_token", "stored-codex-access")
             .unwrap();
@@ -782,7 +782,7 @@ mod tests {
     fn env_key_wins_over_store() {
         std::env::set_var("OPENAI_API_KEY", "env-openai-key");
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Store::open_at(dir.path().join("store.sqlite3")).expect("store");
+        let store = Store::open(dir.path()).expect("store");
         store
             .set_setting("auth.openai.api_key", "stored-openai-key")
             .unwrap();
@@ -805,7 +805,7 @@ mod tests {
         std::env::remove_var("ANTHROPIC_API_KEY");
         std::env::remove_var("LLM_BROWSER_ANTHROPIC_API_KEY");
         let dir = tempfile::tempdir().expect("tempdir");
-        let store = Store::open_at(dir.path().join("store.sqlite3")).expect("store");
+        let store = Store::open(dir.path()).expect("store");
         store
             .set_setting("auth.anthropic.api_key", "stored-anthropic-key")
             .unwrap();
