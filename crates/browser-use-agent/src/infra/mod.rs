@@ -31,7 +31,8 @@ pub use persistence::{
 };
 pub use review::{
     review_base_instructions, review_prompt_base_branch, review_prompt_commit,
-    review_prompt_custom, review_prompt_uncommitted_changes, ReviewPromptError,
+    review_prompt_custom, review_prompt_uncommitted_changes, start_review_session,
+    ReviewPromptError,
 };
 
 #[cfg(test)]
