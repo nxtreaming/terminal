@@ -52,6 +52,9 @@ use crate::config_overrides::{ChildAgentRunRequest, ChildAgentRunner};
 use crate::events::EventSink;
 use crate::events::PendingEvent;
 use crate::events::TurnCtx;
+use crate::guardian::approval::GuardianApprover;
+use crate::guardian::reviewer::{GuardianReviewer, StaticReviewer};
+use crate::guardian::Guardian;
 use crate::mcp::McpConnectionManager;
 use crate::session::{SessionId, SharedStore};
 use crate::subagents::manager::{
@@ -64,7 +67,7 @@ use crate::tools::handlers::python::PythonBackend;
 use crate::tools::handlers::request_user_input::StoreRoundTripResponder;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::runtime::ToolCtx;
-use crate::tools::sandbox::FileSystemSandboxPolicy;
+use crate::tools::sandbox::{FileSystemSandboxPolicy, NoneSandboxProvider};
 use crate::turn::dispatch::{RegistryRunner, ToolDispatcher};
 use crate::turn::model_path::build_route;
 use crate::turn::model_path::build_sampling_driver;
@@ -85,7 +88,21 @@ use crate::turn::sampling::ModelSamplingDriver;
 /// implements [`SamplingDriver`](crate::turn::SamplingDriver) (the loop drives the
 /// concrete type — the trait is not dyn-compatible, so the driver is held as the
 /// concrete generic, not boxed as `dyn SamplingDriver`).
-pub type RealSamplingDriver = ModelSamplingDriver<ModelClientTransport, RegistryRunner>;
+///
+/// The runner's approver is the REAL [`GuardianApprover`] (over a permissive
+/// [`NoneSandboxProvider`] — OS sandboxing is intentionally NOT enforced here).
+/// The active [`AskForApproval`] policy (from the run config) decides whether the
+/// approver is consulted at all: `Never` auto-approves without a prompt, any other
+/// policy routes each gated call through the guardian review.
+pub type RealSamplingDriver = ModelSamplingDriver<
+    ModelClientTransport,
+    RegistryRunner<NoneSandboxProvider, GuardianApprover>,
+>;
+
+/// The production tool dispatcher type: a [`RegistryRunner`] whose approver is the
+/// REAL [`GuardianApprover`] (permissive sandbox seam). Named so the builder + the
+/// fused driver agree on the runner's generic arguments.
+pub type RealToolDispatcher = ToolDispatcher<RegistryRunner<NoneSandboxProvider, GuardianApprover>>;
 
 /// Errors resolving a provider into a driver.
 #[derive(Debug)]
@@ -471,8 +488,9 @@ fn resolve_provider_with_python(
 }
 
 /// Build the production fused tool dispatcher: a [`ToolRegistry`] behind the REAL
-/// [`RegistryRunner`], over a [`ToolOrchestrator`] stub (sandbox = `None`,
-/// auto-approve), wrapped in a [`ToolDispatcher`].
+/// [`RegistryRunner`], over a REAL [`ToolOrchestrator`] (permissive
+/// [`NoneSandboxProvider`] + a live [`GuardianApprover`]), wrapped in a
+/// [`ToolDispatcher`].
 ///
 /// This is the dispatcher the fused [`ModelSamplingDriver`] runs every model
 /// tool-call through (codex `try_run_turn` -> router -> orchestrator). The runner
@@ -513,15 +531,18 @@ fn resolve_provider_with_python(
 /// [`McpTool::new`]: crate::tools::handlers::mcp::McpTool::new
 /// [`PythonWorker`]: browser_use_python_worker::PythonWorker
 ///
-/// ## Phase-E seams (honest defaults)
-/// - **Approval policy = `Never`** + **`ToolOrchestrator::stub()`** (auto-approve,
-///   `NoneSandboxProvider`): tools run unsandboxed and un-prompted. The richer
-///   policy (real `AskForApproval` from config, a live `Approver`, the real sandbox
-///   provider) is threaded by a later Phase-E WP — the seam is exactly this builder.
-/// - **`TurnEnv`** carries an unrestricted filesystem policy and no managed network
-///   / guardian, matching the `sandbox = None` initial scope.
+/// ## Approval / guardian wiring (LIVE)
+/// - **Approval policy** is sourced from `config.options.approval_policy` (default
+///   [`AskForApproval::Never`], preserving prior non-interactive behavior) and
+///   threaded into the [`RegistryRunner`]. `Never` auto-approves (no prompt); any
+///   other policy routes each gated call through the REAL [`GuardianApprover`],
+///   which can deny.
+/// - **Orchestrator** is [`build_real_orchestrator`] over a permissive
+///   [`NoneSandboxProvider`] (OS-level sandbox enforcement is intentionally
+///   SKIPPED — a permissive seam) + a live [`GuardianApprover`]. The guardian's
+///   reviewer is selected by `config.options.use_guardian` (deny vs. allow).
 /// - **`ToolCtx.cwd`** is the process cwd (best-effort); the per-call id/name are
-///   placeholders the orchestrator does not key behavior on for the `Never`/stub path.
+///   placeholders for this headless dispatch path.
 /// - **`supports_parallel_tool_calls = true`**: lets the registry's own per-tool
 ///   `parallel_safe` flag drive the parallel/serial gate (the conservative tools
 ///   are registered serial, so this is safe).
@@ -529,7 +550,7 @@ fn build_tool_dispatcher(
     python_backend: Arc<dyn PythonBackend>,
     config: &ProviderRunConfig,
     user_input: Option<(SharedStore, SessionId)>,
-) -> Arc<ToolDispatcher<RegistryRunner>> {
+) -> Arc<RealToolDispatcher> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
     use crate::tools::handlers::done::{DoneRequest, DoneTool};
@@ -548,7 +569,9 @@ fn build_tool_dispatcher(
     // The backend-free handlers, each with its parity-grounded definition + static
     // parallel_safe flag (matching `default_registry`'s presets), plus the
     // browser/python product tools. `mcp` is still absent (handled separately).
-    let mut reg = ToolRegistry::new();
+    // Typed with the production approver (`GuardianApprover`) so the registry, the
+    // orchestrator, and the runner all agree on the `(S, A)` seams.
+    let mut reg: ToolRegistry<NoneSandboxProvider, GuardianApprover> = ToolRegistry::new();
     reg.register::<_, ShellRequest>("shell", definitions::shell(), false, ShellTool::new());
     reg.register::<_, ApplyPatchRequest>(
         "apply_patch",
@@ -689,12 +712,20 @@ fn build_tool_dispatcher(
     // definitions and can never emit browser/python/shell tool calls.
     let specs = reg.model_visible_definitions();
 
+    // The REAL approval policy, sourced from the run config (default `Never`,
+    // which preserves prior non-interactive behavior).
+    let policy: AskForApproval = config.options.approval_policy;
+    // The REAL orchestrator: permissive `NoneSandboxProvider` (OS sandboxing is
+    // intentionally skipped) + a live `GuardianApprover`. The approver is only
+    // consulted when the policy routes to it (any non-`Never` policy on a gated
+    // call); under `Never` the orchestrator bypasses the prompt entirely.
+    let orchestrator = Arc::new(build_real_orchestrator(config.options.use_guardian));
+
     let runner = RegistryRunner::new(
         Arc::new(reg),
-        Arc::new(ToolOrchestrator::stub()),
-        // Phase-E seam: placeholder per-turn ctx/env; the stub orchestrator +
-        // `Never` policy do not key behavior on these (no approval prompt, no
-        // sandbox). Wave-E threads the real ToolCtx/TurnEnv/policy through.
+        orchestrator,
+        // Per-turn ctx/env. The cwd is the process cwd (best-effort); the per-call
+        // id/name are placeholders for this headless path.
         ToolCtx {
             call_id: String::new(),
             tool_name: String::new(),
@@ -707,14 +738,44 @@ fn build_tool_dispatcher(
             },
             managed_network_active: false,
             strict_auto_review: false,
-            use_guardian: false,
+            // Mirror the run config's guardian toggle for parity.
+            use_guardian: config.options.use_guardian,
         },
-        AskForApproval::Never,
+        policy,
     );
 
     Arc::new(ToolDispatcher::with_runner_and_specs(
         runner, /* supports_parallel_tool_calls */ true, specs,
     ))
+}
+
+/// Build the production tool orchestrator: a permissive [`NoneSandboxProvider`]
+/// (OS-level sandbox enforcement is intentionally SKIPPED — this is a permissive
+/// seam) paired with a live [`GuardianApprover`].
+///
+/// `use_guardian` selects the guardian's reviewer:
+///   * `false` → [`StaticReviewer::allow`] — the permissive default. Under a
+///     non-`Never` policy a gated call is reviewed and ALLOWED (the approver IS
+///     consulted — the routing is live — it just permits).
+///   * `true`  → [`StaticReviewer::deny`] — fail-closed. Under a non-`Never`
+///     policy a gated call is reviewed and DENIED, proving the policy routes to a
+///     real approver that can block.
+///
+/// Under [`AskForApproval::Never`] the orchestrator's pure decision table bypasses
+/// the approval gate entirely, so the reviewer is never consulted regardless of
+/// this flag — preserving the prior auto-approve behavior.
+fn build_real_orchestrator(
+    use_guardian: bool,
+) -> ToolOrchestrator<NoneSandboxProvider, GuardianApprover> {
+    let reviewer: Arc<dyn GuardianReviewer> = if use_guardian {
+        Arc::new(StaticReviewer::deny(
+            "guardian denied: non-interactive run with the guardian gate enabled",
+        ))
+    } else {
+        Arc::new(StaticReviewer::allow())
+    };
+    let approver = GuardianApprover::new(Guardian::new(reviewer));
+    ToolOrchestrator::new(NoneSandboxProvider, approver)
 }
 
 /// Bridges the run config's [`ChildAgentRunner`] (a `Fn(ChildAgentRunRequest) ->
@@ -807,11 +868,14 @@ impl EventSink for NoopSubagentSink {
 /// Lifecycle events are persisted through a store-backed [`SubagentStoreSink`]
 /// when a session store is available (the live run path), else dropped via
 /// [`NoopSubagentSink`] (tests/headless).
-fn register_subagent_tools(
-    reg: &mut crate::tools::registry::ToolRegistry,
+fn register_subagent_tools<S, A>(
+    reg: &mut crate::tools::registry::ToolRegistry<S, A>,
     config: &ProviderRunConfig,
     user_input: &Option<(SharedStore, SessionId)>,
-) {
+) where
+    S: crate::tools::sandbox::SandboxProvider,
+    A: crate::tools::runtime::Approver,
+{
     use crate::subagents::spawn::SpawnAgentArgs;
     use crate::tools::handlers::subagent::{
         ListAgentsRequest, ListAgentsTool, SendInputRequest, SendInputTool, SpawnAgentTool,
@@ -907,10 +971,13 @@ fn register_subagent_tools(
 ///
 /// Mirrors [`register_subagent_tools`]: a shared store + a store-backed event sink
 /// + the session id from the threaded `(SharedStore, SessionId)`.
-fn register_goal_tools(
-    reg: &mut crate::tools::registry::ToolRegistry,
+fn register_goal_tools<S, A>(
+    reg: &mut crate::tools::registry::ToolRegistry<S, A>,
     user_input: &Option<(SharedStore, SessionId)>,
-) {
+) where
+    S: crate::tools::sandbox::SandboxProvider,
+    A: crate::tools::runtime::Approver,
+{
     use crate::tools::handlers::goal::{
         CreateGoalRequest, CreateGoalTool, GetGoalRequest, GetGoalTool, GoalStore,
         UpdateGoalRequest, UpdateGoalTool,
@@ -1424,7 +1491,7 @@ mod tests {
     fn production_builder_accepts_injected_python_backend() {
         // No MCP servers, no user-input store -> mcp tool absent, Echo responder.
         let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
-        let _dispatcher: Arc<ToolDispatcher<RegistryRunner>> =
+        let _dispatcher: Arc<RealToolDispatcher> =
             build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
     }
 
@@ -1544,7 +1611,7 @@ mod tests {
         // Build the production registration into a registry, then dispatch a
         // spawn_agent call BY NAME through it (the same `dispatch` the production
         // RegistryRunner calls), under the auto-approve stub orchestrator.
-        let mut reg: ToolRegistry = ToolRegistry::new();
+        let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
         register_subagent_tools(&mut reg, &config, &None);
         assert!(reg.contains("spawn_agent"));
 
@@ -1621,7 +1688,7 @@ mod tests {
 
         // Dispatch a single tool call BY NAME and return its JSON tool output.
         async fn dispatch_one(
-            dispatcher: &ToolDispatcher<RegistryRunner>,
+            dispatcher: &RealToolDispatcher,
             name: &str,
             input: serde_json::Value,
         ) -> serde_json::Value {
@@ -1728,6 +1795,148 @@ mod tests {
         assert!(
             kinds.iter().any(|k| k == "goal.updated"),
             "expected a durable goal.updated event, got: {kinds:?}"
+        );
+    }
+
+    // ---- approval-policy routing (the LIVE approval/guardian path) -------------
+    //
+    // These prove the production dispatcher HONORS `config.options.approval_policy`,
+    // routing each gated tool call through the orchestrator's REAL `GuardianApprover`
+    // (no OS sandbox — permissive seam). They dispatch a `shell` `echo` call BY NAME
+    // through the SAME `dispatch_ordered` path the turn loop uses, asserting the
+    // policy decides whether the approver is consulted / can deny.
+
+    /// Dispatch a single tool call through the production dispatcher and return
+    /// the recorded tool-result `(text, is_error)`.
+    async fn dispatch_call(
+        dispatcher: &RealToolDispatcher,
+        name: &str,
+        input: serde_json::Value,
+    ) -> (String, bool) {
+        use browser_use_llm::schema::{ContentPart, MessageRole};
+        use tokio_util::sync::CancellationToken;
+
+        let call = ContentPart::ToolCall {
+            id: format!("call-{name}"),
+            name: name.to_string(),
+            input,
+            provider_metadata: None,
+        };
+        let result = dispatcher
+            .dispatch_ordered(vec![call], CancellationToken::new())
+            .await;
+        let msg = result
+            .outputs_in_order
+            .into_iter()
+            .next()
+            .expect("one tool output");
+        assert_eq!(msg.role, MessageRole::Tool);
+        msg.content
+            .iter()
+            .find_map(|p| match p {
+                ContentPart::ToolResult {
+                    content, is_error, ..
+                } => {
+                    let text = content
+                        .iter()
+                        .find_map(|c| match c {
+                            ContentPart::Text { text } => Some(text.clone()),
+                            _ => None,
+                        })
+                        .unwrap_or_default();
+                    Some((text, *is_error))
+                }
+                _ => None,
+            })
+            .expect("a tool-result part")
+    }
+
+    /// `AskForApproval::Never` (the default) AUTO-APPROVES: a gated `shell` call
+    /// runs with NO prompt and NO denial — the approver is never consulted. This
+    /// is the preserved-default-behavior proof.
+    #[tokio::test]
+    async fn never_policy_auto_approves_shell_call() {
+        // Default config => approval_policy = Never, use_guardian = false.
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        assert_eq!(config.options.approval_policy, AskForApproval::Never);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+
+        let (text, is_error) = dispatch_call(
+            &dispatcher,
+            "shell",
+            serde_json::json!({ "command": ["echo", "hi"] }),
+        )
+        .await;
+        assert!(
+            !is_error,
+            "Never policy must auto-approve (run the tool), got error: {text}"
+        );
+        assert!(
+            text.contains("hi"),
+            "the shell tool must have actually run under Never, got: {text}"
+        );
+    }
+
+    /// A NON-`Never` policy ROUTES the gated call to the real approver, which —
+    /// with the guardian gate enabled — DENIES it. Proves the policy is honored
+    /// (the call is no longer hardcoded auto-approve) AND the approver can block.
+    #[tokio::test]
+    async fn non_never_policy_routes_to_approver_and_can_deny() {
+        // UnlessTrusted always requires approval; use_guardian => the guardian's
+        // reviewer denies, so the gated call is rejected.
+        let options = crate::config_overrides::AgentRunOptions::default()
+            .with_approval_policy(AskForApproval::UnlessTrusted)
+            .with_guardian(true);
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+
+        let (text, is_error) = dispatch_call(
+            &dispatcher,
+            "shell",
+            serde_json::json!({ "command": ["echo", "hi"] }),
+        )
+        .await;
+        assert!(
+            is_error,
+            "a non-Never policy with the guardian denying must reject the call; got ok: {text}"
+        );
+        assert!(
+            text.contains("rejected"),
+            "the rejection must surface the approver's denial, got: {text}"
+        );
+        assert!(
+            !text.contains("hi"),
+            "a denied shell call must NOT have executed, got: {text}"
+        );
+    }
+
+    /// A NON-`Never` policy with the guardian DISABLED still routes to the real
+    /// approver — which ALLOWS — so the gated call runs. This isolates "routing is
+    /// live" from "guardian denies": the approver IS consulted (not bypassed), and
+    /// the permissive reviewer permits.
+    #[tokio::test]
+    async fn non_never_policy_routes_to_approver_and_can_allow() {
+        let options = crate::config_overrides::AgentRunOptions::default()
+            .with_approval_policy(AskForApproval::UnlessTrusted)
+            .with_guardian(false);
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+
+        let (text, is_error) = dispatch_call(
+            &dispatcher,
+            "shell",
+            serde_json::json!({ "command": ["echo", "hi"] }),
+        )
+        .await;
+        assert!(
+            !is_error,
+            "the permissive guardian must approve the routed call, got error: {text}"
+        );
+        assert!(
+            text.contains("hi"),
+            "the approved shell call must have executed, got: {text}"
         );
     }
 }

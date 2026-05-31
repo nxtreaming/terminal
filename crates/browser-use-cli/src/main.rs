@@ -3551,6 +3551,10 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         // No MCP servers wired from the CLI dataset path yet (a `[mcp_servers]`
         // config loader is a follow-up); empty keeps the `mcp` tool unregistered.
         mcp_servers: std::collections::HashMap::new(),
+        // Non-interactive dataset runs keep the default non-prompting approval
+        // policy with the guardian gate off (preserves prior auto-approve behavior).
+        approval_policy: AgentRunOptions::default().approval_policy,
+        use_guardian: AgentRunOptions::default().use_guardian,
     };
     let mut run_error = runner
         .run_dataset_session(store, &session_id, agent_options)
