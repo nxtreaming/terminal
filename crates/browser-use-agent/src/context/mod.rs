@@ -22,6 +22,7 @@ pub mod constants;
 pub mod image_estimate;
 pub mod inject;
 pub mod normalize;
+pub mod workspace_context;
 
 #[cfg(test)]
 mod inject_tests;
