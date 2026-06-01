@@ -802,10 +802,12 @@ fn build_tool_dispatcher_with_cwd(
     let browser_tool = match &user_input {
         Some((store, session_id)) => {
             BrowserTool::with_browser_mode(config.options.browser_mode.clone())
+                .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds)
                 .with_session_id(session_id.as_str().to_string())
                 .with_persistence(store.clone(), session_id.as_str().to_string())
         }
-        None => BrowserTool::with_browser_mode(config.options.browser_mode.clone()),
+        None => BrowserTool::with_browser_mode(config.options.browser_mode.clone())
+            .with_default_script_timeout_secs(config.options.python_tool_timeout_seconds),
     };
     // `browser`: standalone production backend (`browser-use-browser`, internal
     // session management). parallel_safe = false (single CDP connection).
@@ -1348,6 +1350,8 @@ mod tests {
             session_id: "prov-test".to_string(),
             model: "m".to_string(),
             provider: "p".to_string(),
+            base_instructions: crate::prompts::browser_agent_system_prompt(),
+            browser_mode_instruction: None,
             turn_idx: 0,
             attempt: 0,
         }

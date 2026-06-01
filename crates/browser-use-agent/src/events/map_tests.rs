@@ -16,6 +16,8 @@ fn ctx() -> TurnCtx {
         session_id: "sess-1".to_string(),
         model: "gpt-test".to_string(),
         provider: "openai".to_string(),
+        base_instructions: crate::prompts::browser_agent_system_prompt(),
+        browser_mode_instruction: None,
         turn_idx: 3,
         attempt: 0,
     }

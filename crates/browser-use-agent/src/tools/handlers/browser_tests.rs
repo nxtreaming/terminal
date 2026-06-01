@@ -53,6 +53,7 @@ struct FakeBackend {
     last: Mutex<LastCall>,
     last_session: Mutex<Option<String>>,
     last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
+    last_timeout_secs: Mutex<Option<u64>>,
     script_images: Mutex<Vec<serde_json::Value>>,
     fail: bool,
 }
@@ -68,6 +69,10 @@ impl FakeBackend {
 
     fn last_paths(&self) -> Option<(PathBuf, PathBuf)> {
         self.last_paths.lock().unwrap().clone()
+    }
+
+    fn last_timeout_secs(&self) -> Option<u64> {
+        *self.last_timeout_secs.lock().unwrap()
     }
 
     fn record_paths(&self, cwd: &std::path::Path, artifact_dir: &std::path::Path) {
@@ -127,10 +132,11 @@ impl BrowserBackend for FakeBackend {
         cwd: &std::path::Path,
         artifact_dir: &std::path::Path,
         code: &str,
-        _timeout_secs: u64,
+        timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
+        *self.last_timeout_secs.lock().unwrap() = Some(timeout_secs);
         *self.last.lock().unwrap() = LastCall::RunScript(code.to_string());
         self.record_paths(cwd, artifact_dir);
         if self.fail {
@@ -146,10 +152,11 @@ impl BrowserBackend for FakeBackend {
         cwd: &std::path::Path,
         artifact_dir: &std::path::Path,
         code: &str,
-        _timeout_secs: u64,
+        timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
+        *self.last_timeout_secs.lock().unwrap() = Some(timeout_secs);
         *self.last.lock().unwrap() = LastCall::StartScript(code.to_string());
         self.record_paths(cwd, artifact_dir);
         if self.fail {
@@ -279,6 +286,100 @@ async fn command_routes_and_maps_output() {
     );
 }
 
+#[tokio::test]
+async fn bare_browser_connect_resolves_to_selected_local_mode() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool =
+        tool_with(Arc::clone(&backend)).with_selected_browser_mode(Some("local".to_string()));
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser connect local".to_string())
+    );
+}
+
+#[tokio::test]
+async fn bare_browser_connect_resolves_to_selected_cloud_mode() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool =
+        tool_with(Arc::clone(&backend)).with_selected_browser_mode(Some("cloud".to_string()));
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser remote start".to_string())
+    );
+}
+
+#[tokio::test]
+async fn selected_browser_mode_rejects_wrong_connection_family() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool =
+        tool_with(Arc::clone(&backend)).with_selected_browser_mode(Some("local".to_string()));
+
+    let req = BrowserRequest::command("sess-1", "browser remote start");
+    let err = run_direct(&tool, &req).await.unwrap_err();
+
+    assert!(matches!(err, ToolError::Rejected(_)), "got {err:?}");
+    assert_eq!(backend.last(), LastCall::None);
+}
+
+#[tokio::test]
+async fn browser_preference_command_is_store_backed_and_synthetic() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    let tool = tool_with(Arc::clone(&backend))
+        .with_selected_browser_mode(Some("cloud".to_string()))
+        .with_persistence(store.clone(), session.clone());
+
+    let req = BrowserRequest::command("sess-1", "browser preference use cloud");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(backend.last(), LastCall::None);
+    assert!(out.stdout.contains("\"next_step\":\"browser connect\""));
+    assert_eq!(
+        store
+            .lock()
+            .unwrap()
+            .get_setting("browser.preference.mode")
+            .unwrap()
+            .as_deref(),
+        Some("cloud")
+    );
+}
+
+#[tokio::test]
+async fn stored_cloud_profile_influences_bare_connect_when_mode_unlocked() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    {
+        let store = store.lock().unwrap();
+        store
+            .set_setting("browser.preference.mode", "cloud")
+            .unwrap();
+        store
+            .set_setting("browser.preference.profile", "profile with space")
+            .unwrap();
+    }
+    let tool = tool_with(Arc::clone(&backend)).with_persistence(store, session);
+
+    let req = BrowserRequest::command("sess-1", "browser connect");
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(
+        backend.last(),
+        LastCall::Command("browser remote start --profile-id 'profile with space'".to_string())
+    );
+}
+
 // (2) Script start routes to start_script, matching main's browser_script tool.
 #[tokio::test]
 async fn script_start_routes_to_start_script() {
@@ -303,6 +404,31 @@ async fn script_start_routes_to_start_script() {
         out.stdout
     );
     assert_eq!(out.exit_code, 0);
+}
+
+#[tokio::test]
+async fn script_start_uses_tool_default_timeout_when_request_omits_it() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend)).with_default_script_timeout_secs(7);
+
+    let req = BrowserRequest::execute("sess-1", "click('#go')", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(backend.last_timeout_secs(), Some(7));
+}
+
+#[tokio::test]
+async fn script_start_request_timeout_overrides_tool_default() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend)).with_default_script_timeout_secs(7);
+
+    let mut req = BrowserRequest::execute("sess-1", "click('#go')", false);
+    req.timeout_secs = Some(3);
+    let out = run_direct(&tool, &req).await.unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(backend.last_timeout_secs(), Some(3));
 }
 
 #[tokio::test]
