@@ -8,7 +8,7 @@
 //! Chrome, no network.
 //!
 //! Tests cover: (1) a command request routes to the backend and maps output ->
-//! ExecOutput; (2) script execute/observe/cancel route correctly; (3)
+//! ExecOutput; (2) script start/observe/cancel route correctly; (3)
 //! parallel_safe = false; (4) backend error -> ToolError; (5) an
 //! orchestrator-driven run with the fake backend.
 
@@ -16,10 +16,14 @@ use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
+use browser_use_llm::schema::ContentPart;
 use browser_use_store::Store;
 use serde_json::json;
 
-use super::browser::{BrowserAction, BrowserBackend, BrowserRequest, BrowserTool};
+use super::browser::{
+    BrowserAction, BrowserBackend, BrowserRequest, BrowserTool,
+    BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX,
+};
 use crate::session::SharedStore;
 use crate::tools::approval::AskForApproval;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
@@ -49,6 +53,7 @@ struct FakeBackend {
     last: Mutex<LastCall>,
     last_session: Mutex<Option<String>>,
     last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
+    script_images: Mutex<Vec<serde_json::Value>>,
     fail: bool,
 }
 
@@ -63,6 +68,14 @@ impl FakeBackend {
 
     fn last_paths(&self) -> Option<(PathBuf, PathBuf)> {
         self.last_paths.lock().unwrap().clone()
+    }
+
+    fn record_paths(&self, cwd: &std::path::Path, artifact_dir: &std::path::Path) {
+        *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
+    }
+
+    fn script_images(&self) -> Vec<serde_json::Value> {
+        self.script_images.lock().unwrap().clone()
     }
 
     fn ok_command() -> BrowserCommandOutput {
@@ -81,6 +94,13 @@ impl FakeBackend {
             ..Default::default()
         }
     }
+
+    fn ok_script_with_images(&self, status: Option<&str>, ok: bool) -> BrowserScriptOutput {
+        BrowserScriptOutput {
+            images: self.script_images(),
+            ..Self::ok_script(status, ok)
+        }
+    }
 }
 
 impl BrowserBackend for FakeBackend {
@@ -94,6 +114,7 @@ impl BrowserBackend for FakeBackend {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
         *self.last.lock().unwrap() = LastCall::Command(command.to_string());
+        self.record_paths(cwd, artifact_dir);
         if self.fail {
             anyhow::bail!("boom");
         }
@@ -111,11 +132,12 @@ impl BrowserBackend for FakeBackend {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
         *self.last.lock().unwrap() = LastCall::RunScript(code.to_string());
+        self.record_paths(cwd, artifact_dir);
         if self.fail {
             anyhow::bail!("boom");
         }
         // Foreground run completed successfully.
-        Ok(Self::ok_script(None, true))
+        Ok(self.ok_script_with_images(None, true))
     }
 
     fn start_script(
@@ -129,11 +151,12 @@ impl BrowserBackend for FakeBackend {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
         *self.last.lock().unwrap() = LastCall::StartScript(code.to_string());
+        self.record_paths(cwd, artifact_dir);
         if self.fail {
             anyhow::bail!("boom");
         }
         // A backgrounded start is still running.
-        Ok(Self::ok_script(Some("running"), true))
+        Ok(self.ok_script_with_images(Some("running"), true))
     }
 
     fn observe_script(
@@ -147,7 +170,7 @@ impl BrowserBackend for FakeBackend {
         if self.fail {
             anyhow::bail!("unknown browser_script run_id {run_id:?}");
         }
-        Ok(Self::ok_script(None, true))
+        Ok(self.ok_script_with_images(None, true))
     }
 
     fn cancel_script(&self, session_id: &str, run_id: &str) -> anyhow::Result<BrowserScriptOutput> {
@@ -157,7 +180,7 @@ impl BrowserBackend for FakeBackend {
             anyhow::bail!("unknown browser_script run_id {run_id:?}");
         }
         // Cancel reports a completed-but-not-ok run.
-        Ok(Self::ok_script(None, false))
+        Ok(self.ok_script_with_images(None, false))
     }
 }
 
@@ -256,33 +279,9 @@ async fn command_routes_and_maps_output() {
     );
 }
 
+// (2) Script start routes to start_script, matching main's browser_script tool.
 #[tokio::test]
-async fn default_artifact_dir_comes_from_tool_ctx_artifact_root() {
-    let root = tempfile::tempdir().expect("tempdir");
-    let cwd = root.path().join("cwd");
-    let artifact_root = root.path().join("artifacts").join("session-1");
-    let backend = Arc::new(FakeBackend::default());
-    let tool = tool_with(Arc::clone(&backend));
-    let ctx = ToolCtx {
-        call_id: "call-browser".to_string(),
-        tool_name: "browser".to_string(),
-        cwd: cwd.clone(),
-        artifact_root: artifact_root.clone(),
-    };
-
-    let req = BrowserRequest::execute("sess-1", "page_info()", false);
-    run_direct_with_ctx(&tool, &req, &ctx).await.unwrap();
-
-    assert_eq!(
-        backend.last_paths(),
-        Some((cwd, artifact_root)),
-        "browser backend should receive separate cwd and artifact root"
-    );
-}
-
-// (2) Script execute (foreground) routes to run_script.
-#[tokio::test]
-async fn execute_foreground_routes_to_run_script() {
+async fn script_start_routes_to_start_script() {
     let backend = Arc::new(FakeBackend::default());
     let tool = tool_with(Arc::clone(&backend));
 
@@ -291,15 +290,119 @@ async fn execute_foreground_routes_to_run_script() {
 
     assert_eq!(
         backend.last(),
-        LastCall::RunScript("click('#go')".to_string())
+        LastCall::StartScript("click('#go')".to_string())
     );
-    assert_eq!(out.stdout, "script-output");
-    assert_eq!(out.exit_code, 0); // ok + not running
+    assert!(
+        out.stdout.contains("script-output"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(
+        out.stdout.contains("run_id: run-1"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert_eq!(out.exit_code, 0);
 }
 
-// (2) Script execute (background) routes to start_script and signals in-progress.
 #[tokio::test]
-async fn execute_background_routes_to_start_script_and_signals_in_progress() {
+async fn script_images_are_appended_as_structured_stdout_payload() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let image_path = temp.path().join("shot.png");
+    std::fs::write(&image_path, [0x89, b'P', b'N', b'G']).expect("write png");
+
+    let backend = Arc::new(FakeBackend::default());
+    backend.script_images.lock().unwrap().push(json!({
+        "path": image_path,
+        "mime_type": "image/png",
+        "detail": "auto",
+        "label": "viewport",
+    }));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "capture_screenshot()", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+    let (visible, payload) = out
+        .stdout
+        .rsplit_once(BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX)
+        .expect("browser_script content marker");
+    assert!(
+        visible.contains("script-output"),
+        "visible stdout: {visible}"
+    );
+    let parts: Vec<ContentPart> = serde_json::from_str(payload).expect("content parts");
+    assert!(matches!(parts.first(), Some(ContentPart::Text { .. })));
+    let media = parts
+        .iter()
+        .find_map(|part| match part {
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => Some((mime_type, data, url)),
+            _ => None,
+        })
+        .expect("image media part");
+    assert_eq!(media.0, "image/png");
+    assert!(media.1.as_deref().is_some_and(|data| !data.is_empty()));
+    assert!(media.2.is_none());
+}
+
+#[tokio::test]
+async fn script_unreadable_images_warn_in_stdout() {
+    let temp = tempfile::tempdir().expect("tempdir");
+    let missing_path = temp.path().join("missing.png");
+
+    let backend = Arc::new(FakeBackend::default());
+    backend.script_images.lock().unwrap().push(json!({
+        "path": missing_path,
+        "mime_type": "image/png",
+        "detail": "auto",
+        "label": "missing",
+    }));
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::execute("sess-1", "capture_screenshot()", false);
+    let out = run_direct(&tool, &req).await.unwrap();
+    assert!(
+        out.stdout
+            .contains("Warning: image artifact could not be read:"),
+        "stdout: {}",
+        out.stdout
+    );
+    assert!(out.stdout.contains("missing.png"), "stdout: {}", out.stdout);
+    assert!(
+        !out.stdout.contains(BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX),
+        "unreadable-only images should not emit a media marker: {}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
+async fn default_artifact_dir_comes_from_tool_ctx_artifact_root() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend));
+    let temp = tempfile::tempdir().expect("tempdir");
+    let cwd = temp.path().join("repo");
+    let artifact_root = temp.path().join("state").join("artifacts").join("sess-1");
+    let ctx = ToolCtx {
+        call_id: "call-browser".to_string(),
+        tool_name: "browser_script".to_string(),
+        cwd: cwd.clone(),
+        artifact_root: artifact_root.clone(),
+    };
+
+    let req = BrowserRequest::execute("sess-1", "click('#go')", false);
+    let _ = run_direct_with_ctx(&tool, &req, &ctx).await.unwrap();
+
+    let (seen_cwd, seen_artifact_dir) = backend.last_paths().expect("backend paths");
+    assert_eq!(seen_cwd, cwd);
+    assert_eq!(seen_artifact_dir, artifact_root);
+}
+
+// (2) The compatibility `background` flag is ignored: main always starts scripts.
+#[tokio::test]
+async fn script_background_compat_also_routes_to_start_script() {
     let backend = Arc::new(FakeBackend::default());
     let tool = tool_with(Arc::clone(&backend));
 
@@ -310,8 +413,12 @@ async fn execute_background_routes_to_start_script_and_signals_in_progress() {
         backend.last(),
         LastCall::StartScript("longRunning()".to_string())
     );
-    // status == "running" -> sentinel exit code 2 (observe again).
-    assert_eq!(out.exit_code, 2);
+    assert_eq!(out.exit_code, 0);
+    assert!(
+        out.stdout.contains("action=\"observe\""),
+        "stdout: {}",
+        out.stdout
+    );
 }
 
 // (2) Observe routes to observe_script.

@@ -623,6 +623,12 @@ pub fn provider_messages_from_event_slice(
                 );
                 if let Some(call_id) = event.payload.get("tool_call_id").and_then(Value::as_str) {
                     if !emitted_tool_messages.contains(call_id) {
+                        if event.payload.get("content").is_some() {
+                            messages.push(tool_message_from_output_event(&event.payload, call_id));
+                            emitted_tool_messages.insert(call_id.to_string());
+                            turn_open = true;
+                            continue;
+                        }
                         let name = event
                             .payload
                             .get("name")

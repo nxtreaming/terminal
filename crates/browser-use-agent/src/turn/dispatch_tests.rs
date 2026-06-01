@@ -397,13 +397,16 @@ mod registry_e2e {
     use tokio_util::sync::CancellationToken;
 
     use crate::tools::approval::AskForApproval;
+    use crate::tools::handlers::browser::BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX;
     use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
     use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
     use crate::tools::handlers::view_image::{ViewImageRequest, ViewImageTool};
     use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
     use crate::tools::registry::ToolRegistry;
-    use crate::tools::sandbox::FileSystemSandboxPolicy;
-    use crate::tools::ToolCtx;
+    use crate::tools::runtime::{
+        Approvable, ExecOutput, SandboxAttempt, Sandboxable, ToolCtx, ToolError, ToolRuntime,
+    };
+    use crate::tools::sandbox::{FileSystemSandboxPolicy, SandboxPermissions, SandboxPreference};
     use crate::turn::dispatch::{RegistryRunner, ToolDispatcher};
 
     fn def(name: &str) -> ToolDefinition {
@@ -441,6 +444,57 @@ mod registry_e2e {
             name: name.to_string(),
             input,
             provider_metadata: None,
+        }
+    }
+
+    #[derive(Clone, Debug, serde::Deserialize)]
+    struct MarkerRequest {}
+
+    #[derive(Clone)]
+    struct BrowserScriptMarkerTool;
+
+    impl Approvable<MarkerRequest> for BrowserScriptMarkerTool {
+        type ApprovalKey = String;
+
+        fn approval_keys(&self, _req: &MarkerRequest) -> Vec<Self::ApprovalKey> {
+            Vec::new()
+        }
+
+        fn sandbox_permissions(&self, _req: &MarkerRequest) -> SandboxPermissions {
+            SandboxPermissions::UseDefault
+        }
+    }
+
+    impl Sandboxable for BrowserScriptMarkerTool {
+        fn sandbox_preference(&self) -> SandboxPreference {
+            SandboxPreference::Never
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ToolRuntime<MarkerRequest, ExecOutput> for BrowserScriptMarkerTool {
+        async fn run(
+            &self,
+            _req: &MarkerRequest,
+            _attempt: &SandboxAttempt<'_>,
+            _ctx: &ToolCtx,
+        ) -> Result<ExecOutput, ToolError> {
+            let parts = vec![
+                ContentPart::text("browser_script failed."),
+                ContentPart::Media {
+                    mime_type: "image/png".to_string(),
+                    data: Some("AAAA".to_string()),
+                    url: None,
+                },
+            ];
+            let payload = serde_json::to_string(&parts).unwrap();
+            Ok(ExecOutput {
+                exit_code: 1,
+                stdout: format!(
+                    "browser_script failed.{BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX}{payload}"
+                ),
+                stderr: "RuntimeError: failed after screenshot".to_string(),
+            })
         }
     }
 
@@ -596,6 +650,51 @@ mod registry_e2e {
         assert_eq!(mime_type, "image/png");
         assert!(data.as_deref().is_some_and(|data| !data.is_empty()));
         assert!(url.is_none());
+    }
+
+    #[tokio::test]
+    async fn registry_runner_wraps_browser_script_marker_as_media_even_on_error() {
+        let mut registry = ToolRegistry::new();
+        registry.register::<_, MarkerRequest>(
+            "browser_script",
+            def("browser_script"),
+            false,
+            BrowserScriptMarkerTool,
+        );
+        let runner = RegistryRunner::new(
+            Arc::new(registry),
+            Arc::new(ToolOrchestrator::stub()),
+            ctx(),
+            env(),
+            AskForApproval::Never,
+        );
+        let dispatcher = ToolDispatcher::with_runner(runner, true);
+
+        let out = dispatcher
+            .dispatch_ordered(
+                vec![tool_call("browser-call", "browser_script", json!({}))],
+                CancellationToken::new(),
+            )
+            .await;
+
+        let ContentPart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        } = &out.outputs_in_order[0].content[0]
+        else {
+            panic!("expected tool result, got {:?}", out.outputs_in_order[0]);
+        };
+        assert_eq!(tool_call_id, "browser-call");
+        assert!(*is_error);
+        assert!(matches!(content.first(), Some(ContentPart::Text { .. })));
+        assert!(
+            content.iter().any(
+                |part| matches!(part, ContentPart::Media { mime_type, data, .. }
+                    if mime_type == "image/png" && data.as_deref() == Some("AAAA"))
+            ),
+            "expected media in browser_script error content: {content:?}"
+        );
     }
 
     #[tokio::test]

@@ -151,6 +151,43 @@ fn tool_output_event_preserves_image_content() {
 }
 
 #[test]
+fn tool_failed_event_preserves_image_content() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "inspect page" })),
+        event(
+            2,
+            "model.tool_call",
+            json!({ "id": "call_browser", "name": "browser_script", "arguments": { "action": "start" } }),
+        ),
+        event(
+            3,
+            "tool.failed",
+            json!({
+                "tool_call_id": "call_browser",
+                "name": "browser_script",
+                "error": "RuntimeError: failed after screenshot",
+                "content": [
+                    { "type": "input_text", "text": "browser_script failed: RuntimeError: failed after screenshot" },
+                    { "type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "high" }
+                ],
+            }),
+        ),
+        event(4, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    let tool = &messages[2];
+    assert_eq!(tool.get("role").and_then(Value::as_str), Some("tool"));
+    let content = tool
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("tool failed content array");
+    assert_eq!(content[0]["type"], "input_text");
+    assert_eq!(content[1]["type"], "input_image");
+}
+
+#[test]
 fn codex_shaped_stream_and_tool_events_replay() {
     let events = vec![
         event(1, "session.input", json!({ "text": "run the tool" })),

@@ -726,33 +726,20 @@ pub mod definitions {
         }
     }
 
-    /// `browser`: a tagged browser action. Parity: browser-use's browser tool
-    /// (the hidden `browser <cmd>` command path + the `browser_execute` /
-    /// `observe` / `cancel` script paths; legacy
-    /// `browser-use-core/src/tools/mod.rs`).
+    /// `browser`: browser-use's browser control-plane command tool.
     pub fn browser() -> ToolDefinition {
         ToolDefinition {
             name: "browser".to_string(),
-            description:
-                "Drive the browser: run a command, execute a script, or observe/cancel a run."
-                    .to_string(),
+            description: crate::prompts::browser_tool_description().to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "action": {
+                    "cmd": {
                         "type": "string",
-                        "enum": ["command", "execute", "observe", "cancel"],
-                        "description": "Which browser operation to perform."
-                    },
-                    "session_id": { "type": "string", "description": "Browser session id. Usually omitted; the runtime supplies the current agent session." },
-                    "command": { "type": "string", "description": "Command string for the `command` action." },
-                    "script": { "type": "string", "description": "Script body for the `execute` action." },
-                    "background": { "type": "boolean", "description": "Run an `execute` in the background." },
-                    "run_id": { "type": "string", "description": "Run id for `observe`/`cancel`." },
-                    "timeout_secs": { "type": "integer", "description": "Script timeout in seconds." },
-                    "observe_timeout_ms": { "type": "integer", "description": "Observe poll window in ms." }
+                        "description": "CLI-like browser command. The leading word `browser` is optional, e.g. `status --json` or `browser connect local`."
+                    }
                 },
-                "required": ["action"],
+                "required": ["cmd"],
                 "additionalProperties": false
             }),
         }
@@ -768,15 +755,23 @@ pub mod definitions {
                 "properties": {
                     "action": {
                         "type": "string",
-                        "enum": ["execute", "observe", "cancel"],
-                        "description": "Which browser script operation to perform. Defaults to execute when script/code is provided."
+                        "enum": ["start", "observe", "cancel"],
+                        "description": "start launches code and returns either a final result or a run_id; observe listens for new output/final status; cancel stops a running script. Defaults to start when code is provided and observe when only run_id is provided."
                     },
-                    "script": { "type": "string", "description": "Python browser script to execute." },
-                    "code": { "type": "string", "description": "Alias for script." },
-                    "background": { "type": "boolean", "description": "Start the script in the background and observe later." },
-                    "run_id": { "type": "string", "description": "Run id for observe/cancel." },
-                    "timeout_secs": { "type": "integer", "description": "Script timeout in seconds." },
-                    "observe_timeout_ms": { "type": "integer", "description": "Observe poll window in ms." }
+                    "code": {
+                        "type": "string",
+                        "description": "Python code to run in a fresh process with browser helpers preimported. Omit when action is observe or cancel."
+                    },
+                    "run_id": {
+                        "type": "string",
+                        "description": "Running browser_script id returned by a previous start call. Required for observe and cancel."
+                    },
+                    "observe_timeout_ms": {
+                        "type": "integer",
+                        "minimum": 1,
+                        "maximum": 10000,
+                        "description": "How long observe should wait for new output or completion before returning still-running/no-new-output. Defaults to 1000."
+                    }
                 },
                 "additionalProperties": false
             }),

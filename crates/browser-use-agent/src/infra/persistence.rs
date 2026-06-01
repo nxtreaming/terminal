@@ -24,6 +24,7 @@
 //! The `DEFAULT_TOOL_OUTPUT_TEXT_TOKENS` budget is reused from this crate's
 //! [`crate::events::names`] (== core's constant of the same name).
 
+use base64::{engine::general_purpose, Engine as _};
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
 use browser_use_python_worker::{PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::Store;
@@ -159,6 +160,9 @@ pub fn record_browser_script_response_events_for_tool(
         "diagnosis": response.diagnosis,
     });
     if response.ok {
+        if let Some(content) = browser_script_output_content_parts(response, &transcript_text) {
+            payload["content"] = content;
+        }
         payload["error"] = serde_json::to_value(response.error.clone()).unwrap_or(Value::Null);
         store.append_event(session_id, "tool.output", payload)?;
     } else {
@@ -168,10 +172,78 @@ pub fn record_browser_script_response_events_for_tool(
             .filter(|error| !error.trim().is_empty())
             .or_else(|| (!transcript_text.trim().is_empty()).then_some(transcript_text.as_str()))
             .unwrap_or("browser_script failed");
+        let failed_text = format!("{tool_name} failed: {error}");
+        if let Some(content) = browser_script_output_content_parts(response, &failed_text) {
+            payload["content"] = content;
+        }
         payload["error"] = Value::String(error.to_string());
         store.append_event(session_id, "tool.failed", payload)?;
     }
     Ok(())
+}
+
+fn browser_script_output_content_parts(
+    response: &BrowserScriptOutput,
+    text: &str,
+) -> Option<Value> {
+    if response.images.is_empty() {
+        return None;
+    }
+    let mut image_parts = Vec::new();
+    let mut warnings = Vec::new();
+    for image in &response.images {
+        let Some(path) = image.get("path").and_then(Value::as_str) else {
+            continue;
+        };
+        let bytes = match std::fs::read(path) {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                warnings.push(format!(
+                    "Warning: image artifact could not be read: {path} ({error})"
+                ));
+                continue;
+            }
+        };
+        let mime_type = image
+            .get("mime_type")
+            .or_else(|| image.get("mime"))
+            .and_then(Value::as_str)
+            .unwrap_or("image/png");
+        if !mime_type.starts_with("image/") {
+            continue;
+        };
+        let mut part = serde_json::json!({
+            "type": "input_image",
+            "image_url": format!(
+                "data:{mime_type};base64,{}",
+                general_purpose::STANDARD.encode(bytes)
+            ),
+        });
+        if let Some(detail) = image.get("detail").and_then(Value::as_str) {
+            part["detail"] = Value::String(detail.to_string());
+        }
+        image_parts.push(part);
+    }
+    if image_parts.is_empty() && warnings.is_empty() {
+        return None;
+    }
+    let text = append_browser_script_image_warnings(text.to_string(), &warnings);
+    let mut parts = Vec::new();
+    if !text.trim().is_empty() {
+        parts.push(serde_json::json!({ "type": "input_text", "text": text }));
+    }
+    parts.extend(image_parts);
+    Some(Value::Array(parts))
+}
+
+fn append_browser_script_image_warnings(mut text: String, warnings: &[String]) -> String {
+    for warning in warnings {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(warning);
+    }
+    text
 }
 
 /// Record browser events emitted by a lifecycle/command browser call. The
@@ -719,6 +791,85 @@ mod tests {
         assert_eq!(output.payload["text"], "visible text");
         assert_eq!(output.payload["summary"][0]["title"], "Example");
         assert_eq!(store.artifacts_for_session(&session).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn record_browser_script_failure_persists_replayable_image_content() {
+        let (dir, store) = store();
+        let session = new_session(&store);
+        let image_path = dir.path().join("failure.png");
+        std::fs::write(&image_path, [0x89, b'P', b'N', b'G']).expect("write png");
+
+        let mut response = BrowserScriptOutput::default();
+        response.ok = false;
+        response.error = Some("RuntimeError: failed after screenshot".to_string());
+        response.images = vec![serde_json::json!({
+            "path": image_path,
+            "mime_type": "image/png",
+            "detail": "high",
+        })];
+
+        record_browser_script_response_events_for_tool(
+            &store,
+            &session,
+            "browser_script",
+            "call-image-failed",
+            &response,
+        )
+        .unwrap();
+
+        let events = store.events_for_session(&session).unwrap();
+        let failed = events
+            .iter()
+            .find(|e| e.event_type == "tool.failed")
+            .expect("tool.failed");
+        let content = failed.payload["content"].as_array().expect("content array");
+        assert_eq!(content[0]["type"], "input_text");
+        assert_eq!(content[1]["type"], "input_image");
+        assert_eq!(content[1]["detail"], "high");
+        assert!(content[1]["image_url"]
+            .as_str()
+            .is_some_and(|url| url.starts_with("data:image/png;base64,")));
+    }
+
+    #[test]
+    fn record_browser_script_failure_persists_unreadable_image_warning() {
+        let (dir, store) = store();
+        let session = new_session(&store);
+        let missing_path = dir.path().join("missing.png");
+
+        let response = BrowserScriptOutput {
+            ok: false,
+            error: Some("RuntimeError: failed after screenshot".to_string()),
+            images: vec![serde_json::json!({
+                "path": missing_path,
+                "mime_type": "image/png",
+                "detail": "high",
+            })],
+            ..Default::default()
+        };
+
+        record_browser_script_response_events_for_tool(
+            &store,
+            &session,
+            "browser_script",
+            "call-missing-image",
+            &response,
+        )
+        .unwrap();
+
+        let events = store.events_for_session(&session).unwrap();
+        let failed = events
+            .iter()
+            .find(|e| e.event_type == "tool.failed")
+            .expect("tool.failed");
+        let content = failed.payload["content"].as_array().expect("content array");
+        assert_eq!(content.len(), 1);
+        assert_eq!(content[0]["type"], "input_text");
+        let text = content[0]["text"].as_str().expect("warning text");
+        assert!(text.contains("browser_script failed: RuntimeError"));
+        assert!(text.contains("Warning: image artifact could not be read:"));
+        assert!(text.contains("missing.png"));
     }
 
     #[test]

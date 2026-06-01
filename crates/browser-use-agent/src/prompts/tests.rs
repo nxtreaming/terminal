@@ -71,6 +71,17 @@ fn system_prompt_has_browser_use_preamble() {
     assert!(!prompt.ends_with(char::is_whitespace));
 }
 
+#[test]
+fn browser_agent_system_prompt_loads_main_interaction_skills() {
+    let prompt = browser_agent_system_prompt();
+    assert!(prompt.starts_with(system_prompt()));
+    assert!(prompt.contains("Loaded Browser-Harness Interaction Skills"));
+    assert!(prompt.contains("interaction-skills/forms.md"));
+    assert!(prompt.contains("interaction-skills/screenshots.md"));
+    assert!(prompt.contains("interaction-skills/profile-sync.md"));
+    assert_eq!(browser_harness_interaction_skills().len(), 18);
+}
+
 /// The collaboration selector returns the right asset per mode, wrapped in the
 /// collaboration-mode tags, with `{{KNOWN_MODE_NAMES}}` substituted, and the
 /// two modes differ.

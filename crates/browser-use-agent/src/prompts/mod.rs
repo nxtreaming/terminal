@@ -148,6 +148,101 @@ pub fn system_prompt() -> &'static str {
     BASE_SYSTEM_PROMPT.trim()
 }
 
+/// Builds the browser-agent system prompt with the browser-harness interaction
+/// skills appended, matching main's provider instruction assembly.
+pub fn browser_agent_system_prompt() -> String {
+    let mut instructions = String::from(system_prompt());
+    instructions.push_str("\n\n## Loaded Browser-Harness Interaction Skills");
+    instructions.push_str(
+        "\n\nThese are the same interaction-skill playbooks from browser-harness. Apply the relevant section when the page mechanic appears.",
+    );
+    for (path, content) in browser_harness_interaction_skills() {
+        instructions.push_str("\n\n### ");
+        instructions.push_str(path);
+        instructions.push_str("\n\n");
+        instructions.push_str(content.trim());
+    }
+    instructions
+}
+
+/// The full browser-harness interaction-skill bundle loaded by main.
+pub fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str)] {
+    &[
+        (
+            "interaction-skills/connection.md",
+            include_str!("../../../../prompts/interaction-skills/connection.md"),
+        ),
+        (
+            "interaction-skills/cookies.md",
+            include_str!("../../../../prompts/interaction-skills/cookies.md"),
+        ),
+        (
+            "interaction-skills/cross-origin-iframes.md",
+            include_str!("../../../../prompts/interaction-skills/cross-origin-iframes.md"),
+        ),
+        (
+            "interaction-skills/dialogs.md",
+            include_str!("../../../../prompts/interaction-skills/dialogs.md"),
+        ),
+        (
+            "interaction-skills/downloads.md",
+            include_str!("../../../../prompts/interaction-skills/downloads.md"),
+        ),
+        (
+            "interaction-skills/drag-and-drop.md",
+            include_str!("../../../../prompts/interaction-skills/drag-and-drop.md"),
+        ),
+        (
+            "interaction-skills/dropdowns.md",
+            include_str!("../../../../prompts/interaction-skills/dropdowns.md"),
+        ),
+        (
+            "interaction-skills/forms.md",
+            include_str!("../../../../prompts/interaction-skills/forms.md"),
+        ),
+        (
+            "interaction-skills/iframes.md",
+            include_str!("../../../../prompts/interaction-skills/iframes.md"),
+        ),
+        (
+            "interaction-skills/network-requests.md",
+            include_str!("../../../../prompts/interaction-skills/network-requests.md"),
+        ),
+        (
+            "interaction-skills/print-as-pdf.md",
+            include_str!("../../../../prompts/interaction-skills/print-as-pdf.md"),
+        ),
+        (
+            "interaction-skills/profile-sync.md",
+            include_str!("../../../../prompts/interaction-skills/profile-sync.md"),
+        ),
+        (
+            "interaction-skills/screenshots.md",
+            include_str!("../../../../prompts/interaction-skills/screenshots.md"),
+        ),
+        (
+            "interaction-skills/scrolling.md",
+            include_str!("../../../../prompts/interaction-skills/scrolling.md"),
+        ),
+        (
+            "interaction-skills/shadow-dom.md",
+            include_str!("../../../../prompts/interaction-skills/shadow-dom.md"),
+        ),
+        (
+            "interaction-skills/tabs.md",
+            include_str!("../../../../prompts/interaction-skills/tabs.md"),
+        ),
+        (
+            "interaction-skills/uploads.md",
+            include_str!("../../../../prompts/interaction-skills/uploads.md"),
+        ),
+        (
+            "interaction-skills/viewport.md",
+            include_str!("../../../../prompts/interaction-skills/viewport.md"),
+        ),
+    ]
+}
+
 /// Returns the `browser` runtime-control tool description (trimmed), matching
 /// the legacy tool-description loaders.
 pub fn browser_tool_description() -> &'static str {

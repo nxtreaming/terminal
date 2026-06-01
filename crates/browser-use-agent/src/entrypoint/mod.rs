@@ -262,8 +262,9 @@ impl CompactionSampler for EntrypointSampler {
         // call tools). `request` already carries the history + the summarization
         // prompt as its final user message (assembled by `run_compaction`).
         let mut req = LlmRequest::new(self.model.clone(), self.provider.clone());
-        req.system
-            .push(SystemPart::new(crate::prompts::system_prompt()));
+        req.system.push(SystemPart::new(
+            crate::prompts::browser_agent_system_prompt(),
+        ));
         req.messages = request;
 
         // Open the model stream. `ModelClient::stream` is async; the entrypoint

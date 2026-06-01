@@ -237,8 +237,9 @@ pub fn build_transport(
     messages: Vec<Message>,
 ) -> ModelClientTransport {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
-    req.system
-        .push(SystemPart::new(crate::prompts::system_prompt()));
+    req.system.push(SystemPart::new(
+        crate::prompts::browser_agent_system_prompt(),
+    ));
     req.messages = messages;
     ModelClientTransport::new(client, route, req)
 }

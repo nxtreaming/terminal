@@ -12,9 +12,8 @@
 //! Two legacy model-facing paths are modeled here:
 //!   * the hidden `browser <cmd-string>` command path
 //!     -> [`browser_use_browser::run_browser_command`]
-//!   * the execute/observe/cancel script path
-//!     -> [`browser_use_browser::run_browser_script`] /
-//!        [`browser_use_browser::start_browser_script`] /
+//!   * the start/observe/cancel script path
+//!     -> [`browser_use_browser::start_browser_script`] /
 //!        [`browser_use_browser::observe_browser_script`] /
 //!        [`browser_use_browser::cancel_browser_script`]
 //!
@@ -37,10 +36,13 @@
 //! connection is shared and serialized, matching the legacy tool set where the
 //! browser tool is excluded from the parallel set.
 
+use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use base64::{engine::general_purpose, Engine as _};
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
+use browser_use_llm::schema::ContentPart;
 use serde_json::Value;
 
 use crate::infra::{
@@ -63,6 +65,13 @@ pub const DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS: u64 = 120;
 /// Mirrors the legacy default observe window used by the browser_script runtime.
 pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
 
+/// Appended to `browser_script` stdout when the response carries image parts.
+///
+/// The dispatch layer strips this marker and re-wraps the JSON payload as typed
+/// [`ContentPart`]s so provider protocols can send images to vision-capable
+/// models while preserving a plain text fallback for logs/tests.
+pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_content__:";
+
 /// What the model wants the browser to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum BrowserAction {
@@ -72,14 +81,13 @@ pub enum BrowserAction {
         /// The raw command string (e.g. `go https://example.com`).
         command: String,
     },
-    /// `browser_execute`: run a script. When `background` is false this blocks
-    /// for the result ([`browser_use_browser::run_browser_script`]); when true
-    /// it starts the run and returns a handle
-    /// ([`browser_use_browser::start_browser_script`]).
+    /// `browser_script`: start a script and either return its final result or a
+    /// running handle, matching main's `browser_script action=start` behavior.
     Execute {
         /// The script body to run in the browser runtime.
         script: String,
-        /// Whether to start the run in the background (observe later).
+        /// Compatibility field for older current-branch calls. Main ignores
+        /// this concept; script execution always uses `start_browser_script`.
         background: bool,
     },
     /// `observe`: poll an in-flight run.
@@ -192,7 +200,8 @@ impl BrowserRequest {
 /// # Wire shape (model-facing args)
 ///
 /// ```json
-/// { "action": "execute", "script": "...", "background": false }
+/// { "code": "..." }
+/// { "action": "start", "code": "..." }
 /// { "action": "command", "command": "go https://example.com" }
 /// { "action": "observe", "run_id": "r1" }
 /// { "action": "cancel",  "run_id": "r1" }
@@ -200,8 +209,8 @@ impl BrowserRequest {
 ///
 /// The variants mirror the existing [`BrowserAction`] cases and the legacy
 /// model-facing browser paths (the hidden `browser <cmd>` command path and the
-/// `browser_execute`/`observe`/`cancel` script paths; see the module docs and
-/// legacy `browser-use-core/src/tools/mod.rs`). `cwd` / `artifact_dir` are
+/// `browser_script` start/observe/cancel paths; see the module docs and legacy
+/// `browser-use-core/src/tools/mod.rs`). `cwd` / `artifact_dir` are
 /// carried-but-optional plumbing fields the router supplies; the per-action
 /// payload fields (`command` / `script` / `run_id`) are validated by the `From`
 /// adapter against the chosen `action`.
@@ -217,13 +226,16 @@ pub struct BrowserWireArgs {
     /// Command string for the `command` action.
     #[serde(default)]
     pub command: Option<String>,
-    /// Script body for the `execute` action.
+    /// Main-branch browser command field.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// Script body for the `start` action.
     #[serde(default)]
     pub script: Option<String>,
     /// Alias used by Codex-style tool schemas.
     #[serde(default)]
     pub code: Option<String>,
-    /// Whether an `execute` runs in the background (observe later).
+    /// Compatibility field for older current-branch calls.
     #[serde(default)]
     pub background: bool,
     /// Run identifier for the `observe` / `cancel` actions.
@@ -250,8 +262,9 @@ pub struct BrowserWireArgs {
 pub enum BrowserActionKind {
     /// Hidden `browser <cmd>` command path.
     Command,
-    /// `browser_execute` script path.
-    Execute,
+    /// `browser_script` start path.
+    #[serde(alias = "execute")]
+    Start,
     /// Poll an in-flight run.
     Observe,
     /// Cancel an in-flight run.
@@ -268,22 +281,23 @@ impl From<BrowserWireArgs> for BrowserRequest {
     /// failure).
     fn from(w: BrowserWireArgs) -> Self {
         let script = w.script.or(w.code);
+        let command = w.cmd.or(w.command);
         let action_kind = w.action.unwrap_or_else(|| {
             if script.is_some() {
-                BrowserActionKind::Execute
-            } else if w.command.is_some() {
+                BrowserActionKind::Start
+            } else if command.is_some() {
                 BrowserActionKind::Command
             } else if w.run_id.is_some() {
                 BrowserActionKind::Observe
             } else {
-                BrowserActionKind::Execute
+                BrowserActionKind::Start
             }
         });
         let action = match action_kind {
             BrowserActionKind::Command => BrowserAction::Command {
-                command: w.command.unwrap_or_default(),
+                command: command.unwrap_or_default(),
             },
-            BrowserActionKind::Execute => BrowserAction::Execute {
+            BrowserActionKind::Start => BrowserAction::Execute {
                 script: script.unwrap_or_default(),
                 background: w.background,
             },
@@ -572,26 +586,201 @@ fn map_command_output(out: BrowserCommandOutput) -> ExecOutput {
     }
 }
 
-/// Map a [`BrowserScriptOutput`] into [`ExecOutput`].
-///
-/// `text` is the accumulated model-facing output (stdout). A script `error`
-/// goes to stderr. Exit code mirrors the run's `ok` flag, with a sentinel `2`
-/// when the run is still `running` (the model should observe again).
+/// Map a [`BrowserScriptOutput`] into [`ExecOutput`], using the same
+/// model-facing text contract as main's `browser_script` dispatcher.
 fn map_script_output(out: BrowserScriptOutput) -> ExecOutput {
-    let still_running = out.status.as_deref() == Some("running");
-    let exit_code = if still_running {
-        2
-    } else if out.ok {
-        0
+    let exit_code = if out.ok { 0 } else { 1 };
+    let stderr = if out.ok {
+        String::new()
     } else {
-        1
+        out.error.clone().unwrap_or_default()
     };
-    let stderr = out.error.unwrap_or_default();
     ExecOutput {
         exit_code,
-        stdout: out.text,
+        stdout: browser_script_stdout(&out),
         stderr,
     }
+}
+
+fn browser_script_stdout(response: &BrowserScriptOutput) -> String {
+    let text = browser_script_tool_message_content(response);
+    let (image_parts, warnings) = browser_script_image_parts(response);
+    let text = append_browser_script_image_warnings(text, &warnings);
+    let Some(payload) = browser_script_content_payload(&text, image_parts) else {
+        return text;
+    };
+    format!("{text}{BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX}{payload}")
+}
+
+fn browser_script_content_payload(text: &str, image_parts: Vec<ContentPart>) -> Option<String> {
+    if image_parts.is_empty() {
+        return None;
+    }
+    let mut parts = Vec::new();
+    if !text.is_empty() {
+        parts.push(ContentPart::text(text.to_string()));
+    }
+    parts.extend(image_parts);
+    serde_json::to_string(&parts).ok()
+}
+
+fn browser_script_image_parts(response: &BrowserScriptOutput) -> (Vec<ContentPart>, Vec<String>) {
+    let mut parts = Vec::new();
+    let mut warnings = Vec::new();
+    for image in &response.images {
+        match browser_script_image_part(image) {
+            Ok(Some(media)) => parts.push(media),
+            Ok(None) => {}
+            Err(warning) => warnings.push(warning),
+        }
+    }
+    (parts, warnings)
+}
+
+fn append_browser_script_image_warnings(mut text: String, warnings: &[String]) -> String {
+    for warning in warnings {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(warning);
+    }
+    text
+}
+
+fn browser_script_image_part(image: &Value) -> Result<Option<ContentPart>, String> {
+    let Some(path) = image.get("path").and_then(Value::as_str) else {
+        return Ok(None);
+    };
+    let bytes = fs::read(path)
+        .map_err(|error| format!("Warning: image artifact could not be read: {path} ({error})"))?;
+    let mime_type = image
+        .get("mime_type")
+        .or_else(|| image.get("mime"))
+        .and_then(Value::as_str)
+        .unwrap_or("image/png");
+    if !mime_type.starts_with("image/") {
+        return Ok(None);
+    }
+    Ok(Some(ContentPart::Media {
+        mime_type: mime_type.to_string(),
+        data: Some(general_purpose::STANDARD.encode(bytes)),
+        url: None,
+    }))
+}
+
+fn browser_script_tool_message_content(response: &BrowserScriptOutput) -> String {
+    if response.status.as_deref() == Some("running") {
+        return browser_script_running_message(response);
+    }
+    if response.status.as_deref() == Some("cancelled") {
+        return browser_script_cancelled_message(response);
+    }
+    if response.ok {
+        let mut parts = Vec::new();
+        if !response.text.trim().is_empty() {
+            parts.push(response.text.trim().to_string());
+        }
+        parts.extend(browser_script_structured_message_parts(response));
+        if parts.is_empty() {
+            "browser_script completed".to_string()
+        } else {
+            parts.join("\n")
+        }
+    } else {
+        browser_script_failure_message(response)
+    }
+}
+
+fn browser_script_running_message(response: &BrowserScriptOutput) -> String {
+    let mut parts = Vec::new();
+    if !response.text.trim().is_empty() {
+        parts.push(response.text.trim().to_string());
+    } else {
+        parts.push("browser_script is still running.".to_string());
+    }
+    if let Some(run_id) = response.run_id.as_deref() {
+        if !parts
+            .iter()
+            .any(|part| part.contains(&format!("run_id: {run_id}")))
+        {
+            parts.push(format!("run_id: {run_id}"));
+        }
+        parts.push(format!(
+            "Next step: call browser_script with action=\"observe\", run_id=\"{run_id}\", and observe_timeout_ms={}.",
+            response.next_observe_ms.unwrap_or(DEFAULT_OBSERVE_TIMEOUT_MS)
+        ));
+    }
+    parts.extend(browser_script_structured_message_parts(response));
+    parts.join("\n")
+}
+
+fn browser_script_cancelled_message(response: &BrowserScriptOutput) -> String {
+    let mut parts = Vec::new();
+    if response.text.trim().is_empty() {
+        parts.push("browser_script cancelled.".to_string());
+    } else {
+        parts.push(response.text.trim().to_string());
+    }
+    parts.extend(browser_script_structured_message_parts(response));
+    parts.join("\n")
+}
+
+fn browser_script_failure_message(response: &BrowserScriptOutput) -> String {
+    let mut parts = vec!["browser_script failed.".to_string()];
+    if let Some(diagnosis) = response.diagnosis.as_ref() {
+        parts.push(diagnosis.summary.clone());
+        parts.push(format!("What happened: {}", diagnosis.what_happened));
+        parts.push(format!("Next step: {}", diagnosis.next_step));
+    }
+    if let Some(error) = response.error.as_deref() {
+        let detail = browser_script_error_detail(error);
+        if !detail.is_empty() {
+            parts.push(format!("Details: {detail}"));
+        }
+    } else if response.diagnosis.is_none() {
+        parts.push("Details: unknown browser_script error".to_string());
+    }
+    parts.extend(browser_script_structured_message_parts(response));
+    parts.join("\n")
+}
+
+fn browser_script_structured_message_parts(response: &BrowserScriptOutput) -> Vec<String> {
+    let mut parts = Vec::new();
+    if !response.outputs.is_empty() {
+        parts.push(format!(
+            "outputs: {}",
+            Value::Array(response.outputs.clone())
+        ));
+    }
+    if !response.summary.is_empty() {
+        parts.push(format!(
+            "summary: {}",
+            Value::Array(response.summary.clone())
+        ));
+    }
+    if !response.data.is_null() && response.data != serde_json::json!({}) {
+        parts.push(format!("data: {}", response.data));
+    }
+    parts
+}
+
+fn browser_script_error_detail(error: &str) -> String {
+    const MAX_DETAIL_CHARS: usize = 500;
+    let detail = error
+        .lines()
+        .rev()
+        .map(str::trim)
+        .find(|line| !line.is_empty())
+        .unwrap_or(error.trim());
+    if detail.chars().count() <= MAX_DETAIL_CHARS {
+        return detail.to_string();
+    }
+    let mut out = detail
+        .chars()
+        .take(MAX_DETAIL_CHARS.saturating_sub(3))
+        .collect::<String>();
+    out.push_str("...");
+    out
 }
 
 /// Browser tool handler.
@@ -829,19 +1018,10 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                     }
                     Ok(map_command_output(out))
                 }
-                BrowserAction::Execute { script, background } => {
-                    let out = if background {
-                        backend.start_script(
-                            &session_id,
-                            &cwd,
-                            &artifact_dir,
-                            &script,
-                            timeout_secs,
-                        )
-                    } else {
-                        backend.run_script(&session_id, &cwd, &artifact_dir, &script, timeout_secs)
-                    }
-                    .map_err(ToolError::Other)?;
+                BrowserAction::Execute { script, .. } => {
+                    let out = backend
+                        .start_script(&session_id, &cwd, &artifact_dir, &script, timeout_secs)
+                        .map_err(ToolError::Other)?;
                     if let Some(persistence) = &persistence {
                         if let Ok(store) = persistence.store.lock() {
                             let _ = record_browser_script_response_events_for_tool(

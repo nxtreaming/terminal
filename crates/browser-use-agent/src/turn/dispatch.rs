@@ -52,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::decision::{self, ToolParallelism};
 use crate::tools::approval::AskForApproval;
+use crate::tools::handlers::browser::BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX;
 use crate::tools::handlers::view_image::VIEW_IMAGE_STDOUT_PREFIX;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::registry::ToolRegistry;
@@ -267,6 +268,14 @@ fn result_message_for(call: &ContentPart, text: &str, is_error: bool) -> Message
 }
 
 fn tool_result_content_for(call: &ContentPart, text: &str, is_error: bool) -> Vec<ContentPart> {
+    if let ContentPart::ToolCall { name, .. } = call {
+        if name == "browser_script" {
+            if let Some(parts) = content_parts_from_browser_script_stdout(text) {
+                return parts;
+            }
+            return vec![ContentPart::text(strip_browser_script_content_marker(text))];
+        }
+    }
     if !is_error {
         if let ContentPart::ToolCall { name, .. } = call {
             if name == "view_image" {
@@ -277,6 +286,19 @@ fn tool_result_content_for(call: &ContentPart, text: &str, is_error: bool) -> Ve
         }
     }
     vec![ContentPart::text(text)]
+}
+
+fn content_parts_from_browser_script_stdout(text: &str) -> Option<Vec<ContentPart>> {
+    let (_, payload) = text.rsplit_once(BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX)?;
+    let parts: Vec<ContentPart> = serde_json::from_str(payload.trim()).ok()?;
+    (!parts.is_empty()).then_some(parts)
+}
+
+fn strip_browser_script_content_marker(text: &str) -> String {
+    text.rsplit_once(BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX)
+        .map(|(visible, _)| visible)
+        .unwrap_or(text)
+        .to_string()
 }
 
 fn media_part_from_view_image_stdout(text: &str) -> Option<ContentPart> {

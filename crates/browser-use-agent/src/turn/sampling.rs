@@ -882,8 +882,9 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 /// unit-reachable while the fused driver still advertises the catalog.
 fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
-    req.system
-        .push(SystemPart::new(crate::prompts::system_prompt()));
+    req.system.push(SystemPart::new(
+        crate::prompts::browser_agent_system_prompt(),
+    ));
     req.messages = input;
     req
 }

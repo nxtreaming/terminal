@@ -680,12 +680,7 @@ async fn browser_dispatches_through_the_wire_args() {
     let reg = full_registry();
     let orch = ToolOrchestrator::stub();
     // The `execute` action with the flat wire-args shape -> BrowserRequest.
-    let input = serde_json::json!({
-        "action": "execute",
-        "session_id": "s1",
-        "script": "click()",
-        "background": false
-    });
+    let input = serde_json::json!({ "cmd": "click()" });
     let out = reg
         .dispatch(
             "browser",
@@ -699,7 +694,7 @@ async fn browser_dispatches_through_the_wire_args() {
         .expect("browser should dispatch");
     assert_eq!(out.exit_code, 0);
     assert!(
-        out.stdout.contains("ran:click()"),
+        out.stdout.contains("\"echoed\":\"click()\""),
         "browser stdout: {:?}",
         out.stdout
     );
@@ -1006,7 +1001,11 @@ fn definitions_carry_required_fields_and_names() {
         "path"
     );
     assert_eq!(definitions::python().input_schema["required"][0], "code");
-    assert_eq!(definitions::browser().input_schema["required"][0], "action");
+    assert_eq!(definitions::browser().input_schema["required"][0], "cmd");
+    assert_eq!(
+        definitions::browser_script().input_schema["properties"]["action"]["enum"][0],
+        "start"
+    );
     assert_eq!(definitions::mcp().input_schema["required"][0], "server");
 }
 
