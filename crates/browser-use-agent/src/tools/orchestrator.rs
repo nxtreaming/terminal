@@ -14,6 +14,7 @@
 use std::marker::PhantomData;
 
 use tokio::sync::Mutex;
+use tokio_util::sync::CancellationToken;
 
 use super::approval::{ApprovalStore, AskForApproval, ReviewDecision};
 use super::runtime::{
@@ -115,6 +116,24 @@ impl<S: SandboxProvider, A: Approver> ToolOrchestrator<S, A> {
         Req: Send + Sync,
         Out: Send,
     {
+        self.run_with_cancel(tool, req, ctx, env, policy, CancellationToken::new())
+            .await
+    }
+
+    pub async fn run_with_cancel<Req, Out, T>(
+        &self,
+        tool: &T,
+        req: &Req,
+        ctx: &ToolCtx,
+        env: &TurnEnv,
+        policy: AskForApproval,
+        cancel: CancellationToken,
+    ) -> Result<OrchestratorRunResult<Out>, ToolError>
+    where
+        T: ToolRuntime<Req, Out>,
+        Req: Send + Sync,
+        Out: Send,
+    {
         let fs = &env.file_system_sandbox_policy;
         let perms = tool.sandbox_permissions(req);
 
@@ -174,7 +193,10 @@ impl<S: SandboxProvider, A: Approver> ToolOrchestrator<S, A> {
         };
 
         // 7. Run under the chosen sandbox.
-        match self.run_under(tool, req, ctx, initial_sandbox, perms).await {
+        match self
+            .run_under(tool, req, ctx, initial_sandbox, perms, cancel.clone())
+            .await
+        {
             Ok(output) => Ok(OrchestratorRunResult {
                 output,
                 sandbox_used: initial_sandbox,
@@ -193,7 +215,7 @@ impl<S: SandboxProvider, A: Approver> ToolOrchestrator<S, A> {
                         }
                     }
                     let output = self
-                        .run_under(tool, req, ctx, SandboxType::None, perms)
+                        .run_under(tool, req, ctx, SandboxType::None, perms, cancel)
                         .await?;
                     Ok(OrchestratorRunResult {
                         output,
@@ -214,6 +236,7 @@ impl<S: SandboxProvider, A: Approver> ToolOrchestrator<S, A> {
         ctx: &ToolCtx,
         sandbox: SandboxType,
         perms: SandboxPermissions,
+        cancel: CancellationToken,
     ) -> Result<Out, ToolError>
     where
         T: ToolRuntime<Req, Out>,
@@ -226,7 +249,7 @@ impl<S: SandboxProvider, A: Approver> ToolOrchestrator<S, A> {
             permissions: perms,
             enforce_managed_network: false,
             launch: &launch,
-            cancel: launch.cancel.clone(),
+            cancel: launch.cancel.clone().or_else(|| Some(cancel.clone())),
         };
         tool.run(req, &attempt, ctx).await
     }

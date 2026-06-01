@@ -127,6 +127,16 @@ where
         policy: AskForApproval,
         orchestrator: &ToolOrchestrator<S, A>,
     ) -> Result<ExecOutput, ToolError>;
+
+    async fn call_with_cancel(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+        env: &TurnEnv,
+        policy: AskForApproval,
+        orchestrator: &ToolOrchestrator<S, A>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ExecOutput, ToolError>;
 }
 
 /// Adapter that lifts a typed [`ToolRuntime<Req, ExecOutput>`] into a
@@ -206,6 +216,27 @@ where
         // applies uniformly (parity with codex router.rs, where dispatch goes
         // through the handler under the orchestrator's policy wrapper).
         let result = orchestrator.run(&self.tool, &req, ctx, env, policy).await?;
+        Ok(result.output)
+    }
+
+    async fn call_with_cancel(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+        env: &TurnEnv,
+        policy: AskForApproval,
+        orchestrator: &ToolOrchestrator<S, A>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
+        let req: Req = serde_json::from_value(input.clone()).map_err(|source| {
+            ToolError::Other(anyhow::anyhow!(
+                "tool `{}`: invalid arguments: {source}",
+                self.name
+            ))
+        })?;
+        let result = orchestrator
+            .run_with_cancel(&self.tool, &req, ctx, env, policy, cancel)
+            .await?;
         Ok(result.output)
     }
 }
@@ -293,6 +324,28 @@ where
         })?;
         let req: Req = wire.into();
         let result = orchestrator.run(&self.tool, &req, ctx, env, policy).await?;
+        Ok(result.output)
+    }
+
+    async fn call_with_cancel(
+        &self,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+        env: &TurnEnv,
+        policy: AskForApproval,
+        orchestrator: &ToolOrchestrator<S, A>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
+        let wire: Wire = serde_json::from_value(input.clone()).map_err(|source| {
+            ToolError::Other(anyhow::anyhow!(
+                "tool `{}`: invalid arguments: {source}",
+                self.name
+            ))
+        })?;
+        let req: Req = wire.into();
+        let result = orchestrator
+            .run_with_cancel(&self.tool, &req, ctx, env, policy, cancel)
+            .await?;
         Ok(result.output)
     }
 }
@@ -431,10 +484,34 @@ where
         policy: AskForApproval,
         orchestrator: &ToolOrchestrator<S, A>,
     ) -> Result<ExecOutput, ToolError> {
+        self.dispatch_with_cancel(
+            name,
+            input,
+            ctx,
+            env,
+            policy,
+            orchestrator,
+            tokio_util::sync::CancellationToken::new(),
+        )
+        .await
+    }
+
+    /// Dispatch a tool call by name with a live turn cancellation token.
+    pub async fn dispatch_with_cancel(
+        &self,
+        name: &str,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+        env: &TurnEnv,
+        policy: AskForApproval,
+        orchestrator: &ToolOrchestrator<S, A>,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<ExecOutput, ToolError> {
         let tool = self
             .get(name)
             .ok_or_else(|| ToolError::Other(anyhow::anyhow!("unknown tool `{name}`")))?;
-        tool.call(input, ctx, env, policy, orchestrator).await
+        tool.call_with_cancel(input, ctx, env, policy, orchestrator, cancel)
+            .await
     }
 }
 
@@ -546,6 +623,64 @@ pub mod definitions {
                     }
                 },
                 "required": ["command"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `exec_command`: Codex-style process execution with live output snapshots
+    /// and a process id when the command is still running.
+    pub fn exec_command() -> ToolDefinition {
+        ToolDefinition {
+            name: "exec_command".to_string(),
+            description:
+                "Runs a command in a PTY, returning output or a session ID for ongoing interaction."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "cmd": { "type": "string", "description": "Shell command to execute." },
+                    "workdir": { "type": "string", "description": "Optional working directory to run the command in; defaults to the turn cwd." },
+                    "shell": { "type": "string", "description": "Shell binary to launch. Defaults to the user's default shell." },
+                    "login": { "type": "boolean", "description": "Whether to run the shell with -l/-i semantics. Defaults to true." },
+                    "tty": { "type": "boolean", "description": "Whether to allocate a TTY for the command. Defaults to false (plain pipes); set to true to open a PTY and access TTY process." },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "description": "How long to wait (in milliseconds) for output before yielding."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Maximum number of tokens to return. Excess output will be truncated."
+                    }
+                },
+                "required": ["cmd"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `write_stdin`: send input to or poll a live `exec_command` process.
+    pub fn write_stdin() -> ToolDefinition {
+        ToolDefinition {
+            name: "write_stdin".to_string(),
+            description:
+                "Send characters to a live command process, or poll it by sending an empty string."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "session_id": { "type": "integer", "description": "Identifier of the running unified exec session." },
+                    "chars": { "type": "string", "description": "Characters to write to stdin; empty string polls output." },
+                    "yield_time_ms": {
+                        "type": "integer",
+                        "description": "How long to wait for output after writing."
+                    },
+                    "max_output_tokens": {
+                        "type": "integer",
+                        "description": "Maximum number of tokens to return. Excess output will be truncated."
+                    }
+                },
+                "required": ["session_id"],
                 "additionalProperties": false
             }),
         }
@@ -1044,7 +1179,9 @@ where
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::PythonRequest;
     use crate::tools::handlers::request_user_input::RequestUserInputRequest;
-    use crate::tools::handlers::shell::ShellRequest;
+    use crate::tools::handlers::shell::{
+        ExecCommandRequest, ExecCommandTool, ShellRequest, WriteStdinRequest, WriteStdinTool,
+    };
     use crate::tools::handlers::tool_search::ToolSearchRequest;
     use crate::tools::handlers::update_plan::UpdatePlanRequest;
     use crate::tools::handlers::view_image::ViewImageRequest;
@@ -1053,6 +1190,19 @@ where
     let mut reg = ToolRegistry::new();
 
     reg.register::<_, ShellRequest>("shell", definitions::shell(), false, shell);
+    let unified_exec = crate::tools::unified_exec::UnifiedExecManager::default();
+    reg.register::<_, ExecCommandRequest>(
+        "exec_command",
+        definitions::exec_command(),
+        false,
+        ExecCommandTool::new(unified_exec.clone()),
+    );
+    reg.register::<_, WriteStdinRequest>(
+        "write_stdin",
+        definitions::write_stdin(),
+        false,
+        WriteStdinTool::new(unified_exec),
+    );
     reg.register::<_, ApplyPatchRequest>(
         "apply_patch",
         definitions::apply_patch(),

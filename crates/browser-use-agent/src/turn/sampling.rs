@@ -439,6 +439,17 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
             }
         }
         if is_error {
+            if text.starts_with("aborted by user") {
+                self.sink.emit(PendingEvent::new(
+                    self.ctx.session_id.clone(),
+                    names::TOOL_ABORTED,
+                    serde_json::json!({
+                        "name": name,
+                        "tool_call_id": tool_call_id,
+                        "error": text,
+                    }),
+                ));
+            }
             self.sink.emit(PendingEvent::new(
                 self.ctx.session_id.clone(),
                 names::TOOL_FAILED,

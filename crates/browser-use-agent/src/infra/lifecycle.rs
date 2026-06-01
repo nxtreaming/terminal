@@ -10,14 +10,9 @@
 //!
 //! In core, `UnifiedExecShutdownCleanup::drop` calls
 //! `cleanup_all_agent_runtime_state()`
-//! (`crates/browser-use-core/src/lib.rs:22391`), which tears down all
-//! unified-exec command sessions (`tools::command::cleanup_all_commands`) and
-//! MCP connections (`mcp::cleanup_all_mcp_connections`). Those subsystems are
-//! owned by other Phase modules and are NOT yet ported into this crate, so this
-//! leaf cannot call them without reaching outside its owned files. The guard is
-//! ported with its exact public shape (`new`, `Default`, RAII drop) and routes
-//! its drop through [`run_shutdown_cleanup`], which is the single integration
-//! point to wire up the real teardown once those modules land.
+//! (`crates/browser-use-core/src/lib.rs:22391`), which tears down unified-exec
+//! command sessions and MCP connections. This crate now owns unified exec
+//! cleanup; MCP cleanup is still a future integration point.
 
 /// Install the process-wide rustls crypto provider.
 ///
@@ -38,10 +33,7 @@ pub fn install_process_crypto_provider() {
 /// resources (currently `0`) and serves as the wiring point for them. Returning
 /// the count preserves the core signature shape for future callers.
 fn run_shutdown_cleanup() -> usize {
-    // Integration point: wire `cleanup_all_unified_exec_commands()` +
-    // `mcp::cleanup_all_mcp_connections()` here once those subsystems are ported
-    // into this crate.
-    0
+    crate::entrypoint::cleanup_all_unified_exec_managers()
 }
 
 /// RAII guard that runs unified-exec shutdown cleanup when dropped.

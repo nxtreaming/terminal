@@ -7,8 +7,9 @@
 use std::collections::HashMap;
 
 use super::shell::{
-    dangerous_command_rejection, ShellRequest, ShellTool, DEFAULT_SHELL_COMMAND_TIMEOUT_MS,
-    MAX_STREAM_OUTPUT_BYTES, TIMEOUT_EXIT_CODE,
+    dangerous_command_rejection, ExecCommandRequest, ExecCommandTool, ShellRequest, ShellTool,
+    WriteStdinRequest, WriteStdinTool, DEFAULT_SHELL_COMMAND_TIMEOUT_MS, MAX_STREAM_OUTPUT_BYTES,
+    TIMEOUT_EXIT_CODE,
 };
 use crate::tools::approval::AskForApproval;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
@@ -18,6 +19,7 @@ use crate::tools::runtime::{
 use crate::tools::sandbox::{
     FileSystemSandboxPolicy, NoneSandboxProvider, SandboxLaunch, SandboxPermissions, SandboxType,
 };
+use crate::tools::UnifiedExecManager;
 
 /// A `SandboxType::None` launch + attempt for direct `run` calls.
 fn none_launch() -> SandboxLaunch {
@@ -47,12 +49,474 @@ fn ctx_in(cwd: &std::path::Path) -> ToolCtx {
     }
 }
 
+fn ctx_for(cwd: &std::path::Path, tool_name: &str) -> ToolCtx {
+    ToolCtx {
+        call_id: format!("{tool_name}-call"),
+        tool_name: tool_name.to_string(),
+        cwd: cwd.to_path_buf(),
+        artifact_root: cwd.join("artifacts"),
+    }
+}
+
 /// Run a shell request directly through the runtime (no orchestrator).
 async fn run_direct(req: &ShellRequest, ctx: &ToolCtx) -> Result<ExecOutput, ToolError> {
     let tool = ShellTool::new();
     let launch = none_launch();
     let attempt = none_attempt(&launch);
     tool.run(req, &attempt, ctx).await
+}
+
+fn session_id_from_model_text(text: &str) -> i32 {
+    text.lines()
+        .find_map(|line| line.strip_prefix("Process running with session ID "))
+        .expect("missing running session id")
+        .parse()
+        .expect("session id parses")
+}
+
+#[tokio::test]
+async fn exec_command_returns_session_id_and_write_stdin_polls_to_exit() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::deterministic_for_tests();
+    let exec = ExecCommandTool::new(manager.clone());
+    let write = WriteStdinTool::new(manager);
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+    let write_ctx = ctx_for(dir.path(), "write_stdin");
+
+    let first = exec
+        .run(
+            &ExecCommandRequest {
+                cmd: Some("printf start; sleep 1; printf done".to_string()),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(10),
+                max_output_tokens: None,
+                env: HashMap::new(),
+                tty: false,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+        .expect("exec_command starts");
+    assert_eq!(first.exit_code, 0);
+    let session_id = session_id_from_model_text(&first.stdout);
+    assert!(first.stdout.contains("Chunk ID:"));
+    assert!(first.stdout.contains("Wall time:"));
+    assert!(first.stdout.contains("Original token count:"));
+    assert!(first.stdout.contains("Output:\nstart"));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_100)).await;
+    let second = write
+        .run(
+            &WriteStdinRequest {
+                session_id,
+                chars: String::new(),
+                yield_time_ms: Some(50),
+                max_output_tokens: None,
+            },
+            &attempt,
+            &write_ctx,
+        )
+        .await
+        .expect("write_stdin polls");
+    assert!(second.stdout.contains("Process exited with code 0"));
+    assert!(second.stdout.contains("Output:\ndone"));
+}
+
+#[tokio::test]
+async fn write_stdin_rejects_non_tty_input() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::deterministic_for_tests();
+    let exec = ExecCommandTool::new(manager.clone());
+    let write = WriteStdinTool::new(manager);
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+    let write_ctx = ctx_for(dir.path(), "write_stdin");
+
+    let first = exec
+        .run(
+            &ExecCommandRequest {
+                cmd: Some("sleep 1".to_string()),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(10),
+                max_output_tokens: None,
+                env: HashMap::new(),
+                tty: false,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+        .expect("exec_command starts");
+    let session_id = session_id_from_model_text(&first.stdout);
+
+    let err = write
+        .run(
+            &WriteStdinRequest {
+                session_id,
+                chars: "hello\n".to_string(),
+                yield_time_ms: Some(250),
+                max_output_tokens: None,
+            },
+            &attempt,
+            &write_ctx,
+        )
+        .await
+        .expect_err("non-tty stdin should reject");
+    match err {
+        ToolError::Other(err) => assert!(
+            err.to_string().contains("stdin is closed"),
+            "unexpected error: {err}"
+        ),
+        other => panic!("expected stdin closed error, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn tty_write_stdin_sends_input_and_returns_exit_metadata() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::default();
+    let exec = ExecCommandTool::new(manager.clone());
+    let write = WriteStdinTool::new(manager);
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+    let write_ctx = ctx_for(dir.path(), "write_stdin");
+
+    let first = exec
+        .run(
+            &ExecCommandRequest {
+                cmd: Some("read line; echo got:$line".to_string()),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(10),
+                max_output_tokens: None,
+                env: HashMap::new(),
+                tty: true,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+        .expect("pty exec starts");
+    let session_id = session_id_from_model_text(&first.stdout);
+
+    let second = write
+        .run(
+            &WriteStdinRequest {
+                session_id,
+                chars: "hello unified exec\n".to_string(),
+                yield_time_ms: Some(1_000),
+                max_output_tokens: None,
+            },
+            &attempt,
+            &write_ctx,
+        )
+        .await
+        .expect("pty stdin writes");
+    assert!(second.stdout.contains("Process exited with code 0"));
+    assert!(
+        second.stdout.contains("got:hello unified exec"),
+        "output should include command response, got: {}",
+        second.stdout
+    );
+}
+
+#[tokio::test]
+async fn exec_command_applies_codex_env_defaults() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::deterministic_for_tests();
+    let exec = ExecCommandTool::new(manager);
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+    let mut env = HashMap::new();
+    env.insert("TERM".to_string(), "xterm-256color".to_string());
+    env.insert("PAGER".to_string(), "less".to_string());
+
+    let out = exec
+        .run(
+            &ExecCommandRequest {
+                cmd: Some(
+                    "printf '%s|%s|%s|%s' \"$NO_COLOR\" \"$TERM\" \"$PAGER\" \"$CODEX_CI\""
+                        .to_string(),
+                ),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(1_000),
+                max_output_tokens: None,
+                env,
+                tty: false,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+        .expect("exec completes");
+
+    assert!(
+        out.stdout.contains("1|dumb|cat|1"),
+        "Codex env defaults should override request/env noise: {}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
+async fn exec_command_interruption_preserves_live_session() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::deterministic_for_tests();
+    let exec = ExecCommandTool::new(manager.clone());
+    let write = WriteStdinTool::new(manager);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+    let write_ctx = ctx_for(dir.path(), "write_stdin");
+
+    let handle = tokio::spawn(async move {
+        let launch = none_launch();
+        let attempt = none_attempt(&launch);
+        exec.run(
+            &ExecCommandRequest {
+                cmd: Some("printf ready; sleep 1; printf survived".to_string()),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(5_000),
+                max_output_tokens: None,
+                env: HashMap::new(),
+                tty: false,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+    handle.abort();
+    let _ = handle.await;
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+    let poll_launch = none_launch();
+    let poll_attempt = none_attempt(&poll_launch);
+    let polled = write
+        .run(
+            &WriteStdinRequest {
+                session_id: 1000,
+                chars: String::new(),
+                yield_time_ms: Some(250),
+                max_output_tokens: None,
+            },
+            &poll_attempt,
+            &write_ctx,
+        )
+        .await
+        .expect("aborted exec future leaves live session pollable");
+    assert!(polled.stdout.contains("Process exited with code 0"));
+    assert!(polled.stdout.contains("survived"), "got: {}", polled.stdout);
+}
+
+#[tokio::test]
+async fn exec_command_cancel_returns_live_session_snapshot() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::deterministic_for_tests();
+    let exec = ExecCommandTool::new(manager.clone());
+    let write = WriteStdinTool::new(manager);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+    let write_ctx = ctx_for(dir.path(), "write_stdin");
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let launch = SandboxLaunch {
+        sandbox: SandboxType::None,
+        cancel: Some(cancel.clone()),
+    };
+    let attempt = SandboxAttempt {
+        sandbox: SandboxType::None,
+        permissions: SandboxPermissions::UseDefault,
+        enforce_managed_network: false,
+        launch: &launch,
+        cancel: Some(cancel.clone()),
+    };
+
+    let cancel2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        cancel2.cancel();
+    });
+
+    let started = std::time::Instant::now();
+    let first = exec
+        .run(
+            &ExecCommandRequest {
+                cmd: Some("printf ready; sleep 1; printf survived".to_string()),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(30_000),
+                max_output_tokens: None,
+                env: HashMap::new(),
+                tty: false,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+        .expect("exec returns snapshot on cancel");
+    assert!(
+        started.elapsed() < std::time::Duration::from_secs(2),
+        "exec should return when cancelled instead of waiting full yield"
+    );
+    assert!(first
+        .stdout
+        .contains("Process running with session ID 1000"));
+    assert!(first.stdout.contains("ready"));
+
+    tokio::time::sleep(std::time::Duration::from_millis(1_000)).await;
+    let poll_launch = none_launch();
+    let poll_attempt = none_attempt(&poll_launch);
+    let polled = write
+        .run(
+            &WriteStdinRequest {
+                session_id: 1000,
+                chars: String::new(),
+                yield_time_ms: Some(250),
+                max_output_tokens: None,
+            },
+            &poll_attempt,
+            &write_ctx,
+        )
+        .await
+        .expect("cancelled exec remains pollable");
+    assert!(polled.stdout.contains("Process exited with code 0"));
+    assert!(polled.stdout.contains("survived"), "got: {}", polled.stdout);
+}
+
+#[tokio::test]
+async fn terminate_all_best_effort_kills_managed_processes() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::deterministic_for_tests();
+    let exec = ExecCommandTool::new(manager.clone());
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+    let marker = dir.path().join("survived");
+
+    let first = exec
+        .run(
+            &ExecCommandRequest {
+                cmd: Some("sleep 1; touch survived".to_string()),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(250),
+                max_output_tokens: None,
+                env: HashMap::new(),
+                tty: false,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+        .expect("exec starts");
+    assert!(first
+        .stdout
+        .contains("Process running with session ID 1000"));
+
+    assert_eq!(manager.terminate_all_best_effort(), 1);
+    tokio::time::sleep(std::time::Duration::from_millis(1_200)).await;
+    assert!(
+        !marker.exists(),
+        "cleanup should kill the managed command before it can write {marker:?}"
+    );
+}
+
+#[tokio::test]
+async fn exec_command_max_output_tokens_truncates_model_output() {
+    let dir = tempfile::tempdir().unwrap();
+    let manager = UnifiedExecManager::default();
+    let exec = ExecCommandTool::new(manager);
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    let exec_ctx = ctx_for(dir.path(), "exec_command");
+
+    let out = exec
+        .run(
+            &ExecCommandRequest {
+                cmd: Some("printf abcdefghijklmnopqrstuvwxyz".to_string()),
+                command: None,
+                workdir: None,
+                cwd: None,
+                shell: None,
+                login: None,
+                yield_time_ms: Some(1_000),
+                max_output_tokens: Some(2),
+                env: HashMap::new(),
+                tty: false,
+            },
+            &attempt,
+            &exec_ctx,
+        )
+        .await
+        .expect("exec completes");
+    assert!(out.stdout.contains("\n…\n"), "got: {}", out.stdout);
+    assert!(
+        !out.stdout.contains("abcdefghijklmnopqrstuvwxyz"),
+        "full output should be truncated: {}",
+        out.stdout
+    );
+}
+
+#[tokio::test]
+async fn shell_cancellation_kills_running_child() {
+    let dir = tempfile::tempdir().unwrap();
+    let ctx = ctx_in(dir.path());
+    let tool = ShellTool::new();
+    let cancel = tokio_util::sync::CancellationToken::new();
+    let req = ShellRequest {
+        command: vec!["sh".to_string(), "-c".to_string(), "sleep 5".to_string()],
+        cwd: None,
+        timeout_ms: Some(10_000),
+        env: HashMap::new(),
+    };
+
+    let run_cancel = cancel.clone();
+    let handle = tokio::spawn(async move {
+        let launch = SandboxLaunch {
+            sandbox: SandboxType::None,
+            cancel: Some(run_cancel.clone()),
+        };
+        let attempt = SandboxAttempt {
+            sandbox: SandboxType::None,
+            permissions: SandboxPermissions::UseDefault,
+            enforce_managed_network: false,
+            launch: &launch,
+            cancel: Some(run_cancel),
+        };
+        tool.run(&req, &attempt, &ctx).await
+    });
+    tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+    cancel.cancel();
+    let out = handle.await.unwrap().expect("cancel returns output");
+    assert_eq!(out.exit_code, 130);
 }
 
 // (1) `echo hello` -> exit 0, stdout contains "hello".
@@ -124,14 +588,13 @@ async fn oversized_output_is_truncated() {
     let out = run_direct(&req, &ctx).await.expect("command should run");
     assert_eq!(out.exit_code, 0);
     assert!(
-        out.stdout.contains("[output truncated"),
+        out.stdout.contains("[... omitted"),
         "expected truncation marker, stdout len = {}",
         out.stdout.len()
     );
     // Strip the truncation marker before measuring the retained payload (the
     // marker text itself contains a couple of 'a's).
-    let payload = out.stdout.split("\n[output truncated").next().unwrap_or("");
-    let a_count = payload.matches('a').count();
+    let a_count = out.stdout.matches('a').count();
     assert_eq!(
         a_count, MAX_STREAM_OUTPUT_BYTES,
         "retained payload should be exactly the byte cap (cap honored, no overflow)"

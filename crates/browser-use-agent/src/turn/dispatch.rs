@@ -72,7 +72,7 @@ pub trait CallRunner: Send + Sync {
     fn parallel_safe(&self, call: &ContentPart) -> bool;
 
     /// Execute the call and return the `Message` (tool output) to record.
-    async fn run(&self, call: ContentPart) -> Message;
+    async fn run(&self, call: ContentPart, cancel: CancellationToken) -> Message;
 }
 
 /// Blanket impl so a shared, already-`Arc`'d runner satisfies the bound. This is
@@ -85,8 +85,8 @@ impl<T: CallRunner + ?Sized> CallRunner for Arc<T> {
         (**self).parallel_safe(call)
     }
 
-    async fn run(&self, call: ContentPart) -> Message {
-        (**self).run(call).await
+    async fn run(&self, call: ContentPart, cancel: CancellationToken) -> Message {
+        (**self).run(call, cancel).await
     }
 }
 
@@ -125,7 +125,7 @@ impl CallRunner for OrchestratorRunner {
         false
     }
 
-    async fn run(&self, call: ContentPart) -> Message {
+    async fn run(&self, call: ContentPart, _cancel: CancellationToken) -> Message {
         // The real per-tool routing through `ToolOrchestrator::run` is wired by
         // the toolset-owning WP. Recording a tool-result message keeps the dispatch
         // contract intact in the meantime.
@@ -206,7 +206,7 @@ where
         }
     }
 
-    async fn run(&self, call: ContentPart) -> Message {
+    async fn run(&self, call: ContentPart, cancel: CancellationToken) -> Message {
         match &call {
             ContentPart::ToolCall {
                 id, name, input, ..
@@ -216,13 +216,14 @@ where
                 ctx.tool_name = name.clone();
                 match self
                     .registry
-                    .dispatch(
+                    .dispatch_with_cancel(
                         name,
                         input,
                         &ctx,
                         &self.env,
                         self.policy,
                         &self.orchestrator,
+                        cancel,
                     )
                     .await
                 {
@@ -445,19 +446,35 @@ impl<R: CallRunner + 'static> ToolDispatcher<R> {
     }
 }
 
-/// Run a single call, honoring cancellation. Returns `None` if the call was
-/// cancelled before producing output (so it is skipped rather than recorded with
-/// a bogus value).
+/// Run a single call, honoring cancellation. Cancellation is model-visible: the
+/// tool result records an aborted error instead of silently dropping the call.
 async fn run_one<R: CallRunner + ?Sized>(
     runner: &R,
     call: ContentPart,
     cancel: &CancellationToken,
 ) -> Option<Message> {
+    if preserves_result_on_cancel(&call) {
+        return Some(runner.run(call, cancel.clone()).await);
+    }
+
+    let started = std::time::Instant::now();
     tokio::select! {
         biased;
-        _ = cancel.cancelled() => None,
-        msg = runner.run(call) => Some(msg),
+        _ = cancel.cancelled() => Some(aborted_result_message_for(&call, started.elapsed())),
+        msg = runner.run(call.clone(), cancel.clone()) => Some(msg),
     }
+}
+
+fn preserves_result_on_cancel(call: &ContentPart) -> bool {
+    matches!(call, ContentPart::ToolCall { name, .. } if name == "exec_command")
+}
+
+fn aborted_result_message_for(call: &ContentPart, elapsed: std::time::Duration) -> Message {
+    result_message_for(
+        call,
+        &format!("aborted by user after {:.1}s", elapsed.as_secs_f64()),
+        true,
+    )
 }
 
 impl Default for ToolDispatcher<OrchestratorRunner> {

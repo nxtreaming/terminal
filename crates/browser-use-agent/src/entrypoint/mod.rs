@@ -78,6 +78,9 @@ use crate::turn::TurnState;
 use crate::AgentError;
 
 use provider::ResolvedProvider;
+pub use provider::{
+    cleanup_all_unified_exec_managers, cleanup_unified_exec_manager_for_session_id,
+};
 
 /// The shared, in-run conversation buffer that BOTH the loop's [`TurnState`] reads
 /// (via [`StoreTurnState::clone_history_for_prompt`]) AND the fused driver's
@@ -911,6 +914,7 @@ async fn drive_run<Sd: SamplingDriver>(
     turn_has_fresh_input: bool,
     recorded: RecordedBuffer,
     compaction: Option<(i64, Arc<dyn DynCompactionSampler>)>,
+    cancel: CancellationToken,
 ) -> Result<Option<String>, AgentError> {
     let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded);
     // Enable REAL token accounting + model-based compaction when a sampler is
@@ -929,9 +933,7 @@ async fn drive_run<Sd: SamplingDriver>(
     let observer = StoreObserver::new(sink, session_id.as_str().to_string());
 
     let turn_loop = TurnLoop::new(state, driver, observer);
-    let result = turn_loop
-        .run(ctx, turn_has_fresh_input, CancellationToken::new())
-        .await;
+    let result = turn_loop.run(ctx, turn_has_fresh_input, cancel).await;
     if result.is_ok() {
         ensure_fallback_capture_recording(&store, session_id.as_str());
     }
@@ -984,6 +986,15 @@ pub async fn run_session_with_config(
     store: SharedStore,
     session_id: &str,
     config: ProviderRunConfig,
+) -> anyhow::Result<SessionId> {
+    run_session_with_config_with_cancel(store, session_id, config, CancellationToken::new()).await
+}
+
+pub async fn run_session_with_config_with_cancel(
+    store: SharedStore,
+    session_id: &str,
+    config: ProviderRunConfig,
+    cancel: CancellationToken,
 ) -> anyhow::Result<SessionId> {
     let session_id = SessionId(session_id.to_string());
     let ctx = turn_ctx(&session_id, &config);
@@ -1068,6 +1079,7 @@ pub async fn run_session_with_config(
                 turn_has_fresh_input,
                 Arc::clone(&recorded),
                 compaction,
+                cancel.clone(),
             )
             .await?;
         }
@@ -1086,6 +1098,7 @@ pub async fn run_session_with_config(
                 turn_has_fresh_input,
                 Arc::clone(&recorded),
                 None,
+                cancel.clone(),
             )
             .await?;
         }

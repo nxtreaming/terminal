@@ -94,7 +94,7 @@ use render::{
     lines_plain_text, main_viewport_height, native_scrollback_lines, render, render_dump,
     APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
-use runtime::run_agent_thread;
+use runtime::{cancel_agent_run, run_agent_thread};
 use settings::{
     browser_use_cloud_env_key_present, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
@@ -3878,12 +3878,15 @@ impl App {
         if !self.current_task_is_active()? {
             return Ok(false);
         }
+        let cancelled_live_run = cancel_agent_run(&id);
         self.store.request_cancel(&id, "stopped from terminal")?;
-        // The new engine's cleanup takes a per-session closure that drops the
-        // caller's in-process runtime handles. The TUI keeps no such per-session
-        // registry (the legacy 2-arg core fn handled this internally), so the
-        // closure is a no-op returning 0 removed entries.
-        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |_session_id| 0)?;
+        cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
+            usize::from(cancel_agent_run(session_id))
+        })?;
+        if !cancelled_live_run {
+            self.status_notice =
+                Some("Marked task stopped; no live runtime handle was found.".to_string());
+        }
         Ok(true)
     }
 

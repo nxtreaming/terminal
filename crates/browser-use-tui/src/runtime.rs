@@ -1,5 +1,6 @@
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, OnceLock};
 use std::thread;
 
 use anyhow::{bail, Context, Result};
@@ -9,18 +10,37 @@ use browser_use_agent::config_overrides::{
     ChildAgentRunner, ConfigOverrides, ProviderRunConfig,
 };
 use browser_use_agent::context::typed_user_input_payload_from_text_for_cwd;
-use browser_use_agent::entrypoint::run_session_with_config;
+use browser_use_agent::entrypoint::run_session_with_config_with_cancel;
 use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_protocol::{
     failure_from_events, sanitized_agent_context_from_events, session_result_from_events,
     SessionMeta,
 };
 use browser_use_store::{Store, StoreNotifier};
+use tokio_util::sync::CancellationToken;
 
 use crate::settings::{
     browser_use_cloud_env_key_present, AgentBackend, BROWSER_USE_CLOUD,
     BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
 };
+
+static ACTIVE_AGENT_RUNS: OnceLock<Mutex<HashMap<String, CancellationToken>>> = OnceLock::new();
+
+fn active_agent_runs() -> &'static Mutex<HashMap<String, CancellationToken>> {
+    ACTIVE_AGENT_RUNS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+pub(crate) fn cancel_agent_run(session_id: &str) -> bool {
+    let Some(token) = active_agent_runs()
+        .lock()
+        .ok()
+        .and_then(|runs| runs.get(session_id).cloned())
+    else {
+        return false;
+    };
+    token.cancel();
+    true
+}
 
 pub(crate) fn run_agent_thread(
     state_dir: PathBuf,
@@ -85,11 +105,19 @@ pub(crate) fn run_agent_thread(
     // TUI still keeps the existing one OS thread per session entrypoint.
     let shared_store = Arc::new(Mutex::new(store));
     let runtime = build_agent_runtime()?;
-    let result = runtime.block_on(run_session_with_config(
+    let cancel = CancellationToken::new();
+    if let Ok(mut runs) = active_agent_runs().lock() {
+        runs.insert(session_id.clone(), cancel.clone());
+    }
+    let result = runtime.block_on(run_session_with_config_with_cancel(
         Arc::clone(&shared_store),
         &session_id,
         config,
+        cancel,
     ));
+    if let Ok(mut runs) = active_agent_runs().lock() {
+        runs.remove(&session_id);
+    }
     if let Err(error) = result {
         if let Ok(store) = shared_store.lock() {
             let _ = store.append_event(

@@ -30,18 +30,18 @@
 
 use std::collections::HashMap;
 use std::path::PathBuf;
-use std::process::Stdio;
-use std::time::Duration;
-
-use tokio::io::{AsyncRead, AsyncReadExt};
-use tokio::process::Command;
-use tokio::time::timeout;
+use std::sync::Arc;
 
 use crate::tools::approval::ExecApprovalRequirement;
 use crate::tools::runtime::{
     Approvable, ExecOutput, SandboxAttempt, Sandboxable, ToolCtx, ToolError, ToolRuntime,
 };
 use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
+use crate::tools::unified_exec::{
+    SpawnProcessRequest, UnifiedExecEventEmitter, UnifiedExecManager,
+    WriteStdinRequest as UnifiedWriteStdinRequest, DEFAULT_EXEC_YIELD_TIME_MS,
+    DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
+};
 
 /// Default per-command timeout in milliseconds.
 ///
@@ -62,19 +62,6 @@ pub const TIMEOUT_EXIT_CODE: i32 = 124;
 /// exec.rs:68) and legacy `UNIFIED_EXEC_OUTPUT_MAX_BYTES = 1024 * 1024`
 /// (command.rs:33).
 pub const MAX_STREAM_OUTPUT_BYTES: usize = 1024 * 1024;
-
-/// Bound on draining child output after a timeout kill, so a grandchild holding
-/// the pipe open cannot hang the engine.
-///
-/// Matches codex `IO_DRAIN_TIMEOUT_MS = 2_000` (exec.rs:81) and legacy
-/// `SHELL_COMMAND_IO_DRAIN_TIMEOUT_MS` (command.rs:40).
-const IO_DRAIN_TIMEOUT_MS: u64 = 2_000;
-
-/// Size of each read chunk. Matches codex `READ_CHUNK_SIZE` (exec.rs:61).
-const READ_CHUNK_SIZE: usize = 8192;
-
-/// Marker appended to a stream when it was truncated at the byte cap.
-const TRUNCATION_MARKER: &str = "\n[output truncated: exceeded 1 MiB byte cap]";
 
 /// Typed request for the shell/exec tool.
 ///
@@ -191,6 +178,23 @@ fn base_name(s: &str) -> String {
     s.rsplit('/').next().unwrap_or(s).to_string()
 }
 
+fn shell_argv(cmd: &str, shell: Option<&str>, login: Option<bool>) -> Vec<String> {
+    #[cfg(windows)]
+    {
+        let shell = shell.unwrap_or("cmd");
+        vec![shell.to_string(), "/C".to_string(), cmd.to_string()]
+    }
+    #[cfg(not(windows))]
+    {
+        let shell = shell
+            .map(ToOwned::to_owned)
+            .or_else(|| std::env::var("SHELL").ok())
+            .unwrap_or_else(|| "sh".to_string());
+        let flag = if login.unwrap_or(true) { "-lc" } else { "-c" };
+        vec![shell, flag.to_string(), cmd.to_string()]
+    }
+}
+
 /// Whether a normalized (whitespace-collapsed) command string looks like a
 /// recursive-force delete of a filesystem root / home directory.
 fn is_root_wipe(norm: &str) -> bool {
@@ -221,13 +225,165 @@ fn is_root_wipe(norm: &str) -> bool {
 ///
 /// Stateless; cheap to clone/construct. Limits and timeouts come from the
 /// request and the constants above.
-#[derive(Clone, Debug, Default)]
-pub struct ShellTool;
+#[derive(Clone, Debug)]
+pub struct ShellTool {
+    manager: UnifiedExecManager,
+    emitter: Option<Arc<UnifiedExecEventEmitter>>,
+}
+
+impl Default for ShellTool {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl ShellTool {
     /// Construct a new shell tool.
     pub fn new() -> Self {
-        Self
+        Self {
+            manager: UnifiedExecManager::default(),
+            emitter: None,
+        }
+    }
+
+    pub fn with_manager(manager: UnifiedExecManager) -> Self {
+        Self {
+            manager,
+            emitter: None,
+        }
+    }
+
+    pub fn with_event_emitter(mut self, emitter: Arc<UnifiedExecEventEmitter>) -> Self {
+        self.emitter = Some(emitter);
+        self
+    }
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+#[serde(untagged)]
+pub enum ExecCommandValue {
+    Argv(Vec<String>),
+    Shell(String),
+}
+
+/// Codex-style command execution request.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct ExecCommandRequest {
+    /// Shell command string. Mirrors Codex's `cmd` field.
+    #[serde(default)]
+    pub cmd: Option<String>,
+    /// Alternate command field. Accepts either argv or a shell string.
+    #[serde(default)]
+    pub command: Option<ExecCommandValue>,
+    /// Working directory. `workdir` matches the API tool; `cwd` is accepted for
+    /// compatibility with the older shell tool.
+    #[serde(default)]
+    pub workdir: Option<PathBuf>,
+    #[serde(default)]
+    pub cwd: Option<PathBuf>,
+    /// Optional shell binary to launch.
+    #[serde(default)]
+    pub shell: Option<String>,
+    /// Whether to use login shell semantics where supported.
+    #[serde(default)]
+    pub login: Option<bool>,
+    /// Initial output collection window before returning a process id.
+    #[serde(default)]
+    pub yield_time_ms: Option<u64>,
+    /// Maximum model-visible output tokens.
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+    /// Extra env is accepted for backwards compatibility. It is not advertised
+    /// in the Codex-style schema.
+    #[serde(default)]
+    pub env: HashMap<String, String>,
+    /// Allocate a PTY for stdin-capable interactive command sessions.
+    #[serde(default)]
+    pub tty: bool,
+}
+
+impl ExecCommandRequest {
+    fn argv(&self) -> Vec<String> {
+        if let Some(cmd) = self.cmd.as_ref().filter(|cmd| !cmd.trim().is_empty()) {
+            return shell_argv(cmd, self.shell.as_deref(), self.login);
+        }
+        match self.command.as_ref() {
+            Some(ExecCommandValue::Argv(argv)) => argv.clone(),
+            Some(ExecCommandValue::Shell(cmd)) => {
+                shell_argv(cmd, self.shell.as_deref(), self.login)
+            }
+            None => Vec::new(),
+        }
+    }
+
+    fn cwd(&self, ctx: &ToolCtx) -> PathBuf {
+        self.workdir
+            .clone()
+            .or_else(|| self.cwd.clone())
+            .unwrap_or_else(|| ctx.cwd.clone())
+    }
+
+    fn yield_time_ms(&self) -> u64 {
+        self.yield_time_ms.unwrap_or(DEFAULT_EXEC_YIELD_TIME_MS)
+    }
+}
+
+/// Send stdin to, or poll, a live unified exec process.
+#[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
+pub struct WriteStdinRequest {
+    pub session_id: i32,
+    #[serde(default)]
+    pub chars: String,
+    #[serde(default)]
+    pub yield_time_ms: Option<u64>,
+    #[serde(default)]
+    pub max_output_tokens: Option<usize>,
+}
+
+impl WriteStdinRequest {
+    fn yield_time_ms(&self) -> u64 {
+        self.yield_time_ms
+            .unwrap_or(DEFAULT_WRITE_STDIN_YIELD_TIME_MS)
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct ExecCommandTool {
+    manager: UnifiedExecManager,
+    emitter: Option<Arc<UnifiedExecEventEmitter>>,
+}
+
+impl ExecCommandTool {
+    pub fn new(manager: UnifiedExecManager) -> Self {
+        Self {
+            manager,
+            emitter: None,
+        }
+    }
+
+    pub fn with_event_emitter(mut self, emitter: Arc<UnifiedExecEventEmitter>) -> Self {
+        self.emitter = Some(emitter);
+        self
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct WriteStdinTool {
+    manager: UnifiedExecManager,
+    emitter: Option<Arc<UnifiedExecEventEmitter>>,
+}
+
+impl WriteStdinTool {
+    pub fn new(manager: UnifiedExecManager) -> Self {
+        Self {
+            manager,
+            emitter: None,
+        }
+    }
+
+    pub fn with_event_emitter(mut self, emitter: Arc<UnifiedExecEventEmitter>) -> Self {
+        self.emitter = Some(emitter);
+        self
     }
 }
 
@@ -239,6 +395,17 @@ impl ShellTool {
 pub struct ShellApprovalKey {
     command: Vec<String>,
     cwd: Option<PathBuf>,
+}
+
+#[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct ExecCommandApprovalKey {
+    command: Vec<String>,
+    cwd: Option<PathBuf>,
+}
+
+#[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
+pub struct WriteStdinApprovalKey {
+    session_id: i32,
 }
 
 impl Approvable<ShellRequest> for ShellTool {
@@ -273,6 +440,45 @@ impl Approvable<ShellRequest> for ShellTool {
     }
 }
 
+impl Approvable<ExecCommandRequest> for ExecCommandTool {
+    type ApprovalKey = ExecCommandApprovalKey;
+
+    fn approval_keys(&self, req: &ExecCommandRequest) -> Vec<Self::ApprovalKey> {
+        vec![ExecCommandApprovalKey {
+            command: req.argv(),
+            cwd: req.workdir.clone().or_else(|| req.cwd.clone()),
+        }]
+    }
+
+    fn sandbox_permissions(&self, _req: &ExecCommandRequest) -> SandboxPermissions {
+        SandboxPermissions::UseDefault
+    }
+
+    fn exec_approval_requirement(
+        &self,
+        req: &ExecCommandRequest,
+    ) -> Option<ExecApprovalRequirement> {
+        if let Err(ToolError::Rejected(reason)) = dangerous_command_rejection(&req.argv()) {
+            return Some(ExecApprovalRequirement::Forbidden { reason });
+        }
+        None
+    }
+}
+
+impl Approvable<WriteStdinRequest> for WriteStdinTool {
+    type ApprovalKey = WriteStdinApprovalKey;
+
+    fn approval_keys(&self, req: &WriteStdinRequest) -> Vec<Self::ApprovalKey> {
+        vec![WriteStdinApprovalKey {
+            session_id: req.session_id,
+        }]
+    }
+
+    fn sandbox_permissions(&self, _req: &WriteStdinRequest) -> SandboxPermissions {
+        SandboxPermissions::UseDefault
+    }
+}
+
 impl Sandboxable for ShellTool {
     fn sandbox_preference(&self) -> SandboxPreference {
         // Let the provider decide. Today everything resolves to
@@ -285,6 +491,26 @@ impl Sandboxable for ShellTool {
     fn escalate_on_failure(&self) -> bool {
         // Codex parity: `ShellRuntime::escalate_on_failure -> true`
         // (runtimes/shell.rs:112-114).
+        true
+    }
+}
+
+impl Sandboxable for ExecCommandTool {
+    fn sandbox_preference(&self) -> SandboxPreference {
+        SandboxPreference::Auto
+    }
+
+    fn escalate_on_failure(&self) -> bool {
+        true
+    }
+}
+
+impl Sandboxable for WriteStdinTool {
+    fn sandbox_preference(&self) -> SandboxPreference {
+        SandboxPreference::Auto
+    }
+
+    fn escalate_on_failure(&self) -> bool {
         true
     }
 }
@@ -307,152 +533,105 @@ impl ToolRuntime<ShellRequest, ExecOutput> for ShellTool {
         // directly, bypassing the orchestrator's approval gate.
         dangerous_command_rejection(&req.command)?;
 
-        // Today the only sandbox is `None`; a real backend (Landlock/seccomp)
-        // lands later behind `attempt.sandbox`. We acknowledge the attempt to
-        // make the seam explicit.
-        let _ = attempt;
-
-        let program = req
-            .command
-            .first()
-            .ok_or_else(|| ToolError::Other(anyhow::anyhow!("empty command")))?;
-        let args = &req.command[1..];
-
         // Working dir: explicit request cwd, else the ambient ToolCtx cwd.
         let cwd = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
         let timeout_ms = req.effective_timeout_ms();
-
-        let mut cmd = Command::new(program);
-        cmd.args(args)
-            .current_dir(&cwd)
-            .stdin(Stdio::null())
-            .stdout(Stdio::piped())
-            .stderr(Stdio::piped());
-        for (k, v) in &req.env {
-            cmd.env(k, v);
+        let snapshot = self
+            .manager
+            .run_to_completion(SpawnProcessRequest {
+                argv: req.command.clone(),
+                cwd,
+                env: req.env.clone(),
+                tty: false,
+                yield_time_ms: DEFAULT_WRITE_STDIN_YIELD_TIME_MS,
+                max_output_tokens: None,
+                timeout_ms: Some(timeout_ms),
+                kill_on_cancel: true,
+                call_id: ctx.call_id.clone(),
+                tool_name: ctx.tool_name.clone(),
+                emitter: self.emitter.clone(),
+                cancel: attempt.cancel.clone(),
+            })
+            .await?;
+        let mut stderr = snapshot.stderr;
+        if snapshot.timed_out && stderr.trim().is_empty() {
+            stderr = format!("command timed out after {timeout_ms} ms");
         }
-        // Ensure the child is reaped if we drop it on timeout.
-        cmd.kill_on_drop(true);
-
-        let mut child = cmd
-            .spawn()
-            .map_err(|e| ToolError::Other(anyhow::anyhow!("failed to spawn `{program}`: {e}")))?;
-
-        // Take the piped handles so we can drain them concurrently with the wait,
-        // byte-capping each (codex `read_output`, exec.rs:1441-1475).
-        let stdout_pipe = child.stdout.take();
-        let stderr_pipe = child.stderr.take();
-
-        let wait_with_output = async {
-            let stdout_fut = read_capped_opt(stdout_pipe);
-            let stderr_fut = read_capped_opt(stderr_pipe);
-            tokio::join!(child.wait(), stdout_fut, stderr_fut)
-        };
-
-        let dur = Duration::from_millis(timeout_ms);
-        match timeout(dur, wait_with_output).await {
-            Ok((status, stdout_res, stderr_res)) => {
-                let (stdout, _) = stdout_res
-                    .map_err(|e| ToolError::Other(anyhow::anyhow!("reading stdout: {e}")))?;
-                let (stderr, _) = stderr_res
-                    .map_err(|e| ToolError::Other(anyhow::anyhow!("reading stderr: {e}")))?;
-                let status = status
-                    .map_err(|e| ToolError::Other(anyhow::anyhow!("waiting on child: {e}")))?;
-                // Codex: exit_code = status.code().unwrap_or(-1) (exec.rs:745),
-                // with signal-terminated children mapped to a sentinel.
-                let exit_code = status.code().unwrap_or_else(|| signal_exit_code(&status));
-                Ok(ExecOutput {
-                    exit_code,
-                    stdout,
-                    stderr,
-                })
-            }
-            Err(_elapsed) => {
-                // Timed out. Kill the child and drain whatever output it produced,
-                // bounded by IO_DRAIN_TIMEOUT_MS so a grandchild holding the pipe
-                // cannot hang us (codex exec.rs:1370-1415). Report exit code 124
-                // (codex exec.rs:746-748 sets exit_code = EXEC_TIMEOUT_EXIT_CODE).
-                let _ = child.start_kill();
-                let _ = child.wait().await;
-                Ok(ExecOutput {
-                    exit_code: TIMEOUT_EXIT_CODE,
-                    stdout: String::new(),
-                    stderr: format!("command timed out after {timeout_ms} ms"),
-                })
-            }
-        }
+        Ok(ExecOutput {
+            exit_code: snapshot.exit_code.unwrap_or(0),
+            stdout: snapshot.stdout,
+            stderr,
+        })
     }
 }
 
-/// Map a signal-terminated exit status onto a conventional `128 + signal` code,
-/// matching common shell behavior (codex `EXIT_CODE_SIGNAL_BASE = 128`,
-/// exec.rs:57). Falls back to `-1` if unavailable (codex exec.rs:745).
-fn signal_exit_code(status: &std::process::ExitStatus) -> i32 {
-    #[cfg(unix)]
-    {
-        use std::os::unix::process::ExitStatusExt;
-        if let Some(sig) = status.signal() {
-            return 128 + sig;
-        }
+#[async_trait::async_trait]
+impl ToolRuntime<ExecCommandRequest, ExecOutput> for ExecCommandTool {
+    fn parallel_safe(&self, _req: &ExecCommandRequest) -> bool {
+        false
     }
-    let _ = status;
-    -1
+
+    async fn run(
+        &self,
+        req: &ExecCommandRequest,
+        attempt: &SandboxAttempt<'_>,
+        ctx: &ToolCtx,
+    ) -> Result<ExecOutput, ToolError> {
+        let argv = req.argv();
+        dangerous_command_rejection(&argv)?;
+        let snapshot = self
+            .manager
+            .spawn_process(SpawnProcessRequest {
+                argv,
+                cwd: req.cwd(ctx),
+                env: req.env.clone(),
+                tty: req.tty,
+                yield_time_ms: req.yield_time_ms(),
+                max_output_tokens: req.max_output_tokens,
+                timeout_ms: None,
+                kill_on_cancel: false,
+                call_id: ctx.call_id.clone(),
+                tool_name: ctx.tool_name.clone(),
+                emitter: self.emitter.clone(),
+                cancel: attempt.cancel.clone(),
+            })
+            .await?;
+        Ok(ExecOutput {
+            exit_code: snapshot.exit_code.unwrap_or(0),
+            stdout: snapshot.to_model_text(),
+            stderr: String::new(),
+        })
+    }
 }
 
-/// Read an optional child pipe to its byte cap. `None` pipes yield empty output.
-async fn read_capped_opt<R: AsyncRead + Unpin>(pipe: Option<R>) -> std::io::Result<(String, bool)> {
-    match pipe {
-        Some(r) => read_capped(r, MAX_STREAM_OUTPUT_BYTES).await,
-        None => Ok((String::new(), false)),
-    }
-}
-
-/// Read `reader` to EOF, retaining at most `max_output` bytes.
-///
-/// Mirrors codex `read_output` + `append_capped` (exec.rs:1441-1475, 856-864):
-/// we keep draining the reader to EOF even after the cap is reached (so the
-/// child does not block on a full pipe / receive SIGPIPE), but only retain the
-/// first `max_output` bytes. The whole drain is bounded by
-/// [`IO_DRAIN_TIMEOUT_MS`] so an inherited-fd grandchild cannot hang us. When
-/// truncation occurs, a [`TRUNCATION_MARKER`] is appended and the bool flag set.
-async fn read_capped<R: AsyncRead + Unpin>(
-    mut reader: R,
-    max_output: usize,
-) -> std::io::Result<(String, bool)> {
-    let mut buf: Vec<u8> = Vec::with_capacity(max_output.min(READ_CHUNK_SIZE));
-    let mut tmp = [0u8; READ_CHUNK_SIZE];
-    let mut truncated = false;
-
-    let drain = async {
-        loop {
-            let n = reader.read(&mut tmp).await?;
-            if n == 0 {
-                break;
-            }
-            if buf.len() < max_output {
-                let remaining = max_output - buf.len();
-                let take = remaining.min(n);
-                buf.extend_from_slice(&tmp[..take]);
-                if take < n {
-                    truncated = true;
-                }
-            } else {
-                truncated = true;
-            }
-            // Keep reading to EOF even after the cap to avoid SIGPIPE.
-        }
-        Ok::<(), std::io::Error>(())
-    };
-
-    // Bound the drain so a grandchild holding the pipe open cannot hang us.
-    match timeout(Duration::from_millis(IO_DRAIN_TIMEOUT_MS), drain).await {
-        Ok(res) => res?,
-        Err(_elapsed) => { /* fall through with whatever we collected */ }
+#[async_trait::async_trait]
+impl ToolRuntime<WriteStdinRequest, ExecOutput> for WriteStdinTool {
+    fn parallel_safe(&self, _req: &WriteStdinRequest) -> bool {
+        false
     }
 
-    let mut s = String::from_utf8_lossy(&buf).into_owned();
-    if truncated {
-        s.push_str(TRUNCATION_MARKER);
+    async fn run(
+        &self,
+        req: &WriteStdinRequest,
+        _attempt: &SandboxAttempt<'_>,
+        ctx: &ToolCtx,
+    ) -> Result<ExecOutput, ToolError> {
+        let snapshot = self
+            .manager
+            .write_stdin(UnifiedWriteStdinRequest {
+                session_id: req.session_id,
+                chars: req.chars.clone(),
+                yield_time_ms: req.yield_time_ms(),
+                max_output_tokens: req.max_output_tokens,
+                call_id: ctx.call_id.clone(),
+                tool_name: ctx.tool_name.clone(),
+                emitter: self.emitter.clone(),
+            })
+            .await?;
+        Ok(ExecOutput {
+            exit_code: snapshot.exit_code.unwrap_or(0),
+            stdout: snapshot.to_model_text(),
+            stderr: String::new(),
+        })
     }
-    Ok((s, truncated))
 }

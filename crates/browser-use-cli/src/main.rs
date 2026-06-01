@@ -20,7 +20,9 @@ use browser_use_agent::config_overrides::{
 use browser_use_agent::context::{
     append_user_shell_command_context_event, typed_user_input_payload_from_text_for_cwd,
 };
-use browser_use_agent::entrypoint::run_session_with_config;
+use browser_use_agent::entrypoint::{
+    cleanup_unified_exec_manager_for_session_id, run_session_with_config,
+};
 use browser_use_agent::infra::{
     capture_async, capture_blocking, install_process_crypto_provider,
     record_browser_script_response_events, record_python_response_final_event,
@@ -3392,7 +3394,9 @@ fn close_agent(store: &Store, current_id: Option<&str>, target: &str, reason: &s
         .agent_summary_for_child(&child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
     let previous_status = local_agent_status_value(store, &child, Some(&summary))?;
-    cleanup_agent_runtime_state_for_agent_subtree(store, &child_id, |_| 0)?;
+    cleanup_agent_runtime_state_for_agent_subtree(store, &child_id, |session_id| {
+        cleanup_unified_exec_manager_for_session_id(session_id)
+    })?;
     store.close_child_agent(&child_id, reason)?;
     store.append_event(
         &summary.parent_session_id,

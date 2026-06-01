@@ -9,6 +9,7 @@ pub mod orchestrator;
 pub mod registry;
 pub mod runtime;
 pub mod sandbox;
+pub mod unified_exec;
 
 pub use approval::{
     ApprovalStore, AskForApproval, ExecApprovalRequirement, GranularApprovalConfig, ReviewDecision,
@@ -25,6 +26,7 @@ pub use sandbox::{
     FileSystemSandboxPolicy, NoneSandboxProvider, SandboxLaunch, SandboxOverride,
     SandboxPermissions, SandboxPreference, SandboxProvider, SandboxType,
 };
+pub use unified_exec::{UnifiedExecEventEmitter, UnifiedExecManager};
 
 /// Re-export for callers that classify dispatch parallelism.
 pub use crate::decision::ToolParallelism;
