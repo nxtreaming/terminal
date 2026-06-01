@@ -374,7 +374,7 @@ fn chat_image_part(mime_type: &str, data: Option<&str>, url: Option<&str>) -> Op
     };
     Some(json!({
         "type": "image_url",
-        "image_url": { "url": resolved },
+        "image_url": { "url": resolved, "detail": "auto" },
     }))
 }
 
@@ -715,6 +715,7 @@ mod tests {
             content[1]["image_url"]["url"],
             json!("data:image/png;base64,AAAA")
         );
+        assert_eq!(content[1]["image_url"]["detail"], json!("auto"));
     }
 
     #[test]

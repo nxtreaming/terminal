@@ -685,7 +685,7 @@ fn media_event_content_part(
         Some(serde_json::json!({
             "type": "input_image",
             "image_url": resolved,
-            "detail": "high",
+            "detail": "auto",
         }))
     } else {
         Some(serde_json::json!({

@@ -216,7 +216,7 @@ fn lower_media(role: MessageRole, mime_type: &str, data: Option<&str>, url: Opti
         (None, None) => String::new(),
     };
     if mime_type.starts_with("image/") {
-        json!({ "type": "input_image", "image_url": resolved })
+        json!({ "type": "input_image", "image_url": resolved, "detail": "auto" })
     } else {
         json!({ "type": "input_file", "file_data": resolved })
     }
@@ -728,6 +728,7 @@ mod tests {
             input[1]["output"][0]["image_url"],
             json!("data:image/png;base64,AAAA")
         );
+        assert_eq!(input[1]["output"][0]["detail"], json!("auto"));
     }
 
     #[test]
