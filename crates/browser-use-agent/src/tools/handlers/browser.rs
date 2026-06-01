@@ -40,10 +40,12 @@ use std::fs;
 use std::path::PathBuf;
 use std::sync::Arc;
 
+use anyhow::{anyhow, bail};
 use base64::{engine::general_purpose, Engine as _};
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
 use browser_use_llm::schema::ContentPart;
-use serde_json::Value;
+use browser_use_store::Store;
+use serde_json::{json, Value};
 
 use crate::infra::{
     record_browser_command_response_events, record_browser_script_response_events_for_tool,
@@ -71,6 +73,10 @@ pub const DEFAULT_OBSERVE_TIMEOUT_MS: u64 = 1_000;
 /// [`ContentPart`]s so provider protocols can send images to vision-capable
 /// models while preserving a plain text fallback for logs/tests.
 pub const BROWSER_SCRIPT_CONTENT_STDOUT_PREFIX: &str = "\n__browser_script_content__:";
+
+const BROWSER_PREF_MODE: &str = "browser.preference.mode";
+const BROWSER_PREF_PROFILE: &str = "browser.preference.profile";
+const BROWSER_DOMAIN_PROFILE_PREFIX: &str = "browser.domain_profile.";
 
 /// What the model wants the browser to do.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -176,9 +182,8 @@ impl BrowserRequest {
         }
     }
 
-    fn effective_timeout_secs(&self) -> u64 {
-        self.timeout_secs
-            .unwrap_or(DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS)
+    fn effective_timeout_secs(&self, default_timeout_secs: u64) -> u64 {
+        self.timeout_secs.unwrap_or(default_timeout_secs)
     }
 
     fn effective_observe_ms(&self) -> u64 {
@@ -396,7 +401,10 @@ impl RealBackend {
         if self.normalized_browser_mode().is_none() {
             return false;
         }
-        let words = command_words(command);
+        let Ok(words) = browser_command_words(command) else {
+            return false;
+        };
+        let words = words.iter().map(String::as_str).collect::<Vec<_>>();
         !matches!(
             words.as_slice(),
             ["browser", "remote", "start", ..]
@@ -407,7 +415,10 @@ impl RealBackend {
     }
 
     fn rewrite_command_for_mode(&self, command: &str) -> String {
-        let words = command_words(command);
+        let Ok(words) = browser_command_words(command) else {
+            return command.to_string();
+        };
+        let words = words.iter().map(String::as_str).collect::<Vec<_>>();
         if self.normalized_browser_mode() == Some("cloud")
             && matches!(
                 words.as_slice(),
@@ -467,13 +478,6 @@ impl RealBackend {
         events.append(&mut started.events);
         Ok(events)
     }
-}
-
-fn command_words(command: &str) -> Vec<&str> {
-    command
-        .split_whitespace()
-        .map(|word| word.trim_matches(|ch: char| ch == '"' || ch == '\''))
-        .collect()
 }
 
 impl BrowserBackend for RealBackend {
@@ -560,6 +564,526 @@ impl BrowserBackend for RealBackend {
 
     fn cancel_script(&self, session_id: &str, run_id: &str) -> anyhow::Result<BrowserScriptOutput> {
         browser_use_browser::cancel_browser_script(session_id, run_id)
+    }
+}
+
+fn dispatch_browser_preference_command_for_mode(
+    store: &Store,
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    cmd: &str,
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<Option<Value>> {
+    let argv = browser_command_words(cmd)?;
+    let args = strip_browser_prefix(&argv);
+    let Some(first) = args.first().map(String::as_str) else {
+        return Ok(None);
+    };
+    match first {
+        "preference" | "preferences" => Ok(Some(dispatch_browser_preference(
+            store,
+            &args,
+            selected_browser_mode,
+        )?)),
+        "profile" | "profiles"
+            if args.get(1).is_some_and(|arg| {
+                matches!(
+                    arg.as_str(),
+                    "suggest" | "use" | "remember" | "forget" | "current"
+                )
+            }) =>
+        {
+            Ok(Some(dispatch_browser_profile_preference(
+                store,
+                backend,
+                session_id,
+                cwd,
+                artifact_dir,
+                &args,
+                selected_browser_mode,
+            )?))
+        }
+        _ => Ok(None),
+    }
+}
+
+fn dispatch_browser_preference(
+    store: &Store,
+    args: &[String],
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<Value> {
+    match args.get(1).map(String::as_str) {
+        None | Some("--json") | Some("show") => browser_preference_json(store),
+        Some("use") => {
+            let mode = args.get(2).map(String::as_str).ok_or_else(|| {
+                anyhow!("browser preference use requires <local|cloud|managed-headless>")
+            })?;
+            let normalized = normalize_browser_preference_mode(mode)?;
+            enforce_selected_browser_mode(selected_browser_mode, normalized)?;
+            store.set_setting(BROWSER_PREF_MODE, normalized)?;
+            store.set_setting("browser", browser_display_name(normalized))?;
+            Ok(json!({
+                "status": "ok",
+                "preference": browser_preference_json(store)?,
+                "next_step": "browser connect",
+            }))
+        }
+        Some(other) => bail!("unknown browser preference command: {other}"),
+    }
+}
+
+fn dispatch_browser_profile_preference(
+    store: &Store,
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    args: &[String],
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<Value> {
+    match args.get(1).map(String::as_str) {
+        Some("current") => browser_preference_json(store),
+        Some("use") => {
+            enforce_selected_browser_mode(selected_browser_mode, "local")?;
+            let profile_id = args
+                .get(2)
+                .map(String::as_str)
+                .ok_or_else(|| anyhow!("browser profile use requires <profile-id>"))?;
+            store.set_setting(BROWSER_PREF_PROFILE, profile_id)?;
+            Ok(json!({
+                "status": "ok",
+                "profile_id": profile_id,
+                "next_step": browser_profile_connect_next_step("local", Some(profile_id)),
+            }))
+        }
+        Some("remember") => {
+            let domain = option_value_core(args, "--domain")
+                .ok_or_else(|| anyhow!("browser profile remember requires --domain <domain>"))?;
+            let profile_id = option_value_core(args, "--profile")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| {
+                    anyhow!("browser profile remember requires --profile <profile-id>")
+                })?;
+            let mode = option_value_core(args, "--mode")
+                .map(|mode| normalize_browser_preference_mode(&mode).map(ToOwned::to_owned))
+                .transpose()?
+                .or_else(|| {
+                    selected_browser_mode
+                        .and_then(|mode| normalize_browser_preference_mode(mode).ok())
+                        .map(ToOwned::to_owned)
+                })
+                .or_else(|| store.get_setting(BROWSER_PREF_MODE).ok().flatten())
+                .unwrap_or_else(|| "local".to_string());
+            enforce_selected_browser_mode(selected_browser_mode, &mode)?;
+            let value = json!({
+                "domain": normalize_domain(&domain),
+                "mode": mode,
+                "profile_id": profile_id,
+            });
+            store.set_setting(
+                &browser_domain_profile_key(&domain),
+                &serde_json::to_string(&value)?,
+            )?;
+            store.set_setting(BROWSER_PREF_MODE, value["mode"].as_str().unwrap_or("local"))?;
+            store.set_setting(
+                BROWSER_PREF_PROFILE,
+                value["profile_id"].as_str().unwrap_or(""),
+            )?;
+            store.set_setting(
+                "browser",
+                browser_display_name(value["mode"].as_str().unwrap_or("local")),
+            )?;
+            let next_step = browser_profile_connect_next_step(
+                value["mode"].as_str().unwrap_or("local"),
+                value["profile_id"].as_str(),
+            );
+            Ok(json!({
+                "status": "ok",
+                "remembered": value,
+                "next_step": next_step,
+            }))
+        }
+        Some("forget") => {
+            let domain = option_value_core(args, "--domain")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow!("browser profile forget requires --domain <domain>"))?;
+            store.delete_setting(&browser_domain_profile_key(&domain))?;
+            Ok(json!({ "status": "ok", "forgot_domain": normalize_domain(&domain) }))
+        }
+        Some("suggest") => {
+            enforce_selected_browser_mode(selected_browser_mode, "local")?;
+            let domain = option_value_core(args, "--domain")
+                .or_else(|| args.get(2).cloned())
+                .ok_or_else(|| anyhow!("browser profile suggest requires --domain <domain>"))?;
+            let remembered = remembered_domain_profile(store, &domain)?;
+            let profiles = backend
+                .command(
+                    session_id,
+                    cwd,
+                    artifact_dir,
+                    "browser local profiles --json",
+                )
+                .map(|output| output.content)
+                .unwrap_or_else(|error| {
+                    json!({
+                        "status": "failed",
+                        "error": format!("{error:#}"),
+                        "profiles": [],
+                    })
+                });
+            let next_step = remembered.as_ref().map_or_else(
+                || "Ask the user which profile to use, then run browser profile remember --domain <domain> --profile <profile-id>".to_string(),
+                |remembered| {
+                    browser_profile_connect_next_step(
+                        remembered["mode"].as_str().unwrap_or("local"),
+                        remembered["profile_id"].as_str(),
+                    )
+                },
+            );
+            Ok(json!({
+                "status": "ok",
+                "domain": normalize_domain(&domain),
+                "remembered": remembered,
+                "local_profiles": profiles.get("profiles").cloned().unwrap_or_else(|| json!([])),
+                "next_step": next_step,
+            }))
+        }
+        Some(other) => bail!("unknown browser profile command: {other}"),
+        None => browser_preference_json(store),
+    }
+}
+
+fn resolve_browser_command_for_selected_mode(
+    store: Option<&Store>,
+    cmd: &str,
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<String> {
+    let argv = browser_command_words(cmd)?;
+    let args = strip_browser_prefix(&argv);
+    if args.len() == 1 && args.first().is_some_and(|arg| arg == "connect") {
+        let effective_mode = effective_browser_mode(store, selected_browser_mode)?;
+        let profile_id = if selected_browser_mode.is_some() {
+            None
+        } else {
+            store
+                .map(|store| store.get_setting(BROWSER_PREF_PROFILE))
+                .transpose()?
+                .flatten()
+        };
+        Ok(browser_connect_command_for_mode(
+            effective_mode,
+            profile_id.as_deref(),
+        ))
+    } else {
+        enforce_browser_command_matches_selected_mode(&args, selected_browser_mode)?;
+        Ok(cmd.to_string())
+    }
+}
+
+fn effective_browser_mode(
+    store: Option<&Store>,
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<&'static str> {
+    if let Some(mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        return normalize_browser_preference_mode(mode);
+    }
+    preferred_browser_mode(store)
+}
+
+fn preferred_browser_mode(store: Option<&Store>) -> anyhow::Result<&'static str> {
+    let mode = match store {
+        Some(store) => store
+            .get_setting(BROWSER_PREF_MODE)?
+            .or_else(|| {
+                store
+                    .get_setting("browser")
+                    .ok()
+                    .flatten()
+                    .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+            })
+            .unwrap_or_else(|| "local".to_string()),
+        None => "local".to_string(),
+    };
+    normalize_browser_preference_mode(&mode)
+}
+
+fn browser_connect_command_for_mode(mode: &str, profile_id: Option<&str>) -> String {
+    match normalize_browser_preference_mode(mode).unwrap_or("local") {
+        "cloud" => profile_id.filter(|value| !value.is_empty()).map_or_else(
+            || "browser remote start".to_string(),
+            |profile_id| {
+                format!(
+                    "browser remote start --profile-id {}",
+                    shell_quote_browser_arg(profile_id)
+                )
+            },
+        ),
+        "managed-headless" => "browser connect managed --headless".to_string(),
+        "managed-headed" => "browser connect managed --headed".to_string(),
+        _ => "browser connect local".to_string(),
+    }
+}
+
+fn enforce_selected_browser_mode(
+    selected_browser_mode: Option<&str>,
+    requested_mode: &str,
+) -> anyhow::Result<()> {
+    let Some(selected_mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let selected_mode = normalize_browser_preference_mode(selected_mode)?;
+    let requested_mode = normalize_browser_preference_mode(requested_mode)?;
+    if selected_mode == requested_mode {
+        return Ok(());
+    }
+    bail!(
+        "browser mode is locked to {} for this run; change the browser selector in the terminal UI before using {}",
+        browser_display_name(selected_mode),
+        browser_display_name(requested_mode),
+    )
+}
+
+fn enforce_browser_command_matches_selected_mode(
+    args: &[String],
+    selected_browser_mode: Option<&str>,
+) -> anyhow::Result<()> {
+    let Some(selected_mode) = selected_browser_mode
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    else {
+        return Ok(());
+    };
+    let selected_mode = normalize_browser_preference_mode(selected_mode)?;
+    let Some(command) = args.first().map(String::as_str) else {
+        return Ok(());
+    };
+    match command {
+        "help" | "--help" | "-h" | "status" | "doctor" | "domain" | "runtime" | "script" => Ok(()),
+        "connect" => match args.get(1).map(String::as_str) {
+            None => Ok(()),
+            Some("local") => enforce_selected_browser_mode(Some(selected_mode), "local"),
+            Some("managed") => {
+                let requested_mode =
+                    if has_browser_arg(args, "--headed") || has_browser_arg(args, "--headful") {
+                        "managed-headed"
+                    } else {
+                        "managed-headless"
+                    };
+                enforce_selected_browser_mode(Some(selected_mode), requested_mode)
+            }
+            Some("remote-cdp") => bail!(
+                "browser mode is locked to {} for this run; remote CDP endpoints are not selectable from this terminal browser mode",
+                browser_display_name(selected_mode),
+            ),
+            Some(other) => bail!("unknown browser connect mode: {other}"),
+        },
+        "local" => enforce_selected_browser_mode(Some(selected_mode), "local"),
+        "remote" => enforce_selected_browser_mode(Some(selected_mode), "cloud"),
+        "recover" => match args.get(1).map(String::as_str) {
+            Some("restart-owned-browser") => match selected_mode {
+                "managed-headless" | "managed-headed" => Ok(()),
+                _ => bail!(
+                    "browser mode is locked to {} for this run; restart-owned-browser only applies to managed Chromium",
+                    browser_display_name(selected_mode),
+                ),
+            },
+            Some("stop-owned-remote") => enforce_selected_browser_mode(Some(selected_mode), "cloud"),
+            _ => Ok(()),
+        },
+        _ => Ok(()),
+    }
+}
+
+fn has_browser_arg(args: &[String], flag: &str) -> bool {
+    args.iter().any(|arg| arg == flag)
+}
+
+fn browser_preference_json(store: &Store) -> anyhow::Result<Value> {
+    let mode = store
+        .get_setting(BROWSER_PREF_MODE)?
+        .or_else(|| {
+            store
+                .get_setting("browser")
+                .ok()
+                .flatten()
+                .and_then(|value| display_browser_to_mode(&value).map(ToOwned::to_owned))
+        })
+        .unwrap_or_else(|| "local".to_string());
+    let profile_id = store.get_setting(BROWSER_PREF_PROFILE)?;
+    let domain_profiles = store
+        .list_settings()?
+        .into_iter()
+        .filter_map(|(key, value)| {
+            key.strip_prefix(BROWSER_DOMAIN_PROFILE_PREFIX)
+                .and_then(|domain| {
+                    serde_json::from_str::<Value>(&value)
+                        .ok()
+                        .map(|value| (domain.to_string(), value))
+                })
+        })
+        .map(|(domain, value)| json!({ "domain": domain, "preference": value }))
+        .collect::<Vec<_>>();
+    Ok(json!({
+        "mode": normalize_browser_preference_mode(&mode)?,
+        "display": browser_display_name(normalize_browser_preference_mode(&mode)?),
+        "profile_id": profile_id,
+        "domain_profiles": domain_profiles,
+        "connect_command": match normalize_browser_preference_mode(&mode)? {
+            "cloud" => "browser remote start",
+            "managed-headless" => "browser connect managed --headless",
+            "managed-headed" => "browser connect managed --headed",
+            _ => "browser connect local",
+        },
+    }))
+}
+
+fn remembered_domain_profile(store: &Store, domain: &str) -> anyhow::Result<Option<Value>> {
+    store
+        .get_setting(&browser_domain_profile_key(domain))?
+        .map(|raw| serde_json::from_str::<Value>(&raw).map_err(Into::into))
+        .transpose()
+}
+
+fn browser_command_words(cmd: &str) -> anyhow::Result<Vec<String>> {
+    let mut words = Vec::new();
+    let mut current = String::new();
+    let mut chars = cmd.chars().peekable();
+    let mut quote = None;
+    while let Some(ch) = chars.next() {
+        match (quote, ch) {
+            (Some(q), c) if c == q => quote = None,
+            (Some(_), '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (Some(_), c) => current.push(c),
+            (None, '"' | '\'') => quote = Some(ch),
+            (None, c) if c.is_whitespace() => {
+                if !current.is_empty() {
+                    words.push(std::mem::take(&mut current));
+                }
+            }
+            (None, '\\') => {
+                if let Some(next) = chars.next() {
+                    current.push(next);
+                }
+            }
+            (None, c) => current.push(c),
+        }
+    }
+    if quote.is_some() {
+        bail!("unterminated quote in browser command");
+    }
+    if !current.is_empty() {
+        words.push(current);
+    }
+    Ok(words)
+}
+
+fn strip_browser_prefix(argv: &[String]) -> Vec<String> {
+    if argv.first().is_some_and(|arg| arg == "browser") {
+        argv[1..].to_vec()
+    } else {
+        argv.to_vec()
+    }
+}
+
+fn option_value_core(argv: &[String], flag: &str) -> Option<String> {
+    argv.windows(2)
+        .find(|window| window[0] == flag)
+        .map(|window| window[1].clone())
+}
+
+fn shell_quote_browser_arg(value: &str) -> String {
+    if value
+        .chars()
+        .all(|ch| ch.is_ascii_alphanumeric() || matches!(ch, '-' | '_' | ':' | '/' | '.'))
+    {
+        value.to_string()
+    } else {
+        format!("'{}'", value.replace('\'', "'\\''"))
+    }
+}
+
+fn normalize_domain(domain: &str) -> String {
+    domain
+        .trim()
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_start_matches("www.")
+        .trim_matches('/')
+        .to_ascii_lowercase()
+}
+
+fn browser_domain_profile_key(domain: &str) -> String {
+    format!(
+        "{BROWSER_DOMAIN_PROFILE_PREFIX}{}",
+        normalize_domain(domain)
+    )
+}
+
+fn browser_profile_connect_next_step(mode: &str, profile_id: Option<&str>) -> String {
+    let profile_id = profile_id.filter(|value| !value.is_empty());
+    match normalize_browser_preference_mode(mode).unwrap_or("local") {
+        "cloud" => profile_id.map_or_else(
+            || "browser remote start".to_string(),
+            |profile_id| {
+                format!(
+                    "browser remote start --profile-id {}",
+                    shell_quote_browser_arg(profile_id)
+                )
+            },
+        ),
+        "managed-headless" => "browser connect managed --headless".to_string(),
+        "managed-headed" => "browser connect managed --headed".to_string(),
+        _ => profile_id.map_or_else(
+            || "browser connect local".to_string(),
+            |profile_id| {
+                format!(
+                    "If this profile is already open with remote debugging, run `browser connect local`; otherwise run `browser local setup --profile {}` and then `browser connect local`.",
+                    shell_quote_browser_arg(profile_id)
+                )
+            },
+        ),
+    }
+}
+
+fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str> {
+    let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "local" | "local-chrome" => Ok("local"),
+        "cloud" | "browser-use-cloud" => Ok("cloud"),
+        "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
+        "managed" | "managed-headed" | "headed" => Ok("managed-headed"),
+        other => bail!("unknown browser preference mode: {other}"),
+    }
+}
+
+fn browser_display_name(mode: &str) -> &'static str {
+    match mode {
+        "cloud" => "Browser Use cloud",
+        "managed-headless" => "Headless Chromium",
+        "managed-headed" => "Managed Chromium",
+        _ => "Local Chrome",
+    }
+}
+
+fn display_browser_to_mode(display: &str) -> Option<&'static str> {
+    match display {
+        "Browser Use cloud" => Some("cloud"),
+        "Headless Chromium" => Some("managed-headless"),
+        "Managed Chromium" => Some("managed-headed"),
+        "Local Chrome" => Some("local"),
+        _ => None,
     }
 }
 
@@ -791,6 +1315,8 @@ fn browser_script_error_detail(error: &str) -> String {
 #[derive(Clone)]
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
+    selected_browser_mode: Option<String>,
+    default_script_timeout_secs: u64,
     session_id_fallback: Option<String>,
     persistence: Option<BrowserPersistence>,
 }
@@ -819,6 +1345,8 @@ impl BrowserTool {
     pub fn new() -> Self {
         Self {
             backend: Arc::new(RealBackend::default()),
+            selected_browser_mode: None,
+            default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
         }
@@ -827,7 +1355,9 @@ impl BrowserTool {
     /// Construct a real browser tool with the run's configured browser mode.
     pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
         Self {
-            backend: Arc::new(RealBackend::with_browser_mode(browser_mode)),
+            backend: Arc::new(RealBackend::with_browser_mode(browser_mode.clone())),
+            selected_browser_mode: browser_mode,
+            default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
         }
@@ -837,9 +1367,28 @@ impl BrowserTool {
     pub fn with_backend(backend: Arc<dyn BrowserBackend>) -> Self {
         Self {
             backend,
+            selected_browser_mode: None,
+            default_script_timeout_secs: DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS,
             session_id_fallback: None,
             persistence: None,
         }
+    }
+
+    /// Override the selected browser mode while keeping the existing backend.
+    ///
+    /// Tests use this with a fake backend; production normally uses
+    /// [`BrowserTool::with_browser_mode`] so the backend auto-connection behavior
+    /// receives the same mode.
+    pub fn with_selected_browser_mode(mut self, browser_mode: Option<String>) -> Self {
+        self.selected_browser_mode = browser_mode;
+        self
+    }
+
+    /// Configure the default browser_script timeout used when the model omits
+    /// the hidden compatibility `timeout_secs` argument.
+    pub fn with_default_script_timeout_secs(mut self, timeout_secs: u64) -> Self {
+        self.default_script_timeout_secs = timeout_secs;
+        self
     }
 
     /// Configure the browser tool with the live agent session id. The model can
@@ -981,10 +1530,11 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
             .artifact_dir
             .clone()
             .unwrap_or_else(|| ctx.artifact_root.clone());
-        let timeout_secs = req.effective_timeout_secs();
+        let timeout_secs = req.effective_timeout_secs(self.default_script_timeout_secs);
         let observe_ms = req.effective_observe_ms();
         let action = req.action.clone();
         let persistence = self.persistence.clone();
+        let selected_browser_mode = self.selected_browser_mode.clone();
         let tool_call_id = ctx.call_id.clone();
         let tool_name = if ctx.tool_name.trim().is_empty() {
             match &action {
@@ -1002,9 +1552,49 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         let result = tokio::task::spawn_blocking(move || -> Result<ExecOutput, ToolError> {
             match action {
                 BrowserAction::Command { command } => {
-                    let out = backend
-                        .command(&session_id, &cwd, &artifact_dir, &command)
-                        .map_err(ToolError::Other)?;
+                    let selected_browser_mode = selected_browser_mode.as_deref();
+                    let out = if let Some(persistence) = &persistence {
+                        let store = persistence.store.lock().map_err(|_| {
+                            ToolError::Other(anyhow::anyhow!("store mutex poisoned"))
+                        })?;
+                        if let Some(content) = dispatch_browser_preference_command_for_mode(
+                            &store,
+                            backend.as_ref(),
+                            &session_id,
+                            &cwd,
+                            &artifact_dir,
+                            &command,
+                            selected_browser_mode,
+                        )
+                        .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                        {
+                            BrowserCommandOutput {
+                                content,
+                                events: Vec::new(),
+                            }
+                        } else {
+                            let resolved = resolve_browser_command_for_selected_mode(
+                                Some(&store),
+                                &command,
+                                selected_browser_mode,
+                            )
+                            .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                            drop(store);
+                            backend
+                                .command(&session_id, &cwd, &artifact_dir, &resolved)
+                                .map_err(ToolError::Other)?
+                        }
+                    } else {
+                        let resolved = resolve_browser_command_for_selected_mode(
+                            None,
+                            &command,
+                            selected_browser_mode,
+                        )
+                        .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                        backend
+                            .command(&session_id, &cwd, &artifact_dir, &resolved)
+                            .map_err(ToolError::Other)?
+                    };
                     if let Some(persistence) = &persistence {
                         if let Ok(store) = persistence.store.lock() {
                             let _ = record_browser_command_response_events(

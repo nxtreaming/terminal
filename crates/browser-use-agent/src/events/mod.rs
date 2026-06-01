@@ -51,6 +51,8 @@ pub struct TurnCtx {
     pub session_id: String,
     pub model: String,
     pub provider: String,
+    pub base_instructions: String,
+    pub browser_mode_instruction: Option<String>,
     pub turn_idx: usize,
     pub attempt: usize,
 }

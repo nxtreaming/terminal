@@ -82,6 +82,14 @@ fn browser_agent_system_prompt_loads_main_interaction_skills() {
     assert_eq!(browser_harness_interaction_skills().len(), 18);
 }
 
+#[test]
+fn browser_mode_instruction_matches_main_local_connection_guidance() {
+    let prompt = browser_mode_instruction("local");
+    assert!(prompt.contains("Selected browser mode: Local Chrome"));
+    assert!(prompt.contains("Use `browser connect local` before page work"));
+    assert!(prompt.contains("browser local setup"));
+}
+
 /// The collaboration selector returns the right asset per mode, wrapped in the
 /// collaboration-mode tags, with `{{KNOWN_MODE_NAMES}}` substituted, and the
 /// two modes differ.
