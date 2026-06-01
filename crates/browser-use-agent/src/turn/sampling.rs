@@ -696,7 +696,7 @@ fn media_event_content_part(
         Some(serde_json::json!({
             "type": "input_image",
             "image_url": resolved,
-            "detail": detail.unwrap_or("high"),
+            "detail": detail.unwrap_or("auto"),
         }))
     } else {
         Some(serde_json::json!({
@@ -893,9 +893,17 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 /// unit-reachable while the fused driver still advertises the catalog.
 fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
-    req.system.push(SystemPart::new(
-        crate::prompts::browser_agent_system_prompt(),
-    ));
+    req.system
+        .push(SystemPart::new(ctx.base_instructions.clone()));
     req.messages = input;
+    if let Some(instruction) = ctx.browser_mode_instruction.as_deref() {
+        req.messages.insert(
+            0,
+            Message::new(
+                MessageRole::System,
+                vec![ContentPart::text(instruction.to_string())],
+            ),
+        );
+    }
     req
 }

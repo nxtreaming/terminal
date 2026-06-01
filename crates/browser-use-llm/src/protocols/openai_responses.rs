@@ -237,9 +237,7 @@ fn lower_media(
             ("type".to_string(), json!("input_image")),
             ("image_url".to_string(), json!(resolved)),
         ]);
-        if let Some(detail) = detail {
-            image.insert("detail".to_string(), json!(detail));
-        }
+        image.insert("detail".to_string(), json!(detail.unwrap_or("auto")));
         Value::Object(image)
     } else {
         json!({ "type": "input_file", "file_data": resolved })
@@ -788,12 +786,20 @@ mod tests {
             MessageRole::Tool,
             vec![ContentPart::ToolResult {
                 tool_call_id: "call_view".into(),
-                content: vec![ContentPart::Media {
-                    mime_type: "image/png".into(),
-                    data: Some("AAAA".into()),
-                    url: None,
-                    detail: Some("original".into()),
-                }],
+                content: vec![
+                    ContentPart::Media {
+                        mime_type: "image/png".into(),
+                        data: Some("AAAA".into()),
+                        url: None,
+                        detail: Some("original".into()),
+                    },
+                    ContentPart::Media {
+                        mime_type: "image/jpeg".into(),
+                        data: Some("BBBB".into()),
+                        url: None,
+                        detail: None,
+                    },
+                ],
                 is_error: false,
             }],
         ));
@@ -808,6 +814,11 @@ mod tests {
             json!("data:image/png;base64,AAAA")
         );
         assert_eq!(input[1]["output"][0]["detail"], json!("original"));
+        assert_eq!(
+            input[1]["output"][1]["image_url"],
+            json!("data:image/jpeg;base64,BBBB")
+        );
+        assert_eq!(input[1]["output"][1]["detail"], json!("auto"));
     }
 
     #[test]

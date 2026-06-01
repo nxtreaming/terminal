@@ -215,6 +215,8 @@ fn ctx() -> TurnCtx {
         session_id: "sess-loop".to_string(),
         model: "gpt-5-codex".to_string(),
         provider: "openai".to_string(),
+        base_instructions: crate::prompts::browser_agent_system_prompt(),
+        browser_mode_instruction: None,
         turn_idx: 0,
         attempt: 0,
     }

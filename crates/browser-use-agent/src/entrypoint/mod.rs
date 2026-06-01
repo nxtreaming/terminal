@@ -1851,7 +1851,7 @@ fn media_content_part_for_provider(
         Some(serde_json::json!({
             "type": "input_image",
             "image_url": resolved,
-            "detail": detail.unwrap_or("high"),
+            "detail": detail.unwrap_or("auto"),
         }))
     } else {
         Some(serde_json::json!({
@@ -1938,6 +1938,12 @@ fn turn_ctx(session_id: &SessionId, config: &ProviderRunConfig) -> TurnCtx {
         // Best-effort wire-provider label from the backend; the request's real
         // provider identity is fixed inside `build_route`.
         provider: format!("{:?}", config.backend).to_ascii_lowercase(),
+        base_instructions: base_instructions_for_config(config),
+        browser_mode_instruction: config
+            .options
+            .browser_mode
+            .as_deref()
+            .map(crate::prompts::browser_mode_instruction),
         turn_idx: 0,
         attempt: 0,
     }
@@ -3776,6 +3782,8 @@ mod tests {
             session_id: session_id.clone(),
             model: "m".to_string(),
             provider: "fake".to_string(),
+            base_instructions: crate::prompts::browser_agent_system_prompt(),
+            browser_mode_instruction: None,
             turn_idx: 0,
             attempt: 0,
         };

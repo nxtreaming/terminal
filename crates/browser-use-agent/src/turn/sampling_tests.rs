@@ -121,6 +121,8 @@ fn ctx() -> TurnCtx {
         session_id: "sess-1".to_string(),
         model: "gpt-5-codex".to_string(),
         provider: "openai".to_string(),
+        base_instructions: crate::prompts::browser_agent_system_prompt(),
+        browser_mode_instruction: None,
         turn_idx: 0,
         attempt: 0,
     }
@@ -411,6 +413,36 @@ async fn driver_passes_populated_per_call_request_to_open_stream() {
         ctx().provider.into(),
         "request carries the turn's provider"
     );
+}
+
+#[tokio::test]
+async fn driver_prepends_selected_browser_mode_instruction_to_messages() {
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink: Arc<dyn EventSink> = Arc::new(RecordingSink::default());
+    let mut ctx = ctx();
+    ctx.browser_mode_instruction = Some(crate::prompts::browser_mode_instruction("local"));
+    let d = ModelSamplingDriver::new(transport, sink, ctx, 5).without_jitter();
+
+    let input = user_input();
+    let _ = d
+        .run_sampling_request(input.clone(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    let req = &captured[0];
+    assert_eq!(req.messages.len(), input.len() + 1);
+    assert_eq!(req.messages[0].role, MessageRole::System);
+    assert!(
+        matches!(
+            req.messages[0].content.first(),
+            Some(ContentPart::Text { text }) if text.contains("Use `browser connect local` before page work")
+        ),
+        "mode instruction message was not prepended: {:?}",
+        req.messages[0]
+    );
+    assert_eq!(&req.messages[1..], input.as_slice());
 }
 
 // ---- (6) each turn installs its OWN request (the cell is per-call) ----------
