@@ -871,6 +871,12 @@ fn committed_node_for_event(
             tool_failed_lines(event),
             NodeStyle::Failed,
         )),
+        "tool.aborted" => Some(timeline_node(
+            event,
+            "run",
+            tool_failed_lines(event),
+            NodeStyle::Muted,
+        )),
         "tool.output_spilled" => {
             let path = event
                 .payload
@@ -1590,6 +1596,7 @@ fn is_live_output_event(event: &EventRecord) -> bool {
             .and_then(serde_json::Value::as_str)
             .is_some_and(|text| !text.trim().is_empty()),
         "command.waiting"
+        | "tool.output_delta"
         | "tool.started"
         | "browser.page"
         | "browser.state"
@@ -2174,7 +2181,7 @@ fn tool_output_group(name: &str) -> &str {
     match name {
         "browser_script" => "browser",
         "python" => "python",
-        "shell" => "run",
+        "shell" | "exec_command" | "write_stdin" => "run",
         _ => "tool",
     }
 }
@@ -2184,8 +2191,6 @@ fn is_known_tool_with_domain_events(name: &str) -> bool {
         name,
         "done"
             | "python"
-            | "exec_command"
-            | "write_stdin"
             | "apply_patch"
             | "read_file"
             | "search_files"

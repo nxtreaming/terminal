@@ -499,7 +499,7 @@ impl McpClient for FakeMcpClient {
     }
 }
 
-/// Build a registry holding all ten handlers via [`default_registry`], using
+/// Build a registry holding all handlers via [`default_registry`], using
 /// fake backends for browser/python/mcp so no OS resource is touched.
 fn full_registry() -> ToolRegistry {
     default_registry(
@@ -532,14 +532,14 @@ fn ctx_at(name: &str, cwd: PathBuf) -> ToolCtx {
 }
 
 #[test]
-fn default_registry_registers_all_eleven_tools() {
+fn default_registry_registers_all_tools() {
     let reg = full_registry();
-    assert_eq!(reg.len(), 11, "all eleven tools must register");
+    assert_eq!(reg.len(), 13, "all tools must register");
     let defs = reg.model_visible_definitions();
     assert_eq!(
         defs.len(),
-        11,
-        "model_visible_definitions must list all eleven"
+        13,
+        "model_visible_definitions must list all tools"
     );
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     names.sort_unstable();
@@ -549,6 +549,7 @@ fn default_registry_registers_all_eleven_tools() {
             "apply_patch",
             "browser",
             "done",
+            "exec_command",
             "mcp",
             "python",
             "request_user_input",
@@ -557,6 +558,7 @@ fn default_registry_registers_all_eleven_tools() {
             "update_plan",
             "view_image",
             "web_search",
+            "write_stdin",
         ]
     );
     // Every definition carries a non-empty description + object schema.

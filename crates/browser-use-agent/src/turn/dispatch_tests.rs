@@ -81,7 +81,7 @@ impl CallRunner for ScriptedRunner {
             .unwrap_or(false)
     }
 
-    async fn run(&self, call: ContentPart) -> Message {
+    async fn run(&self, call: ContentPart, _cancel: CancellationToken) -> Message {
         let id = call_id(&call);
         self.runs_started.fetch_add(1, Ordering::SeqCst);
         self.invocation_order.lock().unwrap().push(id.clone());
@@ -110,9 +110,13 @@ impl CallRunner for ScriptedRunner {
 
 /// Build a model tool-call content part with the given id (the dispatcher input).
 fn tool_call(id: &str) -> ContentPart {
+    named_tool_call(id, "shell")
+}
+
+fn named_tool_call(id: &str, name: &str) -> ContentPart {
     ContentPart::ToolCall {
         id: id.to_string(),
-        name: "shell".to_string(),
+        name: name.to_string(),
         input: serde_json::json!({ "command": ["echo", id] }),
         provider_metadata: None,
     }
@@ -147,6 +151,26 @@ fn output_id(msg: &Message) -> String {
         }
     }
     String::new()
+}
+
+fn output_text_and_error(msg: &Message) -> (String, bool) {
+    for part in &msg.content {
+        if let ContentPart::ToolResult {
+            content, is_error, ..
+        } = part
+        {
+            let text = content
+                .iter()
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.as_str()),
+                    _ => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            return (text, *is_error);
+        }
+    }
+    (String::new(), false)
 }
 
 fn script(id: &str, sleep_ms: u64, parallel_safe: bool) -> CallScript {
@@ -306,6 +330,31 @@ async fn cancellation_mid_dispatch_stops_scheduling_further_calls() {
         started < 5,
         "cancellation must stop scheduling further calls (runs_started={started}, expected <5)"
     );
+}
+
+#[tokio::test]
+async fn cancellation_preserves_exec_command_result() {
+    let runner = ScriptedRunner::new(vec![script("exec", 60, false)]);
+    let dispatcher = ToolDispatcher::with_runner(runner.clone(), true);
+
+    let cancel = CancellationToken::new();
+    let cancel2 = cancel.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(Duration::from_millis(20)).await;
+        cancel2.cancel();
+    });
+
+    let out = dispatcher
+        .dispatch_ordered(vec![named_tool_call("exec", "exec_command")], cancel)
+        .await;
+
+    assert_eq!(out.outputs_in_order.len(), 1);
+    let (text, is_error) = output_text_and_error(&out.outputs_in_order[0]);
+    assert!(
+        !is_error,
+        "exec_command result should not be aborted: {text}"
+    );
+    assert_eq!(text, "output:exec");
 }
 
 // ---- (5) needs_follow_up: true when dispatched, false for empty -----------

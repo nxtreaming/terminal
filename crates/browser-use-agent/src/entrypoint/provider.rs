@@ -40,7 +40,8 @@
 //! matching the legacy `stored_or_env` precedence. A missing credential surfaces
 //! as [`ProviderResolveError::MissingCredentials`] (honest, never a panic).
 
-use std::sync::{Arc, Mutex};
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex, OnceLock};
 
 use browser_use_llm::auth::{load_codex_auth, CodexAuth};
 use browser_use_llm::route::ModelClient;
@@ -73,6 +74,7 @@ use crate::tools::handlers::request_user_input::StoreRoundTripResponder;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::runtime::ToolCtx;
 use crate::tools::sandbox::{FileSystemSandboxPolicy, NoneSandboxProvider};
+use crate::tools::UnifiedExecManager;
 use crate::turn::dispatch::{RegistryRunner, ToolDispatcher};
 use crate::turn::model_path::build_route;
 use crate::turn::model_path::build_sampling_driver;
@@ -108,6 +110,59 @@ pub type RealSamplingDriver = ModelSamplingDriver<
 /// REAL [`GuardianApprover`] (permissive sandbox seam). Named so the builder + the
 /// fused driver agree on the runner's generic arguments.
 pub type RealToolDispatcher = ToolDispatcher<RegistryRunner<NoneSandboxProvider, GuardianApprover>>;
+
+static UNIFIED_EXEC_MANAGERS: OnceLock<Mutex<HashMap<String, UnifiedExecManager>>> =
+    OnceLock::new();
+
+fn unified_exec_managers() -> &'static Mutex<HashMap<String, UnifiedExecManager>> {
+    UNIFIED_EXEC_MANAGERS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn unified_exec_manager_for_session(session_id: Option<&SessionId>) -> UnifiedExecManager {
+    let Some(session_id) = session_id else {
+        return UnifiedExecManager::default();
+    };
+    let key = session_id.as_str().to_string();
+    let Ok(mut managers) = unified_exec_managers().lock() else {
+        return UnifiedExecManager::default();
+    };
+    managers.entry(key).or_default().clone()
+}
+
+pub fn cleanup_unified_exec_manager_for_session_id(session_id: &str) -> usize {
+    let manager = unified_exec_managers()
+        .lock()
+        .ok()
+        .and_then(|mut managers| managers.remove(session_id));
+    manager
+        .map(|manager| manager.terminate_all_best_effort())
+        .unwrap_or(0)
+}
+
+pub fn cleanup_all_unified_exec_managers() -> usize {
+    let managers = unified_exec_managers()
+        .lock()
+        .ok()
+        .map(|mut managers| {
+            managers
+                .drain()
+                .map(|(_, manager)| manager)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    managers
+        .into_iter()
+        .map(|manager| manager.terminate_all_best_effort())
+        .sum()
+}
+
+#[cfg(test)]
+struct NoopEventSink;
+
+#[cfg(test)]
+impl EventSink for NoopEventSink {
+    fn emit(&self, _ev: PendingEvent) {}
+}
 
 /// Errors resolving a provider into a driver.
 #[derive(Debug)]
@@ -538,13 +593,14 @@ fn resolve_provider_with_python(
     // It yields the text-only sampler; we then attach the FUSED dispatch path so a
     // model tool-call actually EXECUTES (through the registry + orchestrator) and
     // its output re-enters the prompt via `recorder`, and the loop re-samples.
-    let driver = build_sampling_driver(transport, sink, ctx, max_retries).with_fusion(
+    let driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries).with_fusion(
         build_tool_dispatcher_with_cwd(
             python_backend,
             config,
             user_input,
             tool_cwd,
             tool_artifact_root,
+            sink,
         ),
         recorder,
     );
@@ -623,6 +679,7 @@ fn build_tool_dispatcher(
         user_input,
         tool_cwd.clone(),
         tool_cwd,
+        Arc::new(NoopEventSink),
     )
 }
 
@@ -632,6 +689,7 @@ fn build_tool_dispatcher_with_cwd(
     user_input: Option<(SharedStore, SessionId)>,
     tool_cwd: std::path::PathBuf,
     tool_artifact_root: std::path::PathBuf,
+    event_sink: Arc<dyn EventSink>,
 ) -> Arc<RealToolDispatcher> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
@@ -642,7 +700,10 @@ fn build_tool_dispatcher_with_cwd(
     use crate::tools::handlers::request_user_input::{
         RequestUserInputRequest, RequestUserInputTool,
     };
-    use crate::tools::handlers::shell::{ShellRequest, ShellTool};
+    use crate::tools::handlers::shell::{
+        ExecCommandRequest, ExecCommandTool, ShellRequest, ShellTool, WriteStdinRequest,
+        WriteStdinTool,
+    };
     use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
     use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
     use crate::tools::handlers::view_image::{ViewImageRequest, ViewImageTool};
@@ -655,7 +716,45 @@ fn build_tool_dispatcher_with_cwd(
     // Typed with the production approver (`GuardianApprover`) so the registry, the
     // orchestrator, and the runner all agree on the `(S, A)` seams.
     let mut reg: ToolRegistry<NoneSandboxProvider, GuardianApprover> = ToolRegistry::new();
-    reg.register::<_, ShellRequest>("shell", definitions::shell(), false, ShellTool::new());
+    let unified_exec =
+        unified_exec_manager_for_session(user_input.as_ref().map(|(_, session_id)| session_id));
+    let unified_exec_emitter = user_input.as_ref().map(|(_, session_id)| {
+        Arc::new(crate::tools::UnifiedExecEventEmitter::new(
+            Arc::clone(&event_sink),
+            session_id.as_str().to_string(),
+        ))
+    });
+    let shell_tool = match &unified_exec_emitter {
+        Some(emitter) => {
+            ShellTool::with_manager(unified_exec.clone()).with_event_emitter(Arc::clone(emitter))
+        }
+        None => ShellTool::with_manager(unified_exec.clone()),
+    };
+    let exec_command_tool = match &unified_exec_emitter {
+        Some(emitter) => {
+            ExecCommandTool::new(unified_exec.clone()).with_event_emitter(Arc::clone(emitter))
+        }
+        None => ExecCommandTool::new(unified_exec.clone()),
+    };
+    let write_stdin_tool = match &unified_exec_emitter {
+        Some(emitter) => {
+            WriteStdinTool::new(unified_exec.clone()).with_event_emitter(Arc::clone(emitter))
+        }
+        None => WriteStdinTool::new(unified_exec.clone()),
+    };
+    reg.register::<_, ShellRequest>("shell", definitions::shell(), false, shell_tool);
+    reg.register::<_, ExecCommandRequest>(
+        "exec_command",
+        definitions::exec_command(),
+        false,
+        exec_command_tool,
+    );
+    reg.register::<_, WriteStdinRequest>(
+        "write_stdin",
+        definitions::write_stdin(),
+        false,
+        write_stdin_tool,
+    );
     reg.register::<_, ApplyPatchRequest>(
         "apply_patch",
         definitions::apply_patch(),
@@ -2115,6 +2214,7 @@ mod tests {
             None,
             dir.path().to_path_buf(),
             dir.path().join("artifacts"),
+            Arc::new(NoopEventSink),
         );
 
         let (text, is_error) = dispatch_call(

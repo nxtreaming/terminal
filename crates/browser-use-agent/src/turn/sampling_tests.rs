@@ -493,7 +493,11 @@ impl crate::turn::dispatch::CallRunner for NoopRunner {
     fn parallel_safe(&self, _call: &ContentPart) -> bool {
         false
     }
-    async fn run(&self, call: ContentPart) -> Message {
+    async fn run(
+        &self,
+        call: ContentPart,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Message {
         // Unreachable in these tests (no tool call is emitted), but satisfy the
         // trait with a benign tool-result so the type checks.
         let id = match &call {

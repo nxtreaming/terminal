@@ -101,7 +101,11 @@ impl CallRunner for ScriptedRunner {
         self.parallel_safe
     }
 
-    async fn run(&self, call: ContentPart) -> Message {
+    async fn run(
+        &self,
+        call: ContentPart,
+        _cancel: tokio_util::sync::CancellationToken,
+    ) -> Message {
         let (id, name, input) = match &call {
             ContentPart::ToolCall {
                 id, name, input, ..

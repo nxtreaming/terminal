@@ -59,7 +59,10 @@ pub use request_user_input::{
     RequestUserInputApprovalKey, RequestUserInputRequest, RequestUserInputResponse,
     RequestUserInputTool, UserInputAnswer, UserInputOption, UserInputQuestion,
 };
-pub use shell::{ShellApprovalKey, ShellRequest, ShellTool};
+pub use shell::{
+    ExecCommandApprovalKey, ExecCommandRequest, ExecCommandTool, ShellApprovalKey, ShellRequest,
+    ShellTool, WriteStdinApprovalKey, WriteStdinRequest, WriteStdinTool,
+};
 pub use subagent::{
     ListAgentsRequest, ListAgentsTool, SendInputRequest, SendInputTool, SpawnAgentTool,
     SubagentToolDeps, WaitAgentRequest, WaitAgentTool,

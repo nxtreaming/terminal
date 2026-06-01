@@ -29,5 +29,6 @@ syntect.workspace = true
 tempfile.workspace = true
 toml.workspace = true
 tokio = { workspace = true, features = ["rt", "rt-multi-thread", "macros", "io-util", "sync", "time", "net"] }
+tokio-util.workspace = true
 two-face.workspace = true
 unicode-width.workspace = true
