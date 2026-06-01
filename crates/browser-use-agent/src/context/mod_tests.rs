@@ -263,6 +263,37 @@ fn lower_to_messages_array_content_and_images() {
     }
 }
 
+#[test]
+fn lower_to_messages_tool_content_preserves_images() {
+    let cm = ContextManager::new();
+    let items = vec![json!({
+        "role": "tool",
+        "tool_call_id": "call-view",
+        "name": "view_image",
+        "content": [
+            { "type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "high" },
+        ],
+    })];
+
+    let messages = cm.lower_to_messages(&items);
+    assert_eq!(messages.len(), 1);
+    assert_eq!(messages[0].role, MessageRole::Tool);
+    let ContentPart::ToolResult { content, .. } = &messages[0].content[0] else {
+        panic!("expected tool result, got {:?}", messages[0].content);
+    };
+    let ContentPart::Media {
+        mime_type,
+        data,
+        url,
+    } = &content[0]
+    else {
+        panic!("expected media content, got {content:?}");
+    };
+    assert_eq!(mime_type, "image/png");
+    assert_eq!(data.as_deref(), Some("AAAA"));
+    assert!(url.is_none());
+}
+
 // ---------------------------------------------------------------------------
 // token accounting: update_token_info accumulation + total_token_usage branches.
 // ---------------------------------------------------------------------------

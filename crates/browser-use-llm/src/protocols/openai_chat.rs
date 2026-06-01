@@ -53,7 +53,7 @@ impl Protocol for OpenAiChatProtocol {
             messages.push(json!({ "role": "system", "content": system_text }));
         }
         for message in &req.messages {
-            messages.push(build_message(message)?);
+            append_message(message, &mut messages)?;
         }
         body.insert("messages".to_string(), Value::Array(messages));
 
@@ -129,20 +129,39 @@ fn reasoning_effort_str(effort: ReasoningEffort) -> &'static str {
     }
 }
 
-/// Translate a neutral [`Message`] into one Chat Completions message object.
-fn build_message(message: &Message) -> Result<Value, LlmError> {
+/// Translate a neutral [`Message`] into one or more Chat Completions message objects.
+fn append_message(message: &Message, out: &mut Vec<Value>) -> Result<(), LlmError> {
     match message.role {
-        MessageRole::Tool => Ok(build_tool_message(message)),
-        MessageRole::Assistant => build_assistant_message(message),
-        MessageRole::System => Ok(build_simple_message("system", message)),
-        MessageRole::Developer => Ok(build_simple_message("developer", message)),
-        MessageRole::User => Ok(build_simple_message("user", message)),
+        MessageRole::Tool => {
+            append_tool_messages(message, out);
+            Ok(())
+        }
+        MessageRole::Assistant => {
+            out.push(build_assistant_message(message)?);
+            Ok(())
+        }
+        MessageRole::System => {
+            out.push(build_simple_message("system", message));
+            Ok(())
+        }
+        MessageRole::Developer => {
+            out.push(build_simple_message("developer", message));
+            Ok(())
+        }
+        MessageRole::User => {
+            out.push(build_simple_message("user", message));
+            Ok(())
+        }
     }
 }
 
-/// Render a `system`/`developer`/`user` message: text parts joined into `content`.
+/// Render a `system`/`developer`/`user` message.
 fn build_simple_message(role: &str, message: &Message) -> Value {
-    json!({ "role": role, "content": collect_text(message) })
+    if role == "user" {
+        json!({ "role": role, "content": build_user_content(message) })
+    } else {
+        json!({ "role": role, "content": collect_text(message) })
+    }
 }
 
 /// Render an `assistant` message, including any `tool_calls`.
@@ -178,7 +197,11 @@ fn build_assistant_message(message: &Message) -> Result<Value, LlmError> {
 }
 
 /// Render a `tool` message from the first [`ContentPart::ToolResult`] it carries.
-fn build_tool_message(message: &Message) -> Value {
+///
+/// Chat Completions tool messages are text-only in practice. When a tool result
+/// carries image media, keep the required tool message as text and append a
+/// follow-up user message that carries the actual image parts.
+fn append_tool_messages(message: &Message, out: &mut Vec<Value>) {
     let mut obj = Map::new();
     obj.insert("role".to_string(), json!("tool"));
     for part in &message.content {
@@ -189,11 +212,170 @@ fn build_tool_message(message: &Message) -> Value {
         } = part
         {
             obj.insert("tool_call_id".to_string(), json!(tool_call_id));
-            obj.insert("content".to_string(), json!(collect_text_parts(content)));
+            obj.insert(
+                "content".to_string(),
+                json!(tool_result_text_for_chat(content)),
+            );
+            out.push(Value::Object(obj));
+            if let Some(visual_context) = tool_result_visual_context(tool_call_id, content) {
+                out.push(visual_context);
+            }
             break;
         }
     }
-    Value::Object(obj)
+}
+
+fn build_user_content(message: &Message) -> Value {
+    let mut text = String::new();
+    let mut parts = Vec::new();
+    let mut has_media = false;
+    for part in &message.content {
+        match part {
+            ContentPart::Text { text: fragment }
+            | ContentPart::Reasoning { text: fragment, .. } => {
+                text.push_str(fragment);
+                if !fragment.is_empty() {
+                    parts.push(json!({ "type": "text", "text": fragment }));
+                }
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => {
+                if let Some(image) = chat_image_part(mime_type, data.as_deref(), url.as_deref()) {
+                    has_media = true;
+                    parts.push(image);
+                }
+            }
+            ContentPart::ToolResult { content, .. } => {
+                append_chat_content_parts(content, &mut text, &mut parts, &mut has_media);
+            }
+            ContentPart::ToolCall { .. } => {}
+        }
+    }
+    if has_media {
+        Value::Array(parts)
+    } else {
+        Value::String(text)
+    }
+}
+
+fn tool_result_text_for_chat(content: &[ContentPart]) -> String {
+    let mut text = String::new();
+    let mut image_count = 0usize;
+    collect_tool_result_text_and_images(content, &mut text, &mut image_count);
+    if image_count > 0 {
+        if !text.is_empty() {
+            text.push('\n');
+        }
+        text.push_str(&format!(
+            "[{image_count} image(s) attached in the following visual context message]"
+        ));
+    }
+    text
+}
+
+fn tool_result_visual_context(tool_call_id: &str, content: &[ContentPart]) -> Option<Value> {
+    let mut parts = vec![json!({
+        "type": "text",
+        "text": format!("Visual context from tool call {tool_call_id}. Use these images as the tool result."),
+    })];
+    append_tool_result_images(content, &mut parts);
+    (parts.len() > 1).then_some(json!({
+        "role": "user",
+        "content": parts,
+    }))
+}
+
+fn append_chat_content_parts(
+    content: &[ContentPart],
+    text: &mut String,
+    parts: &mut Vec<Value>,
+    has_media: &mut bool,
+) {
+    for part in content {
+        match part {
+            ContentPart::Text { text: fragment }
+            | ContentPart::Reasoning { text: fragment, .. } => {
+                text.push_str(fragment);
+                if !fragment.is_empty() {
+                    parts.push(json!({ "type": "text", "text": fragment }));
+                }
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => {
+                if let Some(image) = chat_image_part(mime_type, data.as_deref(), url.as_deref()) {
+                    *has_media = true;
+                    parts.push(image);
+                }
+            }
+            ContentPart::ToolResult { content, .. } => {
+                append_chat_content_parts(content, text, parts, has_media);
+            }
+            ContentPart::ToolCall { .. } => {}
+        }
+    }
+}
+
+fn collect_tool_result_text_and_images(
+    content: &[ContentPart],
+    text: &mut String,
+    image_count: &mut usize,
+) {
+    for part in content {
+        match part {
+            ContentPart::Text { text: fragment }
+            | ContentPart::Reasoning { text: fragment, .. } => {
+                text.push_str(fragment);
+            }
+            ContentPart::Media { mime_type, .. } => {
+                if mime_type.starts_with("image/") {
+                    *image_count += 1;
+                }
+            }
+            ContentPart::ToolResult { content, .. } => {
+                collect_tool_result_text_and_images(content, text, image_count);
+            }
+            ContentPart::ToolCall { .. } => {}
+        }
+    }
+}
+
+fn append_tool_result_images(content: &[ContentPart], parts: &mut Vec<Value>) {
+    for part in content {
+        match part {
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => {
+                if let Some(image) = chat_image_part(mime_type, data.as_deref(), url.as_deref()) {
+                    parts.push(image);
+                }
+            }
+            ContentPart::ToolResult { content, .. } => append_tool_result_images(content, parts),
+            _ => {}
+        }
+    }
+}
+
+fn chat_image_part(mime_type: &str, data: Option<&str>, url: Option<&str>) -> Option<Value> {
+    if !mime_type.starts_with("image/") {
+        return None;
+    }
+    let resolved = match (url, data) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(data)) => format!("data:{mime_type};base64,{data}"),
+        (None, None) => return None,
+    };
+    Some(json!({
+        "type": "image_url",
+        "image_url": { "url": resolved },
+    }))
 }
 
 /// Concatenate all [`ContentPart::Text`] fragments in a message into one string.
@@ -508,6 +690,73 @@ mod tests {
         });
 
         assert_eq!(body, expected);
+    }
+
+    #[test]
+    fn build_body_preserves_user_image_content() {
+        let mut req = LlmRequest::new("gpt-4o", "openai");
+        req.messages.push(Message::new(
+            MessageRole::User,
+            vec![
+                ContentPart::text("describe"),
+                ContentPart::Media {
+                    mime_type: "image/png".into(),
+                    data: Some("AAAA".into()),
+                    url: None,
+                },
+            ],
+        ));
+
+        let body = OpenAiChatProtocol::new().build_body(&req).unwrap();
+        let content = body["messages"][0]["content"].as_array().unwrap();
+        assert_eq!(content[0], json!({ "type": "text", "text": "describe" }));
+        assert_eq!(content[1]["type"], json!("image_url"));
+        assert_eq!(
+            content[1]["image_url"]["url"],
+            json!("data:image/png;base64,AAAA")
+        );
+    }
+
+    #[test]
+    fn build_body_keeps_tool_image_context_in_followup_user_message() {
+        let mut req = LlmRequest::new("gpt-4o", "openai");
+        req.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_view".into(),
+                name: "view_image".into(),
+                input: json!({ "path": "shot.png" }),
+                provider_metadata: None,
+            }],
+        ));
+        req.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "call_view".into(),
+                content: vec![ContentPart::Media {
+                    mime_type: "image/png".into(),
+                    data: Some("AAAA".into()),
+                    url: None,
+                }],
+                is_error: false,
+            }],
+        ));
+
+        let body = OpenAiChatProtocol::new().build_body(&req).unwrap();
+        let messages = body["messages"].as_array().unwrap();
+        assert_eq!(messages.len(), 3);
+        assert_eq!(messages[1]["role"], json!("tool"));
+        assert_eq!(messages[1]["tool_call_id"], json!("call_view"));
+        assert!(messages[1]["content"]
+            .as_str()
+            .unwrap()
+            .contains("image(s) attached"));
+        assert_eq!(messages[2]["role"], json!("user"));
+        assert_eq!(messages[2]["content"][1]["type"], json!("image_url"));
+        assert_eq!(
+            messages[2]["content"][1]["image_url"]["url"],
+            json!("data:image/png;base64,AAAA")
+        );
     }
 
     #[test]

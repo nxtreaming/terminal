@@ -350,6 +350,7 @@ mod registry_e2e {
     use crate::tools::approval::AskForApproval;
     use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
     use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
+    use crate::tools::handlers::view_image::{ViewImageRequest, ViewImageTool};
     use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
     use crate::tools::registry::ToolRegistry;
     use crate::tools::sandbox::FileSystemSandboxPolicy;
@@ -481,6 +482,69 @@ mod registry_e2e {
         let (text1, err1) = result_of(&out.outputs_in_order[1]);
         assert!(!err1, "tool_search should succeed: {text1}");
         assert!(text1.contains("kubernetes"), "got: {text1}");
+    }
+
+    #[tokio::test]
+    async fn registry_runner_wraps_view_image_stdout_as_media_tool_result() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let png_bytes: &[u8] = &[
+            0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0xDE, 0xAD, 0xBE, 0xEF,
+        ];
+        std::fs::write(dir.path().join("pic.png"), png_bytes).expect("write png");
+
+        let mut registry = ToolRegistry::new();
+        registry.register::<_, ViewImageRequest>(
+            "view_image",
+            def("view_image"),
+            false,
+            ViewImageTool::new(),
+        );
+        let runner = RegistryRunner::new(
+            Arc::new(registry),
+            Arc::new(ToolOrchestrator::stub()),
+            ToolCtx {
+                cwd: dir.path().to_path_buf(),
+                ..ctx()
+            },
+            env(),
+            AskForApproval::Never,
+        );
+        let dispatcher = ToolDispatcher::with_runner(runner, true);
+
+        let out = dispatcher
+            .dispatch_ordered(
+                vec![tool_call(
+                    "view-call",
+                    "view_image",
+                    json!({ "path": "pic.png" }),
+                )],
+                CancellationToken::new(),
+            )
+            .await;
+
+        assert_eq!(out.outputs_in_order.len(), 1);
+        let ContentPart::ToolResult {
+            tool_call_id,
+            content,
+            is_error,
+        } = &out.outputs_in_order[0].content[0]
+        else {
+            panic!("expected tool result, got {:?}", out.outputs_in_order[0]);
+        };
+        assert_eq!(tool_call_id, "view-call");
+        assert!(!is_error);
+        assert_eq!(content.len(), 1);
+        let ContentPart::Media {
+            mime_type,
+            data,
+            url,
+        } = &content[0]
+        else {
+            panic!("expected media result, got {content:?}");
+        };
+        assert_eq!(mime_type, "image/png");
+        assert!(data.as_deref().is_some_and(|data| !data.is_empty()));
+        assert!(url.is_none());
     }
 
     #[tokio::test]

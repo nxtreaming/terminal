@@ -104,7 +104,7 @@ pub fn provider_messages_to_response_items(messages: &[ProviderMessage]) -> Vec<
                 items.push(serde_json::json!({
                     "type": "function_call_output",
                     "call_id": call_id,
-                    "output": message_text(message),
+                    "output": message_tool_output_for_response_item(message),
                 }));
             }
             continue;
@@ -135,22 +135,88 @@ pub fn provider_messages_to_response_items(messages: &[ProviderMessage]) -> Vec<
                 }));
             }
         }
-        // Text content -> message item (skip empty, e.g. tool-call-only assistant turns).
-        let text = message_text(message);
-        if !text.is_empty() {
-            let part_type = if role == "assistant" {
-                "output_text"
-            } else {
-                "input_text"
-            };
+        // Content -> message item (skip empty, e.g. tool-call-only assistant turns).
+        let content = message_content_parts_for_response_item(message, role);
+        if !content.is_empty() {
             items.push(serde_json::json!({
                 "type": "message",
                 "role": role,
-                "content": [{ "type": part_type, "text": text }],
+                "content": content,
             }));
         }
     }
     items
+}
+
+fn message_tool_output_for_response_item(message: &Value) -> Value {
+    let content = message_content_parts_for_response_item(message, "user");
+    if content
+        .iter()
+        .any(|part| part.get("type").and_then(Value::as_str) == Some("input_image"))
+    {
+        Value::Array(content)
+    } else {
+        Value::String(message_text(message))
+    }
+}
+
+fn message_content_parts_for_response_item(message: &Value, role: &str) -> Vec<Value> {
+    let part_type = if role == "assistant" {
+        "output_text"
+    } else {
+        "input_text"
+    };
+    match message.get("content") {
+        Some(Value::String(text)) if !text.is_empty() => {
+            vec![serde_json::json!({ "type": part_type, "text": text })]
+        }
+        Some(Value::Array(parts)) => parts
+            .iter()
+            .filter_map(|part| response_content_part(part, part_type))
+            .collect(),
+        _ => Vec::new(),
+    }
+}
+
+fn response_content_part(part: &Value, text_type: &str) -> Option<Value> {
+    match part.get("type").and_then(Value::as_str) {
+        Some("input_image") | Some("image") | Some("image_url") | Some("output_image") => {
+            let image_url = part_image_url(part)?;
+            let mut out = serde_json::json!({
+                "type": "input_image",
+                "image_url": image_url,
+            });
+            if let Some(detail) = part.get("detail").and_then(Value::as_str) {
+                out["detail"] = Value::String(detail.to_string());
+            }
+            Some(out)
+        }
+        Some("input_text") | Some("output_text") | Some("text") | None => part
+            .get("text")
+            .and_then(Value::as_str)
+            .filter(|text| !text.is_empty())
+            .map(|text| serde_json::json!({ "type": text_type, "text": text })),
+        _ => None,
+    }
+}
+
+fn part_image_url(part: &Value) -> Option<String> {
+    part.get("image_url")
+        .and_then(|value| {
+            value
+                .as_str()
+                .or_else(|| value.get("url").and_then(Value::as_str))
+        })
+        .or_else(|| part.get("url").and_then(Value::as_str))
+        .map(ToOwned::to_owned)
+        .or_else(|| {
+            let data = part.get("data").and_then(Value::as_str)?;
+            let mime_type = part
+                .get("mime_type")
+                .and_then(Value::as_str)
+                .unwrap_or("image/png");
+            Some(format!("data:{mime_type};base64,{data}"))
+        })
 }
 
 fn message_text(message: &Value) -> String {

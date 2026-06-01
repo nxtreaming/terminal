@@ -505,18 +505,10 @@ fn message_to_item(message: &Message) -> Item {
             ..
         }) = message.content.first()
         {
-            let text = content
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
             return json!({
                 "role": "tool",
                 "tool_call_id": tool_call_id,
-                "content": text,
+                "content": tool_result_content_to_item_content(content),
             });
         }
     }
@@ -560,4 +552,79 @@ fn message_to_item(message: &Message) -> Item {
         obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
     Value::Object(obj)
+}
+
+fn tool_result_content_to_item_content(content: &[ContentPart]) -> Value {
+    let mut text = String::new();
+    let mut parts = Vec::new();
+    let mut has_non_text = false;
+    for part in content {
+        match part {
+            ContentPart::Text { text: fragment }
+            | ContentPart::Reasoning { text: fragment, .. } => {
+                text.push_str(fragment);
+                if !fragment.is_empty() {
+                    parts.push(json!({ "type": "input_text", "text": fragment }));
+                }
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => {
+                has_non_text = true;
+                if let Some(media) =
+                    media_item_content_part(mime_type, data.as_deref(), url.as_deref())
+                {
+                    parts.push(media);
+                }
+            }
+            ContentPart::ToolResult { content, .. } => {
+                let nested = tool_result_content_to_item_content(content);
+                match nested {
+                    Value::String(fragment) => {
+                        text.push_str(&fragment);
+                        if !fragment.is_empty() {
+                            parts.push(json!({ "type": "input_text", "text": fragment }));
+                        }
+                    }
+                    Value::Array(nested_parts) => {
+                        has_non_text = true;
+                        parts.extend(nested_parts);
+                    }
+                    _ => {}
+                }
+            }
+            ContentPart::ToolCall { .. } => {}
+        }
+    }
+    if has_non_text {
+        Value::Array(parts)
+    } else {
+        Value::String(text)
+    }
+}
+
+fn media_item_content_part(
+    mime_type: &str,
+    data: Option<&str>,
+    url: Option<&str>,
+) -> Option<Value> {
+    let resolved = match (url, data) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(data)) => format!("data:{mime_type};base64,{data}"),
+        (None, None) => return None,
+    };
+    if mime_type.starts_with("image/") {
+        Some(json!({
+            "type": "input_image",
+            "image_url": resolved,
+            "detail": "high",
+        }))
+    } else {
+        Some(json!({
+            "type": "input_file",
+            "file_data": resolved,
+        }))
+    }
 }

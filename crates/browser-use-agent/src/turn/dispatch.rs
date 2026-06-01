@@ -52,6 +52,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::decision::{self, ToolParallelism};
 use crate::tools::approval::AskForApproval;
+use crate::tools::handlers::view_image::VIEW_IMAGE_STDOUT_PREFIX;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::registry::ToolRegistry;
 use crate::tools::runtime::{Approver, AutoApprover, ToolCtx};
@@ -253,14 +254,42 @@ fn result_message_for(call: &ContentPart, text: &str, is_error: bool) -> Message
         ContentPart::ToolCall { id, .. } => id.clone(),
         _ => String::new(),
     };
+    let content = tool_result_content_for(call, text, is_error);
     Message::new(
         MessageRole::Tool,
         vec![ContentPart::ToolResult {
             tool_call_id,
-            content: vec![ContentPart::text(text)],
+            content,
             is_error,
         }],
     )
+}
+
+fn tool_result_content_for(call: &ContentPart, text: &str, is_error: bool) -> Vec<ContentPart> {
+    if !is_error {
+        if let ContentPart::ToolCall { name, .. } = call {
+            if name == "view_image" {
+                if let Some(media) = media_part_from_view_image_stdout(text) {
+                    return vec![media];
+                }
+            }
+        }
+    }
+    vec![ContentPart::text(text)]
+}
+
+fn media_part_from_view_image_stdout(text: &str) -> Option<ContentPart> {
+    let data_url = text.strip_prefix(VIEW_IMAGE_STDOUT_PREFIX)?;
+    let rest = data_url.strip_prefix("data:")?;
+    let (mime_type, data) = rest.split_once(";base64,")?;
+    if !mime_type.starts_with("image/") || data.is_empty() {
+        return None;
+    }
+    Some(ContentPart::Media {
+        mime_type: mime_type.to_string(),
+        data: Some(data.to_string()),
+        url: None,
+    })
 }
 
 /// Result of dispatching a turn's tool calls.

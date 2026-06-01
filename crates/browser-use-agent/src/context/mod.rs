@@ -206,7 +206,7 @@ impl ContextManager {
 ///     `{type:input_text,text}` / image parts -> [`ContentPart`]s.
 ///   * `tool_calls` (assistant) -> [`ContentPart::ToolCall`].
 ///   * a `tool`-role message -> a single [`ContentPart::ToolResult`] carrying
-///     the textual output, linked by `tool_call_id`.
+///     the output content, linked by `tool_call_id`.
 ///
 /// Returns `None` for items with no usable content (so empty envelopes don't
 /// produce empty `Message`s).
@@ -221,12 +221,15 @@ fn item_to_message(item: &Item) -> Option<Message> {
             .and_then(Value::as_str)
             .unwrap_or_default()
             .to_string();
-        let text = content_text(obj.get("content"));
+        let mut content = obj.get("content").map(content_to_parts).unwrap_or_default();
+        if content.is_empty() {
+            content.push(ContentPart::text(content_text(obj.get("content"))));
+        }
         return Some(Message::new(
             MessageRole::Tool,
             vec![ContentPart::ToolResult {
                 tool_call_id,
-                content: vec![ContentPart::text(text)],
+                content,
                 is_error: false,
             }],
         ));
@@ -301,6 +304,13 @@ fn part_to_content_part(part: &Value) -> Option<ContentPart> {
                 .and_then(|v| v.as_str().or_else(|| v.get("url").and_then(Value::as_str)))
                 .or_else(|| part.get("url").and_then(Value::as_str))
                 .map(ToOwned::to_owned);
+            if let Some((mime_type, data)) = url.as_deref().and_then(data_url_media) {
+                return Some(ContentPart::Media {
+                    mime_type,
+                    data: Some(data),
+                    url: None,
+                });
+            }
             let mime_type = part
                 .get("mime_type")
                 .and_then(Value::as_str)
@@ -308,12 +318,25 @@ fn part_to_content_part(part: &Value) -> Option<ContentPart> {
                 .to_string();
             Some(ContentPart::Media {
                 mime_type,
-                data: None,
+                data: part
+                    .get("data")
+                    .and_then(Value::as_str)
+                    .map(ToOwned::to_owned),
                 url,
             })
         }
         _ => None,
     }
+}
+
+fn data_url_media(url: &str) -> Option<(String, String)> {
+    let rest = url.strip_prefix("data:")?;
+    let (header, data) = rest.split_once(',')?;
+    let mime_type = header.split(';').next()?.to_string();
+    if !mime_type.starts_with("image/") || !header.contains(";base64") || data.is_empty() {
+        return None;
+    }
+    Some((mime_type, data.to_string()))
 }
 
 /// Flatten a `content` Value to plain text (string content, or the joined

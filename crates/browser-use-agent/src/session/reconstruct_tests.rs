@@ -115,6 +115,42 @@ fn turn_with_tool_call_and_output() {
 }
 
 #[test]
+fn tool_output_event_preserves_image_content() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "load image" })),
+        event(
+            2,
+            "model.tool_call",
+            json!({ "id": "call_view", "name": "view_image", "arguments": { "path": "pic.png" } }),
+        ),
+        event(
+            3,
+            "tool.output",
+            json!({
+                "tool_call_id": "call_view",
+                "name": "view_image",
+                "text": "[media: image/png]",
+                "content": [
+                    { "type": "input_image", "image_url": "data:image/png;base64,AAAA", "detail": "high" }
+                ],
+            }),
+        ),
+        event(4, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    let tool = &messages[2];
+    assert_eq!(tool.get("role").and_then(Value::as_str), Some("tool"));
+    let content = tool
+        .get("content")
+        .and_then(Value::as_array)
+        .expect("tool image content array");
+    assert_eq!(content[0]["type"], "input_image");
+    assert_eq!(content[0]["image_url"], "data:image/png;base64,AAAA");
+}
+
+#[test]
 fn codex_shaped_stream_and_tool_events_replay() {
     let events = vec![
         event(1, "session.input", json!({ "text": "run the tool" })),

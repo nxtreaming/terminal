@@ -60,6 +60,7 @@ use browser_use_llm::schema::{
     MessageRole, SystemPart, Usage,
 };
 use futures_util::{Stream, StreamExt};
+use serde_json::Value;
 use tokio_util::sync::CancellationToken;
 
 use crate::decision::{self, RetryAction, SamplingOutcome};
@@ -424,12 +425,19 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
             // row and lose the structured browser contract.
             return;
         }
-        let payload = serde_json::json!({
+        let mut payload = serde_json::json!({
             "name": name,
             "tool_call_id": tool_call_id,
             "ok": !is_error,
             "text": text,
         });
+        if !is_error {
+            if let Some(content) = tool_result_event_content(output) {
+                if let Value::Object(obj) = &mut payload {
+                    obj.insert("content".to_string(), Value::Array(content));
+                }
+            }
+        }
         if is_error {
             self.sink.emit(PendingEvent::new(
                 self.ctx.session_id.clone(),
@@ -606,6 +614,74 @@ fn tool_result_text_and_status(message: &Message) -> (String, bool) {
         }
     }
     (flatten_content_text(&message.content), true)
+}
+
+fn tool_result_event_content(message: &Message) -> Option<Vec<Value>> {
+    for part in &message.content {
+        if let ContentPart::ToolResult { content, .. } = part {
+            return event_content_parts_if_media(content);
+        }
+    }
+    event_content_parts_if_media(&message.content)
+}
+
+fn event_content_parts_if_media(parts: &[ContentPart]) -> Option<Vec<Value>> {
+    let mut out = Vec::new();
+    let mut has_media = false;
+    append_event_content_parts(parts, &mut out, &mut has_media);
+    has_media.then_some(out)
+}
+
+fn append_event_content_parts(parts: &[ContentPart], out: &mut Vec<Value>, has_media: &mut bool) {
+    for part in parts {
+        match part {
+            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+                if !text.is_empty() {
+                    out.push(serde_json::json!({ "type": "input_text", "text": text }));
+                }
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => {
+                if let Some(part) =
+                    media_event_content_part(mime_type, data.as_deref(), url.as_deref())
+                {
+                    *has_media = true;
+                    out.push(part);
+                }
+            }
+            ContentPart::ToolResult { content, .. } => {
+                append_event_content_parts(content, out, has_media);
+            }
+            ContentPart::ToolCall { .. } => {}
+        }
+    }
+}
+
+fn media_event_content_part(
+    mime_type: &str,
+    data: Option<&str>,
+    url: Option<&str>,
+) -> Option<Value> {
+    let resolved = match (url, data) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(data)) => format!("data:{mime_type};base64,{data}"),
+        (None, None) => return None,
+    };
+    if mime_type.starts_with("image/") {
+        Some(serde_json::json!({
+            "type": "input_image",
+            "image_url": resolved,
+            "detail": "high",
+        }))
+    } else {
+        Some(serde_json::json!({
+            "type": "input_file",
+            "file_data": resolved,
+        }))
+    }
 }
 
 fn flatten_content_text(parts: &[ContentPart]) -> String {

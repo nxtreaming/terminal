@@ -1112,7 +1112,7 @@ fn response_input_item_tool_message(
     if name.trim().is_empty() {
         name = "tool".to_string();
     }
-    let content = response_input_item_output_text(item);
+    let content = response_input_item_output_content(item);
     serde_json::json!({
         "role": "tool",
         "tool_call_id": call_id,
@@ -1121,14 +1121,20 @@ fn response_input_item_tool_message(
     })
 }
 
-fn response_input_item_output_text(item: &Value) -> String {
+fn response_input_item_output_content(item: &Value) -> Value {
     if let Some(output) = item.get("output") {
-        return value_to_tool_output_text(output);
+        return match output {
+            Value::String(_) | Value::Array(_) => output.clone(),
+            _ => Value::String(value_to_tool_output_text(output)),
+        };
     }
     if let Some(content) = item.get("content") {
-        return value_to_tool_output_text(content);
+        return match content {
+            Value::String(_) | Value::Array(_) => content.clone(),
+            _ => Value::String(value_to_tool_output_text(content)),
+        };
     }
-    String::new()
+    Value::String(String::new())
 }
 
 fn value_to_tool_output_text(value: &Value) -> String {
@@ -1428,13 +1434,20 @@ fn tool_message_from_output_event(payload: &Value, call_id: &str) -> Value {
         .filter(|name| !name.trim().is_empty())
         .unwrap_or("tool")
         .to_string();
-    let content = tool_output_event_text(payload);
+    let content = tool_output_event_content(payload);
     serde_json::json!({
         "role": "tool",
         "tool_call_id": call_id,
         "name": name,
         "content": content,
     })
+}
+
+fn tool_output_event_content(payload: &Value) -> Value {
+    if let Some(content) = payload.get("content") {
+        return content.clone();
+    }
+    Value::String(tool_output_event_text(payload))
 }
 
 fn tool_output_event_text(payload: &Value) -> String {

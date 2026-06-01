@@ -54,7 +54,7 @@ use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use browser_use_llm::schema::Message;
+use browser_use_llm::schema::{ContentPart, Message};
 use tokio_util::sync::CancellationToken;
 
 use crate::compact::{run_compaction, CompactionSampler, COMPACT_USER_MESSAGE_MAX_TOKENS};
@@ -469,7 +469,7 @@ impl TurnState for StoreTurnState {
 /// (the `ContextManager` buffer shape): text/media/tool calls become a role-tagged
 /// object; a tool-result lowers to a `tool` item keyed by `tool_call_id`.
 fn message_to_provider_item(message: &Message) -> Item {
-    use browser_use_llm::schema::{ContentPart, MessageRole};
+    use browser_use_llm::schema::MessageRole;
     use serde_json::{json, Value};
 
     let role = match message.role {
@@ -488,18 +488,10 @@ fn message_to_provider_item(message: &Message) -> Item {
             ..
         }) = message.content.first()
         {
-            let text = content
-                .iter()
-                .filter_map(|p| match p {
-                    ContentPart::Text { text } => Some(text.as_str()),
-                    _ => None,
-                })
-                .collect::<Vec<_>>()
-                .join("");
             return json!({
                 "role": "tool",
                 "tool_call_id": tool_call_id,
-                "content": text,
+                "content": tool_result_content_to_provider_content(content),
             });
         }
     }
@@ -543,6 +535,83 @@ fn message_to_provider_item(message: &Message) -> Item {
         obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
     }
     Value::Object(obj)
+}
+
+fn tool_result_content_to_provider_content(content: &[ContentPart]) -> serde_json::Value {
+    use serde_json::{json, Value};
+
+    let mut text = String::new();
+    let mut parts = Vec::new();
+    let mut has_non_text = false;
+    for part in content {
+        match part {
+            ContentPart::Text { text: fragment }
+            | ContentPart::Reasoning { text: fragment, .. } => {
+                text.push_str(fragment);
+                if !fragment.is_empty() {
+                    parts.push(json!({ "type": "input_text", "text": fragment }));
+                }
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => {
+                has_non_text = true;
+                if let Some(media) =
+                    media_content_part_for_provider(mime_type, data.as_deref(), url.as_deref())
+                {
+                    parts.push(media);
+                }
+            }
+            ContentPart::ToolResult { content, .. } => {
+                let nested = tool_result_content_to_provider_content(content);
+                match nested {
+                    Value::String(fragment) => {
+                        text.push_str(&fragment);
+                        if !fragment.is_empty() {
+                            parts.push(json!({ "type": "input_text", "text": fragment }));
+                        }
+                    }
+                    Value::Array(nested_parts) => {
+                        has_non_text = true;
+                        parts.extend(nested_parts);
+                    }
+                    _ => {}
+                }
+            }
+            ContentPart::ToolCall { .. } => {}
+        }
+    }
+    if has_non_text {
+        Value::Array(parts)
+    } else {
+        Value::String(text)
+    }
+}
+
+fn media_content_part_for_provider(
+    mime_type: &str,
+    data: Option<&str>,
+    url: Option<&str>,
+) -> Option<serde_json::Value> {
+    let resolved = match (url, data) {
+        (Some(url), _) => url.to_string(),
+        (None, Some(data)) => format!("data:{mime_type};base64,{data}"),
+        (None, None) => return None,
+    };
+    if mime_type.starts_with("image/") {
+        Some(serde_json::json!({
+            "type": "input_image",
+            "image_url": resolved,
+            "detail": "high",
+        }))
+    } else {
+        Some(serde_json::json!({
+            "type": "input_file",
+            "file_data": resolved,
+        }))
+    }
 }
 
 /// A [`TurnObserver`] that maps loop lifecycle into the durable UI event log.

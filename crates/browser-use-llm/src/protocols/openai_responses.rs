@@ -182,7 +182,7 @@ fn lower_message(message: &Message, out: &mut Vec<Value>) {
                 out.push(json!({
                     "type": "function_call_output",
                     "call_id": tool_call_id,
-                    "output": flatten_tool_result(content),
+                    "output": lower_tool_result_output(content),
                 }));
             }
         }
@@ -231,18 +231,56 @@ fn stringify_arguments(input: &Value) -> String {
     }
 }
 
-/// Flatten a tool result's content parts into a single output string.
-fn flatten_tool_result(content: &[ContentPart]) -> String {
+/// Lower a tool result's content parts to a Responses `function_call_output.output`.
+///
+/// Text-only results remain the legacy string form. Results containing media use
+/// the Responses content-array form so `view_image` and screenshot tools stay
+/// model-visible instead of collapsing to placeholder text.
+fn lower_tool_result_output(content: &[ContentPart]) -> Value {
     let mut text = String::new();
+    let mut parts = Vec::new();
+    let mut has_media = false;
+    append_tool_result_output(content, &mut text, &mut parts, &mut has_media);
+    if has_media {
+        Value::Array(parts)
+    } else {
+        Value::String(text)
+    }
+}
+
+fn append_tool_result_output(
+    content: &[ContentPart],
+    text: &mut String,
+    parts: &mut Vec<Value>,
+    has_media: &mut bool,
+) {
     for part in content {
         match part {
-            ContentPart::Text { text: t } => text.push_str(t),
-            ContentPart::ToolResult { content, .. } => text.push_str(&flatten_tool_result(content)),
-            ContentPart::Reasoning { text: t, .. } => text.push_str(t),
-            ContentPart::Media { .. } | ContentPart::ToolCall { .. } => {}
+            ContentPart::Text { text: t } | ContentPart::Reasoning { text: t, .. } => {
+                text.push_str(t);
+                if !t.is_empty() {
+                    parts.push(json!({ "type": "input_text", "text": t }));
+                }
+            }
+            ContentPart::ToolResult { content, .. } => {
+                append_tool_result_output(content, text, parts, has_media);
+            }
+            ContentPart::Media {
+                mime_type,
+                data,
+                url,
+            } => {
+                *has_media = true;
+                parts.push(lower_media(
+                    MessageRole::User,
+                    mime_type,
+                    data.as_deref(),
+                    url.as_deref(),
+                ));
+            }
+            ContentPart::ToolCall { .. } => {}
         }
     }
-    text
 }
 
 /// Lower a [`ToolDefinition`] into a Responses tool entry.
@@ -653,6 +691,42 @@ mod tests {
         assert_eq!(
             body["tool_choice"],
             json!({ "type": "function", "name": "get_weather" })
+        );
+    }
+
+    #[test]
+    fn build_body_lowers_tool_result_media_as_function_output_content() {
+        let mut request = LlmRequest::new("gpt-5.1-codex", "openai");
+        request.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_view".into(),
+                name: "view_image".into(),
+                input: json!({ "path": "shot.png" }),
+                provider_metadata: None,
+            }],
+        ));
+        request.messages.push(Message::new(
+            MessageRole::Tool,
+            vec![ContentPart::ToolResult {
+                tool_call_id: "call_view".into(),
+                content: vec![ContentPart::Media {
+                    mime_type: "image/png".into(),
+                    data: Some("AAAA".into()),
+                    url: None,
+                }],
+                is_error: false,
+            }],
+        ));
+
+        let body = OpenAiResponsesProtocol::new().build_body(&request).unwrap();
+        let input = body["input"].as_array().unwrap();
+        assert_eq!(input[1]["type"], json!("function_call_output"));
+        assert_eq!(input[1]["call_id"], json!("call_view"));
+        assert_eq!(input[1]["output"][0]["type"], json!("input_image"));
+        assert_eq!(
+            input[1]["output"][0]["image_url"],
+            json!("data:image/png;base64,AAAA")
         );
     }
 
