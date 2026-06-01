@@ -2,8 +2,7 @@ use std::fs::File;
 use std::io::{BufRead, BufReader, BufWriter, Write};
 use std::path::{Path, PathBuf};
 use std::str::FromStr;
-use std::sync::mpsc;
-use std::thread;
+use std::sync::{mpsc, Arc, Condvar, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{bail, Context, Result};
@@ -22,12 +21,17 @@ const MIGRATIONS: &[(i64, &str)] = &[
     (3, include_str!("../migrations/0003_agent_messages.sql")),
     (4, include_str!("../migrations/0004_app_settings.sql")),
     (5, include_str!("../migrations/0005_unique_agent_paths.sql")),
+    (
+        6,
+        include_str!("../migrations/0006_agent_message_input_items.sql"),
+    ),
 ];
 
 pub struct Store {
     state_dir: PathBuf,
     conn: Connection,
     notifier: Option<StoreNotifier>,
+    notification_state: Arc<StoreNotificationState>,
 }
 
 pub fn default_state_dir() -> PathBuf {
@@ -70,6 +74,55 @@ pub enum StoreNotification {
 
 pub type StoreNotifier = mpsc::Sender<StoreNotification>;
 
+#[derive(Default)]
+struct StoreNotificationState {
+    version: Mutex<u64>,
+    changed: Condvar,
+}
+
+impl StoreNotificationState {
+    fn notify(&self) {
+        let mut version = self
+            .version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *version = version.saturating_add(1);
+        self.changed.notify_all();
+    }
+}
+
+#[derive(Clone)]
+pub struct StoreNotificationWatcher {
+    state: Arc<StoreNotificationState>,
+}
+
+impl StoreNotificationWatcher {
+    pub fn cursor(&self) -> u64 {
+        *self
+            .state
+            .version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    pub fn wait_for_change(&self, cursor: u64, timeout: Duration) -> bool {
+        let version = self
+            .state
+            .version
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        if *version != cursor {
+            return true;
+        }
+        let (version, _) = self
+            .state
+            .changed
+            .wait_timeout_while(version, timeout, |version| *version == cursor)
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        *version != cursor
+    }
+}
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct AgentSummary {
     pub parent_session_id: String,
@@ -87,6 +140,8 @@ pub struct AgentMessage {
     pub author_session_id: String,
     pub target_session_id: String,
     pub content: String,
+    pub input_items: Option<Value>,
+    pub input_kind: String,
     pub trigger_turn: bool,
     pub created_ms: i64,
 }
@@ -139,6 +194,7 @@ impl Store {
             state_dir,
             conn,
             notifier,
+            notification_state: Arc::new(StoreNotificationState::default()),
         };
         store.migrate()?;
         Ok(store)
@@ -152,10 +208,17 @@ impl Store {
         self.notifier.clone()
     }
 
+    pub fn notification_watcher(&self) -> StoreNotificationWatcher {
+        StoreNotificationWatcher {
+            state: Arc::clone(&self.notification_state),
+        }
+    }
+
     fn notify(&self, notification: StoreNotification) {
         if let Some(notifier) = self.notifier.as_ref() {
-            let _ = notifier.send(notification);
+            let _ = notifier.send(notification.clone());
         }
+        self.notification_state.notify();
     }
 
     fn migrate(&self) -> Result<()> {
@@ -197,7 +260,7 @@ impl Store {
         parent_id: Option<&str>,
         cwd: impl AsRef<Path>,
     ) -> Result<SessionMeta> {
-        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let id = new_thread_id();
         let artifact_root = self.state_dir.join("artifacts").join(&id);
         self.create_session_with_id_and_artifact_root(parent_id, cwd, artifact_root, id)
     }
@@ -208,7 +271,7 @@ impl Store {
         cwd: impl AsRef<Path>,
         artifact_root: impl AsRef<Path>,
     ) -> Result<SessionMeta> {
-        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let id = new_thread_id();
         self.create_session_with_id_and_artifact_root(parent_id, cwd, artifact_root, id)
     }
 
@@ -247,7 +310,7 @@ impl Store {
         nickname: Option<&str>,
         role: Option<&str>,
     ) -> Result<SessionMeta> {
-        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let id = new_thread_id();
         self.create_child_session_with_id(parent_id, cwd, agent_path, nickname, role, id)
     }
 
@@ -441,12 +504,18 @@ impl Store {
         timeout: Duration,
     ) -> Result<Vec<EventRecord>> {
         let deadline = Instant::now() + timeout;
+        let watcher = self.notification_watcher();
+        let mut cursor = watcher.cursor();
         loop {
             let events = self.events_after_seq(session_id, after_seq)?;
             if !events.is_empty() || Instant::now() >= deadline {
                 return Ok(events);
             }
-            thread::sleep(Duration::from_millis(50));
+            let remaining = deadline.saturating_duration_since(Instant::now());
+            if !watcher.wait_for_change(cursor, remaining) {
+                return self.events_after_seq(session_id, after_seq);
+            }
+            cursor = watcher.cursor();
         }
     }
 
@@ -598,10 +667,6 @@ impl Store {
             "UPDATE agent_edges SET status = 'closed', updated_ms = ?1 WHERE child_session_id = ?2",
             params![now, child_session_id],
         )?;
-        self.notify(StoreNotification::SessionChanged {
-            session_id: child_session_id.to_string(),
-        });
-
         let mut to_cancel = vec![child_session_id.to_string()];
         self.collect_descendant_agent_ids(child_session_id, &mut to_cancel)?;
         for id in to_cancel {
@@ -640,10 +705,12 @@ impl Store {
             "UPDATE agent_edges SET status = 'open', updated_ms = ?1 WHERE child_session_id = ?2",
             params![now, child_session_id],
         )?;
-        if self
-            .load_session(child_session_id)?
-            .is_some_and(|session| session.status == SessionStatus::Cancelled)
-        {
+        if self.load_session(child_session_id)?.is_some_and(|session| {
+            matches!(
+                session.status,
+                SessionStatus::Done | SessionStatus::Failed | SessionStatus::Cancelled
+            )
+        }) {
             self.set_status(child_session_id, SessionStatus::Created)?;
         } else {
             self.notify(StoreNotification::SessionChanged {
@@ -696,25 +763,74 @@ impl Store {
         content: &str,
         trigger_turn: bool,
     ) -> Result<AgentMessage> {
+        self.send_agent_message_with_kind(
+            author_session_id,
+            target_session_id,
+            content,
+            None,
+            "inter_agent",
+            trigger_turn,
+        )
+    }
+
+    pub fn send_agent_message_with_input_items(
+        &self,
+        author_session_id: &str,
+        target_session_id: &str,
+        content: &str,
+        input_items: Option<Value>,
+        trigger_turn: bool,
+    ) -> Result<AgentMessage> {
+        self.send_agent_message_with_kind(
+            author_session_id,
+            target_session_id,
+            content,
+            input_items,
+            "user_input",
+            trigger_turn,
+        )
+    }
+
+    pub fn send_agent_message_with_kind(
+        &self,
+        author_session_id: &str,
+        target_session_id: &str,
+        content: &str,
+        input_items: Option<Value>,
+        input_kind: &str,
+        trigger_turn: bool,
+    ) -> Result<AgentMessage> {
         self.load_session(author_session_id)?
             .with_context(|| format!("unknown author session id: {author_session_id}"))?;
         self.load_session(target_session_id)?
             .with_context(|| format!("unknown target session id: {target_session_id}"))?;
+        if input_kind.trim().is_empty() {
+            bail!("agent message input_kind must not be empty");
+        }
+        let input_items_json = input_items
+            .as_ref()
+            .map(serde_json::to_string)
+            .transpose()
+            .context("serialize agent message input items")?;
         let message = AgentMessage {
             id: Uuid::new_v4().simple().to_string(),
             author_session_id: author_session_id.to_string(),
             target_session_id: target_session_id.to_string(),
             content: content.to_string(),
+            input_items,
+            input_kind: input_kind.to_string(),
             trigger_turn,
             created_ms: now_ms(),
         };
         self.conn.execute(
-            "INSERT INTO agent_messages(id, author_session_id, target_session_id, content, trigger_turn, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+            "INSERT INTO agent_messages(id, author_session_id, target_session_id, content, input_items, input_kind, trigger_turn, created_ms) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
             params![
                 message.id,
                 message.author_session_id,
                 message.target_session_id,
                 message.content,
+                input_items_json,
+                message.input_kind,
                 if message.trigger_turn { 1 } else { 0 },
                 message.created_ms,
             ],
@@ -730,7 +846,7 @@ impl Store {
 
     pub fn messages_for_agent(&self, target_session_id: &str) -> Result<Vec<AgentMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, author_session_id, target_session_id, content, trigger_turn, created_ms FROM agent_messages WHERE target_session_id = ?1 ORDER BY created_ms ASC, id ASC",
+            "SELECT id, author_session_id, target_session_id, content, input_items, input_kind, trigger_turn, created_ms FROM agent_messages WHERE target_session_id = ?1 ORDER BY created_ms ASC, id ASC",
         )?;
         let rows = stmt
             .query_map(params![target_session_id], row_to_agent_message)?
@@ -1025,14 +1141,20 @@ fn row_to_agent_summary(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentSummar
 }
 
 fn row_to_agent_message(row: &rusqlite::Row<'_>) -> rusqlite::Result<AgentMessage> {
-    let trigger_turn: i64 = row.get(4)?;
+    let input_items_json: Option<String> = row.get(4)?;
+    let input_items = input_items_json
+        .as_deref()
+        .and_then(|raw| serde_json::from_str(raw).ok());
+    let trigger_turn: i64 = row.get(6)?;
     Ok(AgentMessage {
         id: row.get(0)?,
         author_session_id: row.get(1)?,
         target_session_id: row.get(2)?,
         content: row.get(3)?,
+        input_items,
+        input_kind: row.get(5)?,
         trigger_turn: trigger_turn != 0,
-        created_ms: row.get(5)?,
+        created_ms: row.get(7)?,
     })
 }
 
@@ -1064,6 +1186,19 @@ fn status_for_event(event_type: &str, payload: &Value) -> Option<SessionStatus> 
 
 pub fn now_ms() -> i64 {
     Utc::now().timestamp_millis()
+}
+
+/// Generate a public thread/session id with the same wire shape Codex uses for
+/// subagent ids: a UUID string accepted by `ThreadId::from_string`.
+pub fn new_thread_id() -> String {
+    Uuid::new_v4().to_string()
+}
+
+/// Validate the public thread/session id grammar used by Codex's v1 multi-agent
+/// tools. Existing imported sessions can still have arbitrary ids, but v1 tool
+/// targets must be UUID strings.
+pub fn is_thread_id(value: &str) -> bool {
+    Uuid::parse_str(value.trim()).is_ok()
 }
 
 fn read_json(path: &Path) -> Result<Value> {
@@ -1204,8 +1339,14 @@ mod tests {
         let temp = tempfile::tempdir()?;
         let (tx, rx) = mpsc::channel();
         let store = Store::open_with_notifier(temp.path(), tx)?;
+        let watcher = store.notification_watcher();
+        let cursor = watcher.cursor();
 
         let session = store.create_session(None, "/tmp")?;
+        assert!(
+            watcher.wait_for_change(cursor, Duration::from_millis(1)),
+            "store-owned watcher must wake on create_session notifications"
+        );
         let startup_notifications: Vec<_> = rx.try_iter().collect();
         assert!(startup_notifications.contains(&StoreNotification::SessionsChanged));
         assert!(startup_notifications.iter().any(|notification| matches!(

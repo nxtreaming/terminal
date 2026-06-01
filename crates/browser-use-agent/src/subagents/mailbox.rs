@@ -23,6 +23,7 @@
 use std::collections::VecDeque;
 use std::sync::Mutex;
 
+use serde_json::Value;
 use tokio::sync::watch;
 use tokio::time::timeout_at;
 use tokio::time::Instant;
@@ -37,6 +38,9 @@ pub struct InterAgentCommunication {
     pub to_agent_path: String,
     /// Opaque carried items (e.g. serialized response items); free-form here.
     pub items: Vec<String>,
+    /// Structured legacy v1 user-input items, preserved for no-store fallback
+    /// paths that do not have durable `agent_messages.input_items`.
+    pub input_items: Option<Value>,
     /// The human-readable prompt/body of the communication.
     pub prompt: String,
     /// Whether delivery should wake the recipient into a fresh turn
@@ -56,34 +60,74 @@ impl InterAgentCommunication {
             from_agent_path: from_agent_path.into(),
             to_agent_path: to_agent_path.into(),
             items,
+            input_items: None,
+            prompt: prompt.into(),
+            trigger_turn,
+        }
+    }
+
+    pub fn new_with_input_items(
+        from_agent_path: impl Into<String>,
+        to_agent_path: impl Into<String>,
+        input_items: Option<Value>,
+        prompt: impl Into<String>,
+        trigger_turn: bool,
+    ) -> Self {
+        Self {
+            from_agent_path: from_agent_path.into(),
+            to_agent_path: to_agent_path.into(),
+            items: Vec::new(),
+            input_items,
             prompt: prompt.into(),
             trigger_turn,
         }
     }
 }
 
-/// Status of a sub-agent (codex `AgentStatus`, the subset this WP needs).
-#[derive(Clone, Copy, Debug, PartialEq, Eq, serde::Serialize)]
+/// Status of a sub-agent (codex `AgentStatus` wire surface).
+#[derive(Clone, Debug, PartialEq, Eq, serde::Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentStatus {
+    PendingInit,
     Running,
-    Completed,
-    Failed,
-    Closed,
+    Interrupted,
+    Completed(Option<String>),
+    Errored(String),
+    Shutdown,
     NotFound,
 }
 
 impl AgentStatus {
-    /// The wire string used inside the `<subagent_notification>` body
-    /// (codex serializes `AgentStatus` snake_case).
+    /// Short label used in the in-model `<subagents>` environment block.
     pub fn as_str(&self) -> &'static str {
         match self {
+            AgentStatus::PendingInit => "pending_init",
             AgentStatus::Running => "running",
-            AgentStatus::Completed => "completed",
-            AgentStatus::Failed => "failed",
-            AgentStatus::Closed => "closed",
+            AgentStatus::Interrupted => "interrupted",
+            AgentStatus::Completed(_) => "completed",
+            AgentStatus::Errored(_) => "errored",
+            AgentStatus::Shutdown => "shutdown",
             AgentStatus::NotFound => "not_found",
         }
+    }
+
+    pub fn is_final(&self) -> bool {
+        matches!(
+            self,
+            AgentStatus::Completed(_)
+                | AgentStatus::Errored(_)
+                | AgentStatus::Shutdown
+                | AgentStatus::NotFound
+        )
+    }
+
+    pub fn is_live(&self) -> bool {
+        !matches!(self, AgentStatus::Shutdown | AgentStatus::NotFound)
+    }
+
+    pub fn wire_value(&self) -> serde_json::Value {
+        serde_json::to_value(self)
+            .unwrap_or_else(|_| serde_json::Value::String(self.as_str().into()))
     }
 }
 
@@ -115,7 +159,7 @@ impl SubagentNotification {
         let (open, close) = Self::markers();
         let body = serde_json::json!({
             "agent_path": &self.agent_reference,
-            "status": self.status.as_str(),
+            "status": self.status.wire_value(),
         });
         format!("{open}\n{body}\n{close}")
     }

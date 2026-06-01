@@ -47,6 +47,9 @@ fn def(name: &str) -> ToolDefinition {
         name: name.to_string(),
         description: format!("the {name} tool"),
         input_schema: serde_json::json!({ "type": "object" }),
+        output_schema: None,
+        namespace: None,
+        namespace_description: None,
     }
 }
 
@@ -1004,6 +1007,103 @@ fn definitions_carry_required_fields_and_names() {
     assert_eq!(definitions::python().input_schema["required"][0], "code");
     assert_eq!(definitions::browser().input_schema["required"][0], "action");
     assert_eq!(definitions::mcp().input_schema["required"][0], "server");
+}
+
+#[test]
+fn subagent_v2_definitions_match_codex_output_schema_surface() {
+    let spawn = definitions::spawn_agent();
+    assert_eq!(
+        spawn.input_schema["required"],
+        serde_json::json!(["task_name", "message"])
+    );
+    assert_eq!(
+        spawn.output_schema.expect("spawn_agent output schema")["required"],
+        serde_json::json!(["task_name", "nickname"])
+    );
+
+    let wait = definitions::wait_agent();
+    assert_eq!(
+        wait.input_schema["properties"]["timeout_ms"]["description"],
+        serde_json::json!(
+            "Optional timeout in milliseconds. Defaults to 30000, min 10000, max 3600000."
+        )
+    );
+    assert_eq!(
+        wait.output_schema.expect("wait_agent output schema")["properties"]["message"]
+            ["description"],
+        serde_json::json!("Brief wait summary without the agent's final content.")
+    );
+
+    let send_input = definitions::send_input();
+    assert_eq!(
+        send_input.output_schema.expect("send_input output schema")["required"],
+        serde_json::json!(["submission_id"])
+    );
+
+    assert_eq!(definitions::send_message().output_schema, None);
+    assert_eq!(definitions::followup_task().output_schema, None);
+
+    let list = definitions::list_agents();
+    assert_eq!(
+        list.output_schema.expect("list_agents output schema")["properties"]["agents"]["items"]
+            ["required"],
+        serde_json::json!(["agent_name", "agent_status", "last_task_message"])
+    );
+
+    let close = definitions::close_agent();
+    assert_eq!(
+        close.output_schema.expect("close_agent output schema")["required"],
+        serde_json::json!(["previous_status"])
+    );
+}
+
+#[test]
+fn subagent_v2_spawn_schema_can_hide_metadata_fields() {
+    let spawn = definitions::spawn_agent_with_options(definitions::SpawnAgentDefinitionOptions {
+        hide_agent_type_model_reasoning: true,
+        ..Default::default()
+    });
+    let properties = spawn.input_schema["properties"]
+        .as_object()
+        .expect("spawn properties");
+    assert!(properties.contains_key("message"));
+    assert!(properties.contains_key("task_name"));
+    assert!(properties.contains_key("fork_turns"));
+    assert!(!properties.contains_key("agent_type"));
+    assert!(!properties.contains_key("model"));
+    assert!(!properties.contains_key("reasoning_effort"));
+    assert!(!properties.contains_key("service_tier"));
+    assert_eq!(
+        spawn.output_schema.expect("spawn output schema")["required"],
+        serde_json::json!(["task_name"])
+    );
+}
+
+#[test]
+fn legacy_subagent_items_schema_advertises_full_user_input_fields() {
+    let spawn = definitions::spawn_agent_v1_with_options(Default::default());
+    let item_properties = &spawn.input_schema["properties"]["items"]["items"]["properties"];
+
+    assert_eq!(
+        item_properties["text_elements"]["items"]["properties"]["byte_range"]["required"],
+        serde_json::json!(["start", "end"])
+    );
+    assert_eq!(
+        item_properties["detail"]["enum"],
+        serde_json::json!(["high", "original"])
+    );
+
+    let send_input = definitions::send_input();
+    let send_item_properties =
+        &send_input.input_schema["properties"]["items"]["items"]["properties"];
+    assert_eq!(
+        send_item_properties["text_elements"]["items"]["properties"]["byte_range"]["required"],
+        serde_json::json!(["start", "end"])
+    );
+    assert_eq!(
+        send_item_properties["detail"]["enum"],
+        serde_json::json!(["high", "original"])
+    );
 }
 
 /// REGRESSION (fix 1): the `request_user_input` schema must advertise the shape

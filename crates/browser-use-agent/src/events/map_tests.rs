@@ -68,6 +68,7 @@ fn tool_call_maps_to_tool_started_with_parsed_arguments() {
         &LlmEvent::ToolCall {
             id: "c0".to_string(),
             name: "click".to_string(),
+            namespace: None,
             input: json!({ "index": 5 }),
         },
     );

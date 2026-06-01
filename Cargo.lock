@@ -220,6 +220,7 @@ dependencies = [
  "browser-use-browser",
  "browser-use-llm",
  "browser-use-protocol",
+ "browser-use-providers",
  "browser-use-python-worker",
  "browser-use-store",
  "futures-util",

@@ -156,6 +156,9 @@ impl Tool {
             name: self.name.clone(),
             description: self.description.clone(),
             input_schema: self.parameters.clone(),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 

@@ -246,18 +246,19 @@ fn lower_to_messages_array_content_and_images() {
     let cm = ContextManager::new();
     let items = vec![json!({
         "role": "user",
-        "content": [
-            { "type": "input_text", "text": "describe" },
-            { "type": "input_image", "image_url": "https://example.com/a.png" },
-        ],
+            "content": [
+                { "type": "input_text", "text": "describe" },
+                { "type": "input_image", "image_url": "https://example.com/a.png", "detail": "original" },
+            ],
     })];
     let messages = cm.lower_to_messages(&items);
     assert_eq!(messages.len(), 1);
     assert_eq!(messages[0].content.len(), 2);
     assert!(matches!(messages[0].content[0], ContentPart::Text { .. }));
     match &messages[0].content[1] {
-        ContentPart::Media { url, .. } => {
+        ContentPart::Media { url, detail, .. } => {
             assert_eq!(url.as_deref(), Some("https://example.com/a.png"));
+            assert_eq!(detail.as_deref(), Some("original"));
         }
         other => panic!("expected Media, got {other:?}"),
     }
@@ -285,11 +286,13 @@ fn lower_to_messages_tool_content_preserves_images() {
         mime_type,
         data,
         url,
+        detail,
     } = &content[0]
     else {
         panic!("expected media content, got {content:?}");
     };
     assert_eq!(mime_type, "image/png");
+    assert_eq!(detail.as_deref(), Some("high"));
     assert_eq!(data.as_deref(), Some("AAAA"));
     assert!(url.is_none());
 }

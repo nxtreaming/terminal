@@ -6,7 +6,7 @@
 //!
 //! 1. `ForkMode::LastN(n)` previously truncated by reconstructed-MESSAGE count
 //!    (`full[full.len()-n..]`). Per codex / legacy fork parity it must keep the
-//!    last `n` USER TURNS (turn boundary), not the last `n` messages.
+//!    last `n` fork turns (turn boundary), not the last `n` messages.
 //! 2. `ForkMode::Summary` previously aliased `All` (`ForkMode::All |
 //!    ForkMode::Summary => full`). Per the WP brief it must be a DISTINCT
 //!    behavior. Legacy has no real summary-fork (its doc says Summary "is
@@ -25,15 +25,12 @@
 //!   `session.followup`, rollback.rs:114-119), slicing on a turn boundary, NOT
 //!   on raw message/event count.
 //! - codex `thread_rollout_truncation.rs::truncate_rollout_to_last_n_fork_turns`
-//!   keeps the last `n` fork-turn boundaries.
-//! - we REUSE the agent's already-ported turn predicate
-//!   [`crate::session::reconstruct::is_real_user_event`] (re-exported as
-//!   `crate::session::is_real_user_event`) rather than duplicating it, so fork
-//!   and the rollback reducer agree on what a "user turn" is.
+//!   keeps the last `n` fork-turn boundaries. A fork boundary is a normal user
+//!   input/followup or an inter-agent message with `trigger_turn = true`.
 
 use browser_use_protocol::EventRecord;
+use serde_json::Value;
 
-use crate::session::is_real_user_event;
 use crate::session::ForkMode;
 
 /// A summary placeholder marking collapsed pre-fork history.
@@ -68,34 +65,61 @@ pub struct ForkOutcome {
 /// Default summary text used when collapsing pre-fork history.
 const DEFAULT_FORK_SUMMARY: &str = "[summary of earlier conversation]";
 
-/// Collect the seqs of real (non-context) user-turn events, in order.
+/// Collect the seqs of fork-turn events, in order.
 ///
-/// Reuses [`is_real_user_event`] (`reconstruct.rs:854`, ported from legacy
-/// `rollback.rs:114`) so fork and rollback share one turn-boundary definition.
-fn real_user_turn_seqs(events: &[EventRecord]) -> Vec<i64> {
-    events
+/// Codex counts normal user inputs and inter-agent messages that set
+/// `trigger_turn = true` as fork-turn boundaries.
+fn fork_turn_seqs(events: &[EventRecord]) -> Vec<i64> {
+    effective_events_after_rollbacks(events)
         .iter()
-        .filter(|event| is_real_user_event(event))
+        .filter(|event| is_fork_turn_boundary_event(event))
         .map(|event| event.seq)
         .collect()
+}
+
+fn effective_events_after_rollbacks(events: &[EventRecord]) -> Vec<EventRecord> {
+    let mut checkpoint_messages = Vec::new();
+    crate::session::rollback_filtered_events_after_for_fork(events, 0, &mut checkpoint_messages)
+        .into_iter()
+        .cloned()
+        .collect()
+}
+
+fn is_fork_turn_boundary_event(event: &EventRecord) -> bool {
+    if crate::session::is_real_user_event(event) {
+        return true;
+    }
+    matches!(
+        event.event_type.as_str(),
+        "agent.message" | "agent.mailbox_input"
+    ) && event
+        .payload
+        .get("content")
+        .and_then(Value::as_str)
+        .is_some()
+        && event
+            .payload
+            .get("trigger_turn")
+            .and_then(Value::as_bool)
+            .unwrap_or(false)
 }
 
 /// The seq at which the last `n` user turns begin, or `None` if there are no
 /// user turns (or `n == 0`). Keeping events with `seq >= boundary` keeps exactly
 /// the last `n` user turns.
 ///
-/// Legacy parity: `rollback_last_n_user_turns:73-82` indexes user turns from the
-/// end; when `n` exceeds the number of user turns it keeps from the FIRST user
-/// turn onward (carry as much as exists) — the natural fork semantics, matching
-/// codex `truncate_rollout_to_last_n_fork_turns` returning the full rollout when
-/// `fork_turn_positions.len() <= n_from_end`.
+/// Codex parity: when `n` exceeds the number of fork turns, keep the full rollout,
+/// including system/developer/context events before the first turn.
 fn last_n_user_turns_start_seq(events: &[EventRecord], n: usize) -> Option<i64> {
     if n == 0 {
         return None;
     }
-    let seqs = real_user_turn_seqs(events);
+    let seqs = fork_turn_seqs(events);
     if seqs.is_empty() {
         return None;
+    }
+    if n >= seqs.len() {
+        return Some(0);
     }
     let idx = seqs.len().saturating_sub(n);
     Some(seqs[idx])
@@ -113,22 +137,29 @@ pub fn fork_events_by_turn(events: &[EventRecord], mode: &ForkMode) -> ForkOutco
             summary: None,
         },
         ForkMode::All => ForkOutcome {
-            carried: events.to_vec(),
+            carried: effective_events_after_rollbacks(events),
             summary: None,
         },
         ForkMode::LastN(n) => {
-            // DEBT FIX #1: keep the last `n` USER TURNS, not the last `n`
+            // DEBT FIX #1: keep the last `n` fork turns, not the last `n`
             // messages. Legacy parity: rollback_last_n_user_turns:73.
+            let effective = effective_events_after_rollbacks(events);
             match last_n_user_turns_start_seq(events, *n) {
                 Some(start_seq) => ForkOutcome {
-                    carried: events
+                    carried: effective
                         .iter()
                         .filter(|event| event.seq >= start_seq)
                         .cloned()
                         .collect(),
                     summary: None,
                 },
-                // No real user turns (or n == 0): carry nothing.
+                // Codex keeps the full effective rollout when there are no fork
+                // boundaries but the caller asked for a positive LastN budget.
+                // Only an explicit zero budget carries nothing.
+                None if *n > 0 => ForkOutcome {
+                    carried: effective,
+                    summary: None,
+                },
                 None => ForkOutcome {
                     carried: Vec::new(),
                     summary: None,
@@ -138,7 +169,10 @@ pub fn fork_events_by_turn(events: &[EventRecord], mode: &ForkMode) -> ForkOutco
         ForkMode::Summary => {
             // DEBT FIX #2: Summary is DISTINCT from All. Collapse all-but-the-
             // last-turn into a placeholder; carry the most recent turn forward.
-            summary_fork(events, DEFAULT_FORK_SUMMARY)
+            summary_fork(
+                &effective_events_after_rollbacks(events),
+                DEFAULT_FORK_SUMMARY,
+            )
         }
     }
 }
@@ -150,7 +184,7 @@ pub fn fork_events_by_turn(events: &[EventRecord], mode: &ForkMode) -> ForkOutco
 /// `replacement_history` (carried) separate; here the carried slice is the last
 /// turn and the placeholder records the collapsed-prefix size.
 fn summary_fork(events: &[EventRecord], summary: &str) -> ForkOutcome {
-    let seqs = real_user_turn_seqs(events);
+    let seqs = fork_turn_seqs(events);
     match seqs.last() {
         Some(&last_user_seq) => {
             let split = events

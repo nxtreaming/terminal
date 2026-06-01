@@ -476,6 +476,9 @@ mod tests {
 
     #[test]
     fn default_model_falls_back_to_bundled_default_when_unconfigured() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
+        std::env::remove_var("BROWSER_USE_TERMINAL_HOME");
         let dir = temp_dir("default");
         let resolved = default_model_for_cwd_with_options(&dir, None, &[], true).unwrap();
         assert_eq!(resolved, BUNDLED_DEFAULT_MODEL);
@@ -489,6 +492,10 @@ mod tests {
             None
         );
         let _ = fs::remove_dir_all(&dir);
+        match previous {
+            Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+            None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
+        }
     }
 
     #[test]
@@ -578,6 +585,9 @@ mod tests {
 
     #[test]
     fn catalog_default_when_unconfigured_matches_bundled() {
+        let _guard = crate::test_env::lock();
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
+        std::env::remove_var("BROWSER_USE_TERMINAL_HOME");
         let dir = temp_dir("catalog_default");
         let catalog = model_catalog_for_cwd_with_options(&dir, None, &[]).unwrap();
         assert_eq!(catalog, bundled_model_catalog());
@@ -586,6 +596,10 @@ mod tests {
             Some(BUNDLED_DEFAULT_MODEL.to_string())
         );
         let _ = fs::remove_dir_all(&dir);
+        match previous {
+            Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+            None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
+        }
     }
 
     #[test]
@@ -629,12 +643,8 @@ mod tests {
         assert_eq!(config_override_str(&ov, "absent"), None);
     }
 
-    /// Serializes the `BROWSER_USE_TERMINAL_HOME` env mutation across the
-    /// config.toml-layer tests (they share process-global env state).
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::lock();
         let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         std::env::set_var("BROWSER_USE_TERMINAL_HOME", home);
         let result = f();

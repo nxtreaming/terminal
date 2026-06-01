@@ -79,6 +79,23 @@ fn workspace_context(seq: i64, before_seq: i64) -> EventRecord {
     )
 }
 
+fn agent_message(seq: i64, content: &str, trigger_turn: bool) -> EventRecord {
+    event(
+        seq,
+        "agent.message",
+        json!({
+            "source": "/root/a",
+            "target": "/root/b",
+            "content": content,
+            "trigger_turn": trigger_turn,
+        }),
+    )
+}
+
+fn rollback(seq: i64, num_turns: usize) -> EventRecord {
+    event(seq, "session.rollback", json!({ "num_turns": num_turns }))
+}
+
 /// Four user turns, each with an assistant reply (8 events, seqs 1..=8).
 fn four_turn_log() -> Vec<EventRecord> {
     vec![
@@ -292,6 +309,51 @@ fn fork_lastn_skips_non_user_events() {
     let outcome = fork_events_by_turn(&log, &ForkMode::LastN(1));
     let seqs: Vec<i64> = outcome.carried.iter().map(|e| e.seq).collect();
     assert_eq!(seqs, vec![4, 5]);
+}
+
+#[test]
+fn fork_lastn_without_turn_boundaries_keeps_effective_rollout() {
+    let log = vec![workspace_context(1, 2), assistant(2, "preface")];
+    let outcome = fork_events_by_turn(&log, &ForkMode::LastN(1));
+    let seqs: Vec<i64> = outcome.carried.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![1, 2]);
+}
+
+#[test]
+fn fork_lastn_counts_triggered_inter_agent_messages() {
+    let log = vec![
+        user(1, "root-turn"),
+        assistant(2, "root-reply"),
+        agent_message(3, "queued note", false),
+        assistant(4, "ignored for boundary"),
+        agent_message(5, "please continue", true),
+        assistant(6, "child reply"),
+    ];
+
+    let outcome = fork_events_by_turn(&log, &ForkMode::LastN(1));
+    let seqs: Vec<i64> = outcome.carried.iter().map(|e| e.seq).collect();
+    assert_eq!(seqs, vec![5, 6]);
+}
+
+#[test]
+fn fork_lastn_applies_rollback_markers_before_selecting_suffix() {
+    let log = vec![
+        user(1, "kept"),
+        assistant(2, "kept reply"),
+        user(3, "rolled back"),
+        assistant(4, "stale reply"),
+        rollback(5, 1),
+        user(6, "new suffix"),
+        assistant(7, "new reply"),
+    ];
+
+    let one = fork_events_by_turn(&log, &ForkMode::LastN(1));
+    let one_seqs: Vec<i64> = one.carried.iter().map(|event| event.seq).collect();
+    assert_eq!(one_seqs, vec![6, 7]);
+
+    let two = fork_events_by_turn(&log, &ForkMode::LastN(2));
+    let two_seqs: Vec<i64> = two.carried.iter().map(|event| event.seq).collect();
+    assert_eq!(two_seqs, vec![1, 2, 6, 7]);
 }
 
 #[test]

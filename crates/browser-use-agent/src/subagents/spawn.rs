@@ -77,6 +77,10 @@ impl ForkTurns {
 pub struct SpawnAgentArgs {
     pub message: String,
     pub task_name: String,
+    #[serde(default, skip)]
+    pub input_items: Option<Value>,
+    #[serde(default, skip)]
+    pub input_is_inter_agent_communication: bool,
     #[serde(default)]
     pub agent_type: Option<String>,
     #[serde(default)]
@@ -87,6 +91,8 @@ pub struct SpawnAgentArgs {
     pub service_tier: Option<String>,
     #[serde(default)]
     pub fork_turns: Option<String>,
+    #[serde(default)]
+    pub fork_context: Option<bool>,
 }
 
 impl SpawnAgentArgs {
@@ -97,6 +103,11 @@ impl SpawnAgentArgs {
 
     /// Resolve `fork_turns` to a [`ForkTurns`].
     pub fn fork_turns_mode(&self) -> Result<ForkTurns, String> {
+        if self.fork_context.is_some() {
+            return Err(
+                "fork_context is not supported in MultiAgentV2; use fork_turns instead".to_string(),
+            );
+        }
         ForkTurns::parse(self.fork_turns.as_deref())
     }
 
@@ -115,6 +126,31 @@ impl SpawnAgentArgs {
     pub fn validate_task_name(&self) -> Result<(), String> {
         validate_task_name(&self.task_name)
     }
+
+    pub fn validate_overrides(&self) -> Result<(), String> {
+        if let Some(model) = self.model.as_deref() {
+            if model.trim().is_empty() {
+                return Err("model override must not be empty".to_string());
+            }
+        }
+        if let Some(service_tier) = self.service_tier.as_deref() {
+            if service_tier.trim().is_empty() {
+                return Err("service_tier override must not be empty".to_string());
+            }
+        }
+        if let Some(reasoning) = self.reasoning_effort.as_deref() {
+            let normalized = reasoning.trim().to_ascii_lowercase().replace('-', "_");
+            if !matches!(
+                normalized.as_str(),
+                "none" | "minimal" | "low" | "medium" | "high" | "xhigh"
+            ) {
+                return Err(format!(
+                    "reasoning_effort must be one of none, minimal, low, medium, high, or xhigh; got `{reasoning}`"
+                ));
+            }
+        }
+        Ok(())
+    }
 }
 
 /// `task_name` must be lowercase ascii letters, digits, or `_`, and non-empty
@@ -122,6 +158,9 @@ impl SpawnAgentArgs {
 pub fn validate_task_name(task_name: &str) -> Result<(), String> {
     if task_name.is_empty() {
         return Err("task_name must not be empty".to_string());
+    }
+    if matches!(task_name, "root" | "." | "..") {
+        return Err(format!("task_name `{task_name}` is reserved"));
     }
     let ok = task_name
         .chars()
@@ -162,9 +201,9 @@ pub const SPAWN_AGENT_TOOL_NAME: &str = "spawn_agent";
 /// `create_spawn_agent_tool_v2` → name `"spawn_agent"`, required
 /// `["task_name","message"]`, properties at `:584-621`).
 ///
-/// Emitting JSON (rather than a typed `ToolSpec`) keeps this module free of the
-/// crate's tool-registry types; a later integration WP maps this onto the real
-/// `ToolSpec` when registering the tool.
+/// Emitting JSON keeps this module's parser tests independent from the runtime
+/// tool registry; production registration uses the definitions in
+/// [`crate::tools::registry::definitions`].
 pub fn spawn_agent_tool_spec() -> Value {
     json!({
         "name": SPAWN_AGENT_TOOL_NAME,

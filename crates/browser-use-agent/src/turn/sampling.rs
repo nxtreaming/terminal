@@ -466,14 +466,20 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                 acc.full_text.push_str(&delta);
                 StreamProgress::Continue
             }
-            LlmEvent::ToolCall { id, name, input } => {
+            LlmEvent::ToolCall {
+                id,
+                name,
+                namespace,
+                input,
+            } => {
                 // Capture the actual call (model order) so the fused dispatch can
                 // run it; the count is derived from this vec's length.
                 acc.tool_calls.push(ContentPart::ToolCall {
                     id,
                     name,
                     input,
-                    provider_metadata: None,
+                    provider_metadata: namespace
+                        .map(|namespace| serde_json::json!({ "namespace": namespace })),
                 });
                 StreamProgress::Continue
             }
@@ -644,10 +650,14 @@ fn append_event_content_parts(parts: &[ContentPart], out: &mut Vec<Value>, has_m
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
-                if let Some(part) =
-                    media_event_content_part(mime_type, data.as_deref(), url.as_deref())
-                {
+                if let Some(part) = media_event_content_part(
+                    mime_type,
+                    data.as_deref(),
+                    url.as_deref(),
+                    detail.as_deref(),
+                ) {
                     *has_media = true;
                     out.push(part);
                 }
@@ -664,6 +674,7 @@ fn media_event_content_part(
     mime_type: &str,
     data: Option<&str>,
     url: Option<&str>,
+    detail: Option<&str>,
 ) -> Option<Value> {
     let resolved = match (url, data) {
         (Some(url), _) => url.to_string(),
@@ -674,7 +685,7 @@ fn media_event_content_part(
         Some(serde_json::json!({
             "type": "input_image",
             "image_url": resolved,
-            "detail": "high",
+            "detail": detail.unwrap_or("high"),
         }))
     } else {
         Some(serde_json::json!({

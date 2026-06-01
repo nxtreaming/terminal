@@ -53,21 +53,30 @@ use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::sync::Mutex;
+use std::time::Duration;
 
-use browser_use_llm::schema::{ContentPart, Message};
+use browser_use_llm::schema::{ContentPart, Message, MessageRole};
+use browser_use_protocol::SessionStatus;
 use tokio_util::sync::CancellationToken;
 
 use crate::compact::{run_compaction, CompactionSampler, COMPACT_USER_MESSAGE_MAX_TOKENS};
 use crate::config_overrides::ProviderRunConfig;
 use crate::context::assembly::TruncationPolicy;
-use crate::context::workspace_context::append_environment_context_event;
-use crate::context::{ContextManager, Item};
+use crate::context::workspace_context::{
+    append_environment_context_event, append_workspace_context_event,
+};
+use crate::context::{
+    typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
+    ContextManager, Item,
+};
 use crate::decision::SamplingOutcome;
 use crate::decision::TokenStatus;
 use crate::events::{names, session_done_payload, EventSink, PendingEvent, TurnCtx};
 use crate::session::provider_messages_from_events;
+use crate::session::reconstruct::WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND;
 use crate::session::SessionId;
 use crate::session::SharedStore;
+use crate::subagents::display_agent_path_for_session;
 use crate::task::TurnLifecycleEvent;
 use crate::turn::sampling::FusionRecorder;
 use crate::turn::SamplingDriver;
@@ -373,6 +382,34 @@ fn history_from_store(store: &SharedStore, session_id: &str) -> Vec<Message> {
     ContextManager::new().lower_to_messages(&items)
 }
 
+fn user_input_payload_to_messages(payload: &serde_json::Value) -> Vec<Message> {
+    let mut items = Vec::new();
+    if let Some(messages) = payload
+        .get("skill_context_messages")
+        .and_then(serde_json::Value::as_array)
+    {
+        items.extend(messages.iter().cloned());
+    }
+    if let Some(messages) = payload
+        .get("mention_context_messages")
+        .and_then(serde_json::Value::as_array)
+    {
+        items.extend(messages.iter().cloned());
+    }
+    if let Some(content) = payload.get("content") {
+        items.push(serde_json::json!({
+            "role": "user",
+            "content": content,
+        }));
+    } else if let Some(text) = payload.get("text").and_then(serde_json::Value::as_str) {
+        items.push(serde_json::json!({
+            "role": "user",
+            "content": text,
+        }));
+    }
+    ContextManager::new().lower_to_messages(&items)
+}
+
 impl TurnState for StoreTurnState {
     async fn clone_history_for_prompt(&self) -> Vec<Message> {
         // Once compacted, the prompt base is the compacted override (codex's
@@ -401,13 +438,90 @@ impl TurnState for StoreTurnState {
     }
 
     async fn has_pending_input(&self) -> bool {
-        // Phase-E seam: no pending steer/input queue is wired yet.
-        false
+        let store = Arc::clone(&self.store);
+        let session_id = self.session_id.as_str().to_string();
+        tokio::task::spawn_blocking(move || {
+            store
+                .lock()
+                .expect("store mutex poisoned")
+                .messages_for_agent(&session_id)
+                .map(|messages| !messages.is_empty())
+                .unwrap_or(false)
+        })
+        .await
+        .unwrap_or(false)
     }
 
     async fn take_pending_input(&self) -> Vec<Message> {
-        // Phase-E seam: no pending steer/input queue is wired yet.
-        Vec::new()
+        let store = Arc::clone(&self.store);
+        let session_id = self.session_id.as_str().to_string();
+        tokio::task::spawn_blocking(move || {
+            let store = store.lock().expect("store mutex poisoned");
+            let messages = store
+                .drain_agent_messages_for_agent(&session_id)
+                .unwrap_or_default();
+            messages
+                .into_iter()
+                .flat_map(|message| {
+                    let author_path =
+                        display_agent_path_for_session(&store, &message.author_session_id)
+                            .unwrap_or_else(|_| "/root".to_string());
+                    let recipient_path =
+                        display_agent_path_for_session(&store, &message.target_session_id)
+                            .unwrap_or_else(|_| "/root".to_string());
+                    let content = message.content.clone();
+                    let trigger_turn = message.trigger_turn;
+                    if message.input_kind == "user_input" {
+                        let cwd = store
+                            .load_session(&message.target_session_id)
+                            .ok()
+                            .flatten()
+                            .map(|session| session.cwd)
+                            .unwrap_or_else(|| ".".to_string());
+                        let payload = if let Some(items) = message.input_items.as_ref() {
+                            typed_user_input_payload_from_items_for_cwd(items, &cwd)
+                        } else {
+                            typed_user_input_payload_from_text_for_cwd(&content, &cwd)
+                        };
+                        if let Ok(payload) = payload {
+                            let _ = store.append_event(
+                                &message.target_session_id,
+                                "session.followup",
+                                payload.clone(),
+                            );
+                            return user_input_payload_to_messages(&payload);
+                        }
+                    } else {
+                        let _ = store.append_event(
+                            &message.target_session_id,
+                            "agent.mailbox_input",
+                            serde_json::json!({
+                                "id": message.id,
+                                "author_session_id": message.author_session_id,
+                                "target_session_id": message.target_session_id,
+                                "author_path": author_path,
+                                "recipient_path": recipient_path,
+                                "content": content,
+                                "trigger_turn": trigger_turn,
+                            }),
+                        );
+                    }
+                    let envelope = serde_json::json!({
+                        "author": author_path,
+                        "recipient": recipient_path,
+                        "other_recipients": [],
+                        "content": content,
+                        "trigger_turn": trigger_turn,
+                    });
+                    vec![Message::new(
+                        MessageRole::Assistant,
+                        vec![ContentPart::text(envelope.to_string())],
+                    )]
+                })
+                .collect()
+        })
+        .await
+        .unwrap_or_default()
     }
 
     async fn token_status(&self) -> TokenStatus {
@@ -507,12 +621,14 @@ fn message_to_provider_item(message: &Message) -> Item {
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
                 content_parts.push(json!({
                     "type": "image",
                     "mime_type": mime_type,
                     "data": data,
                     "url": url,
+                    "detail": detail,
                 }));
             }
             ContentPart::ToolCall {
@@ -556,11 +672,15 @@ fn tool_result_content_to_provider_content(content: &[ContentPart]) -> serde_jso
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
                 has_non_text = true;
-                if let Some(media) =
-                    media_content_part_for_provider(mime_type, data.as_deref(), url.as_deref())
-                {
+                if let Some(media) = media_content_part_for_provider(
+                    mime_type,
+                    data.as_deref(),
+                    url.as_deref(),
+                    detail.as_deref(),
+                ) {
                     parts.push(media);
                 }
             }
@@ -594,6 +714,7 @@ fn media_content_part_for_provider(
     mime_type: &str,
     data: Option<&str>,
     url: Option<&str>,
+    detail: Option<&str>,
 ) -> Option<serde_json::Value> {
     let resolved = match (url, data) {
         (Some(url), _) => url.to_string(),
@@ -604,7 +725,7 @@ fn media_content_part_for_provider(
         Some(serde_json::json!({
             "type": "input_image",
             "image_url": resolved,
-            "detail": "high",
+            "detail": detail.unwrap_or("high"),
         }))
     } else {
         Some(serde_json::json!({
@@ -738,9 +859,46 @@ async fn drive_run<Sd: SamplingDriver>(
     let observer = StoreObserver::new(sink, session_id.as_str().to_string());
 
     let turn_loop = TurnLoop::new(state, driver, observer);
-    turn_loop
-        .run(ctx, turn_has_fresh_input, CancellationToken::new())
-        .await
+    let cancel = CancellationToken::new();
+    let cancel_monitor =
+        spawn_store_cancel_monitor(Arc::clone(&store), session_id.clone(), cancel.clone());
+    let result = turn_loop
+        .run(ctx, turn_has_fresh_input, cancel.clone())
+        .await;
+    cancel.cancel();
+    cancel_monitor.abort();
+    result
+}
+
+fn spawn_store_cancel_monitor(
+    store: SharedStore,
+    session_id: SessionId,
+    cancel: CancellationToken,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        loop {
+            if cancel.is_cancelled() {
+                return;
+            }
+            let store = Arc::clone(&store);
+            let session_id = session_id.as_str().to_string();
+            let should_cancel = tokio::task::spawn_blocking(move || {
+                let store = store.lock().expect("store mutex poisoned");
+                store
+                    .load_session(&session_id)
+                    .ok()
+                    .flatten()
+                    .is_some_and(|session| session.status == SessionStatus::Cancelled)
+            })
+            .await
+            .unwrap_or(false);
+            if should_cancel {
+                cancel.cancel();
+                return;
+            }
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+    })
 }
 
 /// Build the durable UI sink for loop lifecycle events.
@@ -839,6 +997,18 @@ pub async fn run_session_with_config(
     // (2) seed the environment workspace-context durable event (de-duped per kind).
     let env_content = environment_context_content(&config);
     append_environment_context_event(Arc::clone(&store), session_id.as_str(), env_content).await?;
+    if let Some(usage_hint) = multi_agent_v2_usage_hint_content(
+        &config,
+        session_is_spawned_subagent(&store, session_id.as_str())?,
+    ) {
+        append_workspace_context_event(
+            Arc::clone(&store),
+            session_id.as_str(),
+            WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND,
+            usage_hint,
+        )
+        .await?;
+    }
 
     // The run drives over the session's existing durable history (the prompt the
     // caller already seeded). `turn_has_fresh_input` is true iff that log already
@@ -900,7 +1070,14 @@ fn log_has_user_input(store: &SharedStore, session_id: &str) -> bool {
     let store = store.lock().expect("store mutex poisoned");
     store
         .events_for_session(session_id)
-        .map(|events| events.iter().any(|e| e.event_type == "session.input"))
+        .map(|events| {
+            events.iter().any(|e| {
+                matches!(
+                    e.event_type.as_str(),
+                    "session.input" | "agent.mailbox_input"
+                )
+            })
+        })
         .unwrap_or(false)
 }
 
@@ -926,6 +1103,38 @@ fn environment_context_content(config: &ProviderRunConfig) -> String {
     format!("<environment_context>\n<cwd>{cwd}</cwd>\n</environment_context>")
 }
 
+fn session_is_spawned_subagent(store: &SharedStore, session_id: &str) -> anyhow::Result<bool> {
+    let store = store.lock().expect("store mutex poisoned");
+    let has_parent = store
+        .load_session(session_id)?
+        .and_then(|session| session.parent_id)
+        .is_some();
+    if !has_parent {
+        return Ok(false);
+    }
+    Ok(store
+        .events_for_session(session_id)?
+        .iter()
+        .any(|event| event.event_type == "agent.context"))
+}
+
+fn multi_agent_v2_usage_hint_content(
+    config: &ProviderRunConfig,
+    is_spawned_subagent: bool,
+) -> Option<String> {
+    let options = &config.options.multi_agent_v2;
+    if !options.enabled {
+        return None;
+    }
+    let hint = if is_spawned_subagent {
+        options.subagent_usage_hint_text.as_deref()
+    } else {
+        options.root_agent_usage_hint_text.as_deref()
+    }?;
+    let hint = hint.trim();
+    (!hint.is_empty()).then(|| hint.to_string())
+}
+
 /// The fixed assistant reply the `Fake` backend emits.
 ///
 /// Honors a configured [`ProviderRunConfig::with_fake_result`] when present
@@ -941,6 +1150,8 @@ fn fake_response_text(config: &ProviderRunConfig) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::config_overrides::AgentRunOptions;
+    use crate::config_overrides::MultiAgentV2Options;
     use crate::config_overrides::ProviderBackend;
     use crate::config_overrides::ProviderRunConfig;
     use browser_use_store::Store;
@@ -1011,6 +1222,38 @@ mod tests {
                 && e.payload.get("result").and_then(|v| v.as_str()) == Some("hi from fake")),
             "expected the fake assistant reply persisted; log={log:?}"
         );
+    }
+
+    #[tokio::test]
+    async fn config_facade_seeds_multi_agent_v2_usage_hint_context() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "do a thing").await;
+        let config = fake_config().with_options(AgentRunOptions {
+            multi_agent_v2: MultiAgentV2Options {
+                enabled: true,
+                root_agent_usage_hint_text: Some("Root delegation guidance.".to_string()),
+                ..Default::default()
+            },
+            ..AgentRunOptions::default()
+        });
+
+        run_session_with_config(Arc::clone(&store), &session_id, config)
+            .await
+            .expect("config facade must run the fake backend");
+        let log = events(&store, &session_id);
+        assert!(log.iter().any(|event| {
+            event.event_type == "workspace.context"
+                && event
+                    .payload
+                    .get("kind")
+                    .and_then(serde_json::Value::as_str)
+                    == Some(WORKSPACE_CONTEXT_MULTI_AGENT_USAGE_HINT_KIND)
+                && event
+                    .payload
+                    .get("content")
+                    .and_then(serde_json::Value::as_str)
+                    == Some("Root delegation guidance.")
+        }));
     }
 
     /// With no user turn in the log the facade still drives (env-context only) and
@@ -1104,6 +1347,110 @@ mod tests {
         );
         assert!(!state.has_pending_input().await);
         assert!(!state.token_status().await.token_limit_reached);
+    }
+
+    #[tokio::test]
+    async fn store_turn_state_drains_agent_mailbox_as_pending_input() {
+        let (_dir, store, root_id) = store_with_session();
+        let child_id = {
+            let store = store.lock().expect("store mutex poisoned");
+            let child = store
+                .create_child_session(
+                    &root_id,
+                    std::path::Path::new("/work"),
+                    Some("/root/worker"),
+                    Some("Atlas"),
+                    Some("explorer"),
+                )
+                .expect("child session");
+            store
+                .send_agent_message(&child.id, &root_id, "child update", false)
+                .expect("agent message");
+            child.id
+        };
+
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(root_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        assert!(state.has_pending_input().await);
+        let drained = state.take_pending_input().await;
+        assert_eq!(drained.len(), 1);
+        assert!(!state.has_pending_input().await);
+
+        assert_eq!(drained[0].role, MessageRole::Assistant);
+        let ContentPart::Text { text } = &drained[0].content[0] else {
+            panic!("mailbox input should be a text envelope");
+        };
+        let envelope: serde_json::Value =
+            serde_json::from_str(text).expect("mailbox envelope json");
+        assert_eq!(envelope["author"], "/root/worker");
+        assert_eq!(envelope["recipient"], "/root");
+        assert_eq!(envelope["content"], "child update");
+        assert_eq!(envelope["trigger_turn"], false);
+
+        let root_events = events(&store, &root_id);
+        let mailbox_event = root_events
+            .iter()
+            .find(|event| event.event_type == "agent.mailbox_input")
+            .expect("mailbox input event");
+        assert_eq!(mailbox_event.payload["author_session_id"], child_id);
+        assert_eq!(mailbox_event.payload["target_session_id"], root_id);
+    }
+
+    struct CancelAwareDriver;
+
+    impl SamplingDriver for CancelAwareDriver {
+        async fn run_sampling_request(
+            &self,
+            _input: Vec<Message>,
+            cancel: CancellationToken,
+        ) -> Result<SamplingOutcome, AgentError> {
+            cancel.cancelled().await;
+            Err(AgentError::TurnAborted)
+        }
+    }
+
+    #[tokio::test]
+    async fn drive_run_observes_store_cancel_requests() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "long task").await;
+        let sid = SessionId(session_id.clone());
+        let config = fake_config();
+        let ctx = turn_ctx(&sid, &config);
+        let store_for_cancel = Arc::clone(&store);
+        let session_for_cancel = session_id.clone();
+
+        tokio::spawn(async move {
+            tokio::time::sleep(Duration::from_millis(25)).await;
+            let store = store_for_cancel.lock().expect("store mutex poisoned");
+            store
+                .request_cancel(&session_for_cancel, "test cancellation")
+                .expect("request cancel");
+        });
+
+        let result = tokio::time::timeout(
+            Duration::from_secs(2),
+            drive_run(
+                Arc::clone(&store),
+                sid,
+                ctx,
+                CancelAwareDriver,
+                true,
+                Arc::new(Mutex::new(Vec::new())),
+                None,
+            ),
+        )
+        .await
+        .expect("cancel monitor should abort the hanging driver")
+        .expect("turn abort should be a graceful run result");
+        assert_eq!(result, None);
+
+        let log = events(&store, &session_id);
+        assert!(log
+            .iter()
+            .any(|event| event.event_type == "session.cancel_requested"));
     }
 
     // -----------------------------------------------------------------------
@@ -1217,6 +1564,7 @@ mod tests {
                 LlmEvent::ToolCall {
                     id: "call-1".to_string(),
                     name: "shell".to_string(),
+                    namespace: None,
                     input: serde_json::json!({ "command": ["echo", "fusion-ok"] }),
                 },
                 LlmEvent::Finish {

@@ -4,17 +4,23 @@ use std::thread;
 
 use anyhow::{bail, Context, Result};
 use browser_use_agent::config_overrides::{
-    load_mcp_servers_for_profile, resolve_approval_policy_for_profile,
-    resolve_guardian_for_profile, AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunRequest,
-    ChildAgentRunner, ConfigOverrides, ProviderRunConfig,
+    load_mcp_servers_for_profile, resolve_agent_roles_for_profile,
+    resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
+    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
+    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderRunConfig,
 };
-use browser_use_agent::context::typed_user_input_payload_from_text_for_cwd;
+use browser_use_agent::context::{
+    typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
+};
 use browser_use_agent::entrypoint::run_session_with_config;
 use browser_use_agent::prompts::CollaborationModeKind;
-use browser_use_protocol::{
-    failure_from_events, sanitized_agent_context_from_events, session_result_from_events,
-    SessionMeta,
+use browser_use_agent::rollout::fork_events_by_turn;
+use browser_use_agent::session::{
+    provider_messages_from_events_for_fork, resume::provider_messages_to_fork_response_items,
+    ForkMode,
 };
+use browser_use_agent::subagents::{display_agent_path_for_session, session_was_interrupted};
+use browser_use_protocol::{failure_from_events, session_result_from_events, SessionMeta};
 use browser_use_store::{Store, StoreNotifier};
 
 use crate::settings::{
@@ -166,12 +172,18 @@ fn spawn_tui_child_agent(
     let store = Store::open(&state_dir)?;
     let child = create_tui_child_session_from_request(&store, &request)?;
     let child_id = child.id.clone();
+    record_child_run_marker_from_request(&store, &child_id, &request)?;
     let child_model = request
         .model
         .as_deref()
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or(model);
+    let child_model_provider_id = child_request_provider_id(&request).or(model_provider_id);
+    let child_backend = child_model_provider_id
+        .as_deref()
+        .and_then(AgentBackend::from_setting)
+        .unwrap_or(backend);
     config_overrides.extend(request.config_overrides.clone());
     if let Some(reasoning) = request.reasoning_effort.clone() {
         config_overrides.push((
@@ -192,9 +204,9 @@ fn spawn_tui_child_agent(
             let result = run_agent_thread(
                 run_state_dir,
                 child_id.clone(),
-                backend,
+                child_backend,
                 child_model,
-                model_provider_id,
+                child_model_provider_id,
                 browser,
                 collaboration_mode,
                 config_profile,
@@ -222,18 +234,28 @@ fn notify_tui_child_completion(
     let completion = match run_error {
         Some(error) => ChildAgentRunCompletion::failure(format!("{error:#}")),
         None => {
-            let summary = Store::open(state_dir)
+            let events = Store::open(state_dir)
                 .and_then(|store| store.events_for_session(child_id))
-                .ok()
-                .and_then(|events| {
-                    session_result_from_events(&events).or_else(|| failure_from_events(&events))
-                });
+                .ok();
+            if events
+                .as_deref()
+                .is_some_and(child_run_was_interrupted_from_events)
+            {
+                return;
+            }
+            let summary = events.and_then(|events| {
+                session_result_from_events(&events).or_else(|| failure_from_events(&events))
+            });
             ChildAgentRunCompletion::success(summary)
         }
     };
     if let Err(error) = handler.notify(completion) {
         eprintln!("tui child agent completion notification failed: {error:#}");
     }
+}
+
+fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRecord]) -> bool {
+    session_was_interrupted(events)
 }
 
 fn create_tui_child_session_from_request(
@@ -255,19 +277,10 @@ fn create_tui_child_session_from_request(
         request.child_session_id.clone(),
     )?;
     let parent_events = store.events_for_session(&request.parent_session_id)?;
-    let inherited_context = sanitized_agent_context_from_events(&parent_events);
     store.append_event(
         &child.id,
         "agent.context",
-        serde_json::json!({
-            "from_session_id": request.parent_session_id.clone(),
-            "fork_mode": request.fork_turns.as_deref().unwrap_or("all"),
-            "history_mode": "compact_context",
-            "agent_path": request.agent_path.clone(),
-            "nickname": request.nickname.clone(),
-            "role": request.role.clone(),
-            "context": inherited_context,
-        }),
+        child_request_agent_context_payload(&parent_events, request)?,
     )?;
     store.append_event(
         &child.id,
@@ -280,11 +293,8 @@ fn create_tui_child_session_from_request(
             ),
         }),
     )?;
-    store.append_event(
-        &child.id,
-        "session.input",
-        typed_user_input_payload_from_text_for_cwd(&request.message, &child.cwd)?,
-    )?;
+    seed_child_permissions_context_event(store, &child.id, request)?;
+    append_child_initial_input_from_request(store, &child.id, &child.cwd, request)?;
     store.append_event(
         &request.parent_session_id,
         "agent.spawned",
@@ -296,6 +306,161 @@ fn create_tui_child_session_from_request(
         }),
     )?;
     Ok(child)
+}
+
+fn record_child_run_marker_from_request(
+    store: &Store,
+    child_id: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    let Some(run_id) = request.run_id.as_deref() else {
+        return Ok(());
+    };
+    store.append_event(
+        child_id,
+        "agent.run.started",
+        serde_json::json!({
+            "run_id": run_id,
+            "parent_session_id": request.parent_session_id.as_str(),
+            "child_session_id": child_id,
+            "agent_path": request.agent_path.as_deref(),
+        }),
+    )?;
+    Ok(())
+}
+
+fn append_child_initial_input_from_request(
+    store: &Store,
+    child_id: &str,
+    child_cwd: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    if request.input_is_inter_agent_communication {
+        let author_path = display_agent_path_for_session(store, &request.parent_session_id)
+            .unwrap_or_else(|_| "/root".to_string());
+        let recipient_path = request.agent_path.clone().unwrap_or_else(|| {
+            display_agent_path_for_session(store, child_id).unwrap_or_else(|_| child_id.to_string())
+        });
+        store.append_event(
+            child_id,
+            "agent.mailbox_input",
+            serde_json::json!({
+                "id": browser_use_store::new_thread_id(),
+                "author_session_id": request.parent_session_id,
+                "target_session_id": child_id,
+                "author_path": author_path,
+                "recipient_path": recipient_path,
+                "content": request.message,
+                "trigger_turn": true,
+            }),
+        )?;
+    } else {
+        let payload = if let Some(items) = request.input_items.as_ref() {
+            typed_user_input_payload_from_items_for_cwd(items, child_cwd)?
+        } else {
+            typed_user_input_payload_from_text_for_cwd(&request.message, child_cwd)?
+        };
+        store.append_event(child_id, "session.input", payload)?;
+    }
+    Ok(())
+}
+
+fn seed_child_permissions_context_event(
+    store: &Store,
+    session_id: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    let Some(content) = child_request_developer_instructions(request) else {
+        return Ok(());
+    };
+    store.append_event(
+        session_id,
+        "workspace.context",
+        serde_json::json!({
+            "kind": "permissions",
+            "content": content,
+        }),
+    )?;
+    Ok(())
+}
+
+fn child_request_developer_instructions(request: &ChildAgentRunRequest) -> Option<String> {
+    request
+        .config_overrides
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "developer_instructions")
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn child_request_provider_id(request: &ChildAgentRunRequest) -> Option<String> {
+    request
+        .config_overrides
+        .iter()
+        .rev()
+        .find(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "model_provider" | "model_provider_id" | "provider"
+            )
+        })
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn child_request_agent_context_payload(
+    parent_events: &[browser_use_protocol::EventRecord],
+    request: &ChildAgentRunRequest,
+) -> Result<serde_json::Value> {
+    let mode = child_request_fork_mode(request.fork_turns.as_deref())?;
+    let forked = fork_events_by_turn(parent_events, &mode);
+    let history = provider_messages_from_events_for_fork(&forked.carried);
+    let response_items = provider_messages_to_fork_response_items(&history);
+    let raw_mode = request
+        .fork_turns
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all");
+    let mut payload = serde_json::json!({
+        "from_session_id": request.parent_session_id.clone(),
+        "fork_mode": raw_mode,
+        "agent_path": request.agent_path.clone(),
+        "nickname": request.nickname.clone(),
+        "role": request.role.clone(),
+    });
+    if matches!(mode, ForkMode::None) {
+        payload["history_mode"] = serde_json::json!("none");
+    } else {
+        payload["history_mode"] = serde_json::json!("fork_response_items");
+        payload["fork_response_items"] = serde_json::Value::Array(response_items);
+    }
+    Ok(payload)
+}
+
+fn child_request_fork_mode(raw: Option<&str>) -> Result<ForkMode> {
+    let value = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all");
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(ForkMode::None);
+    }
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(ForkMode::All);
+    }
+    let turns = value
+        .parse::<usize>()
+        .with_context(|| "fork_turns must be `none`, `all`, or a positive integer string")?;
+    if turns == 0 {
+        bail!("fork_turns must be `none`, `all`, or a positive integer string");
+    }
+    Ok(ForkMode::LastN(turns))
 }
 
 fn tui_agent_options(
@@ -344,6 +509,16 @@ fn tui_agent_options(
     {
         options = options.with_guardian(use_guardian);
     }
+    options = options.with_multi_agent_v2(resolve_multi_agent_v2_for_profile(
+        profile_ref,
+        &config_overrides,
+    )?);
+    options =
+        options.with_collab_enabled(resolve_collab_for_profile(profile_ref, &config_overrides)?);
+    options = options.with_agent_roles(resolve_agent_roles_for_profile(
+        profile_ref,
+        &config_overrides,
+    )?);
     let mcp_servers = load_mcp_servers_for_profile(profile_ref, &[])?;
     if !mcp_servers.is_empty() {
         options = options.with_mcp_servers(mcp_servers);
@@ -572,7 +747,10 @@ command = "test-mcp"
         let request = ChildAgentRunRequest {
             parent_session_id: parent.id.clone(),
             child_session_id: "00000000dcba".to_string(),
+            run_id: None,
             message: "Handle the child task".to_string(),
+            input_items: None,
+            input_is_inter_agent_communication: false,
             agent_path: Some("/root/worker_1".to_string()),
             nickname: Some("Worker".to_string()),
             role: Some("explorer".to_string()),

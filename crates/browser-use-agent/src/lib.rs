@@ -69,6 +69,20 @@ pub use config_model::FakeAgentOptions;
 pub use config_model::ModelCatalog;
 pub use config_model::ModelCatalogEntry;
 
+#[cfg(test)]
+pub(crate) mod test_env {
+    use std::sync::{Mutex, MutexGuard, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    pub(crate) fn lock() -> MutexGuard<'static, ()> {
+        ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|err| err.into_inner())
+    }
+}
+
 // The run-entrypoint facade (Wave-3 cutover): the binary-facing call tui/cli use
 // to run a session on the new async engine. It assembles
 // config -> provider/driver -> context seed -> turn loop -> store persistence and

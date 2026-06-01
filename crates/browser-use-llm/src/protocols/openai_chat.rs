@@ -242,8 +242,14 @@ fn build_user_content(message: &Message) -> Value {
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
-                if let Some(image) = chat_image_part(mime_type, data.as_deref(), url.as_deref()) {
+                if let Some(image) = chat_image_part(
+                    mime_type,
+                    data.as_deref(),
+                    url.as_deref(),
+                    detail.as_deref(),
+                ) {
                     has_media = true;
                     parts.push(image);
                 }
@@ -307,8 +313,14 @@ fn append_chat_content_parts(
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
-                if let Some(image) = chat_image_part(mime_type, data.as_deref(), url.as_deref()) {
+                if let Some(image) = chat_image_part(
+                    mime_type,
+                    data.as_deref(),
+                    url.as_deref(),
+                    detail.as_deref(),
+                ) {
                     *has_media = true;
                     parts.push(image);
                 }
@@ -352,8 +364,14 @@ fn append_tool_result_images(content: &[ContentPart], parts: &mut Vec<Value>) {
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
-                if let Some(image) = chat_image_part(mime_type, data.as_deref(), url.as_deref()) {
+                if let Some(image) = chat_image_part(
+                    mime_type,
+                    data.as_deref(),
+                    url.as_deref(),
+                    detail.as_deref(),
+                ) {
                     parts.push(image);
                 }
             }
@@ -363,7 +381,12 @@ fn append_tool_result_images(content: &[ContentPart], parts: &mut Vec<Value>) {
     }
 }
 
-fn chat_image_part(mime_type: &str, data: Option<&str>, url: Option<&str>) -> Option<Value> {
+fn chat_image_part(
+    mime_type: &str,
+    data: Option<&str>,
+    url: Option<&str>,
+    detail: Option<&str>,
+) -> Option<Value> {
     if !mime_type.starts_with("image/") {
         return None;
     }
@@ -372,9 +395,13 @@ fn chat_image_part(mime_type: &str, data: Option<&str>, url: Option<&str>) -> Op
         (None, Some(data)) => format!("data:{mime_type};base64,{data}"),
         (None, None) => return None,
     };
+    let mut image_url = serde_json::Map::from_iter([("url".to_string(), json!(resolved))]);
+    if let Some(detail) = detail {
+        image_url.insert("detail".to_string(), json!(detail));
+    }
     Some(json!({
         "type": "image_url",
-        "image_url": { "url": resolved },
+        "image_url": Value::Object(image_url),
     }))
 }
 
@@ -635,6 +662,9 @@ mod tests {
                 "type": "object",
                 "properties": { "city": { "type": "string" } }
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         });
         req.tool_choice = Some(ToolChoice::Auto);
         // 0.5 is exactly representable in both f32 and f64, so the widening that
@@ -703,6 +733,7 @@ mod tests {
                     mime_type: "image/png".into(),
                     data: Some("AAAA".into()),
                     url: None,
+                    detail: Some("original".into()),
                 },
             ],
         ));
@@ -715,6 +746,7 @@ mod tests {
             content[1]["image_url"]["url"],
             json!("data:image/png;base64,AAAA")
         );
+        assert_eq!(content[1]["image_url"]["detail"], json!("original"));
     }
 
     #[test]
@@ -737,6 +769,7 @@ mod tests {
                     mime_type: "image/png".into(),
                     data: Some("AAAA".into()),
                     url: None,
+                    detail: Some("high".into()),
                 }],
                 is_error: false,
             }],
@@ -756,6 +789,10 @@ mod tests {
         assert_eq!(
             messages[2]["content"][1]["image_url"]["url"],
             json!("data:image/png;base64,AAAA")
+        );
+        assert_eq!(
+            messages[2]["content"][1]["image_url"]["detail"],
+            json!("high")
         );
     }
 
@@ -874,6 +911,7 @@ mod tests {
             LlmEvent::ToolCall {
                 id: "call_42".into(),
                 name: "get_weather".into(),
+                namespace: None,
                 input: json!({ "city": "Paris" }),
             },
             LlmEvent::StepFinish {

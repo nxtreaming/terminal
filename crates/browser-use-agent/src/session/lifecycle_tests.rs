@@ -113,18 +113,22 @@ async fn fork_last_n_truncates_and_creates_child_row() {
         "parent should have a multi-message history: {full_history:?}"
     );
 
-    // Fork keeping only the last two provider messages (the trailing user+assistant turn).
-    // LastN truncates to the last N provider messages of the reconstructed parent history.
+    // Fork keeping only the last fork turn (the trailing user+assistant turn).
+    // LastN truncates by Codex fork-turn boundary, not by provider-message count.
     let child = parent
-        .fork(source.clone(), dyn_sink.clone(), ForkMode::LastN(2))
+        .fork(source.clone(), dyn_sink.clone(), ForkMode::LastN(1))
         .await
         .expect("fork");
 
-    assert_eq!(child.history().len(), 2, "LastN(2) keeps two messages");
+    assert_eq!(
+        child.history().len(),
+        2,
+        "LastN(1) keeps the final user+assistant turn"
+    );
     assert_eq!(
         &child.history()[..],
         &full_history[full_history.len() - 2..],
-        "kept messages are the last two of the parent history"
+        "kept messages are the last provider messages from the final fork turn"
     );
 
     // The child is a real child row pointing at the parent (agent edge in the store).

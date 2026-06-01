@@ -75,6 +75,8 @@ pub enum LlmEvent {
     ToolCall {
         id: String,
         name: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        namespace: Option<String>,
         input: Value,
     },
     StepFinish {

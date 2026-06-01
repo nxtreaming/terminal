@@ -40,6 +40,7 @@
 //! matching the legacy `stored_or_env` precedence. A missing credential surfaces
 //! as [`ProviderResolveError::MissingCredentials`] (honest, never a panic).
 
+use std::collections::BTreeSet;
 use std::sync::{Arc, Mutex};
 
 use browser_use_llm::auth::{load_codex_auth, CodexAuth};
@@ -50,6 +51,7 @@ use crate::config_overrides::ProviderBackend;
 use crate::config_overrides::ProviderRunConfig;
 use crate::config_overrides::{
     ChildAgentCompletionHandler, ChildAgentRunCompletion, ChildAgentRunRequest, ChildAgentRunner,
+    ConfigOverrides,
 };
 use crate::events::EventSink;
 use crate::events::PendingEvent;
@@ -59,6 +61,7 @@ use crate::guardian::reviewer::{GuardianReviewer, StaticReviewer};
 use crate::guardian::Guardian;
 use crate::mcp::McpConnectionManager;
 use crate::session::{SessionId, SharedStore};
+use crate::subagents::display_agent_path_for_session;
 use crate::subagents::mailbox::Mailbox;
 use crate::subagents::manager::{
     ChildHandle, ChildSpawner, ChildSpec, ParentContext, SubagentError, SubagentManager,
@@ -696,20 +699,20 @@ fn build_tool_dispatcher_with_cwd(
     // its final summary. Serial (terminal; must not be reordered).
     reg.register::<_, DoneRequest>("done", definitions::done(), false, DoneTool::new());
 
-    // Subagent orchestration tools (`spawn_agent` / `wait_agent` / `send_input` /
-    // `list_agents`). All four share ONE `SubagentManager` (live-agent registry +
-    // EVENT-NOTIFY mailbox + depth enforcement + the `ChildSpawner` seam). The
-    // child spawner is bridged from the run config's `child_agent_runner` so
-    // spawned children inherit the parent's provider/model; when none is configured
-    // the spawner returns an honest "subagents not configured" error rather than
-    // silently dropping the tools (the model still SEES the tools).
-    register_subagent_tools(&mut reg, config, &user_input);
+    // Codex-style collaboration exposure: v2 is gated by
+    // `features.multi_agent_v2`, while legacy v1 tools are exposed only when
+    // the legacy collaboration feature is enabled.
+    if config.options.multi_agent_v2.enabled {
+        register_subagent_tools(&mut reg, config, &user_input, &tool_cwd);
+    } else if config.options.collab_enabled {
+        register_legacy_subagent_tools(&mut reg, config, &user_input, &tool_cwd);
+    }
 
     // Goal tools (`get_goal` / `create_goal` / `update_goal`). All three share ONE
     // `GoalStore` (the event-sourced `GoalManager` + its durable `goal.*` event
     // sink), registered behind the same registry seam so a `create_goal` is
     // visible to a later `get_goal`/`update_goal`. The model always SEES the tools
-    // (no config gate), matching how the subagent tools are always advertised.
+    // (no config gate).
     register_goal_tools(&mut reg, &user_input);
 
     // `mcp`: register the MCP bridge ONLY when servers are configured. An empty
@@ -738,6 +741,8 @@ fn build_tool_dispatcher_with_cwd(
             Err(e) => eprintln!("warning: failed to start MCP runtime, mcp tool disabled: {e}"),
         }
     }
+
+    apply_role_tool_policy(&mut reg, config);
 
     // `tool_search` catalog: populate it from the registry's model-visible
     // definitions so the model can discover the registered tools by free-text
@@ -768,6 +773,7 @@ fn build_tool_dispatcher_with_cwd(
         true,
         ToolSearchTool::new(catalog),
     );
+    apply_role_tool_policy(&mut reg, config);
 
     // Capture the model-visible tool definitions BEFORE `reg` is moved into the
     // runner's Arc, so the dispatcher can carry them to the sampling driver (which
@@ -816,6 +822,86 @@ fn build_tool_dispatcher_with_cwd(
     ))
 }
 
+fn apply_role_tool_policy<S, A>(
+    reg: &mut crate::tools::registry::ToolRegistry<S, A>,
+    config: &ProviderRunConfig,
+) where
+    S: crate::tools::sandbox::SandboxProvider,
+    A: crate::tools::runtime::Approver,
+{
+    let Some(policy) = ToolPolicy::from_config_overrides(&config.options.config_overrides) else {
+        return;
+    };
+    reg.retain_registered_tools(|namespace, name| policy.allows(namespace, name));
+}
+
+struct ToolPolicy {
+    allowlist: Option<BTreeSet<String>>,
+    can_write: Option<bool>,
+}
+
+impl ToolPolicy {
+    fn from_config_overrides(overrides: &[(String, toml::Value)]) -> Option<Self> {
+        let allowlist = overrides
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "tool_allowlist")
+            .and_then(|(_, value)| value.as_array())
+            .map(|values| {
+                values
+                    .iter()
+                    .filter_map(|value| value.as_str())
+                    .map(str::trim)
+                    .filter(|value| !value.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<BTreeSet<_>>()
+            })
+            .filter(|set| !set.is_empty());
+        let can_write = overrides
+            .iter()
+            .rev()
+            .find(|(key, _)| key == "can_write")
+            .and_then(|(_, value)| value.as_bool());
+        if allowlist.is_none() && can_write.is_none() {
+            None
+        } else {
+            Some(Self {
+                allowlist,
+                can_write,
+            })
+        }
+    }
+
+    fn allows(&self, namespace: Option<&str>, name: &str) -> bool {
+        if let Some(allowlist) = &self.allowlist {
+            let display_name = tool_display_name(namespace, name);
+            if !allowlist.contains(name) && !allowlist.contains(&display_name) {
+                return false;
+            }
+        }
+        if self.can_write == Some(false) && is_write_capable_tool(name) {
+            return false;
+        }
+        true
+    }
+}
+
+fn tool_display_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) => {
+            let mut display = String::with_capacity(namespace.len() + name.len());
+            display.push_str(namespace);
+            display.push_str(name);
+            display
+        }
+        None => name.to_string(),
+    }
+}
+
+fn is_write_capable_tool(name: &str) -> bool {
+    matches!(name, "shell" | "apply_patch" | "python")
+}
+
 /// Build the production tool orchestrator: a permissive [`NoneSandboxProvider`]
 /// (OS-level sandbox enforcement is intentionally SKIPPED — this is a permissive
 /// seam) paired with a live [`GuardianApprover`].
@@ -858,6 +944,7 @@ struct ChildAgentRunnerSpawner {
     runner: ChildAgentRunner,
     parent_session_id: String,
     parent_link: Arc<Mutex<Option<ChildAgentRunnerParentLink>>>,
+    store: Option<SharedStore>,
 }
 
 #[derive(Clone)]
@@ -869,7 +956,7 @@ struct ChildAgentRunnerParentLink {
 #[async_trait::async_trait]
 impl ChildSpawner for ChildAgentRunnerSpawner {
     async fn spawn_child(&self, spec: ChildSpec) -> Result<ChildHandle, SubagentError> {
-        let completion_handler = self
+        let manager_completion_handler = self
             .parent_link
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
@@ -895,11 +982,33 @@ impl ChildSpawner for ChildAgentRunnerSpawner {
                     Ok(())
                 })
             });
+        let store_completion_handler = self.store.as_ref().map(|store| {
+            let run_id = Some(spec.run_id.clone());
+            crate::tools::handlers::subagent::store_completion_handler(
+                Arc::clone(store),
+                self.parent_session_id.clone(),
+                spec.agent_id.clone(),
+                run_id,
+            )
+        });
+        let completion_handler = match (manager_completion_handler, store_completion_handler) {
+            (None, None) => None,
+            (Some(handler), None) | (None, Some(handler)) => Some(handler),
+            (Some(manager_handler), Some(store_handler)) => {
+                Some(ChildAgentCompletionHandler::new(move |completion| {
+                    manager_handler.notify(completion.clone())?;
+                    store_handler.notify(completion)
+                }))
+            }
+        };
         let request = ChildAgentRunRequest {
             parent_session_id: self.parent_session_id.clone(),
             // The child's session id is its canonical agent id (unique per spawn).
             child_session_id: spec.agent_id.clone(),
+            run_id: Some(spec.run_id.clone()),
             message: spec.message.clone(),
+            input_items: spec.input_items.clone(),
+            input_is_inter_agent_communication: spec.input_is_inter_agent_communication,
             agent_path: Some(spec.agent_path.clone()),
             nickname: spec.nickname.clone(),
             role: spec.role.clone(),
@@ -910,7 +1019,7 @@ impl ChildSpawner for ChildAgentRunnerSpawner {
             model: Some(spec.config.model.clone()),
             reasoning_effort: spec.config.reasoning_effort.clone(),
             service_tier: spec.config.service_tier.clone(),
-            config_overrides: Vec::new(),
+            config_overrides: child_role_config_overrides(&spec.config),
             completion_handler,
         };
         self.runner
@@ -963,8 +1072,8 @@ impl EventSink for NoopSubagentSink {
     fn emit(&self, _ev: PendingEvent) {}
 }
 
-/// Register the four subagent orchestration tools (`spawn_agent`, `wait_agent`,
-/// `send_input`, `list_agents`) into `reg`, all sharing ONE [`SubagentManager`].
+/// Register the subagent orchestration tools into `reg`, all sharing ONE
+/// [`SubagentManager`].
 ///
 /// The manager's [`ChildSpawner`] is bridged from
 /// `config.options.child_agent_runner` via [`ChildAgentRunnerSpawner`]; spawned
@@ -978,16 +1087,20 @@ fn register_subagent_tools<S, A>(
     reg: &mut crate::tools::registry::ToolRegistry<S, A>,
     config: &ProviderRunConfig,
     user_input: &Option<(SharedStore, SessionId)>,
+    tool_cwd: &std::path::Path,
 ) where
     S: crate::tools::sandbox::SandboxProvider,
     A: crate::tools::runtime::Approver,
 {
     use crate::subagents::spawn::SpawnAgentArgs;
     use crate::tools::handlers::subagent::{
-        ListAgentsRequest, ListAgentsTool, SendInputRequest, SendInputTool, SpawnAgentTool,
-        SubagentToolDeps, WaitAgentRequest, WaitAgentTool,
+        CloseAgentRequest, CloseAgentTool, FollowupTaskRequest, FollowupTaskTool,
+        ListAgentsRequest, ListAgentsTool, SendMessageRequest, SendMessageTool, SpawnAgentTool,
+        SubagentToolDeps, WaitAgentRequest, WaitAgentTimeoutOptions, WaitAgentTool,
     };
-    use crate::tools::registry::definitions;
+    use crate::tools::registry::definitions::{
+        self, SpawnAgentDefinitionOptions, WaitAgentDefinitionOptions,
+    };
 
     let parent_session_id = user_input
         .as_ref()
@@ -1002,10 +1115,22 @@ fn register_subagent_tools<S, A>(
             runner: runner.clone(),
             parent_session_id,
             parent_link: Arc::clone(&parent_link),
+            store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
         }),
         None => Arc::new(UnconfiguredChildSpawner),
     };
-    let manager = Arc::new(SubagentManager::new(spawner));
+    let subagent_thread_limit = config
+        .options
+        .multi_agent_v2
+        .max_concurrent_threads_per_session
+        .saturating_sub(1);
+    let manager = Arc::new(SubagentManager::with_config_and_limits(
+        spawner,
+        crate::subagents::role::RoleRegistry::with_user_defined(config.options.agent_roles.clone()),
+        crate::subagents::depth::DEFAULT_AGENT_MAX_DEPTH,
+        Some(subagent_thread_limit),
+    ));
+    let spawn_gate = Arc::new(tokio::sync::Mutex::new(()));
     *parent_link
         .lock()
         .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ChildAgentRunnerParentLink {
@@ -1013,12 +1138,15 @@ fn register_subagent_tools<S, A>(
         mailbox: manager.mailbox(),
     });
 
-    // The parent context the children hang off: `/root`, depth 0, with the run's
-    // model + provider as the base config so role layering preserves them.
+    // The parent context the children hang off. On the live store-backed path,
+    // use the current session's agent path so nested spawns resolve beneath the
+    // child, not always beneath `/root`.
+    let parent_agent_path =
+        parent_agent_path_from_store(user_input).unwrap_or_else(|| "/root".to_string());
     let parent = ParentContext {
-        agent_path: "/root".to_string(),
-        depth: 0,
-        base_config: AgentConfigLayer::base(config.model.clone(), provider_label(config)),
+        depth: agent_path_depth(&parent_agent_path),
+        agent_path: parent_agent_path,
+        base_config: parent_agent_config_layer(config, tool_cwd),
     };
 
     // Durable lifecycle sink + session scope: the store-backed sink on the live
@@ -1038,37 +1166,364 @@ fn register_subagent_tools<S, A>(
         parent,
         sink,
         session_id,
+        store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
+        child_runner: config.options.child_agent_runner.clone(),
+        spawn_gate,
+        wait_timeouts: WaitAgentTimeoutOptions {
+            default_timeout_ms: config.options.multi_agent_v2.default_wait_timeout_ms,
+            min_timeout_ms: config.options.multi_agent_v2.min_wait_timeout_ms,
+            max_timeout_ms: config.options.multi_agent_v2.max_wait_timeout_ms,
+        },
+        hide_spawn_agent_metadata: config.options.multi_agent_v2.hide_spawn_agent_metadata,
+        max_concurrent_threads_per_session: Some(subagent_thread_limit),
+    };
+    let tool_namespace = if provider_supports_tool_namespaces(config) {
+        config.options.multi_agent_v2.tool_namespace.clone()
+    } else {
+        None
+    };
+    let namespace_description = tool_namespace
+        .as_ref()
+        .map(|_| "Tools for spawning and managing sub-agents.".to_string());
+    let namespace_definition = |mut definition: browser_use_llm::schema::ToolDefinition| {
+        definition.namespace = tool_namespace.clone();
+        definition.namespace_description = namespace_description.clone();
+        definition
     };
 
-    // spawn_agent: parallel-safe (each spawn mints a handle + hands off; the child
-    // runs on its own task).
     reg.register::<_, SpawnAgentArgs>(
         "spawn_agent",
-        definitions::spawn_agent(),
-        true,
+        namespace_definition(definitions::spawn_agent_with_options(
+            SpawnAgentDefinitionOptions {
+                agent_type_description: agent_type_description(&config.options.agent_roles),
+                available_models_description: Some(spawn_agent_available_models_description(
+                    config, tool_cwd,
+                )),
+                hide_agent_type_model_reasoning: config
+                    .options
+                    .multi_agent_v2
+                    .hide_spawn_agent_metadata,
+                include_usage_hint: config.options.multi_agent_v2.usage_hint_enabled,
+                usage_hint_text: config.options.multi_agent_v2.usage_hint_text.clone(),
+                max_concurrent_threads_per_session: Some(
+                    config
+                        .options
+                        .multi_agent_v2
+                        .max_concurrent_threads_per_session,
+                ),
+            },
+        )),
+        false,
         SpawnAgentTool::new(deps.clone()),
     );
-    // wait_agent: parallel-safe (blocks on the shared mailbox + reads the registry).
     reg.register::<_, WaitAgentRequest>(
         "wait_agent",
-        definitions::wait_agent(),
-        true,
+        namespace_definition(definitions::wait_agent_with_timeouts(
+            WaitAgentDefinitionOptions {
+                default_timeout_ms: config.options.multi_agent_v2.default_wait_timeout_ms,
+                min_timeout_ms: config.options.multi_agent_v2.min_wait_timeout_ms,
+                max_timeout_ms: config.options.multi_agent_v2.max_wait_timeout_ms,
+            },
+        )),
+        false,
         WaitAgentTool::new(deps.clone()),
     );
-    // send_input: parallel-safe (enqueues onto the mailbox).
+    // send_message: queue-only Codex v2 message delivery.
+    reg.register::<_, SendMessageRequest>(
+        "send_message",
+        namespace_definition(definitions::send_message()),
+        false,
+        SendMessageTool::new(deps.clone()),
+    );
+    // followup_task: queue + trigger the target's next turn.
+    reg.register::<_, FollowupTaskRequest>(
+        "followup_task",
+        namespace_definition(definitions::followup_task()),
+        false,
+        FollowupTaskTool::new(deps.clone()),
+    );
+    reg.register::<_, ListAgentsRequest>(
+        "list_agents",
+        namespace_definition(definitions::list_agents()),
+        false,
+        ListAgentsTool::new(deps.clone()),
+    );
+    // close_agent: marks a spawned agent subtree closed in this control plane.
+    reg.register::<_, CloseAgentRequest>(
+        "close_agent",
+        namespace_definition(definitions::close_agent()),
+        false,
+        CloseAgentTool::new(deps),
+    );
+}
+
+fn register_legacy_subagent_tools<S, A>(
+    reg: &mut crate::tools::registry::ToolRegistry<S, A>,
+    config: &ProviderRunConfig,
+    user_input: &Option<(SharedStore, SessionId)>,
+    tool_cwd: &std::path::Path,
+) where
+    S: crate::tools::sandbox::SandboxProvider,
+    A: crate::tools::runtime::Approver,
+{
+    use crate::tools::handlers::subagent::{
+        CloseAgentTool, CloseAgentV1Request, ResumeAgentRequest, ResumeAgentTool, SendInputRequest,
+        SendInputTool, SpawnAgentV1Request, SpawnAgentV1Tool, SubagentToolDeps,
+        WaitAgentTimeoutOptions, WaitAgentV1Request, WaitAgentV1Tool,
+    };
+    use crate::tools::registry::definitions::{
+        self, SpawnAgentDefinitionOptions, WaitAgentDefinitionOptions,
+    };
+
+    let parent_session_id = user_input
+        .as_ref()
+        .map(|(_, sid)| sid.as_str().to_string())
+        .unwrap_or_default();
+    let parent_link = Arc::new(Mutex::new(None));
+    let spawner: Arc<dyn ChildSpawner> = match &config.options.child_agent_runner {
+        Some(runner) => Arc::new(ChildAgentRunnerSpawner {
+            runner: runner.clone(),
+            parent_session_id,
+            parent_link: Arc::clone(&parent_link),
+            store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
+        }),
+        None => Arc::new(UnconfiguredChildSpawner),
+    };
+    let subagent_thread_limit = config
+        .options
+        .multi_agent_v2
+        .max_concurrent_threads_per_session
+        .saturating_sub(1);
+    let manager = Arc::new(SubagentManager::with_config_and_limits(
+        spawner,
+        crate::subagents::role::RoleRegistry::with_user_defined(config.options.agent_roles.clone()),
+        crate::subagents::depth::DEFAULT_AGENT_MAX_DEPTH,
+        Some(subagent_thread_limit),
+    ));
+    let spawn_gate = Arc::new(tokio::sync::Mutex::new(()));
+    *parent_link
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ChildAgentRunnerParentLink {
+        registry: manager.registry(),
+        mailbox: manager.mailbox(),
+    });
+
+    let parent_agent_path =
+        parent_agent_path_from_store(user_input).unwrap_or_else(|| "/root".to_string());
+    let parent = ParentContext {
+        depth: agent_path_depth(&parent_agent_path),
+        agent_path: parent_agent_path,
+        base_config: parent_agent_config_layer(config, tool_cwd),
+    };
+    let (sink, session_id): (Arc<dyn EventSink>, String) = match user_input {
+        Some((store, sid)) => (
+            Arc::new(SubagentStoreSink {
+                store: store.clone(),
+            }),
+            sid.as_str().to_string(),
+        ),
+        None => (Arc::new(NoopSubagentSink), String::new()),
+    };
+    let deps = SubagentToolDeps {
+        manager,
+        parent,
+        sink,
+        session_id,
+        store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
+        child_runner: config.options.child_agent_runner.clone(),
+        spawn_gate,
+        wait_timeouts: WaitAgentTimeoutOptions {
+            default_timeout_ms: config.options.multi_agent_v2.default_wait_timeout_ms,
+            min_timeout_ms: config.options.multi_agent_v2.min_wait_timeout_ms,
+            max_timeout_ms: config.options.multi_agent_v2.max_wait_timeout_ms,
+        },
+        hide_spawn_agent_metadata: config.options.multi_agent_v2.hide_spawn_agent_metadata,
+        max_concurrent_threads_per_session: Some(subagent_thread_limit),
+    };
+
+    let spawn_options = SpawnAgentDefinitionOptions {
+        agent_type_description: agent_type_description(&config.options.agent_roles),
+        available_models_description: Some(spawn_agent_available_models_description(
+            config, tool_cwd,
+        )),
+        hide_agent_type_model_reasoning: config.options.multi_agent_v2.hide_spawn_agent_metadata,
+        include_usage_hint: config.options.multi_agent_v2.usage_hint_enabled,
+        usage_hint_text: config.options.multi_agent_v2.usage_hint_text.clone(),
+        max_concurrent_threads_per_session: Some(
+            config
+                .options
+                .multi_agent_v2
+                .max_concurrent_threads_per_session,
+        ),
+    };
+    let wait_options = WaitAgentDefinitionOptions {
+        default_timeout_ms: WaitAgentTimeoutOptions::default().default_timeout_ms,
+        min_timeout_ms: WaitAgentTimeoutOptions::default().min_timeout_ms,
+        max_timeout_ms: WaitAgentTimeoutOptions::default().max_timeout_ms,
+    };
+    reg.register::<_, SpawnAgentV1Request>(
+        "spawn_agent",
+        definitions::spawn_agent_v1_with_options(spawn_options),
+        false,
+        SpawnAgentV1Tool::new(deps.clone()),
+    );
     reg.register::<_, SendInputRequest>(
         "send_input",
         definitions::send_input(),
-        true,
+        false,
         SendInputTool::new(deps.clone()),
     );
-    // list_agents: parallel-safe (read-only registry snapshot).
-    reg.register::<_, ListAgentsRequest>(
-        "list_agents",
-        definitions::list_agents(),
-        true,
-        ListAgentsTool::new(deps),
+    reg.register::<_, ResumeAgentRequest>(
+        "resume_agent",
+        definitions::resume_agent(),
+        false,
+        ResumeAgentTool::new(deps.clone()),
     );
+    reg.register::<_, WaitAgentV1Request>(
+        "wait_agent",
+        definitions::wait_agent_v1_with_timeouts(wait_options),
+        false,
+        WaitAgentV1Tool::new(deps.clone()),
+    );
+    reg.register::<_, CloseAgentV1Request>(
+        "close_agent",
+        definitions::close_agent_v1(),
+        false,
+        CloseAgentTool::new_legacy(deps),
+    );
+}
+
+fn provider_supports_tool_namespaces(config: &ProviderRunConfig) -> bool {
+    matches!(
+        config.backend,
+        ProviderBackend::Openai | ProviderBackend::Codex
+    )
+}
+
+fn agent_type_description(
+    user_roles: &std::collections::BTreeMap<String, crate::subagents::role::AgentRoleConfig>,
+) -> String {
+    use std::collections::BTreeSet;
+
+    let built_in_roles = crate::subagents::role::built_in_roles();
+    let mut seen = BTreeSet::new();
+    let mut formatted_roles = Vec::new();
+    for (name, role) in user_roles {
+        if seen.insert(name.as_str()) {
+            formatted_roles.push(format_agent_role(name, role));
+        }
+    }
+    for (name, role) in &built_in_roles {
+        if seen.insert(name.as_str()) {
+            formatted_roles.push(format_agent_role(name, role));
+        }
+    }
+    format!(
+        "Optional type name for the new agent. If omitted, `default` is used.\nAvailable roles:\n{}",
+        formatted_roles.join("\n")
+    )
+}
+
+fn format_agent_role(name: &str, role: &crate::subagents::role::AgentRoleConfig) -> String {
+    let Some(description) = role
+        .description
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+    else {
+        return format!("{name}: no description");
+    };
+    format!(
+        "{name}: {{\n{description}{}\n}}",
+        locked_role_settings_note(role)
+    )
+}
+
+fn locked_role_settings_note(role: &crate::subagents::role::AgentRoleConfig) -> String {
+    let model = role.overrides.model.as_deref();
+    let reasoning_effort = role.overrides.reasoning_effort.as_deref();
+    let service_tier = role.overrides.service_tier.as_deref();
+    let model_and_reasoning_note = match (model, reasoning_effort) {
+        (Some(model), Some(reasoning_effort)) => format!(
+            "\n- This role's model is set to `{model}` and its reasoning effort is set to `{reasoning_effort}`. These settings cannot be changed."
+        ),
+        (Some(model), None) => {
+            format!("\n- This role's model is set to `{model}` and cannot be changed.")
+        }
+        (None, Some(reasoning_effort)) => {
+            format!(
+                "\n- This role's reasoning effort is set to `{reasoning_effort}` and cannot be changed."
+            )
+        }
+        (None, None) => String::new(),
+    };
+    let service_tier_note = service_tier
+        .map(|service_tier| {
+            format!(
+                "\n- This role's service tier is set to `{service_tier}`. If it is supported by the resolved model, it takes precedence over a valid spawn request service tier."
+            )
+        })
+        .unwrap_or_default();
+    format!("{model_and_reasoning_note}{service_tier_note}")
+}
+
+fn child_role_config_overrides(config: &AgentConfigLayer) -> Vec<(String, toml::Value)> {
+    let mut overrides = config.config_overrides.clone();
+    let instructions = config.instructions.trim();
+    if !instructions.is_empty() {
+        overrides.push((
+            "developer_instructions".to_string(),
+            toml::Value::String(instructions.to_string()),
+        ));
+    }
+    let provider = config.provider.trim();
+    if !provider.is_empty() {
+        overrides.push((
+            "model_provider".to_string(),
+            toml::Value::String(provider.to_string()),
+        ));
+    }
+    if let Some(service_tier) = config
+        .service_tier
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+    {
+        overrides.push((
+            "service_tier".to_string(),
+            toml::Value::String(service_tier.to_string()),
+        ));
+    }
+    if !config.tool_allowlist.is_empty() {
+        overrides.push((
+            "tool_allowlist".to_string(),
+            toml::Value::Array(
+                config
+                    .tool_allowlist
+                    .iter()
+                    .map(|tool| toml::Value::String(tool.clone()))
+                    .collect(),
+            ),
+        ));
+    }
+    overrides.push((
+        "can_write".to_string(),
+        toml::Value::Boolean(config.can_write),
+    ));
+    overrides
+}
+
+fn parent_agent_path_from_store(user_input: &Option<(SharedStore, SessionId)>) -> Option<String> {
+    let (store, session_id) = user_input.as_ref()?;
+    let store = store.lock().ok()?;
+    display_agent_path_for_session(&store, session_id.as_str()).ok()
+}
+
+fn agent_path_depth(agent_path: &str) -> i32 {
+    let trimmed = agent_path.trim().trim_matches('/');
+    if trimmed.is_empty() || trimmed == "root" {
+        return 0;
+    }
+    trimmed.split('/').count().saturating_sub(1) as i32
 }
 
 /// Register the goal tool family (`get_goal`, `create_goal`, `update_goal`) into
@@ -1142,6 +1597,120 @@ fn register_goal_tools<S, A>(
 /// entrypoint's backend->label derivation).
 fn provider_label(config: &ProviderRunConfig) -> String {
     format!("{:?}", config.backend).to_ascii_lowercase()
+}
+
+fn effective_provider_id(config: &ProviderRunConfig) -> String {
+    config
+        .options
+        .model_provider_id
+        .clone()
+        .unwrap_or_else(|| provider_label(config))
+}
+
+fn parent_agent_config_layer(
+    config: &ProviderRunConfig,
+    tool_cwd: &std::path::Path,
+) -> AgentConfigLayer {
+    let overrides = &config.options.config_overrides;
+    let mut layer = AgentConfigLayer::base(config.model.clone(), effective_provider_id(config));
+    if let Some(catalog) = spawn_agent_model_catalog(config, tool_cwd) {
+        layer.available_models = catalog.presets(true);
+        layer.model_catalog = Some(catalog);
+    }
+    if let Some(instructions) = config_override_string_any(overrides, &["developer_instructions"])
+        .or_else(|| config.options.developer_instructions.clone())
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty())
+    {
+        layer.instructions = instructions;
+    }
+    layer.reasoning_effort =
+        config_override_string_any(overrides, &["model_reasoning_effort", "reasoning_effort"])
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty());
+    layer.service_tier = config_override_string_any(overrides, &["service_tier"])
+        .map(|value| value.trim().to_string())
+        .filter(|value| !value.is_empty());
+    if let Some(tool_allowlist) =
+        config_override_string_array_any(overrides, &["tool_allowlist", "tools"])
+    {
+        layer.tool_allowlist = tool_allowlist;
+    }
+    if let Some(can_write) = config_override_bool_any(overrides, &["can_write"]) {
+        layer.can_write = can_write;
+    }
+    layer
+}
+
+fn spawn_agent_available_models_description(
+    config: &ProviderRunConfig,
+    tool_cwd: &std::path::Path,
+) -> String {
+    if let Some(catalog) = spawn_agent_model_catalog(config, tool_cwd) {
+        browser_use_providers::spawn_agent_model_overrides_description_for_catalog(&catalog, true)
+    } else {
+        browser_use_providers::spawn_agent_model_overrides_description()
+    }
+}
+
+fn spawn_agent_model_catalog(
+    config: &ProviderRunConfig,
+    tool_cwd: &std::path::Path,
+) -> Option<browser_use_providers::ModelCatalog> {
+    let path = config
+        .options
+        .config_overrides
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "model_catalog_json")
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    let path = std::path::PathBuf::from(path);
+    let path = if path.is_absolute() {
+        path
+    } else {
+        tool_cwd.join(path)
+    };
+    let json = std::fs::read_to_string(path).ok()?;
+    serde_json::from_str::<browser_use_providers::ModelCatalog>(&json).ok()
+}
+
+fn config_override_string_any(overrides: &ConfigOverrides, keys: &[&str]) -> Option<String> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| keys.iter().any(|key| candidate == key))
+        .and_then(|(_, value)| value.as_str().map(str::to_string))
+}
+
+fn config_override_bool_any(overrides: &ConfigOverrides, keys: &[&str]) -> Option<bool> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| keys.iter().any(|key| candidate == key))
+        .and_then(|(_, value)| value.as_bool())
+}
+
+fn config_override_string_array_any(
+    overrides: &ConfigOverrides,
+    keys: &[&str],
+) -> Option<Vec<String>> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| keys.iter().any(|key| candidate == key))
+        .and_then(|(_, value)| {
+            value.as_array().map(|items| {
+                items
+                    .iter()
+                    .filter_map(|item| item.as_str())
+                    .map(str::trim)
+                    .filter(|item| !item.is_empty())
+                    .map(ToOwned::to_owned)
+                    .collect::<Vec<_>>()
+            })
+        })
 }
 
 #[cfg(test)]
@@ -1672,25 +2241,190 @@ mod tests {
         );
     }
 
-    /// The production dispatcher ALWAYS advertises the four subagent
-    /// orchestration tools (no config gate — the model can always attempt
-    /// delegation; a spawn fails honestly when no child runner is wired). This is
-    /// the "engine B matches rival A on the subagents row" registration proof.
+    /// The production dispatcher advertises the Codex MultiAgentV2 orchestration
+    /// tools while the feature is enabled; a spawn still fails honestly when no
+    /// child runner is wired.
     #[test]
     fn subagent_tools_are_registered_in_the_dispatcher() {
-        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        let options = crate::config_overrides::AgentRunOptions {
+            multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
+                enabled: true,
+                ..Default::default()
+            },
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
         let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
         let names: Vec<&str> = dispatcher
             .tool_specs()
             .iter()
             .map(|s| s.name.as_str())
             .collect();
-        for tool in ["spawn_agent", "wait_agent", "send_input", "list_agents"] {
+        for tool in [
+            "spawn_agent",
+            "wait_agent",
+            "send_message",
+            "followup_task",
+            "list_agents",
+            "close_agent",
+        ] {
             assert!(
                 names.contains(&tool),
                 "{tool} must be registered in the production dispatcher; got {names:?}"
             );
         }
+        assert!(
+            !names.contains(&"send_input"),
+            "send_input is a v1 tool and must not be exposed in the Codex-v2 flat tool surface"
+        );
+    }
+
+    #[test]
+    fn subagent_tools_are_hidden_when_multi_agent_features_disabled() {
+        let options = crate::config_overrides::AgentRunOptions {
+            multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
+                enabled: false,
+                ..Default::default()
+            },
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for tool in ["send_message", "followup_task", "list_agents"] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} must be hidden when multi_agent_v2 is disabled; got {names:?}"
+            );
+        }
+        for tool in [
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+        ] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} must be hidden when both multi-agent feature gates are disabled; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn legacy_subagent_tools_are_exposed_when_collab_enabled() {
+        let options = crate::config_overrides::AgentRunOptions {
+            multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
+                enabled: false,
+                ..Default::default()
+            },
+            collab_enabled: true,
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for tool in [
+            "spawn_agent",
+            "send_input",
+            "resume_agent",
+            "wait_agent",
+            "close_agent",
+        ] {
+            assert!(
+                names.contains(&tool),
+                "{tool} must be exposed through multi_agent_v1 when collab is enabled; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn subagent_tools_apply_multi_agent_v2_definition_options() {
+        let options = crate::config_overrides::AgentRunOptions {
+            multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
+                enabled: true,
+                tool_namespace: Some("agents".to_string()),
+                hide_spawn_agent_metadata: true,
+                min_wait_timeout_ms: 0,
+                default_wait_timeout_ms: 100,
+                max_wait_timeout_ms: 1000,
+                usage_hint_text: Some("Use sparingly.".to_string()),
+                ..Default::default()
+            },
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let spawn = dispatcher
+            .tool_specs()
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .expect("spawn_agent tool");
+        assert_eq!(spawn.namespace.as_deref(), None);
+        assert!(spawn.description.contains("Use sparingly."));
+        assert!(spawn.input_schema["properties"].get("model").is_none());
+        assert_eq!(
+            spawn.output_schema.as_ref().unwrap()["required"],
+            serde_json::json!(["task_name"])
+        );
+
+        let wait = dispatcher
+            .tool_specs()
+            .iter()
+            .find(|spec| spec.name == "wait_agent")
+            .expect("wait_agent tool");
+        assert_eq!(wait.namespace.as_deref(), None);
+        assert_eq!(
+            wait.input_schema["properties"]["timeout_ms"]["description"],
+            serde_json::json!(
+                "Optional timeout in milliseconds. Defaults to 100, min 0, max 1000."
+            )
+        );
+    }
+
+    #[test]
+    fn subagent_namespace_is_only_applied_for_responses_backends() {
+        let options = crate::config_overrides::AgentRunOptions {
+            multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
+                enabled: true,
+                tool_namespace: Some("agents".to_string()),
+                ..Default::default()
+            },
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let openai =
+            ProviderRunConfig::new(ProviderBackend::Openai, "gpt-x").with_options(options.clone());
+        let anthropic =
+            ProviderRunConfig::new(ProviderBackend::Anthropic, "claude-x").with_options(options);
+
+        let openai_dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &openai, None);
+        let anthropic_dispatcher =
+            build_tool_dispatcher(Arc::new(MarkerPythonBackend), &anthropic, None);
+
+        let openai_spawn = openai_dispatcher
+            .tool_specs()
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .expect("openai spawn_agent");
+        let anthropic_spawn = anthropic_dispatcher
+            .tool_specs()
+            .iter()
+            .find(|spec| spec.name == "spawn_agent")
+            .expect("anthropic spawn_agent");
+        assert_eq!(openai_spawn.namespace.as_deref(), Some("agents"));
+        assert_eq!(anthropic_spawn.namespace.as_deref(), None);
     }
 
     /// A `spawn_agent` call routes from the production registration into the
@@ -1720,6 +2454,10 @@ mod tests {
         });
         let options = AgentRunOptions {
             child_agent_runner: Some(runner),
+            multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
+                enabled: true,
+                ..Default::default()
+            },
             ..AgentRunOptions::default()
         };
         let config =
@@ -1729,7 +2467,7 @@ mod tests {
         // spawn_agent call BY NAME through it (the same `dispatch` the production
         // RegistryRunner calls), under the auto-approve stub orchestrator.
         let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
-        register_subagent_tools(&mut reg, &config, &None);
+        register_subagent_tools(&mut reg, &config, &None, &std::env::temp_dir());
         assert!(reg.contains("spawn_agent"));
 
         let orch = ToolOrchestrator::stub();
@@ -1764,10 +2502,8 @@ mod tests {
             "the configured child runner must be invoked"
         );
         let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-        assert!(
-            body.get("agent_path").and_then(|v| v.as_str()).is_some(),
-            "spawn returns the child handle: {body}"
-        );
+        assert_eq!(body["task_name"].as_str(), Some("/root/explore"));
+        assert!(body.get("nickname").is_some());
     }
 
     #[tokio::test]
@@ -1789,13 +2525,17 @@ mod tests {
         });
         let options = AgentRunOptions {
             child_agent_runner: Some(runner),
+            multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
+                enabled: true,
+                ..Default::default()
+            },
             ..AgentRunOptions::default()
         };
         let config =
             ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
 
         let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
-        register_subagent_tools(&mut reg, &config, &None);
+        register_subagent_tools(&mut reg, &config, &None, &std::env::temp_dir());
 
         let orch = ToolOrchestrator::stub();
         let env = TurnEnv {
@@ -1812,23 +2552,16 @@ mod tests {
             tool_name: "spawn_agent".to_string(),
             cwd: std::env::temp_dir(),
         };
-        let spawn_out = reg
-            .dispatch(
-                "spawn_agent",
-                &serde_json::json!({ "task_name": "explore", "message": "go" }),
-                &spawn_ctx,
-                &env,
-                AskForApproval::Never,
-                &orch,
-            )
-            .await
-            .expect("spawn_agent should run");
-        let body: serde_json::Value = serde_json::from_str(&spawn_out.stdout).unwrap();
-        let agent_path = body
-            .get("agent_path")
-            .and_then(|v| v.as_str())
-            .expect("agent path");
-
+        reg.dispatch(
+            "spawn_agent",
+            &serde_json::json!({ "task_name": "explore", "message": "go" }),
+            &spawn_ctx,
+            &env,
+            AskForApproval::Never,
+            &orch,
+        )
+        .await
+        .expect("spawn_agent should run");
         let wait_ctx = ToolCtx {
             call_id: "wait".to_string(),
             tool_name: "wait_agent".to_string(),
@@ -1837,7 +2570,7 @@ mod tests {
         let wait_out = reg
             .dispatch(
                 "wait_agent",
-                &serde_json::json!({ "agent_path": agent_path, "timeout_secs": 1 }),
+                &serde_json::json!({ "timeout_ms": 10_000 }),
                 &wait_ctx,
                 &env,
                 AskForApproval::Never,
@@ -1846,8 +2579,151 @@ mod tests {
             .await
             .expect("wait_agent should run");
         let wait_body: serde_json::Value = serde_json::from_str(&wait_out.stdout).unwrap();
-        assert_eq!(wait_body["status"], "completed");
+        assert_eq!(wait_body["message"], "Wait completed.");
         assert_eq!(wait_body["timed_out"], false);
+    }
+
+    #[tokio::test]
+    async fn store_backed_child_runner_completion_writes_durable_parent_mail_once() {
+        use crate::config_overrides::{AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunner};
+        use crate::tools::orchestrator::ToolOrchestrator;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::runtime::ToolCtx;
+        use crate::tools::sandbox::FileSystemSandboxPolicy;
+
+        let temp = tempfile::tempdir().expect("tempdir");
+        let store = Store::open(temp.path()).expect("store");
+        let root = store
+            .create_session(None, temp.path())
+            .expect("root session");
+        store
+            .set_status(&root.id, browser_use_protocol::SessionStatus::Running)
+            .expect("root running");
+        let root_id = root.id.clone();
+        let shared_store: SharedStore = Arc::new(Mutex::new(store));
+        let runner_store = Arc::clone(&shared_store);
+        let runner = ChildAgentRunner::new(move |req| {
+            {
+                let store = runner_store
+                    .lock()
+                    .map_err(|_| anyhow::anyhow!("store mutex poisoned"))?;
+                if store.load_session(&req.child_session_id)?.is_none() {
+                    let parent = store
+                        .load_session(&req.parent_session_id)?
+                        .ok_or_else(|| anyhow::anyhow!("missing parent session"))?;
+                    store.create_child_session_with_id(
+                        &req.parent_session_id,
+                        std::path::Path::new(&parent.cwd),
+                        req.agent_path.as_deref(),
+                        req.nickname.as_deref(),
+                        req.role.as_deref(),
+                        req.child_session_id.clone(),
+                    )?;
+                }
+                if let Some(run_id) = req.run_id.as_deref() {
+                    store.append_event(
+                        &req.child_session_id,
+                        "agent.run.started",
+                        serde_json::json!({ "run_id": run_id }),
+                    )?;
+                }
+                store.set_status(
+                    &req.child_session_id,
+                    browser_use_protocol::SessionStatus::Done,
+                )?;
+            }
+            req.completion_handler
+                .as_ref()
+                .expect("store completion handler wired")
+                .notify(ChildAgentRunCompletion::success(Some(
+                    "child finished".to_string(),
+                )))?;
+            Ok(())
+        });
+        let options = AgentRunOptions {
+            child_agent_runner: Some(runner),
+            multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
+                enabled: true,
+                min_wait_timeout_ms: 0,
+                default_wait_timeout_ms: 0,
+                max_wait_timeout_ms: 1000,
+                ..Default::default()
+            },
+            ..AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+
+        let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
+        register_subagent_tools(
+            &mut reg,
+            &config,
+            &Some((Arc::clone(&shared_store), SessionId(root_id.clone()))),
+            temp.path(),
+        );
+
+        let orch = ToolOrchestrator::stub();
+        let env = TurnEnv {
+            file_system_sandbox_policy: FileSystemSandboxPolicy {
+                restricted: false,
+                denied_read: false,
+            },
+            managed_network_active: false,
+            strict_auto_review: false,
+            use_guardian: false,
+        };
+        let spawn_ctx = ToolCtx {
+            call_id: "spawn".to_string(),
+            tool_name: "spawn_agent".to_string(),
+            cwd: temp.path().to_path_buf(),
+        };
+        reg.dispatch(
+            "spawn_agent",
+            &serde_json::json!({ "task_name": "explore", "message": "go" }),
+            &spawn_ctx,
+            &env,
+            AskForApproval::Never,
+            &orch,
+        )
+        .await
+        .expect("spawn_agent should run");
+        let wait_ctx = ToolCtx {
+            call_id: "wait".to_string(),
+            tool_name: "wait_agent".to_string(),
+            cwd: temp.path().to_path_buf(),
+        };
+        let wait_out = reg
+            .dispatch(
+                "wait_agent",
+                &serde_json::json!({ "timeout_ms": 0 }),
+                &wait_ctx,
+                &env,
+                AskForApproval::Never,
+                &orch,
+            )
+            .await
+            .expect("wait_agent should read durable parent mail");
+        let wait_body: serde_json::Value = serde_json::from_str(&wait_out.stdout).unwrap();
+        assert_eq!(wait_body["message"], "Wait completed.");
+        assert_eq!(wait_body["timed_out"], false);
+
+        let store = shared_store.lock().unwrap();
+        let parent_events = store.events_for_session(&root_id).unwrap();
+        assert_eq!(
+            parent_events
+                .iter()
+                .filter(|event| event.event_type == "agent.completed")
+                .count(),
+            1,
+            "completion should be recorded once"
+        );
+        let parent_mail = store.messages_for_agent(&root_id).unwrap();
+        assert_eq!(
+            parent_mail.len(),
+            1,
+            "completion mail should be queued once"
+        );
+        assert!(parent_mail[0].content.contains("<subagent_notification>"));
     }
 
     /// The production dispatcher ALWAYS advertises the three goal tools
@@ -1869,6 +2745,45 @@ mod tests {
                 "{tool} must be registered in the production dispatcher; got {names:?}"
             );
         }
+    }
+
+    #[test]
+    fn parent_agent_config_layer_carries_live_parent_overrides() {
+        let options = crate::config_overrides::AgentRunOptions {
+            developer_instructions: Some("base developer".to_string()),
+            config_overrides: vec![
+                (
+                    "developer_instructions".to_string(),
+                    toml::Value::String("override developer".to_string()),
+                ),
+                (
+                    "reasoning_effort".to_string(),
+                    toml::Value::String("high".to_string()),
+                ),
+                (
+                    "service_tier".to_string(),
+                    toml::Value::String("priority".to_string()),
+                ),
+                (
+                    "tool_allowlist".to_string(),
+                    toml::Value::Array(vec![toml::Value::String("shell".to_string())]),
+                ),
+                ("can_write".to_string(), toml::Value::Boolean(false)),
+            ],
+            ..crate::config_overrides::AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5").with_options(options);
+
+        let layer = parent_agent_config_layer(&config, &std::env::temp_dir());
+
+        assert_eq!(layer.model, "gpt-5.5");
+        assert_eq!(layer.provider, "openai");
+        assert_eq!(layer.instructions, "override developer");
+        assert_eq!(layer.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(layer.service_tier.as_deref(), Some("priority"));
+        assert_eq!(layer.tool_allowlist, vec!["shell"]);
+        assert!(!layer.can_write);
     }
 
     /// A `create_goal` call routes from the PRODUCTION registration through the

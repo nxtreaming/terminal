@@ -14,6 +14,7 @@ use crate::schema::{LlmError, LlmErrorReason, LlmEvent};
 #[derive(Debug, Default)]
 struct Accum {
     name: String,
+    namespace: Option<String>,
     args: String,
     started: bool,
     ended: bool,
@@ -40,11 +41,24 @@ impl ToolStream {
 
     /// Explicit start (Anthropic / Responses). Emits `ToolInputStart` once.
     pub fn start(&mut self, id: impl AsRef<str>, name: impl Into<String>) -> Vec<LlmEvent> {
+        self.start_with_namespace(id, name, None)
+    }
+
+    /// Explicit start with a provider namespace. Emits `ToolInputStart` once.
+    pub fn start_with_namespace(
+        &mut self,
+        id: impl AsRef<str>,
+        name: impl Into<String>,
+        namespace: Option<String>,
+    ) -> Vec<LlmEvent> {
         let id = id.as_ref().to_string();
         let name = name.into();
         let e = self.entry(&id);
         if e.name.is_empty() {
             e.name = name;
+        }
+        if e.namespace.is_none() {
+            e.namespace = namespace;
         }
         if e.started {
             return Vec::new();
@@ -88,18 +102,48 @@ impl ToolStream {
     /// No-op if the id is unknown or already ended.
     pub fn end(&mut self, id: impl AsRef<str>) -> Result<Vec<LlmEvent>, LlmError> {
         let id = id.as_ref().to_string();
-        let (name, args) = match self.calls.get_mut(&id) {
+        let (name, namespace, args) = match self.calls.get_mut(&id) {
             Some(e) if !e.ended => {
                 e.ended = true;
-                (e.name.clone(), e.args.clone())
+                (e.name.clone(), e.namespace.clone(), e.args.clone())
             }
             _ => return Ok(Vec::new()),
         };
         let input = parse_args(&args)?;
         Ok(vec![
             LlmEvent::ToolInputEnd { id: id.clone() },
-            LlmEvent::ToolCall { id, name, input },
+            LlmEvent::ToolCall {
+                id,
+                name,
+                namespace,
+                input,
+            },
         ])
+    }
+
+    /// Close one tool call, using a provider's final full `arguments` payload when
+    /// no argument deltas were observed. OpenAI Responses can send only
+    /// `function_call_arguments.done` with the complete arguments string.
+    pub fn end_with_arguments(
+        &mut self,
+        id: impl AsRef<str>,
+        arguments: Option<&str>,
+    ) -> Result<Vec<LlmEvent>, LlmError> {
+        let id = id.as_ref().to_string();
+        let should_add_full_arguments = arguments
+            .filter(|arguments| !arguments.is_empty())
+            .is_some_and(|_| {
+                self.calls
+                    .get(&id)
+                    .map(|entry| !entry.ended && entry.args.is_empty())
+                    .unwrap_or(false)
+            });
+        let mut out = Vec::new();
+        if should_add_full_arguments {
+            out.extend(self.delta(&id, None, arguments.unwrap_or_default()));
+        }
+        out.extend(self.end(&id)?);
+        Ok(out)
     }
 
     /// Close every still-open call, in arrival order.
@@ -158,6 +202,7 @@ mod tests {
                 LlmEvent::ToolCall {
                     id: "c0".into(),
                     name: "shell".into(),
+                    namespace: None,
                     input: json!({ "command": ["ls"] }),
                 },
             ]
@@ -190,6 +235,7 @@ mod tests {
                 LlmEvent::ToolCall {
                     id: "0".into(),
                     name: "get_weather".into(),
+                    namespace: None,
                     input: json!({ "city": "NYC" }),
                 },
             ]
@@ -206,6 +252,7 @@ mod tests {
             &LlmEvent::ToolCall {
                 id: "c0".into(),
                 name: "now".into(),
+                namespace: None,
                 input: json!({}),
             }
         );

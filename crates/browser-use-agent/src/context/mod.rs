@@ -35,6 +35,7 @@ pub use workspace_context::{
 /// Surface the typed `session.input` payload builders at the `context` module root.
 pub use user_input::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
+    typed_user_input_preview_from_items,
 };
 
 #[cfg(test)]
@@ -309,6 +310,7 @@ fn part_to_content_part(part: &Value) -> Option<ContentPart> {
                     mime_type,
                     data: Some(data),
                     url: None,
+                    detail: image_detail_from_part(part),
                 });
             }
             let mime_type = part
@@ -323,10 +325,18 @@ fn part_to_content_part(part: &Value) -> Option<ContentPart> {
                     .and_then(Value::as_str)
                     .map(ToOwned::to_owned),
                 url,
+                detail: image_detail_from_part(part),
             })
         }
         _ => None,
     }
+}
+
+fn image_detail_from_part(part: &Value) -> Option<String> {
+    part.get("detail")
+        .and_then(Value::as_str)
+        .filter(|detail| !detail.trim().is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn data_url_media(url: &str) -> Option<(String, String)> {

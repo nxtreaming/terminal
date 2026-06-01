@@ -153,6 +153,7 @@ fn tool_call(name: &str) -> Result<LlmEvent, LlmError> {
     Ok(LlmEvent::ToolCall {
         id: "call-1".to_string(),
         name: name.to_string(),
+        namespace: None,
         input: serde_json::json!({"arg": 1}),
     })
 }
@@ -528,6 +529,9 @@ fn tool_def(name: &str) -> browser_use_llm::schema::ToolDefinition {
         name: name.to_string(),
         description: String::new(),
         input_schema: serde_json::json!({"type": "object"}),
+        output_schema: None,
+        namespace: None,
+        namespace_description: None,
     }
 }
 

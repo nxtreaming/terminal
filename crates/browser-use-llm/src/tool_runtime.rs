@@ -82,6 +82,7 @@ struct TurnOutcome {
 struct ToolCall {
     id: String,
     name: String,
+    namespace: Option<String>,
     input: serde_json::Value,
 }
 
@@ -103,14 +104,26 @@ fn reduce_turn(events: Vec<LlmEvent>) -> TurnOutcome {
         match ev {
             LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
             LlmEvent::ReasoningDelta { delta, .. } => reasoning.push_str(&delta),
-            LlmEvent::ToolCall { id, name, input } => {
+            LlmEvent::ToolCall {
+                id,
+                name,
+                namespace,
+                input,
+            } => {
                 assistant_tool_parts.push(ContentPart::ToolCall {
                     id: id.clone(),
                     name: name.clone(),
                     input: input.clone(),
-                    provider_metadata: None,
+                    provider_metadata: namespace
+                        .clone()
+                        .map(|namespace| serde_json::json!({ "namespace": namespace })),
                 });
-                tool_calls.push(ToolCall { id, name, input });
+                tool_calls.push(ToolCall {
+                    id,
+                    name,
+                    namespace,
+                    input,
+                });
             }
             LlmEvent::Finish {
                 usage: u,
@@ -265,9 +278,10 @@ where
             // Dispatch each tool call and collect its result part.
             let mut results: Vec<ContentPart> = Vec::with_capacity(outcome.tool_calls.len());
             for call in &outcome.tool_calls {
-                let dispatched = match tools.get(&call.name) {
+                let dispatch_name = tool_display_name(call.namespace.as_deref(), &call.name);
+                let dispatched = match tools.get(&dispatch_name) {
                     Some(tool) => tool.invoke(call.input.clone()).map(|r| r.content),
-                    None => Err(ToolFailure::new(format!("unknown tool: {}", call.name))),
+                    None => Err(ToolFailure::new(format!("unknown tool: {dispatch_name}"))),
                 };
                 results.push(encode_tool_result(&call.id, dispatched));
             }
@@ -324,6 +338,18 @@ impl TurnSource for ScriptedTurnSource {
     }
 }
 
+fn tool_display_name(namespace: Option<&str>, name: &str) -> String {
+    match namespace {
+        Some(namespace) => {
+            let mut display = String::with_capacity(namespace.len() + name.len());
+            display.push_str(namespace);
+            display.push_str(name);
+            display
+        }
+        None => name.to_string(),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -356,6 +382,7 @@ mod tests {
             LlmEvent::ToolCall {
                 id: id.into(),
                 name: "add".into(),
+                namespace: None,
                 input: json!({ "a": a, "b": b }),
             },
             LlmEvent::Finish {
@@ -505,6 +532,7 @@ mod tests {
             LlmEvent::ToolCall {
                 id: "bad_1".into(),
                 name: "add".into(),
+                namespace: None,
                 input: json!({ "a": "oops", "b": 3 }),
             },
             LlmEvent::Finish {
@@ -550,6 +578,7 @@ mod tests {
             LlmEvent::ToolCall {
                 id: "u1".into(),
                 name: "nonexistent".into(),
+                namespace: None,
                 input: json!({}),
             },
             LlmEvent::Finish {

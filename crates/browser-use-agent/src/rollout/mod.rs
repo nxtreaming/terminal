@@ -9,8 +9,8 @@
 //! (`rollout-trace/{bundle,writer}.rs`). This module mirrors that triad:
 //!
 //! - [`truncation`] — pure size-bounded drop-oldest-until-fit (5 MiB default).
-//! - [`fork`] — by-USER-TURN fork that fixes the two `session::resume` debts
-//!   (`LastN` is now per-turn; `Summary` is distinct from `All`).
+//! - [`fork`] — by-fork-turn fork that keeps real user turns plus triggered
+//!   inter-agent turns (`LastN` is now per-turn; `Summary` is distinct from `All`).
 //! - [`archive`] — async archival seam over the `!Sync` SQLite store.
 //!
 //! [`RolloutManager`] wires the three together: truncate a live log, build a
@@ -20,11 +20,8 @@
 //! Cutover note: at engine cutover, `RolloutManager` is intended to be invoked
 //! from the session lifecycle (`session/mod.rs`) right after a turn's events are
 //! appended — truncate the in-memory/log view to the byte budget and archive the
-//! dropped prefix — and the fork path (`Session::fork`) should call
-//! [`fork_events_by_turn`] instead of the by-message
-//! `resume::fork_history_from_events`. That wiring is intentionally NOT done here
-//! (this WP delivers the seam + parity logic; the engine wiring is a follow-up so
-//! the frozen `session/*` surface is not modified).
+//! dropped prefix. The session fork path also applies this by-turn boundary when
+//! reconstructing fork history.
 
 pub mod archive;
 pub mod fork;

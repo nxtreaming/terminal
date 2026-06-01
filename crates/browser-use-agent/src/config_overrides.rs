@@ -19,6 +19,8 @@
 //! `CollaborationModeKind` is intentionally NOT redefined here — it already lives
 //! in [`crate::prompts`] and is reused so the two engines agree on the mode set.
 
+use std::collections::BTreeMap;
+use std::collections::BTreeSet;
 use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -30,6 +32,7 @@ use serde_json::Value;
 
 use crate::mcp::McpServerConfig;
 use crate::prompts::CollaborationModeKind;
+use crate::subagents::role::{AgentRoleConfig, RoleOverrides};
 use crate::tools::AskForApproval;
 
 /// Legacy `browser-use-core::constants::DEFAULT_MAX_CONTEXT_CHARS`
@@ -37,12 +40,57 @@ use crate::tools::AskForApproval;
 /// matches the legacy engine exactly.
 pub const DEFAULT_MAX_CONTEXT_CHARS: usize = 240_000;
 
+/// Codex MultiAgentV2 defaults. These mirror Codex's `MultiAgentV2Config`
+/// values and the feature's under-development default-off gate.
+pub const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
+pub const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
+pub const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
+pub const DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS: i64 = 30_000;
+pub const HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS: i64 = 0;
+pub const HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS: i64 = DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS;
+
 /// Parsed CLI/TUI `--config key=value` overrides: an ordered list of dotted TOML
 /// paths paired with their parsed values.
 ///
 /// Mirrors `browser-use-core` `pub type ConfigOverrides = Vec<(String, toml::Value)>;`
 /// (`lib.rs:178`).
 pub type ConfigOverrides = Vec<(String, toml::Value)>;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct MultiAgentV2Options {
+    pub enabled: bool,
+    pub max_concurrent_threads_per_session: usize,
+    pub min_wait_timeout_ms: i64,
+    pub max_wait_timeout_ms: i64,
+    pub default_wait_timeout_ms: i64,
+    pub usage_hint_enabled: bool,
+    pub usage_hint_text: Option<String>,
+    pub root_agent_usage_hint_text: Option<String>,
+    pub subagent_usage_hint_text: Option<String>,
+    pub tool_namespace: Option<String>,
+    pub hide_spawn_agent_metadata: bool,
+    pub non_code_mode_only: bool,
+}
+
+impl Default for MultiAgentV2Options {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            max_concurrent_threads_per_session:
+                DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
+            min_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,
+            max_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS,
+            default_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_DEFAULT_WAIT_TIMEOUT_MS,
+            usage_hint_enabled: true,
+            usage_hint_text: None,
+            root_agent_usage_hint_text: None,
+            subagent_usage_hint_text: None,
+            tool_namespace: None,
+            hide_spawn_agent_metadata: false,
+            non_code_mode_only: false,
+        }
+    }
+}
 
 /// The provider backend a run targets.
 ///
@@ -57,6 +105,21 @@ pub enum ProviderBackend {
     Deepseek,
     Fake,
     None,
+}
+
+impl ProviderBackend {
+    pub fn from_provider_id(value: &str) -> Option<Self> {
+        match value.trim().to_ascii_lowercase().as_str() {
+            "codex" => Some(Self::Codex),
+            "openai" => Some(Self::Openai),
+            "anthropic" => Some(Self::Anthropic),
+            "openrouter" => Some(Self::Openrouter),
+            "deepseek" => Some(Self::Deepseek),
+            "fake" => Some(Self::Fake),
+            "none" => Some(Self::None),
+            _ => None,
+        }
+    }
 }
 
 /// Whether a run-config value was set explicitly or fell back to a default.
@@ -113,7 +176,10 @@ impl EnvironmentNetworkContext {
 pub struct ChildAgentRunRequest {
     pub parent_session_id: String,
     pub child_session_id: String,
+    pub run_id: Option<String>,
     pub message: String,
+    pub input_items: Option<serde_json::Value>,
+    pub input_is_inter_agent_communication: bool,
     pub agent_path: Option<String>,
     pub nickname: Option<String>,
     pub role: Option<String>,
@@ -253,6 +319,14 @@ pub struct AgentRunOptions {
     /// it `true` selects the fail-closed denying reviewer so a non-`Never` policy
     /// actually blocks gated calls (the guardian review path).
     pub use_guardian: bool,
+    /// Codex-compatible MultiAgentV2 feature/config values used by the
+    /// dispatcher and subagent tool handlers.
+    pub multi_agent_v2: MultiAgentV2Options,
+    /// Legacy Codex collaboration tool gate (`Feature::Collab`, canonical config
+    /// key `features.multi_agent`, legacy alias `features.collab`).
+    pub collab_enabled: bool,
+    /// User-defined subagent roles loaded from `[agents.<name>]` config.
+    pub agent_roles: BTreeMap<String, AgentRoleConfig>,
 }
 
 impl Default for AgentRunOptions {
@@ -287,6 +361,9 @@ impl Default for AgentRunOptions {
             // auto-approve, the approver is never consulted.
             approval_policy: AskForApproval::Never,
             use_guardian: false,
+            multi_agent_v2: MultiAgentV2Options::default(),
+            collab_enabled: false,
+            agent_roles: BTreeMap::new(),
         }
     }
 }
@@ -419,6 +496,21 @@ impl AgentRunOptions {
         self.use_guardian = use_guardian;
         self
     }
+
+    pub fn with_multi_agent_v2(mut self, options: MultiAgentV2Options) -> Self {
+        self.multi_agent_v2 = options;
+        self
+    }
+
+    pub fn with_collab_enabled(mut self, enabled: bool) -> Self {
+        self.collab_enabled = enabled;
+        self
+    }
+
+    pub fn with_agent_roles(mut self, roles: BTreeMap<String, AgentRoleConfig>) -> Self {
+        self.agent_roles = roles;
+        self
+    }
 }
 
 /// Default model context-window budget in tokens, used when the caller does not
@@ -526,6 +618,10 @@ struct RuntimeConfigToml {
     guardian: Option<bool>,
     #[serde(default)]
     use_guardian: Option<bool>,
+    #[serde(default)]
+    features: Option<toml::Value>,
+    #[serde(default)]
+    agents: Option<toml::Value>,
 }
 
 /// Load `[mcp_servers]` from `$BROWSER_USE_TERMINAL_HOME/config.toml`, the
@@ -599,6 +695,580 @@ pub fn resolve_guardian_for_profile(
         }
     }
     Ok(None)
+}
+
+pub fn resolve_multi_agent_v2_for_profile(
+    config_profile: Option<&str>,
+    config_overrides: &ConfigOverrides,
+) -> Result<MultiAgentV2Options> {
+    let mut options = MultiAgentV2Options::default();
+    for path in existing_runtime_config_paths(config_profile) {
+        let config = read_runtime_config_toml(&path)?;
+        if let Some(value) = config
+            .features
+            .as_ref()
+            .and_then(|features| features.get("multi_agent_v2"))
+        {
+            apply_multi_agent_v2_value(&mut options, value)?;
+        }
+    }
+    let override_layer = build_config_overrides_layer(config_overrides);
+    if let Some(value) = override_layer
+        .get("features")
+        .and_then(|features| features.get("multi_agent_v2"))
+    {
+        apply_multi_agent_v2_value(&mut options, value)?;
+    }
+    validate_multi_agent_v2_options(&options)?;
+    Ok(options)
+}
+
+pub fn resolve_collab_for_profile(
+    config_profile: Option<&str>,
+    config_overrides: &ConfigOverrides,
+) -> Result<bool> {
+    let mut enabled = false;
+    for path in existing_runtime_config_paths(config_profile) {
+        let config = read_runtime_config_toml(&path)?;
+        if let Some(features) = config.features.as_ref() {
+            apply_collab_features_value(&mut enabled, features)?;
+        }
+    }
+    let override_layer = build_config_overrides_layer(config_overrides);
+    if let Some(features) = override_layer.get("features") {
+        apply_collab_features_value(&mut enabled, features)?;
+    }
+    Ok(enabled)
+}
+
+pub fn resolve_agent_roles_for_profile(
+    config_profile: Option<&str>,
+    config_overrides: &ConfigOverrides,
+) -> Result<BTreeMap<String, AgentRoleConfig>> {
+    let mut roles = BTreeMap::new();
+    for path in existing_runtime_config_paths(config_profile) {
+        let config = read_runtime_config_toml(&path)?;
+        if let Some(value) = config.agents.as_ref() {
+            let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+            apply_agent_roles_value(&mut roles, value, base_dir)?;
+        }
+        let base_dir = path.parent().unwrap_or_else(|| Path::new("."));
+        discover_agent_roles_in_dir(&mut roles, &base_dir.join("agents"))?;
+    }
+    let override_layer = build_config_overrides_layer(config_overrides);
+    if let Some(value) = override_layer.get("agents") {
+        apply_agent_roles_value(&mut roles, value, Path::new("."))?;
+    }
+    Ok(roles)
+}
+
+fn discover_agent_roles_in_dir(
+    roles: &mut BTreeMap<String, AgentRoleConfig>,
+    agents_dir: &Path,
+) -> Result<()> {
+    if !agents_dir.exists() {
+        return Ok(());
+    }
+    let mut files = Vec::new();
+    collect_agent_role_files(agents_dir, &mut files)?;
+    files.sort();
+    for file in files {
+        let contents = fs::read_to_string(&file)
+            .with_context(|| format!("read agent role {}", file.display()))?;
+        let role_file_base = file.parent().unwrap_or(agents_dir);
+        let role_name_hint = file.file_stem().and_then(|stem| stem.to_str());
+        let parsed = parse_agent_role_file(&contents, &file, role_file_base, role_name_hint)?;
+        roles.entry(parsed.0).or_insert(parsed.1);
+    }
+    Ok(())
+}
+
+fn collect_agent_role_files(dir: &Path, out: &mut Vec<PathBuf>) -> Result<()> {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(err) if err.kind() == std::io::ErrorKind::NotFound => return Ok(()),
+        Err(err) => return Err(err.into()),
+    };
+    for entry in entries {
+        let entry = entry?;
+        let path = entry.path();
+        let file_type = entry.file_type()?;
+        if file_type.is_dir() {
+            collect_agent_role_files(&path, out)?;
+        } else if file_type.is_file() && path.extension().is_some_and(|ext| ext == "toml") {
+            out.push(path);
+        }
+    }
+    Ok(())
+}
+
+fn parse_agent_role_file(
+    contents: &str,
+    file: &Path,
+    base_dir: &Path,
+    role_name_hint: Option<&str>,
+) -> Result<(String, AgentRoleConfig)> {
+    let mut value = contents
+        .parse::<toml::Value>()
+        .with_context(|| format!("parse agent role {}", file.display()))?;
+    let table = value.as_table_mut().ok_or_else(|| {
+        anyhow!(
+            "agent role file {} must contain a TOML table",
+            file.display()
+        )
+    })?;
+    let name = table
+        .remove("name")
+        .and_then(|value| value.as_str().map(str::trim).map(ToOwned::to_owned))
+        .filter(|value| !value.is_empty())
+        .or_else(|| role_name_hint.map(ToOwned::to_owned))
+        .ok_or_else(|| {
+            anyhow!(
+                "agent role file at {} must define a non-empty `name`",
+                file.display()
+            )
+        })?;
+    let description = optional_toml_string(
+        table.remove("description").as_ref(),
+        &format!("agent role file {}.description", file.display()),
+    )?;
+    let nickname_candidates = optional_toml_string_array(
+        table.remove("nickname_candidates").as_ref(),
+        &format!("agent role file {}.nickname_candidates", file.display()),
+    )?;
+    let overrides = role_overrides_from_table(
+        table,
+        &format!("agent role file {}", file.display()),
+        base_dir,
+    )?;
+    Ok((
+        name,
+        AgentRoleConfig {
+            description,
+            config_file: Some(file.to_path_buf()),
+            nickname_candidates,
+            overrides,
+        },
+    ))
+}
+
+fn apply_agent_roles_value(
+    roles: &mut BTreeMap<String, AgentRoleConfig>,
+    value: &toml::Value,
+    base_dir: &Path,
+) -> Result<()> {
+    let table = value
+        .as_table()
+        .ok_or_else(|| anyhow!("agents must be a table"))?;
+    for (name, value) in table {
+        let role_table = value
+            .as_table()
+            .ok_or_else(|| anyhow!("agents.{name} must be a table"))?;
+        roles.insert(
+            name.clone(),
+            agent_role_from_table(name, role_table, base_dir)?,
+        );
+    }
+    Ok(())
+}
+
+fn agent_role_from_table(
+    name: &str,
+    table: &toml::map::Map<String, toml::Value>,
+    base_dir: &Path,
+) -> Result<AgentRoleConfig> {
+    let description = optional_toml_string(
+        table.get("description"),
+        &format!("agents.{name}.description"),
+    )?;
+    let nickname_candidates = optional_toml_string_array(
+        table.get("nickname_candidates"),
+        &format!("agents.{name}.nickname_candidates"),
+    )?;
+    let config_file = optional_toml_string(
+        table.get("config_file"),
+        &format!("agents.{name}.config_file"),
+    )?
+    .map(|path| {
+        let path = PathBuf::from(path);
+        if path.is_absolute() {
+            path
+        } else {
+            base_dir.join(path)
+        }
+    });
+    let mut overrides = role_overrides_from_table(table, &format!("agents.{name}"), base_dir)?;
+    let mut description = description;
+    let mut nickname_candidates = nickname_candidates;
+    if let Some(config_file) = config_file.as_ref() {
+        let file_contents = fs::read_to_string(config_file)
+            .with_context(|| format!("read agents.{name}.config_file {}", config_file.display()))?;
+        let (file_role_name, file_role) = parse_agent_role_file(
+            &file_contents,
+            config_file,
+            config_file.parent().unwrap_or(base_dir),
+            Some(name),
+        )?;
+        if file_role_name != name {
+            bail!(
+                "agents.{name}.config_file resolved role name `{file_role_name}`, expected `{name}`"
+            );
+        }
+        description = file_role.description.or(description);
+        nickname_candidates = file_role.nickname_candidates.or(nickname_candidates);
+        overrides.merge(file_role.overrides);
+    }
+    Ok(AgentRoleConfig {
+        description,
+        config_file,
+        nickname_candidates,
+        overrides,
+    })
+}
+
+fn optional_toml_string(value: Option<&toml::Value>, label: &str) -> Result<Option<String>> {
+    value
+        .map(|value| read_toml_string(value, label))
+        .transpose()
+}
+
+fn optional_toml_string_array(
+    value: Option<&toml::Value>,
+    label: &str,
+) -> Result<Option<Vec<String>>> {
+    let Some(value) = value else {
+        return Ok(None);
+    };
+    let values = value
+        .as_array()
+        .ok_or_else(|| anyhow!("{label} must be an array of strings"))?;
+    let mut out = Vec::with_capacity(values.len());
+    let mut seen = BTreeSet::new();
+    for value in values {
+        let value = read_toml_string(value, label)?.trim().to_string();
+        if value.is_empty() {
+            bail!("{label} cannot contain blank names");
+        }
+        if !value
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || matches!(c, ' ' | '-' | '_'))
+        {
+            bail!(
+                "{label} may only contain ASCII letters, digits, spaces, hyphens, and underscores"
+            );
+        }
+        if !seen.insert(value.clone()) {
+            bail!("{label} cannot contain duplicates");
+        }
+        out.push(value);
+    }
+    if out.is_empty() {
+        bail!("{label} must not be empty");
+    }
+    Ok(Some(out))
+}
+
+fn role_overrides_from_table(
+    table: &toml::map::Map<String, toml::Value>,
+    label: &str,
+    base_dir: &Path,
+) -> Result<RoleOverrides> {
+    Ok(RoleOverrides {
+        model: optional_toml_string(table.get("model"), &format!("{label}.model"))?,
+        reasoning_effort: optional_toml_string(
+            table
+                .get("model_reasoning_effort")
+                .or_else(|| table.get("reasoning_effort")),
+            &format!("{label}.reasoning_effort"),
+        )?,
+        instructions: optional_toml_string(
+            table
+                .get("developer_instructions")
+                .or_else(|| table.get("instructions")),
+            &format!("{label}.instructions"),
+        )?,
+        tool_allowlist: optional_toml_string_array(
+            table.get("tool_allowlist").or_else(|| table.get("tools")),
+            &format!("{label}.tool_allowlist"),
+        )?,
+        can_write: table
+            .get("can_write")
+            .map(|value| read_toml_bool(value, &format!("{label}.can_write")))
+            .transpose()?,
+        provider: optional_toml_string(
+            table
+                .get("model_provider")
+                .or_else(|| table.get("provider")),
+            &format!("{label}.model_provider"),
+        )?,
+        service_tier: optional_toml_string(
+            table.get("service_tier"),
+            &format!("{label}.service_tier"),
+        )?,
+        config_overrides: role_config_overrides_from_table(table, base_dir),
+    })
+}
+
+fn role_config_overrides_from_table(
+    table: &toml::map::Map<String, toml::Value>,
+    base_dir: &Path,
+) -> ConfigOverrides {
+    let mut out = Vec::new();
+    for (key, value) in table {
+        if matches!(
+            key.as_str(),
+            "name" | "description" | "nickname_candidates" | "config_file"
+        ) {
+            continue;
+        }
+        flatten_role_config_override(key, value, base_dir, &mut out);
+    }
+    out
+}
+
+fn flatten_role_config_override(
+    key: &str,
+    value: &toml::Value,
+    base_dir: &Path,
+    out: &mut ConfigOverrides,
+) {
+    if let toml::Value::Table(table) = value {
+        for (child_key, child_value) in table {
+            let dotted = format!("{key}.{child_key}");
+            flatten_role_config_override(&dotted, child_value, base_dir, out);
+        }
+        return;
+    }
+    out.push((
+        canonicalize_config_override_key(key),
+        resolve_role_config_value_paths(key, value.clone(), base_dir),
+    ));
+}
+
+fn resolve_role_config_value_paths(key: &str, value: toml::Value, base_dir: &Path) -> toml::Value {
+    let toml::Value::String(raw) = value else {
+        return value;
+    };
+    if !is_role_path_like_key(key) {
+        return toml::Value::String(raw);
+    }
+    let path = PathBuf::from(raw.trim());
+    if path.as_os_str().is_empty() || path.is_absolute() {
+        return toml::Value::String(path.to_string_lossy().to_string());
+    }
+    toml::Value::String(base_dir.join(path).to_string_lossy().to_string())
+}
+
+fn is_role_path_like_key(key: &str) -> bool {
+    let leaf = key.rsplit('.').next().unwrap_or(key);
+    leaf == "cwd"
+        || leaf == "model_catalog_json"
+        || leaf.ends_with("_path")
+        || leaf.ends_with("_file")
+        || leaf.ends_with("_dir")
+}
+
+fn apply_multi_agent_v2_value(
+    options: &mut MultiAgentV2Options,
+    value: &toml::Value,
+) -> Result<()> {
+    match value {
+        toml::Value::Boolean(enabled) => {
+            options.enabled = *enabled;
+            Ok(())
+        }
+        toml::Value::Table(table) => {
+            if let Some(value) = table.get("enabled") {
+                options.enabled = read_toml_bool(value, "features.multi_agent_v2.enabled")?;
+            }
+            if let Some(value) = table.get("max_concurrent_threads_per_session") {
+                let threads = read_toml_i64(
+                    value,
+                    "features.multi_agent_v2.max_concurrent_threads_per_session",
+                )?;
+                options.max_concurrent_threads_per_session =
+                    usize::try_from(threads).map_err(|_| {
+                        anyhow!(
+                            "features.multi_agent_v2.max_concurrent_threads_per_session must be at least 1"
+                        )
+                    })?;
+            }
+            if let Some(value) = table.get("min_wait_timeout_ms") {
+                options.min_wait_timeout_ms =
+                    read_toml_i64(value, "features.multi_agent_v2.min_wait_timeout_ms")?;
+            }
+            if let Some(value) = table.get("max_wait_timeout_ms") {
+                options.max_wait_timeout_ms =
+                    read_toml_i64(value, "features.multi_agent_v2.max_wait_timeout_ms")?;
+            }
+            if let Some(value) = table.get("default_wait_timeout_ms") {
+                options.default_wait_timeout_ms =
+                    read_toml_i64(value, "features.multi_agent_v2.default_wait_timeout_ms")?;
+            }
+            if let Some(value) = table.get("usage_hint_enabled") {
+                options.usage_hint_enabled =
+                    read_toml_bool(value, "features.multi_agent_v2.usage_hint_enabled")?;
+            }
+            if let Some(value) = table.get("usage_hint_text") {
+                options.usage_hint_text = Some(read_toml_string(
+                    value,
+                    "features.multi_agent_v2.usage_hint_text",
+                )?);
+            }
+            if let Some(value) = table.get("root_agent_usage_hint_text") {
+                options.root_agent_usage_hint_text = Some(read_toml_string(
+                    value,
+                    "features.multi_agent_v2.root_agent_usage_hint_text",
+                )?);
+            }
+            if let Some(value) = table.get("subagent_usage_hint_text") {
+                options.subagent_usage_hint_text = Some(read_toml_string(
+                    value,
+                    "features.multi_agent_v2.subagent_usage_hint_text",
+                )?);
+            }
+            if let Some(value) = table.get("tool_namespace") {
+                options.tool_namespace = Some(read_toml_string(
+                    value,
+                    "features.multi_agent_v2.tool_namespace",
+                )?);
+            }
+            if let Some(value) = table.get("hide_spawn_agent_metadata") {
+                options.hide_spawn_agent_metadata =
+                    read_toml_bool(value, "features.multi_agent_v2.hide_spawn_agent_metadata")?;
+            }
+            if let Some(value) = table.get("non_code_mode_only") {
+                options.non_code_mode_only =
+                    read_toml_bool(value, "features.multi_agent_v2.non_code_mode_only")?;
+            }
+            Ok(())
+        }
+        _ => bail!("features.multi_agent_v2 must be a boolean or table"),
+    }
+}
+
+fn apply_collab_features_value(enabled: &mut bool, features: &toml::Value) -> Result<()> {
+    let Some(table) = features.as_table() else {
+        return Ok(());
+    };
+    if let Some(value) = table.get("collab") {
+        *enabled = read_toml_bool(value, "features.collab")?;
+    }
+    if let Some(value) = table.get("multi_agent") {
+        *enabled = read_toml_bool(value, "features.multi_agent")?;
+    }
+    Ok(())
+}
+
+fn read_toml_bool(value: &toml::Value, label: &str) -> Result<bool> {
+    value
+        .as_bool()
+        .ok_or_else(|| anyhow!("{label} must be a boolean"))
+}
+
+fn read_toml_i64(value: &toml::Value, label: &str) -> Result<i64> {
+    value
+        .as_integer()
+        .ok_or_else(|| anyhow!("{label} must be an integer"))
+}
+
+fn read_toml_string(value: &toml::Value, label: &str) -> Result<String> {
+    value
+        .as_str()
+        .map(str::to_string)
+        .ok_or_else(|| anyhow!("{label} must be a string"))
+}
+
+fn validate_multi_agent_v2_options(options: &MultiAgentV2Options) -> Result<()> {
+    if options.max_concurrent_threads_per_session == 0 {
+        bail!("features.multi_agent_v2.max_concurrent_threads_per_session must be at least 1");
+    }
+    validate_multi_agent_v2_wait_timeout(
+        "features.multi_agent_v2.min_wait_timeout_ms",
+        options.min_wait_timeout_ms,
+    )?;
+    validate_multi_agent_v2_wait_timeout(
+        "features.multi_agent_v2.max_wait_timeout_ms",
+        options.max_wait_timeout_ms,
+    )?;
+    validate_multi_agent_v2_wait_timeout(
+        "features.multi_agent_v2.default_wait_timeout_ms",
+        options.default_wait_timeout_ms,
+    )?;
+    if options.min_wait_timeout_ms > options.max_wait_timeout_ms {
+        bail!(
+            "features.multi_agent_v2.min_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms"
+        );
+    }
+    if options.default_wait_timeout_ms < options.min_wait_timeout_ms {
+        bail!(
+            "features.multi_agent_v2.default_wait_timeout_ms must be at least features.multi_agent_v2.min_wait_timeout_ms"
+        );
+    }
+    if options.default_wait_timeout_ms > options.max_wait_timeout_ms {
+        bail!(
+            "features.multi_agent_v2.default_wait_timeout_ms must be at most features.multi_agent_v2.max_wait_timeout_ms"
+        );
+    }
+    validate_multi_agent_v2_tool_namespace(options.tool_namespace.as_deref())?;
+    Ok(())
+}
+
+fn validate_multi_agent_v2_wait_timeout(label: &str, value: i64) -> Result<()> {
+    if value < HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS {
+        bail!("{label} must be at least {HARD_MIN_MULTI_AGENT_V2_TIMEOUT_MS}");
+    }
+    if value > HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS {
+        bail!("{label} must be at most {HARD_MAX_MULTI_AGENT_V2_TIMEOUT_MS}");
+    }
+    Ok(())
+}
+
+fn validate_multi_agent_v2_tool_namespace(namespace: Option<&str>) -> Result<()> {
+    const LABEL: &str = "features.multi_agent_v2.tool_namespace";
+    const MAX_LEN: usize = 64;
+    const RESERVED_RESPONSES_NAMESPACES: &[&str] = &[
+        "api_tool",
+        "browser",
+        "computer",
+        "container",
+        "file_search",
+        "functions",
+        "image_gen",
+        "multi_tool_use",
+        "python",
+        "python_user_visible",
+        "submodel_delegator",
+        "terminal",
+        "tool_search",
+        "web",
+    ];
+
+    let Some(namespace) = namespace else {
+        return Ok(());
+    };
+    if namespace.is_empty() {
+        bail!("{LABEL} must not be empty");
+    }
+    if namespace.trim() != namespace {
+        bail!("{LABEL} must not have leading or trailing whitespace");
+    }
+    if !namespace
+        .bytes()
+        .all(|byte| byte.is_ascii_alphanumeric() || matches!(byte, b'_' | b'-'))
+    {
+        bail!("{LABEL} must match ^[a-zA-Z0-9_-]+$");
+    }
+    if namespace.chars().count() > MAX_LEN {
+        bail!("{LABEL} must be at most {MAX_LEN} characters");
+    }
+    if namespace == "mcp"
+        || namespace.starts_with("mcp__")
+        || RESERVED_RESPONSES_NAMESPACES.contains(&namespace)
+    {
+        bail!("{LABEL} uses a reserved namespace: {namespace}");
+    }
+    Ok(())
 }
 
 pub fn parse_approval_policy(raw: &str) -> Result<AskForApproval> {
@@ -741,9 +1411,6 @@ fn apply_toml_override(root: &mut toml::Value, path: &str, value: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn ov(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
@@ -837,10 +1504,7 @@ mod tests {
 
     #[test]
     fn runtime_config_loads_profile_mcp_approval_and_guardian() {
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned");
+        let _guard = crate::test_env::lock();
         let temp = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         unsafe {
@@ -926,6 +1590,9 @@ command = "profile-server"
         // Approval defaults preserve prior non-interactive behavior.
         assert_eq!(options.approval_policy, AskForApproval::Never);
         assert!(!options.use_guardian);
+        assert_eq!(options.multi_agent_v2, MultiAgentV2Options::default());
+        assert!(!options.collab_enabled);
+        assert!(options.agent_roles.is_empty());
     }
 
     #[test]
@@ -1027,6 +1694,179 @@ command = "profile-server"
     }
 
     #[test]
+    fn resolves_multi_agent_v2_from_profile_and_overrides() {
+        let _guard = crate::test_env::lock();
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
+        unsafe {
+            std::env::set_var("BROWSER_USE_TERMINAL_HOME", temp.path());
+        }
+        std::fs::write(
+            temp.path().join("config.toml"),
+            r#"
+[features.multi_agent_v2]
+enabled = true
+max_concurrent_threads_per_session = 5
+min_wait_timeout_ms = 2500
+max_wait_timeout_ms = 120000
+default_wait_timeout_ms = 30000
+usage_hint_enabled = false
+usage_hint_text = "Custom delegation guidance."
+tool_namespace = "agents"
+hide_spawn_agent_metadata = true
+"#,
+        )
+        .unwrap();
+        let overrides = parse_config_overrides(&ov(&[
+            "features.multi_agent_v2.max_concurrent_threads_per_session=2",
+            "features.multi_agent_v2.enabled=false",
+        ]))
+        .unwrap();
+
+        let options = resolve_multi_agent_v2_for_profile(None, &overrides).unwrap();
+        assert!(!options.enabled);
+        assert_eq!(options.max_concurrent_threads_per_session, 2);
+        assert_eq!(options.min_wait_timeout_ms, 2500);
+        assert_eq!(options.max_wait_timeout_ms, 120000);
+        assert_eq!(options.default_wait_timeout_ms, 30000);
+        assert!(!options.usage_hint_enabled);
+        assert_eq!(
+            options.usage_hint_text.as_deref(),
+            Some("Custom delegation guidance.")
+        );
+        assert_eq!(options.tool_namespace.as_deref(), Some("agents"));
+        assert!(options.hide_spawn_agent_metadata);
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+                None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolves_legacy_collab_from_profile_and_overrides() {
+        let _guard = crate::test_env::lock();
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
+        unsafe {
+            std::env::set_var("BROWSER_USE_TERMINAL_HOME", temp.path());
+        }
+        std::fs::write(
+            temp.path().join("config.toml"),
+            r#"
+[features]
+collab = true
+"#,
+        )
+        .unwrap();
+        assert!(resolve_collab_for_profile(None, &Vec::new()).unwrap());
+
+        let overrides = parse_config_overrides(&ov(&["features.multi_agent=false"])).unwrap();
+        assert!(!resolve_collab_for_profile(None, &overrides).unwrap());
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+                None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn resolves_agent_roles_from_config_files() {
+        let _guard = crate::test_env::lock();
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
+        unsafe {
+            std::env::set_var("BROWSER_USE_TERMINAL_HOME", temp.path());
+        }
+        std::fs::create_dir_all(temp.path().join("agents")).unwrap();
+        std::fs::write(
+            temp.path().join("agents/researcher.toml"),
+            r#"
+model = "gpt-5.1"
+model_provider = "openai"
+model_reasoning_effort = "low"
+developer_instructions = "Research narrowly."
+tool_allowlist = ["shell", "rg"]
+can_write = false
+service_tier = "priority"
+model_catalog_json = "catalog.json"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("config.toml"),
+            r#"
+[agents.researcher]
+description = "Read-only researcher."
+config_file = "./agents/researcher.toml"
+nickname_candidates = ["Hypatia", "Noether"]
+"#,
+        )
+        .unwrap();
+
+        let roles = resolve_agent_roles_for_profile(None, &Vec::new()).unwrap();
+        let role = roles.get("researcher").expect("researcher role");
+        assert_eq!(role.description.as_deref(), Some("Read-only researcher."));
+        assert_eq!(
+            role.nickname_candidates.as_deref(),
+            Some(&["Hypatia".to_string(), "Noether".to_string()][..])
+        );
+        assert_eq!(role.overrides.model.as_deref(), Some("gpt-5.1"));
+        assert_eq!(role.overrides.provider.as_deref(), Some("openai"));
+        assert_eq!(role.overrides.reasoning_effort.as_deref(), Some("low"));
+        assert_eq!(
+            role.overrides.instructions.as_deref(),
+            Some("Research narrowly.")
+        );
+        assert_eq!(role.overrides.tool_allowlist.as_deref().unwrap().len(), 2);
+        assert_eq!(role.overrides.can_write, Some(false));
+        assert_eq!(role.overrides.service_tier.as_deref(), Some("priority"));
+        assert!(role
+            .overrides
+            .config_overrides
+            .iter()
+            .any(|(key, value)| key == "developer_instructions"
+                && value.as_str() == Some("Research narrowly.")));
+        assert!(role
+            .overrides
+            .config_overrides
+            .iter()
+            .any(|(key, value)| key == "model_catalog_json"
+                && value
+                    .as_str()
+                    .is_some_and(|path| path.ends_with("agents/catalog.json"))));
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+                None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
+            }
+        }
+    }
+
+    #[test]
+    fn rejects_invalid_multi_agent_v2_config() {
+        let overrides = parse_config_overrides(&ov(&[
+            "features.multi_agent_v2.max_concurrent_threads_per_session=0",
+        ]))
+        .unwrap();
+        let err = resolve_multi_agent_v2_for_profile(None, &overrides).unwrap_err();
+        assert!(err
+            .to_string()
+            .contains("max_concurrent_threads_per_session must be at least 1"));
+
+        let overrides =
+            parse_config_overrides(&ov(&["features.multi_agent_v2.tool_namespace=functions"]))
+                .unwrap();
+        let err = resolve_multi_agent_v2_for_profile(None, &overrides).unwrap_err();
+        assert!(err.to_string().contains("reserved namespace"));
+    }
+
+    #[test]
     fn child_agent_runner_invokes_callback() {
         use std::sync::atomic::{AtomicUsize, Ordering};
         let calls = Arc::new(AtomicUsize::new(0));
@@ -1039,7 +1879,10 @@ command = "profile-server"
             .run(ChildAgentRunRequest {
                 parent_session_id: "parent".to_string(),
                 child_session_id: "child".to_string(),
+                run_id: None,
                 message: "do work".to_string(),
+                input_items: None,
+                input_is_inter_agent_communication: false,
                 agent_path: Some("/root/child".to_string()),
                 nickname: None,
                 role: None,

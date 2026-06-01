@@ -18,12 +18,12 @@
 //! - `resolve_agent_reference_in_tree` (lib.rs:22436)
 //!   -> [`resolve_agent_reference_in_tree`]
 
-use super::mailbox::AgentStatus;
 use super::registry::{AgentRecord, AgentRegistry};
 
 /// The canonical root agent path. Legacy uses `/root` as the top of every tree
 /// (see `canonical_agent_reference`'s `..` handling, lib.rs:22313).
 pub const ROOT_AGENT_PATH: &str = "/root";
+pub const MORPHEUS_AGENT_PATH: &str = "/morpheus";
 
 /// One node in the collected agent tree: the agent's live record plus its
 /// `depth` relative to the walk root (the walk root is depth 0).
@@ -167,6 +167,121 @@ pub fn canonical_agent_reference(reference: &str, current_agent_path: &str) -> S
     format!("{normalized}/{reference}")
 }
 
+/// Resolve a Codex MultiAgentV2 target reference to a canonical path.
+///
+/// This mirrors `codex_protocol::AgentPath::resolve`: `"/root"` is the root
+/// shorthand, `"/morpheus"` is the special non-root absolute path, absolute
+/// paths otherwise start with `/root`, and relative references are path
+/// segments below the current agent. Legacy conveniences
+/// such as bare `root`, `parent`, `.`, `..`, nicknames, and `@mentions` are
+/// intentionally not accepted by the v2 tool surface.
+pub fn resolve_agent_path_v2(current_agent_path: &str, reference: &str) -> Result<String, String> {
+    if reference.is_empty() {
+        return Err("agent path must not be empty".to_string());
+    }
+    if reference == ROOT_AGENT_PATH {
+        return Ok(ROOT_AGENT_PATH.to_string());
+    }
+    if reference == MORPHEUS_AGENT_PATH {
+        return Ok(MORPHEUS_AGENT_PATH.to_string());
+    }
+    if reference.starts_with('/') {
+        validate_absolute_agent_path_v2(reference)?;
+        return Ok(reference.to_string());
+    }
+    validate_relative_agent_reference_v2(reference)?;
+    Ok(format!(
+        "{}/{}",
+        current_agent_path.trim_end_matches('/'),
+        reference
+    ))
+}
+
+fn validate_absolute_agent_path_v2(path: &str) -> Result<(), String> {
+    if path == MORPHEUS_AGENT_PATH {
+        return Ok(());
+    }
+    let Some(stripped) = path.strip_prefix('/') else {
+        return Err("absolute agent paths must start with `/root` or be `/morpheus`".to_string());
+    };
+    let mut segments = stripped.split('/');
+    let Some(root) = segments.next() else {
+        return Err("absolute agent path must not be empty".to_string());
+    };
+    if root != "root" {
+        return Err("absolute agent paths must start with `/root` or be `/morpheus`".to_string());
+    }
+    if stripped.ends_with('/') {
+        return Err("absolute agent path must not end with `/`".to_string());
+    }
+    for segment in segments {
+        validate_agent_name_v2(segment)?;
+    }
+    Ok(())
+}
+
+fn validate_relative_agent_reference_v2(reference: &str) -> Result<(), String> {
+    if reference.ends_with('/') {
+        return Err("relative agent path must not end with `/`".to_string());
+    }
+    for segment in reference.split('/') {
+        validate_agent_name_v2(segment)?;
+    }
+    Ok(())
+}
+
+fn validate_agent_name_v2(agent_name: &str) -> Result<(), String> {
+    if agent_name.is_empty() {
+        return Err("agent_name must not be empty".to_string());
+    }
+    if agent_name == "root" {
+        return Err("agent_name `root` is reserved".to_string());
+    }
+    if agent_name == "." || agent_name == ".." {
+        return Err(format!("agent_name `{agent_name}` is reserved"));
+    }
+    if agent_name.contains('/') {
+        return Err("agent_name must not contain `/`".to_string());
+    }
+    if !agent_name
+        .chars()
+        .all(|ch| ch.is_ascii_lowercase() || ch.is_ascii_digit() || ch == '_')
+    {
+        return Err(
+            "agent_name must use only lowercase letters, digits, and underscores".to_string(),
+        );
+    }
+    Ok(())
+}
+
+/// Resolve a Codex MultiAgentV2 target reference against the live registry.
+///
+/// Thread/agent ids are accepted before path resolution, matching Codex's
+/// `resolve_agent_target`; otherwise the stricter v2 path grammar above is
+/// used.
+pub fn resolve_agent_reference_in_tree_v2(
+    registry: &AgentRegistry,
+    current_agent_path: &str,
+    reference: &str,
+) -> Result<Option<AgentRecord>, String> {
+    let root_path =
+        root_session(registry, current_agent_path).unwrap_or_else(|| ROOT_AGENT_PATH.to_string());
+    let tree = collect_agent_tree(registry, &root_path);
+
+    if let Some(node) = tree
+        .iter()
+        .find(|n| n.record.status.is_live() && n.record.agent_id == reference)
+    {
+        return Ok(Some(node.record.clone()));
+    }
+
+    let agent_path = resolve_agent_path_v2(current_agent_path, reference)?;
+    Ok(tree
+        .iter()
+        .find(|n| n.record.status.is_live() && n.record.agent_path == agent_path)
+        .map(|node| node.record.clone()))
+}
+
 /// Resolve an agent reference (mention, path, `.`/`..`/`self`, or nickname)
 /// against the tree containing `current_agent_path`, returning the matched live
 /// [`AgentRecord`].
@@ -197,7 +312,7 @@ pub fn resolve_agent_reference_in_tree(
     // closed agents to match legacy `status != "closed"` filtering.
     if let Some(node) = tree
         .iter()
-        .find(|n| n.record.status != AgentStatus::Closed && n.record.agent_path == canonical)
+        .find(|n| n.record.status.is_live() && n.record.agent_path == canonical)
     {
         return Some(node.record.clone());
     }
@@ -208,7 +323,7 @@ pub fn resolve_agent_reference_in_tree(
     if !token.is_empty() {
         let mut hits = tree
             .iter()
-            .filter(|n| n.record.status != AgentStatus::Closed)
+            .filter(|n| n.record.status.is_live())
             .filter(|n| n.record.nickname.as_deref() == Some(token));
         if let Some(node) = hits.next() {
             if hits.next().is_none() {
@@ -248,6 +363,7 @@ pub fn root_session(registry: &AgentRegistry, agent_path: &str) -> Option<String
 #[cfg(test)]
 mod tree_unit_tests {
     use super::*;
+    use crate::subagents::mailbox::AgentStatus;
 
     fn rec(path: &str, depth: i32, status: AgentStatus) -> AgentRecord {
         AgentRecord {
@@ -257,6 +373,7 @@ mod tree_unit_tests {
             role: None,
             status,
             depth,
+            last_task_message: None,
         }
     }
 
@@ -358,10 +475,22 @@ mod tree_unit_tests {
     }
 
     #[test]
+    fn resolve_v2_accepts_morpheus_special_path() {
+        assert_eq!(
+            resolve_agent_path_v2("/root/alpha", MORPHEUS_AGENT_PATH).unwrap(),
+            MORPHEUS_AGENT_PATH
+        );
+        assert!(
+            resolve_agent_path_v2("/root/alpha", "/neo").is_err(),
+            "non-root absolute paths other than /morpheus must be rejected"
+        );
+    }
+
+    #[test]
     fn resolve_skips_closed_agents() {
         let r = registry();
         // Close the leaf; the legacy resolver filters `status != "closed"`.
-        assert!(r.update_status("/root/alpha/leaf", AgentStatus::Closed));
+        assert!(r.update_status("/root/alpha/leaf", AgentStatus::Shutdown));
         // Exact-path resolution must now miss the closed agent.
         assert!(
             resolve_agent_reference_in_tree(&r, "/root", "/root/alpha/leaf").is_none(),

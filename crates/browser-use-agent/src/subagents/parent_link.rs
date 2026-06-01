@@ -52,9 +52,9 @@ impl ChildRunOutcome {
     /// (legacy maps `run_error` -> `Completed`/`Failed`).
     pub fn child_status(&self) -> AgentStatus {
         if self.success {
-            AgentStatus::Completed
+            AgentStatus::Completed(self.summary.clone())
         } else {
-            AgentStatus::Failed
+            AgentStatus::Errored(self.summary.clone().unwrap_or_else(|| "failed".to_string()))
         }
     }
 }
@@ -79,15 +79,16 @@ pub struct ParentLinkUpdate {
 ///    ([`parent_path_of`]). If the child has no parent (it is a root) the
 ///    function is a no-op and returns `None` — exactly as the legacy early-returns
 ///    when `parent_session_id` is `None`.
-/// 2. **Verify the child is live.** If the child is not in the registry, no-op
-///    `None` (legacy bails when the child link/session is absent).
+/// 2. **Verify the child is live or reserved.** If the child is neither in the
+///    registry nor an in-flight spawn reservation, no-op `None` (legacy bails
+///    when the child link/session is absent).
 /// 3. **Record the child outcome.** Set the child's [`AgentStatus`] to
 ///    `Completed`/`Failed` via [`AgentRegistry::update_status`] (legacy updates
 ///    the child link's status/error).
 /// 4. **Notify the parent.** Enqueue a rendered [`SubagentNotification`] onto the
 ///    [`Mailbox`] as an [`InterAgentCommunication`] addressed parent <- child,
-///    with `trigger_turn = true` so the parent wakes (legacy
-///    `enqueue_mailbox_communication` of the `<subagent_notification>`).
+///    with `trigger_turn = false`: completion mail wakes `wait_agent`, but does
+///    not count as a fresh instruction turn.
 ///
 /// Returns `Some(ParentLinkUpdate)` describing what was linked, or `None` when
 /// there was nothing to link.
@@ -100,15 +101,18 @@ pub fn update_parent_from_child_run(
     // 1. Resolve the parent (None for a root child).
     let parent_path = parent_path_of(child_path)?.to_string();
 
-    // 2. The child must be a live agent.
-    let _child = registry.get(child_path)?;
+    // 2. The child must be live, or still hidden behind a successful spawn
+    // reservation while its runner reports an immediate completion.
+    if registry.get(child_path).is_none() && !registry.has_reserved_path(child_path) {
+        return None;
+    }
 
     // 3. Record the child outcome on the registry.
     let child_status = outcome.child_status();
-    registry.update_status(child_path, child_status);
+    registry.update_status(child_path, child_status.clone());
 
     // 4. Notify the parent via the mailbox.
-    let notification = SubagentNotification::new(child_path.to_string(), child_status);
+    let notification = SubagentNotification::new(child_path.to_string(), child_status.clone());
     let mut prompt = notification.render();
     if let Some(summary) = &outcome.summary {
         // Carry the summary alongside the rendered notification (legacy threads
@@ -121,7 +125,7 @@ pub fn update_parent_from_child_run(
         parent_path.clone(),
         Vec::new(),
         prompt,
-        true,
+        false,
     ));
 
     Some(ParentLinkUpdate {
@@ -144,6 +148,7 @@ mod parent_link_unit_tests {
             role: None,
             status: AgentStatus::Running,
             depth: path.matches('/').count() as i32 - 1,
+            last_task_message: None,
         }
     }
 
@@ -168,10 +173,16 @@ mod parent_link_unit_tests {
 
         assert_eq!(update.parent_path, "/root");
         assert_eq!(update.child_path, "/root/child");
-        assert_eq!(update.child_status, AgentStatus::Completed);
+        assert_eq!(
+            update.child_status,
+            AgentStatus::Completed(Some("all done".to_string()))
+        );
 
         // Child status recorded on the registry.
-        assert_eq!(r.get("/root/child").unwrap().status, AgentStatus::Completed);
+        assert_eq!(
+            r.get("/root/child").unwrap().status,
+            AgentStatus::Completed(Some("all done".to_string()))
+        );
 
         // Parent inbox got exactly one communication, addressed parent <- child.
         let drained = mailbox.drain();
@@ -179,7 +190,7 @@ mod parent_link_unit_tests {
         let msg = &drained[0];
         assert_eq!(msg.from_agent_path, "/root/child");
         assert_eq!(msg.to_agent_path, "/root");
-        assert!(msg.trigger_turn);
+        assert!(!msg.trigger_turn);
         assert!(msg.prompt.contains("<subagent_notification>"));
         assert!(msg.prompt.contains("completed"));
         assert!(msg.prompt.contains("all done"));
@@ -197,11 +208,17 @@ mod parent_link_unit_tests {
         )
         .expect("child has a parent");
 
-        assert_eq!(update.child_status, AgentStatus::Failed);
-        assert_eq!(r.get("/root/child").unwrap().status, AgentStatus::Failed);
+        assert_eq!(
+            update.child_status,
+            AgentStatus::Errored("boom".to_string())
+        );
+        assert_eq!(
+            r.get("/root/child").unwrap().status,
+            AgentStatus::Errored("boom".to_string())
+        );
         let drained = mailbox.drain();
         assert_eq!(drained.len(), 1);
-        assert!(drained[0].prompt.contains("failed"));
+        assert!(drained[0].prompt.contains("errored"));
         assert!(drained[0].prompt.contains("boom"));
     }
 

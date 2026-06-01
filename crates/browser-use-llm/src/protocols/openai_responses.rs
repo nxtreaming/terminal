@@ -20,6 +20,8 @@
 //!   [`LlmEvent::ProviderError`] in-stream (not as a hard decode error), matching
 //!   the streaming-event contract.
 
+use std::collections::HashMap;
+
 use serde_json::{json, Map, Value};
 
 use crate::route::framing::SseFrame;
@@ -67,11 +69,7 @@ impl Protocol for OpenAiResponsesProtocol {
         body.insert("input".to_string(), Value::Array(input));
 
         if !request.tools.is_empty() {
-            let tools: Vec<Value> = request
-                .tools
-                .iter()
-                .filter_map(|tool| lower_tool(tool, request.provider.as_str()))
-                .collect();
+            let tools = lower_tools(&request.tools, request.provider.as_str());
             if !tools.is_empty() {
                 body.insert("tools".to_string(), Value::Array(tools));
             }
@@ -147,12 +145,14 @@ fn lower_message(message: &Message, out: &mut Vec<Value>) {
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
                 content_parts.push(lower_media(
                     message.role,
                     mime_type,
                     data.as_deref(),
                     url.as_deref(),
+                    detail.as_deref(),
                 ));
             }
             ContentPart::Reasoning { text, .. } => {
@@ -163,15 +163,26 @@ fn lower_message(message: &Message, out: &mut Vec<Value>) {
                 }));
             }
             ContentPart::ToolCall {
-                id, name, input, ..
+                id,
+                name,
+                input,
+                provider_metadata,
             } => {
                 flush_message(role, &mut content_parts, out);
-                out.push(json!({
+                let mut item = json!({
                     "type": "function_call",
                     "call_id": id,
                     "name": name,
                     "arguments": stringify_arguments(input),
-                }));
+                });
+                if let Some(namespace) = provider_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.get("namespace"))
+                    .and_then(Value::as_str)
+                {
+                    item["namespace"] = Value::String(namespace.to_string());
+                }
+                out.push(item);
             }
             ContentPart::ToolResult {
                 tool_call_id,
@@ -208,7 +219,13 @@ fn flush_message(role: &str, parts: &mut Vec<Value>, out: &mut Vec<Value>) {
 /// Image MIME types become `input_image` (with an `image_url`), everything else
 /// becomes `input_file` (with `file_data`). A base64 `data` payload is wrapped
 /// in a `data:` URL; an explicit `url` is used verbatim.
-fn lower_media(role: MessageRole, mime_type: &str, data: Option<&str>, url: Option<&str>) -> Value {
+fn lower_media(
+    role: MessageRole,
+    mime_type: &str,
+    data: Option<&str>,
+    url: Option<&str>,
+    detail: Option<&str>,
+) -> Value {
     let _ = role;
     let resolved = match (url, data) {
         (Some(u), _) => u.to_string(),
@@ -216,7 +233,14 @@ fn lower_media(role: MessageRole, mime_type: &str, data: Option<&str>, url: Opti
         (None, None) => String::new(),
     };
     if mime_type.starts_with("image/") {
-        json!({ "type": "input_image", "image_url": resolved })
+        let mut image = serde_json::Map::from_iter([
+            ("type".to_string(), json!("input_image")),
+            ("image_url".to_string(), json!(resolved)),
+        ]);
+        if let Some(detail) = detail {
+            image.insert("detail".to_string(), json!(detail));
+        }
+        Value::Object(image)
     } else {
         json!({ "type": "input_file", "file_data": resolved })
     }
@@ -269,6 +293,7 @@ fn append_tool_result_output(
                 mime_type,
                 data,
                 url,
+                detail,
             } => {
                 *has_media = true;
                 parts.push(lower_media(
@@ -276,6 +301,7 @@ fn append_tool_result_output(
                     mime_type,
                     data.as_deref(),
                     url.as_deref(),
+                    detail.as_deref(),
                 ));
             }
             ContentPart::ToolCall { .. } => {}
@@ -290,6 +316,55 @@ fn append_tool_result_output(
 /// hosted tool encoded as `{"type":"web_search_preview"}`. The ChatGPT-backed
 /// Codex endpoint currently rejects that hosted type, so the Codex route omits
 /// it and relies on local/browser tools instead.
+fn lower_tools(tools: &[ToolDefinition], provider: &str) -> Vec<Value> {
+    let mut output = Vec::new();
+    let mut namespace_indices = HashMap::<String, usize>::new();
+
+    for tool in tools {
+        let Some(lowered) = lower_tool(tool, provider) else {
+            continue;
+        };
+        let Some(namespace) = tool.namespace.as_deref() else {
+            output.push(lowered);
+            continue;
+        };
+        if lowered.get("type").and_then(Value::as_str) != Some("function") {
+            output.push(lowered);
+            continue;
+        }
+        if let Some(index) = namespace_indices.get(namespace).copied() {
+            if let Some(namespace_tools) =
+                output[index].get_mut("tools").and_then(Value::as_array_mut)
+            {
+                namespace_tools.push(lowered);
+            }
+            continue;
+        }
+        namespace_indices.insert(namespace.to_string(), output.len());
+        output.push(json!({
+            "type": "namespace",
+            "name": namespace,
+            "description": tool
+                .namespace_description
+                .clone()
+                .unwrap_or_else(|| format!("Tools in the {namespace} namespace.")),
+            "tools": [lowered],
+        }));
+    }
+
+    output
+}
+
+fn lower_function_tool(tool: &ToolDefinition) -> Value {
+    json!({
+        "type": "function",
+        "name": tool.name,
+        "description": tool.description,
+        "parameters": tool.input_schema,
+        "strict": false,
+    })
+}
+
 fn lower_tool(tool: &ToolDefinition, provider: &str) -> Option<Value> {
     if tool.name == "web_search" {
         if provider.eq_ignore_ascii_case("codex") {
@@ -299,12 +374,7 @@ fn lower_tool(tool: &ToolDefinition, provider: &str) -> Option<Value> {
         // no function envelope.
         return Some(json!({ "type": "web_search_preview" }));
     }
-    Some(json!({
-        "type": "function",
-        "name": tool.name,
-        "description": tool.description,
-        "parameters": tool.input_schema,
-    }))
+    Some(lower_function_tool(tool))
 }
 
 /// Lower a [`ToolChoice`] into the Responses `tool_choice` value.
@@ -452,12 +522,16 @@ impl ProtocolStream for ResponsesDecoder {
                             .and_then(Value::as_str)
                             .unwrap_or_default()
                             .to_string();
+                        let namespace = item
+                            .get("namespace")
+                            .and_then(Value::as_str)
+                            .map(str::to_string);
                         if !item_id.is_empty() {
                             self.item_to_call.insert(item_id, call_id.clone());
                         }
                         // A tool call interrupts any open text/reasoning block.
                         self.close_open(&mut out);
-                        out.extend(self.tools.start(&call_id, name));
+                        out.extend(self.tools.start_with_namespace(&call_id, name, namespace));
                         self.finish_reason = Some(FinishReason::ToolUse);
                     }
                 }
@@ -497,7 +571,8 @@ impl ProtocolStream for ResponsesDecoder {
             "response.function_call_arguments.done" => {
                 let item_id = value.get("item_id").and_then(Value::as_str).unwrap_or("");
                 let call_id = self.call_id_for(item_id);
-                out.extend(self.tools.end(&call_id)?);
+                let arguments = value.get("arguments").and_then(Value::as_str);
+                out.extend(self.tools.end_with_arguments(&call_id, arguments)?);
             }
 
             "response.output_item.done" => {
@@ -616,6 +691,9 @@ mod tests {
                 "properties": { "city": { "type": "string" } },
                 "required": ["city"]
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         });
         request.tool_choice = Some(ToolChoice::Auto);
         request.generation.temperature = Some(0.2);
@@ -714,6 +792,7 @@ mod tests {
                     mime_type: "image/png".into(),
                     data: Some("AAAA".into()),
                     url: None,
+                    detail: Some("original".into()),
                 }],
                 is_error: false,
             }],
@@ -728,6 +807,7 @@ mod tests {
             input[1]["output"][0]["image_url"],
             json!("data:image/png;base64,AAAA")
         );
+        assert_eq!(input[1]["output"][0]["detail"], json!("original"));
     }
 
     #[test]
@@ -812,6 +892,7 @@ mod tests {
             LlmEvent::ToolCall {
                 id: "call_1".into(),
                 name: "get_weather".into(),
+                namespace: None,
                 input: json!({ "city": "NYC" }),
             },
             LlmEvent::StepFinish {
@@ -922,9 +1003,34 @@ mod tests {
         assert!(events.contains(&LlmEvent::ToolCall {
             id: "call_9".into(),
             name: "do_it".into(),
+            namespace: None,
             input: json!({}),
         }));
         assert!(matches!(events.last(), Some(LlmEvent::Finish { .. })));
+    }
+
+    #[test]
+    fn decoder_preserves_responses_function_namespace() {
+        let proto = OpenAiResponsesProtocol::new();
+        let mut dec = proto.decoder();
+        let added = frame(
+            "response.output_item.added",
+            r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_9","name":"spawn_agent","namespace":"agents"}}"#,
+        );
+        let done = frame(
+            "response.function_call_arguments.done",
+            r#"{"type":"response.function_call_arguments.done","item_id":"item_1","arguments":"{\"task_name\":\"audit\",\"message\":\"check\"}"}"#,
+        );
+        let mut events = Vec::new();
+        events.extend(dec.on_frame(&added).unwrap());
+        events.extend(dec.on_frame(&done).unwrap());
+
+        assert!(events.contains(&LlmEvent::ToolCall {
+            id: "call_9".into(),
+            name: "spawn_agent".into(),
+            namespace: Some("agents".into()),
+            input: json!({ "task_name": "audit", "message": "check" }),
+        }));
     }
 
     #[test]
@@ -939,6 +1045,9 @@ mod tests {
                 "properties": { "command": { "type": "array" } },
                 "required": ["command"]
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         });
         request.tools.push(ToolDefinition {
             name: "web_search".to_string(),
@@ -948,6 +1057,9 @@ mod tests {
                 "properties": { "query": { "type": "string" } },
                 "required": ["query"]
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         });
 
         let body = OpenAiResponsesProtocol::new()
@@ -990,17 +1102,85 @@ mod tests {
     }
 
     #[test]
+    fn namespaced_tools_coalesce_like_codex() {
+        let mut request = LlmRequest::new("gpt-5.1-codex", "openai");
+        request.tools.push(ToolDefinition {
+            name: "spawn_agent".to_string(),
+            description: "Spawn".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: Some(json!({
+                "type": "object",
+                "properties": { "task_name": { "type": "string" } },
+                "required": ["task_name"],
+                "additionalProperties": false
+            })),
+            namespace: Some("agents".to_string()),
+            namespace_description: Some("Agent tools.".to_string()),
+        });
+        request.tools.push(ToolDefinition {
+            name: "wait_agent".to_string(),
+            description: "Wait".to_string(),
+            input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            namespace: Some("agents".to_string()),
+            namespace_description: Some("Ignored after first namespace.".to_string()),
+        });
+
+        let body = OpenAiResponsesProtocol::new()
+            .build_body(&request)
+            .expect("build_body");
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["type"], json!("namespace"));
+        assert_eq!(tools[0]["name"], json!("agents"));
+        assert_eq!(tools[0]["description"], json!("Agent tools."));
+        let namespace_tools = tools[0]["tools"].as_array().expect("namespace tools");
+        assert_eq!(namespace_tools.len(), 2);
+        assert_eq!(namespace_tools[0]["name"], json!("spawn_agent"));
+        assert_eq!(namespace_tools[0]["strict"], json!(false));
+        assert!(namespace_tools[0].get("output_schema").is_none());
+        assert_eq!(namespace_tools[1]["name"], json!("wait_agent"));
+    }
+
+    #[test]
+    fn assistant_tool_call_history_preserves_namespace_metadata() {
+        let mut request = LlmRequest::new("gpt-5.1-codex", "openai");
+        request.messages.push(Message::new(
+            MessageRole::Assistant,
+            vec![ContentPart::ToolCall {
+                id: "call_1".into(),
+                name: "spawn_agent".into(),
+                input: json!({ "task_name": "audit" }),
+                provider_metadata: Some(json!({ "namespace": "agents" })),
+            }],
+        ));
+
+        let body = OpenAiResponsesProtocol::new()
+            .build_body(&request)
+            .expect("build_body");
+        let input = body["input"].as_array().expect("input array");
+        assert_eq!(input[0]["type"], json!("function_call"));
+        assert_eq!(input[0]["namespace"], json!("agents"));
+    }
+
+    #[test]
     fn codex_route_omits_hosted_web_search_preview() {
         let mut request = LlmRequest::new("gpt-5.5", "codex");
         request.tools.push(ToolDefinition {
             name: "shell".to_string(),
             description: "Run a shell command".to_string(),
             input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         });
         request.tools.push(ToolDefinition {
             name: "web_search".to_string(),
             description: "Search the web".to_string(),
             input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         });
 
         let body = OpenAiResponsesProtocol::new()

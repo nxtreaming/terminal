@@ -21,26 +21,136 @@
 //! - Built-ins `default`/`explorer`/`worker`: `core/src/agent/role.rs:305-348`.
 //!
 //! Codex backs roles with real TOML files merged through a `ConfigLayerStack`.
-//! That machinery (`codex_config`, `LOCAL_FS`, on-disk role files) is out of
-//! scope for this crate, so the layer a role mutates is the small, in-process
-//! [`AgentConfigLayer`] below — NOT the crate's `Config`/`AgentConfig`. The
-//! resolution order, the built-in set, the user-override-wins rule, and the
-//! provider/tier-preservation rule match codex exactly.
+//! This crate maps the supported role TOML keys into the small in-process
+//! [`AgentConfigLayer`] below. The resolution order, built-in set,
+//! user-override-wins rule, and provider/tier-preservation rule match Codex.
 
 use std::collections::BTreeMap;
 use std::path::PathBuf;
+
+use browser_use_providers::{bundled_model_catalog, ModelCatalog, ModelPresetInfo};
 
 /// The role name used when a caller omits `agent_type`
 /// (codex `agent/role.rs:29` `DEFAULT_ROLE_NAME = "default"`).
 pub const DEFAULT_ROLE_NAME: &str = "default";
 
+const AGENT_NAMES: &str = r#"Euclid
+Archimedes
+Ptolemy
+Hypatia
+Avicenna
+Averroes
+Aquinas
+Copernicus
+Kepler
+Galileo
+Bacon
+Descartes
+Pascal
+Fermat
+Huygens
+Leibniz
+Newton
+Halley
+Euler
+Lagrange
+Laplace
+Volta
+Gauss
+Ampere
+Faraday
+Darwin
+Lovelace
+Boole
+Pasteur
+Maxwell
+Mendel
+Curie
+Planck
+Tesla
+Poincare
+Noether
+Hilbert
+Einstein
+Raman
+Bohr
+Turing
+Hubble
+Feynman
+Franklin
+McClintock
+Meitner
+Herschel
+Linnaeus
+Wegener
+Chandrasekhar
+Sagan
+Goodall
+Carson
+Carver
+Socrates
+Plato
+Aristotle
+Epicurus
+Cicero
+Confucius
+Mencius
+Zeno
+Locke
+Hume
+Kant
+Hegel
+Kierkegaard
+Mill
+Nietzsche
+Peirce
+James
+Dewey
+Russell
+Popper
+Sartre
+Beauvoir
+Arendt
+Rawls
+Singer
+Anscombe
+Parfit
+Kuhn
+Boyle
+Hooke
+Harvey
+Dalton
+Ohm
+Helmholtz
+Gibbs
+Lorentz
+Schrodinger
+Heisenberg
+Pauli
+Dirac
+Bernoulli
+Godel
+Nash
+Banach
+Ramanujan
+Erdos
+Jason"#;
+
+pub fn default_agent_nickname_candidates() -> Vec<String> {
+    AGENT_NAMES
+        .lines()
+        .map(str::trim)
+        .filter(|name| !name.is_empty())
+        .map(ToOwned::to_owned)
+        .collect()
+}
+
 /// A role declaration (codex `config/mod.rs:1890-1898` `AgentRoleConfig`).
 ///
-/// `config_file` mirrors codex's pointer to the role's TOML overrides; here it
-/// is carried for parity (and to drive [`RoleRegistry`] resolution) but the
-/// actual override payload is expressed inline via [`RoleOverrides`] so the
-/// layer can be applied without a filesystem.
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+/// `config_file` mirrors codex's pointer to the role's TOML overrides. Runtime
+/// config loading resolves supported role TOML keys into [`RoleOverrides`] so
+/// the effective layer can be applied at spawn time.
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct AgentRoleConfig {
     /// Human-readable description shown in the spawn tool spec.
     pub description: Option<String>,
@@ -60,7 +170,7 @@ pub struct AgentRoleConfig {
 /// untouched. `provider`/`service_tier` are deliberately *sticky*: a `None` here
 /// means "preserve the caller's current value" (codex
 /// `preserve_current_provider`/`preserve_current_service_tier`).
-#[derive(Clone, Debug, Default, PartialEq, Eq)]
+#[derive(Clone, Debug, Default, PartialEq)]
 pub struct RoleOverrides {
     /// Pin the child to a specific model.
     pub model: Option<String>,
@@ -77,16 +187,43 @@ pub struct RoleOverrides {
     pub provider: Option<String>,
     /// Service-tier override. `None` => preserve caller's tier (codex sticky).
     pub service_tier: Option<String>,
+    /// Raw role config-layer overrides. Codex applies the role TOML through the
+    /// normal config stack; this carries fields beyond the small set projected
+    /// above so child CLI/TUI runs can apply them too.
+    pub config_overrides: Vec<(String, toml::Value)>,
 }
 
-/// The minimal "config" a role layers onto — local to this module by design
-/// (the task forbids depending on the crate's `Config`/`AgentConfig`).
-///
-/// This is the seam an integration WP would map onto the real agent config when
-/// the spawned child is actually constructed. The fields are exactly the surface
-/// a role touches in codex: model/reasoning, instructions, tools, permissions,
-/// and the provider/tier the role may or may not override.
-#[derive(Clone, Debug, PartialEq, Eq)]
+impl RoleOverrides {
+    pub fn merge(&mut self, other: RoleOverrides) {
+        if other.model.is_some() {
+            self.model = other.model;
+        }
+        if other.reasoning_effort.is_some() {
+            self.reasoning_effort = other.reasoning_effort;
+        }
+        if other.instructions.is_some() {
+            self.instructions = other.instructions;
+        }
+        if other.tool_allowlist.is_some() {
+            self.tool_allowlist = other.tool_allowlist;
+        }
+        if other.can_write.is_some() {
+            self.can_write = other.can_write;
+        }
+        if other.provider.is_some() {
+            self.provider = other.provider;
+        }
+        if other.service_tier.is_some() {
+            self.service_tier = other.service_tier;
+        }
+        self.config_overrides.extend(other.config_overrides);
+    }
+}
+
+/// The child config values a role layers onto. The fields are exactly the
+/// surface a role touches in codex: model/reasoning, instructions, tools,
+/// permissions, and the provider/tier the role may or may not override.
+#[derive(Clone, Debug, PartialEq)]
 pub struct AgentConfigLayer {
     pub model: String,
     pub reasoning_effort: Option<String>,
@@ -99,6 +236,11 @@ pub struct AgentConfigLayer {
     pub service_tier: Option<String>,
     /// The role this config was last layered with (for diagnostics / registry).
     pub role: Option<String>,
+    /// Raw role config overrides to pass into the child run.
+    pub config_overrides: Vec<(String, toml::Value)>,
+    /// The model catalog/list available to spawn override validation.
+    pub model_catalog: Option<ModelCatalog>,
+    pub available_models: Vec<ModelPresetInfo>,
 }
 
 impl AgentConfigLayer {
@@ -114,6 +256,9 @@ impl AgentConfigLayer {
             provider: provider.into(),
             service_tier: None,
             role: None,
+            config_overrides: Vec::new(),
+            model_catalog: None,
+            available_models: bundled_model_catalog().presets(true),
         }
     }
 }
@@ -140,6 +285,10 @@ impl RoleRegistry {
         Self {
             user_defined: BTreeMap::new(),
         }
+    }
+
+    pub fn with_user_defined(user_defined: BTreeMap<String, AgentRoleConfig>) -> Self {
+        Self { user_defined }
     }
 
     /// Register (or replace) a user-defined role. A user role with the same name
@@ -217,6 +366,11 @@ fn apply_overrides(config: &mut AgentConfigLayer, role_name: &str, overrides: &R
     if let Some(service_tier) = &overrides.service_tier {
         config.service_tier = Some(service_tier.clone());
     }
+    if !overrides.config_overrides.is_empty() {
+        config
+            .config_overrides
+            .extend(overrides.config_overrides.clone());
+    }
     config.role = Some(role_name.to_string());
 }
 
@@ -241,56 +395,33 @@ pub fn built_in_roles() -> BTreeMap<String, AgentRoleConfig> {
     roles.insert(
         "explorer".to_string(),
         AgentRoleConfig {
-            description: Some(
-                "Use `explorer` for specific codebase questions. Explorers are fast and \
-                 authoritative and must be used to ask specific, well-scoped questions on the \
-                 codebase."
-                    .to_string(),
-            ),
+            description: Some(r#"Use `explorer` for specific codebase questions.
+Explorers are fast and authoritative.
+They must be used to ask specific, well-scoped questions on the codebase.
+Rules:
+- In order to avoid redundant work, you should avoid exploring the same problem that explorers have already covered. Typically, you should trust the explorer results without additional verification. You are still allowed to inspect the code yourself to gain the needed context!
+- You are encouraged to spawn up multiple explorers in parallel when you have multiple distinct questions to ask about the codebase that can be answered independently. This allows you to get more information faster without waiting for one question to finish before asking the next. While waiting for the explorer results, you can continue working on other local tasks that do not depend on those results. This parallelism is a key advantage of delegation, so use it whenever you have multiple questions to ask.
+- Reuse existing explorers for related questions."#.to_string()),
             config_file: Some(PathBuf::from("explorer.toml")),
-            nickname_candidates: Some(vec![
-                "Ada".to_string(),
-                "Lin".to_string(),
-                "Hopper".to_string(),
-                "Turing".to_string(),
-            ]),
-            overrides: RoleOverrides {
-                instructions: Some(
-                    "You are an explorer sub-agent: answer the specific question about the \
-                     codebase concisely and authoritatively."
-                        .to_string(),
-                ),
-                // Explorers are read-only investigators.
-                can_write: Some(false),
-                ..RoleOverrides::default()
-            },
+            nickname_candidates: None,
+            overrides: RoleOverrides::default(),
         },
     );
 
     roles.insert(
         "worker".to_string(),
         AgentRoleConfig {
-            description: Some(
-                "Use for execution and production work: implement part of a feature, fix tests \
-                 or bugs, or split large refactors into independent chunks."
-                    .to_string(),
-            ),
+            description: Some(r#"Use for execution and production work.
+Typical tasks:
+- Implement part of a feature
+- Fix tests or bugs
+- Split large refactors into independent chunks
+Rules:
+- Explicitly assign **ownership** of the task (files / responsibility). When the subtask involves code changes, you should clearly specify which files or modules the worker is responsible for. This helps avoid merge conflicts and ensures accountability. For example, you can say "Worker 1 is responsible for updating the authentication module, while Worker 2 will handle the database layer." By defining clear ownership, you can delegate more effectively and reduce coordination overhead.
+- Always tell workers they are **not alone in the codebase**, and they should not revert the edits made by others, and they should adjust their implementation to accommodate the changes made by others. This is important because there may be multiple workers making changes in parallel, and they need to be aware of each other's work to avoid conflicts and ensure a cohesive final product."#.to_string()),
             config_file: None,
-            nickname_candidates: Some(vec![
-                "Bolt".to_string(),
-                "Forge".to_string(),
-                "Mason".to_string(),
-                "Smith".to_string(),
-            ]),
-            overrides: RoleOverrides {
-                instructions: Some(
-                    "You are a worker sub-agent: you own the assigned files/responsibility, you \
-                     are not alone in the codebase, and you must not revert others' edits."
-                        .to_string(),
-                ),
-                can_write: Some(true),
-                ..RoleOverrides::default()
-            },
+            nickname_candidates: None,
+            overrides: RoleOverrides::default(),
         },
     );
 

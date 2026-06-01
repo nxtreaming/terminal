@@ -362,6 +362,9 @@ mod registry_e2e {
             name: name.to_string(),
             description: name.to_string(),
             input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -538,11 +541,13 @@ mod registry_e2e {
             mime_type,
             data,
             url,
+            detail,
         } = &content[0]
         else {
             panic!("expected media result, got {content:?}");
         };
         assert_eq!(mime_type, "image/png");
+        assert_eq!(detail, &None);
         assert!(data.as_deref().is_some_and(|data| !data.is_empty()));
         assert!(url.is_none());
     }

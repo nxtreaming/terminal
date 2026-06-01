@@ -132,6 +132,7 @@ fn build_content_block(part: &ContentPart) -> Result<Value, LlmError> {
             mime_type,
             data,
             url,
+            ..
         } => {
             let source = if let Some(data) = data {
                 json!({ "type": "base64", "media_type": mime_type, "data": data })
@@ -576,6 +577,9 @@ mod tests {
                 "properties": { "city": { "type": "string" } },
                 "required": ["city"],
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         });
         req.tool_choice = Some(ToolChoice::Auto);
 
@@ -769,6 +773,7 @@ mod tests {
                 mime_type: "image/png".into(),
                 data: Some("AAAA".into()),
                 url: None,
+                detail: None,
             }],
         ));
         let body = AnthropicMessagesProtocol::new().build_body(&req).unwrap();
@@ -909,6 +914,7 @@ mod tests {
             LlmEvent::ToolCall {
                 id: "toolu_1".into(),
                 name: "get_weather".into(),
+                namespace: None,
                 input: json!({ "city": "Paris" }),
             },
             LlmEvent::StepFinish {

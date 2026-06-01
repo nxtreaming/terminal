@@ -13,12 +13,15 @@ use browser_use_agent::config_model::{
     model_catalog_for_cwd_with_options,
 };
 use browser_use_agent::config_overrides::{
-    load_mcp_servers_for_profile, parse_config_overrides, resolve_approval_policy_for_profile,
-    resolve_guardian_for_profile, AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunRequest,
-    ChildAgentRunner, ConfigOverrides, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
+    load_mcp_servers_for_profile, parse_config_overrides, resolve_agent_roles_for_profile,
+    resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
+    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
+    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderBackend, ProviderRunConfig,
+    RunConfigValueSource,
 };
 use browser_use_agent::context::{
-    append_user_shell_command_context_event, typed_user_input_payload_from_text_for_cwd,
+    append_user_shell_command_context_event, typed_user_input_payload_from_items_for_cwd,
+    typed_user_input_payload_from_text_for_cwd,
 };
 use browser_use_agent::entrypoint::run_session_with_config;
 use browser_use_agent::infra::{
@@ -29,12 +32,17 @@ use browser_use_agent::infra::{
     UnifiedExecShutdownCleanup,
 };
 use browser_use_agent::prompts::CollaborationModeKind;
+use browser_use_agent::rollout::fork_events_by_turn;
 use browser_use_agent::session::SharedStore;
+use browser_use_agent::session::{
+    provider_messages_from_events_for_fork, resume::provider_messages_to_fork_response_items,
+    ForkMode,
+};
 use browser_use_agent::subagents::{
     canonical_agent_path_from_task_name, canonical_agent_reference,
     cleanup_agent_runtime_state_for_agent_subtree, display_agent_path_for_session,
     final_statuses_for_v1_wait, last_task_message_for_agent, local_agent_status_value,
-    store_collect_agent_tree as collect_agent_tree,
+    session_was_interrupted, store_collect_agent_tree as collect_agent_tree,
     store_resolve_agent_reference_in_tree as resolve_agent_reference_in_tree,
     store_root_session_id as root_session_id,
 };
@@ -601,7 +609,7 @@ impl DatasetRunner for ConfigDatasetRunner {
         merged_options.approval_policy = config.options.approval_policy;
         merged_options.use_guardian = config.options.use_guardian;
         config.options = merged_options;
-        run_existing_session_from_config_and_notify(store, session_id, config)?;
+        run_existing_session_from_config_and_notify(store, session_id, config, None)?;
         Ok(())
     }
 }
@@ -1320,11 +1328,22 @@ fn run_session_via_engine(
 
 fn attach_cli_child_agent_runner(store: &Store, config: &mut ProviderRunConfig) {
     let state_dir = store.state_dir().to_path_buf();
-    let child_base_config = config.clone();
+    let base_config_slot: std::sync::Arc<std::sync::Mutex<Option<ProviderRunConfig>>> =
+        std::sync::Arc::new(std::sync::Mutex::new(None));
+    let slot = std::sync::Arc::clone(&base_config_slot);
     let runner = ChildAgentRunner::new(move |request| {
-        spawn_cli_child_agent(state_dir.clone(), child_base_config.clone(), request)
+        let base_config = slot
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .as_ref()
+            .cloned()
+            .context("child agent runner base config not initialized")?;
+        spawn_cli_child_agent(state_dir.clone(), base_config, request)
     });
     config.options = config.options.clone().with_child_agent_runner(runner);
+    *base_config_slot
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(config.clone());
 }
 
 fn spawn_cli_child_agent(
@@ -1335,6 +1354,7 @@ fn spawn_cli_child_agent(
     let store = Store::open(&state_dir)?;
     let child = create_agent_child_session_from_request(&store, &request)?;
     let child_id = child.id.clone();
+    record_child_run_marker_from_request(&store, &child_id, &request)?;
     thread::Builder::new()
         .name(format!("browser-use-child-{child_id}"))
         .spawn(move || {
@@ -1355,10 +1375,18 @@ fn run_cli_child_agent_thread(
     request: ChildAgentRunRequest,
 ) -> Result<()> {
     let completion_handler = request.completion_handler.clone();
+    let mut completion_events = None;
     let run_result: Result<Option<String>> = (|| {
         if let Some(model) = request.model.as_deref().filter(|value| !value.is_empty()) {
             config.model = model.to_string();
             config.model_source = RunConfigValueSource::Explicit;
+        }
+        if let Some(provider_id) = child_request_provider_id(&request) {
+            if let Some(backend) = ProviderBackend::from_provider_id(&provider_id) {
+                config.backend = backend;
+            }
+            config.options.model_provider_id = Some(provider_id);
+            config.options.model_provider_id_source = RunConfigValueSource::Explicit;
         }
         if !request.config_overrides.is_empty() {
             config
@@ -1379,20 +1407,63 @@ fn run_cli_child_agent_thread(
             ));
         }
         let store = Store::open(&state_dir)?;
-        let _ = run_existing_session_from_config_and_notify(&store, &child_id, config)?;
+        if completion_handler.is_some() {
+            let _ = run_session_via_engine(&store, &child_id, config)?;
+        } else {
+            let _ = run_existing_session_from_config_and_notify(
+                &store,
+                &child_id,
+                config,
+                request.run_id.clone(),
+            )?;
+        }
         let events = store.events_for_session(&child_id)?;
-        Ok(session_result_from_events(&events))
+        let summary = session_result_from_events(&events);
+        completion_events = Some(events);
+        Ok(summary)
     })();
     if let Some(handler) = completion_handler {
-        let completion = match &run_result {
-            Ok(summary) => ChildAgentRunCompletion::success(summary.clone()),
-            Err(error) => ChildAgentRunCompletion::failure(format!("{error:#}")),
-        };
-        if let Err(error) = handler.notify(completion) {
-            eprintln!("child agent completion notification failed: {error:#}");
+        if let Some(completion) =
+            cli_child_completion_from_result(&run_result, completion_events.as_deref())
+        {
+            if let Err(error) = handler.notify(completion) {
+                eprintln!("child agent completion notification failed: {error:#}");
+            }
         }
     }
     run_result.map(|_| ())
+}
+
+fn cli_child_completion_from_result(
+    run_result: &Result<Option<String>>,
+    events: Option<&[browser_use_protocol::EventRecord]>,
+) -> Option<ChildAgentRunCompletion> {
+    match run_result {
+        Ok(summary) => {
+            if events.is_some_and(child_run_was_interrupted_from_events) {
+                return None;
+            }
+            Some(ChildAgentRunCompletion::success(summary.clone()))
+        }
+        Err(error) => Some(ChildAgentRunCompletion::failure(format!("{error:#}"))),
+    }
+}
+
+fn child_request_provider_id(request: &ChildAgentRunRequest) -> Option<String> {
+    request
+        .config_overrides
+        .iter()
+        .rev()
+        .find(|(key, _)| {
+            matches!(
+                key.as_str(),
+                "model_provider" | "model_provider_id" | "provider"
+            )
+        })
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
 }
 
 fn create_agent_child_session_from_request(
@@ -1412,26 +1483,14 @@ fn create_agent_child_session_from_request(
         request.child_session_id.clone(),
     )?;
     let parent_events = store.events_for_session(&request.parent_session_id)?;
-    let inherited_context = sanitized_agent_context_from_events(&parent_events);
     store.append_event(
         &child.id,
         "agent.context",
-        serde_json::json!({
-            "from_session_id": request.parent_session_id.clone(),
-            "fork_mode": request.fork_turns.as_deref().unwrap_or("all"),
-            "history_mode": "compact_context",
-            "agent_path": request.agent_path.clone(),
-            "nickname": request.nickname.clone(),
-            "role": request.role.clone(),
-            "context": inherited_context,
-        }),
+        child_request_agent_context_payload(&parent_events, request)?,
     )?;
     seed_environment_context_event(store, &child.id, &child.cwd)?;
-    store.append_event(
-        &child.id,
-        "session.input",
-        typed_user_input_payload_from_text_for_cwd(&request.message, &child.cwd)?,
-    )?;
+    seed_child_permissions_context_event(store, &child.id, request)?;
+    append_child_initial_input_from_request(store, &child.id, &child.cwd, request)?;
     store.append_event(
         &request.parent_session_id,
         "agent.spawned",
@@ -1443,6 +1502,113 @@ fn create_agent_child_session_from_request(
         }),
     )?;
     Ok(child)
+}
+
+fn record_child_run_marker_from_request(
+    store: &Store,
+    child_id: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    let Some(run_id) = request.run_id.as_deref() else {
+        return Ok(());
+    };
+    store.append_event(
+        child_id,
+        "agent.run.started",
+        serde_json::json!({
+            "run_id": run_id,
+            "parent_session_id": request.parent_session_id.as_str(),
+            "child_session_id": child_id,
+            "agent_path": request.agent_path.as_deref(),
+        }),
+    )?;
+    Ok(())
+}
+
+fn append_child_initial_input_from_request(
+    store: &Store,
+    child_id: &str,
+    child_cwd: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    if request.input_is_inter_agent_communication {
+        let author_path = display_agent_path_for_session(store, &request.parent_session_id)
+            .unwrap_or_else(|_| "/root".to_string());
+        let recipient_path = request.agent_path.clone().unwrap_or_else(|| {
+            display_agent_path_for_session(store, child_id).unwrap_or_else(|_| child_id.to_string())
+        });
+        store.append_event(
+            child_id,
+            "agent.mailbox_input",
+            serde_json::json!({
+                "id": browser_use_store::new_thread_id(),
+                "author_session_id": request.parent_session_id,
+                "target_session_id": child_id,
+                "author_path": author_path,
+                "recipient_path": recipient_path,
+                "content": request.message,
+                "trigger_turn": true,
+            }),
+        )?;
+    } else {
+        let payload = if let Some(items) = request.input_items.as_ref() {
+            typed_user_input_payload_from_items_for_cwd(items, child_cwd)?
+        } else {
+            typed_user_input_payload_from_text_for_cwd(&request.message, child_cwd)?
+        };
+        store.append_event(child_id, "session.input", payload)?;
+    }
+    Ok(())
+}
+
+fn child_request_agent_context_payload(
+    parent_events: &[browser_use_protocol::EventRecord],
+    request: &ChildAgentRunRequest,
+) -> Result<serde_json::Value> {
+    let mode = child_request_fork_mode(request.fork_turns.as_deref())?;
+    let forked = fork_events_by_turn(parent_events, &mode);
+    let history = provider_messages_from_events_for_fork(&forked.carried);
+    let response_items = provider_messages_to_fork_response_items(&history);
+    let raw_mode = request
+        .fork_turns
+        .as_deref()
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all");
+    let mut payload = serde_json::json!({
+        "from_session_id": request.parent_session_id.clone(),
+        "fork_mode": raw_mode,
+        "agent_path": request.agent_path.clone(),
+        "nickname": request.nickname.clone(),
+        "role": request.role.clone(),
+    });
+    if matches!(mode, ForkMode::None) {
+        payload["history_mode"] = serde_json::json!("none");
+    } else {
+        payload["history_mode"] = serde_json::json!("fork_response_items");
+        payload["fork_response_items"] = serde_json::Value::Array(response_items);
+    }
+    Ok(payload)
+}
+
+fn child_request_fork_mode(raw: Option<&str>) -> Result<ForkMode> {
+    let value = raw
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .unwrap_or("all");
+    if value.eq_ignore_ascii_case("none") {
+        return Ok(ForkMode::None);
+    }
+    if value.eq_ignore_ascii_case("all") {
+        return Ok(ForkMode::All);
+    }
+    let turns = value
+        .parse::<usize>()
+        .with_context(|| "fork_turns must be `none`, `all`, or a positive integer string")?;
+    if turns == 0 {
+        bail!("fork_turns must be `none`, `all`, or a positive integer string");
+    }
+    Ok(ForkMode::LastN(turns))
 }
 
 fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<()> {
@@ -1504,6 +1670,18 @@ fn cli_agent_options(
     )? {
         options = options.with_guardian(use_guardian);
     }
+    options = options.with_multi_agent_v2(resolve_multi_agent_v2_for_profile(
+        config_profile,
+        &config_overrides,
+    )?);
+    options = options.with_collab_enabled(resolve_collab_for_profile(
+        config_profile,
+        &config_overrides,
+    )?);
+    options = options.with_agent_roles(resolve_agent_roles_for_profile(
+        config_profile,
+        &config_overrides,
+    )?);
     let mcp_servers =
         load_mcp_servers_for_profile(config_profile, &runtime_options.mcp_config_paths)?;
     if !mcp_servers.is_empty() {
@@ -1745,7 +1923,7 @@ fn run_openai_session(
             collaboration_mode,
             runtime_options,
         )?);
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1767,7 +1945,7 @@ fn run_anthropic_session(
             collaboration_mode,
             runtime_options,
         )?);
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1789,7 +1967,7 @@ fn run_openrouter_session(
             collaboration_mode,
             runtime_options,
         )?);
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1811,7 +1989,7 @@ fn run_deepseek_session(
             collaboration_mode,
             runtime_options,
         )?);
-    let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
+    let session_id = run_existing_session_from_config_and_notify(store, task_id, config, None)?;
     println!("{session_id}");
     Ok(())
 }
@@ -1820,11 +1998,12 @@ fn run_existing_session_from_config_and_notify(
     store: &Store,
     task_id: &str,
     config: ProviderRunConfig,
+    expected_run_id: Option<String>,
 ) -> Result<String> {
     let result = run_session_via_engine(store, task_id, config);
     let run_error = result.as_ref().err().map(|error| format!("{error:#}"));
     let child_id = result.as_deref().unwrap_or(task_id);
-    notify_parent_after_cli_child_run(store, child_id, run_error)?;
+    notify_parent_after_cli_child_run(store, child_id, run_error, expected_run_id.as_deref())?;
     result
 }
 
@@ -1832,6 +2011,7 @@ fn notify_parent_after_cli_child_run(
     store: &Store,
     child_id: &str,
     run_error: Option<String>,
+    expected_run_id: Option<&str>,
 ) -> Result<()> {
     let Some(child) = store.load_session(child_id)? else {
         return Ok(());
@@ -1839,7 +2019,7 @@ fn notify_parent_after_cli_child_run(
     let Some(parent_id) = child.parent_id.as_deref() else {
         return Ok(());
     };
-    update_parent_from_child_run(store, parent_id, child_id, run_error)?;
+    update_parent_from_child_run(store, parent_id, child_id, run_error, expected_run_id)?;
     Ok(())
 }
 
@@ -1860,14 +2040,81 @@ fn update_parent_from_child_run(
     parent_id: &str,
     child_id: &str,
     run_error: Option<String>,
+    expected_run_id: Option<&str>,
 ) -> Result<Value> {
     let child = store
         .load_session(child_id)?
         .with_context(|| format!("unknown child session id: {child_id}"))?;
     let child_events = store.events_for_session(child_id)?;
-    let result = session_result_from_events(&child_events);
-    let failure = failure_from_events(&child_events).or(run_error);
+    let latest_run_id = latest_child_run_id_from_events(&child_events);
+    let run_id = expected_run_id.map(ToOwned::to_owned).or(latest_run_id);
+    let child_run_events = if let Some(expected_run_id) = expected_run_id {
+        let Some(current_events) = current_child_run_events(&child_events, expected_run_id) else {
+            return Ok(serde_json::json!({
+                "child_session_id": child_id,
+                "run_id": run_id.as_deref(),
+                "status": "stale",
+                "result": null,
+                "failure": null,
+            }));
+        };
+        current_events
+    } else {
+        child_events.as_slice()
+    };
+    if store
+        .agent_summary_for_child(child_id)?
+        .is_some_and(|summary| summary.status == "closed")
+    {
+        return Ok(serde_json::json!({
+            "child_session_id": child_id,
+            "run_id": run_id.as_deref(),
+            "status": "closed",
+            "result": null,
+            "failure": null,
+        }));
+    }
+    if parent_has_child_terminal_event_for_run(store, parent_id, child_id, run_id.as_deref())? {
+        return Ok(serde_json::json!({
+            "child_session_id": child_id,
+            "run_id": run_id.as_deref(),
+            "status": "duplicate",
+            "result": null,
+            "failure": null,
+        }));
+    }
+    let terminal = latest_child_terminal_from_events(child_run_events);
+    let result = terminal
+        .as_ref()
+        .and_then(|terminal| terminal.result.clone())
+        .or_else(|| session_result_from_events(child_run_events));
+    let failure = terminal
+        .as_ref()
+        .and_then(|terminal| terminal.failure.clone())
+        .or_else(|| run_error.clone())
+        .or_else(|| failure_from_events(child_run_events));
     let status = child.status.as_str().to_string();
+    if status == "cancelled" && child_run_was_interrupted_from_events(child_run_events) {
+        store.set_child_agent_status(child_id, "open")?;
+        let payload = serde_json::json!({
+            "child_session_id": child_id,
+            "run_id": run_id.as_deref(),
+            "status": "interrupted",
+            "result": result,
+            "failure": failure,
+        });
+        store.append_event(
+            parent_id,
+            "agent.updated",
+            serde_json::json!({
+                "child_session_id": child_id,
+                "run_id": run_id.as_deref(),
+                "status": "interrupted",
+                "payload": payload,
+            }),
+        )?;
+        return Ok(payload);
+    }
     let event_type = match status.as_str() {
         "done" => "agent.completed",
         "failed" => "agent.failed",
@@ -1881,6 +2128,7 @@ fn update_parent_from_child_run(
     store.set_child_agent_status(child_id, edge_status)?;
     let payload = serde_json::json!({
         "child_session_id": child_id,
+        "run_id": run_id.as_deref(),
         "status": status,
         "result": result,
         "failure": failure,
@@ -1890,6 +2138,7 @@ fn update_parent_from_child_run(
         event_type,
         serde_json::json!({
             "child_session_id": child_id,
+            "run_id": run_id.as_deref(),
             "status": status,
             "payload": payload,
         }),
@@ -1903,6 +2152,89 @@ fn update_parent_from_child_run(
         store.send_agent_message(child_id, parent_id, &notification, false)?;
     }
     Ok(payload)
+}
+
+struct ChildTerminal {
+    result: Option<String>,
+    failure: Option<String>,
+}
+
+fn latest_child_terminal_from_events(
+    events: &[browser_use_protocol::EventRecord],
+) -> Option<ChildTerminal> {
+    events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event_type.as_str(), "session.done" | "session.failed"))
+        .map(|event| match event.event_type.as_str() {
+            "session.done" => ChildTerminal {
+                result: session_result_from_events(std::slice::from_ref(event)),
+                failure: None,
+            },
+            "session.failed" => ChildTerminal {
+                result: None,
+                failure: failure_from_events(std::slice::from_ref(event))
+                    .or_else(|| Some("failed".to_string())),
+            },
+            _ => ChildTerminal {
+                result: None,
+                failure: None,
+            },
+        })
+}
+
+fn latest_child_run_id_from_events(events: &[browser_use_protocol::EventRecord]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        (event.event_type == "agent.run.started")
+            .then(|| event.payload.get("run_id").and_then(Value::as_str))
+            .flatten()
+            .map(ToOwned::to_owned)
+    })
+}
+
+fn current_child_run_events<'a>(
+    events: &'a [browser_use_protocol::EventRecord],
+    expected_run_id: &str,
+) -> Option<&'a [browser_use_protocol::EventRecord]> {
+    let marker_idx = events
+        .iter()
+        .rposition(|event| event.event_type == "agent.run.started")?;
+    let marker = &events[marker_idx];
+    let marker_run_id = marker.payload.get("run_id").and_then(Value::as_str)?;
+    (marker_run_id == expected_run_id).then_some(&events[marker_idx + 1..])
+}
+
+fn parent_has_child_terminal_event_for_run(
+    store: &Store,
+    parent_id: &str,
+    child_id: &str,
+    run_id: Option<&str>,
+) -> Result<bool> {
+    Ok(store.events_for_session(parent_id)?.iter().any(|event| {
+        matches!(
+            event.event_type.as_str(),
+            "agent.completed" | "agent.failed" | "agent.cancelled"
+        ) && event
+            .payload
+            .get("child_session_id")
+            .and_then(Value::as_str)
+            == Some(child_id)
+            && match run_id {
+                Some(run_id) => {
+                    event
+                        .payload
+                        .get("run_id")
+                        .or_else(|| event.payload.pointer("/payload/run_id"))
+                        .and_then(Value::as_str)
+                        == Some(run_id)
+                }
+                None => true,
+            }
+    }))
+}
+
+fn child_run_was_interrupted_from_events(events: &[browser_use_protocol::EventRecord]) -> bool {
+    session_was_interrupted(events)
 }
 
 /// Whether `parent_id` is in a state that can still receive a child-completion
@@ -2028,15 +2360,17 @@ fn show(store: &Store, task_id: &str) -> Result<()> {
     if let Some(url) = browser.url {
         println!("Browser: {url}");
     }
-    if let Some(result) = session_result_from_events(&events) {
-        println!();
-        println!("Result");
-        println!("{result}");
-    }
-    if let Some(error) = failure_from_events(&events) {
-        println!();
-        println!("Failure");
-        println!("{error}");
+    if let Some(terminal) = latest_child_terminal_from_events(&events) {
+        if let Some(result) = terminal.result {
+            println!();
+            println!("Result");
+            println!("{result}");
+        }
+        if let Some(error) = terminal.failure {
+            println!();
+            println!("Failure");
+            println!("{error}");
+        }
     }
     Ok(())
 }
@@ -3042,6 +3376,37 @@ fn seed_environment_context_event(store: &Store, session_id: &str, cwd: &str) ->
     Ok(())
 }
 
+fn seed_child_permissions_context_event(
+    store: &Store,
+    session_id: &str,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    let Some(content) = child_request_developer_instructions(request) else {
+        return Ok(());
+    };
+    store.append_event(
+        session_id,
+        "workspace.context",
+        serde_json::json!({
+            "kind": "permissions",
+            "content": content,
+        }),
+    )?;
+    Ok(())
+}
+
+fn child_request_developer_instructions(request: &ChildAgentRunRequest) -> Option<String> {
+    request
+        .config_overrides
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "developer_instructions")
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
 fn spawn_agent(
     store: &Store,
     parent_id: &str,
@@ -3255,8 +3620,12 @@ fn resume_agent(store: &Store, child_id: &str) -> Result<()> {
     let summary = store
         .agent_summary_for_child(child_id)?
         .with_context(|| format!("unknown child agent edge for session id: {child_id}"))?;
-    let needs_reopen = child.status == browser_use_protocol::SessionStatus::Cancelled
-        || summary.status == "closed";
+    let needs_reopen = matches!(
+        child.status,
+        browser_use_protocol::SessionStatus::Done
+            | browser_use_protocol::SessionStatus::Failed
+            | browser_use_protocol::SessionStatus::Cancelled
+    ) || matches!(summary.status.as_str(), "closed" | "done" | "failed");
     if needs_reopen {
         store.reopen_child_agent_subtree(child_id)?;
     }
@@ -3275,7 +3644,7 @@ fn resume_agent(store: &Store, child_id: &str) -> Result<()> {
 }
 
 fn is_local_agent_id(value: &str) -> bool {
-    value.len() == 12 && value.as_bytes().iter().all(u8::is_ascii_hexdigit)
+    browser_use_store::is_thread_id(value)
 }
 
 fn send_agent_message(
@@ -3907,6 +4276,9 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         mcp_servers: std::collections::HashMap::new(),
         approval_policy: AgentRunOptions::default().approval_policy,
         use_guardian: AgentRunOptions::default().use_guardian,
+        multi_agent_v2: AgentRunOptions::default().multi_agent_v2,
+        collab_enabled: AgentRunOptions::default().collab_enabled,
+        agent_roles: AgentRunOptions::default().agent_roles,
     };
     let mut run_error = runner
         .run_dataset_session(store, &session_id, agent_options)
@@ -4913,7 +5285,7 @@ fn notify_parent_agent_done(store: &Store, task: &browser_use_protocol::SessionM
     let Some(parent_id) = task.parent_id.as_deref() else {
         return Ok(());
     };
-    update_parent_from_child_run(store, parent_id, &task.id, None)?;
+    update_parent_from_child_run(store, parent_id, &task.id, None, None)?;
     Ok(())
 }
 
@@ -4995,6 +5367,71 @@ command = "test-mcp"
     }
 
     #[test]
+    fn cli_completion_handler_skips_interrupted_child_runs() {
+        let interrupted_events = vec![browser_use_protocol::EventRecord {
+            seq: 1,
+            id: "e1".to_string(),
+            session_id: "child".to_string(),
+            ts_ms: 0,
+            event_type: "session.cancelled".to_string(),
+            payload: serde_json::json!({"reason": "interrupt requested"}),
+        }];
+        let ok_result: Result<Option<String>> = Ok(Some("partial".to_string()));
+
+        assert!(cli_child_completion_from_result(&ok_result, Some(&interrupted_events)).is_none());
+
+        let done_events = vec![browser_use_protocol::EventRecord {
+            seq: 1,
+            id: "e2".to_string(),
+            session_id: "child".to_string(),
+            ts_ms: 0,
+            event_type: "session.done".to_string(),
+            payload: serde_json::json!({"result": "finished"}),
+        }];
+        let completion = cli_child_completion_from_result(&ok_result, Some(&done_events))
+            .expect("non-interrupted run should notify");
+        assert!(completion.success);
+        assert_eq!(completion.summary.as_deref(), Some("partial"));
+
+        let resumed_done_events = vec![
+            browser_use_protocol::EventRecord {
+                seq: 1,
+                id: "e3".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 0,
+                event_type: "session.cancelled".to_string(),
+                payload: serde_json::json!({"reason": "interrupted by send_input"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 2,
+                id: "e4".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 1,
+                event_type: "session.followup".to_string(),
+                payload: serde_json::json!({"text": "continue"}),
+            },
+            browser_use_protocol::EventRecord {
+                seq: 3,
+                id: "e5".to_string(),
+                session_id: "child".to_string(),
+                ts_ms: 2,
+                event_type: "session.done".to_string(),
+                payload: serde_json::json!({"result": "finished after resume"}),
+            },
+        ];
+        let completion = cli_child_completion_from_result(&ok_result, Some(&resumed_done_events))
+            .expect("resumed completion should clear earlier interruption");
+        assert!(completion.success);
+        assert_eq!(completion.summary.as_deref(), Some("partial"));
+
+        let error_result: Result<Option<String>> = Err(anyhow::anyhow!("boom"));
+        let completion = cli_child_completion_from_result(&error_result, Some(&interrupted_events))
+            .expect("run errors should still notify failure");
+        assert!(!completion.success);
+        assert!(completion.summary.unwrap_or_default().contains("boom"));
+    }
+
+    #[test]
     fn cli_child_runner_request_creates_store_child_session() -> Result<()> {
         let temp = unique_cli_test_dir("child-runner-session")?;
         let state_dir = temp.join("state");
@@ -5005,7 +5442,10 @@ command = "test-mcp"
         let request = ChildAgentRunRequest {
             parent_session_id: parent.id.clone(),
             child_session_id: "00000000abcd".to_string(),
+            run_id: None,
             message: "Investigate the failing case".to_string(),
+            input_items: None,
+            input_is_inter_agent_communication: false,
             agent_path: Some("/root/investigate_1".to_string()),
             nickname: Some("Analyst".to_string()),
             role: Some("explorer".to_string()),
@@ -5506,7 +5946,7 @@ command = "test-mcp"
             .context("agent.wait.finished")?;
         assert_eq!(finished.payload["timed_out"], false);
         assert_eq!(
-            finished.payload["status"][&child.id]["completed"],
+            finished.payload["status"]["/root/cli_child"]["completed"],
             "complete"
         );
         let err = wait_agent(&store, &parent.id, vec!["not_an_id".to_string()], 0)
@@ -5563,6 +6003,197 @@ command = "test-mcp"
             .content
             .contains("\"agent_path\":\"/root/cli_child\""));
         assert!(mail[0].content.contains("\"completed\":\"done\""));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_terminal_status_ignores_late_completion_after_close() -> Result<()> {
+        let temp = unique_cli_test_dir("child-notification-closed")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({ "run_id": "run-closed" }),
+        )?;
+        store.close_child_agent(&child.id, "closed by close_agent")?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "late"}),
+        )?;
+        let child = store.load_session(&child.id)?.context("child session")?;
+
+        notify_parent_agent_done(&store, &child)?;
+
+        assert_eq!(
+            store.agent_summary_for_child(&child.id)?.unwrap().status,
+            "closed"
+        );
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events.iter().all(|event| {
+            event.event_type != "agent.completed" && event.event_type != "agent.failed"
+        }));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_terminal_status_queues_parent_notification_once() -> Result<()> {
+        let temp = unique_cli_test_dir("child-notification-once")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({ "run_id": "run-once" }),
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "done once"}),
+        )?;
+        let child = store.load_session(&child.id)?.context("child session")?;
+
+        notify_parent_agent_done(&store, &child)?;
+        notify_parent_agent_done(&store, &child)?;
+
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert_eq!(
+            parent_events
+                .iter()
+                .filter(|event| event.event_type == "agent.completed")
+                .count(),
+            1
+        );
+        let mail = store.messages_for_agent(&parent.id)?;
+        assert_eq!(mail.len(), 1);
+        assert!(mail[0].content.contains("done once"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_terminal_status_ignores_stale_old_run_after_restart() -> Result<()> {
+        let temp = unique_cli_test_dir("child-notification-stale-run")?;
+        let state_dir = temp.join("state");
+        let parent_cwd = temp.join("parent");
+        std::fs::create_dir_all(&parent_cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &parent_cwd)?;
+        let child = store.create_child_session(
+            &parent.id,
+            &parent_cwd,
+            Some("/root/cli_child"),
+            Some("CliNick"),
+            Some("worker"),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({ "run_id": "run-old" }),
+        )?;
+        store.append_event(
+            &child.id,
+            "agent.run.started",
+            serde_json::json!({ "run_id": "run-new" }),
+        )?;
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "late old completion"}),
+        )?;
+
+        let stale =
+            update_parent_from_child_run(&store, &parent.id, &child.id, None, Some("run-old"))?;
+
+        assert_eq!(stale["status"], "stale");
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events.iter().all(|event| {
+            event.event_type != "agent.completed" && event.event_type != "agent.failed"
+        }));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
+
+        store.append_event(
+            &child.id,
+            "session.done",
+            serde_json::json!({"result": "new completion"}),
+        )?;
+        let completed =
+            update_parent_from_child_run(&store, &parent.id, &child.id, None, Some("run-new"))?;
+
+        assert_eq!(completed["status"], "done");
+        assert_eq!(completed["result"], "new completion");
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert_eq!(
+            parent_events
+                .iter()
+                .filter(|event| event.event_type == "agent.completed")
+                .count(),
+            1
+        );
+        assert!(store.messages_for_agent(&parent.id)?[0]
+            .content
+            .contains("new completion"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_show_uses_latest_terminal_event_not_stale_failure() -> Result<()> {
+        let temp = unique_cli_test_dir("show-latest-terminal")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, &cwd)?;
+        store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "inspect"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.failed",
+            serde_json::json!({"error": "old failure"}),
+        )?;
+        store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "later success"}),
+        )?;
+
+        let events = store.events_for_session(&session.id)?;
+        let terminal = latest_child_terminal_from_events(&events).context("latest terminal")?;
+        assert_eq!(terminal.result.as_deref(), Some("later success"));
+        assert!(terminal.failure.is_none());
+        show(&store, &session.id)?;
 
         std::fs::remove_dir_all(temp)?;
         Ok(())

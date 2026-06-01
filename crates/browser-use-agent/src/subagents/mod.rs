@@ -65,15 +65,18 @@ pub use spawn::{
 pub use store_tree::{
     canonical_agent_path_from_task_name, cleanup_agent_runtime_state_for_agent_subtree,
     collect_agent_subtree_session_ids, display_agent_path_for_session, final_statuses_for_v1_wait,
-    last_task_message_for_agent, local_agent_status_value, ResolvedAgentReference,
+    last_task_message_for_agent, local_agent_status_value, session_was_interrupted,
+    ResolvedAgentReference,
 };
 pub use store_tree::{
     collect_agent_tree as store_collect_agent_tree,
     resolve_agent_reference_in_tree as store_resolve_agent_reference_in_tree,
+    resolve_agent_reference_in_tree_v2 as store_resolve_agent_reference_in_tree_v2,
     root_session_id as store_root_session_id,
 };
 pub use tree::{
-    canonical_agent_reference, collect_agent_tree, resolve_agent_reference_in_tree, root_session,
+    canonical_agent_reference, collect_agent_tree, resolve_agent_path_v2,
+    resolve_agent_reference_in_tree, resolve_agent_reference_in_tree_v2, root_session,
     AgentTreeNode,
 };
 

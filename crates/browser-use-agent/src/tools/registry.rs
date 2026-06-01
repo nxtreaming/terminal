@@ -308,8 +308,14 @@ where
     S: SandboxProvider,
     A: Approver,
 {
-    tools: BTreeMap<String, Box<dyn DynTool<S, A>>>,
+    tools: BTreeMap<ToolKey, Box<dyn DynTool<S, A>>>,
     deferred: Vec<ToolSearchEntry>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Ord, PartialOrd)]
+struct ToolKey {
+    namespace: Option<String>,
+    name: String,
 }
 
 impl<S, A> Default for ToolRegistry<S, A>
@@ -354,23 +360,41 @@ where
     {
         let name = name.into();
         let adapter = ToolAdapter::<T, Req>::new(tool, name.clone(), definition, parallel_safe);
-        self.tools.insert(name, Box::new(adapter));
+        let key = ToolKey::new(adapter.definition.namespace.as_deref(), &name);
+        self.tools.insert(key, Box::new(adapter));
     }
 
     /// Register an already-erased [`DynTool`] under its own `name()`.
     pub fn register_dyn(&mut self, tool: Box<dyn DynTool<S, A>>) {
-        let name = tool.name().to_string();
-        self.tools.insert(name, tool);
+        let definition = tool.definition();
+        let key = ToolKey::new(definition.namespace.as_deref(), tool.name());
+        self.tools.insert(key, tool);
     }
 
     /// Look up a handler by name.
     pub fn get(&self, name: &str) -> Option<&dyn DynTool<S, A>> {
-        self.tools.get(name).map(|b| b.as_ref())
+        self.tools.get(&ToolKey::plain(name)).map(|b| b.as_ref())
+    }
+
+    /// Look up a handler by Responses namespace + function name.
+    pub fn get_namespaced(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+    ) -> Option<&dyn DynTool<S, A>> {
+        self.tools
+            .get(&ToolKey::new(namespace, name))
+            .map(|b| b.as_ref())
     }
 
     /// Whether a handler is registered under `name`.
     pub fn contains(&self, name: &str) -> bool {
-        self.tools.contains_key(name)
+        self.tools.contains_key(&ToolKey::plain(name))
+    }
+
+    /// Whether a handler is registered under a namespace + name.
+    pub fn contains_namespaced(&self, namespace: Option<&str>, name: &str) -> bool {
+        self.tools.contains_key(&ToolKey::new(namespace, name))
     }
 
     /// Number of registered handlers.
@@ -381,6 +405,12 @@ where
     /// Whether the registry holds no handlers.
     pub fn is_empty(&self) -> bool {
         self.tools.is_empty()
+    }
+
+    /// Retain only registered tools accepted by `keep`.
+    pub fn retain_registered_tools(&mut self, mut keep: impl FnMut(Option<&str>, &str) -> bool) {
+        self.tools
+            .retain(|key, _| keep(key.namespace.as_deref(), &key.name));
     }
 
     /// Set the deferred tool catalog that `tool_search` searches over.
@@ -414,7 +444,16 @@ where
     /// The dispatcher feeds this into its parallel/serial gate
     /// (`turn::decision`).
     pub fn parallel_safe(&self, name: &str) -> Option<bool> {
-        self.tools.get(name).map(|t| t.parallel_safe())
+        self.tools
+            .get(&ToolKey::plain(name))
+            .map(|t| t.parallel_safe())
+    }
+
+    /// Whether a namespaced registered tool is parallel-safe.
+    pub fn parallel_safe_namespaced(&self, namespace: Option<&str>, name: &str) -> Option<bool> {
+        self.tools
+            .get(&ToolKey::new(namespace, name))
+            .map(|t| t.parallel_safe())
     }
 
     /// Dispatch a tool call by name, routing through the orchestrator.
@@ -435,6 +474,48 @@ where
             .get(name)
             .ok_or_else(|| ToolError::Other(anyhow::anyhow!("unknown tool `{name}`")))?;
         tool.call(input, ctx, env, policy, orchestrator).await
+    }
+
+    /// Dispatch a Responses namespace function call.
+    pub async fn dispatch_namespaced(
+        &self,
+        namespace: Option<&str>,
+        name: &str,
+        input: &serde_json::Value,
+        ctx: &ToolCtx,
+        env: &TurnEnv,
+        policy: AskForApproval,
+        orchestrator: &ToolOrchestrator<S, A>,
+    ) -> Result<ExecOutput, ToolError> {
+        let tool = self.get_namespaced(namespace, name).ok_or_else(|| {
+            ToolError::Other(anyhow::anyhow!(
+                "unknown tool `{}`",
+                ToolKey::new(namespace, name)
+            ))
+        })?;
+        tool.call(input, ctx, env, policy, orchestrator).await
+    }
+}
+
+impl ToolKey {
+    fn new(namespace: Option<&str>, name: &str) -> Self {
+        Self {
+            namespace: namespace.map(ToOwned::to_owned),
+            name: name.to_string(),
+        }
+    }
+
+    fn plain(name: &str) -> Self {
+        Self::new(None, name)
+    }
+}
+
+impl std::fmt::Display for ToolKey {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match &self.namespace {
+            Some(namespace) => write!(f, "{namespace}{}", self.name),
+            None => f.write_str(&self.name),
+        }
     }
 }
 
@@ -462,6 +543,49 @@ where
 pub mod definitions {
     use browser_use_llm::schema::ToolDefinition;
     use serde_json::json;
+    use serde_json::Map;
+    use serde_json::Value;
+
+    pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
+    const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str =
+        "Tools for spawning and managing sub-agents.";
+    const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
+    const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str = "Optional model override for the new agent. Leave unset to inherit the same model as the parent, which is the preferred default. Only set this when the user explicitly asks for a different model or the task clearly requires one.";
+    const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
+        "Optional service tier override for the new agent. Leave unset unless the user explicitly asks for one.";
+
+    #[derive(Clone, Debug)]
+    pub struct SpawnAgentDefinitionOptions {
+        pub agent_type_description: String,
+        pub available_models_description: Option<String>,
+        pub hide_agent_type_model_reasoning: bool,
+        pub include_usage_hint: bool,
+        pub usage_hint_text: Option<String>,
+        pub max_concurrent_threads_per_session: Option<usize>,
+    }
+
+    impl Default for SpawnAgentDefinitionOptions {
+        fn default() -> Self {
+            Self {
+                agent_type_description:
+                    "Optional role for the new agent. If omitted, `default` is used.".to_string(),
+                available_models_description: Some(
+                    "No picker-visible model overrides are currently loaded.".to_string(),
+                ),
+                hide_agent_type_model_reasoning: false,
+                include_usage_hint: false,
+                usage_hint_text: None,
+                max_concurrent_threads_per_session: None,
+            }
+        }
+    }
+
+    #[derive(Clone, Copy, Debug, PartialEq, Eq)]
+    pub struct WaitAgentDefinitionOptions {
+        pub default_timeout_ms: i64,
+        pub min_timeout_ms: i64,
+        pub max_timeout_ms: i64,
+    }
 
     /// `get_goal`: report the current thread goal + token-budget usage. Parity:
     /// codex goal-spec read tool (`goal_spec.rs` / `spec_plan.rs`).
@@ -475,6 +599,9 @@ pub mod definitions {
                 "properties": {},
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -496,6 +623,9 @@ pub mod definitions {
                 "required": ["text"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -519,6 +649,9 @@ pub mod definitions {
                 },
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -548,6 +681,9 @@ pub mod definitions {
                 "required": ["command"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -569,6 +705,9 @@ pub mod definitions {
                 "required": ["patch"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -588,6 +727,9 @@ pub mod definitions {
                 "required": ["path"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -620,6 +762,9 @@ pub mod definitions {
                 "required": ["action"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -645,6 +790,9 @@ pub mod definitions {
                 },
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -665,6 +813,9 @@ pub mod definitions {
                 "required": ["code"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -687,6 +838,9 @@ pub mod definitions {
                 "required": ["server", "tool"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -717,6 +871,9 @@ pub mod definitions {
                 "required": ["plan"],
                 "additionalProperties": true
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -793,6 +950,9 @@ pub mod definitions {
                 "required": ["questions"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -812,6 +972,9 @@ pub mod definitions {
                 "required": ["query"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -836,6 +999,9 @@ pub mod definitions {
                 },
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -853,7 +1019,373 @@ pub mod definitions {
                 "required": ["query"],
                 "additionalProperties": false
             }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
+    }
+
+    fn agent_status_output_schema() -> Value {
+        json!({
+            "oneOf": [
+                {
+                    "type": "string",
+                    "enum": ["pending_init", "running", "interrupted", "shutdown", "not_found"]
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "completed": { "type": ["string", "null"] }
+                    },
+                    "required": ["completed"],
+                    "additionalProperties": false
+                },
+                {
+                    "type": "object",
+                    "properties": {
+                        "errored": { "type": "string" }
+                    },
+                    "required": ["errored"],
+                    "additionalProperties": false
+                }
+            ]
+        })
+    }
+
+    fn spawn_agent_output_schema_v2(hide_agent_metadata: bool) -> Value {
+        if hide_agent_metadata {
+            return json!({
+                "type": "object",
+                "properties": {
+                    "task_name": {
+                        "type": "string",
+                        "description": "Canonical task name for the spawned agent."
+                    }
+                },
+                "required": ["task_name"],
+                "additionalProperties": false
+            });
+        }
+        json!({
+            "type": "object",
+            "properties": {
+                "task_name": {
+                    "type": "string",
+                    "description": "Canonical task name for the spawned agent."
+                },
+                "nickname": {
+                    "type": ["string", "null"],
+                    "description": "User-facing nickname for the spawned agent when available."
+                }
+            },
+            "required": ["task_name", "nickname"],
+            "additionalProperties": false
+        })
+    }
+
+    fn spawn_agent_output_schema_v1() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agent_id": {
+                    "type": "string",
+                    "description": "Thread identifier for the spawned agent."
+                },
+                "nickname": {
+                    "type": ["string", "null"],
+                    "description": "User-facing nickname for the spawned agent when available."
+                }
+            },
+            "required": ["agent_id", "nickname"],
+            "additionalProperties": false
+        })
+    }
+
+    fn spawn_agent_description_v2(options: &SpawnAgentDefinitionOptions) -> String {
+        let available_models_description = if options.hide_agent_type_model_reasoning {
+            ""
+        } else {
+            options
+                .available_models_description
+                .as_deref()
+                .unwrap_or("")
+        };
+        let concurrency_guidance = options
+            .max_concurrent_threads_per_session
+            .map(|limit| {
+                format!(
+                    " This session is configured with `max_concurrent_threads_per_session = {limit}` for concurrently open agent threads."
+                )
+            })
+            .unwrap_or_default();
+        let mut description = format!(
+            r#"
+        {}
+        Spawns an agent to work on the specified task. If your current task is `/root/task1` and you spawn_agent with task_name "task_3" the agent will have canonical task name `/root/task1/task_3`.
+You are then able to refer to this agent as `task_3` or `/root/task1/task_3` interchangeably. However an agent `/root/task2/task_3` would only be able to communicate with this agent via its canonical name `/root/task1/task_3`.
+The spawned agent will have the same tools as you and the ability to spawn its own subagents.
+{SPAWN_AGENT_INHERITED_MODEL_GUIDANCE}
+It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
+The new agent's canonical task name will be provided to it along with the message.
+{concurrency_guidance}"#,
+            available_models_description
+        );
+        if options.include_usage_hint {
+            if let Some(usage_hint) = options
+                .usage_hint_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                description.push('\n');
+                description.push_str(usage_hint);
+            }
+        }
+        description
+    }
+
+    fn spawn_agent_tool_description_v1(options: &SpawnAgentDefinitionOptions) -> String {
+        let available_models_description = if options.hide_agent_type_model_reasoning {
+            ""
+        } else {
+            options
+                .available_models_description
+                .as_deref()
+                .unwrap_or("")
+        };
+        let mut description = format!(
+            r#"
+        {}
+This spawn_agent tool provides you access to sub-agents that inherit your current model by default. Do not set the `model` field unless the user explicitly asks for a different model or there is a clear task-specific reason. You should follow the rules and guidelines below to use this tool.
+
+Only use `spawn_agent` if and only if the user explicitly asks for sub-agents, delegation, or parallel agent work.
+Requests for depth, thoroughness, research, investigation, or detailed codebase analysis do not count as permission to spawn.
+Agent-role guidance below only helps choose which agent to use after spawning is already authorized; it never authorizes spawning by itself.
+
+### When to delegate vs. do the subtask yourself
+- First, quickly analyze the overall user task and form a succinct high-level plan. Identify which tasks are immediate blockers on the critical path, and which tasks are sidecar tasks that are needed but can run in parallel without blocking the next local step. As part of that plan, explicitly decide what immediate task you should do locally right now. Do this planning step before delegating to agents so you do not hand off the immediate blocking task to a submodel and then waste time waiting on it.
+- Use a subagent when a subtask is easy enough for it to handle and can run in parallel with your local work. Prefer delegating concrete, bounded sidecar tasks that materially advance the main task without blocking your immediate next local step.
+- Do not delegate urgent blocking work when your immediate next step depends on that result. If the very next action is blocked on that task, the main rollout should usually do it locally to keep the critical path moving.
+- Keep work local when the subtask is too difficult to delegate well and when it is tightly coupled, urgent, or likely to block your immediate next step.
+
+### Designing delegated subtasks
+- Subtasks must be concrete, well-defined, and self-contained.
+- Delegated subtasks must materially advance the main task.
+- Do not duplicate work between the main rollout and delegated subtasks.
+- Avoid issuing multiple delegate calls on the same unresolved thread unless the new delegated task is genuinely different and necessary.
+- Narrow the delegated ask to the concrete output you need next.
+- For coding tasks, prefer delegating concrete code-change worker subtasks over read-only explorer analysis when the subagent can make a bounded patch in a clear write scope.
+- When delegating coding work, instruct the submodel to edit files directly in its forked workspace and list the file paths it changed in the final answer.
+- For code-edit subtasks, decompose work so each delegated task has a disjoint write set.
+
+### After you delegate
+- Call wait_agent very sparingly. Only call wait_agent when you need the result immediately for the next critical-path step and you are blocked until it returns.
+- Do not redo delegated subagent tasks yourself; focus on integrating results or tackling non-overlapping work.
+- While the subagent is running in the background, do meaningful non-overlapping work immediately.
+- Do not repeatedly wait by reflex.
+- When a delegated coding task returns, quickly review the uploaded changes, then integrate or refine them.
+
+### Parallel delegation patterns
+- Run multiple independent information-seeking subtasks in parallel when you have distinct questions that can be answered independently.
+- Split implementation into disjoint codebase slices and spawn multiple agents for them in parallel when the write scopes do not overlap.
+- Delegate verification only when it can run in parallel with ongoing implementation and is likely to catch a concrete risk before final integration.
+- The key is to find opportunities to spawn multiple independent subtasks in parallel within the same round, while ensuring each subtask is well-defined, self-contained, and materially advances the main task."#,
+            available_models_description
+        );
+        if options.include_usage_hint {
+            if let Some(usage_hint) = options
+                .usage_hint_text
+                .as_deref()
+                .map(str::trim)
+                .filter(|value| !value.is_empty())
+            {
+                description.push('\n');
+                description.push_str(usage_hint);
+            }
+        }
+        description
+    }
+
+    fn namespace_v1(mut definition: ToolDefinition) -> ToolDefinition {
+        definition.namespace = Some(MULTI_AGENT_V1_NAMESPACE.to_string());
+        definition.namespace_description = Some(MULTI_AGENT_V1_NAMESPACE_DESCRIPTION.to_string());
+        definition
+    }
+
+    fn wait_output_schema_v2() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "message": {
+                    "type": "string",
+                    "description": "Brief wait summary without the agent's final content."
+                },
+                "timed_out": {
+                    "type": "boolean",
+                    "description": "Whether the wait call returned because no mailbox update arrived before the timeout."
+                }
+            },
+            "required": ["message", "timed_out"],
+            "additionalProperties": false
+        })
+    }
+
+    fn send_input_output_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "submission_id": {
+                    "type": "string",
+                    "description": "Identifier for the queued input submission."
+                }
+            },
+            "required": ["submission_id"],
+            "additionalProperties": false
+        })
+    }
+
+    fn resume_agent_output_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "status": agent_status_output_schema()
+            },
+            "required": ["status"],
+            "additionalProperties": false
+        })
+    }
+
+    fn wait_output_schema_v1() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "status": {
+                    "type": "object",
+                    "description": "Final statuses keyed by agent id.",
+                    "additionalProperties": agent_status_output_schema()
+                },
+                "timed_out": {
+                    "type": "boolean",
+                    "description": "Whether the wait call returned due to timeout before any agent reached a final status."
+                }
+            },
+            "required": ["status", "timed_out"],
+            "additionalProperties": false
+        })
+    }
+
+    fn collab_input_items_schema() -> Value {
+        json!({
+            "type": "array",
+            "description": "Structured input items. Use this to pass explicit mentions (for example app:// connector paths).",
+            "items": {
+                "type": "object",
+                "properties": {
+                    "type": {
+                        "type": "string",
+                        "description": "Input item type: text, image, local_image, skill, or mention."
+                    },
+                    "text": {
+                        "type": "string",
+                        "description": "Text content when type is text."
+                    },
+                    "image_url": {
+                        "type": "string",
+                        "description": "Image URL when type is image."
+                    },
+                    "path": {
+                        "type": "string",
+                        "description": "Path when type is local_image/skill, or structured mention target such as app://<connector-id> or plugin://<plugin-name>@<marketplace-name> when type is mention."
+                    },
+                    "name": {
+                        "type": "string",
+                        "description": "Display name when type is skill or mention."
+                    },
+                    "detail": {
+                        "type": "string",
+                        "description": "Optional image detail hint when type is image or local_image.",
+                        "enum": ["high", "original"]
+                    },
+                    "text_elements": {
+                        "type": "array",
+                        "description": "UI-defined spans within text that should be treated as special elements.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "byte_range": {
+                                    "type": "object",
+                                    "properties": {
+                                        "start": {
+                                            "type": "integer",
+                                            "minimum": 0
+                                        },
+                                        "end": {
+                                            "type": "integer",
+                                            "minimum": 0
+                                        }
+                                    },
+                                    "required": ["start", "end"],
+                                    "additionalProperties": false
+                                },
+                                "placeholder": {
+                                    "type": "string"
+                                }
+                            },
+                            "required": ["byte_range"],
+                            "additionalProperties": false
+                        }
+                    }
+                },
+                "additionalProperties": false
+            }
+        })
+    }
+
+    fn list_agents_output_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "agents": {
+                    "type": "array",
+                    "items": {
+                        "type": "object",
+                        "properties": {
+                            "agent_name": {
+                                "type": "string",
+                                "description": "Canonical task name for the agent when available, otherwise the agent id."
+                            },
+                            "agent_status": {
+                                "description": "Last known status of the agent.",
+                                "allOf": [agent_status_output_schema()]
+                            },
+                            "last_task_message": {
+                                "type": ["string", "null"],
+                                "description": "Most recent user or inter-agent instruction received by the agent, when available."
+                            }
+                        },
+                        "required": ["agent_name", "agent_status", "last_task_message"],
+                        "additionalProperties": false
+                    },
+                    "description": "Live agents visible in the current root thread tree."
+                }
+            },
+            "required": ["agents"],
+            "additionalProperties": false
+        })
+    }
+
+    fn close_agent_output_schema() -> Value {
+        json!({
+            "type": "object",
+            "properties": {
+                "previous_status": {
+                    "description": "The agent status observed before shutdown was requested.",
+                    "allOf": [agent_status_output_schema()]
+                }
+            },
+            "required": ["previous_status"],
+            "additionalProperties": false
+        })
     }
 
     /// `spawn_agent`: delegate a task to a child sub-agent. Parity: codex
@@ -862,94 +1394,317 @@ pub mod definitions {
     /// [`SpawnAgentArgs`](crate::subagents::SpawnAgentArgs) (the request type the
     /// handler deserializes), which is `deny_unknown_fields`.
     pub fn spawn_agent() -> ToolDefinition {
+        spawn_agent_with_options(SpawnAgentDefinitionOptions::default())
+    }
+
+    pub fn spawn_agent_with_options(options: SpawnAgentDefinitionOptions) -> ToolDefinition {
+        let mut properties = Map::new();
+        properties.insert(
+            "message".to_string(),
+            json!({
+                "type": "string",
+                "description": "Initial plain-text task for the new agent."
+            }),
+        );
+        properties.insert(
+            "task_name".to_string(),
+            json!({
+                "type": "string",
+                "description": "Task name for the new agent. Use lowercase letters, digits, and underscores."
+            }),
+        );
+        properties.insert(
+            "fork_turns".to_string(),
+            json!({
+                "type": "string",
+                "description": "Optional number of turns to fork. Defaults to `all`. Use `none`, `all`, or a positive integer string such as `3` to fork only the most recent turns."
+            }),
+        );
+        if !options.hide_agent_type_model_reasoning {
+            properties.insert(
+                "agent_type".to_string(),
+                json!({
+                    "type": "string",
+                    "description": options.agent_type_description
+                }),
+            );
+            properties.insert(
+                "model".to_string(),
+                json!({
+                    "type": "string",
+                    "description": SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION
+                }),
+            );
+            properties.insert(
+                "reasoning_effort".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
+                }),
+            );
+            properties.insert(
+                "service_tier".to_string(),
+                json!({
+                    "type": "string",
+                    "description": SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION
+                }),
+            );
+        }
         ToolDefinition {
             name: "spawn_agent".to_string(),
-            description: "Spawn a sub-agent to work on a delegated task.".to_string(),
+            description: spawn_agent_description_v2(&options),
             input_schema: json!({
                 "type": "object",
-                "properties": {
-                    "message": {
-                        "type": "string",
-                        "description": "The task/message for the new agent."
-                    },
-                    "task_name": {
-                        "type": "string",
-                        "description": "Short canonical name for the task (lowercase letters, digits, underscores)."
-                    },
-                    "agent_type": {
-                        "type": "string",
-                        "description": "Optional role for the new agent. If omitted, `default` is used."
-                    },
-                    "fork_turns": {
-                        "type": "string",
-                        "description": "`none`, `all`, or a positive integer. Defaults to `all`."
-                    },
-                    "model": {
-                        "type": "string",
-                        "description": "Optional model override for the new agent."
-                    },
-                    "reasoning_effort": {
-                        "type": "string",
-                        "description": "Optional reasoning-effort override for the new agent."
-                    },
-                    "service_tier": {
-                        "type": "string",
-                        "description": "Optional service-tier override for the new agent."
-                    }
-                },
+                "properties": Value::Object(properties),
                 "required": ["task_name", "message"],
                 "additionalProperties": false
             }),
+            output_schema: Some(spawn_agent_output_schema_v2(
+                options.hide_agent_type_model_reasoning,
+            )),
+            namespace: None,
+            namespace_description: None,
         }
     }
 
+    pub fn spawn_agent_v1_with_options(options: SpawnAgentDefinitionOptions) -> ToolDefinition {
+        let mut properties = Map::new();
+        properties.insert(
+            "message".to_string(),
+            json!({
+                "type": "string",
+                "description": "Initial plain-text task for the new agent. Use either message or items."
+            }),
+        );
+        properties.insert("items".to_string(), collab_input_items_schema());
+        if !options.hide_agent_type_model_reasoning {
+            properties.insert(
+                "agent_type".to_string(),
+                json!({
+                    "type": "string",
+                    "description": options.agent_type_description
+                }),
+            );
+            properties.insert(
+                "fork_context".to_string(),
+                json!({
+                    "type": "boolean",
+                    "description": "When true, fork the current thread history into the new agent before sending the initial prompt. This must be used when you want the new agent to have exactly the same context as you."
+                }),
+            );
+            properties.insert(
+                "model".to_string(),
+                json!({
+                    "type": "string",
+                    "description": SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION
+                }),
+            );
+            properties.insert(
+                "reasoning_effort".to_string(),
+                json!({
+                    "type": "string",
+                    "description": "Optional reasoning effort override for the new agent. Replaces the inherited reasoning effort."
+                }),
+            );
+            properties.insert(
+                "service_tier".to_string(),
+                json!({
+                    "type": "string",
+                    "description": SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION
+                }),
+            );
+        }
+        namespace_v1(ToolDefinition {
+            name: "spawn_agent".to_string(),
+            description: spawn_agent_tool_description_v1(&options),
+            input_schema: json!({
+                "type": "object",
+                "properties": Value::Object(properties),
+                "additionalProperties": false
+            }),
+            output_schema: Some(spawn_agent_output_schema_v1()),
+            namespace: None,
+            namespace_description: None,
+        })
+    }
+
     /// `wait_agent`: EVENT-NOTIFY wait for a child to report news. Parity: codex
-    /// `multi_agents_v2/wait.rs` (the parent blocks on the mailbox, then reads the
-    /// child's status).
+    /// `multi_agents_v2/wait.rs`: targetless mailbox wait.
     pub fn wait_agent() -> ToolDefinition {
+        wait_agent_with_timeouts(WaitAgentDefinitionOptions {
+            default_timeout_ms: 30_000,
+            min_timeout_ms: 10_000,
+            max_timeout_ms: 3_600_000,
+        })
+    }
+
+    pub fn wait_agent_with_timeouts(options: WaitAgentDefinitionOptions) -> ToolDefinition {
         ToolDefinition {
             name: "wait_agent".to_string(),
-            description: "Wait for a spawned sub-agent to report progress or completion."
+            description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline."
                 .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "agent_path": {
-                        "type": "string",
-                        "description": "Canonical path of the child agent to wait on (from spawn_agent)."
-                    },
-                    "timeout_secs": {
-                        "type": "integer",
-                        "description": "Optional wait budget in seconds (default 300)."
+                    "timeout_ms": {
+                        "type": "number",
+                        "description": format!(
+                            "Optional timeout in milliseconds. Defaults to {}, min {}, max {}.",
+                            options.default_timeout_ms,
+                            options.min_timeout_ms,
+                            options.max_timeout_ms
+                        )
                     }
                 },
-                "required": ["agent_path"],
                 "additionalProperties": false
             }),
+            output_schema: Some(wait_output_schema_v2()),
+            namespace: None,
+            namespace_description: None,
         }
+    }
+
+    pub fn wait_agent_v1_with_timeouts(options: WaitAgentDefinitionOptions) -> ToolDefinition {
+        namespace_v1(ToolDefinition {
+            name: "wait_agent".to_string(),
+            description: "Wait for agents to reach a final status. Completed statuses may include the agent's final message. Returns empty status when timed out. Once the agent reaches a final status, a notification message will be received containing the same completed status."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "targets": {
+                        "type": "array",
+                        "description": "Agent ids to wait on. Pass multiple ids to wait for whichever finishes first.",
+                        "items": { "type": "string" }
+                    },
+                    "timeout_ms": {
+                        "type": "number",
+                        "description": format!(
+                            "Optional timeout in milliseconds. Defaults to {}, min {}, max {}. Prefer longer waits (minutes) to avoid busy polling.",
+                            options.default_timeout_ms,
+                            options.min_timeout_ms,
+                            options.max_timeout_ms
+                        )
+                    }
+                },
+                "required": ["targets"],
+                "additionalProperties": false
+            }),
+            output_schema: Some(wait_output_schema_v1()),
+            namespace: None,
+            namespace_description: None,
+        })
     }
 
     /// `send_input`: deliver a message to a running child agent (codex
     /// `enqueue_mailbox_communication`).
     pub fn send_input() -> ToolDefinition {
-        ToolDefinition {
+        namespace_v1(ToolDefinition {
             name: "send_input".to_string(),
-            description: "Send a message to a running sub-agent.".to_string(),
+            description: "Send a message to an existing agent. Use interrupt=true to redirect work immediately. You should reuse the agent by send_input if you believe your assigned task is highly dependent on the context of a previous task."
+                .to_string(),
             input_schema: json!({
                 "type": "object",
                 "properties": {
-                    "agent_path": {
+                    "target": {
                         "type": "string",
-                        "description": "Canonical path of the child agent to deliver input to."
+                        "description": "Agent id to message (from spawn_agent)."
                     },
                     "message": {
                         "type": "string",
-                        "description": "The message/prompt body delivered to the child agent."
-                    }
+                        "description": "Legacy plain-text message to send to the agent. Use either message or items."
+                    },
+                    "items": collab_input_items_schema(),
+                    "interrupt": {
+                        "type": "boolean",
+                        "description": "When true, stop the agent's current task and handle this immediately. When false (default), queue this message."
+                    },
                 },
-                "required": ["agent_path", "message"],
+                "required": ["target"],
                 "additionalProperties": false
             }),
+            output_schema: Some(send_input_output_schema()),
+            namespace: None,
+            namespace_description: None,
+        })
+    }
+
+    pub fn resume_agent() -> ToolDefinition {
+        namespace_v1(ToolDefinition {
+            name: "resume_agent".to_string(),
+            description:
+                "Resume a previously closed agent by id so it can receive send_input and wait_agent calls."
+                    .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "id": {
+                        "type": "string",
+                        "description": "Agent id to resume."
+                    }
+                },
+                "required": ["id"],
+                "additionalProperties": false
+            }),
+            output_schema: Some(resume_agent_output_schema()),
+            namespace: None,
+            namespace_description: None,
+        })
+    }
+
+    /// `send_message`: queue a message on a running child without triggering a
+    /// fresh turn (codex MultiAgentV2).
+    pub fn send_message() -> ToolDefinition {
+        ToolDefinition {
+            name: "send_message".to_string(),
+            description: "Send a message to an existing agent. The message will be delivered promptly. Does not trigger a new turn."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Relative or canonical task name to message (from spawn_agent)."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Message text to queue on the target agent."
+                    }
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
+        }
+    }
+
+    /// `followup_task`: send a message and trigger the target's next turn (codex
+    /// MultiAgentV2).
+    pub fn followup_task() -> ToolDefinition {
+        ToolDefinition {
+            name: "followup_task".to_string(),
+            description: "Send a message to an existing non-root target agent and trigger a turn in that target. If the target is currently mid-turn, the message is queued and will be used to start the target's next turn, after the current turn completes."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Agent id or canonical task name to message (from spawn_agent)."
+                    },
+                    "message": {
+                        "type": "string",
+                        "description": "Message text to send to the target agent."
+                    }
+                },
+                "required": ["target", "message"],
+                "additionalProperties": false
+            }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         }
     }
 
@@ -958,13 +1713,67 @@ pub mod definitions {
     pub fn list_agents() -> ToolDefinition {
         ToolDefinition {
             name: "list_agents".to_string(),
-            description: "List the currently live sub-agents and their statuses.".to_string(),
+            description:
+                "List live agents in the current root thread tree. Optionally filter by task-path prefix."
+                    .to_string(),
             input_schema: json!({
                 "type": "object",
-                "properties": {},
+                "properties": {
+                    "path_prefix": {
+                        "type": "string",
+                        "description": "Optional task-path prefix (not ending with trailing slash). Accepts the same relative or absolute task-path syntax."
+                    }
+                },
                 "additionalProperties": false
             }),
+            output_schema: Some(list_agents_output_schema()),
+            namespace: None,
+            namespace_description: None,
         }
+    }
+
+    /// `close_agent`: close a spawned child agent and descendants.
+    pub fn close_agent() -> ToolDefinition {
+        ToolDefinition {
+            name: "close_agent".to_string(),
+            description: "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Don't keep agents open for too long if they are not needed anymore."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Agent id or canonical task name to close (from spawn_agent)."
+                    }
+                },
+                "required": ["target"],
+                "additionalProperties": false
+            }),
+            output_schema: Some(close_agent_output_schema()),
+            namespace: None,
+            namespace_description: None,
+        }
+    }
+
+    pub fn close_agent_v1() -> ToolDefinition {
+        namespace_v1(ToolDefinition {
+            name: "close_agent".to_string(),
+            description: "Close an agent and any open descendants when they are no longer needed, and return the target agent's previous status before shutdown was requested. Don't keep agents open for too long if they are not needed anymore.".to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "target": {
+                        "type": "string",
+                        "description": "Agent id to close (from spawn_agent)."
+                    }
+                },
+                "required": ["target"],
+                "additionalProperties": false
+            }),
+            output_schema: Some(close_agent_output_schema()),
+            namespace: None,
+            namespace_description: None,
+        })
     }
 }
 

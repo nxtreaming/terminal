@@ -85,6 +85,13 @@ pub fn typed_user_input_payload_from_items_for_cwd(
     collab_input_event_payload_with_context(&input, cwd.as_ref())
 }
 
+/// Build the human-readable preview Codex uses for structured collab input
+/// items, without flattening the items themselves.
+pub fn typed_user_input_preview_from_items(items: &Value) -> anyhow::Result<String> {
+    let input = collab_input_from_items(items).map_err(anyhow::Error::msg)?;
+    Ok(input.preview)
+}
+
 /// Plain-text -> `CollabInput`: linked-mention parse if any links resolve, else a
 /// single text input. Parity: legacy `typed_collab_input_from_text` (lib.rs:21223).
 fn typed_collab_input_from_text(text: &str) -> CollabInput {

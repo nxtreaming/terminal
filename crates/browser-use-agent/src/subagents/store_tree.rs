@@ -52,7 +52,7 @@ use browser_use_protocol::{
 };
 use browser_use_store::{AgentSummary, Store};
 
-use super::tree::canonical_agent_reference;
+use super::tree::{canonical_agent_reference, resolve_agent_path_v2};
 
 /// A resolved agent reference within a Store-backed tree.
 ///
@@ -302,6 +302,79 @@ pub fn resolve_agent_reference_in_tree(
         }))
 }
 
+/// Resolve a Codex MultiAgentV2 agent reference against the Store-backed tree.
+///
+/// This keeps the durable-tree behavior but uses Codex's stricter v2 path
+/// grammar: raw session ids are accepted first, then `AgentPath`-style absolute
+/// or relative task paths are resolved. Legacy shorthands such as bare `root`,
+/// `parent`, `.`, `..`, nicknames, and `@mentions` are intentionally excluded
+/// from model-facing v2 tools.
+pub fn resolve_agent_reference_in_tree_v2(
+    store: &Store,
+    current_session_id: &str,
+    reference: &str,
+) -> Result<Option<ResolvedAgentReference>> {
+    if reference.is_empty() {
+        anyhow::bail!("agent path must not be empty");
+    }
+    let root_id = root_session_id(store, current_session_id)?;
+    if reference == root_id {
+        return Ok(Some(ResolvedAgentReference {
+            session_id: root_id,
+            agent_path: "/root".to_string(),
+            summary: None,
+            is_root: true,
+        }));
+    }
+
+    let tree = collect_agent_tree(store, &root_id)?;
+    if let Some(agent) = tree
+        .iter()
+        .filter(|agent| agent.status != "closed")
+        .find(|agent| agent.child_session_id == reference)
+        .cloned()
+    {
+        let path = agent.agent_path.clone().unwrap_or_else(|| {
+            display_agent_path_for_session(store, &agent.child_session_id)
+                .unwrap_or_else(|_| agent.child_session_id.clone())
+        });
+        return Ok(Some(ResolvedAgentReference {
+            session_id: agent.child_session_id.clone(),
+            agent_path: path,
+            summary: Some(agent),
+            is_root: false,
+        }));
+    }
+
+    let current_agent_path = display_agent_path_for_session(store, current_session_id)?;
+    let agent_path =
+        resolve_agent_path_v2(&current_agent_path, reference).map_err(anyhow::Error::msg)?;
+    if agent_path == "/root" {
+        return Ok(Some(ResolvedAgentReference {
+            session_id: root_id,
+            agent_path,
+            summary: None,
+            is_root: true,
+        }));
+    }
+
+    Ok(tree
+        .into_iter()
+        .filter(|agent| agent.status != "closed")
+        .find_map(|agent| {
+            let path = agent.agent_path.clone().unwrap_or_else(|| {
+                display_agent_path_for_session(store, &agent.child_session_id)
+                    .unwrap_or_else(|_| agent.child_session_id.clone())
+            });
+            (path == agent_path).then(|| ResolvedAgentReference {
+                session_id: agent.child_session_id.clone(),
+                agent_path: path,
+                summary: Some(agent),
+                is_root: false,
+            })
+        }))
+}
+
 /// Display path for a session: its stored `agent_path`, else `/root` for a
 /// parentless session, else the raw session id.
 ///
@@ -327,9 +400,10 @@ pub fn display_agent_path_for_session(store: &Store, session_id: &str) -> Result
 /// Compute the public status value for a single agent session.
 ///
 /// Verbatim port of legacy `local_agent_status_value` (lib.rs:23181):
-/// - a `closed` edge or a `Cancelled` session -> `"shutdown"`;
-/// - else, derive from the event log: a failure -> `{ "errored": <msg> }`,
-///   a result -> `{ "completed": <result> }`;
+/// - a `closed` edge -> `"shutdown"`;
+/// - else, an active interruption boundary -> `"interrupted"`;
+/// - else, a `Cancelled` session -> `"shutdown"`;
+/// - else, derive from the event log's latest terminal event;
 /// - else map the [`SessionStatus`]: `Created` -> `"pending_init"`,
 ///   `Running` -> `"running"`, `Done` -> `{ "completed": null }`,
 ///   `Failed` -> `{ "errored": "failed" }`, `Cancelled` -> `"shutdown"`.
@@ -341,17 +415,18 @@ pub fn local_agent_status_value(
     session: &SessionMeta,
     agent: Option<&AgentSummary>,
 ) -> Result<Value> {
-    if agent.is_some_and(|agent| agent.status == "closed")
-        || session.status == SessionStatus::Cancelled
-    {
+    let events = store.events_for_session(&session.id)?;
+    if agent.is_some_and(|agent| agent.status == "closed") {
         return Ok(Value::String("shutdown".to_string()));
     }
-    let events = store.events_for_session(&session.id)?;
-    if let Some(failure) = failure_from_events(&events) {
-        return Ok(serde_json::json!({ "errored": failure }));
+    if session_was_interrupted(&events) {
+        return Ok(Value::String("interrupted".to_string()));
     }
-    if let Some(result) = session_result_from_events(&events) {
-        return Ok(serde_json::json!({ "completed": result }));
+    if session.status == SessionStatus::Cancelled {
+        return Ok(Value::String("shutdown".to_string()));
+    }
+    if let Some(terminal) = latest_terminal_status_from_events(&events) {
+        return Ok(terminal);
     }
     Ok(match session.status {
         SessionStatus::Created => Value::String("pending_init".to_string()),
@@ -364,6 +439,51 @@ pub fn local_agent_status_value(
         }),
         SessionStatus::Cancelled => Value::String("shutdown".to_string()),
     })
+}
+
+fn latest_terminal_status_from_events(
+    events: &[browser_use_protocol::EventRecord],
+) -> Option<Value> {
+    events
+        .iter()
+        .rev()
+        .find(|event| matches!(event.event_type.as_str(), "session.done" | "session.failed"))
+        .map(|event| match event.event_type.as_str() {
+            "session.done" => serde_json::json!({
+                "completed": session_result_from_events(std::slice::from_ref(event)),
+            }),
+            "session.failed" => serde_json::json!({
+                "errored": failure_from_events(std::slice::from_ref(event))
+                    .unwrap_or_else(|| "failed".to_string()),
+            }),
+            _ => Value::Null,
+        })
+}
+
+pub fn session_was_interrupted(events: &[browser_use_protocol::EventRecord]) -> bool {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            matches!(
+                event.event_type.as_str(),
+                "session.cancelled"
+                    | "session.interrupted"
+                    | "session.input"
+                    | "session.followup"
+                    | "session.done"
+                    | "session.failed"
+            )
+        })
+        .is_some_and(|event| {
+            event.event_type == "session.interrupted"
+                || (event.event_type == "session.cancelled"
+                    && event
+                        .payload
+                        .get("reason")
+                        .and_then(Value::as_str)
+                        .is_some_and(|reason| reason.to_ascii_lowercase().contains("interrupt")))
+        })
 }
 
 /// Collect the final statuses of v1 `wait` targets that have stopped running.
@@ -385,10 +505,14 @@ pub fn final_statuses_for_v1_wait(store: &Store, targets: &[&str]) -> Result<Map
         if session.status.is_active() || session.status == SessionStatus::Created {
             continue;
         }
-        statuses.insert(
-            (*target).to_string(),
-            local_agent_status_value(store, &session, None)?,
-        );
+        let summary = store.agent_summary_for_child(&session.id)?;
+        let status = local_agent_status_value(store, &session, summary.as_ref())?;
+        if status == Value::String("interrupted".to_string()) {
+            continue;
+        }
+        let key = display_agent_path_for_session(store, &session.id)
+            .unwrap_or_else(|_| (*target).to_string());
+        statuses.insert(key, status);
     }
     Ok(statuses)
 }
@@ -675,6 +799,119 @@ mod store_tree_tests {
     }
 
     #[test]
+    fn interrupted_status_is_not_sticky_after_followup_completion() {
+        let (_dir, store) = store();
+        let (_root, alpha, _leaf, _beta) = seed_tree(&store);
+        store
+            .append_event(
+                &alpha,
+                "session.cancelled",
+                serde_json::json!({ "reason": "interrupted by send_input" }),
+            )
+            .unwrap();
+
+        let alpha_session = store.load_session(&alpha).unwrap().unwrap();
+        assert_eq!(
+            local_agent_status_value(&store, &alpha_session, None).unwrap(),
+            Value::String("interrupted".to_string())
+        );
+
+        store
+            .append_event(
+                &alpha,
+                "session.followup",
+                serde_json::json!({ "text": "continue" }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                &alpha,
+                "session.done",
+                serde_json::json!({ "result": "finished after resume" }),
+            )
+            .unwrap();
+        store.set_status(&alpha, SessionStatus::Done).unwrap();
+
+        let events = store.events_for_session(&alpha).unwrap();
+        assert!(!session_was_interrupted(&events));
+        let alpha_session = store.load_session(&alpha).unwrap().unwrap();
+        assert_eq!(
+            local_agent_status_value(&store, &alpha_session, None).unwrap(),
+            serde_json::json!({ "completed": "finished after resume" })
+        );
+    }
+
+    #[test]
+    fn failed_status_is_not_sticky_after_later_completion() {
+        let (_dir, store) = store();
+        let (_root, alpha, _leaf, _beta) = seed_tree(&store);
+        store
+            .append_event(
+                &alpha,
+                "session.failed",
+                serde_json::json!({ "error": "boom" }),
+            )
+            .unwrap();
+        store.set_status(&alpha, SessionStatus::Failed).unwrap();
+        let alpha_session = store.load_session(&alpha).unwrap().unwrap();
+        assert_eq!(
+            local_agent_status_value(&store, &alpha_session, None).unwrap(),
+            serde_json::json!({ "errored": "boom" })
+        );
+
+        store
+            .append_event(
+                &alpha,
+                "session.followup",
+                serde_json::json!({ "text": "try again" }),
+            )
+            .unwrap();
+        store
+            .append_event(
+                &alpha,
+                "session.done",
+                serde_json::json!({ "result": "recovered" }),
+            )
+            .unwrap();
+        store.set_status(&alpha, SessionStatus::Done).unwrap();
+
+        let alpha_session = store.load_session(&alpha).unwrap().unwrap();
+        assert_eq!(
+            local_agent_status_value(&store, &alpha_session, None).unwrap(),
+            serde_json::json!({ "completed": "recovered" })
+        );
+    }
+
+    #[test]
+    fn closed_interrupted_child_reports_shutdown_not_interrupted() {
+        let (_dir, store) = store();
+        let (_root, alpha, _leaf, _beta) = seed_tree(&store);
+        store
+            .append_event(
+                &alpha,
+                "session.cancelled",
+                serde_json::json!({ "reason": "interrupted by send_input" }),
+            )
+            .unwrap();
+        store.set_status(&alpha, SessionStatus::Cancelled).unwrap();
+        store
+            .close_child_agent(&alpha, "closed by close_agent")
+            .unwrap();
+
+        let alpha_session = store.load_session(&alpha).unwrap().unwrap();
+        let alpha_summary = store.agent_summary_for_child(&alpha).unwrap().unwrap();
+        assert_eq!(
+            local_agent_status_value(&store, &alpha_session, Some(&alpha_summary)).unwrap(),
+            Value::String("shutdown".to_string())
+        );
+        let statuses = final_statuses_for_v1_wait(&store, &[alpha.as_str()]).unwrap();
+        assert_eq!(
+            statuses["/root/alpha"],
+            Value::String("shutdown".to_string())
+        );
+    }
+
+    #[test]
     fn final_statuses_for_v1_wait_filters_active_and_marks_missing() {
         let (_dir, store) = store();
         let (root, alpha, _leaf, beta) = seed_tree(&store);
@@ -692,7 +929,7 @@ mod store_tree_tests {
             Some(&Value::String("not_found".to_string()))
         );
         assert_eq!(
-            statuses.get(&beta),
+            statuses.get("/root/beta"),
             Some(&serde_json::json!({ "errored": "failed" }))
         );
     }

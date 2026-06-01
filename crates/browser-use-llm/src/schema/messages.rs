@@ -25,6 +25,8 @@ pub enum ContentPart {
         data: Option<String>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         url: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        detail: Option<String>,
     },
     ToolCall {
         id: String,
@@ -105,6 +107,16 @@ pub struct ToolDefinition {
     pub description: String,
     /// JSON Schema for the tool input.
     pub input_schema: Value,
+    /// Optional JSON Schema for the tool output. Protocol lowerers that cannot
+    /// send output schemas may keep this as local metadata.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_schema: Option<Value>,
+    /// Optional Responses API namespace. Protocol lowerers that cannot send
+    /// namespaces keep the tool flat.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub namespace_description: Option<String>,
 }
 
 /// How the model should choose tools.

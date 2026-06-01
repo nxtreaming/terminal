@@ -47,17 +47,17 @@ fn depth_computation_and_limit() {
 }
 
 #[tokio::test]
-async fn spawn_rejected_at_depth_equal_to_max() {
+async fn v2_spawn_allows_depth_past_configured_max() {
     let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
-    // Parent already at depth == max (1): child would be depth 2 > 1 -> reject.
+    // Codex MultiAgentV2 records depth but does not disable nested v2 spawning at
+    // `agent_max_depth`; only older collaboration tools are disabled there.
     let parent = parent_ctx("/root/worker", DEFAULT_AGENT_MAX_DEPTH);
-    let err = manager
+    let handle = manager
         .spawn(spawn_args("dig_deeper", "go"), &parent)
         .await
-        .expect_err("spawn at max depth must be rejected");
-    assert!(err.0.contains("exceeds"), "unexpected error: {}", err.0);
-    // Nothing registered.
-    assert!(manager.list_agents().is_empty());
+        .expect("v2 spawn should ignore the configured max depth");
+    assert_eq!(handle.agent_path, "/root/worker/dig_deeper");
+    assert_eq!(manager.registry().get(&handle.agent_path).unwrap().depth, 2);
 }
 
 #[tokio::test]
@@ -69,8 +69,42 @@ async fn spawn_succeeds_below_depth_limit() {
         .spawn(spawn_args("explore_db", "find the db layer"), &parent)
         .await
         .expect("spawn below limit must succeed");
-    assert!(handle.agent_path.starts_with("/root/explore_db_"));
-    assert_eq!(manager.list_agents().len(), 1);
+    assert_eq!(handle.agent_path, "/root/explore_db");
+    assert_eq!(manager.list_agents().len(), 2);
+}
+
+#[tokio::test]
+async fn v2_concurrent_thread_cap_counts_only_subagents() {
+    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(1));
+    let parent = parent_ctx("/root", 0);
+    manager
+        .spawn(spawn_args("first", "ok"), &parent)
+        .await
+        .expect("root does not count against the subagent cap");
+    let err = manager
+        .spawn(spawn_args("second", "no room"), &parent)
+        .await
+        .expect_err("second child exceeds cap 1");
+    assert!(err
+        .to_string()
+        .contains("max_concurrent_threads_per_session limit reached (1)"));
+
+    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(2));
+    manager
+        .spawn(spawn_args("first", "ok"), &parent)
+        .await
+        .expect("first child fits under cap 2");
+    manager
+        .spawn(spawn_args("second", "ok"), &parent)
+        .await
+        .expect("second child fits under cap 2");
+    let err = manager
+        .spawn(spawn_args("third", "no room"), &parent)
+        .await
+        .expect_err("third child exceeds cap 2");
+    assert!(err
+        .to_string()
+        .contains("max_concurrent_threads_per_session limit reached (2)"));
 }
 
 // ---------------------------------------------------------------------------
@@ -120,15 +154,19 @@ fn apply_role_layers_fields_but_preserves_caller_provider_and_tier() {
         .apply_role_to_config(&mut config, Some("explorer"))
         .expect("explorer applies");
 
-    // Role set instructions + can_write (explorer is read-only).
-    assert!(config.instructions.contains("explorer"));
-    assert_eq!(config.can_write, false);
+    // Codex's built-in explorer currently points at an empty built-in role file,
+    // so it marks the role without changing the inherited child config.
+    assert!(config.instructions.is_empty());
+    assert!(config.can_write);
     assert_eq!(config.role.as_deref(), Some("explorer"));
     // Caller's provider/tier preserved (explorer role sets neither).
     assert_eq!(config.provider, "parent-provider");
     assert_eq!(config.service_tier.as_deref(), Some("parent-tier"));
-    // Nickname pool available on the role.
-    assert!(role.nickname_candidates.is_some());
+    assert_eq!(
+        role.config_file.as_deref(),
+        Some(std::path::Path::new("explorer.toml"))
+    );
+    assert!(role.nickname_candidates.is_none());
 }
 
 #[test]
@@ -168,8 +206,9 @@ fn nickname_drawn_from_candidates_without_collision() {
     let second = registry.reserve_nickname(&pool).expect("second nickname");
     assert_ne!(first, second);
     assert!(pool.contains(&first) && pool.contains(&second));
-    // Pool exhausted -> None.
-    assert!(registry.reserve_nickname(&pool).is_none());
+    // Pool exhausted -> reset with an ordinal suffix like Codex.
+    let reset = registry.reserve_nickname(&pool).expect("reset nickname");
+    assert!(reset.ends_with(" the 2nd"));
 }
 
 // ---------------------------------------------------------------------------
@@ -212,7 +251,7 @@ fn mailbox_drains_fifo() {
 
 #[test]
 fn subagent_notification_render_contains_markers_and_status() {
-    let note = SubagentNotification::new("/root/explorer_1", AgentStatus::Completed);
+    let note = SubagentNotification::new("/root/explorer_1", AgentStatus::Completed(None));
     let rendered = note.render();
     assert!(rendered.contains("<subagent_notification>"));
     assert!(rendered.contains("</subagent_notification>"));
@@ -241,7 +280,7 @@ async fn spawn_then_wait_observes_completion_via_mailbox() {
         .wait(&handle.agent_path, Duration::from_secs(5))
         .await
         .expect("wait wakes via mailbox before timeout");
-    assert_eq!(status, AgentStatus::Completed);
+    assert_eq!(status, AgentStatus::Completed(None));
 }
 
 #[tokio::test]
@@ -276,12 +315,17 @@ async fn registry_reflects_spawn_and_close() {
         .expect("spawn");
 
     let agents = manager.list_agents();
-    assert_eq!(agents.len(), 1);
-    assert_eq!(agents[0].agent_path, handle.agent_path);
+    assert_eq!(agents.len(), 2);
+    assert!(
+        agents
+            .iter()
+            .any(|agent| agent.agent_path == handle.agent_path),
+        "spawned child should be listed: {agents:?}"
+    );
 
     assert!(manager.close_agent(&handle.agent_path));
     let after = manager.registry().get(&handle.agent_path).expect("record");
-    assert_eq!(after.status, AgentStatus::Closed);
+    assert_eq!(after.status, AgentStatus::Shutdown);
     assert!(!manager.close_agent("/root/does_not_exist"));
 }
 
@@ -300,6 +344,7 @@ fn subagents_env_block_shape() {
         role: Some("explorer".to_string()),
         status: AgentStatus::Running,
         depth: 1,
+        last_task_message: Some("inspect repo".to_string()),
     });
     let block = registry.render_subagents_block();
     assert!(block.starts_with("<subagents>\n"));
@@ -309,6 +354,62 @@ fn subagents_env_block_shape() {
     assert!(block.contains("role=\"explorer\""));
     assert!(block.contains("status=\"running\""));
     assert!(block.contains("depth=\"1\""));
+}
+
+#[tokio::test]
+async fn spawn_rejects_duplicate_task_path() {
+    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+    let parent = parent_ctx("/root", 0);
+    manager
+        .spawn(spawn_args("explore", "first"), &parent)
+        .await
+        .expect("first spawn");
+    let err = manager
+        .spawn(spawn_args("explore", "second"), &parent)
+        .await
+        .expect_err("second spawn must collide");
+    assert!(err.0.contains("already exists"), "unexpected error: {err}");
+}
+
+#[tokio::test]
+async fn send_message_resolves_relative_target_and_updates_last_task() {
+    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+    let parent = parent_ctx("/root", 0);
+    let handle = manager
+        .spawn(spawn_args("worker_one", "do work"), &parent)
+        .await
+        .expect("spawn");
+    manager.mailbox().drain();
+
+    let target = manager
+        .send_message_to_agent(&parent, "worker_one", "more context", false)
+        .expect("message target resolves");
+    assert_eq!(target.agent_path, handle.agent_path);
+    let updated = manager.registry().get(&handle.agent_path).unwrap();
+    assert_eq!(updated.last_task_message.as_deref(), Some("more context"));
+    let drained = manager.mailbox().drain();
+    assert_eq!(drained.len(), 1);
+    assert!(!drained[0].trigger_turn);
+}
+
+#[tokio::test]
+async fn close_agent_reference_closes_subtree() {
+    let manager = fake_manager(RoleRegistry::new(), 2);
+    let parent = parent_ctx("/root", 0);
+    manager
+        .spawn(spawn_args("worker_one", "do work"), &parent)
+        .await
+        .expect("spawn");
+
+    let previous = manager
+        .close_agent_reference(&parent, "worker_one")
+        .expect("close target");
+    assert_eq!(previous, AgentStatus::Completed(None));
+    assert_eq!(
+        manager.registry().get("/root/worker_one").unwrap().status,
+        AgentStatus::Shutdown
+    );
+    assert!(manager.close_agent_reference(&parent, "root").is_err());
 }
 
 // ---------------------------------------------------------------------------
@@ -359,6 +460,30 @@ fn fork_turns_parses_none_all_numeric() {
     assert!(ForkTurns::parse(Some("lots")).is_err());
 }
 
+#[tokio::test]
+async fn full_history_spawn_rejects_agent_model_reasoning_overrides() {
+    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+    let parent = parent_ctx("/root", 0);
+    let err = manager
+        .spawn(
+            SpawnAgentArgs::from_value(serde_json::json!({
+                "message": "do it",
+                "task_name": "worker",
+                "agent_type": "explorer",
+                "fork_turns": "all"
+            }))
+            .unwrap(),
+            &parent,
+        )
+        .await
+        .expect_err("full-history fork must reject role/model/reasoning overrides");
+    assert!(
+        err.0.contains("Full-history forked agents inherit"),
+        "unexpected error: {}",
+        err.0
+    );
+}
+
 #[test]
 fn invalid_task_name_rejected() {
     let upper = SpawnAgentArgs::from_value(serde_json::json!({
@@ -374,6 +499,13 @@ fn invalid_task_name_rejected() {
     }))
     .unwrap();
     assert!(spaced.validate_task_name().is_err());
+
+    let reserved = SpawnAgentArgs::from_value(serde_json::json!({
+        "message": "m",
+        "task_name": "root"
+    }))
+    .unwrap();
+    assert!(reserved.validate_task_name().is_err());
 
     let good = SpawnAgentArgs::from_value(serde_json::json!({
         "message": "m",
@@ -409,6 +541,106 @@ fn tool_spec_has_codex_name_and_required_params() {
     assert_eq!(spec["parameters"]["additionalProperties"], false);
 }
 
+#[tokio::test]
+async fn spawn_rejects_invalid_overrides() {
+    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+    let parent = parent_ctx("/root", 0);
+    let mut args = spawn_args("bad_reasoning", "go");
+    args.reasoning_effort = Some("super_high".to_string());
+    let err = manager
+        .spawn(args, &parent)
+        .await
+        .expect_err("invalid reasoning effort must be rejected");
+    assert!(err.to_string().contains("reasoning_effort must be one of"));
+
+    let mut args = spawn_args("empty_model", "go");
+    args.model = Some("  ".to_string());
+    let err = manager
+        .spawn(args, &parent)
+        .await
+        .expect_err("empty model override must be rejected");
+    assert!(err.to_string().contains("model override must not be empty"));
+}
+
+#[tokio::test]
+async fn spawn_validates_model_reasoning_and_service_tier_like_codex() {
+    let spawner = Arc::new(RecordingSpawner::default());
+    let manager = SubagentManager::with_config(
+        spawner.clone(),
+        RoleRegistry::new(),
+        DEFAULT_AGENT_MAX_DEPTH,
+    );
+    let parent = parent_ctx("/root", 0);
+    let mut args = spawn_args("catalog_model", "go");
+    args.model = Some("gpt-5.5".to_string());
+    args.reasoning_effort = Some("high".to_string());
+    args.service_tier = Some("priority".to_string());
+
+    manager.spawn(args, &parent).await.expect("spawn ok");
+
+    let specs = spawner.specs.lock().unwrap();
+    let spec = specs.last().expect("recorded spec");
+    assert_eq!(spec.config.model, "gpt-5.5");
+    assert_eq!(spec.config.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(spec.config.service_tier.as_deref(), Some("priority"));
+}
+
+#[tokio::test]
+async fn spawn_rejects_unknown_model_and_unsupported_reasoning_or_tier() {
+    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+    let parent = parent_ctx("/root", 0);
+
+    let mut args = spawn_args("unknown_model", "go");
+    args.model = Some("not-a-codex-model".to_string());
+    let err = manager
+        .spawn(args, &parent)
+        .await
+        .expect_err("unknown model must be rejected");
+    assert!(err.0.contains("Unknown model `not-a-codex-model`"));
+
+    let mut args = spawn_args("bad_reasoning_model", "go");
+    args.model = Some("gpt-5.5".to_string());
+    args.reasoning_effort = Some("minimal".to_string());
+    let err = manager
+        .spawn(args, &parent)
+        .await
+        .expect_err("unsupported reasoning must be rejected");
+    assert!(err
+        .0
+        .contains("Reasoning effort `minimal` is not supported"));
+
+    let mut args = spawn_args("bad_tier_model", "go");
+    args.model = Some("gpt-5.3-codex".to_string());
+    args.service_tier = Some("priority".to_string());
+    let err = manager
+        .spawn(args, &parent)
+        .await
+        .expect_err("unsupported service tier must be rejected");
+    assert!(err.0.contains("Service tier `priority` is not supported"));
+}
+
+#[tokio::test]
+async fn spawn_preserves_parent_service_tier_when_model_supports_it() {
+    let spawner = Arc::new(RecordingSpawner::default());
+    let manager = SubagentManager::with_config(
+        spawner.clone(),
+        RoleRegistry::new(),
+        DEFAULT_AGENT_MAX_DEPTH,
+    );
+    let mut parent = parent_ctx("/root", 0);
+    parent.base_config.model = "gpt-5.5".to_string();
+    parent.base_config.service_tier = Some("priority".to_string());
+
+    manager
+        .spawn(spawn_args("inherit_tier", "go"), &parent)
+        .await
+        .expect("spawn ok");
+
+    let specs = spawner.specs.lock().unwrap();
+    let spec = specs.last().expect("recorded spec");
+    assert_eq!(spec.config.service_tier.as_deref(), Some("priority"));
+}
+
 // ---------------------------------------------------------------------------
 // helpers / fakes
 // ---------------------------------------------------------------------------
@@ -425,16 +657,30 @@ fn spawn_args(task_name: &str, message: &str) -> SpawnAgentArgs {
     SpawnAgentArgs::from_value(serde_json::json!({
         "message": message,
         "task_name": task_name,
-        "agent_type": "explorer"
+        "agent_type": "explorer",
+        "fork_turns": "none"
     }))
     .expect("valid args")
 }
 
 fn fake_manager(roles: RoleRegistry, max_depth: i32) -> SubagentManager {
+    fake_manager_with_limit(roles, max_depth, None)
+}
+
+fn fake_manager_with_limit(
+    roles: RoleRegistry,
+    max_depth: i32,
+    max_concurrent_threads_per_session: Option<usize>,
+) -> SubagentManager {
     // Build the manager first so the fake spawner can share its mailbox +
     // registry to simulate a child reporting completion.
     let spawner = Arc::new(FakeSpawner::new());
-    let manager = SubagentManager::with_config(spawner.clone(), roles, max_depth);
+    let manager = SubagentManager::with_config_and_limits(
+        spawner.clone(),
+        roles,
+        max_depth,
+        max_concurrent_threads_per_session,
+    );
     spawner.attach(manager.mailbox(), manager.registry());
     manager
 }
@@ -471,21 +717,38 @@ impl ChildSpawner for FakeSpawner {
             // Simulate the child running to completion.
             shared
                 .registry
-                .update_status(&spec.agent_path, AgentStatus::Completed);
+                .update_status(&spec.agent_path, AgentStatus::Completed(None));
             // The child reports its completion through the mailbox (the wake).
-            let note = SubagentNotification::new(&spec.agent_path, AgentStatus::Completed);
+            let note = SubagentNotification::new(&spec.agent_path, AgentStatus::Completed(None));
             shared.mailbox.enqueue(InterAgentCommunication::new(
                 spec.agent_path.clone(),
                 "/root",
                 Vec::new(),
                 note.render(),
-                /*trigger_turn*/ true,
+                /*trigger_turn*/ false,
             ));
         }
         Ok(ChildHandle {
             agent_path: spec.agent_path,
             agent_id: spec.agent_id,
         })
+    }
+}
+
+#[derive(Default)]
+struct RecordingSpawner {
+    specs: Mutex<Vec<ChildSpec>>,
+}
+
+#[async_trait::async_trait]
+impl ChildSpawner for RecordingSpawner {
+    async fn spawn_child(&self, spec: ChildSpec) -> Result<ChildHandle, SubagentError> {
+        let handle = ChildHandle {
+            agent_path: spec.agent_path.clone(),
+            agent_id: spec.agent_id.clone(),
+        };
+        self.specs.lock().unwrap().push(spec);
+        Ok(handle)
     }
 }
 

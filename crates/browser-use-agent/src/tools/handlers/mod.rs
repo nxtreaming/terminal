@@ -57,8 +57,9 @@ pub use request_user_input::{
 };
 pub use shell::{ShellApprovalKey, ShellRequest, ShellTool};
 pub use subagent::{
-    ListAgentsRequest, ListAgentsTool, SendInputRequest, SendInputTool, SpawnAgentTool,
-    SubagentToolDeps, WaitAgentRequest, WaitAgentTool,
+    CloseAgentRequest, CloseAgentTool, CloseAgentV1Request, FollowupTaskRequest, FollowupTaskTool,
+    ListAgentsRequest, ListAgentsTool, SendInputRequest, SendInputTool, SendMessageRequest,
+    SendMessageTool, SpawnAgentTool, SubagentToolDeps, WaitAgentRequest, WaitAgentTool,
 };
 pub use tool_search::{
     ToolSearchApprovalKey, ToolSearchEntry, ToolSearchMatch, ToolSearchRequest, ToolSearchTool,

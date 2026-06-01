@@ -701,7 +701,7 @@ fn viewport_label_from_payload(payload: &Value) -> Option<String> {
 
 pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
     let mut activity = Vec::new();
-    for event in events {
+    for (idx, event) in events.iter().enumerate() {
         match event.event_type.as_str() {
             "browser.connected" => push_activity(&mut activity, "browser connected"),
             "browser.reconnected" => push_activity(&mut activity, "browser reconnected"),
@@ -780,7 +780,30 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
                 );
             }
             "file.list" => push_activity(&mut activity, "listed files"),
+            "collab_agent_spawn_end" => {
+                push_activity(&mut activity, collab_agent_spawn_text(&event.payload))
+            }
+            "collab_agent_interaction_end" => {
+                push_activity(&mut activity, collab_agent_interaction_text(&event.payload))
+            }
+            "collab_waiting_begin" => {
+                push_activity(&mut activity, collab_wait_started_text(&event.payload))
+            }
+            "collab_waiting_end" => {
+                if !has_later_event(events, idx, &event.session_id, "agent.wait.finished") {
+                    push_activity(&mut activity, "subagent wait finished");
+                }
+            }
+            "collab_close_end" => push_activity(
+                &mut activity,
+                collab_agent_status_text(&event.payload, "stopped"),
+            ),
+            "collab_resume_end" => push_activity(
+                &mut activity,
+                collab_agent_status_text(&event.payload, "resumed"),
+            ),
             "agent.spawned" => push_activity(&mut activity, agent_started_text(&event.payload)),
+            "agent.message" => push_activity(&mut activity, agent_message_text(&event.payload)),
             "agent.wait.started" => {
                 push_activity(&mut activity, agent_wait_started_text(&event.payload))
             }
@@ -799,10 +822,22 @@ pub fn activity_from_events(events: &[EventRecord]) -> Vec<String> {
             "agent.completed" => push_activity(&mut activity, "subagent finished"),
             "agent.failed" => push_activity(&mut activity, "subagent failed"),
             "agent.cancelled" => push_activity(&mut activity, "subagent stopped"),
+            "agent.resumed" => push_activity(&mut activity, "subagent resumed"),
             _ => {}
         }
     }
     activity
+}
+
+fn has_later_event(
+    events: &[EventRecord],
+    current_idx: usize,
+    session_id: &str,
+    event_type: &str,
+) -> bool {
+    events[current_idx.saturating_add(1)..]
+        .iter()
+        .any(|event| event.session_id == session_id && event.event_type == event_type)
 }
 
 fn push_activity(activity: &mut Vec<String>, item: impl Into<String>) {
@@ -1008,6 +1043,24 @@ fn agent_started_text(payload: &Value) -> String {
     format!("subagent {label} started")
 }
 
+fn agent_message_text(payload: &Value) -> String {
+    let label = payload
+        .get("recipient_path")
+        .and_then(Value::as_str)
+        .or_else(|| payload.get("agent_path").and_then(Value::as_str))
+        .map(short_agent_path)
+        .unwrap_or_else(|| "subagent".to_string());
+    if payload
+        .get("trigger_turn")
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+    {
+        format!("subagent {label} sent task")
+    } else {
+        format!("subagent {label} messaged")
+    }
+}
+
 fn agent_wait_started_text(payload: &Value) -> String {
     let label = payload
         .get("target")
@@ -1036,6 +1089,64 @@ fn agent_wait_started_text(payload: &Value) -> String {
         })
         .unwrap_or_else(|| "subagents".to_string());
     format!("subagent waiting on {label}")
+}
+
+fn collab_agent_spawn_text(payload: &Value) -> String {
+    let label = collab_agent_label(
+        payload,
+        "new_agent_nickname",
+        "new_agent_role",
+        "new_thread_id",
+    );
+    format!("subagent {label} started")
+}
+
+fn collab_agent_interaction_text(payload: &Value) -> String {
+    let label = collab_agent_label(
+        payload,
+        "receiver_agent_nickname",
+        "receiver_agent_role",
+        "receiver_thread_id",
+    );
+    format!("subagent {label} messaged")
+}
+
+fn collab_agent_status_text(payload: &Value, status: &str) -> String {
+    let label = collab_agent_label(
+        payload,
+        "receiver_agent_nickname",
+        "receiver_agent_role",
+        "receiver_thread_id",
+    );
+    format!("subagent {label} {status}")
+}
+
+fn collab_wait_started_text(payload: &Value) -> String {
+    let label = payload
+        .get("receiver_agents")
+        .and_then(Value::as_array)
+        .map(|agents| match agents.as_slice() {
+            [agent] => collab_agent_label(agent, "agent_nickname", "agent_role", "thread_id"),
+            [] => "subagents".to_string(),
+            _ => format!("{} subagents", agents.len()),
+        })
+        .unwrap_or_else(|| "subagents".to_string());
+    format!("subagent waiting on {label}")
+}
+
+fn collab_agent_label(
+    payload: &Value,
+    nickname_key: &str,
+    role_key: &str,
+    thread_id_key: &str,
+) -> String {
+    payload
+        .get(nickname_key)
+        .and_then(Value::as_str)
+        .or_else(|| payload.get(role_key).and_then(Value::as_str))
+        .or_else(|| payload.get(thread_id_key).and_then(Value::as_str))
+        .map(short_agent_path)
+        .unwrap_or_else(|| "subagent".to_string())
 }
 
 fn short_agent_path(path: &str) -> String {
@@ -1935,6 +2046,71 @@ mod tests {
             vec![
                 "subagent waiting on repo_explorer",
                 "subagent wait finished"
+            ]
+        );
+    }
+
+    #[test]
+    fn projects_collab_agent_events_as_activity() {
+        let events = vec![
+            event(
+                1,
+                "collab_agent_spawn_end",
+                json!({
+                    "new_thread_id": "c1",
+                    "new_agent_nickname": "builder",
+                    "status": "running",
+                }),
+            ),
+            event(
+                2,
+                "collab_agent_interaction_end",
+                json!({
+                    "receiver_thread_id": "c1",
+                    "receiver_agent_nickname": "builder",
+                    "status": "running",
+                }),
+            ),
+            event(
+                3,
+                "collab_waiting_begin",
+                json!({
+                    "receiver_agents": [{
+                        "thread_id": "c1",
+                        "agent_nickname": "builder"
+                    }],
+                }),
+            ),
+            event(4, "collab_waiting_end", json!({"statuses": {}})),
+            event(
+                5,
+                "collab_close_end",
+                json!({
+                    "receiver_thread_id": "c1",
+                    "receiver_agent_nickname": "builder",
+                    "status": "running",
+                }),
+            ),
+            event(
+                6,
+                "collab_resume_end",
+                json!({
+                    "receiver_thread_id": "c1",
+                    "receiver_agent_nickname": "builder",
+                    "status": "running",
+                }),
+            ),
+        ];
+
+        assert_eq!(
+            activity_from_events(&events),
+            vec![
+                "subagent builder started",
+                "subagent builder messaged",
+                "subagent waiting on builder",
+                "subagent wait finished",
+                "subagent builder stopped",
+                "subagent builder resumed",
             ]
         );
     }

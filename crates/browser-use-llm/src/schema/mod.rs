@@ -63,6 +63,9 @@ mod tests {
             name: "shell".into(),
             description: "run a command".into(),
             input_schema: json!({ "type": "object" }),
+            output_schema: None,
+            namespace: None,
+            namespace_description: None,
         });
         req.tool_choice = Some(ToolChoice::Auto);
         req.generation.temperature = Some(0.2);
@@ -94,6 +97,7 @@ mod tests {
             LlmEvent::ToolCall {
                 id: "c0".into(),
                 name: "shell".into(),
+                namespace: None,
                 input: json!({}),
             },
             LlmEvent::Finish {

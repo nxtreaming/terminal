@@ -479,12 +479,18 @@ fn aggregate(events: Vec<LlmEvent>) -> LlmResponse {
         match ev {
             LlmEvent::TextDelta { delta, .. } => text.push_str(&delta),
             LlmEvent::ReasoningDelta { delta, .. } => reasoning.push_str(&delta),
-            LlmEvent::ToolCall { id, name, input } => {
+            LlmEvent::ToolCall {
+                id,
+                name,
+                namespace,
+                input,
+            } => {
                 tool_calls.push(ContentPart::ToolCall {
                     id,
                     name,
                     input,
-                    provider_metadata: None,
+                    provider_metadata: namespace
+                        .map(|namespace| serde_json::json!({ "namespace": namespace })),
                 });
             }
             LlmEvent::Finish {
@@ -876,6 +882,7 @@ mod tests {
             LlmEvent::ToolCall {
                 id: "call_1".into(),
                 name: "get_weather".into(),
+                namespace: None,
                 input: serde_json::json!({ "city": "NYC" }),
             },
             LlmEvent::StepFinish {

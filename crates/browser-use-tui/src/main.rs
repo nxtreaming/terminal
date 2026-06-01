@@ -26,7 +26,8 @@ use browser_use_agent::config_model::{
     default_model_for_cwd_with_options, model_catalog_for_cwd_with_options,
 };
 use browser_use_agent::config_overrides::{
-    parse_config_overrides, AgentRunOptions, ConfigOverrides,
+    parse_config_overrides, resolve_agent_roles_for_profile, resolve_multi_agent_v2_for_profile,
+    AgentRunOptions, ConfigOverrides,
 };
 use browser_use_agent::context::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
@@ -5225,7 +5226,16 @@ impl App {
         if let Some(profile) = self.args.config_profile.as_ref() {
             options = options.with_config_profile(profile.clone());
         }
+        let profile_ref = self.args.config_profile.as_deref();
         let config_overrides = self.parsed_config_overrides()?;
+        options = options.with_multi_agent_v2(resolve_multi_agent_v2_for_profile(
+            profile_ref,
+            &config_overrides,
+        )?);
+        options = options.with_agent_roles(resolve_agent_roles_for_profile(
+            profile_ref,
+            &config_overrides,
+        )?);
         if !config_overrides.is_empty() {
             options = options.with_config_overrides(config_overrides);
         }
