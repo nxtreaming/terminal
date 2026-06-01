@@ -26,7 +26,8 @@ pub mod review;
 pub use analytics::{browser_kind, capture_async, capture_blocking, duration_bucket};
 pub use lifecycle::{install_process_crypto_provider, UnifiedExecShutdownCleanup};
 pub use persistence::{
-    record_browser_script_response_events, record_python_response_events,
+    record_browser_command_response_events, record_browser_script_response_events,
+    record_browser_script_response_events_for_tool, record_python_response_events,
     record_python_response_final_event, record_python_worker_event,
 };
 pub use review::{

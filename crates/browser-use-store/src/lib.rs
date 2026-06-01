@@ -247,9 +247,25 @@ impl Store {
         nickname: Option<&str>,
         role: Option<&str>,
     ) -> Result<SessionMeta> {
+        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        self.create_child_session_with_id(parent_id, cwd, agent_path, nickname, role, id)
+    }
+
+    pub fn create_child_session_with_id(
+        &self,
+        parent_id: &str,
+        cwd: impl AsRef<Path>,
+        agent_path: Option<&str>,
+        nickname: Option<&str>,
+        role: Option<&str>,
+        id: impl Into<String>,
+    ) -> Result<SessionMeta> {
         self.load_session(parent_id)?
             .with_context(|| format!("unknown parent session id: {parent_id}"))?;
-        let id = Uuid::new_v4().simple().to_string()[..12].to_string();
+        let id = id.into();
+        if id.trim().is_empty() {
+            bail!("child session id must not be empty");
+        }
         let now = now_ms();
         let artifact_root = self.state_dir.join("artifacts").join(&id);
         std::fs::create_dir_all(&artifact_root)

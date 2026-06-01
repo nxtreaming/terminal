@@ -24,7 +24,7 @@
 //! The `DEFAULT_TOOL_OUTPUT_TEXT_TOKENS` budget is reused from this crate's
 //! [`crate::events::names`] (== core's constant of the same name).
 
-use browser_use_browser::BrowserScriptOutput;
+use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
 use browser_use_python_worker::{PythonWorkerEvent, RunPythonResponse};
 use browser_use_store::Store;
 use serde_json::Value;
@@ -98,6 +98,24 @@ pub fn record_browser_script_response_events(
     tool_call_id: &str,
     response: &BrowserScriptOutput,
 ) -> anyhow::Result<()> {
+    record_browser_script_response_events_for_tool(
+        store,
+        session_id,
+        "browser_script",
+        tool_call_id,
+        response,
+    )
+}
+
+/// Record all events for a browser script response using the actual advertised
+/// tool name from the model call.
+pub fn record_browser_script_response_events_for_tool(
+    store: &Store,
+    session_id: &str,
+    tool_name: &str,
+    tool_call_id: &str,
+    response: &BrowserScriptOutput,
+) -> anyhow::Result<()> {
     for browser_event in &response.browser_events {
         record_python_browser_event(store, session_id, browser_event)?;
     }
@@ -107,13 +125,7 @@ pub fn record_browser_script_response_events(
         .filter_map(|image| image.get("path").and_then(Value::as_str))
         .collect::<std::collections::HashSet<_>>();
     for image in &response.images {
-        record_tool_image_with_call_id(
-            store,
-            session_id,
-            "browser_script",
-            Some(tool_call_id),
-            image,
-        )?;
+        record_tool_image_with_call_id(store, session_id, tool_name, Some(tool_call_id), image)?;
     }
     for artifact in &response.artifacts {
         let Some(path) = artifact.get("path").and_then(Value::as_str) else {
@@ -125,32 +137,56 @@ pub fn record_browser_script_response_events(
         record_tool_artifact_with_call_id(
             store,
             session_id,
-            "browser_script",
+            tool_name,
             Some(tool_call_id),
             artifact,
         )?;
     }
     let transcript_text = browser_script_transcript_text(response);
-    store.append_event(
-        session_id,
-        "tool.output",
-        serde_json::json!({
-            "name": "browser_script",
-            "tool_call_id": tool_call_id,
-            "ok": response.ok,
-            "status": response.status,
-            "run_id": response.run_id,
-            "next_observe_ms": response.next_observe_ms,
-            "text": transcript_text,
-            "data": response.data,
-            "outputs": response.outputs,
-            "summary": response.summary,
-            "images": response.images,
-            "artifacts": response.artifacts,
-            "error": response.error,
-            "diagnosis": response.diagnosis,
-        }),
-    )?;
+    let mut payload = serde_json::json!({
+        "name": tool_name,
+        "tool_call_id": tool_call_id,
+        "ok": response.ok,
+        "status": response.status,
+        "run_id": response.run_id,
+        "next_observe_ms": response.next_observe_ms,
+        "text": transcript_text,
+        "data": response.data,
+        "outputs": response.outputs,
+        "summary": response.summary,
+        "images": response.images,
+        "artifacts": response.artifacts,
+        "diagnosis": response.diagnosis,
+    });
+    if response.ok {
+        payload["error"] = serde_json::to_value(response.error.clone()).unwrap_or(Value::Null);
+        store.append_event(session_id, "tool.output", payload)?;
+    } else {
+        let error = response
+            .error
+            .as_deref()
+            .filter(|error| !error.trim().is_empty())
+            .or_else(|| (!transcript_text.trim().is_empty()).then_some(transcript_text.as_str()))
+            .unwrap_or("browser_script failed");
+        payload["error"] = Value::String(error.to_string());
+        store.append_event(session_id, "tool.failed", payload)?;
+    }
+    Ok(())
+}
+
+/// Record browser events emitted by a lifecycle/command browser call. The
+/// command's model-facing output is still handled by the generic tool-result
+/// event path; this preserves browser state/live-url events for replay/TUI.
+pub fn record_browser_command_response_events(
+    store: &Store,
+    session_id: &str,
+    _tool_name: &str,
+    _tool_call_id: &str,
+    response: &BrowserCommandOutput,
+) -> anyhow::Result<()> {
+    for browser_event in &response.events {
+        record_python_browser_event(store, session_id, browser_event)?;
+    }
     Ok(())
 }
 
@@ -632,6 +668,98 @@ mod tests {
         assert_eq!(tool_output.payload["name"], "browser_script");
         assert_eq!(tool_output.payload["tool_call_id"], "call-1");
         assert_eq!(tool_output.payload["text"], "clicked button");
+    }
+
+    #[test]
+    fn record_browser_script_response_preserves_rich_payload_and_tool_name() {
+        let (_dir, store) = store();
+        let session = new_session(&store);
+        let mut response = BrowserScriptOutput::default();
+        response.ok = true;
+        response.text = "browser_script is still running.\nvisible text".to_string();
+        response.summary = vec![serde_json::json!({
+            "kind": "page",
+            "url": "https://example.com",
+            "title": "Example",
+        })];
+        response.images = vec![serde_json::json!({
+            "path": "/tmp/shot.png",
+            "kind": "image",
+            "mime_type": "image/png",
+        })];
+        response.artifacts = vec![serde_json::json!({
+            "path": "/tmp/report.csv",
+            "kind": "file",
+            "mime": "text/csv",
+        })];
+        response.browser_events = vec![serde_json::json!({
+            "type": "browser.state",
+            "payload": {"url": "https://example.com"},
+        })];
+
+        record_browser_script_response_events_for_tool(
+            &store,
+            &session,
+            "browser_script",
+            "call-rich",
+            &response,
+        )
+        .unwrap();
+
+        let events = store.events_for_session(&session).unwrap();
+        assert!(events.iter().any(|e| e.event_type == "browser.state"));
+        assert!(events.iter().any(|e| e.event_type == "tool.image"));
+        assert!(events.iter().any(|e| e.event_type == "artifact.created"));
+        let output = events
+            .iter()
+            .find(|e| e.event_type == "tool.output")
+            .expect("tool.output");
+        assert_eq!(output.payload["name"], "browser_script");
+        assert_eq!(output.payload["tool_call_id"], "call-rich");
+        assert_eq!(output.payload["text"], "visible text");
+        assert_eq!(output.payload["summary"][0]["title"], "Example");
+        assert_eq!(store.artifacts_for_session(&session).unwrap().len(), 2);
+    }
+
+    #[test]
+    fn record_browser_script_response_failure_is_tool_failed_with_diagnosis() {
+        let (_dir, store) = store();
+        let session = new_session(&store);
+        let mut response = BrowserScriptOutput::default();
+        response.ok = false;
+        response.text = "Traceback line".to_string();
+        response.error = Some("RuntimeError: CDP timed out".to_string());
+        response.diagnosis = Some(browser_use_browser::BrowserIssueDiagnosis {
+            summary: "Browser remains usable.".to_string(),
+            what_happened: "A CDP read timed out.".to_string(),
+            next_step: "Observe again with a smaller script.".to_string(),
+            browser_usable: true,
+            page_usable: true,
+            error_kind: "cdp-read-timeout".to_string(),
+        });
+
+        record_browser_script_response_events_for_tool(
+            &store,
+            &session,
+            "browser_script",
+            "call-failed",
+            &response,
+        )
+        .unwrap();
+
+        let events = store.events_for_session(&session).unwrap();
+        assert!(!events.iter().any(|e| e.event_type == "tool.output"));
+        let failed = events
+            .iter()
+            .find(|e| e.event_type == "tool.failed")
+            .expect("tool.failed");
+        assert_eq!(failed.payload["name"], "browser_script");
+        assert_eq!(failed.payload["tool_call_id"], "call-failed");
+        assert_eq!(failed.payload["error"], "RuntimeError: CDP timed out");
+        assert_eq!(
+            failed.payload["diagnosis"]["error_kind"],
+            "cdp-read-timeout"
+        );
     }
 
     #[test]

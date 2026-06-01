@@ -57,13 +57,13 @@ use std::sync::Arc;
 use browser_use_llm::route::{ModelClient, Route};
 use browser_use_llm::schema::{
     ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
-    MessageRole, Usage,
+    MessageRole, SystemPart, Usage,
 };
 use futures_util::{Stream, StreamExt};
 use tokio_util::sync::CancellationToken;
 
 use crate::decision::{self, RetryAction, SamplingOutcome};
-use crate::events::{self, EventSink, TurnCtx};
+use crate::events::{self, names, EventSink, PendingEvent, TurnCtx};
 use crate::turn::dispatch::ToolDispatcher;
 use crate::turn::{CallRunner, SamplingDriver};
 use crate::AgentError;
@@ -401,6 +401,54 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         }
     }
 
+    fn emit_turn_request(&self, attempt: u32) {
+        self.sink.emit(PendingEvent::new(
+            self.ctx.session_id.clone(),
+            names::MODEL_TURN_REQUEST,
+            serde_json::json!({
+                "model": &self.ctx.model,
+                "provider": &self.ctx.provider,
+                "turn_idx": self.ctx.turn_idx,
+                "attempt": attempt,
+            }),
+        ));
+    }
+
+    fn emit_tool_result(&self, call: &ContentPart, output: &Message) {
+        let (tool_call_id, name) = tool_call_identity(call);
+        let (text, is_error) = tool_result_text_and_status(output);
+        if name == "browser_script" {
+            // Browser script calls persist rich tool.output/tool.failed events
+            // from the handler itself (summary, artifacts, images, diagnosis).
+            // Emitting the generic text-only event here would duplicate the TUI
+            // row and lose the structured browser contract.
+            return;
+        }
+        let payload = serde_json::json!({
+            "name": name,
+            "tool_call_id": tool_call_id,
+            "ok": !is_error,
+            "text": text,
+        });
+        if is_error {
+            self.sink.emit(PendingEvent::new(
+                self.ctx.session_id.clone(),
+                names::TOOL_FAILED,
+                serde_json::json!({
+                    "name": name,
+                    "tool_call_id": tool_call_id,
+                    "error": text,
+                }),
+            ));
+        } else {
+            self.sink.emit(PendingEvent::new(
+                self.ctx.session_id.clone(),
+                names::TOOL_OUTPUT,
+                payload,
+            ));
+        }
+    }
+
     /// Fold a single successfully-decoded event into the accumulator + sink.
     fn consume_event(&self, acc: &mut TurnAccumulator, ev: LlmEvent) -> StreamProgress {
         // Emit UI events first (map is pure; emit is the only side effect).
@@ -541,6 +589,50 @@ fn assistant_message(full_text: &str, tool_calls: &[ContentPart]) -> Message {
     Message::new(MessageRole::Assistant, content)
 }
 
+fn tool_call_identity(call: &ContentPart) -> (String, String) {
+    match call {
+        ContentPart::ToolCall { id, name, .. } => (id.clone(), name.clone()),
+        _ => (String::new(), "tool".to_string()),
+    }
+}
+
+fn tool_result_text_and_status(message: &Message) -> (String, bool) {
+    for part in &message.content {
+        if let ContentPart::ToolResult {
+            content, is_error, ..
+        } = part
+        {
+            return (flatten_content_text(content), *is_error);
+        }
+    }
+    (flatten_content_text(&message.content), true)
+}
+
+fn flatten_content_text(parts: &[ContentPart]) -> String {
+    let mut chunks = Vec::new();
+    collect_content_text(parts, &mut chunks);
+    if chunks.is_empty() && !parts.is_empty() {
+        serde_json::to_string(parts).unwrap_or_default()
+    } else {
+        chunks.join("\n")
+    }
+}
+
+fn collect_content_text(parts: &[ContentPart], chunks: &mut Vec<String>) {
+    for part in parts {
+        match part {
+            ContentPart::Text { text } | ContentPart::Reasoning { text, .. } => {
+                if !text.is_empty() {
+                    chunks.push(text.clone());
+                }
+            }
+            ContentPart::ToolResult { content, .. } => collect_content_text(content, chunks),
+            ContentPart::Media { mime_type, .. } => chunks.push(format!("[media: {mime_type}]")),
+            ContentPart::ToolCall { .. } => {}
+        }
+    }
+}
+
 impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
     for ModelSamplingDriver<T, R>
 {
@@ -566,6 +658,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         }
         let mut attempt: u32 = 0;
         loop {
+            self.emit_turn_request(attempt);
             // ---- open the stream (codex: `client.stream(&prompt).await`) ----
             let mut stream = match self.transport.open_stream(&req) {
                 Ok(s) => s,
@@ -647,11 +740,16 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 
                         // 2. Dispatch in model order through the parallel/serial gate.
                         let result = dispatcher
-                            .dispatch_ordered(tool_calls, cancel.clone())
+                            .dispatch_ordered(tool_calls.clone(), cancel.clone())
                             .await;
 
                         // 3. Record each tool output (already in model order).
                         if !result.outputs_in_order.is_empty() {
+                            for (call, output) in
+                                tool_calls.iter().zip(result.outputs_in_order.iter())
+                            {
+                                self.emit_tool_result(call, output);
+                            }
                             recorder.record(&result.outputs_in_order).await;
                         }
 
@@ -697,6 +795,8 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 /// unit-reachable while the fused driver still advertises the catalog.
 fn build_request(ctx: &TurnCtx, input: Vec<Message>) -> LlmRequest {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
+    req.system
+        .push(SystemPart::new(crate::prompts::system_prompt()));
     req.messages = input;
     req
 }

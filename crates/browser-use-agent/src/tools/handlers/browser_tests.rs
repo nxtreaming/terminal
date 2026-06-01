@@ -15,9 +15,11 @@
 use std::sync::{Arc, Mutex};
 
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
+use browser_use_store::Store;
 use serde_json::json;
 
 use super::browser::{BrowserAction, BrowserBackend, BrowserRequest, BrowserTool};
+use crate::session::SharedStore;
 use crate::tools::approval::AskForApproval;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::runtime::{
@@ -44,12 +46,17 @@ enum LastCall {
 #[derive(Default)]
 struct FakeBackend {
     last: Mutex<LastCall>,
+    last_session: Mutex<Option<String>>,
     fail: bool,
 }
 
 impl FakeBackend {
     fn last(&self) -> LastCall {
         self.last.lock().unwrap().clone()
+    }
+
+    fn last_session(&self) -> Option<String> {
+        self.last_session.lock().unwrap().clone()
     }
 
     fn ok_command() -> BrowserCommandOutput {
@@ -73,11 +80,12 @@ impl FakeBackend {
 impl BrowserBackend for FakeBackend {
     fn command(
         &self,
-        _session_id: &str,
+        session_id: &str,
         _cwd: &std::path::Path,
         _artifact_dir: &std::path::Path,
         command: &str,
     ) -> anyhow::Result<BrowserCommandOutput> {
+        *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last.lock().unwrap() = LastCall::Command(command.to_string());
         if self.fail {
             anyhow::bail!("boom");
@@ -87,12 +95,13 @@ impl BrowserBackend for FakeBackend {
 
     fn run_script(
         &self,
-        _session_id: &str,
+        session_id: &str,
         _cwd: &std::path::Path,
         _artifact_dir: &std::path::Path,
         code: &str,
         _timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
+        *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last.lock().unwrap() = LastCall::RunScript(code.to_string());
         if self.fail {
             anyhow::bail!("boom");
@@ -103,12 +112,13 @@ impl BrowserBackend for FakeBackend {
 
     fn start_script(
         &self,
-        _session_id: &str,
+        session_id: &str,
         _cwd: &std::path::Path,
         _artifact_dir: &std::path::Path,
         code: &str,
         _timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
+        *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last.lock().unwrap() = LastCall::StartScript(code.to_string());
         if self.fail {
             anyhow::bail!("boom");
@@ -119,10 +129,11 @@ impl BrowserBackend for FakeBackend {
 
     fn observe_script(
         &self,
-        _session_id: &str,
+        session_id: &str,
         run_id: &str,
         _observe_timeout_ms: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
+        *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last.lock().unwrap() = LastCall::Observe(run_id.to_string());
         if self.fail {
             anyhow::bail!("unknown browser_script run_id {run_id:?}");
@@ -130,11 +141,8 @@ impl BrowserBackend for FakeBackend {
         Ok(Self::ok_script(None, true))
     }
 
-    fn cancel_script(
-        &self,
-        _session_id: &str,
-        run_id: &str,
-    ) -> anyhow::Result<BrowserScriptOutput> {
+    fn cancel_script(&self, session_id: &str, run_id: &str) -> anyhow::Result<BrowserScriptOutput> {
+        *self.last_session.lock().unwrap() = Some(session_id.to_string());
         *self.last.lock().unwrap() = LastCall::Cancel(run_id.to_string());
         if self.fail {
             anyhow::bail!("unknown browser_script run_id {run_id:?}");
@@ -166,11 +174,33 @@ fn none_attempt(launch: &SandboxLaunch) -> SandboxAttempt<'_> {
 }
 
 fn ctx() -> ToolCtx {
+    ctx_with_call_id("call-browser")
+}
+
+fn ctx_with_call_id(call_id: &str) -> ToolCtx {
     ToolCtx {
-        call_id: "call-browser".to_string(),
+        call_id: call_id.to_string(),
         tool_name: "browser".to_string(),
         cwd: std::env::temp_dir(),
     }
+}
+
+fn ctx_for_tool(tool_name: &str, call_id: &str) -> ToolCtx {
+    ToolCtx {
+        call_id: call_id.to_string(),
+        tool_name: tool_name.to_string(),
+        cwd: std::env::temp_dir(),
+    }
+}
+
+fn shared_store() -> (tempfile::TempDir, SharedStore, String) {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let store = Store::open(dir.path()).expect("open store");
+    let session = store
+        .create_session(None, std::path::Path::new("/tmp"))
+        .expect("create session")
+        .id;
+    (dir, Arc::new(Mutex::new(store)), session)
 }
 
 /// Run a request directly through the runtime with a `SandboxType::None`
@@ -179,6 +209,16 @@ async fn run_direct(tool: &BrowserTool, req: &BrowserRequest) -> Result<ExecOutp
     let launch = none_launch();
     let attempt = none_attempt(&launch);
     tool.run(req, &attempt, &ctx()).await
+}
+
+async fn run_direct_with_ctx(
+    tool: &BrowserTool,
+    req: &BrowserRequest,
+    ctx: &ToolCtx,
+) -> Result<ExecOutput, ToolError> {
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    tool.run(req, &attempt, ctx).await
 }
 
 // (1) A browser command request routes to the backend and maps output->ExecOutput.
@@ -332,7 +372,8 @@ async fn observe_unknown_run_maps_to_error() {
     assert!(matches!(err, ToolError::Other(_)), "got {err:?}");
 }
 
-// Validation: empty session/command/run_id are rejected before touching backend.
+// Validation: empty command/run_id are rejected before touching backend; an
+// empty request session can fall back to the runtime context session id.
 #[tokio::test]
 async fn empty_command_rejected_without_calling_backend() {
     let backend = Arc::new(FakeBackend::default());
@@ -350,9 +391,54 @@ async fn empty_session_id_rejected() {
     let tool = tool_with(Arc::clone(&backend));
 
     let req = BrowserRequest::command("", "go x");
-    let err = run_direct(&tool, &req).await.unwrap_err();
+    let err = run_direct_with_ctx(&tool, &req, &ctx_with_call_id(""))
+        .await
+        .unwrap_err();
     assert!(matches!(err, ToolError::Rejected(_)), "got {err:?}");
     assert_eq!(backend.last(), LastCall::None);
+}
+
+#[tokio::test]
+async fn empty_request_session_uses_context_session_id() {
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend));
+
+    let req = BrowserRequest::command("", "go x");
+    let out = run_direct_with_ctx(&tool, &req, &ctx_with_call_id("sess-from-ctx"))
+        .await
+        .unwrap();
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(backend.last(), LastCall::Command("go x".to_string()));
+}
+
+#[tokio::test]
+async fn configured_session_id_keeps_tool_call_id_for_persistence() {
+    let backend = Arc::new(FakeBackend::default());
+    let (_dir, store, session) = shared_store();
+    let tool = tool_with(Arc::clone(&backend))
+        .with_session_id("agent-session")
+        .with_persistence(store.clone(), session.clone());
+
+    let mut req = BrowserRequest::execute("", "extract()", false);
+    req.session_id.clear();
+    let out = run_direct_with_ctx(
+        &tool,
+        &req,
+        &ctx_for_tool("browser_script", "model-call-123"),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(out.exit_code, 0);
+    assert_eq!(backend.last_session().as_deref(), Some("agent-session"));
+    let events = store.lock().unwrap().events_for_session(&session).unwrap();
+    let output = events
+        .iter()
+        .find(|event| event.event_type == "tool.output")
+        .expect("browser_script tool.output");
+    assert_eq!(output.payload["name"], "browser_script");
+    assert_eq!(output.payload["tool_call_id"], "model-call-123");
+    assert_eq!(output.payload["text"], "script-output");
 }
 
 #[tokio::test]

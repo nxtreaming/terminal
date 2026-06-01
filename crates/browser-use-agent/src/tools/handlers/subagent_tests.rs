@@ -15,8 +15,6 @@
 use std::sync::Arc;
 use std::sync::Mutex;
 
-use serde_json::json;
-
 use super::*;
 use crate::subagents::mailbox::{AgentStatus, InterAgentCommunication, Mailbox};
 use crate::subagents::manager::{

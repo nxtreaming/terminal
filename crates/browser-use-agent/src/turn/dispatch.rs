@@ -207,13 +207,18 @@ where
 
     async fn run(&self, call: ContentPart) -> Message {
         match &call {
-            ContentPart::ToolCall { name, input, .. } => {
+            ContentPart::ToolCall {
+                id, name, input, ..
+            } => {
+                let mut ctx = self.ctx.clone();
+                ctx.call_id = id.clone();
+                ctx.tool_name = name.clone();
                 match self
                     .registry
                     .dispatch(
                         name,
                         input,
-                        &self.ctx,
+                        &ctx,
                         &self.env,
                         self.policy,
                         &self.orchestrator,

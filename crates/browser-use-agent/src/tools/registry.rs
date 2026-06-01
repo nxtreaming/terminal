@@ -609,7 +609,7 @@ pub mod definitions {
                         "enum": ["command", "execute", "observe", "cancel"],
                         "description": "Which browser operation to perform."
                     },
-                    "session_id": { "type": "string", "description": "Browser session id." },
+                    "session_id": { "type": "string", "description": "Browser session id. Usually omitted; the runtime supplies the current agent session." },
                     "command": { "type": "string", "description": "Command string for the `command` action." },
                     "script": { "type": "string", "description": "Script body for the `execute` action." },
                     "background": { "type": "boolean", "description": "Run an `execute` in the background." },
@@ -617,7 +617,32 @@ pub mod definitions {
                     "timeout_secs": { "type": "integer", "description": "Script timeout in seconds." },
                     "observe_timeout_ms": { "type": "integer", "description": "Observe poll window in ms." }
                 },
-                "required": ["action", "session_id"],
+                "required": ["action"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
+    /// `browser_script`: browser-use page/data-plane interaction surface.
+    pub fn browser_script() -> ToolDefinition {
+        ToolDefinition {
+            name: "browser_script".to_string(),
+            description: crate::prompts::browser_script_tool_description().to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "action": {
+                        "type": "string",
+                        "enum": ["execute", "observe", "cancel"],
+                        "description": "Which browser script operation to perform. Defaults to execute when script/code is provided."
+                    },
+                    "script": { "type": "string", "description": "Python browser script to execute." },
+                    "code": { "type": "string", "description": "Alias for script." },
+                    "background": { "type": "boolean", "description": "Start the script in the background and observe later." },
+                    "run_id": { "type": "string", "description": "Run id for observe/cancel." },
+                    "timeout_secs": { "type": "integer", "description": "Script timeout in seconds." },
+                    "observe_timeout_ms": { "type": "integer", "description": "Observe poll window in ms." }
+                },
                 "additionalProperties": false
             }),
         }

@@ -166,7 +166,7 @@ struct Args {
     /// Override a configuration value. Use a dotted path and TOML value.
     #[arg(short = 'c', long = "config", value_name = "key=value", action = clap::ArgAction::Append)]
     config_overrides: Vec<String>,
-    #[arg(long, default_value = "OpenAI API key")]
+    #[arg(long, default_value = "OpenRouter API key")]
     account: String,
     #[arg(long, default_value = "Local Chrome")]
     browser: String,
@@ -184,7 +184,7 @@ struct Args {
     seed_demo: Option<String>,
     #[arg(long, value_enum)]
     overlay: Option<ScreenArg>,
-    #[arg(long, value_enum, default_value = "openai", hide = true)]
+    #[arg(long, value_enum, default_value = "openrouter", hide = true)]
     agent: AgentBackend,
 }
 
@@ -1988,6 +1988,50 @@ fn model_provider_id_for_backend(backend: AgentBackend) -> &'static str {
     backend.as_setting()
 }
 
+fn default_provider_model_for_backend(
+    backend: AgentBackend,
+    current_dir: &Path,
+    config_profile: Option<&str>,
+    config_overrides: &[(String, toml::Value)],
+    model_choices: &[ModelChoice],
+) -> Result<String> {
+    match backend {
+        AgentBackend::Openrouter => Ok(model_choices
+            .iter()
+            .find(|choice| {
+                choice.backend == AgentBackend::Openrouter
+                    && choice.provider_model == "openai/gpt-5.5"
+            })
+            .or_else(|| {
+                model_choices
+                    .iter()
+                    .find(|choice| choice.backend == AgentBackend::Openrouter)
+            })
+            .map(|choice| choice.provider_model.clone())
+            .unwrap_or_else(|| "openai/gpt-5.5".to_string())),
+        AgentBackend::Anthropic => Ok(model_choices
+            .iter()
+            .find(|choice| choice.backend == AgentBackend::Anthropic)
+            .map(|choice| choice.provider_model.clone())
+            .unwrap_or_else(|| "claude-sonnet-4-6".to_string())),
+        AgentBackend::Deepseek => Ok(model_choices
+            .iter()
+            .find(|choice| choice.backend == AgentBackend::Deepseek)
+            .map(|choice| choice.provider_model.clone())
+            .unwrap_or_else(|| "deepseek-v4-pro".to_string())),
+        _ => {
+            let chatgpt_mode = matches!(backend, AgentBackend::Codex);
+            default_model_for_cwd_with_options(
+                current_dir,
+                config_profile,
+                config_overrides,
+                chatgpt_mode,
+            )
+            .or_else(|_| Ok("gpt-5.5".to_string()))
+        }
+    }
+}
+
 fn session_model_selection_from_event(event: &EventRecord) -> Option<SessionModelSelection> {
     if event.event_type != SESSION_MODEL_SELECTION_EVENT {
         return None;
@@ -2108,12 +2152,12 @@ impl App {
         {
             display_and_provider_model_for_input(model, &model_choices)
         } else {
-            let chatgpt_mode = matches!(agent_backend, AgentBackend::Codex);
-            let provider_model = default_model_for_cwd_with_options(
+            let provider_model = default_provider_model_for_backend(
+                agent_backend,
                 &current_dir,
                 config_profile,
                 &config_overrides,
-                chatgpt_mode,
+                &model_choices,
             )
             .unwrap_or_else(|_| "gpt-5.5".to_string());
             let display_model = display_model_for_provider_model(&provider_model, &model_choices);
@@ -4695,6 +4739,29 @@ impl App {
         true
     }
 
+    fn handle_composer_click(&mut self, column: u16, row: u16) -> bool {
+        if self.is_slash_palette_active() {
+            return false;
+        }
+        let Some(rect) = self.composer_input_rect.get() else {
+            return false;
+        };
+        if column < rect.x
+            || column >= rect.x.saturating_add(rect.width)
+            || row < rect.y
+            || row >= rect.y.saturating_add(rect.height)
+        {
+            return false;
+        }
+        self.composer.set_cursor_from_wrapped_position(
+            rect.height.max(1) as usize,
+            rect.width.max(1) as usize,
+            column.saturating_sub(rect.x) as usize,
+            row.saturating_sub(rect.y) as usize,
+        );
+        true
+    }
+
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
             Surface::History => {
@@ -6262,12 +6329,8 @@ impl App {
 
     fn account_ready(&self, account: &str) -> Result<bool> {
         Ok(match account {
-            // OpenAI is the out-of-the-box default account (gpt-5.5). Treat it as
-            // ready under `cfg!(test)` — mirroring the `has_codex_login()`
-            // test-shortcut — so the first-run account picker is skipped and the
-            // home screen renders in tests, exactly as it did when Codex was the
-            // default. In production this is gated on a stored key or
-            // OPENAI_API_KEY in the environment, unchanged.
+            // Legacy unit fixtures still rely on OpenAI being ready without a
+            // real key. Production remains gated on a stored key or env var.
             ACCOUNT_OPENAI => {
                 cfg!(test)
                     || self.has_stored_or_env(
@@ -6599,28 +6662,24 @@ fn format_cookie_count(count: u64) -> String {
     out.chars().rev().collect()
 }
 
-/// Cookie-sync execution seam.
-///
-/// On the legacy `browser-use-core` engine this was a one-shot standalone
-/// browser command (`run_standalone_browser_command_with_browser_use_api_key`)
-/// that scanned local Chromium profiles and uploaded their cookies to a Browser
-/// Use cloud profile. The new `browser-use-agent` engine does not expose a
-/// standalone command runner, so the actual scan/upload is not wired here. The
-/// entire cookie-sync UI (palette `/sync-cookies`, the Cookie Sync surface, the
-/// profile picker, and the loading/ready/syncing/completed/failed screens) is
-/// preserved verbatim; only this terminal step reports the missing backend
-/// instead of pretending to run it. See the engine-gap note in the commit.
 fn run_standalone_browser_command_with_browser_use_api_key(
-    _label: &str,
-    _cwd: &Path,
-    _artifact_root: &Path,
-    _command: &str,
-    _api_key: Option<String>,
+    label: &str,
+    cwd: &Path,
+    artifact_root: &Path,
+    command: &str,
+    api_key: Option<String>,
 ) -> Result<serde_json::Value> {
-    anyhow::bail!(
-        "Cookie sync is not available on the browser-use-agent engine yet \
-         (no standalone browser command runner)."
-    )
+    let options = browser_use_browser::BrowserCommandOptions {
+        browser_use_api_key: api_key,
+    };
+    Ok(browser_use_browser::run_browser_command_with_options(
+        label,
+        cwd,
+        artifact_root,
+        command,
+        options,
+    )?
+    .content)
 }
 
 fn browser_shell_quote_arg(arg: &str) -> String {
@@ -7722,6 +7781,9 @@ fn handle_terminal_event(
             let before_cursor = app.composer.cursor_index();
             let logo_handled = matches!(kind, MouseEventKind::Down(_))
                 && app.handle_welcome_logo_click(column, row);
+            if !logo_handled && matches!(kind, MouseEventKind::Down(_)) {
+                app.handle_composer_click(column, row);
+            }
             app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
             Ok(false)
         }
@@ -8419,6 +8481,31 @@ mod redesign_tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn startup_defaults_to_openrouter_provider_path() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app_home = temp.path().join("browser-use-terminal-home");
+        let state_dir = temp.path().join("state");
+        with_browser_use_terminal_home(&app_home, || -> Result<()> {
+            let args = Args::try_parse_from([
+                "but",
+                "--state-dir",
+                state_dir.to_str().context("state dir is utf-8")?,
+            ])?;
+            assert_eq!(args.account, settings::ACCOUNT_OPENROUTER);
+            assert_eq!(args.agent, AgentBackend::Openrouter);
+
+            let app = App::new(args)?;
+            assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
+            assert_eq!(app.agent_backend, AgentBackend::Openrouter);
+            assert_eq!(app.model, "GPT-5.5");
+            assert_eq!(app.provider_model, "openai/gpt-5.5");
+            assert_eq!(app.model_provider_id.as_deref(), Some("openrouter"));
+            Ok(())
+        })?;
+        Ok(())
     }
 
     // The new engine's `typed_user_input_payload_from_items_for_cwd`
@@ -9961,7 +10048,9 @@ mod redesign_tests {
         assert_eq!(app.surface, Surface::Main);
         assert!(app.setup_complete);
         assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
-        assert_eq!(app.model, "Qwen3.6 Plus");
+        assert_eq!(app.model, "GPT-5.5");
+        assert_eq!(app.provider_model, "openai/gpt-5.5");
+        assert_eq!(app.agent_backend, AgentBackend::Openrouter);
         Ok(())
     }
 

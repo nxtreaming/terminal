@@ -115,6 +115,100 @@ fn turn_with_tool_call_and_output() {
 }
 
 #[test]
+fn codex_shaped_stream_and_tool_events_replay() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "run the tool" })),
+        event(
+            2,
+            "model.stream_delta",
+            json!({ "text": "I will run it. " }),
+        ),
+        event(
+            3,
+            "tool.started",
+            json!({
+                "tool_call_id": "call_1",
+                "name": "do_thing",
+                "arguments": { "x": 1 },
+            }),
+        ),
+        event(
+            4,
+            "tool.output",
+            json!({
+                "tool_call_id": "call_1",
+                "name": "do_thing",
+                "text": "tool result",
+            }),
+        ),
+        event(5, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 3, "messages: {messages:#?}");
+    assert_eq!(
+        messages[1].get("content").and_then(Value::as_str),
+        Some("I will run it. ")
+    );
+    let calls = messages[1]
+        .get("tool_calls")
+        .and_then(Value::as_array)
+        .expect("tool call replayed");
+    assert_eq!(calls[0].get("id").and_then(Value::as_str), Some("call_1"));
+    assert_eq!(
+        calls[0].get("name").and_then(Value::as_str),
+        Some("do_thing")
+    );
+    assert_eq!(
+        messages[2].get("content").and_then(Value::as_str),
+        Some("tool result")
+    );
+}
+
+#[test]
+fn streaming_delta_overlap_is_utf8_boundary_safe() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "read the title" })),
+        event(
+            2,
+            "model.stream_delta",
+            json!({ "text": "The page title is “" }),
+        ),
+        event(
+            3,
+            "model.stream_delta",
+            json!({ "text": "Example Domain”." }),
+        ),
+        event(4, "session.done", json!({})),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(
+        messages[1].get("content").and_then(Value::as_str),
+        Some("The page title is “Example Domain”.")
+    );
+}
+
+#[test]
+fn session_done_result_replays_when_no_stream_text_exists() {
+    let events = vec![
+        event(1, "session.input", json!({ "text": "hello" })),
+        event(2, "session.done", json!({ "result": "hi back" })),
+    ];
+
+    let messages = provider_messages_from_events(&events);
+    assert_eq!(messages.len(), 2, "messages: {messages:#?}");
+    assert_eq!(
+        messages[1].get("role").and_then(Value::as_str),
+        Some("assistant")
+    );
+    assert_eq!(
+        messages[1].get("content").and_then(Value::as_str),
+        Some("hi back")
+    );
+}
+
+#[test]
 fn compaction_checkpoint_seeds_replacement_history() {
     let events = vec![
         event(1, "session.input", json!({ "text": "first user message" })),

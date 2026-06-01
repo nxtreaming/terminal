@@ -75,7 +75,9 @@ pub(crate) const STORE_EVENT_TYPES: &[&str] = &[
     "model.response.input_item",
     "model.tool_call",
     "model.delta",
+    "model.stream_delta",
     "model.thinking_delta",
+    "tool.started",
     "tool.output",
     "tool.failed",
     "tool.finished",
@@ -519,11 +521,16 @@ pub fn provider_messages_from_event_slice(
                 emitted_tool_messages.insert(call_id.to_string());
                 turn_open = true;
             }
-            "model.delta" => {
+            "model.delta" | "model.stream_delta" => {
                 if suppress_terminal_tail {
                     continue;
                 }
-                if let Some(text) = event.payload.get("text").and_then(Value::as_str) {
+                if let Some(text) = event
+                    .payload
+                    .get("text")
+                    .or_else(|| event.payload.get("delta"))
+                    .and_then(Value::as_str)
+                {
                     if let Some(delta) = assistant_delta_to_append(&assistant_text, text) {
                         assistant_text.push_str(&delta);
                         turn_open = true;
@@ -552,6 +559,38 @@ pub fn provider_messages_from_event_slice(
                     }
                 }
                 assistant_tool_calls.push(call);
+                turn_open = true;
+            }
+            "tool.started" => {
+                if suppress_terminal_tail {
+                    continue;
+                }
+                let call_id = event
+                    .payload
+                    .get("tool_call_id")
+                    .or_else(|| event.payload.get("id"))
+                    .and_then(Value::as_str)
+                    .unwrap_or("call");
+                let Some(name) = event.payload.get("name").and_then(Value::as_str) else {
+                    continue;
+                };
+                if assistant_tool_calls
+                    .iter()
+                    .any(|existing| tool_call_id_from_value(existing) == Some(call_id))
+                {
+                    continue;
+                }
+                tool_names.insert(call_id.to_string(), name.to_string());
+                assistant_tool_calls.push(serde_json::json!({
+                    "id": call_id,
+                    "name": name,
+                    "arguments": event
+                        .payload
+                        .get("arguments")
+                        .or_else(|| event.payload.get("input"))
+                        .cloned()
+                        .unwrap_or_else(|| serde_json::json!({})),
+                }));
                 turn_open = true;
             }
             "tool.output" => {
@@ -651,7 +690,26 @@ pub fn provider_messages_from_event_slice(
                 turn_open = false;
                 suppress_terminal_tail = true;
             }
-            "session.done" | "session.failed" => {
+            "session.done" => {
+                if !suppress_terminal_tail
+                    && assistant_text.is_empty()
+                    && assistant_tool_calls.is_empty()
+                {
+                    if let Some(result) = event.payload.get("result").and_then(Value::as_str) {
+                        assistant_text.push_str(result);
+                    }
+                }
+                flush_assistant(
+                    messages,
+                    &mut assistant_text,
+                    &mut assistant_phase,
+                    &mut assistant_reasoning_content,
+                    &mut assistant_tool_calls,
+                );
+                turn_open = false;
+                suppress_terminal_tail = true;
+            }
+            "session.failed" => {
                 flush_assistant(
                     messages,
                     &mut assistant_text,
@@ -1116,8 +1174,12 @@ fn assistant_delta_to_append(current: &str, incoming: &str) -> Option<String> {
 fn longest_suffix_prefix_overlap(current: &str, incoming: &str) -> Option<usize> {
     let max = current.len().min(incoming.len());
     (1..=max).rev().find_map(|len| {
-        let current_tail = &current[current.len() - len..];
-        let incoming_head = incoming.get(..len)?;
+        let current_start = current.len() - len;
+        if !current.is_char_boundary(current_start) || !incoming.is_char_boundary(len) {
+            return None;
+        }
+        let current_tail = &current[current_start..];
+        let incoming_head = &incoming[..len];
         (current_tail == incoming_head).then_some(len)
     })
 }

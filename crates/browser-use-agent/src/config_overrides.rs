@@ -20,9 +20,11 @@
 //! in [`crate::prompts`] and is reused so the two engines agree on the mode set.
 
 use std::collections::HashMap;
+use std::fs;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
-use anyhow::{anyhow, bail, Result};
+use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
@@ -111,10 +113,66 @@ impl EnvironmentNetworkContext {
 pub struct ChildAgentRunRequest {
     pub parent_session_id: String,
     pub child_session_id: String,
+    pub message: String,
+    pub agent_path: Option<String>,
+    pub nickname: Option<String>,
+    pub role: Option<String>,
+    pub fork_turns: Option<String>,
     pub model: Option<String>,
     pub reasoning_effort: Option<String>,
     pub service_tier: Option<String>,
     pub config_overrides: Vec<(String, toml::Value)>,
+    pub completion_handler: Option<ChildAgentCompletionHandler>,
+}
+
+/// Terminal status reported by a child agent back to its parent run.
+#[derive(Clone, Debug)]
+pub struct ChildAgentRunCompletion {
+    pub success: bool,
+    pub summary: Option<String>,
+}
+
+impl ChildAgentRunCompletion {
+    pub fn success(summary: impl Into<Option<String>>) -> Self {
+        Self {
+            success: true,
+            summary: summary.into(),
+        }
+    }
+
+    pub fn failure(error: impl Into<String>) -> Self {
+        Self {
+            success: false,
+            summary: Some(error.into()),
+        }
+    }
+}
+
+/// Opaque, cloneable callback used by child runners to notify parent runs.
+#[derive(Clone)]
+pub struct ChildAgentCompletionHandler {
+    notify: Arc<dyn Fn(ChildAgentRunCompletion) -> Result<()> + Send + Sync>,
+}
+
+impl std::fmt::Debug for ChildAgentCompletionHandler {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ChildAgentCompletionHandler")
+            .finish_non_exhaustive()
+    }
+}
+
+impl ChildAgentCompletionHandler {
+    pub fn new(
+        notify: impl Fn(ChildAgentRunCompletion) -> Result<()> + Send + Sync + 'static,
+    ) -> Self {
+        Self {
+            notify: Arc::new(notify),
+        }
+    }
+
+    pub fn notify(&self, completion: ChildAgentRunCompletion) -> Result<()> {
+        (self.notify)(completion)
+    }
 }
 
 /// Opaque, cloneable callback used to launch child agents.
@@ -176,8 +234,7 @@ pub struct AgentRunOptions {
     /// Empty (the default) registers no `mcp` tool, preserving prior behavior.
     /// Each entry maps a logical server name (the `{server}` segment of an
     /// `mcp__{server}__{tool}` call) to its launch config. Populated by the
-    /// TUI/CLI from a `[mcp_servers]` config table (a TOML loader is a follow-up;
-    /// the registration wiring is live as soon as this map is non-empty).
+    /// TUI/CLI from a `[mcp_servers]` config table or explicit MCP config file.
     pub mcp_servers: HashMap<String, McpServerConfig>,
     /// How aggressively the agent asks before running a gated tool call.
     ///
@@ -457,6 +514,166 @@ pub fn parse_config_overrides(raw_config_overrides: &[String]) -> Result<ConfigO
         .collect()
 }
 
+#[derive(Default, Deserialize)]
+struct RuntimeConfigToml {
+    #[serde(default)]
+    mcp_servers: HashMap<String, McpServerConfig>,
+    #[serde(default)]
+    approval_policy: Option<String>,
+    #[serde(default)]
+    ask_for_approval: Option<String>,
+    #[serde(default)]
+    guardian: Option<bool>,
+    #[serde(default)]
+    use_guardian: Option<bool>,
+}
+
+/// Load `[mcp_servers]` from `$BROWSER_USE_TERMINAL_HOME/config.toml`, the
+/// active profile config, and explicit MCP config files. Later layers win.
+pub fn load_mcp_servers_for_profile(
+    config_profile: Option<&str>,
+    explicit_paths: &[PathBuf],
+) -> Result<HashMap<String, McpServerConfig>> {
+    let mut servers = HashMap::new();
+    for path in existing_runtime_config_paths(config_profile) {
+        servers.extend(read_runtime_config_toml(&path)?.mcp_servers);
+    }
+    for path in explicit_paths {
+        if !path.exists() {
+            bail!("MCP config file does not exist: {}", path.display());
+        }
+        servers.extend(read_runtime_config_toml(path)?.mcp_servers);
+    }
+    Ok(servers)
+}
+
+/// Resolve the run approval policy from explicit CLI choice, `--config`
+/// overrides, or the active config.toml layer. `None` means keep defaults.
+pub fn resolve_approval_policy_for_profile(
+    config_profile: Option<&str>,
+    config_overrides: &ConfigOverrides,
+    explicit: Option<AskForApproval>,
+) -> Result<Option<AskForApproval>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    if let Some(value) = config_override_str(config_overrides, "approval_policy")
+        .or_else(|| config_override_str(config_overrides, "ask_for_approval"))
+    {
+        return parse_approval_policy(&value).map(Some);
+    }
+    for path in existing_runtime_config_paths(config_profile)
+        .into_iter()
+        .rev()
+    {
+        let config = read_runtime_config_toml(&path)?;
+        if let Some(value) = config.approval_policy.or(config.ask_for_approval) {
+            return parse_approval_policy(&value).map(Some);
+        }
+    }
+    Ok(None)
+}
+
+/// Resolve the guardian gate from explicit CLI choice, `--config` overrides, or
+/// config.toml. `None` means keep defaults.
+pub fn resolve_guardian_for_profile(
+    config_profile: Option<&str>,
+    config_overrides: &ConfigOverrides,
+    explicit: Option<bool>,
+) -> Result<Option<bool>> {
+    if explicit.is_some() {
+        return Ok(explicit);
+    }
+    if let Some(value) = config_override_bool(config_overrides, "guardian")
+        .or_else(|| config_override_bool(config_overrides, "use_guardian"))
+    {
+        return Ok(Some(value));
+    }
+    for path in existing_runtime_config_paths(config_profile)
+        .into_iter()
+        .rev()
+    {
+        let config = read_runtime_config_toml(&path)?;
+        if let Some(value) = config.guardian.or(config.use_guardian) {
+            return Ok(Some(value));
+        }
+    }
+    Ok(None)
+}
+
+pub fn parse_approval_policy(raw: &str) -> Result<AskForApproval> {
+    let normalized = raw.trim().to_ascii_lowercase().replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "never" => Ok(AskForApproval::Never),
+        "on-failure" | "onfailure" => Ok(AskForApproval::OnFailure),
+        "on-request" | "onrequest" => Ok(AskForApproval::OnRequest),
+        "unless-trusted" | "unlesstrusted" => Ok(AskForApproval::UnlessTrusted),
+        other => bail!(
+            "invalid approval policy {other:?}; expected never, on-failure, on-request, or unless-trusted"
+        ),
+    }
+}
+
+fn read_runtime_config_toml(path: &Path) -> Result<RuntimeConfigToml> {
+    let contents = fs::read_to_string(path).with_context(|| format!("read {}", path.display()))?;
+    toml::from_str(&contents).with_context(|| format!("parse {}", path.display()))
+}
+
+fn existing_runtime_config_paths(config_profile: Option<&str>) -> Vec<PathBuf> {
+    runtime_config_paths(config_profile)
+        .into_iter()
+        .filter(|path| path.exists())
+        .collect()
+}
+
+fn runtime_config_paths(config_profile: Option<&str>) -> Vec<PathBuf> {
+    let Some(home) = terminal_home_dir() else {
+        return Vec::new();
+    };
+    let mut paths = vec![home.join("config.toml")];
+    if let Some(profile) = config_profile
+        .map(str::trim)
+        .filter(|profile| !profile.is_empty())
+    {
+        paths.push(home.join(format!("{profile}.config.toml")));
+    }
+    paths
+}
+
+fn terminal_home_dir() -> Option<PathBuf> {
+    std::env::var_os("BROWSER_USE_TERMINAL_HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| home_dir().map(|home| home.join(".browser-use-terminal")))
+}
+
+fn home_dir() -> Option<PathBuf> {
+    std::env::var_os("HOME")
+        .filter(|value| !value.is_empty())
+        .map(PathBuf::from)
+        .or_else(|| {
+            std::env::var_os("USERPROFILE")
+                .filter(|value| !value.is_empty())
+                .map(PathBuf::from)
+        })
+}
+
+fn config_override_str(overrides: &ConfigOverrides, key: &str) -> Option<String> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == key)
+        .and_then(|(_, value)| value.as_str().map(str::to_string))
+}
+
+fn config_override_bool(overrides: &ConfigOverrides, key: &str) -> Option<bool> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == key)
+        .and_then(|(_, value)| value.as_bool())
+}
+
 /// Mirrors `browser-use-core::canonicalize_config_override_key`
 /// (`config_overrides.rs:35`).
 fn canonicalize_config_override_key(key: &str) -> String {
@@ -524,6 +741,9 @@ fn apply_toml_override(root: &mut toml::Value, path: &str, value: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn ov(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
@@ -596,6 +816,79 @@ mod tests {
     fn rejects_missing_equals_and_empty_key() {
         assert!(parse_config_overrides(&ov(&["no_equals_here"])).is_err());
         assert!(parse_config_overrides(&ov(&["=value"])).is_err());
+    }
+
+    #[test]
+    fn parses_approval_policy_names() {
+        assert_eq!(
+            parse_approval_policy("never").unwrap(),
+            AskForApproval::Never
+        );
+        assert_eq!(
+            parse_approval_policy("on_request").unwrap(),
+            AskForApproval::OnRequest
+        );
+        assert_eq!(
+            parse_approval_policy("unless-trusted").unwrap(),
+            AskForApproval::UnlessTrusted
+        );
+        assert!(parse_approval_policy("sometimes").is_err());
+    }
+
+    #[test]
+    fn runtime_config_loads_profile_mcp_approval_and_guardian() {
+        let _guard = ENV_LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .expect("env lock poisoned");
+        let temp = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
+        unsafe {
+            std::env::set_var("BROWSER_USE_TERMINAL_HOME", temp.path());
+        }
+        std::fs::write(
+            temp.path().join("config.toml"),
+            r#"
+approval_policy = "on-failure"
+guardian = false
+
+[mcp_servers.base]
+transport = "stdio"
+command = "base-server"
+"#,
+        )
+        .unwrap();
+        std::fs::write(
+            temp.path().join("work.config.toml"),
+            r#"
+approval_policy = "on-request"
+use_guardian = true
+
+[mcp_servers.profile]
+transport = "stdio"
+command = "profile-server"
+"#,
+        )
+        .unwrap();
+
+        let servers = load_mcp_servers_for_profile(Some("work"), &[]).unwrap();
+        assert!(servers.contains_key("base"));
+        assert!(servers.contains_key("profile"));
+        assert_eq!(
+            resolve_approval_policy_for_profile(Some("work"), &Vec::new(), None).unwrap(),
+            Some(AskForApproval::OnRequest)
+        );
+        assert_eq!(
+            resolve_guardian_for_profile(Some("work"), &Vec::new(), None).unwrap(),
+            Some(true)
+        );
+
+        unsafe {
+            match previous {
+                Some(value) => std::env::set_var("BROWSER_USE_TERMINAL_HOME", value),
+                None => std::env::remove_var("BROWSER_USE_TERMINAL_HOME"),
+            }
+        }
     }
 
     #[test]
@@ -746,10 +1039,16 @@ mod tests {
             .run(ChildAgentRunRequest {
                 parent_session_id: "parent".to_string(),
                 child_session_id: "child".to_string(),
+                message: "do work".to_string(),
+                agent_path: Some("/root/child".to_string()),
+                nickname: None,
+                role: None,
+                fork_turns: None,
                 model: None,
                 reasoning_effort: None,
                 service_tier: None,
                 config_overrides: Vec::new(),
+                completion_handler: None,
             })
             .unwrap();
         assert_eq!(calls.load(Ordering::SeqCst), 1);

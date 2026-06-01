@@ -29,7 +29,7 @@ use browser_use_llm::providers::{
     Anthropic, AnthropicConfig, OpenAi, OpenAiCompatible, OpenAiConfig,
 };
 use browser_use_llm::route::{ModelClient, Route};
-use browser_use_llm::schema::{LlmRequest, Message};
+use browser_use_llm::schema::{LlmRequest, Message, SystemPart};
 
 use crate::events::{EventSink, TurnCtx};
 use crate::turn::sampling::{ModelClientTransport, ModelSamplingDriver};
@@ -237,6 +237,8 @@ pub fn build_transport(
     messages: Vec<Message>,
 ) -> ModelClientTransport {
     let mut req = LlmRequest::new(ctx.model.clone(), ctx.provider.clone());
+    req.system
+        .push(SystemPart::new(crate::prompts::system_prompt()));
     req.messages = messages;
     ModelClientTransport::new(client, route, req)
 }

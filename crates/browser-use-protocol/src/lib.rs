@@ -506,7 +506,12 @@ pub fn turn_streaming_text_from_events(events: &[EventRecord]) -> Option<String>
                 text.clear();
             }
             "model.stream_delta" => {
-                if let Some(incoming) = event.payload.get("text").and_then(Value::as_str) {
+                if let Some(incoming) = event
+                    .payload
+                    .get("text")
+                    .or_else(|| event.payload.get("delta"))
+                    .and_then(Value::as_str)
+                {
                     append_streaming_text_delta(&mut text, incoming);
                 }
             }
@@ -524,7 +529,12 @@ pub fn turn_thinking_text_from_events(events: &[EventRecord]) -> Option<String> 
                 text.clear();
             }
             "model.thinking_delta" => {
-                if let Some(incoming) = event.payload.get("text").and_then(Value::as_str) {
+                if let Some(incoming) = event
+                    .payload
+                    .get("text")
+                    .or_else(|| event.payload.get("delta"))
+                    .and_then(Value::as_str)
+                {
                     append_streaming_text_delta(&mut text, incoming);
                 }
             }

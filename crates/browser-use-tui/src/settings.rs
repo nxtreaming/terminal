@@ -222,6 +222,14 @@ fn preset_choice(
 fn static_external_model_choices() -> Vec<ModelChoice> {
     vec![
         ModelChoice {
+            display: "GPT-5.5".to_string(),
+            account: ACCOUNT_OPENROUTER,
+            backend: AgentBackend::Openrouter,
+            provider_model: "openai/gpt-5.5".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::OpenRouter,
+        },
+        ModelChoice {
             display: "Claude Sonnet 4.6".to_string(),
             account: ACCOUNT_ANTHROPIC,
             backend: AgentBackend::Anthropic,

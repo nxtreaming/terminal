@@ -55,7 +55,6 @@
 //! uses. Every store call is dispatched through `spawn_blocking` to keep the async
 //! runtime unblocked, mirroring [`crate::session::sink`].
 
-use std::sync::Arc;
 use std::time::Duration;
 
 use browser_use_protocol::EventRecord;
@@ -275,7 +274,7 @@ where
 mod tests {
     use super::*;
     use browser_use_store::Store;
-    use std::sync::Mutex;
+    use std::sync::{Arc, Mutex};
     use tempfile::TempDir;
 
     /// A tempdir-backed `SharedStore` plus a fresh session id. The `TempDir` is

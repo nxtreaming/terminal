@@ -212,6 +212,7 @@ async fn tool_call_sets_follow_up_and_records_message_and_events() {
     assert_eq!(
         types,
         vec![
+            names::MODEL_TURN_REQUEST,
             names::MODEL_STREAM_DELTA,
             names::MODEL_STREAM_DELTA,
             names::TOOL_STARTED,
@@ -220,7 +221,7 @@ async fn tool_call_sets_follow_up_and_records_message_and_events() {
         "mapped UI events must be emitted in stream order"
     );
     // The tool.started payload carries the tool name.
-    let tool_started = &events[2];
+    let tool_started = &events[3];
     assert_eq!(tool_started.payload["name"], serde_json::json!("search"));
 }
 

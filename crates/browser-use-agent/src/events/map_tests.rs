@@ -37,7 +37,7 @@ fn text_delta_maps_to_stream_delta() {
         vec![PendingEvent::new(
             "sess-1",
             names::MODEL_STREAM_DELTA,
-            json!({ "delta": "hello" }),
+            json!({ "text": "hello", "delta": "hello" }),
         )]
     );
 }
@@ -56,7 +56,7 @@ fn reasoning_delta_maps_to_thinking_delta() {
         vec![PendingEvent::new(
             "sess-1",
             names::MODEL_THINKING_DELTA,
-            json!({ "delta": "thinking" }),
+            json!({ "text": "thinking", "delta": "thinking" }),
         )]
     );
 }
@@ -76,7 +76,7 @@ fn tool_call_maps_to_tool_started_with_parsed_arguments() {
         vec![PendingEvent::new(
             "sess-1",
             names::TOOL_STARTED,
-            json!({ "name": "click", "arguments": { "index": 5 } }),
+            json!({ "name": "click", "tool_call_id": "c0", "arguments": { "index": 5 } }),
         )]
     );
 }

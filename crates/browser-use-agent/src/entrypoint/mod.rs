@@ -64,9 +64,7 @@ use crate::context::workspace_context::append_environment_context_event;
 use crate::context::{ContextManager, Item};
 use crate::decision::SamplingOutcome;
 use crate::decision::TokenStatus;
-use crate::events::EventSink;
-use crate::events::PendingEvent;
-use crate::events::TurnCtx;
+use crate::events::{names, session_done_payload, EventSink, PendingEvent, TurnCtx};
 use crate::session::provider_messages_from_events;
 use crate::session::SessionId;
 use crate::session::SharedStore;
@@ -250,13 +248,15 @@ impl CompactionSampler for EntrypointSampler {
         request: Vec<Message>,
         cancel: CancellationToken,
     ) -> Result<String, AgentError> {
-        use browser_use_llm::schema::{LlmEvent, LlmRequest};
+        use browser_use_llm::schema::{LlmEvent, LlmRequest, SystemPart};
         use futures_util::StreamExt;
 
         // Tool-free request (tools deliberately empty — the summary pass must not
         // call tools). `request` already carries the history + the summarization
         // prompt as its final user message (assembled by `run_compaction`).
         let mut req = LlmRequest::new(self.model.clone(), self.provider.clone());
+        req.system
+            .push(SystemPart::new(crate::prompts::system_prompt()));
         req.messages = request;
 
         // Open the model stream. `ModelClient::stream` is async; the entrypoint
@@ -547,10 +547,10 @@ fn message_to_provider_item(message: &Message) -> Item {
 
 /// A [`TurnObserver`] that maps loop lifecycle into the durable UI event log.
 ///
-/// On turn completion it emits the final agent message as an `agent.message`
-/// event through the durable UI sink, so the run's result is persisted (parity:
-/// the legacy run path persisted the final assistant message). The streaming text
-/// deltas are already emitted by the sampling driver through its own sink.
+/// On turn completion it emits the final agent message as a `session.done`
+/// event through the durable UI sink, so the run's result is visible to the TUI
+/// and protocol reducers. The streaming text deltas are emitted by the sampling
+/// driver through the same durable sink.
 struct StoreObserver {
     sink: Arc<dyn EventSink>,
     session_id: String,
@@ -566,7 +566,7 @@ impl TurnObserver for StoreObserver {
     fn on_lifecycle(&self, ev: TurnLifecycleEvent) {
         // Phase-E seam: started/aborted lifecycle markers are not surfaced as
         // store events yet (the legacy stack had richer turn-lifecycle telemetry).
-        // We persist the terminal agent message, which is what readers need today.
+        // We persist the terminal session result, which is what readers need today.
         if let TurnLifecycleEvent::TurnComplete {
             last_agent_message: Some(text),
             ..
@@ -574,8 +574,8 @@ impl TurnObserver for StoreObserver {
         {
             self.sink.emit(PendingEvent::new(
                 self.session_id.clone(),
-                "agent.message",
-                serde_json::json!({ "content": text }),
+                names::SESSION_DONE,
+                session_done_payload(Some(&text), None),
             ));
         }
     }
@@ -627,14 +627,11 @@ fn turn_ctx(session_id: &SessionId, config: &ProviderRunConfig) -> TurnCtx {
     }
 }
 
-/// A no-op UI [`EventSink`] for the sampling driver's emitted events.
-///
-/// Phase-E seam: production routes the driver's UI events to a real
-/// [`StoreSink`]/TUI sink. The facade discards them for now — the run's durable
-/// result is still persisted by [`StoreObserver`] — so a run is exercisable
-/// without a UI wired up. Wave-E threads the real UI sink here.
+/// A no-op UI [`EventSink`] for tests that need to suppress emitted events.
+#[cfg(test)]
 struct DiscardSink;
 
+#[cfg(test)]
 impl EventSink for DiscardSink {
     fn emit(&self, _ev: PendingEvent) {}
 }
@@ -739,7 +736,7 @@ pub async fn run_session_with_config(
     //     backend the driver is fused with the production tool dispatcher + a
     //     recorder writing into `recorded`, so model tool-calls EXECUTE and their
     //     outputs re-enter the prompt.
-    let driver_sink: Arc<dyn EventSink> = Arc::new(DiscardSink);
+    let driver_sink: Arc<dyn EventSink> = make_ui_sink(Arc::clone(&store));
     let fusion_recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
         buffer: Arc::clone(&recorded),
     });
@@ -753,7 +750,11 @@ pub async fn run_session_with_config(
     let user_input_ctx = Some((Arc::clone(&store), session_id.clone()));
     let resolved = {
         let store_guard = store.lock().expect("store mutex poisoned");
-        provider::resolve_provider(
+        let tool_cwd = store_guard
+            .load_session(session_id.as_str())?
+            .map(|session| std::path::PathBuf::from(session.cwd))
+            .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
+        provider::resolve_provider_with_tool_cwd(
             &config,
             Some(&store_guard),
             driver_sink,
@@ -761,6 +762,7 @@ pub async fn run_session_with_config(
             max_retries(&config),
             fusion_recorder,
             user_input_ctx,
+            tool_cwd,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?
     };
@@ -934,10 +936,10 @@ mod tests {
             log.iter().any(|e| e.event_type == "workspace.context"),
             "expected a seeded workspace.context event"
         );
-        // the terminal agent message was persisted by the observer.
+        // the terminal agent message was persisted as the visible session result.
         assert!(
-            log.iter().any(|e| e.event_type == "agent.message"
-                && e.payload.get("content").and_then(|v| v.as_str()) == Some("hi from fake")),
+            log.iter().any(|e| e.event_type == "session.done"
+                && e.payload.get("result").and_then(|v| v.as_str()) == Some("hi from fake")),
             "expected the fake assistant reply persisted; log={log:?}"
         );
     }
@@ -956,8 +958,8 @@ mod tests {
             !log.iter().any(|e| e.event_type == "session.input"),
             "no user input should be present"
         );
-        // The agent still produced (and persisted) a reply.
-        assert!(log.iter().any(|e| e.event_type == "agent.message"));
+        // The agent still produced (and persisted) a visible result.
+        assert!(log.iter().any(|e| e.event_type == "session.done"));
     }
 
     /// The codex backend is a REAL provider again: with codex OAuth creds in the

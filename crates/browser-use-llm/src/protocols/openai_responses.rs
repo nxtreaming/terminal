@@ -47,6 +47,7 @@ impl Protocol for OpenAiResponsesProtocol {
         let mut body = Map::new();
         body.insert("model".to_string(), json!(request.model.as_str()));
         body.insert("stream".to_string(), json!(true));
+        body.insert("store".to_string(), json!(false));
 
         // Top-level system prompt: join all system parts with blank lines.
         if !request.system.is_empty() {
@@ -66,8 +67,14 @@ impl Protocol for OpenAiResponsesProtocol {
         body.insert("input".to_string(), Value::Array(input));
 
         if !request.tools.is_empty() {
-            let tools: Vec<Value> = request.tools.iter().map(lower_tool).collect();
-            body.insert("tools".to_string(), Value::Array(tools));
+            let tools: Vec<Value> = request
+                .tools
+                .iter()
+                .filter_map(|tool| lower_tool(tool, request.provider.as_str()))
+                .collect();
+            if !tools.is_empty() {
+                body.insert("tools".to_string(), Value::Array(tools));
+            }
         }
 
         if let Some(choice) = &request.tool_choice {
@@ -241,25 +248,25 @@ fn flatten_tool_result(content: &[ContentPart]) -> String {
 /// Lower a [`ToolDefinition`] into a Responses tool entry.
 ///
 /// Most tools are plain function tools (`{"type":"function", "name", ...}`).
-/// `web_search` is the EXCEPTION: the OpenAI Responses API rejects it as a
-/// function tool — it is a HOSTED tool that must be emitted as
-/// `{"type":"web_search_preview"}` (no `name`/`description`/`parameters`
-/// wrapper). This mirrors the legacy provider encoding (the
-/// `responses_tools_encode_hosted_web_search_and_image_generation_like_codex`
-/// test) and codex's `ModelClient`, which maps the `web_search` tool to the
-/// Responses hosted `web_search_preview` type.
-fn lower_tool(tool: &ToolDefinition) -> Value {
+/// `web_search` is the EXCEPTION for first-party OpenAI Responses: it is a
+/// hosted tool encoded as `{"type":"web_search_preview"}`. The ChatGPT-backed
+/// Codex endpoint currently rejects that hosted type, so the Codex route omits
+/// it and relies on local/browser tools instead.
+fn lower_tool(tool: &ToolDefinition, provider: &str) -> Option<Value> {
     if tool.name == "web_search" {
+        if provider.eq_ignore_ascii_case("codex") {
+            return None;
+        }
         // Hosted tool: the Responses API names it `web_search_preview` and takes
         // no function envelope.
-        return json!({ "type": "web_search_preview" });
+        return Some(json!({ "type": "web_search_preview" }));
     }
-    json!({
+    Some(json!({
         "type": "function",
         "name": tool.name,
         "description": tool.description,
         "parameters": tool.input_schema,
-    })
+    }))
 }
 
 /// Lower a [`ToolChoice`] into the Responses `tool_choice` value.
@@ -906,6 +913,31 @@ mod tests {
             tools.iter().all(|t| t["name"] != json!("web_search")),
             "web_search must NOT appear as a function tool named web_search"
         );
+    }
+
+    #[test]
+    fn codex_route_omits_hosted_web_search_preview() {
+        let mut request = LlmRequest::new("gpt-5.5", "codex");
+        request.tools.push(ToolDefinition {
+            name: "shell".to_string(),
+            description: "Run a shell command".to_string(),
+            input_schema: json!({ "type": "object" }),
+        });
+        request.tools.push(ToolDefinition {
+            name: "web_search".to_string(),
+            description: "Search the web".to_string(),
+            input_schema: json!({ "type": "object" }),
+        });
+
+        let body = OpenAiResponsesProtocol::new()
+            .build_body(&request)
+            .expect("build_body");
+        let tools = body["tools"].as_array().expect("tools array");
+        assert_eq!(tools.len(), 1);
+        assert_eq!(tools[0]["name"], json!("shell"));
+        assert!(tools
+            .iter()
+            .all(|tool| tool["type"] != "web_search_preview"));
     }
 
     #[test]

@@ -24,6 +24,7 @@ use super::sandbox::{
 };
 
 /// Context handed to a tool when it runs. Codex parity: `ToolCtx`.
+#[derive(Clone)]
 pub struct ToolCtx {
     pub call_id: String,
     pub tool_name: String,

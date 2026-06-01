@@ -61,6 +61,8 @@ pub struct ChildSpec {
     pub depth: i32,
     /// The initial message/prompt for the child.
     pub message: String,
+    /// The parent's requested history-fork mode.
+    pub fork_turns: Option<String>,
     /// The child's resolved config (after the role layer was applied).
     pub config: AgentConfigLayer,
 }
@@ -192,7 +194,7 @@ impl SubagentManager {
         // 3. Mint a unique path + id, draw a nickname from the role's pool.
         let seq = self.next_id.fetch_add(1, Ordering::AcqRel);
         let agent_path = format!("{}/{}_{}", parent.agent_path, args.task_name, seq);
-        let agent_id = format!("agent-{seq}");
+        let agent_id = format!("{:04x}{:08x}", seq & 0xffff, rand::random::<u32>());
         let nickname = role
             .nickname_candidates
             .as_ref()
@@ -216,6 +218,7 @@ impl SubagentManager {
             role: config.role.clone(),
             depth: child_depth,
             message: args.message.clone(),
+            fork_turns: args.fork_turns.clone(),
             config,
         };
         match self.spawner.spawn_child(spec).await {

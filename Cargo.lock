@@ -342,6 +342,7 @@ dependencies = [
  "anyhow",
  "arboard",
  "browser-use-agent",
+ "browser-use-browser",
  "browser-use-protocol",
  "browser-use-providers",
  "browser-use-store",

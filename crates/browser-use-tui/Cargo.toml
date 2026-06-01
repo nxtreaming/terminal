@@ -12,6 +12,7 @@ path = "src/main.rs"
 anyhow.workspace = true
 arboard.workspace = true
 browser-use-agent = { path = "../browser-use-agent" }
+browser-use-browser = { path = "../browser-use-browser" }
 browser-use-providers = { path = "../browser-use-providers" }
 browser-use-protocol = { path = "../browser-use-protocol" }
 browser-use-store = { path = "../browser-use-store" }

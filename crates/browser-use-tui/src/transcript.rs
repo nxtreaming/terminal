@@ -2155,6 +2155,7 @@ fn active_tool_status(name: &str) -> Option<(&'static str, &'static str)> {
     match name {
         "browser_script" => Some(("browser", "running browser script")),
         "python" => Some(("python", "running browser Python")),
+        "shell" => Some(("run", "running command")),
         "exec_command" => Some(("run", "running command")),
         "write_stdin" => Some(("run", "writing to command")),
         "apply_patch" => Some(("edit", "applying patch")),
@@ -2173,6 +2174,7 @@ fn tool_output_group(name: &str) -> &str {
     match name {
         "browser_script" => "browser",
         "python" => "python",
+        "shell" => "run",
         _ => "tool",
     }
 }
@@ -3876,6 +3878,32 @@ mod tests {
         assert!(!lines
             .iter()
             .any(|line| line.contains("Traceback (most recent call last)")));
+    }
+
+    #[test]
+    fn shell_tool_output_uses_run_group_and_shows_text() {
+        let event = EventRecord {
+            seq: 8,
+            id: "event-8".to_string(),
+            session_id: "session".to_string(),
+            ts_ms: 0,
+            event_type: "tool.output".to_string(),
+            payload: serde_json::json!({
+                "name": "shell",
+                "text": "hello from command\nsecond line"
+            }),
+        };
+
+        let node = tool_output_node(&event).expect("tool output node");
+        let text = node
+            .display_lines(120, DisplayMode::Scrollback)
+            .iter()
+            .map(line_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+
+        assert!(text.contains("• run"), "{text}");
+        assert!(text.contains("hello from command"), "{text}");
     }
 
     #[test]

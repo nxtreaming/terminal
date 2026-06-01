@@ -40,7 +40,7 @@
 //! matching the legacy `stored_or_env` precedence. A missing credential surfaces
 //! as [`ProviderResolveError::MissingCredentials`] (honest, never a panic).
 
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 
 use browser_use_llm::auth::{load_codex_auth, CodexAuth};
 use browser_use_llm::route::ModelClient;
@@ -48,7 +48,9 @@ use browser_use_store::Store;
 
 use crate::config_overrides::ProviderBackend;
 use crate::config_overrides::ProviderRunConfig;
-use crate::config_overrides::{ChildAgentRunRequest, ChildAgentRunner};
+use crate::config_overrides::{
+    ChildAgentCompletionHandler, ChildAgentRunCompletion, ChildAgentRunRequest, ChildAgentRunner,
+};
 use crate::events::EventSink;
 use crate::events::PendingEvent;
 use crate::events::TurnCtx;
@@ -57,9 +59,12 @@ use crate::guardian::reviewer::{GuardianReviewer, StaticReviewer};
 use crate::guardian::Guardian;
 use crate::mcp::McpConnectionManager;
 use crate::session::{SessionId, SharedStore};
+use crate::subagents::mailbox::Mailbox;
 use crate::subagents::manager::{
     ChildHandle, ChildSpawner, ChildSpec, ParentContext, SubagentError, SubagentManager,
 };
+use crate::subagents::parent_link::{update_parent_from_child_run, ChildRunOutcome};
+use crate::subagents::registry::AgentRegistry;
 use crate::subagents::role::AgentConfigLayer;
 use crate::tools::approval::AskForApproval;
 use crate::tools::handlers::mcp::{McpClient, McpTool};
@@ -383,6 +388,30 @@ pub fn resolve_provider(
     recorder: Arc<dyn FusionRecorder>,
     user_input: Option<(SharedStore, SessionId)>,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
+    let tool_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    resolve_provider_with_tool_cwd(
+        config,
+        store,
+        sink,
+        ctx,
+        max_retries,
+        recorder,
+        user_input,
+        tool_cwd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_provider_with_tool_cwd(
+    config: &ProviderRunConfig,
+    store: Option<&Store>,
+    sink: Arc<dyn EventSink>,
+    ctx: TurnCtx,
+    max_retries: u32,
+    recorder: Arc<dyn FusionRecorder>,
+    user_input: Option<(SharedStore, SessionId)>,
+    tool_cwd: std::path::PathBuf,
+) -> Result<ResolvedProvider, ProviderResolveError> {
     // The Fake short-circuit lives in the inner builder (so we never spawn a
     // Python worker for a fake/cut/missing-credential run). For a real backend we
     // start the run's single Python worker EAGERLY here, then thread its backend
@@ -400,6 +429,7 @@ pub fn resolve_provider(
         recorder,
         None,
         user_input,
+        tool_cwd,
     )
 }
 
@@ -448,6 +478,7 @@ fn resolve_provider_with_python(
     recorder: Arc<dyn FusionRecorder>,
     python_backend: Option<Arc<dyn PythonBackend>>,
     user_input: Option<(SharedStore, SessionId)>,
+    tool_cwd: std::path::PathBuf,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
     // (1) backend → credentialed provider choice (env-then-store creds; codex from
     //     env/store/~/.codex; None → Err; Fake → None).
@@ -481,7 +512,7 @@ fn resolve_provider_with_python(
     // model tool-call actually EXECUTES (through the registry + orchestrator) and
     // its output re-enters the prompt via `recorder`, and the loop re-samples.
     let driver = build_sampling_driver(transport, sink, ctx, max_retries).with_fusion(
-        build_tool_dispatcher(python_backend, config, user_input),
+        build_tool_dispatcher_with_cwd(python_backend, config, user_input, tool_cwd),
         recorder,
     );
     Ok(ResolvedProvider::Real(Box::new(driver)))
@@ -546,10 +577,21 @@ fn resolve_provider_with_python(
 /// - **`supports_parallel_tool_calls = true`**: lets the registry's own per-tool
 ///   `parallel_safe` flag drive the parallel/serial gate (the conservative tools
 ///   are registered serial, so this is safe).
+#[cfg(test)]
 fn build_tool_dispatcher(
     python_backend: Arc<dyn PythonBackend>,
     config: &ProviderRunConfig,
     user_input: Option<(SharedStore, SessionId)>,
+) -> Arc<RealToolDispatcher> {
+    let tool_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
+    build_tool_dispatcher_with_cwd(python_backend, config, user_input, tool_cwd)
+}
+
+fn build_tool_dispatcher_with_cwd(
+    python_backend: Arc<dyn PythonBackend>,
+    config: &ProviderRunConfig,
+    user_input: Option<(SharedStore, SessionId)>,
+    tool_cwd: std::path::PathBuf,
 ) -> Arc<RealToolDispatcher> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
@@ -617,9 +659,31 @@ fn build_tool_dispatcher(
         true,
         WebSearchTool::new(WebSearchConfig::enabled()),
     );
+    let browser_tool = match &user_input {
+        Some((store, session_id)) => {
+            BrowserTool::with_browser_mode(config.options.browser_mode.clone())
+                .with_session_id(session_id.as_str().to_string())
+                .with_persistence(store.clone(), session_id.as_str().to_string())
+        }
+        None => BrowserTool::with_browser_mode(config.options.browser_mode.clone()),
+    };
     // `browser`: standalone production backend (`browser-use-browser`, internal
     // session management). parallel_safe = false (single CDP connection).
-    reg.register::<_, BrowserRequest>("browser", definitions::browser(), false, BrowserTool::new());
+    reg.register::<_, BrowserRequest>(
+        "browser",
+        definitions::browser(),
+        false,
+        browser_tool.clone(),
+    );
+    // `browser_script`: browser-use's page/data-plane surface. It routes through
+    // the same handler, but the schema omits the internal session id and matches
+    // the prompt contract used by current-main browser tasks.
+    reg.register::<_, BrowserRequest>(
+        "browser_script",
+        definitions::browser_script(),
+        false,
+        browser_tool,
+    );
     // `python`: backed by the run's single PythonWorker (started eagerly by
     // `resolve_provider`). parallel_safe = false (single interpreter process).
     reg.register::<_, PythonRequest>(
@@ -724,12 +788,15 @@ fn build_tool_dispatcher(
     let runner = RegistryRunner::new(
         Arc::new(reg),
         orchestrator,
-        // Per-turn ctx/env. The cwd is the process cwd (best-effort); the per-call
-        // id/name are placeholders for this headless path.
+        // Per-turn ctx/env. The cwd is the durable session cwd supplied by the
+        // caller; falling back to the process cwd only in test/headless helper paths.
         ToolCtx {
-            call_id: String::new(),
+            call_id: user_input
+                .as_ref()
+                .map(|(_, session_id)| session_id.as_str().to_string())
+                .unwrap_or_default(),
             tool_name: String::new(),
-            cwd: std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from(".")),
+            cwd: tool_cwd,
         },
         TurnEnv {
             file_system_sandbox_policy: FileSystemSandboxPolicy {
@@ -790,15 +857,53 @@ fn build_real_orchestrator(
 struct ChildAgentRunnerSpawner {
     runner: ChildAgentRunner,
     parent_session_id: String,
+    parent_link: Arc<Mutex<Option<ChildAgentRunnerParentLink>>>,
+}
+
+#[derive(Clone)]
+struct ChildAgentRunnerParentLink {
+    registry: Arc<AgentRegistry>,
+    mailbox: Arc<Mailbox>,
 }
 
 #[async_trait::async_trait]
 impl ChildSpawner for ChildAgentRunnerSpawner {
     async fn spawn_child(&self, spec: ChildSpec) -> Result<ChildHandle, SubagentError> {
+        let completion_handler = self
+            .parent_link
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .map(|parent_link| {
+                let child_path = spec.agent_path.clone();
+                ChildAgentCompletionHandler::new(move |completion: ChildAgentRunCompletion| {
+                    let outcome = if completion.success {
+                        ChildRunOutcome::success(completion.summary)
+                    } else {
+                        ChildRunOutcome::failure(
+                            completion
+                                .summary
+                                .unwrap_or_else(|| "child agent failed".to_string()),
+                        )
+                    };
+                    let _ = update_parent_from_child_run(
+                        &parent_link.registry,
+                        &parent_link.mailbox,
+                        &child_path,
+                        &outcome,
+                    );
+                    Ok(())
+                })
+            });
         let request = ChildAgentRunRequest {
             parent_session_id: self.parent_session_id.clone(),
             // The child's session id is its canonical agent id (unique per spawn).
             child_session_id: spec.agent_id.clone(),
+            message: spec.message.clone(),
+            agent_path: Some(spec.agent_path.clone()),
+            nickname: spec.nickname.clone(),
+            role: spec.role.clone(),
+            fork_turns: spec.fork_turns.clone(),
             // Child inherits the resolved config (provider/tier folded into the
             // role layer); surface the model + reasoning/tier overrides the
             // legacy runner consumes.
@@ -806,6 +911,7 @@ impl ChildSpawner for ChildAgentRunnerSpawner {
             reasoning_effort: spec.config.reasoning_effort.clone(),
             service_tier: spec.config.service_tier.clone(),
             config_overrides: Vec::new(),
+            completion_handler,
         };
         self.runner
             .run(request)
@@ -890,14 +996,22 @@ fn register_subagent_tools<S, A>(
 
     // The child-runner seam (parent's provider/model inheritance) or an honest
     // error fallback when no runner is configured.
+    let parent_link = Arc::new(Mutex::new(None));
     let spawner: Arc<dyn ChildSpawner> = match &config.options.child_agent_runner {
         Some(runner) => Arc::new(ChildAgentRunnerSpawner {
             runner: runner.clone(),
             parent_session_id,
+            parent_link: Arc::clone(&parent_link),
         }),
         None => Arc::new(UnconfiguredChildSpawner),
     };
     let manager = Arc::new(SubagentManager::new(spawner));
+    *parent_link
+        .lock()
+        .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(ChildAgentRunnerParentLink {
+        registry: manager.registry(),
+        mailbox: manager.mailbox(),
+    });
 
     // The parent context the children hang off: `/root`, depth 0, with the run's
     // model + provider as the base config so role layering preserves them.
@@ -1113,6 +1227,7 @@ mod tests {
             recorder(),
             Some(fake_python()),
             None,
+            std::env::temp_dir(),
         )
         .expect("real openai driver must construct offline");
         std::env::remove_var("OPENAI_API_KEY");
@@ -1134,6 +1249,7 @@ mod tests {
             recorder(),
             Some(fake_python()),
             None,
+            std::env::temp_dir(),
         )
         .expect("real anthropic driver must construct offline");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1177,6 +1293,7 @@ mod tests {
             recorder(),
             Some(fake_python()),
             None,
+            std::env::temp_dir(),
         );
         std::env::remove_var("CODEX_ACCESS_TOKEN");
         std::env::remove_var("CODEX_ACCOUNT_ID");
@@ -1653,6 +1770,86 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn child_runner_completion_wakes_wait_agent() {
+        use crate::config_overrides::{AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunner};
+        use crate::tools::orchestrator::ToolOrchestrator;
+        use crate::tools::registry::ToolRegistry;
+        use crate::tools::runtime::ToolCtx;
+        use crate::tools::sandbox::FileSystemSandboxPolicy;
+
+        let runner = ChildAgentRunner::new(|req| {
+            req.completion_handler
+                .as_ref()
+                .expect("completion handler wired")
+                .notify(ChildAgentRunCompletion::success(Some(
+                    "child finished".to_string(),
+                )))?;
+            Ok(())
+        });
+        let options = AgentRunOptions {
+            child_agent_runner: Some(runner),
+            ..AgentRunOptions::default()
+        };
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+
+        let mut reg: ToolRegistry<NoneSandboxProvider, AutoApprover> = ToolRegistry::new();
+        register_subagent_tools(&mut reg, &config, &None);
+
+        let orch = ToolOrchestrator::stub();
+        let env = TurnEnv {
+            file_system_sandbox_policy: FileSystemSandboxPolicy {
+                restricted: false,
+                denied_read: false,
+            },
+            managed_network_active: false,
+            strict_auto_review: false,
+            use_guardian: false,
+        };
+        let spawn_ctx = ToolCtx {
+            call_id: "spawn".to_string(),
+            tool_name: "spawn_agent".to_string(),
+            cwd: std::env::temp_dir(),
+        };
+        let spawn_out = reg
+            .dispatch(
+                "spawn_agent",
+                &serde_json::json!({ "task_name": "explore", "message": "go" }),
+                &spawn_ctx,
+                &env,
+                AskForApproval::Never,
+                &orch,
+            )
+            .await
+            .expect("spawn_agent should run");
+        let body: serde_json::Value = serde_json::from_str(&spawn_out.stdout).unwrap();
+        let agent_path = body
+            .get("agent_path")
+            .and_then(|v| v.as_str())
+            .expect("agent path");
+
+        let wait_ctx = ToolCtx {
+            call_id: "wait".to_string(),
+            tool_name: "wait_agent".to_string(),
+            cwd: std::env::temp_dir(),
+        };
+        let wait_out = reg
+            .dispatch(
+                "wait_agent",
+                &serde_json::json!({ "agent_path": agent_path, "timeout_secs": 1 }),
+                &wait_ctx,
+                &env,
+                AskForApproval::Never,
+                &orch,
+            )
+            .await
+            .expect("wait_agent should run");
+        let wait_body: serde_json::Value = serde_json::from_str(&wait_out.stdout).unwrap();
+        assert_eq!(wait_body["status"], "completed");
+        assert_eq!(wait_body["timed_out"], false);
+    }
+
     /// The production dispatcher ALWAYS advertises the three goal tools
     /// (`get_goal` / `create_goal` / `update_goal`) — the "engine B matches rival
     /// A on the goals row" registration proof. Passes ONLY because
@@ -1849,6 +2046,30 @@ mod tests {
                 _ => None,
             })
             .expect("a tool-result part")
+    }
+
+    #[tokio::test]
+    async fn production_dispatcher_uses_supplied_session_cwd() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        let dispatcher = build_tool_dispatcher_with_cwd(
+            Arc::new(MarkerPythonBackend),
+            &config,
+            None,
+            dir.path().to_path_buf(),
+        );
+
+        let (text, is_error) = dispatch_call(
+            &dispatcher,
+            "shell",
+            serde_json::json!({ "command": ["pwd"] }),
+        )
+        .await;
+        assert!(!is_error, "pwd should run successfully: {text}");
+        assert!(
+            text.contains(&dir.path().display().to_string()),
+            "tool cwd must be the supplied session cwd, got: {text}"
+        );
     }
 
     /// `AskForApproval::Never` (the default) AUTO-APPROVES: a gated `shell` call

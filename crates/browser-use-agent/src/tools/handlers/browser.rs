@@ -41,7 +41,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
+use serde_json::Value;
 
+use crate::infra::{
+    record_browser_command_response_events, record_browser_script_response_events_for_tool,
+};
+use crate::session::SharedStore;
 use crate::tools::approval::ExecApprovalRequirement;
 use crate::tools::runtime::{Approvable, Sandboxable};
 use crate::tools::runtime::{ExecOutput, SandboxAttempt, ToolCtx, ToolError, ToolRuntime};
@@ -187,10 +192,10 @@ impl BrowserRequest {
 /// # Wire shape (model-facing args)
 ///
 /// ```json
-/// { "action": "execute", "session_id": "s1", "script": "...", "background": false }
-/// { "action": "command", "session_id": "s1", "command": "go https://example.com" }
-/// { "action": "observe", "session_id": "s1", "run_id": "r1" }
-/// { "action": "cancel",  "session_id": "s1", "run_id": "r1" }
+/// { "action": "execute", "script": "...", "background": false }
+/// { "action": "command", "command": "go https://example.com" }
+/// { "action": "observe", "run_id": "r1" }
+/// { "action": "cancel",  "run_id": "r1" }
 /// ```
 ///
 /// The variants mirror the existing [`BrowserAction`] cases and the legacy
@@ -203,15 +208,21 @@ impl BrowserRequest {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize)]
 pub struct BrowserWireArgs {
     /// Which browser operation to perform.
-    pub action: BrowserActionKind,
-    /// Browser session id the action is bound to.
-    pub session_id: String,
+    #[serde(default)]
+    pub action: Option<BrowserActionKind>,
+    /// Browser session id the action is bound to. The model normally omits this;
+    /// production fills it from the current agent session through `ToolCtx`.
+    #[serde(default)]
+    pub session_id: Option<String>,
     /// Command string for the `command` action.
     #[serde(default)]
     pub command: Option<String>,
     /// Script body for the `execute` action.
     #[serde(default)]
     pub script: Option<String>,
+    /// Alias used by Codex-style tool schemas.
+    #[serde(default)]
+    pub code: Option<String>,
     /// Whether an `execute` runs in the background (observe later).
     #[serde(default)]
     pub background: bool,
@@ -256,12 +267,24 @@ impl From<BrowserWireArgs> for BrowserRequest {
     /// malformed call surfaces a clean rejection rather than a deserialize
     /// failure).
     fn from(w: BrowserWireArgs) -> Self {
-        let action = match w.action {
+        let script = w.script.or(w.code);
+        let action_kind = w.action.unwrap_or_else(|| {
+            if script.is_some() {
+                BrowserActionKind::Execute
+            } else if w.command.is_some() {
+                BrowserActionKind::Command
+            } else if w.run_id.is_some() {
+                BrowserActionKind::Observe
+            } else {
+                BrowserActionKind::Execute
+            }
+        });
+        let action = match action_kind {
             BrowserActionKind::Command => BrowserAction::Command {
                 command: w.command.unwrap_or_default(),
             },
             BrowserActionKind::Execute => BrowserAction::Execute {
-                script: w.script.unwrap_or_default(),
+                script: script.unwrap_or_default(),
                 background: w.background,
             },
             BrowserActionKind::Observe => BrowserAction::Observe {
@@ -273,7 +296,7 @@ impl From<BrowserWireArgs> for BrowserRequest {
         };
         BrowserRequest {
             action,
-            session_id: w.session_id,
+            session_id: w.session_id.unwrap_or_default(),
             cwd: w.cwd,
             artifact_dir: w.artifact_dir,
             timeout_secs: w.timeout_secs,
@@ -332,12 +355,112 @@ pub trait BrowserBackend: Send + Sync {
     fn cancel_script(&self, session_id: &str, run_id: &str) -> anyhow::Result<BrowserScriptOutput>;
 }
 
-/// Production backend: a 1:1 delegation to `browser-use-browser`.
-///
-/// Every method is a straight pass-through. The wrapped functions require Bun +
-/// Chrome at runtime, so this backend is never exercised in tests.
-#[derive(Debug, Clone, Copy, Default)]
-pub struct RealBackend;
+/// Production backend: a thin delegation to `browser-use-browser`.
+#[derive(Debug, Clone, Default)]
+pub struct RealBackend {
+    browser_mode: Option<String>,
+}
+
+impl RealBackend {
+    pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
+        Self { browser_mode }
+    }
+
+    fn normalized_browser_mode(&self) -> Option<&str> {
+        self.browser_mode
+            .as_deref()
+            .map(str::trim)
+            .filter(|mode| !mode.is_empty())
+            .map(|mode| match mode {
+                "cloud" | "browser-use-cloud" | "remote-cloud" => "cloud",
+                "headless" | "headless-chromium" | "managed-headless" => "managed-headless",
+                other => other,
+            })
+    }
+
+    fn should_ensure_before_command(&self, command: &str) -> bool {
+        if self.normalized_browser_mode().is_none() {
+            return false;
+        }
+        let words = command_words(command);
+        !matches!(
+            words.as_slice(),
+            ["browser", "remote", "start", ..]
+                | ["remote", "start", ..]
+                | ["browser", "remote", "stop", ..]
+                | ["remote", "stop", ..]
+        )
+    }
+
+    fn rewrite_command_for_mode(&self, command: &str) -> String {
+        let words = command_words(command);
+        if self.normalized_browser_mode() == Some("cloud")
+            && matches!(
+                words.as_slice(),
+                ["browser", "local", ..]
+                    | ["local", ..]
+                    | ["browser", "connect", "local", ..]
+                    | ["connect", "local", ..]
+                    | ["browser", "connect", "managed", ..]
+                    | ["connect", "managed", ..]
+            )
+        {
+            return "browser status --json".to_string();
+        }
+        command.to_string()
+    }
+
+    fn ensure_configured_browser(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+    ) -> anyhow::Result<Vec<Value>> {
+        let Some(mode) = self.normalized_browser_mode() else {
+            return Ok(Vec::new());
+        };
+        let status = browser_use_browser::run_browser_command(
+            session_id,
+            cwd,
+            artifact_dir,
+            "browser status --json",
+        )?;
+        let mut events = status.events;
+        let connected =
+            status.content.get("connection").and_then(Value::as_str) == Some("connected");
+        let current_mode = status.content.get("mode").and_then(Value::as_str);
+        let desired_command = match mode {
+            "cloud" => {
+                if connected && current_mode == Some("remote-cloud") {
+                    return Ok(events);
+                }
+                "browser remote start"
+            }
+            "managed-headless" => {
+                if connected && current_mode == Some("managed") {
+                    return Ok(events);
+                }
+                "browser connect managed --headless"
+            }
+            _ => return Ok(events),
+        };
+        let mut started = browser_use_browser::run_browser_command(
+            session_id,
+            cwd,
+            artifact_dir,
+            desired_command,
+        )?;
+        events.append(&mut started.events);
+        Ok(events)
+    }
+}
+
+fn command_words(command: &str) -> Vec<&str> {
+    command
+        .split_whitespace()
+        .map(|word| word.trim_matches(|ch: char| ch == '"' || ch == '\''))
+        .collect()
+}
 
 impl BrowserBackend for RealBackend {
     fn command(
@@ -347,7 +470,23 @@ impl BrowserBackend for RealBackend {
         artifact_dir: &std::path::Path,
         command: &str,
     ) -> anyhow::Result<BrowserCommandOutput> {
-        browser_use_browser::run_browser_command(session_id, cwd, artifact_dir, command)
+        let mut events = if self.should_ensure_before_command(command) {
+            self.ensure_configured_browser(session_id, cwd, artifact_dir)?
+        } else {
+            Vec::new()
+        };
+        let effective_command = self.rewrite_command_for_mode(command);
+        let mut output = browser_use_browser::run_browser_command(
+            session_id,
+            cwd,
+            artifact_dir,
+            &effective_command,
+        )?;
+        if !events.is_empty() {
+            events.append(&mut output.events);
+            output.events = events;
+        }
+        Ok(output)
     }
 
     fn run_script(
@@ -358,7 +497,19 @@ impl BrowserBackend for RealBackend {
         code: &str,
         timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
-        browser_use_browser::run_browser_script(session_id, cwd, artifact_dir, code, timeout_secs)
+        let mut events = self.ensure_configured_browser(session_id, cwd, artifact_dir)?;
+        let mut output = browser_use_browser::run_browser_script(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_secs,
+        )?;
+        if !events.is_empty() {
+            events.append(&mut output.browser_events);
+            output.browser_events = events;
+        }
+        Ok(output)
     }
 
     fn start_script(
@@ -369,7 +520,19 @@ impl BrowserBackend for RealBackend {
         code: &str,
         timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
-        browser_use_browser::start_browser_script(session_id, cwd, artifact_dir, code, timeout_secs)
+        let mut events = self.ensure_configured_browser(session_id, cwd, artifact_dir)?;
+        let mut output = browser_use_browser::start_browser_script(
+            session_id,
+            cwd,
+            artifact_dir,
+            code,
+            timeout_secs,
+        )?;
+        if !events.is_empty() {
+            events.append(&mut output.browser_events);
+            output.browser_events = events;
+        }
+        Ok(output)
     }
 
     fn observe_script(
@@ -439,6 +602,14 @@ fn map_script_output(out: BrowserScriptOutput) -> ExecOutput {
 #[derive(Clone)]
 pub struct BrowserTool {
     backend: Arc<dyn BrowserBackend>,
+    session_id_fallback: Option<String>,
+    persistence: Option<BrowserPersistence>,
+}
+
+#[derive(Clone)]
+struct BrowserPersistence {
+    store: SharedStore,
+    session_id: String,
 }
 
 impl Default for BrowserTool {
@@ -458,13 +629,51 @@ impl BrowserTool {
     /// runtime.
     pub fn new() -> Self {
         Self {
-            backend: Arc::new(RealBackend),
+            backend: Arc::new(RealBackend::default()),
+            session_id_fallback: None,
+            persistence: None,
+        }
+    }
+
+    /// Construct a real browser tool with the run's configured browser mode.
+    pub fn with_browser_mode(browser_mode: Option<String>) -> Self {
+        Self {
+            backend: Arc::new(RealBackend::with_browser_mode(browser_mode)),
+            session_id_fallback: None,
+            persistence: None,
         }
     }
 
     /// Construct a browser tool with a custom backend (used by tests).
     pub fn with_backend(backend: Arc<dyn BrowserBackend>) -> Self {
-        Self { backend }
+        Self {
+            backend,
+            session_id_fallback: None,
+            persistence: None,
+        }
+    }
+
+    /// Configure the browser tool with the live agent session id. The model can
+    /// omit `session_id`; the runtime supplies it while keeping `ToolCtx.call_id`
+    /// available for the actual model tool-call id.
+    pub fn with_session_id(mut self, session_id: impl Into<String>) -> Self {
+        self.session_id_fallback = Some(session_id.into());
+        self
+    }
+
+    /// Configure durable event persistence for rich browser outputs.
+    pub fn with_persistence(mut self, store: SharedStore, session_id: impl Into<String>) -> Self {
+        self.persistence = Some(BrowserPersistence {
+            store,
+            session_id: session_id.into(),
+        });
+        self
+    }
+
+    fn fallback_session_id<'a>(&'a self, ctx: &'a ToolCtx) -> &'a str {
+        self.session_id_fallback
+            .as_deref()
+            .unwrap_or_else(|| ctx.call_id.trim())
     }
 }
 
@@ -543,8 +752,14 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         // own processes); acknowledge the attempt to make the seam explicit.
         let _ = attempt;
 
+        let effective_session_id = if req.session_id.trim().is_empty() {
+            self.fallback_session_id(ctx).trim()
+        } else {
+            req.session_id.trim()
+        };
+
         // Validate the request before touching the backend.
-        if req.session_id.trim().is_empty() {
+        if effective_session_id.is_empty() {
             return Err(ToolError::Rejected(
                 "browser session_id must not be empty".to_string(),
             ));
@@ -571,12 +786,24 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         }
 
         let backend = Arc::clone(&self.backend);
-        let session_id = req.session_id.clone();
+        let session_id = effective_session_id.to_string();
         let cwd = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
         let artifact_dir = req.artifact_dir.clone().unwrap_or_else(|| cwd.clone());
         let timeout_secs = req.effective_timeout_secs();
         let observe_ms = req.effective_observe_ms();
         let action = req.action.clone();
+        let persistence = self.persistence.clone();
+        let tool_call_id = ctx.call_id.clone();
+        let tool_name = if ctx.tool_name.trim().is_empty() {
+            match &action {
+                BrowserAction::Command { .. } => "browser".to_string(),
+                BrowserAction::Execute { .. }
+                | BrowserAction::Observe { .. }
+                | BrowserAction::Cancel { .. } => "browser_script".to_string(),
+            }
+        } else {
+            ctx.tool_name.clone()
+        };
 
         // The browser fns are synchronous and spawn external processes; run on a
         // blocking thread so we never stall the async runtime.
@@ -586,6 +813,17 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                     let out = backend
                         .command(&session_id, &cwd, &artifact_dir, &command)
                         .map_err(ToolError::Other)?;
+                    if let Some(persistence) = &persistence {
+                        if let Ok(store) = persistence.store.lock() {
+                            let _ = record_browser_command_response_events(
+                                &store,
+                                &persistence.session_id,
+                                &tool_name,
+                                &tool_call_id,
+                                &out,
+                            );
+                        }
+                    }
                     Ok(map_command_output(out))
                 }
                 BrowserAction::Execute { script, background } => {
@@ -601,18 +839,51 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                         backend.run_script(&session_id, &cwd, &artifact_dir, &script, timeout_secs)
                     }
                     .map_err(ToolError::Other)?;
+                    if let Some(persistence) = &persistence {
+                        if let Ok(store) = persistence.store.lock() {
+                            let _ = record_browser_script_response_events_for_tool(
+                                &store,
+                                &persistence.session_id,
+                                &tool_name,
+                                &tool_call_id,
+                                &out,
+                            );
+                        }
+                    }
                     Ok(map_script_output(out))
                 }
                 BrowserAction::Observe { run_id } => {
                     let out = backend
                         .observe_script(&session_id, &run_id, observe_ms)
                         .map_err(ToolError::Other)?;
+                    if let Some(persistence) = &persistence {
+                        if let Ok(store) = persistence.store.lock() {
+                            let _ = record_browser_script_response_events_for_tool(
+                                &store,
+                                &persistence.session_id,
+                                &tool_name,
+                                &tool_call_id,
+                                &out,
+                            );
+                        }
+                    }
                     Ok(map_script_output(out))
                 }
                 BrowserAction::Cancel { run_id } => {
                     let out = backend
                         .cancel_script(&session_id, &run_id)
                         .map_err(ToolError::Other)?;
+                    if let Some(persistence) = &persistence {
+                        if let Ok(store) = persistence.store.lock() {
+                            let _ = record_browser_script_response_events_for_tool(
+                                &store,
+                                &persistence.session_id,
+                                &tool_name,
+                                &tool_call_id,
+                                &out,
+                            );
+                        }
+                    }
                     Ok(map_script_output(out))
                 }
             }

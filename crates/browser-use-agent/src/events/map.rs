@@ -26,25 +26,28 @@ use serde_json::{json, Value};
 pub fn map_llm_event(ctx: &TurnCtx, ev: &LlmEvent) -> Vec<PendingEvent> {
     let session_id = &ctx.session_id;
     match ev {
-        // Assistant text streaming -> `model.stream_delta { delta }`.
+        // Assistant text streaming -> `model.stream_delta { text }`. Keep the
+        // legacy `delta` alias so older reducers/tests can tolerate both shapes.
         LlmEvent::TextDelta { delta, .. } => vec![PendingEvent::new(
             session_id,
             names::MODEL_STREAM_DELTA,
-            json!({ "delta": delta }),
+            json!({ "text": delta, "delta": delta }),
         )],
-        // Reasoning/thinking streaming -> `model.thinking_delta { delta }`.
+        // Reasoning/thinking streaming -> `model.thinking_delta { text }`.
         LlmEvent::ReasoningDelta { delta, .. } => vec![PendingEvent::new(
             session_id,
             names::MODEL_THINKING_DELTA,
-            json!({ "delta": delta }),
+            json!({ "text": delta, "delta": delta }),
         )],
         // Fully-assembled tool call -> `tool.started { name, arguments }`.
         // `arguments` is the parsed JSON input the model produced; core forwards
         // it under the `arguments` key.
-        LlmEvent::ToolCall { name, input, .. } => vec![PendingEvent::new(
+        LlmEvent::ToolCall {
+            id, name, input, ..
+        } => vec![PendingEvent::new(
             session_id,
             names::TOOL_STARTED,
-            json!({ "name": name, "arguments": input }),
+            json!({ "name": name, "tool_call_id": id, "arguments": input }),
         )],
         // Provider-side mid-stream error -> `stream_error { message }`.
         LlmEvent::ProviderError { message, .. } => vec![PendingEvent::new(

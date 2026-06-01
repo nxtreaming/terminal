@@ -13,8 +13,9 @@ use browser_use_agent::config_model::{
     model_catalog_for_cwd_with_options,
 };
 use browser_use_agent::config_overrides::{
-    parse_config_overrides, AgentRunOptions, ConfigOverrides, ProviderBackend, ProviderRunConfig,
-    RunConfigValueSource,
+    load_mcp_servers_for_profile, parse_config_overrides, resolve_approval_policy_for_profile,
+    resolve_guardian_for_profile, AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunRequest,
+    ChildAgentRunner, ConfigOverrides, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
 };
 use browser_use_agent::context::{
     append_user_shell_command_context_event, typed_user_input_payload_from_text_for_cwd,
@@ -37,6 +38,7 @@ use browser_use_agent::subagents::{
     store_resolve_agent_reference_in_tree as resolve_agent_reference_in_tree,
     store_root_session_id as root_session_id,
 };
+use browser_use_agent::tools::AskForApproval;
 use browser_use_protocol::{
     browser_summary_from_events, failure_from_events, sanitized_agent_context_from_events,
     session_result_from_events, task_from_events,
@@ -75,6 +77,13 @@ struct Args {
     config_overrides: Vec<String>,
     #[arg(long = "collaboration-mode", value_enum, default_value_t = CollaborationModeArg::Default, global = true)]
     collaboration_mode: CollaborationModeArg,
+    #[arg(long = "approval-policy", value_enum, global = true)]
+    approval_policy: Option<ApprovalPolicyArg>,
+    #[arg(long = "guardian", global = true)]
+    guardian: bool,
+    /// Load additional MCP server definitions from a TOML config file.
+    #[arg(long = "mcp-config", value_name = "PATH", action = clap::ArgAction::Append, global = true)]
+    mcp_config: Vec<PathBuf>,
     #[command(subcommand)]
     command: Command,
 }
@@ -92,6 +101,32 @@ impl From<CollaborationModeArg> for CollaborationModeKind {
             CollaborationModeArg::Plan => CollaborationModeKind::Plan,
         }
     }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
+enum ApprovalPolicyArg {
+    Never,
+    OnFailure,
+    OnRequest,
+    UnlessTrusted,
+}
+
+impl From<ApprovalPolicyArg> for AskForApproval {
+    fn from(value: ApprovalPolicyArg) -> Self {
+        match value {
+            ApprovalPolicyArg::Never => AskForApproval::Never,
+            ApprovalPolicyArg::OnFailure => AskForApproval::OnFailure,
+            ApprovalPolicyArg::OnRequest => AskForApproval::OnRequest,
+            ApprovalPolicyArg::UnlessTrusted => AskForApproval::UnlessTrusted,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default)]
+struct CliRuntimeOptions {
+    approval_policy: Option<AskForApproval>,
+    use_guardian: Option<bool>,
+    mcp_config_paths: Vec<PathBuf>,
 }
 
 #[derive(Debug, Subcommand)]
@@ -342,6 +377,35 @@ enum Command {
         #[arg(long)]
         browser_mode: Option<String>,
     },
+    DatasetRunCodex {
+        dataset: String,
+        #[arg(long, default_value_t = 1)]
+        count: usize,
+        #[arg(long = "task-id")]
+        task_ids: Vec<String>,
+        #[arg(long)]
+        all: bool,
+        #[arg(long, default_value = "gpt-5.1-codex")]
+        model: String,
+        #[arg(long, default_value_t = 80)]
+        max_turns: usize,
+        #[arg(long, default_value_t = 120)]
+        python_timeout_seconds: u64,
+        #[arg(long)]
+        run_id: Option<String>,
+        #[arg(long)]
+        resume: bool,
+        #[arg(long)]
+        skip_failed: bool,
+        #[arg(long)]
+        stop_on_failure: bool,
+        #[arg(long, default_value_t = 2)]
+        max_attempts: usize,
+        #[arg(long, default_value_t = 1)]
+        concurrency: usize,
+        #[arg(long)]
+        browser_mode: Option<String>,
+    },
     DatasetRunAnthropic {
         dataset: String,
         #[arg(long, default_value_t = 1)]
@@ -530,7 +594,12 @@ impl DatasetRunner for ConfigDatasetRunner {
         merged_options.config_profile = config.options.config_profile.clone();
         merged_options.config_overrides = config.options.config_overrides.clone();
         merged_options.model_provider_id = config.options.model_provider_id.clone();
+        merged_options.model_provider_id_source = config.options.model_provider_id_source;
         merged_options.collaboration_mode = config.options.collaboration_mode;
+        merged_options.child_agent_runner = config.options.child_agent_runner.clone();
+        merged_options.mcp_servers = config.options.mcp_servers.clone();
+        merged_options.approval_policy = config.options.approval_policy;
+        merged_options.use_guardian = config.options.use_guardian;
         config.options = merged_options;
         run_existing_session_from_config_and_notify(store, session_id, config)?;
         Ok(())
@@ -563,6 +632,11 @@ fn main() -> Result<()> {
     let config_profile = args.config_profile.clone();
     let config_overrides = args.config_overrides.clone();
     let collaboration_mode = args.collaboration_mode.into();
+    let runtime_options = CliRuntimeOptions {
+        approval_policy: args.approval_policy.map(Into::into),
+        use_guardian: args.guardian.then_some(true),
+        mcp_config_paths: args.mcp_config.clone(),
+    };
     match args.command {
         Command::Start { text } => start(&store, text),
         Command::RunFake { text, python_code } => run_fake(&store, text, python_code),
@@ -573,6 +647,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunAnthropic { text, model } => run_anthropic(
             &store,
@@ -581,6 +656,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunOpenrouter { text, model } => run_openrouter(
             &store,
@@ -589,6 +665,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunDeepseek { text, model } => run_deepseek(
             &store,
@@ -597,6 +674,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunCodex { text, model } => run_codex(
             &store,
@@ -605,6 +683,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunOpenaiSession { task_id, model } => run_openai_session(
             &store,
@@ -613,6 +692,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunAnthropicSession { task_id, model } => run_anthropic_session(
             &store,
@@ -621,6 +701,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunOpenrouterSession { task_id, model } => run_openrouter_session(
             &store,
@@ -629,6 +710,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::RunDeepseekSession { task_id, model } => run_deepseek_session(
             &store,
@@ -637,6 +719,7 @@ fn main() -> Result<()> {
             config_profile.as_deref(),
             &config_overrides,
             collaboration_mode,
+            &runtime_options,
         ),
         Command::Followup { task_id, text } => followup(&store, &task_id, text),
         Command::Finish { task_id, result } => finish(&store, &task_id, result),
@@ -774,6 +857,44 @@ fn main() -> Result<()> {
             python_timeout_seconds,
             config_profile.as_deref(),
             &config_overrides,
+            &runtime_options,
+        ),
+        Command::DatasetRunCodex {
+            dataset,
+            count,
+            task_ids,
+            all,
+            model,
+            max_turns,
+            python_timeout_seconds,
+            run_id,
+            resume,
+            skip_failed,
+            stop_on_failure,
+            max_attempts,
+            concurrency,
+            browser_mode,
+        } => dataset_run_codex(
+            &store,
+            &dataset,
+            DatasetRunOptions {
+                count,
+                task_ids,
+                all,
+                run_id,
+                resume,
+                skip_failed,
+                stop_on_failure,
+                max_attempts,
+                concurrency,
+                browser_mode,
+            },
+            model,
+            max_turns,
+            python_timeout_seconds,
+            config_profile.as_deref(),
+            &config_overrides,
+            &runtime_options,
         ),
         Command::DatasetRunAnthropic {
             dataset,
@@ -808,6 +929,7 @@ fn main() -> Result<()> {
             model,
             max_turns,
             python_timeout_seconds,
+            &runtime_options,
         ),
         Command::DatasetRunOpenrouter {
             dataset,
@@ -842,6 +964,7 @@ fn main() -> Result<()> {
             model,
             max_turns,
             python_timeout_seconds,
+            &runtime_options,
         ),
     }
 }
@@ -889,6 +1012,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::DatasetReport { .. } => "dataset_report",
         Command::DatasetRunFake { .. } => "dataset_run_fake",
         Command::DatasetRunOpenai { .. } => "dataset_run_openai",
+        Command::DatasetRunCodex { .. } => "dataset_run_codex",
         Command::DatasetRunAnthropic { .. } => "dataset_run_anthropic",
         Command::DatasetRunOpenrouter { .. } => "dataset_run_openrouter",
     }
@@ -1184,13 +1308,141 @@ fn maybe_append_message_history(
 fn run_session_via_engine(
     store: &Store,
     session_id: &str,
-    config: ProviderRunConfig,
+    mut config: ProviderRunConfig,
 ) -> Result<String> {
+    attach_cli_child_agent_runner(store, &mut config);
     let shared: SharedStore =
         std::sync::Arc::new(std::sync::Mutex::new(Store::open(store.state_dir())?));
     let runtime = tokio::runtime::Runtime::new().context("build tokio runtime for engine run")?;
     let resolved = runtime.block_on(run_session_with_config(shared, session_id, config))?;
     Ok(resolved.0)
+}
+
+fn attach_cli_child_agent_runner(store: &Store, config: &mut ProviderRunConfig) {
+    let state_dir = store.state_dir().to_path_buf();
+    let child_base_config = config.clone();
+    let runner = ChildAgentRunner::new(move |request| {
+        spawn_cli_child_agent(state_dir.clone(), child_base_config.clone(), request)
+    });
+    config.options = config.options.clone().with_child_agent_runner(runner);
+}
+
+fn spawn_cli_child_agent(
+    state_dir: PathBuf,
+    base_config: ProviderRunConfig,
+    request: ChildAgentRunRequest,
+) -> Result<()> {
+    let store = Store::open(&state_dir)?;
+    let child = create_agent_child_session_from_request(&store, &request)?;
+    let child_id = child.id.clone();
+    thread::Builder::new()
+        .name(format!("browser-use-child-{child_id}"))
+        .spawn(move || {
+            if let Err(error) =
+                run_cli_child_agent_thread(state_dir, child_id, base_config, request)
+            {
+                eprintln!("child agent failed: {error:#}");
+            }
+        })
+        .context("spawn child agent thread")?;
+    Ok(())
+}
+
+fn run_cli_child_agent_thread(
+    state_dir: PathBuf,
+    child_id: String,
+    mut config: ProviderRunConfig,
+    request: ChildAgentRunRequest,
+) -> Result<()> {
+    let completion_handler = request.completion_handler.clone();
+    let run_result: Result<Option<String>> = (|| {
+        if let Some(model) = request.model.as_deref().filter(|value| !value.is_empty()) {
+            config.model = model.to_string();
+            config.model_source = RunConfigValueSource::Explicit;
+        }
+        if !request.config_overrides.is_empty() {
+            config
+                .options
+                .config_overrides
+                .extend(request.config_overrides.clone());
+        }
+        if let Some(reasoning) = request.reasoning_effort.clone() {
+            config.options.config_overrides.push((
+                "reasoning_effort".to_string(),
+                toml::Value::String(reasoning),
+            ));
+        }
+        if let Some(service_tier) = request.service_tier.clone() {
+            config.options.config_overrides.push((
+                "service_tier".to_string(),
+                toml::Value::String(service_tier),
+            ));
+        }
+        let store = Store::open(&state_dir)?;
+        let _ = run_existing_session_from_config_and_notify(&store, &child_id, config)?;
+        let events = store.events_for_session(&child_id)?;
+        Ok(session_result_from_events(&events))
+    })();
+    if let Some(handler) = completion_handler {
+        let completion = match &run_result {
+            Ok(summary) => ChildAgentRunCompletion::success(summary.clone()),
+            Err(error) => ChildAgentRunCompletion::failure(format!("{error:#}")),
+        };
+        if let Err(error) = handler.notify(completion) {
+            eprintln!("child agent completion notification failed: {error:#}");
+        }
+    }
+    run_result.map(|_| ())
+}
+
+fn create_agent_child_session_from_request(
+    store: &Store,
+    request: &ChildAgentRunRequest,
+) -> Result<browser_use_protocol::SessionMeta> {
+    if let Some(existing) = store.load_session(&request.child_session_id)? {
+        return Ok(existing);
+    }
+    let parent = ensure_task_exists(store, &request.parent_session_id)?;
+    let child = store.create_child_session_with_id(
+        &request.parent_session_id,
+        Path::new(&parent.cwd),
+        request.agent_path.as_deref(),
+        request.nickname.as_deref(),
+        request.role.as_deref(),
+        request.child_session_id.clone(),
+    )?;
+    let parent_events = store.events_for_session(&request.parent_session_id)?;
+    let inherited_context = sanitized_agent_context_from_events(&parent_events);
+    store.append_event(
+        &child.id,
+        "agent.context",
+        serde_json::json!({
+            "from_session_id": request.parent_session_id.clone(),
+            "fork_mode": request.fork_turns.as_deref().unwrap_or("all"),
+            "history_mode": "compact_context",
+            "agent_path": request.agent_path.clone(),
+            "nickname": request.nickname.clone(),
+            "role": request.role.clone(),
+            "context": inherited_context,
+        }),
+    )?;
+    seed_environment_context_event(store, &child.id, &child.cwd)?;
+    store.append_event(
+        &child.id,
+        "session.input",
+        typed_user_input_payload_from_text_for_cwd(&request.message, &child.cwd)?,
+    )?;
+    store.append_event(
+        &request.parent_session_id,
+        "agent.spawned",
+        serde_json::json!({
+            "child_session_id": child.id.clone(),
+            "agent_path": request.agent_path.clone(),
+            "nickname": request.nickname.clone(),
+            "role": request.role.clone(),
+        }),
+    )?;
+    Ok(child)
 }
 
 fn run_fake(store: &Store, text: String, python_code: Option<String>) -> Result<()> {
@@ -1227,6 +1479,7 @@ fn cli_agent_options(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<AgentRunOptions> {
     let mut options = AgentRunOptions::default()
         .with_collaboration_mode(collaboration_mode)
@@ -1237,6 +1490,25 @@ fn cli_agent_options(
         options = options.with_config_profile(profile.to_string());
     }
     let config_overrides = parse_cli_config_overrides(raw_config_overrides)?;
+    if let Some(policy) = resolve_approval_policy_for_profile(
+        config_profile,
+        &config_overrides,
+        runtime_options.approval_policy,
+    )? {
+        options = options.with_approval_policy(policy);
+    }
+    if let Some(use_guardian) = resolve_guardian_for_profile(
+        config_profile,
+        &config_overrides,
+        runtime_options.use_guardian,
+    )? {
+        options = options.with_guardian(use_guardian);
+    }
+    let mcp_servers =
+        load_mcp_servers_for_profile(config_profile, &runtime_options.mcp_config_paths)?;
+    if !mcp_servers.is_empty() {
+        options = options.with_mcp_servers(mcp_servers);
+    }
     if !config_overrides.is_empty() {
         options = options.with_config_overrides(config_overrides);
     }
@@ -1347,6 +1619,7 @@ fn run_openai(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     let (model, model_source) = resolve_cli_model_with_source(
         ProviderBackend::Openai,
@@ -1360,6 +1633,7 @@ fn run_openai(
             config_profile,
             raw_config_overrides,
             collaboration_mode,
+            runtime_options,
         )?);
     run_new_session_from_config(store, text, config)
 }
@@ -1371,10 +1645,15 @@ fn run_anthropic(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     run_new_session_from_config(store, text, config)
 }
 
@@ -1385,10 +1664,15 @@ fn run_openrouter(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     run_new_session_from_config(store, text, config)
 }
 
@@ -1399,10 +1683,15 @@ fn run_deepseek(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let config = ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     run_new_session_from_config(store, text, config)
 }
 
@@ -1420,10 +1709,15 @@ fn run_codex(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
-    let config = ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Codex, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     run_new_session_from_config(store, text, config)
 }
 
@@ -1434,6 +1728,7 @@ fn run_openai_session(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     ensure_task_exists(store, task_id)?;
     let (model, model_source) = resolve_cli_model_with_source(
@@ -1448,6 +1743,7 @@ fn run_openai_session(
             config_profile,
             raw_config_overrides,
             collaboration_mode,
+            runtime_options,
         )?);
     let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
@@ -1461,11 +1757,16 @@ fn run_anthropic_session(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config = ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Anthropic, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
@@ -1478,11 +1779,16 @@ fn run_openrouter_session(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config = ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Openrouter, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
@@ -1495,11 +1801,16 @@ fn run_deepseek_session(
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
     collaboration_mode: CollaborationModeKind,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     ensure_task_exists(store, task_id)?;
-    let config = ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(
-        cli_agent_options(config_profile, raw_config_overrides, collaboration_mode)?,
-    );
+    let config =
+        ProviderRunConfig::new(ProviderBackend::Deepseek, model).with_options(cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            collaboration_mode,
+            runtime_options,
+        )?);
     let session_id = run_existing_session_from_config_and_notify(store, task_id, config)?;
     println!("{session_id}");
     Ok(())
@@ -1997,24 +2308,24 @@ fn default_settings(
     config_overrides: &[(String, toml::Value)],
 ) -> Result<Vec<(String, String)>> {
     let provider_model = default_cli_model_for_backend_with_overrides(
-        ProviderBackend::Openai,
+        ProviderBackend::Openrouter,
         config_profile,
         config_overrides,
     )?;
     let display_model =
         display_model_for_provider_model(&provider_model, config_profile, config_overrides)?;
     let provider_id = resolved_cli_provider_id_for_backend_with_overrides(
-        ProviderBackend::Openai,
+        ProviderBackend::Openrouter,
         config_profile,
         config_overrides,
     )?;
     Ok(vec![
-        ("account".to_string(), "OpenAI API key".to_string()),
+        ("account".to_string(), "OpenRouter API key".to_string()),
         ("model".to_string(), display_model),
         ("provider.model".to_string(), provider_model),
         ("provider.id".to_string(), provider_id),
         ("browser".to_string(), "Local Chrome".to_string()),
-        ("agent.backend".to_string(), "openai".to_string()),
+        ("agent.backend".to_string(), "openrouter".to_string()),
         ("setup.complete".to_string(), "0".to_string()),
     ])
 }
@@ -2024,6 +2335,9 @@ fn display_model_for_provider_model(
     config_profile: Option<&str>,
     config_overrides: &[(String, toml::Value)],
 ) -> Result<String> {
+    if model == "openai/gpt-5.5" {
+        return Ok("GPT-5.5".to_string());
+    }
     let cwd = std::env::current_dir()?;
     let catalog = model_catalog_for_cwd_with_options(cwd, config_profile, config_overrides)?;
     Ok(catalog
@@ -3243,6 +3557,7 @@ fn dataset_run_openai(
     python_timeout_seconds: u64,
     config_profile: Option<&str>,
     raw_config_overrides: &[String],
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     let (model, model_source) = resolve_cli_model_with_source(
         ProviderBackend::Openai,
@@ -3262,6 +3577,7 @@ fn dataset_run_openai(
         config_profile,
         raw_config_overrides,
         CollaborationModeKind::Default,
+        runtime_options,
     )?;
     agent_options = if provider_id_source == RunConfigValueSource::Explicit {
         agent_options.with_model_provider_id(provider_id.clone())
@@ -3286,6 +3602,42 @@ fn dataset_run_openai(
     )
 }
 
+fn dataset_run_codex(
+    store: &Store,
+    dataset: &str,
+    options: DatasetRunOptions,
+    model: String,
+    max_turns: usize,
+    python_timeout_seconds: u64,
+    config_profile: Option<&str>,
+    raw_config_overrides: &[String],
+    runtime_options: &CliRuntimeOptions,
+) -> Result<()> {
+    let browser_mode = dataset_browser_mode(&options);
+    let run_config = ProviderRunConfig::new(ProviderBackend::Codex, model.clone()).with_options(
+        cli_agent_options(
+            config_profile,
+            raw_config_overrides,
+            CollaborationModeKind::Default,
+            runtime_options,
+        )?
+        .with_default_model_provider_id("codex"),
+    );
+    dataset_run_provider(
+        store,
+        dataset,
+        options,
+        ConfigDatasetRunner { config: run_config },
+        DatasetProviderConfig {
+            provider: "codex".to_string(),
+            model: model.clone(),
+            browser_mode,
+            max_turns,
+            python_timeout_seconds,
+        },
+    )
+}
+
 fn dataset_run_anthropic(
     store: &Store,
     dataset: &str,
@@ -3293,11 +3645,12 @@ fn dataset_run_anthropic(
     model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     let browser_mode = dataset_browser_mode(&options);
     let run_config = ProviderRunConfig::new(ProviderBackend::Anthropic, model.clone())
         .with_options(
-            cli_agent_options(None, &[], CollaborationModeKind::Default)?
+            cli_agent_options(None, &[], CollaborationModeKind::Default, runtime_options)?
                 .with_default_model_provider_id("anthropic"),
         );
     dataset_run_provider(
@@ -3322,11 +3675,12 @@ fn dataset_run_openrouter(
     model: String,
     max_turns: usize,
     python_timeout_seconds: u64,
+    runtime_options: &CliRuntimeOptions,
 ) -> Result<()> {
     let browser_mode = dataset_browser_mode(&options);
     let run_config = ProviderRunConfig::new(ProviderBackend::Openrouter, model.clone())
         .with_options(
-            cli_agent_options(None, &[], CollaborationModeKind::Default)?
+            cli_agent_options(None, &[], CollaborationModeKind::Default, runtime_options)?
                 .with_default_model_provider_id("openrouter"),
         );
     dataset_run_provider(
@@ -3548,11 +3902,9 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         analytics_source: Some("cli".to_string()),
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),
-        // No MCP servers wired from the CLI dataset path yet (a `[mcp_servers]`
-        // config loader is a follow-up); empty keeps the `mcp` tool unregistered.
+        // Provider-level runtime options are merged by ConfigDatasetRunner; this
+        // per-case layer carries dataset-specific browser/python limits.
         mcp_servers: std::collections::HashMap::new(),
-        // Non-interactive dataset runs keep the default non-prompting approval
-        // policy with the guardian gate off (preserves prior auto-approve behavior).
         approval_policy: AgentRunOptions::default().approval_policy,
         use_guardian: AgentRunOptions::default().use_guardian,
     };
@@ -4602,9 +4954,87 @@ mod tests {
 
     #[test]
     fn cli_agent_options_pass_collaboration_mode_to_core() -> Result<()> {
-        let options = cli_agent_options(None, &[], CollaborationModeKind::Plan)?;
+        let options = cli_agent_options(
+            None,
+            &[],
+            CollaborationModeKind::Plan,
+            &CliRuntimeOptions::default(),
+        )?;
 
         assert_eq!(options.collaboration_mode, CollaborationModeKind::Plan);
+        Ok(())
+    }
+
+    #[test]
+    fn cli_agent_options_apply_runtime_policy_guardian_and_mcp() -> Result<()> {
+        let temp = unique_cli_test_dir("runtime-options")?;
+        let mcp_config = temp.join("mcp.toml");
+        std::fs::write(
+            &mcp_config,
+            r#"
+[mcp_servers.local]
+transport = "stdio"
+command = "test-mcp"
+"#,
+        )?;
+        let runtime_options = CliRuntimeOptions {
+            approval_policy: Some(AskForApproval::UnlessTrusted),
+            use_guardian: Some(true),
+            mcp_config_paths: vec![mcp_config],
+        };
+
+        let options =
+            cli_agent_options(None, &[], CollaborationModeKind::Default, &runtime_options)?;
+
+        assert_eq!(options.approval_policy, AskForApproval::UnlessTrusted);
+        assert!(options.use_guardian);
+        assert!(options.mcp_servers.contains_key("local"));
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
+    fn cli_child_runner_request_creates_store_child_session() -> Result<()> {
+        let temp = unique_cli_test_dir("child-runner-session")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let parent = store.create_session(None, &cwd)?;
+        let request = ChildAgentRunRequest {
+            parent_session_id: parent.id.clone(),
+            child_session_id: "00000000abcd".to_string(),
+            message: "Investigate the failing case".to_string(),
+            agent_path: Some("/root/investigate_1".to_string()),
+            nickname: Some("Analyst".to_string()),
+            role: Some("explorer".to_string()),
+            fork_turns: Some("all".to_string()),
+            model: Some("gpt-test".to_string()),
+            reasoning_effort: None,
+            service_tier: None,
+            config_overrides: Vec::new(),
+            completion_handler: None,
+        };
+
+        let child = create_agent_child_session_from_request(&store, &request)?;
+
+        assert_eq!(child.id, "00000000abcd");
+        assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
+        let child_events = store.events_for_session(&child.id)?;
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "agent.context"));
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "session.input"));
+        let parent_events = store.events_for_session(&parent.id)?;
+        assert!(parent_events
+            .iter()
+            .any(|event| event.event_type == "agent.spawned"
+                && event.payload["child_session_id"] == child.id));
+
+        std::fs::remove_dir_all(temp)?;
         Ok(())
     }
 
@@ -5210,6 +5640,24 @@ mod tests {
                 .map(|(_, value)| value.as_str()),
             Some("corp")
         );
+        Ok(())
+    }
+
+    #[test]
+    fn cli_default_settings_use_openrouter_provider_path() -> Result<()> {
+        let defaults = default_settings(None, &[])?;
+        let value_for = |key: &str| {
+            defaults
+                .iter()
+                .find(|(setting, _)| setting == key)
+                .map(|(_, value)| value.as_str())
+        };
+
+        assert_eq!(value_for("account"), Some("OpenRouter API key"));
+        assert_eq!(value_for("model"), Some("GPT-5.5"));
+        assert_eq!(value_for("provider.model"), Some("openai/gpt-5.5"));
+        assert_eq!(value_for("provider.id"), Some("openrouter"));
+        assert_eq!(value_for("agent.backend"), Some("openrouter"));
         Ok(())
     }
 
