@@ -746,7 +746,7 @@ fn build_tool_dispatcher_with_cwd(
     reg.register::<_, ExecCommandRequest>(
         "exec_command",
         definitions::exec_command(),
-        false,
+        true,
         exec_command_tool,
     );
     reg.register::<_, WriteStdinRequest>(
@@ -2228,6 +2228,77 @@ mod tests {
             text.contains(&dir.path().display().to_string()),
             "tool cwd must be the supplied session cwd, got: {text}"
         );
+    }
+
+    #[tokio::test]
+    async fn production_exec_command_calls_overlap() {
+        use browser_use_llm::schema::{ContentPart, MessageRole};
+        use std::time::{Duration, Instant};
+        use tokio_util::sync::CancellationToken;
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        let dispatcher = build_tool_dispatcher_with_cwd(
+            Arc::new(MarkerPythonBackend),
+            &config,
+            None,
+            dir.path().to_path_buf(),
+            dir.path().join("artifacts"),
+            Arc::new(NoopEventSink),
+        );
+
+        let call = |id: &str, label: &str| ContentPart::ToolCall {
+            id: id.to_string(),
+            name: "exec_command".to_string(),
+            input: serde_json::json!({
+                "command": ["sh", "-c", format!("sleep 1; printf {label}")],
+                "yield_time_ms": 1500,
+            }),
+            provider_metadata: None,
+        };
+
+        let started = Instant::now();
+        let result = dispatcher
+            .dispatch_ordered(
+                vec![call("call-exec-a", "first"), call("call-exec-b", "second")],
+                CancellationToken::new(),
+            )
+            .await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(result.outputs_in_order.len(), 2);
+        assert!(
+            elapsed < Duration::from_millis(1800),
+            "two 1s exec_command calls should overlap; elapsed={elapsed:?}"
+        );
+
+        for (msg, expected) in result.outputs_in_order.iter().zip(["first", "second"]) {
+            assert_eq!(msg.role, MessageRole::Tool);
+            let (text, is_error) = msg
+                .content
+                .iter()
+                .find_map(|part| match part {
+                    ContentPart::ToolResult {
+                        content, is_error, ..
+                    } => {
+                        let text = content
+                            .iter()
+                            .find_map(|part| match part {
+                                ContentPart::Text { text } => Some(text.clone()),
+                                _ => None,
+                            })
+                            .unwrap_or_default();
+                        Some((text, *is_error))
+                    }
+                    _ => None,
+                })
+                .expect("tool result");
+            assert!(!is_error, "exec_command failed: {text}");
+            assert!(
+                text.contains(expected),
+                "exec_command output should contain {expected:?}, got {text:?}"
+            );
+        }
     }
 
     /// `AskForApproval::Never` (the default) AUTO-APPROVES: a gated `shell` call

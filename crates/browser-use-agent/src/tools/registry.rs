@@ -1145,8 +1145,8 @@ to the single frame that proves the task succeeded."
 /// `WireArgs` types. The browser/python/mcp handlers need an injected backend
 /// (they would otherwise reach the OS), so those are supplied by the caller.
 ///
-/// `parallel_safe` per tool: `tool_search` / `web_search` = `true` (pure /
-/// read-only); `shell` / `apply_patch` / `view_image` / `browser` / `python` /
+/// `parallel_safe` per tool: `exec_command` / `tool_search` / `web_search` =
+/// `true`; `shell` / `apply_patch` / `view_image` / `browser` / `python` /
 /// `update_plan` / `request_user_input` = `false` (serial). `mcp` is registered
 /// `false` here (a serial default); its per-request read-only hint still drives
 /// the handler's own [`ToolRuntime::parallel_safe`](crate::tools::ToolRuntime::parallel_safe).
@@ -1189,7 +1189,7 @@ where
     reg.register::<_, ExecCommandRequest>(
         "exec_command",
         definitions::exec_command(),
-        false,
+        true,
         ExecCommandTool::new(unified_exec.clone()),
     );
     reg.register::<_, WriteStdinRequest>(

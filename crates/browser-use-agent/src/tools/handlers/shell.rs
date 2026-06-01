@@ -568,7 +568,7 @@ impl ToolRuntime<ShellRequest, ExecOutput> for ShellTool {
 #[async_trait::async_trait]
 impl ToolRuntime<ExecCommandRequest, ExecOutput> for ExecCommandTool {
     fn parallel_safe(&self, _req: &ExecCommandRequest) -> bool {
-        false
+        true
     }
 
     async fn run(
