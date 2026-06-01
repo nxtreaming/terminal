@@ -55,6 +55,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use browser_use_llm::schema::{ContentPart, Message};
+use browser_use_protocol::EventRecord;
 use tokio_util::sync::CancellationToken;
 
 use crate::compact::{run_compaction, CompactionSampler, COMPACT_USER_MESSAGE_MAX_TOKENS};
@@ -95,6 +96,9 @@ type RecordedBuffer = Arc<Mutex<Vec<Message>>>;
 /// here; the full `AgentConfig` is not plumbed into [`ProviderRunConfig`] yet, so
 /// the facade uses codex's default budget. Wave-E threads the real value through.
 const DEFAULT_STREAM_MAX_RETRIES: u32 = 5;
+const SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT: &str = "session.followup.pending";
+const SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT: &str = "session.followup.cancelled";
+const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
 
 /// A [`TurnState`] backed by the session's durable event log, with REAL codex-
 /// parity token accounting + model-based compaction.
@@ -373,6 +377,183 @@ fn history_from_store(store: &SharedStore, session_id: &str) -> Vec<Message> {
     ContextManager::new().lower_to_messages(&items)
 }
 
+fn followup_delivery_is_after_next_tool_call(event: &EventRecord) -> bool {
+    matches!(
+        event.event_type.as_str(),
+        names::SESSION_FOLLOWUP | SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+    ) && event
+        .payload
+        .get("delivery")
+        .and_then(serde_json::Value::as_str)
+        == Some(FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL)
+}
+
+fn followup_marker_seqs(event: &EventRecord) -> Vec<i64> {
+    if let Some(seq) = event
+        .payload
+        .get("followup_seq")
+        .or_else(|| event.payload.get("seq"))
+        .and_then(serde_json::Value::as_i64)
+    {
+        return vec![seq];
+    }
+    event
+        .payload
+        .get("followup_seqs")
+        .and_then(serde_json::Value::as_array)
+        .map(|seqs| {
+            seqs.iter()
+                .filter_map(serde_json::Value::as_i64)
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default()
+}
+
+fn event_closes_after_next_tool_call_followup(event: &EventRecord, followup_seq: i64) -> bool {
+    if event.seq <= followup_seq {
+        return false;
+    }
+    match event.event_type.as_str() {
+        "agent.turn_queue_drained" => {
+            let drained_session_messages = event
+                .payload
+                .get("session_messages")
+                .and_then(serde_json::Value::as_u64)
+                .unwrap_or_default();
+            let last_seq = event
+                .payload
+                .get("last_seq")
+                .and_then(serde_json::Value::as_i64)
+                .unwrap_or_default();
+            drained_session_messages > 0 && last_seq >= followup_seq
+        }
+        SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT => {
+            followup_marker_seqs(event).contains(&followup_seq)
+        }
+        _ => false,
+    }
+}
+
+fn pending_after_next_tool_call_followup(events: &[EventRecord], followup: &EventRecord) -> bool {
+    followup_delivery_is_after_next_tool_call(followup)
+        && !events
+            .iter()
+            .any(|event| event_closes_after_next_tool_call_followup(event, followup.seq))
+}
+
+fn next_pending_active_followup(events: &[EventRecord]) -> Option<&EventRecord> {
+    events
+        .iter()
+        .filter(|event| event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT)
+        .filter(|event| event.payload.get("pending_from_seq").is_none())
+        .filter(|event| pending_after_next_tool_call_followup(events, event))
+        .min_by_key(|event| event.seq)
+}
+
+fn has_pending_active_followup(store: &SharedStore, session_id: &str) -> bool {
+    let events = {
+        let Ok(store) = store.lock() else {
+            return false;
+        };
+        store.events_for_session(session_id).unwrap_or_default()
+    };
+    next_pending_active_followup(&events).is_some()
+}
+
+fn drain_one_pending_active_followup(store: &SharedStore, session_id: &str) {
+    let Ok(store) = store.lock() else {
+        return;
+    };
+    let Ok(events) = store.events_for_session(session_id) else {
+        return;
+    };
+    let Some(pending) = next_pending_active_followup(&events) else {
+        return;
+    };
+    let pending_seq = pending.seq;
+    let mut payload = pending.payload.clone();
+    if let Some(obj) = payload.as_object_mut() {
+        obj.remove("delivery");
+        obj.insert(
+            "pending_from_seq".to_string(),
+            serde_json::Value::from(pending_seq),
+        );
+    }
+    let Ok(committed) = store.append_event(session_id, names::SESSION_FOLLOWUP, payload) else {
+        return;
+    };
+    let _ = store.append_event(
+        session_id,
+        "agent.turn_queue_drained",
+        serde_json::json!({
+            "phase": "after_tool_outputs",
+            "session_messages": 1,
+            "mailbox_messages": 0,
+            "last_seq": committed.seq,
+        }),
+    );
+    let _ = store.append_event(
+        session_id,
+        "model.response.continued",
+        serde_json::json!({
+            "reason": "active_turn_queue_drained",
+            "phase": "after_tool_outputs",
+            "session_messages": 1,
+            "mailbox_messages": 0,
+        }),
+    );
+}
+
+fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
+    let Ok(store) = store.lock() else {
+        return;
+    };
+    let Ok(events) = store.events_for_session(session_id) else {
+        return;
+    };
+    if events
+        .iter()
+        .any(|event| event.event_type == "capture.curation")
+    {
+        return;
+    }
+    let Ok(Some(session)) = store.load_session(session_id) else {
+        return;
+    };
+    match browser_use_browser::build_uncurated_summary_gif(std::path::Path::new(
+        &session.artifact_root,
+    )) {
+        Ok(Some(gif_path)) => {
+            let _ = store.append_event(
+                session_id,
+                "capture.curation",
+                serde_json::json!({
+                    "source": "fallback_uncurated",
+                    "gif_path": gif_path.display().to_string(),
+                }),
+            );
+            let _ = crate::infra::persistence::record_tool_artifact(
+                &store,
+                session_id,
+                "capture",
+                &serde_json::json!({
+                    "path": gif_path.display().to_string(),
+                    "kind": "summary_gif",
+                    "mime": "image/gif",
+                }),
+            );
+        }
+        Ok(None) => {}
+        Err(error) => {
+            let _ = store.append_event(
+                session_id,
+                "capture.recording_failed",
+                serde_json::json!({ "error": format!("{error:#}") }),
+            );
+        }
+    }
+}
+
 impl TurnState for StoreTurnState {
     async fn clone_history_for_prompt(&self) -> Vec<Message> {
         // Once compacted, the prompt base is the compacted override (codex's
@@ -401,12 +582,22 @@ impl TurnState for StoreTurnState {
     }
 
     async fn has_pending_input(&self) -> bool {
-        // Phase-E seam: no pending steer/input queue is wired yet.
-        false
+        let store = Arc::clone(&self.store);
+        let session_id = self.session_id.as_str().to_string();
+        tokio::task::spawn_blocking(move || has_pending_active_followup(&store, &session_id))
+            .await
+            .unwrap_or(false)
     }
 
     async fn take_pending_input(&self) -> Vec<Message> {
-        // Phase-E seam: no pending steer/input queue is wired yet.
+        let store = Arc::clone(&self.store);
+        let session_id = self.session_id.as_str().to_string();
+        let _ = tokio::task::spawn_blocking(move || {
+            drain_one_pending_active_followup(&store, &session_id)
+        })
+        .await;
+        // The committed follow-up is appended to the store before the loop calls
+        // `clone_history_for_prompt`, so returning it here would duplicate it.
         Vec::new()
     }
 
@@ -738,9 +929,13 @@ async fn drive_run<Sd: SamplingDriver>(
     let observer = StoreObserver::new(sink, session_id.as_str().to_string());
 
     let turn_loop = TurnLoop::new(state, driver, observer);
-    turn_loop
+    let result = turn_loop
         .run(ctx, turn_has_fresh_input, CancellationToken::new())
-        .await
+        .await;
+    if result.is_ok() {
+        ensure_fallback_capture_recording(&store, session_id.as_str());
+    }
+    result
 }
 
 /// Build the durable UI sink for loop lifecycle events.

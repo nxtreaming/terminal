@@ -595,6 +595,7 @@ fn build_tool_dispatcher_with_cwd(
 ) -> Arc<RealToolDispatcher> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
+    use crate::tools::handlers::capture::{CaptureCurationRequest, CaptureCurationTool};
     use crate::tools::handlers::done::{DoneRequest, DoneTool};
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::{PythonRequest, PythonTool};
@@ -684,6 +685,14 @@ fn build_tool_dispatcher_with_cwd(
         false,
         browser_tool,
     );
+    if let Some((store, session_id)) = &user_input {
+        reg.register::<_, CaptureCurationRequest>(
+            "submit_capture_curation",
+            definitions::submit_capture_curation(),
+            false,
+            CaptureCurationTool::with_store(store.clone(), session_id.as_str().to_string()),
+        );
+    }
     // `python`: backed by the run's single PythonWorker (started eagerly by
     // `resolve_provider`). parallel_safe = false (single interpreter process).
     reg.register::<_, PythonRequest>(

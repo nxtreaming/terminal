@@ -4739,29 +4739,6 @@ impl App {
         true
     }
 
-    fn handle_composer_click(&mut self, column: u16, row: u16) -> bool {
-        if self.is_slash_palette_active() {
-            return false;
-        }
-        let Some(rect) = self.composer_input_rect.get() else {
-            return false;
-        };
-        if column < rect.x
-            || column >= rect.x.saturating_add(rect.width)
-            || row < rect.y
-            || row >= rect.y.saturating_add(rect.height)
-        {
-            return false;
-        }
-        self.composer.set_cursor_from_wrapped_position(
-            rect.height.max(1) as usize,
-            rect.width.max(1) as usize,
-            column.saturating_sub(rect.x) as usize,
-            row.saturating_sub(rect.y) as usize,
-        );
-        true
-    }
-
     fn execute_surface_selection(&mut self) -> Result<()> {
         match self.surface {
             Surface::History => {
@@ -7781,9 +7758,6 @@ fn handle_terminal_event(
             let before_cursor = app.composer.cursor_index();
             let logo_handled = matches!(kind, MouseEventKind::Down(_))
                 && app.handle_welcome_logo_click(column, row);
-            if !logo_handled && matches!(kind, MouseEventKind::Down(_)) {
-                app.handle_composer_click(column, row);
-            }
             app.trace_mouse_event(kind_label, column, row, before_cursor, logo_handled);
             Ok(false)
         }

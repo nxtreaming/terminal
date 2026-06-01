@@ -573,6 +573,23 @@ def capture_screenshot(label="screenshot", full=False, attach=True, max_dim=None
     return path
 
 
+def note(caption):
+    """Mark the current moment as important for the recording, with a short
+    human-readable caption (e.g. note("Delta $209 - cheapest fare details")).
+    Cheap: it just timestamps a caption; the 2fps session capture already has the
+    frame. Call it at each meaningful step so the end-of-run highlight GIF can be
+    captioned. Returns the recorded note."""
+    record = {"ts_ms": int(_time.time() * 1000), "caption": str(caption)}
+    try:
+        notes_path = ARTIFACT_DIR / ".capture.notes.ndjson"
+        with notes_path.open("a", encoding="utf-8") as handle:
+            handle.write(json.dumps(record) + "\n")
+            handle.flush()
+    except Exception:
+        pass
+    return record
+
+
 def screenshot(label="screenshot", full=False):
     return capture_screenshot(label=label, full=full, attach=True)
 

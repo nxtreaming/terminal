@@ -8,6 +8,7 @@
 
 pub mod apply_patch;
 pub mod browser;
+pub mod capture;
 pub mod done;
 pub mod goal;
 pub mod mcp;
@@ -45,6 +46,9 @@ mod web_search_tests;
 
 pub use apply_patch::{ApplyPatchApprovalKey, ApplyPatchRequest, ApplyPatchTool};
 pub use browser::{BrowserAction, BrowserApprovalKey, BrowserRequest, BrowserTool};
+pub use capture::{
+    CaptureCurationApprovalKey, CaptureCurationFrame, CaptureCurationRequest, CaptureCurationTool,
+};
 pub use done::{DoneApprovalKey, DoneRequest, DoneTool, DONE_STDOUT_PREFIX, DONE_TOOL_NAME};
 pub use mcp::{
     mcp_result_tool_content, McpApprovalKey, McpCallResult, McpClient, McpTool, McpToolCallRequest,

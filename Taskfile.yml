@@ -28,19 +28,54 @@ tasks:
     aliases:
       - onboarding:reset
       - reset-onboarding
-    desc: Reset TUI onboarding without clearing saved auth or sessions
+    desc: Reset TUI onboarding and history (keeps saved auth; use auth:clear for a full wipe)
     silent: true
     cmds:
       - |
         set -eu
 
         state_dir="${STATE_DIR:-$HOME/.browser-use-terminal}"
-        cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set setup.complete 0 >/dev/null
-        cargo run -q -p browser-use-cli -- --state-dir "$state_dir" config set browser "Local Chrome" >/dev/null
+        db="$state_dir/state.db"
 
-        echo "onboarding reset: $state_dir/state.db"
-        echo "saved auth and sessions left unchanged"
+        # Re-show onboarding without nuking saved auth. Two things must be cleared:
+        #  1) app_settings EXCEPT auth.* — drops setup.complete, model, account, etc.
+        #     (clearing only setup.complete isn't enough: a leftover model keeps
+        #     model_configured=true, so the app auto-completes setup on the first
+        #     tick and skips the wizard before you ever see it).
+        #  2) every other table (sessions/events/artifacts/...) — otherwise History
+        #     still lists old runs and the home screen won't show the first-run
+        #     examples (those only appear when history is empty).
+        # auth.* rows are kept. Use `task auth:clear` for a full wipe including auth.
+        # IMPORTANT: close the TUI first — a running app holds sessions in memory and
+        # rewrites them on exit, which would undo this.
+        if [ -f "$db" ]; then
+          tables="$(sqlite3 "$db" "SELECT name FROM sqlite_master WHERE type='table' AND name NOT LIKE 'sqlite_%';")"
+          for t in $tables; do
+            case "$t" in
+              app_settings)
+                # keep auth.* (saved login); drop everything else
+                sqlite3 "$db" "DELETE FROM app_settings WHERE key NOT LIKE 'auth.%';" ;;
+              schema_migrations)
+                # NEVER touch: wiping this makes the app re-run migrations against an
+                # already-migrated schema -> "duplicate column name" on next launch.
+                : ;;
+              *)
+                sqlite3 "$db" "DELETE FROM \"$t\";" ;;
+            esac
+          done
+          sqlite3 "$db" "VACUUM;" || true
+          echo "onboarding reset: $db (settings + history cleared; auth.* kept)"
+        else
+          echo "no existing state.db at $db — nothing to reset"
+        fi
+
         echo "launch onboarding: cargo run -q -p browser-use-tui -- --state-dir \"$state_dir\""
+        echo ""
+        echo "NOTE: account_ready also reads credentials OUTSIDE this DB. If the wizard"
+        echo "still auto-skips, a provider key is set in this shell. Unset it first:"
+        echo "  unset ANTHROPIC_API_KEY OPENAI_API_KEY OPENROUTER_API_KEY DEEPSEEK_API_KEY"
+        echo "  unset LLM_BROWSER_ANTHROPIC_API_KEY LLM_BROWSER_OPENAI_API_KEY LLM_BROWSER_OPENAI_COMPAT_API_KEY LLM_BROWSER_DEEPSEEK_API_KEY"
+        echo "  (Codex login at ~/.codex/auth.json is left intact — global Codex auth.)"
 
   auth:clear:
     aliases:

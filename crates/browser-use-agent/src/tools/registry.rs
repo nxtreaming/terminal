@@ -648,6 +648,44 @@ pub mod definitions {
         }
     }
 
+    /// `submit_capture_curation`: build browser recording summary artifacts from
+    /// selected frame seqs.
+    pub fn submit_capture_curation() -> ToolDefinition {
+        ToolDefinition {
+            name: "submit_capture_curation".to_string(),
+            description: "Finalize the visual summary of this browser task. Review the capture \
+contact sheet you were shown (each pane is labeled with its frame seq) and select the frames \
+that best tell the story of what happened, dropping redundant or uninformative ones. For each \
+chosen frame give its seq and a short caption, ordered as they should play. Set confirmation_seq \
+to the single frame that proves the task succeeded."
+                .to_string(),
+            input_schema: json!({
+                "type": "object",
+                "properties": {
+                    "frames": {
+                        "type": "array",
+                        "description": "Chosen frames in playback order.",
+                        "items": {
+                            "type": "object",
+                            "properties": {
+                                "seq": { "type": "integer", "description": "Frame seq from the contact sheet." },
+                                "caption": { "type": "string", "description": "Short caption for this frame." }
+                            },
+                            "required": ["seq", "caption"],
+                            "additionalProperties": false
+                        }
+                    },
+                    "confirmation_seq": {
+                        "type": "integer",
+                        "description": "Seq of the frame that confirms task success."
+                    }
+                },
+                "required": ["frames", "confirmation_seq"],
+                "additionalProperties": false
+            }),
+        }
+    }
+
     /// `python`: a Python snippet + optional timeout. Parity: legacy
     /// `dispatch_python_tool` (`browser-use-core/src/lib.rs`).
     pub fn python() -> ToolDefinition {

@@ -91,6 +91,17 @@ def tmux_send_mouse_down(session: str, column: int, row: int) -> None:
     tmux_send_literal(session, f"\x1b[<0;{column + 1};{row + 1}M")
 
 
+def tmux_send_mouse_up(session: str, column: int, row: int) -> None:
+    # Real terminal clicks report a release after the press.
+    tmux_send_literal(session, f"\x1b[<0;{column + 1};{row + 1}m")
+
+
+def tmux_send_mouse_click(session: str, column: int, row: int) -> None:
+    tmux_send_mouse_down(session, column, row)
+    time.sleep(0.05)
+    tmux_send_mouse_up(session, column, row)
+
+
 def capture(session: str, name: str) -> str:
     text = tmux("capture-pane", "-t", session, "-p", "-S", "-200")
     ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
@@ -279,14 +290,15 @@ def latest_session_id(state_dir: Path) -> str:
     return str(row[0])
 
 
-def append_store_event(state_dir: Path, session_id: str, event_type: str, payload: dict[str, object]) -> None:
+def append_store_event(state_dir: Path, session_id: str, event_type: str, payload: dict[str, object]) -> int:
     now_ms = int(time.time() * 1000)
     with sqlite3.connect(state_dir / "state.db") as conn:
-        conn.execute(
+        cursor = conn.execute(
             "INSERT INTO events(id, session_id, ts_ms, type, payload_json) VALUES (?, ?, ?, ?, ?)",
             (uuid.uuid4().hex, session_id, now_ms, event_type, json.dumps(payload)),
         )
         conn.execute("UPDATE sessions SET updated_ms = ? WHERE id = ?", (now_ms, session_id))
+        return int(cursor.lastrowid)
 
 
 def set_session_status(state_dir: Path, session_id: str, status: str) -> None:
@@ -507,26 +519,6 @@ def smoke_interactive_terminal(binary: Path) -> None:
         tmux_send(session, "C-c")
         wait_for(session, "Type to steer the agent", "main-after-alt-arrow-clear")
 
-        tmux_send_literal(session, "first line")
-        tmux_send_shift_enter(session)
-        tmux_send_literal(session, "second word")
-        tmux_send_shift_enter(session)
-        tmux_send_literal(session, "third")
-        multiline_click_before = wait_for(session, "  second word", "multiline-click-before")
-        click_lines = multiline_click_before.splitlines()
-        click_row = next(idx for idx, line in enumerate(click_lines) if "  second word" in line)
-        click_col = click_lines[click_row].index("word")
-        tmux_send_mouse_down(session, click_col, click_row)
-        tmux_send_literal(session, "X")
-        multiline_click = capture_after_idle(session, "multiline-click", visible_only=True)
-        assert_contains(
-            multiline_click,
-            "  second Xword",
-            "mouse click should place cursor on clicked multiline word",
-        )
-        tmux_send(session, "C-c")
-        wait_for(session, "Type to steer the agent", "main-after-multiline-click-clear")
-
         bracketed = "\x1b[200~paste one\npaste two\x1b[201~"
         tmux_send_literal(session, bracketed)
         pasted = wait_for(session, "paste two", "bracketed-paste")
@@ -662,6 +654,183 @@ def smoke_ready_resize_does_not_leave_stale_frames(binary: Path) -> None:
             assert_count(text, expected_version, 1, f"ready resize {name} should keep one version")
             assert_count(text, "press / for shortcuts", 1, f"ready resize {name} should keep one shortcut hint")
             assert_not_contains(text, "^[[", f"ready resize {name} should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_composer_mouse_clicks_empty_and_line_end(binary: Path) -> None:
+    session = f"but-smoke-composer-mouse-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-composer-mouse-"))
+    try:
+        start_session(
+            session,
+            binary,
+            state_dir,
+            seed_demo="running",
+            select_latest=False,
+        )
+        wait_for(session, "Tell the browser what to do...", "composer-mouse-ready")
+        tmux_send_literal(session, "first line")
+        tmux_send_shift_enter(session)
+        tmux_send_shift_enter(session)
+        tmux_send_shift_enter(session)
+        tmux_send_literal(session, "third line")
+        wait_for(session, "third line", "composer-mouse-before")
+
+        before = capture_after_idle(session, "composer-mouse-before-idle", visible_only=True)
+        lines = before.splitlines()
+        first_row = next(idx for idx, line in enumerate(lines) if "first line" in line)
+        third_row = next(idx for idx, line in enumerate(lines) if "third line" in line)
+        blank_row = first_row + 1
+        second_blank_row = first_row + 2
+        first_col = lines[first_row].index("first line")
+        third_col = lines[third_row].index("third line")
+
+        tmux_send_mouse_click(session, third_col + 5, third_row)
+        tmux_send_mouse_click(session, first_col, blank_row)
+        tmux_send_literal(session, "A")
+        wait_for(session, "  A", "composer-mouse-empty-row-first-cell")
+        tmux_send_mouse_click(session, first_col + 10, second_blank_row)
+        tmux_send_literal(session, "B")
+        wait_for(session, "  B", "composer-mouse-empty-row-tenth-cell")
+        after_blank = capture_after_idle(session, "composer-mouse-empty-row-visible", visible_only=True)
+        assert_contains(after_blank, "  A", "first-cell empty row click should place cursor on the empty logical line")
+        assert_contains(after_blank, "  B", "tenth-column empty row click should place cursor on the empty logical line")
+        assert_not_contains(after_blank, "first lineA", "first-cell empty row click should not reuse the previous line")
+        assert_not_contains(after_blank, "first lineB", "empty row click should not reuse the previous line")
+        assert_not_contains(after_blank, "  AB", "tenth-column empty row click should not reuse the prior empty line")
+
+        lines = after_blank.splitlines()
+        first_row = next(idx for idx, line in enumerate(lines) if "first line" in line)
+        far_col = min(len(lines[first_row]) - 4, first_col + 70)
+        tmux_send_mouse_click(session, far_col, first_row)
+        tmux_send_literal(session, "C")
+        wait_for(session, "first lineC", "composer-mouse-line-end")
+        after_first = capture_after_idle(session, "composer-mouse-line-end-visible", visible_only=True)
+        assert_contains(after_first, "first lineC", "far-right line click should clip to that line end")
+        assert_not_contains(after_first, "  AC", "far-right line click should not spill into the first empty line")
+        assert_not_contains(after_first, "  BC", "far-right line click should not spill into the second empty line")
+
+        tmux_send(session, "C-c")
+        wait_for(session, "Tell the browser what to do...", "composer-mouse-padding-cleared")
+        tmux_send_literal(session, "first line")
+        tmux_send_shift_enter(session)
+        tmux_send_literal(session, "third line")
+        wait_for(session, "third line", "composer-mouse-padding-before")
+        padding_before = capture_after_idle(
+            session,
+            "composer-mouse-padding-before-visible",
+            visible_only=True,
+        )
+        lines = padding_before.splitlines()
+        first_row = next(idx for idx, line in enumerate(lines) if "first line" in line)
+        padding_row = first_row + 2
+        padding_col = len(lines[padding_row]) - 8
+        tmux_send_mouse_click(session, padding_col, padding_row)
+        tmux_send_literal(session, "P")
+        padding_after = wait_for(session, "  P", "composer-mouse-padding-row")
+        assert_contains(
+            padding_after,
+            "  P",
+            "far-right click on a visual padding row should create that blank line",
+        )
+        assert_not_contains(
+            padding_after,
+            "third lineP",
+            "visual padding row click should not reuse the previous line end",
+        )
+
+        tmux_send(session, "C-c")
+        wait_for(session, "Tell the browser what to do...", "composer-mouse-cleared")
+        tmux_send_literal(session, "first line")
+        tmux_send_shift_enter(session)
+        tmux_send_literal(session, "          ")
+        tmux_send_shift_enter(session)
+        tmux_send_literal(session, "third line")
+        wait_for(session, "third line", "composer-mouse-hidden-space-before")
+        hidden_space_before = capture_after_idle(
+            session,
+            "composer-mouse-hidden-space-before-visible",
+            visible_only=True,
+        )
+        lines = hidden_space_before.splitlines()
+        first_row = next(idx for idx, line in enumerate(lines) if "first line" in line)
+        first_col = lines[first_row].index("first line")
+        tmux_send_mouse_click(session, first_col + 10, first_row + 1)
+        tmux_send_literal(session, "W")
+        hidden_space_after = wait_for(session, "  W", "composer-mouse-hidden-space-row")
+        assert_contains(
+            hidden_space_after,
+            "  W",
+            "tenth-column click on a whitespace-only line should behave like an empty line",
+        )
+        assert_not_contains(
+            hidden_space_after,
+            "first lineW",
+            "whitespace-only row click should not reuse the previous line",
+        )
+
+        tmux_send(session, "C-c")
+        wait_for(session, "Tell the browser what to do...", "composer-mouse-overflow-cleared")
+        for idx in range(1, 14):
+            tmux_send_literal(session, f"line{idx}")
+            if idx != 13:
+                tmux_send_shift_enter(session)
+        wait_for(session, "line13", "composer-mouse-overflow-before")
+        overflow_before = capture_after_idle(
+            session,
+            "composer-mouse-overflow-before-visible",
+            visible_only=True,
+        )
+        assert_contains(overflow_before, "line4", "overflowed composer should show line4 as first visible row")
+        assert_contains(overflow_before, "line13", "overflowed composer should show the final line before click")
+        assert_not_contains(
+            overflow_before,
+            "> line1",
+            "overflowed composer should be scrolled to the tail before the click",
+        )
+        lines = overflow_before.splitlines()
+        line4_row = next(idx for idx, line in enumerate(lines) if "line4" in line)
+        line4_col = lines[line4_row].index("line4")
+        tmux_send_mouse_click(session, min(len(lines[line4_row]) - 4, line4_col + 70), line4_row)
+        overflow_after_click = capture_after_idle(
+            session,
+            "composer-mouse-overflow-after-click-visible",
+            visible_only=True,
+        )
+        assert_not_contains(
+            overflow_after_click,
+            "> line1",
+            "clicking an overflowed visible row should not scroll the composer to the start",
+        )
+        after_click_lines = overflow_after_click.splitlines()
+        line4_after_row = next(idx for idx, line in enumerate(after_click_lines) if "line4" in line)
+        if line4_after_row != line4_row:
+            raise AssertionError(
+                "clicking an overflowed visible row should keep that row under the mouse\n\n"
+                f"{overflow_after_click}"
+            )
+        tmux_send_literal(session, "Z")
+        wait_for(session, "line4Z", "composer-mouse-overflow-after-insert")
+        overflow_after_insert = capture_after_idle(
+            session,
+            "composer-mouse-overflow-after-insert-visible",
+            visible_only=True,
+        )
+        assert_not_contains(
+            overflow_after_insert,
+            "> line1",
+            "typing after an overflowed row click should keep the clicked window pinned",
+        )
+        line4_insert_row = next(
+            idx for idx, line in enumerate(overflow_after_insert.splitlines()) if "line4Z" in line
+        )
+        if line4_insert_row != line4_row:
+            raise AssertionError(
+                "typing after an overflowed row click should keep the clicked row stable\n\n"
+                f"{overflow_after_insert}"
+            )
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -862,6 +1031,219 @@ def smoke_tab_queues_followup_after_current_turn(binary: Path) -> None:
         )
         assert_not_contains(sent, "queued follow-up", "sent queued follow-up should stop rendering as queued")
         assert_not_contains(sent, "^[[", "tab queued follow-up should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_enter_previews_followup_after_next_tool(binary: Path) -> None:
+    session = f"but-smoke-enter-pending-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-enter-pending-"))
+    prompt = "adjust after next tool"
+    try:
+        start_session(session, binary, state_dir)
+        wait_for(session, "Type to steer the agent", "enter-pending-running")
+        tmux_send_literal(session, prompt)
+        tmux_send(session, "Enter")
+        pending = wait_for(
+            session,
+            "Messages to be submitted after next tool call",
+            "enter-pending-preview",
+        )
+        assert_contains(
+            pending,
+            "press esc to dequeue and edit",
+            "active follow-up preview should show the reclaim affordance",
+        )
+        assert_contains(pending, f"↳ {prompt}", "active follow-up preview should show the prompt")
+        assert_not_contains(
+            pending,
+            f"> {prompt}",
+            "active follow-up should not render as a committed transcript prompt before drain",
+        )
+        pending_visible = capture_after_idle(
+            session,
+            "enter-pending-preview-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            pending_visible,
+            "• browser",
+            "active follow-up preview should not hide the live browser block",
+        )
+
+        session_id = latest_session_id(state_dir)
+        with sqlite3.connect(state_dir / "state.db") as conn:
+            row = conn.execute(
+                "SELECT seq, payload_json FROM events WHERE session_id = ? "
+                "AND type = 'session.followup.pending' "
+                "AND payload_json LIKE ? "
+                "ORDER BY seq DESC LIMIT 1",
+                (session_id, f'%"{prompt}"%'),
+            ).fetchone()
+        if row is None:
+            raise AssertionError("missing active follow-up event")
+        followup_seq = int(row[0])
+        if '"delivery":"after_next_tool_call"' not in str(row[1]):
+            raise AssertionError(f"active follow-up lacked after_next_tool_call delivery: {row[1]}")
+
+        stream_text = "I'll inspect the repo before using tools."
+        append_store_event(state_dir, session_id, "model.stream_delta", {"text": stream_text})
+        wait_for(session, stream_text, "enter-pending-streaming")
+        visible_streaming = capture_after_idle(
+            session,
+            "enter-pending-streaming-visible",
+            visible_only=True,
+        )
+        assert_contains(
+            visible_streaming,
+            "Messages to be submitted after next tool call",
+            "active follow-up preview should remain visible below streaming text",
+        )
+        assert_contains(
+            visible_streaming,
+            "• browser",
+            "active follow-up preview should not replace the live browser block after streaming updates",
+        )
+        stream_idx = visible_streaming.find(stream_text)
+        preview_idx = visible_streaming.find("Messages to be submitted after next tool call")
+        if stream_idx < 0 or preview_idx < 0 or stream_idx > preview_idx:
+            raise AssertionError(
+                "active follow-up preview should be anchored below live streaming text\n\n"
+                f"{visible_streaming}"
+            )
+
+        committed_seq = append_store_event(
+            state_dir,
+            session_id,
+            "session.followup",
+            {"text": prompt, "pending_from_seq": followup_seq},
+        )
+        append_store_event(
+            state_dir,
+            session_id,
+            "agent.turn_queue_drained",
+            {
+                "phase": "after_tool_outputs",
+                "session_messages": 1,
+                "mailbox_messages": 0,
+                "last_seq": committed_seq,
+            },
+        )
+        drained = wait_for(session, f"> {prompt}", "enter-pending-drained")
+        assert_not_contains(
+            drained,
+            "Messages to be submitted after next tool call",
+            "drained active follow-up should stop rendering as pending",
+        )
+        assert_not_contains(drained, "^[[", "active follow-up preview should not leak escape sequences")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_escape_reclaims_pending_active_followup(binary: Path) -> None:
+    session = f"but-smoke-esc-pending-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-pending-"))
+    prompt = "reclaim this steer"
+    try:
+        start_session(session, binary, state_dir)
+        wait_for(session, "Type to steer the agent", "esc-pending-running")
+        tmux_send_literal(session, prompt)
+        tmux_send(session, "Enter")
+        wait_for(
+            session,
+            "Messages to be submitted after next tool call",
+            "esc-pending-preview",
+        )
+        tmux_send(session, "Escape")
+        reclaimed = wait_for(session, f"> {prompt}", "esc-pending-reclaimed")
+        assert_not_contains(
+            reclaimed,
+            "Messages to be submitted after next tool call",
+            "escape should dequeue pending active follow-up instead of keeping it pending",
+        )
+        assert_not_contains(reclaimed, "esc again to edit messages", "escape should not arm message selector")
+
+        session_id = latest_session_id(state_dir)
+        with sqlite3.connect(state_dir / "state.db") as conn:
+            cancelled = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE session_id = ? "
+                "AND type = 'session.followup.cancelled'",
+                (session_id,),
+            ).fetchone()[0]
+            interrupted = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE session_id = ? "
+                "AND type = 'session.followup.interrupt_sent'",
+                (session_id,),
+            ).fetchone()[0]
+            cancel_requested = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE session_id = ? "
+                "AND type = 'session.cancel_requested'",
+                (session_id,),
+            ).fetchone()[0]
+            status = conn.execute(
+                "SELECT status FROM sessions WHERE id = ?",
+                (session_id,),
+            ).fetchone()[0]
+        if cancelled != 1:
+            raise AssertionError(f"expected one followup.cancelled marker, saw {cancelled}")
+        if interrupted != 0:
+            raise AssertionError(f"escape reclaim should not interrupt, saw {interrupted} interrupt marker(s)")
+        if cancel_requested != 0:
+            raise AssertionError(f"escape reclaim should not cancel the session, saw {cancel_requested}")
+        if status != "running":
+            raise AssertionError(f"pending steer reclaim should leave the session running, saw {status}")
+    finally:
+        tmux("kill-session", "-t", session, check=False)
+        shutil.rmtree(state_dir, ignore_errors=True)
+
+
+def smoke_escape_reclaims_queued_followup(binary: Path) -> None:
+    session = f"but-smoke-esc-queue-{os.getpid()}"
+    state_dir = Path(tempfile.mkdtemp(prefix="but-tui-smoke-esc-queue-"))
+    prompt = "return queued follow-up"
+    try:
+        start_session(session, binary, state_dir)
+        wait_for(session, "Type to steer the agent", "esc-queue-running")
+        tmux_send_literal(session, prompt)
+        tmux_send(session, "Tab")
+        wait_for(session, "queued follow-up", "esc-queue-pending")
+
+        tmux_send(session, "Escape")
+        reclaimed = wait_for(session, f"> {prompt}", "esc-queue-reclaimed")
+        assert_contains(reclaimed, f"> {prompt}", "escape should put queued text back in composer")
+        assert_not_contains(reclaimed, "esc again to edit messages", "escape should not arm message selector")
+        visible_reclaimed = capture_after_idle(session, "esc-queue-reclaimed-visible", visible_only=True)
+        assert_not_contains(
+            visible_reclaimed,
+            "• queued follow-up",
+            "reclaimed queued follow-up should leave the live viewport queue preview",
+        )
+
+        session_id = latest_session_id(state_dir)
+        with sqlite3.connect(state_dir / "state.db") as conn:
+            cancelled = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE session_id = ? "
+                "AND type = 'session.queued_followup.cancelled' "
+                "AND payload_json LIKE '%\"reason\":\"reclaimed from escape\"%'",
+                (session_id,),
+            ).fetchone()[0]
+        if cancelled != 1:
+            raise AssertionError(f"expected one reclaimed queued follow-up, saw {cancelled}")
+
+        append_store_event(state_dir, session_id, "session.done", {"result": "Current turn finished"})
+        set_session_status(state_dir, session_id, "done")
+        capture_after_idle(session, "esc-queue-after-done", visible_only=True)
+        with sqlite3.connect(state_dir / "state.db") as conn:
+            submitted = conn.execute(
+                "SELECT COUNT(*) FROM events WHERE session_id = ? "
+                "AND type = 'session.followup' "
+                "AND payload_json LIKE ?",
+                (session_id, f'%"{prompt}"%'),
+            ).fetchone()[0]
+        if submitted != 0:
+            raise AssertionError(f"reclaimed queued follow-up should not submit, saw {submitted}")
     finally:
         tmux("kill-session", "-t", session, check=False)
         shutil.rmtree(state_dir, ignore_errors=True)
@@ -1601,6 +1983,9 @@ def main() -> int:
     smoke_double_escape_opens_message_selector(binary)
     smoke_escape_reclaims_prompt_before_output(binary)
     smoke_tab_queues_followup_after_current_turn(binary)
+    smoke_enter_previews_followup_after_next_tool(binary)
+    smoke_escape_reclaims_pending_active_followup(binary)
+    smoke_escape_reclaims_queued_followup(binary)
     smoke_completed_history_uses_native_scrollback(binary)
     smoke_streaming_transcript_scrolls_above_composer(binary)
     smoke_prompt_only_followup_keeps_completed_transcript(binary)

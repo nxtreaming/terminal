@@ -7,7 +7,7 @@
 
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::fs::{self, File};
-use std::io::{BufRead, BufReader, Read, Seek, SeekFrom, Write};
+use std::io::{BufRead, BufReader, BufWriter, Read, Seek, SeekFrom, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Child, ChildStderr, ChildStdout, Command, Stdio};
@@ -175,7 +175,7 @@ struct BrowserSession {
     mode: BrowserMode,
     owner: BrowserOwner,
     endpoint: Option<Endpoint>,
-    connection: Option<CdpConnection>,
+    connection: Option<Arc<CdpDispatcher>>,
     current_target_id: Option<String>,
     current_session_id: Option<String>,
     connection_generation: u64,
@@ -233,6 +233,8 @@ struct BrowserScriptRun {
     bridge_errors: Arc<Mutex<Vec<String>>>,
     stream_path: PathBuf,
     stream_offset: u64,
+    frames_dir: PathBuf,
+    last_frame_seq: i64,
     started_at_ms: u128,
     timeout_seconds: u64,
     deadline: Instant,
@@ -364,10 +366,15 @@ pub fn run_browser_command_with_options(
         &argv,
         &options,
     )?;
-    Ok(BrowserCommandOutput {
-        events: session.browser_events(),
-        content,
-    })
+    let events = session.browser_events();
+    let connected = session.connection.is_some();
+    drop(sessions);
+    // Tool-agnostic recording: once the browser is connected (via any `browser`
+    // command), start session-layer 2fps capture if it isn't already running.
+    if connected {
+        start_session_capture(session_id, artifact_dir.as_ref());
+    }
+    Ok(BrowserCommandOutput { events, content })
 }
 
 pub fn run_browser_script(
@@ -420,7 +427,7 @@ pub fn start_browser_script(
                 )
             };
             let run_id = run.id.clone();
-            let output = BrowserScriptOutput {
+            let mut output = BrowserScriptOutput {
                 ok: true,
                 status: Some("running".to_string()),
                 run_id: Some(run_id.clone()),
@@ -433,6 +440,7 @@ pub fn start_browser_script(
                 browser_events: std::mem::take(&mut delta.browser_events),
                 ..Default::default()
             };
+            attach_inline_window_stitch(&mut run, &mut output);
             browser_script_runs()
                 .lock()
                 .expect("browser_script run registry poisoned")
@@ -473,7 +481,8 @@ pub fn observe_browser_script(
         }
         let delta = drain_browser_script_delta(&mut run).unwrap_or_default();
         if delta.has_content() {
-            let output = browser_script_running_output(&run, Some(delta), observe_timeout_ms);
+            let mut output = browser_script_running_output(&run, Some(delta), observe_timeout_ms);
+            attach_inline_window_stitch(&mut run, &mut output);
             browser_script_runs()
                 .lock()
                 .expect("browser_script run registry poisoned")
@@ -481,7 +490,8 @@ pub fn observe_browser_script(
             return Ok(output);
         }
         if Instant::now() >= observe_deadline {
-            let output = browser_script_running_output(&run, None, observe_timeout_ms);
+            let mut output = browser_script_running_output(&run, None, observe_timeout_ms);
+            attach_inline_window_stitch(&mut run, &mut output);
             browser_script_runs()
                 .lock()
                 .expect("browser_script run registry poisoned")
@@ -519,6 +529,9 @@ fn spawn_browser_script(
 ) -> Result<BrowserScriptRun> {
     fs::create_dir_all(artifact_dir.as_ref())
         .with_context(|| format!("create artifact dir {}", artifact_dir.as_ref().display()))?;
+    // Ensure session-layer capture is running (idempotent) so browser_script
+    // runs are recorded by the same tool-agnostic capture as `browser`.
+    start_session_capture(session_id, artifact_dir.as_ref());
     let listener = TcpListener::bind(("127.0.0.1", 0)).context("bind browser_script bridge")?;
     let bridge_addr = listener.local_addr()?;
     listener
@@ -539,6 +552,7 @@ fn spawn_browser_script(
     let stream_path = artifact_dir
         .as_ref()
         .join(format!(".{run_id}.events.ndjson"));
+    let frames_dir = artifact_dir.as_ref().join(format!(".{run_id}.frames"));
     let prelude = browser_script_prelude(
         bridge_addr.port(),
         cwd.as_ref(),
@@ -546,6 +560,7 @@ fn spawn_browser_script(
         &agent_workspace_dir,
         &domain_skill_roots,
         &stream_path,
+        &frames_dir,
         code,
     )?;
     let mut command = browser_script_python_command();
@@ -571,6 +586,8 @@ fn spawn_browser_script(
         bridge_errors,
         stream_path,
         stream_offset: 0,
+        frames_dir,
+        last_frame_seq: -1,
         started_at_ms: unix_time_ms(),
         timeout_seconds: timeout_seconds.max(1),
         deadline: Instant::now() + Duration::from_secs(timeout_seconds.max(1)),
@@ -2156,6 +2173,9 @@ impl BrowserSession {
             return Ok(json!({ "stopped": false, "reason": "missing remote browser id" }));
         };
         stop_cloud_browser(&id)?;
+        if let Some(sid) = self.session_id.clone() {
+            stop_session_capture(&sid);
+        }
         self.connection = None;
         self.endpoint = None;
         self.current_session_id = None;
@@ -2179,7 +2199,7 @@ impl BrowserSession {
         owner: BrowserOwner,
     ) -> Result<()> {
         let ws_url = endpoint.ws_url.clone();
-        let connection = CdpConnection::connect(&ws_url)?;
+        let connection = CdpDispatcher::connect(&ws_url)?;
         self.endpoint = Some(endpoint);
         self.connection = Some(connection);
         self.mode = mode;
@@ -2197,7 +2217,7 @@ impl BrowserSession {
         let Some(endpoint) = self.endpoint.clone() else {
             bail!("no browser endpoint is configured");
         };
-        self.connection = Some(CdpConnection::connect(&endpoint.ws_url)?);
+        self.connection = Some(CdpDispatcher::connect(&endpoint.ws_url)?);
         self.connection_generation += 1;
         if self.current_target_id.is_some() {
             let _ = self.reattach_same_target();
@@ -2266,6 +2286,9 @@ impl BrowserSession {
             let _ = managed.child.wait();
         }
         if self.mode == BrowserMode::Managed {
+            if let Some(sid) = self.session_id.clone() {
+                stop_session_capture(&sid);
+            }
             self.connection = None;
             self.endpoint = None;
             self.current_target_id = None;
@@ -2382,6 +2405,12 @@ impl BrowserSession {
     }
 
     fn cdp(&mut self, method: &str, session_id: Option<&str>, params: Value) -> Result<Value> {
+        if self.connection.is_none() {
+            bail!(
+                "browser is not connected. Run `browser status --json` or `browser connect ...`."
+            );
+        }
+        browser_session_prepare_cdp_visuals(self, method, session_id, &params);
         let Some(connection) = self.connection.as_mut() else {
             bail!(
                 "browser is not connected. Run `browser status --json` or `browser connect ...`."
@@ -2679,6 +2708,139 @@ fn cookie_to_cdp_param(cookie: &Value) -> Option<Value> {
         }
     }
     Some(Value::Object(param))
+}
+
+// Multiplexed CDP connection: one websocket, a background reader thread that
+// routes responses to callers by request id (and, later, id-less events to
+// subscribers). `call` takes `&self`, so many callers (agent + capture + ...)
+// can have requests in flight on the same socket concurrently without locking
+// the whole round-trip. Validated by `bench_multiplex` (p95 ≈ baseline).
+enum CdpDispatchCmd {
+    Call {
+        id: u64,
+        msg: String,
+        resp: std::sync::mpsc::Sender<Result<Value>>,
+    },
+    Shutdown,
+}
+
+struct CdpDispatcher {
+    tx: Mutex<std::sync::mpsc::Sender<CdpDispatchCmd>>,
+    next_id: AtomicU64,
+    reader: Mutex<Option<thread::JoinHandle<()>>>,
+}
+
+impl CdpDispatcher {
+    fn connect(ws_url: &str) -> Result<Arc<Self>> {
+        let (mut socket, _) =
+            connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
+        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
+            let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
+            let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
+        }
+        let (tx, rx) = std::sync::mpsc::channel::<CdpDispatchCmd>();
+        let reader = thread::spawn(move || cdp_dispatcher_loop(socket, rx));
+        Ok(Arc::new(Self {
+            tx: Mutex::new(tx),
+            next_id: AtomicU64::new(1),
+            reader: Mutex::new(Some(reader)),
+        }))
+    }
+
+    fn call(&self, method: &str, session_id: Option<&str>, params: Value) -> Result<Value> {
+        let id = self.next_id.fetch_add(1, Ordering::SeqCst);
+        let mut msg = json!({ "id": id, "method": method, "params": params });
+        if let Some(session_id) = session_id {
+            msg["sessionId"] = Value::String(session_id.to_string());
+        }
+        let (rtx, rrx) = std::sync::mpsc::channel();
+        self.tx
+            .lock()
+            .expect("cdp tx lock poisoned")
+            .send(CdpDispatchCmd::Call {
+                id,
+                msg: msg.to_string(),
+                resp: rtx,
+            })
+            .map_err(|_| anyhow!("CDP dispatcher is shut down"))?;
+        match rrx.recv_timeout(Duration::from_secs(30)) {
+            Ok(result) => result,
+            Err(_) => bail!("CDP {method} timed out"),
+        }
+    }
+}
+
+impl Drop for CdpDispatcher {
+    fn drop(&mut self) {
+        let _ = self
+            .tx
+            .lock()
+            .expect("cdp tx lock poisoned")
+            .send(CdpDispatchCmd::Shutdown);
+        if let Some(handle) = self.reader.lock().expect("cdp reader lock poisoned").take() {
+            let _ = handle.join();
+        }
+    }
+}
+
+fn cdp_dispatcher_loop(
+    mut socket: WebSocket<MaybeTlsStream<TcpStream>>,
+    rx: std::sync::mpsc::Receiver<CdpDispatchCmd>,
+) {
+    let mut pending: HashMap<u64, std::sync::mpsc::Sender<Result<Value>>> = HashMap::new();
+    let mut shutting = false;
+    loop {
+        loop {
+            match rx.try_recv() {
+                Ok(CdpDispatchCmd::Call { id, msg, resp }) => {
+                    if let Err(error) = socket.send(Message::Text(msg)) {
+                        let _ = resp.send(Err(anyhow!("send CDP failed: {error}")));
+                    } else {
+                        pending.insert(id, resp);
+                    }
+                }
+                Ok(CdpDispatchCmd::Shutdown) => shutting = true,
+                Err(std::sync::mpsc::TryRecvError::Empty) => break,
+                Err(std::sync::mpsc::TryRecvError::Disconnected) => {
+                    shutting = true;
+                    break;
+                }
+            }
+        }
+        if shutting && pending.is_empty() {
+            break;
+        }
+        match socket.read() {
+            Ok(Message::Text(text)) => {
+                if let Ok(value) = serde_json::from_str::<Value>(&text) {
+                    if let Some(id) = value.get("id").and_then(Value::as_u64) {
+                        if let Some(resp) = pending.remove(&id) {
+                            let result = if let Some(error) = value.get("error") {
+                                Err(anyhow!("CDP failed: {error}"))
+                            } else {
+                                Ok(value.get("result").cloned().unwrap_or(Value::Null))
+                            };
+                            let _ = resp.send(result);
+                        }
+                    }
+                }
+            }
+            Ok(Message::Ping(bytes)) => {
+                let _ = socket.send(Message::Pong(bytes));
+            }
+            Ok(Message::Close(_)) => break,
+            Ok(_) => {}
+            Err(tungstenite::Error::Io(error))
+                if matches!(
+                    error.kind(),
+                    std::io::ErrorKind::WouldBlock | std::io::ErrorKind::TimedOut
+                ) => {}
+            Err(_) => break,
+        }
+    }
+    for (_, resp) in pending.drain() {
+        let _ = resp.send(Err(anyhow!("CDP connection closed")));
+    }
 }
 
 fn set_cdp_socket_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
@@ -4615,6 +4777,293 @@ fn bridge_request(session_id: &str, request: &Value) -> Result<Value> {
     result
 }
 
+const DOM_HIGHLIGHT_ATTR: &str = "data-browser-use-terminal-highlight";
+const DOM_HIGHLIGHT_CONTAINER_ID: &str = "browser-use-terminal-highlights";
+const DOM_HIGHLIGHT_ACCENT: &str = "#3b82f6";
+const DOM_HIGHLIGHT_DURATION_MS: u64 = 1000;
+const DOM_HIGHLIGHT_Z_INDEX: u64 = 2_147_483_647;
+
+fn browser_terminal_highlight_enabled() -> bool {
+    match std::env::var("BROWSER_USE_TERMINAL_AUTO_HIGHLIGHT") {
+        Ok(value) => !matches!(
+            value.trim().to_ascii_lowercase().as_str(),
+            "0" | "false" | "no" | "off"
+        ),
+        Err(_) => true,
+    }
+}
+
+fn browser_terminal_highlight_color() -> String {
+    std::env::var("BROWSER_USE_TERMINAL_HIGHLIGHT_COLOR")
+        .ok()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or_else(|| DOM_HIGHLIGHT_ACCENT.to_string())
+}
+
+fn browser_session_mouse_press_xy(method: &str, params: &Value) -> Option<(f64, f64)> {
+    if method != "Input.dispatchMouseEvent" {
+        return None;
+    }
+    if params.get("type").and_then(Value::as_str) != Some("mousePressed") {
+        return None;
+    }
+    Some((
+        params.get("x").and_then(Value::as_f64)?,
+        params.get("y").and_then(Value::as_f64)?,
+    ))
+}
+
+fn browser_session_node_highlight_id(method: &str, params: &Value) -> Option<Value> {
+    if !matches!(method, "DOM.focus" | "DOM.setFileInputFiles") {
+        return None;
+    }
+    params.get("nodeId").cloned()
+}
+
+fn browser_session_prepare_cdp_visuals(
+    session: &mut BrowserSession,
+    method: &str,
+    session_id: Option<&str>,
+    params: &Value,
+) {
+    if method == "Page.captureScreenshot" {
+        bridge_remove_highlights(session, session_id);
+    }
+    if !browser_terminal_highlight_enabled() {
+        return;
+    }
+    if let Some((x, y)) = browser_session_mouse_press_xy(method, params) {
+        bridge_highlight_element_at_xy(session, session_id, x, y);
+    } else if let Some(node_id) = browser_session_node_highlight_id(method, params) {
+        bridge_highlight_node(session, session_id, node_id);
+    }
+}
+
+fn bridge_runtime_evaluate(
+    session: &mut BrowserSession,
+    session_id: Option<&str>,
+    expression: String,
+) {
+    let _ = session.cdp(
+        "Runtime.evaluate",
+        session_id,
+        json!({
+            "expression": expression,
+            "returnByValue": true,
+        }),
+    );
+}
+
+fn bridge_remove_highlights(session: &mut BrowserSession, session_id: Option<&str>) {
+    bridge_runtime_evaluate(session, session_id, bridge_remove_highlights_expression());
+}
+
+fn bridge_remove_highlights_expression() -> String {
+    let container_id = serde_json::to_string(DOM_HIGHLIGHT_CONTAINER_ID)
+        .unwrap_or_else(|_| "\"browser-use-terminal-highlights\"".to_string());
+    format!(
+        r#"(function() {{
+const container = document.getElementById({container_id});
+if (container) container.remove();
+document.querySelectorAll('[{attr}]').forEach((el) => el.remove());
+return true;
+}})()"#,
+        attr = DOM_HIGHLIGHT_ATTR,
+    )
+}
+
+fn bridge_highlight_element_at_xy(
+    session: &mut BrowserSession,
+    session_id: Option<&str>,
+    x: f64,
+    y: f64,
+) {
+    bridge_runtime_evaluate(
+        session,
+        session_id,
+        bridge_highlight_element_at_xy_expression(x, y),
+    );
+}
+
+fn bridge_highlight_node(session: &mut BrowserSession, session_id: Option<&str>, node_id: Value) {
+    let Ok(model) = session.cdp("DOM.getBoxModel", session_id, json!({ "nodeId": node_id })) else {
+        return;
+    };
+    let Some((x, y, width, height)) = bridge_box_from_model(&model) else {
+        return;
+    };
+    bridge_runtime_evaluate(
+        session,
+        session_id,
+        bridge_highlight_box_expression(x, y, width, height),
+    );
+}
+
+fn bridge_box_from_model(model: &Value) -> Option<(f64, f64, f64, f64)> {
+    let model = model.get("model")?;
+    bridge_box_from_quad(model.get("border")).or_else(|| bridge_box_from_quad(model.get("content")))
+}
+
+fn bridge_box_from_quad(quad: Option<&Value>) -> Option<(f64, f64, f64, f64)> {
+    let quad = quad?.as_array()?;
+    if quad.len() < 8 {
+        return None;
+    }
+    let mut xs = Vec::with_capacity(4);
+    let mut ys = Vec::with_capacity(4);
+    for pair in quad.chunks(2).take(4) {
+        xs.push(pair.first()?.as_f64()?);
+        ys.push(pair.get(1)?.as_f64()?);
+    }
+    let min_x = xs.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_x = xs.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let min_y = ys.iter().copied().fold(f64::INFINITY, f64::min);
+    let max_y = ys.iter().copied().fold(f64::NEG_INFINITY, f64::max);
+    let width = max_x - min_x;
+    let height = max_y - min_y;
+    (width > 0.0 && height > 0.0).then_some((min_x, min_y, width, height))
+}
+
+fn bridge_highlight_payload(payload: Value) -> String {
+    serde_json::to_string(&payload).unwrap_or_else(|_| "{}".to_string())
+}
+
+fn bridge_highlight_root_js() -> String {
+    let attr_name = serde_json::to_string(DOM_HIGHLIGHT_ATTR)
+        .unwrap_or_else(|_| "\"data-browser-use-terminal-highlight\"".to_string());
+    let container_id = serde_json::to_string(DOM_HIGHLIGHT_CONTAINER_ID)
+        .unwrap_or_else(|_| "\"browser-use-terminal-highlights\"".to_string());
+    format!(
+        r#"
+const attrName = {attr_name};
+const containerId = {container_id};
+let root = document.getElementById(containerId);
+if (!root) {{
+    root = document.createElement('div');
+    root.id = containerId;
+    root.setAttribute(attrName, 'container');
+    root.style.cssText = `
+        position: fixed;
+        inset: 0;
+        pointer-events: none;
+        z-index: {z_index};
+        overflow: visible;
+        contain: layout style;
+    `;
+    document.documentElement.appendChild(root);
+}}
+"#,
+        z_index = DOM_HIGHLIGHT_Z_INDEX,
+    )
+}
+
+fn bridge_highlight_box_body_js(target: &str, color_property: &str) -> String {
+    format!(
+        r#"
+const box = document.createElement('div');
+box.setAttribute(attrName, 'box');
+box.style.cssText = `
+    position: fixed;
+    left: ${{{target}.left}}px;
+    top: ${{{target}.top}}px;
+    width: ${{{target}.width}}px;
+    height: ${{{target}.height}}px;
+    pointer-events: none;
+    box-sizing: border-box;
+    z-index: {z_index};
+`;
+const borderWidth = 3;
+const cornerSize = Math.max(10, Math.min(24, Math.min({target}.width, {target}.height) * 0.35));
+const corners = [
+    ['top', 'left', 'borderTop', 'borderLeft', '-8px', '-8px'],
+    ['top', 'right', 'borderTop', 'borderRight', '8px', '-8px'],
+    ['bottom', 'left', 'borderBottom', 'borderLeft', '-8px', '8px'],
+    ['bottom', 'right', 'borderBottom', 'borderRight', '8px', '8px'],
+];
+for (const [vertical, horizontal, edgeA, edgeB, startX, startY] of corners) {{
+    const corner = document.createElement('div');
+    corner.setAttribute(attrName, 'corner');
+    corner.style.cssText = `
+        position: absolute;
+        ${{vertical}}: -3px;
+        ${{horizontal}}: -3px;
+        width: ${{cornerSize}}px;
+        height: ${{cornerSize}}px;
+        pointer-events: none;
+        transition: transform 140ms ease-out, opacity 220ms ease-out;
+        transform: translate(${{startX}}, ${{startY}});
+        opacity: 0.95;
+    `;
+    corner.style[edgeA] = `${{borderWidth}}px solid ${{{color_property}}}`;
+    corner.style[edgeB] = `${{borderWidth}}px solid ${{{color_property}}}`;
+    box.appendChild(corner);
+    requestAnimationFrame(() => {{
+        corner.style.transform = 'translate(0, 0)';
+    }});
+}}
+root.appendChild(box);
+setTimeout(() => {{
+    box.style.transition = 'opacity 320ms ease-out';
+    box.style.opacity = '0';
+    setTimeout(() => box.remove(), 340);
+}}, {target}.duration);
+"#,
+        z_index = DOM_HIGHLIGHT_Z_INDEX,
+    )
+}
+
+fn bridge_highlight_box_expression(x: f64, y: f64, width: f64, height: f64) -> String {
+    let payload = bridge_highlight_payload(json!({
+        "left": x,
+        "top": y,
+        "width": width,
+        "height": height,
+        "duration": DOM_HIGHLIGHT_DURATION_MS,
+        "color": browser_terminal_highlight_color(),
+    }));
+    format!(
+        r#"(function() {{
+const highlight = {payload};
+{root}
+{body}
+return true;
+}})()"#,
+        root = bridge_highlight_root_js(),
+        body = bridge_highlight_box_body_js("highlight", "highlight.color"),
+    )
+}
+
+fn bridge_highlight_element_at_xy_expression(x: f64, y: f64) -> String {
+    let payload = bridge_highlight_payload(json!({
+        "x": x,
+        "y": y,
+        "duration": DOM_HIGHLIGHT_DURATION_MS,
+        "color": browser_terminal_highlight_color(),
+    }));
+    format!(
+        r#"(function() {{
+const point = {payload};
+const target = document.elementFromPoint(point.x, point.y);
+if (!target || !target.getBoundingClientRect) return false;
+const rect = target.getBoundingClientRect();
+if (rect.width <= 1 || rect.height <= 1) return false;
+const highlight = {{
+    left: rect.left,
+    top: rect.top,
+    width: rect.width,
+    height: rect.height,
+    duration: point.duration,
+    color: point.color,
+}};
+{root}
+{body}
+return true;
+}})()"#,
+        root = bridge_highlight_root_js(),
+        body = bridge_highlight_box_body_js("highlight", "highlight.color"),
+    )
+}
+
 fn bridge_request_with_session(session: &mut BrowserSession, request: &Value) -> Result<Value> {
     let kind = request.get("kind").and_then(Value::as_str).unwrap_or("");
     match kind {
@@ -4677,6 +5126,7 @@ fn browser_script_prelude(
     agent_workspace_dir: &Path,
     domain_skill_roots: &[PathBuf],
     stream_path: &Path,
+    frames_dir: &Path,
     user_code: &str,
 ) -> Result<String> {
     let encoded_code = general_purpose::STANDARD.encode(user_code.as_bytes());
@@ -4689,19 +5139,106 @@ fn browser_script_prelude(
     )?;
     Ok(format!(
         r#"
-import base64, contextlib, io, json, os, pathlib, shutil, socket, sys, time, traceback, urllib.request
+import base64, contextlib, hashlib, io, json, os, pathlib, shutil, socket, sys, threading, time, traceback, urllib.request
 
 BRIDGE_PORT = {bridge_port}
 CWD = pathlib.Path({cwd:?}).expanduser().resolve()
 ARTIFACT_DIR = pathlib.Path({artifact_dir:?}).expanduser().resolve()
 STREAM_PATH = pathlib.Path({stream_path:?}).expanduser().resolve()
+FRAMES_DIR = pathlib.Path({frames_dir:?}).expanduser().resolve()
 AGENT_WORKSPACE_DIR = pathlib.Path({agent_workspace_dir:?}).expanduser().resolve()
 DOMAIN_SKILL_ROOTS = json.loads({domain_skill_roots_json:?})
 ARTIFACT_DIR.mkdir(parents=True, exist_ok=True)
 STREAM_PATH.parent.mkdir(parents=True, exist_ok=True)
+FRAMES_DIR.mkdir(parents=True, exist_ok=True)
+FRAMES_MANIFEST = FRAMES_DIR / "frames.ndjson"
 OUTPUTS_DIR = CWD
 OUTPUTS_DIR.mkdir(parents=True, exist_ok=True)
 __USER_CODE = base64.b64decode({encoded_code:?}).decode()
+
+# 2fps screen capture (observability prototype). Polls Page.captureScreenshot on
+# a fixed cadence so frames land even when the page is visually static. Frames
+# are written as JPEGs plus a sidecar manifest, kept OUT of STREAM_PATH so the
+# event drain never sees partial/interleaved lines.
+try:
+    CAPTURE_FPS = float(os.environ.get("LLM_BROWSER_CAPTURE_FPS", "2") or "2")
+except (TypeError, ValueError):
+    CAPTURE_FPS = 2.0
+try:
+    CAPTURE_QUALITY = int(os.environ.get("LLM_BROWSER_CAPTURE_QUALITY", "60") or "60")
+except (TypeError, ValueError):
+    CAPTURE_QUALITY = 60
+__capture_stop = threading.Event()
+__capture_seq = 0
+__capture_prev_hash = None
+__capture_frames = []  # one record per UNIQUE frame; duplicates coalesce into the last
+
+def _write_frames_manifest():
+    # Full rewrite each change keeps hold_ms/repeat live-consumable; the manifest
+    # is tiny (one line per unique frame) so this is cheap. tmp+replace = atomic.
+    try:
+        tmp = FRAMES_DIR / "frames.ndjson.tmp"
+        with tmp.open("w", encoding="utf-8") as f:
+            for rec in __capture_frames:
+                f.write(json.dumps(rec, default=_jsonable) + "\n")
+        tmp.replace(FRAMES_MANIFEST)
+    except Exception:
+        pass
+
+def _capture_frame_once():
+    global __capture_seq, __capture_prev_hash
+    result = cdp("Page.captureScreenshot", format="jpeg", quality=CAPTURE_QUALITY)
+    data = result.get("data") if isinstance(result, dict) else None
+    if not data:
+        return False
+    raw = base64.b64decode(data)
+    # Deterministic dedup: hash the JPEG bytes and compare ONLY to the previous
+    # tick. Chrome encodes an unchanged page to byte-identical JPEG, so equal
+    # hash == screen unchanged. Adjacent-only (not a global set) so returning to
+    # a prior state, e.g. back to about:blank, is still kept as a real event.
+    digest = hashlib.blake2b(raw, digest_size=16).hexdigest()
+    ts_ms = int(time.time() * 1000)
+    if digest == __capture_prev_hash and __capture_frames:
+        last = __capture_frames[-1]
+        last["last_ts"] = ts_ms
+        last["hold_ms"] = ts_ms - last["first_ts"]
+        last["repeat"] = last.get("repeat", 1) + 1
+        _write_frames_manifest()
+        return True
+    seq = __capture_seq
+    frame_path = FRAMES_DIR / f"{{seq:06d}}-{{ts_ms}}.jpg"
+    frame_path.write_bytes(raw)
+    __capture_frames.append({{
+        "seq": seq, "first_ts": ts_ms, "last_ts": ts_ms, "hold_ms": 0,
+        "repeat": 1, "path": str(frame_path), "sha": digest, "fps_target": CAPTURE_FPS,
+    }})
+    __capture_seq = seq + 1
+    __capture_prev_hash = digest
+    _write_frames_manifest()
+    return True
+
+def _capture_loop():
+    interval = (1.0 / CAPTURE_FPS) if CAPTURE_FPS > 0 else 0.5
+    while not __capture_stop.is_set():
+        start = time.time()
+        try:
+            _capture_frame_once()
+        except Exception:
+            pass
+        elapsed = time.time() - start
+        __capture_stop.wait(max(0.0, interval - elapsed))
+
+def _start_capture():
+    # Capture now runs at the Rust session layer (tool-agnostic, dedicated CDP
+    # connection). The in-process Python capture is OFF unless explicitly opted
+    # in via LLM_BROWSER_PY_CAPTURE, to avoid double-capturing.
+    if CAPTURE_FPS <= 0:
+        return None
+    if os.environ.get("LLM_BROWSER_PY_CAPTURE", "").strip() not in ("1", "true", "yes", "on"):
+        return None
+    thread = threading.Thread(target=_capture_loop, name="browser-script-capture", daemon=True)
+    thread.start()
+    return thread
 
 def _stream_event(event):
     try:
@@ -4729,13 +5266,16 @@ class _BrowserScriptStream:
         return "".join(self._parts)
 
 def _collectable_files(root):
+    # Skip internal capture/stream machinery (dot-prefixed dirs/files like
+    # .capture.frames/ and .{{run_id}}.events.ndjson) so recording artifacts stay
+    # stored-but-invisible to the agent — never surfaced in tool output.
     if root.resolve() == OUTPUTS_DIR.resolve():
         for path in root.iterdir():
-            if path.is_file():
+            if path.is_file() and not path.name.startswith("."):
                 yield path
         return
     for path in root.rglob("*"):
-        if path.is_file():
+        if path.is_file() and not any(part.startswith(".") for part in path.relative_to(root).parts):
             yield path
 
 def _scan_artifact_files():
@@ -5007,14 +5547,20 @@ stdout = _BrowserScriptStream("stdout")
 stderr = _BrowserScriptStream("stderr")
 ok = True
 error = None
+__capture_thread = None
 try:
     with contextlib.redirect_stdout(stdout), contextlib.redirect_stderr(stderr):
         _load_browser_script_helpers()
         load_agent_helpers()
+        __capture_thread = _start_capture()
         _run_user_code()
 except Exception:
     ok = False
     error = traceback.format_exc()
+finally:
+    __capture_stop.set()
+    if __capture_thread is not None:
+        __capture_thread.join(timeout=2.0)
 
 text = stdout.getvalue()
 if stderr.getvalue():
@@ -5037,6 +5583,862 @@ sys.__stdout__.write("__BROWSER_SCRIPT_RESULT__" + json.dumps(result, default=_j
 sys.__stdout__.flush()
 "#
     ))
+}
+
+/// How large a stitched composite may be, derived from the target model's image
+/// billing geometry (see reagan_intuitions_browser_observability.md §3.6). Never
+/// a bare constant — callers pass the cap for the resolved provider/model.
+#[derive(Debug, Clone, Copy)]
+pub struct StitchCaps {
+    pub long_edge: u32,
+    pub short_edge: u32,
+}
+
+impl Default for StitchCaps {
+    fn default() -> Self {
+        // Safe cross-provider envelope; also the Claude Sonnet native cap.
+        Self {
+            long_edge: 1568,
+            short_edge: 768,
+        }
+    }
+}
+
+const STITCH_GUTTER_PX: u32 = 6;
+const STITCH_GUTTER_RGB: image::Rgb<u8> = image::Rgb([24, 24, 27]);
+const STITCH_JPEG_QUALITY: u8 = 72;
+const STITCH_LABEL_SCALE: u32 = 6; // pixel size of each bitmap-digit cell on the full-res canvas
+
+// 3x5 bitmap digits 0-9. Each row's low 3 bits are left..right (bit2=left).
+// Dependency-free: lets us stamp a frame's seq onto its pane so the curating
+// LLM can reference frames by number ("seq 3 is the confirmation").
+const DIGITS_3X5: [[u8; 5]; 10] = [
+    [7, 5, 5, 5, 7], // 0
+    [2, 6, 2, 2, 7], // 1
+    [7, 1, 7, 4, 7], // 2
+    [7, 1, 7, 1, 7], // 3
+    [5, 5, 7, 1, 1], // 4
+    [7, 4, 7, 1, 7], // 5
+    [7, 4, 7, 5, 7], // 6
+    [7, 1, 1, 1, 1], // 7
+    [7, 5, 7, 5, 7], // 8
+    [7, 5, 7, 1, 7], // 9
+];
+
+/// One labeled pane in a stitched contact sheet.
+pub struct StitchFrame {
+    pub seq: u32,
+    pub path: PathBuf,
+}
+
+fn draw_seq_label(canvas: &mut image::RgbImage, x0: u32, y0: u32, seq: u32, scale: u32) {
+    let text = seq.to_string();
+    let (digit_w, gap, glyph_h) = (3 * scale, scale, 5 * scale);
+    let n = text.len() as u32;
+    let badge_w = n * digit_w + (n + 1) * gap;
+    let badge_h = glyph_h + 2 * gap;
+    let (cw, ch) = (canvas.width(), canvas.height());
+    for yy in y0..(y0 + badge_h).min(ch) {
+        for xx in x0..(x0 + badge_w).min(cw) {
+            canvas.put_pixel(xx, yy, image::Rgb([10, 10, 12]));
+        }
+    }
+    let mut cx = x0 + gap;
+    let cy = y0 + gap;
+    for ch_digit in text.chars() {
+        if let Some(d) = ch_digit.to_digit(10) {
+            let glyph = DIGITS_3X5[d as usize];
+            for (row, bits) in glyph.iter().enumerate() {
+                for col in 0..3u32 {
+                    if bits & (1 << (2 - col)) != 0 {
+                        for dy in 0..scale {
+                            for dx in 0..scale {
+                                let (px, py) =
+                                    (cx + col * scale + dx, cy + row as u32 * scale + dy);
+                                if px < cw && py < ch {
+                                    canvas.put_pixel(px, py, image::Rgb([255, 255, 255]));
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            cx += digit_w + gap;
+        }
+    }
+}
+
+/// Compose `frames` (in order) into ONE JPEG laid out in a near-square grid with
+/// gutters, each pane stamped with its `seq`, scaled to fit `caps` (never
+/// upscaled). Panes read left-to-right, top-to-bottom. Returns JPEG bytes.
+pub fn stitch_frames(frames: &[StitchFrame], caps: StitchCaps) -> Result<Vec<u8>> {
+    if frames.is_empty() {
+        bail!("stitch_frames: no frames provided");
+    }
+    let mut imgs = Vec::with_capacity(frames.len());
+    for frame in frames {
+        let img = image::ImageReader::open(&frame.path)
+            .with_context(|| format!("open frame {}", frame.path.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("guess format {}", frame.path.display()))?
+            .decode()
+            .with_context(|| format!("decode frame {}", frame.path.display()))?
+            .to_rgb8();
+        imgs.push(img);
+    }
+    let n = imgs.len() as u32;
+    let cols = (n as f64).sqrt().ceil() as u32;
+    let rows = n.div_ceil(cols);
+    let cell_w = imgs.iter().map(|f| f.width()).max().unwrap_or(1);
+    let cell_h = imgs.iter().map(|f| f.height()).max().unwrap_or(1);
+    let canvas_w = cols * cell_w + (cols + 1) * STITCH_GUTTER_PX;
+    let canvas_h = rows * cell_h + (rows + 1) * STITCH_GUTTER_PX;
+    let mut canvas = image::RgbImage::from_pixel(canvas_w, canvas_h, STITCH_GUTTER_RGB);
+    for (i, frame) in imgs.iter().enumerate() {
+        let idx = i as u32;
+        let (col, row) = (idx % cols, idx / cols);
+        let x = STITCH_GUTTER_PX + col * (cell_w + STITCH_GUTTER_PX);
+        let y = STITCH_GUTTER_PX + row * (cell_h + STITCH_GUTTER_PX);
+        image::imageops::overlay(&mut canvas, frame, x as i64, y as i64);
+        draw_seq_label(&mut canvas, x + 2, y + 2, frames[i].seq, STITCH_LABEL_SCALE);
+    }
+    // Scale the whole canvas to fit both caps; never upscale.
+    let long = canvas_w.max(canvas_h) as f64;
+    let short = canvas_w.min(canvas_h) as f64;
+    let scale = (caps.long_edge as f64 / long)
+        .min(caps.short_edge as f64 / short)
+        .min(1.0);
+    let final_img = if scale < 1.0 {
+        let nw = ((canvas_w as f64 * scale).round() as u32).max(1);
+        let nh = ((canvas_h as f64 * scale).round() as u32).max(1);
+        image::imageops::resize(&canvas, nw, nh, image::imageops::FilterType::Triangle)
+    } else {
+        canvas
+    };
+    let mut bytes = Vec::new();
+    let mut cursor = std::io::Cursor::new(&mut bytes);
+    let encoder =
+        image::codecs::jpeg::JpegEncoder::new_with_quality(&mut cursor, STITCH_JPEG_QUALITY);
+    image::DynamicImage::ImageRgb8(final_img)
+        .write_with_encoder(encoder)
+        .context("encode stitched jpeg")?;
+    Ok(bytes)
+}
+
+// Summary GIF tuning. Per-frame dwell is driven by each frame's hold_ms (how
+// long the page actually sat on that state) but clamped so the GIF stays
+// watchable instead of freezing for 30s on one frame.
+const GIF_MAX_LONG_EDGE: u32 = 900;
+const GIF_MIN_DELAY_MS: u32 = 400;
+const GIF_MAX_DELAY_MS: u32 = 2500;
+const GIF_SPEED: i32 = 12; // image crate GifEncoder speed 1..=30 (higher = faster encode, coarser palette)
+
+/// One frame to include in the summary GIF: its file and how long to dwell on it.
+pub struct GifFrame {
+    pub path: PathBuf,
+    pub hold_ms: u32,
+}
+
+// 5x7 bitmap font (uppercase + digits + basic punctuation) for burning captions
+// ("subtitles") into recording frames. Dependency-free. Each glyph is 7 rows;
+// the low 5 bits of each byte are columns left..right (bit4 = leftmost).
+fn glyph_5x7(c: char) -> [u8; 7] {
+    match c.to_ascii_uppercase() {
+        'A' => [0x0E, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'B' => [0x1E, 0x11, 0x11, 0x1E, 0x11, 0x11, 0x1E],
+        'C' => [0x0E, 0x11, 0x10, 0x10, 0x10, 0x11, 0x0E],
+        'D' => [0x1E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x1E],
+        'E' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x1F],
+        'F' => [0x1F, 0x10, 0x10, 0x1E, 0x10, 0x10, 0x10],
+        'G' => [0x0E, 0x11, 0x10, 0x17, 0x11, 0x11, 0x0F],
+        'H' => [0x11, 0x11, 0x11, 0x1F, 0x11, 0x11, 0x11],
+        'I' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x1F],
+        'J' => [0x07, 0x02, 0x02, 0x02, 0x12, 0x12, 0x0C],
+        'K' => [0x11, 0x12, 0x14, 0x18, 0x14, 0x12, 0x11],
+        'L' => [0x10, 0x10, 0x10, 0x10, 0x10, 0x10, 0x1F],
+        'M' => [0x11, 0x1B, 0x15, 0x15, 0x11, 0x11, 0x11],
+        'N' => [0x11, 0x11, 0x19, 0x15, 0x13, 0x11, 0x11],
+        'O' => [0x0E, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'P' => [0x1E, 0x11, 0x11, 0x1E, 0x10, 0x10, 0x10],
+        'Q' => [0x0E, 0x11, 0x11, 0x11, 0x15, 0x12, 0x0D],
+        'R' => [0x1E, 0x11, 0x11, 0x1E, 0x14, 0x12, 0x11],
+        'S' => [0x0F, 0x10, 0x10, 0x0E, 0x01, 0x01, 0x1E],
+        'T' => [0x1F, 0x04, 0x04, 0x04, 0x04, 0x04, 0x04],
+        'U' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x11, 0x0E],
+        'V' => [0x11, 0x11, 0x11, 0x11, 0x11, 0x0A, 0x04],
+        'W' => [0x11, 0x11, 0x11, 0x15, 0x15, 0x15, 0x0A],
+        'X' => [0x11, 0x11, 0x0A, 0x04, 0x0A, 0x11, 0x11],
+        'Y' => [0x11, 0x11, 0x0A, 0x04, 0x04, 0x04, 0x04],
+        'Z' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x10, 0x1F],
+        '0' => [0x0E, 0x11, 0x13, 0x15, 0x19, 0x11, 0x0E],
+        '1' => [0x04, 0x0C, 0x04, 0x04, 0x04, 0x04, 0x0E],
+        '2' => [0x0E, 0x11, 0x01, 0x06, 0x08, 0x10, 0x1F],
+        '3' => [0x1F, 0x02, 0x04, 0x02, 0x01, 0x11, 0x0E],
+        '4' => [0x02, 0x06, 0x0A, 0x12, 0x1F, 0x02, 0x02],
+        '5' => [0x1F, 0x10, 0x1E, 0x01, 0x01, 0x11, 0x0E],
+        '6' => [0x06, 0x08, 0x10, 0x1E, 0x11, 0x11, 0x0E],
+        '7' => [0x1F, 0x01, 0x02, 0x04, 0x08, 0x08, 0x08],
+        '8' => [0x0E, 0x11, 0x11, 0x0E, 0x11, 0x11, 0x0E],
+        '9' => [0x0E, 0x11, 0x11, 0x0F, 0x01, 0x02, 0x0C],
+        '.' => [0x00, 0x00, 0x00, 0x00, 0x00, 0x06, 0x06],
+        ',' => [0x00, 0x00, 0x00, 0x00, 0x06, 0x04, 0x08],
+        ':' => [0x00, 0x06, 0x06, 0x00, 0x06, 0x06, 0x00],
+        '-' => [0x00, 0x00, 0x00, 0x0E, 0x00, 0x00, 0x00],
+        '/' => [0x01, 0x01, 0x02, 0x04, 0x08, 0x10, 0x10],
+        '\'' => [0x04, 0x04, 0x00, 0x00, 0x00, 0x00, 0x00],
+        '!' => [0x04, 0x04, 0x04, 0x04, 0x04, 0x00, 0x04],
+        '?' => [0x0E, 0x11, 0x01, 0x06, 0x04, 0x00, 0x04],
+        '(' => [0x02, 0x04, 0x08, 0x08, 0x08, 0x04, 0x02],
+        ')' => [0x08, 0x04, 0x02, 0x02, 0x02, 0x04, 0x08],
+        '#' => [0x0A, 0x0A, 0x1F, 0x0A, 0x1F, 0x0A, 0x0A],
+        '$' => [0x04, 0x0F, 0x14, 0x0E, 0x05, 0x1E, 0x04],
+        '%' => [0x19, 0x19, 0x02, 0x04, 0x08, 0x13, 0x13],
+        _ => [0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00], // space / unknown
+    }
+}
+
+const CAPTION_BG: image::Rgb<u8> = image::Rgb([12, 12, 14]);
+const CAPTION_FG: image::Rgb<u8> = image::Rgb([255, 255, 255]);
+
+/// Draw a subtitle bar with `text` across the bottom of `img` (in place).
+fn draw_caption(img: &mut image::RgbImage, text: &str, scale: u32) {
+    let (w, h) = (img.width(), img.height());
+    let glyph_w = 5 * scale;
+    let glyph_h = 7 * scale;
+    let gap = scale; // between glyphs
+    let pad = scale * 3;
+    let bar_h = glyph_h + pad * 2;
+    if bar_h >= h {
+        return;
+    }
+    let bar_top = h - bar_h;
+    // Truncate text to what fits on one line.
+    let per_char = glyph_w + gap;
+    let max_chars = ((w.saturating_sub(pad * 2)) / per_char).max(1) as usize;
+    let upper: String = text.chars().take(400).collect::<String>().to_uppercase();
+    let shown: String = if upper.chars().count() > max_chars {
+        let mut s: String = upper.chars().take(max_chars.saturating_sub(1)).collect();
+        s.push('\u{2026}'); // … (renders as space in our font, but trims length)
+        s
+    } else {
+        upper
+    };
+    // Background bar.
+    for y in bar_top..h {
+        for x in 0..w {
+            img.put_pixel(x, y, CAPTION_BG);
+        }
+    }
+    // Centered text.
+    let n = shown.chars().count() as u32;
+    let text_w = n * glyph_w + n.saturating_sub(1) * gap;
+    let mut cx = (w.saturating_sub(text_w)) / 2;
+    let cy = bar_top + pad;
+    for ch in shown.chars() {
+        let glyph = glyph_5x7(ch);
+        for (row, bits) in glyph.iter().enumerate() {
+            for col in 0..5u32 {
+                if bits & (1 << (4 - col)) != 0 {
+                    for dy in 0..scale {
+                        for dx in 0..scale {
+                            let px = cx + col * scale + dx;
+                            let py = cy + row as u32 * scale + dy;
+                            if px < w && py < h {
+                                img.put_pixel(px, py, CAPTION_FG);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        cx += glyph_w + gap;
+    }
+}
+
+/// A curated keyframe: which captured frame (by seq) and its caption.
+pub struct CaptionedFrame {
+    pub seq: u32,
+    pub caption: String,
+}
+
+/// Evaluation aid: render a selection as a static grid of captioned frames (one
+/// viewable PNG), so recording variants can be compared side by side.
+pub fn build_captioned_sheet(
+    artifact_root: &Path,
+    selection: &[CaptionedFrame],
+    out_path: &Path,
+) -> Result<usize> {
+    let frames_dir = latest_frames_dir(artifact_root)
+        .ok_or_else(|| anyhow!("no capture frames under {}", artifact_root.display()))?;
+    let manifest = read_frame_manifest(&frames_dir)?;
+    let cell_w = 480u32;
+    let mut cells: Vec<image::RgbImage> = Vec::new();
+    for item in selection {
+        let Some((path, _)) = manifest.get(&item.seq) else {
+            continue;
+        };
+        let Ok(dec) = image::ImageReader::open(path)
+            .and_then(|r| r.with_guessed_format())
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.decode().map_err(anyhow::Error::from))
+        else {
+            continue;
+        };
+        let (w, h) = (dec.width(), dec.height());
+        let scale = cell_w as f64 / w as f64;
+        let mut rgb = dec
+            .resize(
+                cell_w,
+                ((h as f64 * scale).round() as u32).max(1),
+                image::imageops::FilterType::Triangle,
+            )
+            .to_rgb8();
+        let label = if item.caption.trim().is_empty() {
+            format!("{}", item.seq)
+        } else {
+            format!("{}: {}", item.seq, item.caption.trim())
+        };
+        draw_caption(&mut rgb, &label, 2);
+        cells.push(rgb);
+    }
+    if cells.is_empty() {
+        bail!("no cells for sheet");
+    }
+    let cols = (cells.len() as f64).sqrt().ceil() as u32;
+    let rows = (cells.len() as u32).div_ceil(cols);
+    let cw = cells.iter().map(|c| c.width()).max().unwrap();
+    let ch = cells.iter().map(|c| c.height()).max().unwrap();
+    let g = 6u32;
+    let (cw_w, cw_h) = (cols * cw + (cols + 1) * g, rows * ch + (rows + 1) * g);
+    let mut canvas = image::RgbImage::from_pixel(cw_w, cw_h, image::Rgb([24, 24, 27]));
+    for (i, c) in cells.iter().enumerate() {
+        let i = i as u32;
+        let (col, row) = (i % cols, i / cols);
+        image::imageops::overlay(
+            &mut canvas,
+            c,
+            (g + col * (cw + g)) as i64,
+            (g + row * (ch + g)) as i64,
+        );
+    }
+    image::DynamicImage::ImageRgb8(canvas).save(out_path)?;
+    Ok(cells.len())
+}
+
+/// Build a captioned GIF from a selection of (seq, caption) over the latest
+/// capture under `artifact_root`. Each chosen frame gets its caption burned in
+/// as a subtitle; dwell comes from the frame's hold_ms. This is the shared
+/// builder all caption-based recording variants feed.
+pub fn build_captioned_gif(
+    artifact_root: &Path,
+    selection: &[CaptionedFrame],
+    out_path: &Path,
+) -> Result<usize> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    let frames_dir = latest_frames_dir(artifact_root)
+        .ok_or_else(|| anyhow!("no capture frames under {}", artifact_root.display()))?;
+    let manifest = read_frame_manifest(&frames_dir)?;
+    let file =
+        File::create(out_path).with_context(|| format!("create gif {}", out_path.display()))?;
+    let mut encoder = GifEncoder::new_with_speed(BufWriter::new(file), GIF_SPEED);
+    encoder
+        .set_repeat(Repeat::Infinite)
+        .context("set gif repeat")?;
+    let mut used = 0usize;
+    for item in selection {
+        let Some((path, hold)) = manifest.get(&item.seq) else {
+            continue;
+        };
+        let Ok(decoded) = image::ImageReader::open(path)
+            .and_then(|r| r.with_guessed_format())
+            .map_err(anyhow::Error::from)
+            .and_then(|r| r.decode().map_err(anyhow::Error::from))
+        else {
+            continue;
+        };
+        let (w, h) = (decoded.width(), decoded.height());
+        let long = w.max(h);
+        let mut rgb = if long > GIF_MAX_LONG_EDGE {
+            let scale = GIF_MAX_LONG_EDGE as f64 / long as f64;
+            decoded
+                .resize(
+                    ((w as f64 * scale).round() as u32).max(1),
+                    ((h as f64 * scale).round() as u32).max(1),
+                    image::imageops::FilterType::Triangle,
+                )
+                .to_rgb8()
+        } else {
+            decoded.to_rgb8()
+        };
+        if !item.caption.trim().is_empty() {
+            let cap_scale = (rgb.width() / 110).clamp(2, 5); // scale caption to frame width
+            draw_caption(&mut rgb, item.caption.trim(), cap_scale);
+        }
+        let delay_ms = (*hold).clamp(GIF_MIN_DELAY_MS, GIF_MAX_DELAY_MS);
+        let frame = image::Frame::from_parts(
+            image::DynamicImage::ImageRgb8(rgb).to_rgba8(),
+            0,
+            0,
+            image::Delay::from_numer_denom_ms(delay_ms, 1),
+        );
+        if encoder.encode_frame(frame).is_ok() {
+            used += 1;
+        }
+    }
+    Ok(used)
+}
+
+/// Build an animated GIF from the given (already curated) frames, dwelling on
+/// each for a clamped function of its hold_ms. Writes to `out_path`.
+pub fn build_summary_gif(frames: &[GifFrame], out_path: &Path) -> Result<()> {
+    use image::codecs::gif::{GifEncoder, Repeat};
+    if frames.is_empty() {
+        bail!("build_summary_gif: no frames provided");
+    }
+    let file =
+        File::create(out_path).with_context(|| format!("create gif {}", out_path.display()))?;
+    let mut encoder = GifEncoder::new_with_speed(BufWriter::new(file), GIF_SPEED);
+    encoder
+        .set_repeat(Repeat::Infinite)
+        .context("set gif repeat")?;
+    for frame in frames {
+        let img = image::ImageReader::open(&frame.path)
+            .with_context(|| format!("open gif frame {}", frame.path.display()))?
+            .with_guessed_format()
+            .with_context(|| format!("guess format {}", frame.path.display()))?
+            .decode()
+            .with_context(|| format!("decode gif frame {}", frame.path.display()))?;
+        // Downscale to keep the GIF small; never upscale.
+        let (w, h) = (img.width(), img.height());
+        let long = w.max(h);
+        let rgba = if long > GIF_MAX_LONG_EDGE {
+            let scale = GIF_MAX_LONG_EDGE as f64 / long as f64;
+            img.resize(
+                ((w as f64 * scale).round() as u32).max(1),
+                ((h as f64 * scale).round() as u32).max(1),
+                image::imageops::FilterType::Triangle,
+            )
+            .to_rgba8()
+        } else {
+            img.to_rgba8()
+        };
+        let delay_ms = frame.hold_ms.clamp(GIF_MIN_DELAY_MS, GIF_MAX_DELAY_MS);
+        let gif_frame =
+            image::Frame::from_parts(rgba, 0, 0, image::Delay::from_numer_denom_ms(delay_ms, 1));
+        encoder
+            .encode_frame(gif_frame)
+            .with_context(|| format!("encode gif frame {}", frame.path.display()))?;
+    }
+    Ok(())
+}
+
+/// One LLM-curated frame: which captured frame (by seq) and the caption the
+/// model gave it.
+pub struct CurationSelection {
+    pub seq: u32,
+    pub caption: String,
+}
+
+/// Result of turning a curation selection into artifacts.
+#[derive(Debug)]
+pub struct CurationResult {
+    pub gif_path: PathBuf,
+    pub confirmation_path: Option<PathBuf>,
+    pub frames_used: usize,
+    pub frames_dir: PathBuf,
+}
+
+/// Most-recent `.bs-*.frames` capture dir under `artifact_root` (by mtime).
+fn latest_frames_dir(artifact_root: &Path) -> Option<PathBuf> {
+    let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
+    for entry in fs::read_dir(artifact_root).ok()?.flatten() {
+        let path = entry.path();
+        let name = entry.file_name();
+        let name = name.to_string_lossy();
+        let is_frames_dir =
+            name == ".capture.frames" || (name.starts_with(".bs-") && name.ends_with(".frames"));
+        if path.is_dir() && is_frames_dir {
+            if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
+                if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
+                    best = Some((mtime, path));
+                }
+            }
+        }
+    }
+    best.map(|(_, path)| path)
+}
+
+/// seq -> (frame path, hold_ms) from a capture dir's `frames.ndjson`.
+fn read_frame_manifest(frames_dir: &Path) -> Result<HashMap<u32, (PathBuf, u32)>> {
+    let manifest = frames_dir.join("frames.ndjson");
+    let text = fs::read_to_string(&manifest)
+        .with_context(|| format!("read frame manifest {}", manifest.display()))?;
+    let mut map = HashMap::new();
+    for line in text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        let value: Value = serde_json::from_str(line)?;
+        if let (Some(seq), Some(path)) = (
+            value.get("seq").and_then(Value::as_u64),
+            value.get("path").and_then(Value::as_str),
+        ) {
+            let hold = value.get("hold_ms").and_then(Value::as_u64).unwrap_or(0) as u32;
+            map.insert(seq as u32, (PathBuf::from(path), hold));
+        }
+    }
+    Ok(map)
+}
+
+/// Build the end-of-run artifacts from an LLM curation selection: a summary GIF
+/// of only the chosen frames (in the given order, dwell from each frame's
+/// hold_ms) plus an optional confirmation still. Uses the latest capture dir
+/// under `artifact_root`. Selections whose seq isn't in the manifest are skipped.
+pub fn build_curated_gif(
+    artifact_root: &Path,
+    selection: &[CurationSelection],
+    confirmation_seq: Option<u32>,
+) -> Result<CurationResult> {
+    let frames_dir = latest_frames_dir(artifact_root)
+        .ok_or_else(|| anyhow!("no capture frames found under {}", artifact_root.display()))?;
+    let manifest = read_frame_manifest(&frames_dir)?;
+    let gif_frames: Vec<GifFrame> = selection
+        .iter()
+        .filter_map(|sel| {
+            manifest.get(&sel.seq).map(|(path, hold)| GifFrame {
+                path: path.clone(),
+                hold_ms: *hold,
+            })
+        })
+        .collect();
+    if gif_frames.is_empty() {
+        bail!("build_curated_gif: none of the selected seqs exist in the manifest");
+    }
+    let gif_path = artifact_root.join("capture-summary.gif");
+    build_summary_gif(&gif_frames, &gif_path)?;
+    let confirmation_path = confirmation_seq
+        .and_then(|seq| manifest.get(&seq).map(|(path, _)| path.clone()))
+        .map(|src| {
+            let dest = artifact_root.join("capture-confirmation.jpg");
+            let _ = fs::copy(&src, &dest);
+            dest
+        });
+    Ok(CurationResult {
+        gif_path,
+        confirmation_path,
+        frames_used: gif_frames.len(),
+        frames_dir,
+    })
+}
+
+const CONTACT_SHEET_MAX_PANES: usize = 16;
+
+/// Build the end-of-run contact sheet (one labeled JPEG) from the latest capture
+/// under `artifact_root`: all unique frames in seq order, each pane stamped with
+/// its seq so the curating LLM can reference them. Returns Ok(None) when there
+/// are no frames. If a run produced more than CONTACT_SHEET_MAX_PANES unique
+/// frames they are evenly sampled (seq labels stay truthful) — long runs that
+/// need every frame should move to batched sheets.
+pub fn capture_contact_sheet(artifact_root: &Path, caps: StitchCaps) -> Result<Option<Vec<u8>>> {
+    let Some(frames_dir) = latest_frames_dir(artifact_root) else {
+        return Ok(None);
+    };
+    let manifest = read_frame_manifest(&frames_dir)?;
+    if manifest.is_empty() {
+        return Ok(None);
+    }
+    let mut seqs: Vec<u32> = manifest.keys().copied().collect();
+    seqs.sort_unstable();
+    let chosen: Vec<u32> = if seqs.len() <= CONTACT_SHEET_MAX_PANES {
+        seqs
+    } else {
+        let n = CONTACT_SHEET_MAX_PANES;
+        (0..n)
+            .map(|i| seqs[i * (seqs.len() - 1) / (n - 1)])
+            .collect()
+    };
+    let frames: Vec<StitchFrame> = chosen
+        .into_iter()
+        .filter_map(|seq| {
+            manifest.get(&seq).map(|(path, _)| StitchFrame {
+                seq,
+                path: path.clone(),
+            })
+        })
+        .collect();
+    if frames.is_empty() {
+        return Ok(None);
+    }
+    Ok(Some(stitch_frames(&frames, caps)?))
+}
+
+/// Deterministic fallback recording: a summary GIF of ALL unique frames (seq
+/// order, dwell from hold_ms) from the latest capture under `artifact_root`.
+/// Used when LLM curation didn't run (non-vision model, or the model didn't call
+/// submit_capture_curation) so a recording always exists. Ok(None) with no frames.
+pub fn build_uncurated_summary_gif(artifact_root: &Path) -> Result<Option<PathBuf>> {
+    let Some(frames_dir) = latest_frames_dir(artifact_root) else {
+        return Ok(None);
+    };
+    let manifest = read_frame_manifest(&frames_dir)?;
+    if manifest.is_empty() {
+        return Ok(None);
+    }
+    let mut seqs: Vec<u32> = manifest.keys().copied().collect();
+    seqs.sort_unstable();
+    let frames: Vec<GifFrame> = seqs
+        .iter()
+        .filter_map(|seq| {
+            manifest.get(seq).map(|(path, hold)| GifFrame {
+                path: path.clone(),
+                hold_ms: *hold,
+            })
+        })
+        .collect();
+    if frames.is_empty() {
+        return Ok(None);
+    }
+    let gif_path = artifact_root.join("capture-summary.gif");
+    build_summary_gif(&frames, &gif_path)?;
+    Ok(Some(gif_path))
+}
+
+fn inline_frames_enabled() -> bool {
+    std::env::var("LLM_BROWSER_INLINE_FRAMES")
+        .map(|value| matches!(value.trim(), "1" | "true" | "yes" | "on"))
+        .unwrap_or(false)
+}
+
+// ===================== Session-layer continuous capture =====================
+// 2fps screenshot capture that runs whenever the browser is CONNECTED, on a
+// DEDICATED CDP websocket (its own connection) so it never holds the shared
+// session lock during a round-trip and never blocks the agent's commands.
+// Tool-agnostic: fires for `browser`, `browser_script`, anything that connects.
+// Frames + manifest land in <artifact_dir>/.capture.frames. Byte-exact adjacent
+// dedup with hold_ms coalescing (same scheme as before, now in Rust).
+
+struct SessionCaptureHandle {
+    stop: Arc<AtomicBool>,
+}
+static SESSION_CAPTURE: OnceLock<Mutex<HashMap<String, SessionCaptureHandle>>> = OnceLock::new();
+fn session_capture_registry() -> &'static Mutex<HashMap<String, SessionCaptureHandle>> {
+    SESSION_CAPTURE.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+fn session_capture_fps() -> f64 {
+    std::env::var("LLM_BROWSER_CAPTURE_FPS")
+        .ok()
+        .and_then(|v| v.trim().parse::<f64>().ok())
+        .unwrap_or(2.0)
+}
+fn session_capture_quality() -> i64 {
+    std::env::var("LLM_BROWSER_CAPTURE_QUALITY")
+        .ok()
+        .and_then(|v| v.trim().parse::<i64>().ok())
+        .unwrap_or(60)
+}
+
+fn start_session_capture(session_id: &str, artifact_dir: &Path) {
+    if session_capture_fps() <= 0.0 {
+        return;
+    }
+    let mut reg = session_capture_registry()
+        .lock()
+        .expect("session capture registry poisoned");
+    if reg.contains_key(session_id) {
+        return; // already capturing this session
+    }
+    let frames_dir = artifact_dir.join(".capture.frames");
+    if fs::create_dir_all(&frames_dir).is_err() {
+        return;
+    }
+    let stop = Arc::new(AtomicBool::new(false));
+    reg.insert(
+        session_id.to_string(),
+        SessionCaptureHandle { stop: stop.clone() },
+    );
+    let sid = session_id.to_string();
+    thread::spawn(move || session_capture_loop(sid, frames_dir, stop));
+}
+
+fn stop_session_capture(session_id: &str) {
+    if let Some(handle) = session_capture_registry()
+        .lock()
+        .expect("session capture registry poisoned")
+        .remove(session_id)
+    {
+        handle.stop.store(true, Ordering::SeqCst);
+    }
+}
+
+// Brief lock to read (ws_url, current_target_id) from the shared session. No
+// round-trip under the lock — just clones two strings.
+fn session_capture_dispatcher(session_id: &str) -> Option<(Arc<CdpDispatcher>, String)> {
+    let sessions = sessions().lock().ok()?;
+    let session = sessions.get(session_id)?;
+    let dispatcher = session.connection.clone()?;
+    let target = session.current_target_id.clone()?;
+    Some((dispatcher, target))
+}
+
+fn write_capture_manifest(path: &Path, records: &[Value]) {
+    let mut text = String::new();
+    for record in records {
+        if let Ok(line) = serde_json::to_string(record) {
+            text.push_str(&line);
+            text.push('\n');
+        }
+    }
+    let _ = fs::write(path, text);
+}
+
+fn session_capture_loop(session_id: String, frames_dir: PathBuf, stop: Arc<AtomicBool>) {
+    let interval = Duration::from_secs_f64(1.0 / session_capture_fps().max(0.1));
+    let quality = session_capture_quality();
+    let manifest = frames_dir.join("frames.ndjson");
+    let mut cap_session: Option<String> = None;
+    let mut attached_target: Option<String> = None;
+    let mut seq: u64 = 0;
+    let mut prev_bytes: Option<Vec<u8>> = None;
+    let mut records: Vec<Value> = Vec::new();
+    let mut idle_ticks: u32 = 0;
+
+    while !stop.load(Ordering::SeqCst) {
+        let tick = Instant::now();
+        match session_capture_dispatcher(&session_id) {
+            None => {
+                idle_ticks += 1;
+                if idle_ticks > 20 {
+                    break; // browser disconnected for ~10s; exit
+                }
+            }
+            Some((dispatcher, target_id)) => {
+                idle_ticks = 0;
+                // (Re)attach our own page session on the SHARED socket. We never
+                // open a websocket here: bug #19 was a second capture socket
+                // reopening in a loop and re-triggering Chrome's approval prompt.
+                if cap_session.is_none() || attached_target.as_deref() != Some(target_id.as_str()) {
+                    match dispatcher.call(
+                        "Target.attachToTarget",
+                        None,
+                        json!({ "targetId": target_id, "flatten": true }),
+                    ) {
+                        Ok(v) => {
+                            cap_session = v
+                                .get("sessionId")
+                                .and_then(Value::as_str)
+                                .map(ToOwned::to_owned);
+                            attached_target = Some(target_id.clone());
+                            if let Some(cs) = cap_session.as_deref() {
+                                let _ = dispatcher.call("Page.enable", Some(cs), json!({}));
+                            }
+                        }
+                        Err(_) => {
+                            cap_session = None;
+                            attached_target = None;
+                        }
+                    }
+                }
+                if let Some(cs) = cap_session.clone() {
+                    match dispatcher.call(
+                        "Page.captureScreenshot",
+                        Some(&cs),
+                        json!({ "format": "jpeg", "quality": quality }),
+                    ) {
+                        Ok(v) => {
+                            if let Some(bytes) = v
+                                .get("data")
+                                .and_then(Value::as_str)
+                                .and_then(|d| general_purpose::STANDARD.decode(d.as_bytes()).ok())
+                            {
+                                let ts = unix_time_ms() as u64;
+                                if prev_bytes.as_deref() == Some(bytes.as_slice()) {
+                                    if let Some(last) = records.last_mut() {
+                                        let first = last["first_ts"].as_u64().unwrap_or(ts);
+                                        last["last_ts"] = json!(ts);
+                                        last["hold_ms"] = json!(ts.saturating_sub(first));
+                                        last["repeat"] =
+                                            json!(last["repeat"].as_u64().unwrap_or(1) + 1);
+                                        write_capture_manifest(&manifest, &records);
+                                    }
+                                } else {
+                                    let path = frames_dir.join(format!("{seq:06}-{ts}.jpg"));
+                                    if fs::write(&path, &bytes).is_ok() {
+                                        records.push(json!({
+                                            "seq": seq,
+                                            "first_ts": ts,
+                                            "last_ts": ts,
+                                            "hold_ms": 0u64,
+                                            "repeat": 1u64,
+                                            "path": path.display().to_string(),
+                                        }));
+                                        write_capture_manifest(&manifest, &records);
+                                        seq += 1;
+                                        prev_bytes = Some(bytes);
+                                    }
+                                }
+                            }
+                        }
+                        Err(_) => {
+                            // session detached / page navigated; re-attach next tick.
+                            cap_session = None;
+                            attached_target = None;
+                        }
+                    }
+                }
+            }
+        }
+        let elapsed = tick.elapsed();
+        if interval > elapsed {
+            thread::sleep(interval - elapsed);
+        }
+    }
+    // Remove our registry entry so a later reconnect can restart capture.
+    session_capture_registry()
+        .lock()
+        .expect("session capture registry poisoned")
+        .remove(&session_id);
+}
+
+/// In-loop ingestion (opt-in via LLM_BROWSER_INLINE_FRAMES): on each observe,
+/// stitch the unique frames captured SINCE THE LAST OBSERVE (seq > cursor) into
+/// one image and attach it to the tool output so the agent sees what changed.
+/// Advances the per-run frame cursor; no-op when nothing new. Non-vision models
+/// are handled by the provider layer, which strips image content.
+fn attach_inline_window_stitch(run: &mut BrowserScriptRun, output: &mut BrowserScriptOutput) {
+    if !inline_frames_enabled() {
+        return;
+    }
+    let Ok(manifest) = read_frame_manifest(&run.frames_dir) else {
+        return;
+    };
+    let mut fresh: Vec<(u32, PathBuf)> = manifest
+        .into_iter()
+        .filter(|(seq, _)| (*seq as i64) > run.last_frame_seq)
+        .map(|(seq, (path, _))| (seq, path))
+        .collect();
+    if fresh.is_empty() {
+        return;
+    }
+    fresh.sort_by_key(|(seq, _)| *seq);
+    let max_seq = fresh.last().map(|(seq, _)| *seq).unwrap_or(0);
+    let frames: Vec<StitchFrame> = fresh
+        .into_iter()
+        .map(|(seq, path)| StitchFrame { seq, path })
+        .collect();
+    if let Ok(bytes) = stitch_frames(&frames, StitchCaps::default()) {
+        let path = run.frames_dir.join(format!("window-{max_seq:06}.jpg"));
+        if std::fs::write(&path, &bytes).is_ok() {
+            output.images.push(serde_json::json!({
+                "path": path.display().to_string(),
+                "mime_type": "image/jpeg",
+                "detail": "auto",
+                "label": format!("browser view (frames through seq {max_seq})"),
+                "source": "capture_window",
+            }));
+            run.last_frame_seq = max_seq as i64;
+        }
+    }
 }
 
 fn is_real_page_target(target: &Value) -> bool {
@@ -5185,6 +6587,234 @@ mod tests {
     use std::sync::MutexGuard;
 
     static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+
+    #[test]
+    #[ignore = "manual measurement; needs STITCH_TEST_FRAMES_DIR"]
+    fn dhash_hamming_among_frames() {
+        let dir = std::env::var("STITCH_TEST_FRAMES_DIR").expect("set STITCH_TEST_FRAMES_DIR");
+        let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jpg"))
+            .collect();
+        paths.sort();
+        // dHash: 9x8 grayscale, compare horizontally adjacent pixels -> 64 bits.
+        let dhash = |p: &PathBuf| -> u64 {
+            let img = image::ImageReader::open(p)
+                .unwrap()
+                .decode()
+                .unwrap()
+                .to_luma8();
+            let small = image::imageops::resize(&img, 9, 8, image::imageops::FilterType::Lanczos3);
+            let mut bits = 0u64;
+            let mut idx = 0;
+            for r in 0..8u32 {
+                for c in 0..8u32 {
+                    let left = small.get_pixel(c, r)[0];
+                    let right = small.get_pixel(c + 1, r)[0];
+                    if left > right {
+                        bits |= 1 << idx;
+                    }
+                    idx += 1;
+                }
+            }
+            bits
+        };
+        let hashes: Vec<u64> = paths.iter().map(dhash).collect();
+        let ham = |a: u64, b: u64| (a ^ b).count_ones();
+        println!("\npairwise dHash Hamming (0=identical, 64=opposite):");
+        for i in 0..hashes.len() {
+            let row: String = (0..hashes.len())
+                .map(|j| format!("{:>4}", ham(hashes[i], hashes[j])))
+                .collect();
+            println!("  frame {i}:{row}");
+        }
+    }
+
+    // Run: CAP_ARTIFACT_ROOT=~/.browser-use-terminal/artifacts/<task> \
+    //   cargo test -p browser-use-browser uncurated_fallback_from_artifact -- --ignored --nocapture
+    // Build a captioned GIF for one variant. CAP_ROOT=artifact dir,
+    // CAP_OUT=output gif, CAP_SEL=JSON [[seq,"caption"],...].
+    #[test]
+    #[ignore = "harness; needs CAP_ROOT/CAP_OUT/CAP_SEL"]
+    fn build_captioned_from_env() {
+        let root = PathBuf::from(std::env::var("CAP_ROOT").expect("CAP_ROOT"));
+        let out = PathBuf::from(std::env::var("CAP_OUT").expect("CAP_OUT"));
+        let sel: Value = serde_json::from_str(&std::env::var("CAP_SEL").expect("CAP_SEL"))
+            .expect("CAP_SEL json");
+        let selection: Vec<CaptionedFrame> = sel
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|e| {
+                let a = e.as_array().unwrap();
+                CaptionedFrame {
+                    seq: a[0].as_u64().unwrap() as u32,
+                    caption: a.get(1).and_then(|x| x.as_str()).unwrap_or("").to_string(),
+                }
+            })
+            .collect();
+        let n = if std::env::var("CAP_SHEET").is_ok() {
+            build_captioned_sheet(&root, &selection, &out).expect("sheet")
+        } else {
+            build_captioned_gif(&root, &selection, &out).expect("build")
+        };
+        println!("built {} frames -> {}", n, out.display());
+    }
+
+    #[test]
+    #[ignore = "manual; renders a caption sample to verify the font"]
+    fn caption_font_render_sample() {
+        // 768x200 dark canvas, draw a caption, save PNG for visual check.
+        let mut img = image::RgbImage::from_pixel(820, 220, image::Rgb([40, 60, 90]));
+        draw_caption(&mut img, "Delta $209 - cheapest fare details (1/3)", 4);
+        let mut img2 = image::RgbImage::from_pixel(820, 120, image::Rgb([30, 30, 30]));
+        draw_caption(&mut img2, "ABCDEFGHIJKLM NOPQRSTUVWXYZ 0123456789", 3);
+        let out = PathBuf::from("/tmp/reagan_caption_sample.png");
+        image::DynamicImage::ImageRgb8(img).save(&out).unwrap();
+        let out2 = PathBuf::from("/tmp/reagan_caption_alphabet.png");
+        image::DynamicImage::ImageRgb8(img2).save(&out2).unwrap();
+        println!("wrote {} and {}", out.display(), out2.display());
+    }
+
+    #[test]
+    #[ignore = "manual; needs CAP_ARTIFACT_ROOT"]
+    fn uncurated_fallback_from_artifact_root() {
+        let root =
+            PathBuf::from(std::env::var("CAP_ARTIFACT_ROOT").expect("set CAP_ARTIFACT_ROOT"));
+        match build_uncurated_summary_gif(&root).expect("build") {
+            Some(path) => {
+                let kb = fs::metadata(&path).unwrap().len() / 1024;
+                println!("\nuncurated recording: {} ({} KB)", path.display(), kb);
+            }
+            None => println!("\nno frames found under {}", root.display()),
+        }
+    }
+
+    // Run: STITCH_TEST_FRAMES_DIR=/path/to/.frames \
+    //   cargo test -p browser-use-browser build_curated_gif_from_real -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual; needs STITCH_TEST_FRAMES_DIR"]
+    fn build_curated_gif_from_real_capture() {
+        let dir = PathBuf::from(std::env::var("STITCH_TEST_FRAMES_DIR").expect("set dir"));
+        let artifact_root = dir.parent().unwrap().to_path_buf();
+        // Simulate an LLM picking the two pivotal frames (example.com + wiki final).
+        let selection = vec![
+            CurationSelection {
+                seq: 1,
+                caption: "example.com loaded".into(),
+            },
+            CurationSelection {
+                seq: 5,
+                caption: "wikipedia loaded".into(),
+            },
+        ];
+        let result = build_curated_gif(&artifact_root, &selection, Some(5)).expect("curate");
+        println!("\ncurated gif: {}", result.gif_path.display());
+        println!("frames used: {}", result.frames_used);
+        println!(
+            "confirmation: {:?}",
+            result.confirmation_path.as_ref().map(|p| p.display())
+        );
+        assert_eq!(result.frames_used, 2);
+        assert!(fs::metadata(&result.gif_path).unwrap().len() > 0);
+        assert!(result
+            .confirmation_path
+            .as_ref()
+            .is_some_and(|p| p.exists()));
+    }
+
+    // Run: STITCH_TEST_FRAMES_DIR=/path/to/.frames \
+    //   cargo test -p browser-use-browser build_summary_gif_from_real -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual; needs STITCH_TEST_FRAMES_DIR"]
+    fn build_summary_gif_from_real_capture() {
+        let dir = std::env::var("STITCH_TEST_FRAMES_DIR").expect("set STITCH_TEST_FRAMES_DIR");
+        let manifest = PathBuf::from(&dir).join("frames.ndjson");
+        let text = fs::read_to_string(&manifest).expect("read manifest");
+        let frames: Vec<GifFrame> = text
+            .lines()
+            .filter(|l| !l.trim().is_empty())
+            .map(|l| {
+                let v: Value = serde_json::from_str(l).unwrap();
+                GifFrame {
+                    path: PathBuf::from(v.get("path").and_then(Value::as_str).unwrap()),
+                    hold_ms: v.get("hold_ms").and_then(Value::as_u64).unwrap_or(0) as u32,
+                }
+            })
+            .collect();
+        let out = PathBuf::from("/tmp/reagan_summary.gif");
+        build_summary_gif(&frames, &out).expect("build gif");
+        let meta = fs::metadata(&out).unwrap();
+        println!(
+            "\nsummary.gif: {} frames, {} KB -> {}",
+            frames.len(),
+            meta.len() / 1024,
+            out.display()
+        );
+        for (i, f) in frames.iter().enumerate() {
+            println!(
+                "  frame {i}: hold={}ms -> dwell={}ms",
+                f.hold_ms,
+                f.hold_ms.clamp(GIF_MIN_DELAY_MS, GIF_MAX_DELAY_MS)
+            );
+        }
+        assert!(meta.len() > 0);
+    }
+
+    // Run: STITCH_TEST_FRAMES_DIR=/path/to/.frames \
+    //   cargo test -p browser-use-browser stitch_frames_measures -- --ignored --nocapture
+    #[test]
+    #[ignore = "manual measurement; needs STITCH_TEST_FRAMES_DIR"]
+    fn stitch_frames_measures_real_capture() {
+        let dir = std::env::var("STITCH_TEST_FRAMES_DIR")
+            .expect("set STITCH_TEST_FRAMES_DIR to a .frames dir");
+        let mut paths: Vec<PathBuf> = fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(|e| e.ok().map(|e| e.path()))
+            .filter(|p| p.extension().and_then(|x| x.to_str()) == Some("jpg"))
+            .collect();
+        paths.sort();
+        println!("\nstitching {} unique frames from {dir}", paths.len());
+
+        let frames: Vec<StitchFrame> = paths
+            .iter()
+            .enumerate()
+            .map(|(i, p)| StitchFrame {
+                seq: i as u32,
+                path: p.clone(),
+            })
+            .collect();
+        let bytes = stitch_frames(&frames, StitchCaps::default()).expect("stitch");
+        let out = PathBuf::from("/tmp/reagan_stitch_preview.jpg");
+        fs::write(&out, &bytes).unwrap();
+        let img = image::ImageReader::open(&out).unwrap().decode().unwrap();
+        let (w, h) = (img.width(), img.height());
+
+        // Per-provider token estimates (see intuitions §3.6).
+        let claude = w * h / 750;
+        let openai = {
+            // fit 2048 box (downscale only), then shortest side -> 768, tile by 512.
+            let (mut ww, mut hh) = (w as f64, h as f64);
+            let fit = (2048.0 / ww.max(hh)).min(1.0);
+            ww *= fit;
+            hh *= fit;
+            let s = 768.0 / ww.min(hh);
+            ww *= s;
+            hh *= s;
+            let tiles = (ww / 512.0).ceil() * (hh / 512.0).ceil();
+            85.0 + 170.0 * tiles
+        };
+        let gemini = if w <= 384 && h <= 384 {
+            258.0
+        } else {
+            (w as f64 / 768.0).ceil() * (h as f64 / 768.0).ceil() * 258.0
+        };
+        println!("composite {w}x{h}  ({} KB)", bytes.len() / 1024);
+        println!("est tokens  claude={claude}  openai≈{openai:.0}  gemini≈{gemini:.0}");
+        println!("preview written to {}", out.display());
+        assert!(w <= StitchCaps::default().long_edge && h <= StitchCaps::default().long_edge);
+    }
 
     struct EnvRestore {
         _guard: MutexGuard<'static, ()>,
@@ -5716,6 +7346,108 @@ print("bs4 available", bs4.__version__)
     }
 
     #[test]
+    fn browser_session_cdp_mouse_press_auto_highlight_is_planned() {
+        let params = json!({
+            "type": "mousePressed",
+            "x": 31,
+            "y": 47,
+            "button": "left",
+            "clickCount": 1,
+        });
+        assert_eq!(
+            browser_session_mouse_press_xy("Input.dispatchMouseEvent", &params),
+            Some((31.0, 47.0))
+        );
+        assert_eq!(
+            browser_session_mouse_press_xy(
+                "Input.dispatchMouseEvent",
+                &json!({ "type": "mouseReleased", "x": 31, "y": 47 })
+            ),
+            None
+        );
+        assert_eq!(
+            browser_session_mouse_press_xy(
+                "Input.dispatchMouseEvent",
+                &json!({ "type": "mouseWheel", "x": 31, "y": 47 })
+            ),
+            None
+        );
+        assert_eq!(
+            browser_session_mouse_press_xy("DOM.focus", &json!({ "nodeId": 2 })),
+            None
+        );
+
+        let expression = bridge_highlight_element_at_xy_expression(31.0, 47.0);
+        assert!(expression.contains("elementFromPoint"), "{expression}");
+        assert!(
+            expression.contains("data-browser-use-terminal-highlight"),
+            "{expression}"
+        );
+        assert!(expression.contains("#3b82f6"), "{expression}");
+        assert!(expression.contains("\"duration\":1000"), "{expression}");
+    }
+
+    #[test]
+    fn browser_session_cdp_dom_node_actions_auto_highlight() {
+        assert_eq!(
+            browser_session_node_highlight_id("DOM.focus", &json!({ "nodeId": 2 })),
+            Some(json!(2))
+        );
+        assert_eq!(
+            browser_session_node_highlight_id("DOM.setFileInputFiles", &json!({ "nodeId": 7 })),
+            Some(json!(7))
+        );
+        assert_eq!(
+            bridge_box_from_model(&json!({
+                "model": {
+                    "border": [10, 20, 110, 20, 110, 60, 10, 60]
+                }
+            })),
+            Some((10.0, 20.0, 100.0, 40.0))
+        );
+    }
+
+    #[test]
+    fn browser_session_screenshot_cleanup_removes_highlights() {
+        let expression = bridge_remove_highlights_expression();
+        assert!(
+            expression.contains("browser-use-terminal-highlights"),
+            "{expression}"
+        );
+        assert!(
+            expression.contains("data-browser-use-terminal-highlight"),
+            "{expression}"
+        );
+    }
+
+    #[test]
+    fn browser_script_highlight_helpers_are_not_agent_api() {
+        let temp = tempfile::tempdir().unwrap();
+        let output = run_browser_script(
+            "script-highlight-helper-visibility",
+            temp.path(),
+            temp.path().join("artifacts"),
+            r#"
+for name in (
+    "highlight_box",
+    "highlight_at_xy",
+    "highlight_element_at_xy",
+    "highlight_node",
+    "highlight_selector",
+    "remove_highlights",
+):
+    assert name not in globals(), name
+print("highlight helpers hidden")
+"#,
+            10,
+        )
+        .unwrap();
+
+        assert!(output.ok, "{:?}\n{}", output.error, output.text);
+        assert!(output.text.contains("highlight helpers hidden"));
+    }
+
+    #[test]
     fn browser_script_fill_input_uses_cdp_focus_and_input() {
         let temp = tempfile::tempdir().unwrap();
         let output = run_browser_script(
@@ -5728,7 +7460,10 @@ events = []
 def js(expression, *args, **kwargs):
     raise AssertionError(f"fill_input should not use page JS: {expression}")
 
-def cdp(method, *args, **kwargs):
+def _bridge(message):
+    assert message["kind"] == "cdp", message
+    method = message["method"]
+    kwargs = message["params"]
     events.append((method, kwargs))
     if method == "DOM.getDocument":
         return {"root": {"nodeId": 1}}

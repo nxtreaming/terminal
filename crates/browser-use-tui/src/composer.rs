@@ -205,64 +205,6 @@ impl Composer {
         )
     }
 
-    pub(crate) fn set_cursor_from_wrapped_position(
-        &mut self,
-        max_lines: usize,
-        width: usize,
-        x: usize,
-        y: usize,
-    ) {
-        if self.is_empty() {
-            self.cursor = 0;
-            self.preferred_column = None;
-            return;
-        }
-
-        let content_width = width.saturating_sub(2).max(1);
-        let visible_start = self.visible_wrapped_line_start(max_lines, width);
-        let target_visual_row = visible_start + y.min(max_lines.saturating_sub(1));
-        let target_visual_col = x.saturating_sub(2);
-        let image_width = self.image_width(!self.text.is_empty());
-        let lines = self.text.split('\n').collect::<Vec<_>>();
-        let mut visual_row = 0usize;
-        let mut char_base = 0usize;
-
-        for (logical_idx, line) in lines.iter().enumerate() {
-            let line_len = line.chars().count();
-            let wrap_width = if logical_idx == 0 {
-                content_width.saturating_sub(image_width).max(1)
-            } else {
-                content_width
-            };
-            let visual_count = wrapped_line_count(line, wrap_width);
-            if target_visual_row < visual_row.saturating_add(visual_count) {
-                let chunk_idx = target_visual_row.saturating_sub(visual_row);
-                let chunk_start = chunk_idx.saturating_mul(wrap_width).min(line_len);
-                let prefix_width = if logical_idx == 0 && chunk_idx == 0 {
-                    image_width
-                } else {
-                    0
-                };
-                let chunk_col = target_visual_col
-                    .saturating_sub(prefix_width)
-                    .min(wrap_width)
-                    .min(line_len.saturating_sub(chunk_start));
-                self.cursor = char_base + chunk_start + chunk_col;
-                self.preferred_column = None;
-                return;
-            }
-
-            visual_row += visual_count;
-            char_base += line_len;
-            if logical_idx + 1 < lines.len() {
-                char_base += 1;
-            }
-        }
-
-        self.cursor = self.input_len();
-        self.preferred_column = None;
-    }
-
     pub(crate) fn handle_key(&mut self, key: KeyEvent) -> bool {
         if !matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
             return false;
@@ -1037,26 +979,6 @@ mod tests {
         composer.set_input("abcdefghijkl".to_string());
         assert_eq!(composer.render_lines_wrapped(2, 8, "placeholder").len(), 2);
         assert_eq!(composer.cursor_position_wrapped(2, 8), (7, 1));
-    }
-
-    #[test]
-    fn mouse_position_sets_cursor_on_multiline_text() {
-        let mut composer = Composer::default();
-        composer.set_input("first line\nsecond word\nthird".to_string());
-
-        composer.set_cursor_from_wrapped_position(4, 80, 9, 1);
-
-        assert_eq!(composer.cursor(), "first line\nsecond ".chars().count());
-    }
-
-    #[test]
-    fn mouse_position_sets_cursor_on_wrapped_text() {
-        let mut composer = Composer::default();
-        composer.set_input("abcdefghij".to_string());
-
-        composer.set_cursor_from_wrapped_position(2, 8, 4, 1);
-
-        assert_eq!(composer.cursor(), "abcdefgh".chars().count());
     }
 
     #[test]

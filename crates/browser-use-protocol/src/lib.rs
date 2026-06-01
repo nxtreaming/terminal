@@ -1,6 +1,8 @@
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+const SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT: &str = "session.followup.pending";
+
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
 pub struct SessionMeta {
     pub id: String,
@@ -348,7 +350,14 @@ pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
     for (idx, event) in events.iter().enumerate() {
         let is_followup = match event.event_type.as_str() {
             "session.input" => false,
-            "session.followup" => true,
+            "session.followup" => {
+                if pending_after_next_tool_call_followup(events, event)
+                    || after_next_tool_call_followup_is_cancelled(events, event.seq)
+                {
+                    continue;
+                }
+                true
+            }
             _ => continue,
         };
         let Some(prompt) = event
@@ -385,6 +394,74 @@ pub fn transcript_from_events(events: &[EventRecord]) -> Vec<TranscriptTurn> {
             }
         })
         .collect()
+}
+
+fn pending_after_next_tool_call_followup(events: &[EventRecord], followup: &EventRecord) -> bool {
+    if !matches!(
+        followup.event_type.as_str(),
+        "session.followup" | SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+    ) {
+        return false;
+    }
+    if !followup_delivery_is_after_next_tool_call(followup) {
+        return false;
+    }
+    !events
+        .iter()
+        .any(|event| event_closes_after_next_tool_call_followup(event, followup.seq))
+}
+
+fn after_next_tool_call_followup_is_cancelled(events: &[EventRecord], followup_seq: i64) -> bool {
+    events.iter().any(|event| {
+        event.seq > followup_seq
+            && event.event_type == "session.followup.cancelled"
+            && followup_marker_seqs(event).contains(&followup_seq)
+    })
+}
+
+fn followup_delivery_is_after_next_tool_call(event: &EventRecord) -> bool {
+    event.payload.get("delivery").and_then(Value::as_str) == Some("after_next_tool_call")
+}
+
+fn event_closes_after_next_tool_call_followup(event: &EventRecord, followup_seq: i64) -> bool {
+    if event.seq <= followup_seq {
+        return false;
+    }
+    match event.event_type.as_str() {
+        "agent.turn_queue_drained" => {
+            let drained_session_messages = event
+                .payload
+                .get("session_messages")
+                .and_then(Value::as_u64)
+                .unwrap_or_default();
+            let last_seq = event
+                .payload
+                .get("last_seq")
+                .and_then(Value::as_i64)
+                .unwrap_or_default();
+            drained_session_messages > 0 && last_seq >= followup_seq
+        }
+        "session.followup.interrupt_sent" => followup_marker_seqs(event).contains(&followup_seq),
+        "session.followup.cancelled" => followup_marker_seqs(event).contains(&followup_seq),
+        _ => false,
+    }
+}
+
+fn followup_marker_seqs(event: &EventRecord) -> Vec<i64> {
+    if let Some(seq) = event
+        .payload
+        .get("followup_seq")
+        .or_else(|| event.payload.get("seq"))
+        .and_then(Value::as_i64)
+    {
+        return vec![seq];
+    }
+    event
+        .payload
+        .get("followup_seqs")
+        .and_then(Value::as_array)
+        .map(|seqs| seqs.iter().filter_map(Value::as_i64).collect::<Vec<_>>())
+        .unwrap_or_default()
 }
 
 pub fn result_from_events(events: &[EventRecord]) -> Option<String> {
@@ -1744,6 +1821,100 @@ mod tests {
             transcript[0].streaming_text.as_deref(),
             Some("fresh answer")
         );
+    }
+
+    #[test]
+    fn pending_after_next_tool_call_followup_does_not_split_live_turn() {
+        let events = vec![
+            event(1, "session.input", json!({"text": "run"})),
+            event(2, "model.turn.request", json!({"model": "GPT-5.5"})),
+            event(3, "model.stream_delta", json!({"text": "still running"})),
+            event(
+                4,
+                "session.followup",
+                json!({"text": "steer after tool", "delivery": "after_next_tool_call"}),
+            ),
+        ];
+
+        let transcript = transcript_from_events(&events);
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].prompt, "run");
+        assert_eq!(
+            transcript[0].streaming_text.as_deref(),
+            Some("still running")
+        );
+
+        let mut drained = events;
+        drained.push(event(
+            5,
+            "agent.turn_queue_drained",
+            json!({
+                "phase": "after_tool_outputs",
+                "session_messages": 1,
+                "last_seq": 4,
+            }),
+        ));
+        let transcript = transcript_from_events(&drained);
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[1].prompt, "steer after tool");
+        assert!(transcript[1].is_followup);
+
+        let cancelled = vec![
+            event(1, "session.input", json!({"text": "run"})),
+            event(
+                2,
+                "session.followup",
+                json!({"text": "edit this", "delivery": "after_next_tool_call"}),
+            ),
+            event(
+                3,
+                "session.followup.cancelled",
+                json!({"followup_seq": 2, "reason": "reclaimed from escape"}),
+            ),
+        ];
+        let transcript = transcript_from_events(&cancelled);
+        assert_eq!(transcript.len(), 1);
+        assert_eq!(transcript[0].prompt, "run");
+    }
+
+    #[test]
+    fn pending_active_followup_event_waits_for_committed_followup_boundary() {
+        let events = vec![
+            event(1, "session.input", json!({"text": "run"})),
+            event(2, "model.stream_delta", json!({"text": "still running"})),
+            event(
+                3,
+                SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                json!({"text": "steer after tool", "delivery": "after_next_tool_call"}),
+            ),
+            event(4, "file.read", json!({"path": "README.md"})),
+            event(
+                5,
+                "session.followup",
+                json!({"text": "steer after tool", "pending_from_seq": 3}),
+            ),
+            event(
+                6,
+                "agent.turn_queue_drained",
+                json!({
+                    "phase": "after_tool_outputs",
+                    "session_messages": 1,
+                    "last_seq": 5,
+                }),
+            ),
+            event(7, "model.stream_delta", json!({"text": "new answer"})),
+        ];
+
+        let transcript = transcript_from_events(&events);
+        assert_eq!(transcript.len(), 2);
+        assert_eq!(transcript[0].prompt, "run");
+        assert_eq!(
+            transcript[0].streaming_text.as_deref(),
+            Some("still running")
+        );
+        assert_eq!(transcript[1].prompt, "steer after tool");
+        assert!(transcript[1].is_followup);
+        assert_eq!(transcript[1].streaming_text.as_deref(), Some("new answer"));
     }
 
     #[test]

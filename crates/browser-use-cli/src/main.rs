@@ -56,6 +56,9 @@ use clap::{Parser, Subcommand, ValueEnum};
 use serde::Serialize;
 use serde_json::Value;
 
+const MESSAGE_KIND_FOLLOWUP: &str = "followup";
+const APPROX_CHARS_PER_TOKEN: usize = 4;
+
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
 #[command(about = "Rust browser-use task control")]
@@ -228,6 +231,24 @@ enum Command {
     BrowserScript {
         task_id: String,
         code: String,
+    },
+    SyncCookies {
+        #[arg(value_name = "LOCAL_PROFILE")]
+        profile: Option<String>,
+        #[arg(long = "local-profile")]
+        local_profile: Option<String>,
+        #[arg(long)]
+        all_cookies: bool,
+        #[arg(long = "domain", action = clap::ArgAction::Append)]
+        domains: Vec<String>,
+        #[arg(long = "exclude-domain", action = clap::ArgAction::Append)]
+        exclude_domains: Vec<String>,
+        #[arg(long)]
+        cloud_profile_id: Option<String>,
+        #[arg(long)]
+        cloud_profile_name: Option<String>,
+        #[arg(long)]
+        new_cloud_profile_name: Option<String>,
     },
     UserShell {
         task_id: String,
@@ -731,6 +752,28 @@ fn main() -> Result<()> {
         Command::Events { task_id } => events(&store, &task_id),
         Command::Python { task_id, code } => python(&store, &task_id, code),
         Command::BrowserScript { task_id, code } => browser_script(&store, &task_id, code),
+        Command::SyncCookies {
+            profile,
+            local_profile,
+            all_cookies,
+            domains,
+            exclude_domains,
+            cloud_profile_id,
+            cloud_profile_name,
+            new_cloud_profile_name,
+        } => sync_cookies(
+            &store,
+            SyncCookiesArgs {
+                profile,
+                local_profile,
+                all_cookies,
+                domains,
+                exclude_domains,
+                cloud_profile_id,
+                cloud_profile_name,
+                new_cloud_profile_name,
+            },
+        ),
         Command::UserShell { task_id, command } => user_shell(&store, &task_id, command),
         Command::Review {
             base,
@@ -992,6 +1035,7 @@ fn command_name(command: &Command) -> &'static str {
         Command::Events { .. } => "events",
         Command::Python { .. } => "python",
         Command::BrowserScript { .. } => "browser_script",
+        Command::SyncCookies { .. } => "sync_cookies",
         Command::UserShell { .. } => "user_shell",
         Command::Review { .. } => "review",
         Command::Export { .. } => "export",
@@ -1954,13 +1998,56 @@ fn format_subagent_notification_message(agent_path: &str, status: &str, payload:
     )
 }
 
+#[allow(clippy::too_many_arguments)]
+fn capture_user_message(
+    store: &Store,
+    surface: &str,
+    session_id: &str,
+    is_subagent: bool,
+    kind: &str,
+    seq: i64,
+    text: &str,
+) {
+    let trimmed = text.trim();
+    let char_count = trimmed.chars().count();
+    let word_count = if trimmed.is_empty() {
+        0
+    } else {
+        trimmed.split_whitespace().count()
+    };
+    let approx_tokens = char_count.div_ceil(APPROX_CHARS_PER_TOKEN);
+    capture_async(
+        store,
+        "bu:tui user_message",
+        serde_json::json!({
+            "surface": surface,
+            "session_id": session_id,
+            "is_subagent": is_subagent,
+            "kind": kind,
+            "seq": seq,
+            "char_count": char_count,
+            "word_count": word_count,
+            "approx_tokens": approx_tokens,
+        }),
+    );
+}
+
 fn followup(store: &Store, task_id: &str, text: String) -> Result<()> {
     let session = ensure_task_exists(store, task_id)?;
-    store.append_event(
+    let followup_record = store.append_event(
         task_id,
         "session.followup",
         typed_user_input_payload_from_text_for_cwd(&text, &session.cwd)?,
     )?;
+    capture_user_message(
+        store,
+        "cli",
+        task_id,
+        session.parent_id.is_some(),
+        MESSAGE_KIND_FOLLOWUP,
+        followup_record.seq,
+        &text,
+    );
     maybe_append_message_history(
         task_id,
         &text,
@@ -2166,6 +2253,111 @@ fn browser_script(store: &Store, task_id: &str, code: String) -> Result<()> {
     )
 }
 
+#[derive(Clone, Debug)]
+struct SyncCookiesArgs {
+    profile: Option<String>,
+    local_profile: Option<String>,
+    all_cookies: bool,
+    domains: Vec<String>,
+    exclude_domains: Vec<String>,
+    cloud_profile_id: Option<String>,
+    cloud_profile_name: Option<String>,
+    new_cloud_profile_name: Option<String>,
+}
+
+fn run_cookie_sync_browser_command(store: &Store, args: &[String]) -> Result<Value> {
+    let browser_use_api_key = browser_use_api_key_from_store_or_env(store)?;
+    let cwd = std::env::current_dir()?;
+    let artifact_root = cli_browser_artifact_root(store)?;
+    let options = browser_use_browser::BrowserCommandOptions {
+        browser_use_api_key,
+    };
+    Ok(browser_use_browser::run_browser_command_with_options(
+        "cli-browser",
+        &cwd,
+        &artifact_root,
+        &browser_command_from_args(args),
+        options,
+    )?
+    .content)
+}
+
+fn sync_cookies(store: &Store, args: SyncCookiesArgs) -> Result<()> {
+    if args.all_cookies && !args.domains.is_empty() {
+        bail!("pass --all-cookies or --domain filters, not both");
+    }
+    let profile = args.local_profile.or(args.profile);
+    let mut browser_args = vec!["profile".to_string(), "sync".to_string()];
+    if let Some(profile) = profile {
+        browser_args.extend(["--profile".to_string(), profile]);
+    }
+    if args.all_cookies || args.domains.is_empty() {
+        browser_args.push("--all-cookies".to_string());
+    }
+    for domain in args.domains {
+        browser_args.extend(["--domain".to_string(), domain]);
+    }
+    for domain in args.exclude_domains {
+        browser_args.extend(["--exclude-domain".to_string(), domain]);
+    }
+    if let Some(profile_id) = args.cloud_profile_id {
+        browser_args.extend(["--cloud-profile-id".to_string(), profile_id]);
+    }
+    if let Some(profile_name) = args.cloud_profile_name {
+        browser_args.extend(["--cloud-profile-name".to_string(), profile_name]);
+    }
+    if let Some(profile_name) = args.new_cloud_profile_name {
+        browser_args.extend(["--new-cloud-profile-name".to_string(), profile_name]);
+    }
+    let output = run_cookie_sync_browser_command(store, &browser_args)?;
+    print_json_value(&output)
+}
+
+fn browser_use_api_key_from_store_or_env(store: &Store) -> Result<Option<String>> {
+    if let Ok(value) = std::env::var(BROWSER_USE_CLOUD_API_KEY_ENV) {
+        if !value.trim().is_empty() {
+            return Ok(Some(value));
+        }
+    }
+    Ok(store
+        .get_setting(BROWSER_USE_CLOUD_API_KEY_SETTING)?
+        .filter(|value| !value.trim().is_empty()))
+}
+
+fn cli_browser_artifact_root(store: &Store) -> Result<PathBuf> {
+    let root = store.state_dir().join("cli-browser-artifacts");
+    fs::create_dir_all(&root)?;
+    Ok(root)
+}
+
+fn browser_command_from_args(args: &[String]) -> String {
+    let mut command = String::from("browser");
+    for arg in args {
+        command.push(' ');
+        command.push_str(&shell_quote_arg(arg));
+    }
+    command
+}
+
+fn shell_quote_arg(arg: &str) -> String {
+    if !arg.is_empty()
+        && arg.bytes().all(|byte| {
+            byte.is_ascii_alphanumeric()
+                || matches!(byte, b'_' | b'-' | b'.' | b'/' | b':' | b'=' | b',')
+        })
+    {
+        return arg.to_string();
+    }
+    format!("'{}'", arg.replace('\'', r#"'\''"#))
+}
+
+fn print_json_value(value: &Value) -> Result<()> {
+    let mut stdout = io::stdout().lock();
+    serde_json::to_writer_pretty(&mut stdout, value)?;
+    writeln!(stdout)?;
+    Ok(())
+}
+
 fn user_shell(store: &Store, task_id: &str, command: String) -> Result<()> {
     let task = ensure_task_exists(store, task_id)?;
     let shell = std::env::var("SHELL")
@@ -2357,6 +2549,7 @@ fn is_secret_setting(key: &str) -> bool {
 }
 
 const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
+const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
 
 fn auth(store: &Store, command: AuthCommand) -> Result<()> {
     match command {
@@ -5036,6 +5229,52 @@ command = "test-mcp"
 
         std::fs::remove_dir_all(temp)?;
         Ok(())
+    }
+
+    #[test]
+    fn sync_cookies_command_accepts_local_profile_without_global_profile_conflict() -> Result<()> {
+        let parsed = Args::try_parse_from([
+            "browser-use-terminal",
+            "sync-cookies",
+            "google-chrome:Profile 1",
+            "--all-cookies",
+            "--new-cloud-profile-name",
+            "Imported Profile",
+        ])?;
+
+        match parsed.command {
+            Command::SyncCookies {
+                profile,
+                local_profile,
+                all_cookies,
+                new_cloud_profile_name,
+                ..
+            } => {
+                assert_eq!(profile.as_deref(), Some("google-chrome:Profile 1"));
+                assert_eq!(local_profile, None);
+                assert!(all_cookies);
+                assert_eq!(new_cloud_profile_name.as_deref(), Some("Imported Profile"));
+                assert_eq!(parsed.config_profile, None);
+            }
+            other => panic!("expected sync-cookies command, got {other:?}"),
+        }
+        Ok(())
+    }
+
+    #[test]
+    fn cookie_sync_runtime_command_quotes_profile_ids() {
+        let command = browser_command_from_args(&[
+            "profile".to_string(),
+            "sync".to_string(),
+            "--profile".to_string(),
+            "google-chrome:Profile 1".to_string(),
+            "--all-cookies".to_string(),
+        ]);
+
+        assert_eq!(
+            command,
+            "browser profile sync --profile 'google-chrome:Profile 1' --all-cookies"
+        );
     }
 
     #[test]
