@@ -184,6 +184,7 @@ fn ctx() -> ToolCtx {
         call_id: "call-1".to_string(),
         tool_name: "test-tool".to_string(),
         cwd: std::path::PathBuf::from("/tmp/wp-b1"),
+        artifact_root: std::path::PathBuf::from("/tmp/wp-b1/artifacts"),
     }
 }
 

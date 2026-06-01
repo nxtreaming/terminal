@@ -46,6 +46,7 @@ fn ctx() -> ToolCtx {
         call_id: "test-call".to_string(),
         tool_name: "update_plan".to_string(),
         cwd: std::env::temp_dir(),
+        artifact_root: std::env::temp_dir().join("artifacts"),
     }
 }
 

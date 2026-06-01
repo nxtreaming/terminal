@@ -249,6 +249,7 @@ fn ctx() -> ToolCtx {
         call_id: "call-1".to_string(),
         tool_name: "shell".to_string(),
         cwd: PathBuf::from("/tmp"),
+        artifact_root: PathBuf::from("/tmp/artifacts"),
     }
 }
 

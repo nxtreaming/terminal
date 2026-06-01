@@ -106,7 +106,7 @@ pub const DEFAULT_PYTHON_SESSION_ID: &str = "default";
 /// matches the legacy python tool arg (`browser-use-core/src/lib.rs`
 /// `dispatch_python_tool`); only `code` is required. `session_id` / `cwd` /
 /// `artifact_dir` / `timeout_secs` are carried-but-optional plumbing fields
-/// (the router/orchestrator supplies cwd/artifact_dir), each `#[serde(default)]`
+/// (the router/orchestrator supplies cwd/artifact_root), each `#[serde(default)]`
 /// so deserialization of `{ "code": ... }` succeeds.
 #[derive(Debug, Clone, PartialEq, serde::Deserialize)]
 pub struct PythonRequest {
@@ -119,7 +119,7 @@ pub struct PythonRequest {
     /// Working directory for the snippet. When `None`, the [`ToolCtx::cwd`].
     #[serde(default)]
     pub cwd: Option<std::path::PathBuf>,
-    /// Directory for run artifacts. When `None`, the effective cwd.
+    /// Directory for run artifacts. When `None`, [`ToolCtx::artifact_root`].
     #[serde(default)]
     pub artifact_dir: Option<std::path::PathBuf>,
     /// Optional timeout in seconds for this snippet.
@@ -491,7 +491,10 @@ impl ToolRuntime<PythonRequest, ExecOutput> for PythonTool {
         let backend = Arc::clone(&self.backend);
         let session_id = req.effective_session_id().to_string();
         let cwd = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
-        let artifact_dir = req.artifact_dir.clone().unwrap_or_else(|| cwd.clone());
+        let artifact_dir = req
+            .artifact_dir
+            .clone()
+            .unwrap_or_else(|| ctx.artifact_root.clone());
         let code = req.code.clone();
         let timeout_secs = req.timeout_secs;
 

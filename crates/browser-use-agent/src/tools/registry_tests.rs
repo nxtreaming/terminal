@@ -67,6 +67,7 @@ fn ctx(name: &str) -> ToolCtx {
         call_id: "c1".to_string(),
         tool_name: name.to_string(),
         cwd: std::path::PathBuf::from("/tmp"),
+        artifact_root: std::path::PathBuf::from("/tmp/artifacts"),
     }
 }
 
@@ -525,7 +526,8 @@ fn ctx_at(name: &str, cwd: PathBuf) -> ToolCtx {
     ToolCtx {
         call_id: "c1".to_string(),
         tool_name: name.to_string(),
-        cwd,
+        cwd: cwd.clone(),
+        artifact_root: cwd.join("artifacts"),
     }
 }
 

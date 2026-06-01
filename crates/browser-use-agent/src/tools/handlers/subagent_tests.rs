@@ -130,6 +130,7 @@ fn ctx() -> ToolCtx {
         call_id: "c".to_string(),
         tool_name: "subagent".to_string(),
         cwd: std::env::temp_dir(),
+        artifact_root: std::env::temp_dir().join("artifacts"),
     }
 }
 

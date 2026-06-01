@@ -88,6 +88,7 @@ fn ctx() -> ToolCtx {
         call_id: "call-mcp".to_string(),
         tool_name: "mcp".to_string(),
         cwd: std::env::temp_dir(),
+        artifact_root: std::env::temp_dir().join("artifacts"),
     }
 }
 

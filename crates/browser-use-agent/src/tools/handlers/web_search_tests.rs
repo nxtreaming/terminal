@@ -25,6 +25,7 @@ fn ctx() -> ToolCtx {
         call_id: "web_search-test".to_string(),
         tool_name: WEB_SEARCH_TOOL_NAME.to_string(),
         cwd: PathBuf::from("/tmp"),
+        artifact_root: PathBuf::from("/tmp/artifacts"),
     }
 }
 

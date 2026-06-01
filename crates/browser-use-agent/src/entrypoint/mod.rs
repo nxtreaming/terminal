@@ -819,11 +819,16 @@ pub async fn run_session_with_config(
     let user_input_ctx = Some((Arc::clone(&store), session_id.clone()));
     let resolved = {
         let store_guard = store.lock().expect("store mutex poisoned");
-        let tool_cwd = store_guard
-            .load_session(session_id.as_str())?
-            .map(|session| std::path::PathBuf::from(session.cwd))
+        let session_meta = store_guard.load_session(session_id.as_str())?;
+        let tool_cwd = session_meta
+            .as_ref()
+            .map(|session| std::path::PathBuf::from(&session.cwd))
             .unwrap_or_else(|| std::env::current_dir().unwrap_or_else(|_| ".".into()));
-        provider::resolve_provider_with_tool_cwd(
+        let tool_artifact_root = session_meta
+            .as_ref()
+            .map(|session| std::path::PathBuf::from(&session.artifact_root))
+            .unwrap_or_else(|| tool_cwd.clone());
+        provider::resolve_provider_with_tool_paths(
             &config,
             Some(&store_guard),
             driver_sink,
@@ -832,6 +837,7 @@ pub async fn run_session_with_config(
             fusion_recorder,
             user_input_ctx,
             tool_cwd,
+            tool_artifact_root,
         )
         .map_err(|e| anyhow::anyhow!("{e}"))?
     };
@@ -1160,6 +1166,7 @@ mod tests {
                 call_id: "c".to_string(),
                 tool_name: "shell".to_string(),
                 cwd: std::env::temp_dir(),
+                artifact_root: std::env::temp_dir().join("artifacts"),
             },
             TurnEnv {
                 file_system_sandbox_policy: FileSystemSandboxPolicy {

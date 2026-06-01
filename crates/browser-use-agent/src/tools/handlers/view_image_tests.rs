@@ -60,6 +60,7 @@ fn ctx_in(cwd: &std::path::Path) -> ToolCtx {
         call_id: "test-call".to_string(),
         tool_name: "view_image".to_string(),
         cwd: cwd.to_path_buf(),
+        artifact_root: cwd.join("artifacts"),
     }
 }
 

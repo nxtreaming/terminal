@@ -382,6 +382,7 @@ mod registry_e2e {
             call_id: "c".to_string(),
             tool_name: "t".to_string(),
             cwd: std::path::PathBuf::from("/tmp"),
+            artifact_root: std::path::PathBuf::from("/tmp/artifacts"),
         }
     }
 
@@ -504,6 +505,7 @@ mod registry_e2e {
             Arc::new(ToolOrchestrator::stub()),
             ToolCtx {
                 cwd: dir.path().to_path_buf(),
+                artifact_root: dir.path().join("artifacts"),
                 ..ctx()
             },
             env(),

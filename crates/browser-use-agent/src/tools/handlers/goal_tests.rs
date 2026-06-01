@@ -53,6 +53,7 @@ fn ctx(name: &str) -> ToolCtx {
         call_id: format!("call-{name}"),
         tool_name: name.to_string(),
         cwd: std::env::temp_dir(),
+        artifact_root: std::env::temp_dir().join("artifacts"),
     }
 }
 

@@ -44,6 +44,7 @@ fn ctx() -> ToolCtx {
         call_id: "test-call".to_string(),
         tool_name: "request_user_input".to_string(),
         cwd: std::env::temp_dir(),
+        artifact_root: std::env::temp_dir().join("artifacts"),
     }
 }
 

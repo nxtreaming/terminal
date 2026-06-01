@@ -29,6 +29,7 @@ pub struct ToolCtx {
     pub call_id: String,
     pub tool_name: String,
     pub cwd: PathBuf,
+    pub artifact_root: PathBuf,
 }
 
 pub struct SandboxAttempt<'a> {

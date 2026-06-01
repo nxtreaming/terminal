@@ -412,6 +412,31 @@ pub fn resolve_provider_with_tool_cwd(
     user_input: Option<(SharedStore, SessionId)>,
     tool_cwd: std::path::PathBuf,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
+    resolve_provider_with_tool_paths(
+        config,
+        store,
+        sink,
+        ctx,
+        max_retries,
+        recorder,
+        user_input,
+        tool_cwd.clone(),
+        tool_cwd,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+pub fn resolve_provider_with_tool_paths(
+    config: &ProviderRunConfig,
+    store: Option<&Store>,
+    sink: Arc<dyn EventSink>,
+    ctx: TurnCtx,
+    max_retries: u32,
+    recorder: Arc<dyn FusionRecorder>,
+    user_input: Option<(SharedStore, SessionId)>,
+    tool_cwd: std::path::PathBuf,
+    tool_artifact_root: std::path::PathBuf,
+) -> Result<ResolvedProvider, ProviderResolveError> {
     // The Fake short-circuit lives in the inner builder (so we never spawn a
     // Python worker for a fake/cut/missing-credential run). For a real backend we
     // start the run's single Python worker EAGERLY here, then thread its backend
@@ -430,6 +455,7 @@ pub fn resolve_provider_with_tool_cwd(
         None,
         user_input,
         tool_cwd,
+        tool_artifact_root,
     )
 }
 
@@ -479,6 +505,7 @@ fn resolve_provider_with_python(
     python_backend: Option<Arc<dyn PythonBackend>>,
     user_input: Option<(SharedStore, SessionId)>,
     tool_cwd: std::path::PathBuf,
+    tool_artifact_root: std::path::PathBuf,
 ) -> Result<ResolvedProvider, ProviderResolveError> {
     // (1) backend → credentialed provider choice (env-then-store creds; codex from
     //     env/store/~/.codex; None → Err; Fake → None).
@@ -512,7 +539,13 @@ fn resolve_provider_with_python(
     // model tool-call actually EXECUTES (through the registry + orchestrator) and
     // its output re-enters the prompt via `recorder`, and the loop re-samples.
     let driver = build_sampling_driver(transport, sink, ctx, max_retries).with_fusion(
-        build_tool_dispatcher_with_cwd(python_backend, config, user_input, tool_cwd),
+        build_tool_dispatcher_with_cwd(
+            python_backend,
+            config,
+            user_input,
+            tool_cwd,
+            tool_artifact_root,
+        ),
         recorder,
     );
     Ok(ResolvedProvider::Real(Box::new(driver)))
@@ -584,7 +617,13 @@ fn build_tool_dispatcher(
     user_input: Option<(SharedStore, SessionId)>,
 ) -> Arc<RealToolDispatcher> {
     let tool_cwd = std::env::current_dir().unwrap_or_else(|_| std::path::PathBuf::from("."));
-    build_tool_dispatcher_with_cwd(python_backend, config, user_input, tool_cwd)
+    build_tool_dispatcher_with_cwd(
+        python_backend,
+        config,
+        user_input,
+        tool_cwd.clone(),
+        tool_cwd,
+    )
 }
 
 fn build_tool_dispatcher_with_cwd(
@@ -592,6 +631,7 @@ fn build_tool_dispatcher_with_cwd(
     config: &ProviderRunConfig,
     user_input: Option<(SharedStore, SessionId)>,
     tool_cwd: std::path::PathBuf,
+    tool_artifact_root: std::path::PathBuf,
 ) -> Arc<RealToolDispatcher> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
@@ -797,6 +837,7 @@ fn build_tool_dispatcher_with_cwd(
                 .unwrap_or_default(),
             tool_name: String::new(),
             cwd: tool_cwd,
+            artifact_root: tool_artifact_root,
         },
         TurnEnv {
             file_system_sandbox_policy: FileSystemSandboxPolicy {
@@ -1228,6 +1269,7 @@ mod tests {
             Some(fake_python()),
             None,
             std::env::temp_dir(),
+            std::env::temp_dir().join("artifacts"),
         )
         .expect("real openai driver must construct offline");
         std::env::remove_var("OPENAI_API_KEY");
@@ -1250,6 +1292,7 @@ mod tests {
             Some(fake_python()),
             None,
             std::env::temp_dir(),
+            std::env::temp_dir().join("artifacts"),
         )
         .expect("real anthropic driver must construct offline");
         std::env::remove_var("ANTHROPIC_API_KEY");
@@ -1294,6 +1337,7 @@ mod tests {
             Some(fake_python()),
             None,
             std::env::temp_dir(),
+            std::env::temp_dir().join("artifacts"),
         );
         std::env::remove_var("CODEX_ACCESS_TOKEN");
         std::env::remove_var("CODEX_ACCOUNT_ID");
@@ -1524,6 +1568,7 @@ mod tests {
             call_id: format!("call-{name}"),
             tool_name: name.to_string(),
             cwd: std::env::temp_dir(),
+            artifact_root: std::env::temp_dir().join("artifacts"),
         }
     }
 
@@ -1746,6 +1791,7 @@ mod tests {
             call_id: "c".to_string(),
             tool_name: "spawn_agent".to_string(),
             cwd: std::env::temp_dir(),
+            artifact_root: std::env::temp_dir().join("artifacts"),
         };
         let out = reg
             .dispatch(
@@ -1811,6 +1857,7 @@ mod tests {
             call_id: "spawn".to_string(),
             tool_name: "spawn_agent".to_string(),
             cwd: std::env::temp_dir(),
+            artifact_root: std::env::temp_dir().join("artifacts"),
         };
         let spawn_out = reg
             .dispatch(
@@ -1833,6 +1880,7 @@ mod tests {
             call_id: "wait".to_string(),
             tool_name: "wait_agent".to_string(),
             cwd: std::env::temp_dir(),
+            artifact_root: std::env::temp_dir().join("artifacts"),
         };
         let wait_out = reg
             .dispatch(
@@ -2057,6 +2105,7 @@ mod tests {
             &config,
             None,
             dir.path().to_path_buf(),
+            dir.path().join("artifacts"),
         );
 
         let (text, is_error) = dispatch_call(

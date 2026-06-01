@@ -39,6 +39,7 @@ fn tool_ctx() -> ToolCtx {
         call_id: "call-tool-search".to_string(),
         tool_name: "tool_search".to_string(),
         cwd: std::env::temp_dir(),
+        artifact_root: std::env::temp_dir().join("artifacts"),
     }
 }
 

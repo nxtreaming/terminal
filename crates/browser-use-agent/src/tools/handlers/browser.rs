@@ -123,8 +123,8 @@ pub struct BrowserRequest {
     /// Working directory for the browser runtime. When `None`, the
     /// [`ToolCtx::cwd`] is used.
     pub cwd: Option<PathBuf>,
-    /// Directory for run artifacts (screenshots, downloads). When `None`, the
-    /// effective cwd is used.
+    /// Directory for run artifacts (screenshots, downloads). When `None`,
+    /// [`ToolCtx::artifact_root`] is used.
     pub artifact_dir: Option<PathBuf>,
     /// Script timeout in seconds (script paths only). When `None`,
     /// [`DEFAULT_BROWSER_SCRIPT_TIMEOUT_SECS`].
@@ -788,7 +788,10 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         let backend = Arc::clone(&self.backend);
         let session_id = effective_session_id.to_string();
         let cwd = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
-        let artifact_dir = req.artifact_dir.clone().unwrap_or_else(|| cwd.clone());
+        let artifact_dir = req
+            .artifact_dir
+            .clone()
+            .unwrap_or_else(|| ctx.artifact_root.clone());
         let timeout_secs = req.effective_timeout_secs();
         let observe_ms = req.effective_observe_ms();
         let action = req.action.clone();

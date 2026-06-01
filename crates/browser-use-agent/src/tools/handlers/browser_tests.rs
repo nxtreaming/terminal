@@ -12,6 +12,7 @@
 //! parallel_safe = false; (4) backend error -> ToolError; (5) an
 //! orchestrator-driven run with the fake backend.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use browser_use_browser::{BrowserCommandOutput, BrowserScriptOutput};
@@ -47,6 +48,7 @@ enum LastCall {
 struct FakeBackend {
     last: Mutex<LastCall>,
     last_session: Mutex<Option<String>>,
+    last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     fail: bool,
 }
 
@@ -57,6 +59,10 @@ impl FakeBackend {
 
     fn last_session(&self) -> Option<String> {
         self.last_session.lock().unwrap().clone()
+    }
+
+    fn last_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        self.last_paths.lock().unwrap().clone()
     }
 
     fn ok_command() -> BrowserCommandOutput {
@@ -81,11 +87,12 @@ impl BrowserBackend for FakeBackend {
     fn command(
         &self,
         session_id: &str,
-        _cwd: &std::path::Path,
-        _artifact_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
         command: &str,
     ) -> anyhow::Result<BrowserCommandOutput> {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
+        *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
         *self.last.lock().unwrap() = LastCall::Command(command.to_string());
         if self.fail {
             anyhow::bail!("boom");
@@ -96,12 +103,13 @@ impl BrowserBackend for FakeBackend {
     fn run_script(
         &self,
         session_id: &str,
-        _cwd: &std::path::Path,
-        _artifact_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
         code: &str,
         _timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
+        *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
         *self.last.lock().unwrap() = LastCall::RunScript(code.to_string());
         if self.fail {
             anyhow::bail!("boom");
@@ -113,12 +121,13 @@ impl BrowserBackend for FakeBackend {
     fn start_script(
         &self,
         session_id: &str,
-        _cwd: &std::path::Path,
-        _artifact_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
         code: &str,
         _timeout_secs: u64,
     ) -> anyhow::Result<BrowserScriptOutput> {
         *self.last_session.lock().unwrap() = Some(session_id.to_string());
+        *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
         *self.last.lock().unwrap() = LastCall::StartScript(code.to_string());
         if self.fail {
             anyhow::bail!("boom");
@@ -178,18 +187,22 @@ fn ctx() -> ToolCtx {
 }
 
 fn ctx_with_call_id(call_id: &str) -> ToolCtx {
+    let cwd = std::env::temp_dir();
     ToolCtx {
         call_id: call_id.to_string(),
         tool_name: "browser".to_string(),
-        cwd: std::env::temp_dir(),
+        cwd: cwd.clone(),
+        artifact_root: cwd.join("artifacts"),
     }
 }
 
 fn ctx_for_tool(tool_name: &str, call_id: &str) -> ToolCtx {
+    let cwd = std::env::temp_dir();
     ToolCtx {
         call_id: call_id.to_string(),
         tool_name: tool_name.to_string(),
-        cwd: std::env::temp_dir(),
+        cwd: cwd.clone(),
+        artifact_root: cwd.join("artifacts"),
     }
 }
 
@@ -240,6 +253,30 @@ async fn command_routes_and_maps_output() {
         out.stderr.contains("navigation"),
         "events should land on stderr: {}",
         out.stderr
+    );
+}
+
+#[tokio::test]
+async fn default_artifact_dir_comes_from_tool_ctx_artifact_root() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let cwd = root.path().join("cwd");
+    let artifact_root = root.path().join("artifacts").join("session-1");
+    let backend = Arc::new(FakeBackend::default());
+    let tool = tool_with(Arc::clone(&backend));
+    let ctx = ToolCtx {
+        call_id: "call-browser".to_string(),
+        tool_name: "browser".to_string(),
+        cwd: cwd.clone(),
+        artifact_root: artifact_root.clone(),
+    };
+
+    let req = BrowserRequest::execute("sess-1", "page_info()", false);
+    run_direct_with_ctx(&tool, &req, &ctx).await.unwrap();
+
+    assert_eq!(
+        backend.last_paths(),
+        Some((cwd, artifact_root)),
+        "browser backend should receive separate cwd and artifact root"
     );
 }
 

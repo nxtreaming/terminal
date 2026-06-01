@@ -11,6 +11,7 @@
 //! parallel_safe = false; (4) empty code -> Rejected; (5) an orchestrator-driven
 //! run with the fake backend.
 
+use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use browser_use_python_worker::RunPythonResponse;
@@ -30,6 +31,7 @@ use crate::tools::sandbox::{
 /// `fail` to make every call return an `anyhow` error.
 struct FakeBackend {
     last_code: Mutex<Option<String>>,
+    last_paths: Mutex<Option<(PathBuf, PathBuf)>>,
     canned: RunPythonResponse,
     fail: bool,
 }
@@ -38,6 +40,7 @@ impl FakeBackend {
     fn new(canned: RunPythonResponse) -> Self {
         Self {
             last_code: Mutex::new(None),
+            last_paths: Mutex::new(None),
             canned,
             fail: false,
         }
@@ -46,6 +49,7 @@ impl FakeBackend {
     fn failing() -> Self {
         Self {
             last_code: Mutex::new(None),
+            last_paths: Mutex::new(None),
             canned: ok_response("", true),
             fail: true,
         }
@@ -54,18 +58,23 @@ impl FakeBackend {
     fn last_code(&self) -> Option<String> {
         self.last_code.lock().unwrap().clone()
     }
+
+    fn last_paths(&self) -> Option<(PathBuf, PathBuf)> {
+        self.last_paths.lock().unwrap().clone()
+    }
 }
 
 impl PythonBackend for FakeBackend {
     fn run(
         &self,
         _session_id: &str,
-        _cwd: &std::path::Path,
-        _artifact_dir: &std::path::Path,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
         code: &str,
         _timeout_secs: Option<f64>,
     ) -> anyhow::Result<RunPythonResponse> {
         *self.last_code.lock().unwrap() = Some(code.to_string());
+        *self.last_paths.lock().unwrap() = Some((cwd.to_path_buf(), artifact_dir.to_path_buf()));
         if self.fail {
             anyhow::bail!("worker exploded");
         }
@@ -112,10 +121,12 @@ fn none_attempt(launch: &SandboxLaunch) -> SandboxAttempt<'_> {
 }
 
 fn ctx() -> ToolCtx {
+    let cwd = std::env::temp_dir();
     ToolCtx {
         call_id: "call-python".to_string(),
         tool_name: "python".to_string(),
-        cwd: std::env::temp_dir(),
+        cwd: cwd.clone(),
+        artifact_root: cwd.join("artifacts"),
     }
 }
 
@@ -125,6 +136,16 @@ async fn run_direct(tool: &PythonTool, req: &PythonRequest) -> Result<ExecOutput
     let launch = none_launch();
     let attempt = none_attempt(&launch);
     tool.run(req, &attempt, &ctx()).await
+}
+
+async fn run_direct_with_ctx(
+    tool: &PythonTool,
+    req: &PythonRequest,
+    ctx: &ToolCtx,
+) -> Result<ExecOutput, ToolError> {
+    let launch = none_launch();
+    let attempt = none_attempt(&launch);
+    tool.run(req, &attempt, ctx).await
 }
 
 // (1) A code request routes to the backend and maps stdout/outputs -> ExecOutput.
@@ -146,6 +167,30 @@ async fn code_routes_and_maps_output() {
     assert_eq!(out.stdout, "hello\n42");
     assert_eq!(out.stderr, "");
     assert_eq!(out.exit_code, 0);
+}
+
+#[tokio::test]
+async fn default_artifact_dir_comes_from_tool_ctx_artifact_root() {
+    let root = tempfile::tempdir().expect("tempdir");
+    let cwd = root.path().join("cwd");
+    let artifact_root = root.path().join("artifacts").join("session-1");
+    let backend = Arc::new(FakeBackend::new(ok_response("ok", true)));
+    let tool = tool_with(Arc::clone(&backend));
+    let ctx = ToolCtx {
+        call_id: "call-python".to_string(),
+        tool_name: "python".to_string(),
+        cwd: cwd.clone(),
+        artifact_root: artifact_root.clone(),
+    };
+
+    let req = PythonRequest::new("result = 1");
+    run_direct_with_ctx(&tool, &req, &ctx).await.unwrap();
+
+    assert_eq!(
+        backend.last_paths(),
+        Some((cwd, artifact_root)),
+        "python backend should receive separate cwd and artifact root"
+    );
 }
 
 // A snippet that raised maps `error` onto stderr and a non-zero exit code.
