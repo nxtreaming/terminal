@@ -18,17 +18,9 @@
 //! a [`BudgetState`], and an injected [`EventSink`]; it emits steering events on
 //! goal-set and on budget warn/exhaust crossings.
 //!
-//! ## Integration seam (parity debt)
-//!
-//! This WP delivers the subsystem as a self-contained, unit-tested unit. It does
-//! NOT yet wire into the async turn loop. In a later integration WP the turn
-//! driver would, per response, call [`GoalManager::record_usage`] with the
-//! response's `Usage`, then drain [`GoalManager::poll_steering`] (live crossings
-//! are already emitted into the sink by `record_usage`/`set_goal`) and inject
-//! [`GoalManager::goal_context_message`] into the next prompt. The legacy call
-//! site is the per-turn accounting checkpoint
-//! `append_goal_progress_accounting` (`browser-use-core/src/goals.rs:201-248`,
-//! invoked from `lib.rs:2682/2907/3235`); that wiring is left as a seam.
+//! The production sampler wires this subsystem through the shared
+//! `GoalStore`: model tool calls, prompt steering, and usage accounting all fold
+//! the same durable `goal.*` event stream.
 
 pub mod budget;
 pub mod state;
@@ -53,6 +45,9 @@ pub use steering::GOAL_BUDGET_LIMIT_STEERING_EVENT;
 pub use steering::GOAL_BUDGET_WARNING_EVENT;
 pub use steering::GOAL_SET_EVENT;
 
+pub const GOAL_ACCOUNTED_EVENT: &str = "goal.accounted";
+pub const GOAL_CLEARED_EVENT: &str = "goal.cleared";
+
 /// Ties the event-sourced [`GoalState`] + [`BudgetState`] + steering together
 /// behind an injected [`EventSink`].
 ///
@@ -76,6 +71,25 @@ impl GoalManager {
             events: Vec::new(),
             state: GoalState::default(),
             budget: BudgetState::new(None),
+            sink,
+        }
+    }
+
+    /// Create a manager from a previously persisted goal event log without
+    /// re-emitting replayed events.
+    pub fn from_events(
+        session_id: impl Into<String>,
+        sink: Arc<dyn EventSink>,
+        events: Vec<GoalEvent>,
+    ) -> Self {
+        let state = state::replay(&events);
+        let mut budget = BudgetState::new(state.token_budget);
+        budget.account_tokens(state.tokens_used);
+        Self {
+            session_id: session_id.into(),
+            events,
+            state,
+            budget,
             sink,
         }
     }
@@ -216,6 +230,11 @@ impl GoalManager {
     /// (`browser-use-core/src/goals.rs:115-145`).
     pub fn goal_context_message(&self) -> Option<Value> {
         steering::render_goal_context_message(&self.state)
+    }
+
+    /// Render the prompt text carried by the active goal context message.
+    pub fn goal_context_text(&self) -> Option<String> {
+        steering::render_goal_context_text(&self.state)
     }
 
     /// Compute (without emitting) the steering events for the CURRENT budget

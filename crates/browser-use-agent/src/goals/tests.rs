@@ -113,6 +113,32 @@ fn accounted_accumulates_elapsed_time_not_assigns() {
 }
 
 #[test]
+fn accounted_before_or_after_terminal_goal_is_ignored() {
+    let events = vec![
+        GoalEvent::Accounted {
+            tokens_used: 10,
+            time_used_seconds: 1,
+        },
+        GoalEvent::Set {
+            goal_id: "g".into(),
+            text: "t".into(),
+            status: None,
+            token_budget: None,
+            turn_idx: None,
+        },
+        GoalEvent::Completed,
+        GoalEvent::Accounted {
+            tokens_used: 20,
+            time_used_seconds: 2,
+        },
+    ];
+    let s = state::replay(&events);
+    assert_eq!(s.status.as_deref(), Some(status::COMPLETE));
+    assert_eq!(s.tokens_used, 0);
+    assert_eq!(s.time_used_seconds, 0);
+}
+
+#[test]
 fn replay_is_deterministic() {
     let events = vec![
         GoalEvent::Set {
@@ -343,22 +369,21 @@ fn goal_context_message_wire_shape() {
         },
     );
     let msg = steering::render_goal_context_message(&s).expect("active goal => message");
-    let expected_body =
-        "Active thread goal:\ndo the thing\n\nStatus: active\n\nToken budget: 1000\nTokens used: 250\nTokens remaining: 750";
     // Envelope matches legacy `goal_context_message` (lib.rs:9796-9805) and the
     // agent's `context::inject::build_context_message` (inject.rs:262-270): NO
     // `"type":"message"` key.
-    assert_eq!(
-        msg,
-        json!({
-            "role": "user",
-            "name": "goal_context",
-            "content": [{
-                "type": "input_text",
-                "text": expected_body,
-            }],
-        })
-    );
+    assert_eq!(msg["role"], json!("user"));
+    assert_eq!(msg["name"], json!("goal_context"));
+    assert_eq!(msg["content"][0]["type"], json!("input_text"));
+    let body = msg["content"][0]["text"].as_str().expect("goal text");
+    assert!(body.starts_with("<goal_context>\n"));
+    assert!(body.ends_with("\n</goal_context>"));
+    assert!(body.contains("Continue working toward the active thread goal."));
+    assert!(body.contains("<objective>\ndo the thing\n</objective>"));
+    assert!(body.contains("- Tokens used: 250"));
+    assert!(body.contains("- Tokens remaining: 750"));
+    assert!(body.contains("Completion audit:"));
+    assert!(body.contains("Blocked audit:"));
 }
 
 #[test]
@@ -466,6 +491,24 @@ fn manager_budget_tracks_folded_tokens_used() {
     assert_eq!(mgr.state().tokens_used, 500);
     assert_eq!(mgr.budget().total_accounted(), 500);
     assert_eq!(mgr.budget().remaining(), Some(9_500));
+}
+
+#[test]
+fn accounting_over_budget_marks_goal_budget_limited() {
+    let sink = Arc::new(RecordingSink::default());
+    let mut mgr = GoalManager::new("s", sink);
+    mgr.set_goal("g", "t", Some(100), None);
+    mgr.record_usage(&usage(80, 0, 10), 1);
+    assert_eq!(mgr.state().status.as_deref(), Some(status::ACTIVE));
+    mgr.record_usage(&usage(20, 0, 0), 1);
+    assert_eq!(mgr.state().status.as_deref(), Some(status::BUDGET_LIMITED));
+    assert!(
+        mgr.state().is_active(),
+        "budget-limited goals remain active for wrap-up steering"
+    );
+    let body = mgr.goal_context_text().expect("budget-limited prompt");
+    assert!(body.contains("has reached its token budget"));
+    assert!(body.contains("do not start new substantive work"));
 }
 
 #[test]

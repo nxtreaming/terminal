@@ -53,6 +53,7 @@
 
 use std::pin::Pin;
 use std::sync::Arc;
+use std::time::Instant;
 
 use browser_use_llm::route::{ModelClient, Route};
 use browser_use_llm::schema::{
@@ -65,6 +66,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::decision::{self, RetryAction, SamplingOutcome};
 use crate::events::{self, names, EventSink, PendingEvent, TurnCtx};
+use crate::tools::handlers::goal::GoalStore;
 use crate::turn::dispatch::ToolDispatcher;
 use crate::turn::{CallRunner, SamplingDriver};
 use crate::AgentError;
@@ -337,6 +339,10 @@ pub struct ModelSamplingDriver<
     /// Where dispatched outputs (and the assistant message) are recorded so the
     /// next sampling iteration sees them. `None` unless fusion is configured.
     recorder: Option<Arc<dyn FusionRecorder>>,
+    /// Shared event-sourced goal state. When present, prompt steering and usage
+    /// accounting are folded through the same store as the model-facing goal
+    /// tools.
+    goal_store: Option<Arc<GoalStore>>,
 }
 
 impl<T: SamplingTransport> ModelSamplingDriver<T> {
@@ -358,6 +364,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             jitter: true,
             dispatcher: None,
             recorder: None,
+            goal_store: None,
         }
     }
 
@@ -384,6 +391,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             jitter: self.jitter,
             dispatcher: Some(dispatcher),
             recorder: Some(recorder),
+            goal_store: self.goal_store,
         }
     }
 }
@@ -392,6 +400,11 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     /// Disable I/O-layer jitter (deterministic sleeps). Used by tests.
     pub fn without_jitter(mut self) -> Self {
         self.jitter = false;
+        self
+    }
+
+    pub fn with_goal_store(mut self, goal_store: Arc<GoalStore>) -> Self {
+        self.goal_store = Some(goal_store);
         self
     }
 
@@ -468,8 +481,44 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         }
     }
 
+    fn emit_goal_accounting(&self, usage: &Usage, time_used_seconds: i64) {
+        let Some(goal_store) = self.goal_store.as_ref() else {
+            return;
+        };
+        let _ = goal_store.account_usage(usage, time_used_seconds);
+    }
+
+    fn emit_goal_elapsed_accounting(&self, started_at: Instant) {
+        let Some(goal_store) = self.goal_store.as_ref() else {
+            return;
+        };
+        let _ = goal_store.account_elapsed_seconds(started_at.elapsed().as_secs() as i64);
+    }
+
+    fn input_with_goal_context(&self, input: Vec<Message>) -> Vec<Message> {
+        let Some(goal_text) = self
+            .goal_store
+            .as_ref()
+            .and_then(|store| store.goal_context_text())
+        else {
+            return input;
+        };
+        let mut messages = Vec::with_capacity(input.len() + 1);
+        messages.push(Message::new(
+            MessageRole::User,
+            vec![ContentPart::text(goal_text)],
+        ));
+        messages.extend(input);
+        messages
+    }
+
     /// Fold a single successfully-decoded event into the accumulator + sink.
-    fn consume_event(&self, acc: &mut TurnAccumulator, ev: LlmEvent) -> StreamProgress {
+    fn consume_event(
+        &self,
+        acc: &mut TurnAccumulator,
+        ev: LlmEvent,
+        started_at: Instant,
+    ) -> StreamProgress {
         // Emit UI events first (map is pure; emit is the only side effect).
         self.emit_event(&ev);
         match ev {
@@ -498,6 +547,7 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
                 usage,
                 finish_reason,
             } => {
+                self.emit_goal_accounting(&usage, started_at.elapsed().as_secs() as i64);
                 acc.usage = Some(usage);
                 acc.finish_reason = finish_reason;
                 StreamProgress::Done
@@ -744,6 +794,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
         // per-turn request from the input here and hand it to `open_stream`, which
         // installs it into the transport before opening — so the provider receives
         // the populated conversation, not an empty body.
+        let input = self.input_with_goal_context(input);
         let mut req = build_request(&self.ctx, input);
         // Advertise the tool catalog. When a dispatcher is attached (the fused
         // path), it carries the registry's model-visible definitions; we copy them
@@ -771,6 +822,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
 
             // ---- consume the stream under the cancellation token ----
             let mut acc = TurnAccumulator::default();
+            let started_at = Instant::now();
             // Set when a retryable mid-stream error tells us to restart the outer
             // loop (codex breaks the inner loop then re-opens).
             let mut restart = false;
@@ -784,7 +836,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 };
 
                 match maybe_event {
-                    Some(Ok(ev)) => match self.consume_event(&mut acc, ev) {
+                    Some(Ok(ev)) => match self.consume_event(&mut acc, ev, started_at) {
                         StreamProgress::Continue => {}
                         StreamProgress::Done => break,
                     },
@@ -837,9 +889,11 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                         recorder.record(std::slice::from_ref(&assistant)).await;
 
                         // 2. Dispatch in model order through the parallel/serial gate.
+                        let tool_started_at = Instant::now();
                         let result = dispatcher
                             .dispatch_ordered(tool_calls.clone(), cancel.clone())
                             .await;
+                        self.emit_goal_elapsed_accounting(tool_started_at);
 
                         // 3. Record each tool output (already in model order).
                         if !result.outputs_in_order.is_empty() {

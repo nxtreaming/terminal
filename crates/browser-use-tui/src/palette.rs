@@ -4,6 +4,7 @@ pub(crate) enum PaletteAction {
     PreviousWork,
     ChangeBrowser,
     ChangeMode,
+    Goal,
     PlanMode,
     ChooseModel,
     Authenticate,
@@ -20,7 +21,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 7] = [
+const VISIBLE_ITEMS: [PaletteItem; 8] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -50,6 +51,11 @@ const VISIBLE_ITEMS: [PaletteItem; 7] = [
         command: "/model",
         description: "choose model and provider",
         action: PaletteAction::ChooseModel,
+    },
+    PaletteItem {
+        command: "/goal",
+        description: "set or view the goal for a long-running task",
+        action: PaletteAction::Goal,
     },
     PaletteItem {
         command: "/sync-cookies",
@@ -119,5 +125,10 @@ mod tests {
             selected_action("/sync", 0),
             Some(PaletteAction::SyncCookies)
         );
+    }
+
+    #[test]
+    fn goal_is_available_from_palette() {
+        assert_eq!(selected_action("/goal", 0), Some(PaletteAction::Goal));
     }
 }

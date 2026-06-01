@@ -60,6 +60,7 @@ use crate::guardian::approval::GuardianApprover;
 use crate::guardian::reviewer::{GuardianReviewer, StaticReviewer};
 use crate::guardian::Guardian;
 use crate::mcp::McpConnectionManager;
+use crate::prompts::CollaborationModeKind;
 use crate::session::{SessionId, SharedStore};
 use crate::subagents::display_agent_path_for_session;
 use crate::subagents::mailbox::Mailbox;
@@ -595,14 +596,21 @@ fn resolve_provider_with_python(
     // It yields the text-only sampler; we then attach the FUSED dispatch path so a
     // model tool-call actually EXECUTES (through the registry + orchestrator) and
     // its output re-enters the prompt via `recorder`, and the loop re-samples.
-    let driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries).with_fusion(
-        build_tool_dispatcher_with_cwd(
+    let goal_store = build_goal_store(&user_input);
+    let goals_enabled = goal_runtime_enabled(config, &user_input);
+    let mut driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries);
+    if goals_enabled {
+        driver = driver.with_goal_store(goal_store.clone());
+    }
+    let driver = driver.with_fusion(
+        build_tool_dispatcher_with_cwd_and_goal_store(
             python_backend,
             config,
             user_input,
             tool_cwd,
             tool_artifact_root,
             sink,
+            goal_store,
         ),
         recorder,
     );
@@ -685,6 +693,7 @@ fn build_tool_dispatcher(
     )
 }
 
+#[cfg(test)]
 fn build_tool_dispatcher_with_cwd(
     python_backend: Arc<dyn PythonBackend>,
     config: &ProviderRunConfig,
@@ -692,6 +701,27 @@ fn build_tool_dispatcher_with_cwd(
     tool_cwd: std::path::PathBuf,
     tool_artifact_root: std::path::PathBuf,
     event_sink: Arc<dyn EventSink>,
+) -> Arc<RealToolDispatcher> {
+    let goal_store = build_goal_store(&user_input);
+    build_tool_dispatcher_with_cwd_and_goal_store(
+        python_backend,
+        config,
+        user_input,
+        tool_cwd,
+        tool_artifact_root,
+        event_sink,
+        goal_store,
+    )
+}
+
+fn build_tool_dispatcher_with_cwd_and_goal_store(
+    python_backend: Arc<dyn PythonBackend>,
+    config: &ProviderRunConfig,
+    user_input: Option<(SharedStore, SessionId)>,
+    tool_cwd: std::path::PathBuf,
+    tool_artifact_root: std::path::PathBuf,
+    event_sink: Arc<dyn EventSink>,
+    goal_store: Arc<crate::tools::handlers::goal::GoalStore>,
 ) -> Arc<RealToolDispatcher> {
     use crate::tools::handlers::apply_patch::{ApplyPatchRequest, ApplyPatchTool};
     use crate::tools::handlers::browser::{BrowserRequest, BrowserTool};
@@ -860,9 +890,11 @@ fn build_tool_dispatcher_with_cwd(
     // Goal tools (`get_goal` / `create_goal` / `update_goal`). All three share ONE
     // `GoalStore` (the event-sourced `GoalManager` + its durable `goal.*` event
     // sink), registered behind the same registry seam so a `create_goal` is
-    // visible to a later `get_goal`/`update_goal`. The model always SEES the tools
-    // (no config gate).
-    register_goal_tools(&mut reg, &user_input);
+    // visible to a later `get_goal`/`update_goal`. Codex only exposes these for
+    // persisted, non-plan, non-review turns; mirror that gate here.
+    if goal_runtime_enabled(config, &user_input) {
+        register_goal_tools(&mut reg, goal_store);
+    }
 
     // `mcp`: register the MCP bridge ONLY when servers are configured. An empty
     // `mcp_servers` map (the default) registers nothing, preserving prior
@@ -1676,6 +1708,56 @@ fn agent_path_depth(agent_path: &str) -> i32 {
     trimmed.split('/').count().saturating_sub(1) as i32
 }
 
+fn build_goal_store(
+    user_input: &Option<(SharedStore, SessionId)>,
+) -> Arc<crate::tools::handlers::goal::GoalStore> {
+    use crate::tools::handlers::goal::GoalStore;
+
+    match user_input {
+        Some((store, sid)) => {
+            let sink: Arc<dyn EventSink> = Arc::new(SubagentStoreSink {
+                store: store.clone(),
+            });
+            Arc::new(GoalStore::from_shared_store(
+                sid.as_str().to_string(),
+                sink,
+                store.clone(),
+            ))
+        }
+        None => Arc::new(GoalStore::new(String::new(), Arc::new(NoopSubagentSink))),
+    }
+}
+
+fn goal_runtime_enabled(
+    config: &ProviderRunConfig,
+    user_input: &Option<(SharedStore, SessionId)>,
+) -> bool {
+    if config.options.collaboration_mode == CollaborationModeKind::Plan {
+        return false;
+    }
+    let Some((store, sid)) = user_input else {
+        return false;
+    };
+    session_allows_goal_tools(store, sid.as_str())
+}
+
+fn session_allows_goal_tools(store: &SharedStore, session_id: &str) -> bool {
+    let events = store
+        .lock()
+        .unwrap()
+        .events_for_session(session_id)
+        .unwrap_or_default();
+    !events.iter().any(|event| {
+        event.event_type == "session.review_mode"
+            && event
+                .payload
+                .get("review_tool_restrictions")
+                .and_then(|restrictions| restrictions.get("goals"))
+                .and_then(serde_json::Value::as_bool)
+                == Some(false)
+    })
+}
+
 /// Register the goal tool family (`get_goal`, `create_goal`, `update_goal`) into
 /// `reg`, all sharing ONE [`GoalStore`].
 ///
@@ -1692,33 +1774,16 @@ fn agent_path_depth(agent_path: &str) -> i32 {
 /// + the session id from the threaded `(SharedStore, SessionId)`.
 fn register_goal_tools<S, A>(
     reg: &mut crate::tools::registry::ToolRegistry<S, A>,
-    user_input: &Option<(SharedStore, SessionId)>,
+    store: Arc<crate::tools::handlers::goal::GoalStore>,
 ) where
     S: crate::tools::sandbox::SandboxProvider,
     A: crate::tools::runtime::Approver,
 {
     use crate::tools::handlers::goal::{
-        CreateGoalRequest, CreateGoalTool, GetGoalRequest, GetGoalTool, GoalStore,
-        UpdateGoalRequest, UpdateGoalTool,
+        CreateGoalRequest, CreateGoalTool, GetGoalRequest, GetGoalTool, UpdateGoalRequest,
+        UpdateGoalTool,
     };
     use crate::tools::registry::definitions;
-
-    // Durable event sink + session scope: the store-backed sink on the live run
-    // path (durable `goal.*` events appended to the session log), a no-op when no
-    // session store is wired (tests/headless). Reuses the subagent tools' sinks
-    // (both are `crate::events::EventSink`).
-    let (sink, session_id): (Arc<dyn EventSink>, String) = match user_input {
-        Some((store, sid)) => (
-            Arc::new(SubagentStoreSink {
-                store: store.clone(),
-            }),
-            sid.as_str().to_string(),
-        ),
-        None => (Arc::new(NoopSubagentSink), String::new()),
-    };
-
-    // One shared store so create_goal is visible to a later get/update_goal.
-    let store = Arc::new(GoalStore::new(session_id, sink));
 
     // get_goal: read-only snapshot (parallel-safe).
     reg.register::<_, GetGoalRequest>(
@@ -2887,14 +2952,29 @@ mod tests {
         assert!(parent_mail[0].content.contains("<subagent_notification>"));
     }
 
-    /// The production dispatcher ALWAYS advertises the three goal tools
-    /// (`get_goal` / `create_goal` / `update_goal`) — the "engine B matches rival
-    /// A on the goals row" registration proof. Passes ONLY because
-    /// `register_goal_tools` is invoked inside `build_tool_dispatcher`.
+    /// The production dispatcher advertises the three goal tools
+    /// (`get_goal` / `create_goal` / `update_goal`) for persisted non-plan,
+    /// non-review sessions.
     #[test]
-    fn goal_tools_are_registered_in_the_dispatcher() {
+    fn goal_tools_are_registered_for_persisted_default_session() {
+        use browser_use_store::Store;
+
         let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
-        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: SharedStore = Arc::new(std::sync::Mutex::new(
+            Store::open(dir.path()).expect("open store"),
+        ));
+        let session_id = store
+            .lock()
+            .unwrap()
+            .create_session(None, dir.path())
+            .expect("create session row")
+            .id;
+        let dispatcher = build_tool_dispatcher(
+            Arc::new(MarkerPythonBackend),
+            &config,
+            Some((store, SessionId(session_id))),
+        );
         let names: Vec<&str> = dispatcher
             .tool_specs()
             .iter()
@@ -2945,6 +3025,104 @@ mod tests {
         assert_eq!(layer.service_tier.as_deref(), Some("priority"));
         assert_eq!(layer.tool_allowlist, vec!["shell"]);
         assert!(!layer.can_write);
+    }
+
+    #[test]
+    fn goal_tools_are_hidden_without_persisted_session() {
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for tool in ["get_goal", "create_goal", "update_goal"] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} must not be registered without a persisted session; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_tools_are_hidden_in_plan_mode() {
+        use browser_use_store::Store;
+
+        let options = crate::config_overrides::AgentRunOptions::default()
+            .with_collaboration_mode(CollaborationModeKind::Plan);
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: SharedStore = Arc::new(std::sync::Mutex::new(
+            Store::open(dir.path()).expect("open store"),
+        ));
+        let session_id = store
+            .lock()
+            .unwrap()
+            .create_session(None, dir.path())
+            .expect("create session row")
+            .id;
+        let dispatcher = build_tool_dispatcher(
+            Arc::new(MarkerPythonBackend),
+            &config,
+            Some((store, SessionId(session_id))),
+        );
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for tool in ["get_goal", "create_goal", "update_goal"] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} must not be registered in plan mode; got {names:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn goal_tools_are_hidden_for_review_restricted_sessions() {
+        use browser_use_store::Store;
+
+        let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
+        let dir = tempfile::tempdir().expect("tempdir");
+        let store: SharedStore = Arc::new(std::sync::Mutex::new(
+            Store::open(dir.path()).expect("open store"),
+        ));
+        let session_id = store
+            .lock()
+            .unwrap()
+            .create_session(None, dir.path())
+            .expect("create session row")
+            .id;
+        store
+            .lock()
+            .unwrap()
+            .append_event(
+                &session_id,
+                "session.review_mode",
+                serde_json::json!({
+                    "kind": "review",
+                    "review_tool_restrictions": { "goals": false },
+                }),
+            )
+            .expect("append review marker");
+        let dispatcher = build_tool_dispatcher(
+            Arc::new(MarkerPythonBackend),
+            &config,
+            Some((store, SessionId(session_id))),
+        );
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for tool in ["get_goal", "create_goal", "update_goal"] {
+            assert!(
+                !names.contains(&tool),
+                "{tool} must not be registered for review-restricted sessions; got {names:?}"
+            );
+        }
     }
 
     /// A `create_goal` call routes from the PRODUCTION registration through the
@@ -3036,17 +3214,17 @@ mod tests {
         let created = dispatch_one(
             &dispatcher,
             "create_goal",
-            serde_json::json!({"text": "ship the goals row", "token_budget": 1000}),
+            serde_json::json!({"objective": "ship the goals row", "token_budget": 1000}),
         )
         .await;
-        assert_eq!(created["active"], true);
-        assert_eq!(created["text"], "ship the goals row");
-        assert_eq!(created["token_budget"], 1000);
+        assert_eq!(created["goal"]["objective"], "ship the goals row");
+        assert_eq!(created["goal"]["status"], "active");
+        assert_eq!(created["goal"]["tokenBudget"], 1000);
 
         // get_goal observes the SAME shared state (the store is shared).
         let fetched = dispatch_one(&dispatcher, "get_goal", serde_json::json!({})).await;
-        assert_eq!(fetched["text"], "ship the goals row");
-        assert_eq!(fetched["active"], true);
+        assert_eq!(fetched["goal"]["objective"], "ship the goals row");
+        assert_eq!(fetched["goal"]["status"], "active");
 
         // A durable `goal.created` event landed for this session (proving the
         // store-backed sink — not just the tool listing — is wired).
@@ -3063,7 +3241,7 @@ mod tests {
             serde_json::json!({"status": "complete"}),
         )
         .await;
-        assert_eq!(updated["status"], "complete");
+        assert_eq!(updated["goal"]["status"], "complete");
         let kinds = event_types(&store, &session_id);
         assert!(
             kinds.iter().any(|k| k == "goal.updated"),

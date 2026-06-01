@@ -23,12 +23,12 @@ use serde::Serialize;
 
 /// Wire-stable status strings for a goal.
 ///
-/// Parity: legacy `GoalState::is_active` treats `complete` / `blocked` /
-/// `budget_limited` as terminal (`browser-use-core/src/goals.rs:38-47`).
 pub mod status {
     pub const ACTIVE: &str = "active";
+    pub const PAUSED: &str = "paused";
     pub const COMPLETE: &str = "complete";
     pub const BLOCKED: &str = "blocked";
+    pub const USAGE_LIMITED: &str = "usage_limited";
     pub const BUDGET_LIMITED: &str = "budget_limited";
 }
 
@@ -96,20 +96,37 @@ pub struct GoalState {
 }
 
 impl GoalState {
-    /// Whether a goal is currently active (created and not in a terminal
-    /// status).
+    /// Whether a goal is currently active (created and still eligible for goal
+    /// progress accounting).
     ///
     /// Parity: legacy continuation gate
     /// (`browser-use-core/src/goals.rs:213` `matches!(status, "active" |
-    /// "budget_limited")` and the effective-status flip at `:250-264`). Here a
-    /// goal is active iff it has objective text and is not in a terminal status
-    /// (`complete` / `blocked` / `budget_limited`).
+    /// "budget_limited")`). `budget_limited` remains active enough for wrap-up
+    /// accounting/steering; stopped statuses do not.
     pub fn is_active(&self) -> bool {
         self.text.is_some()
             && !matches!(
                 self.status.as_deref(),
-                Some(status::COMPLETE) | Some(status::BLOCKED) | Some(status::BUDGET_LIMITED)
+                Some(status::COMPLETE)
+                    | Some(status::BLOCKED)
+                    | Some(status::PAUSED)
+                    | Some(status::USAGE_LIMITED)
             )
+    }
+}
+
+fn apply_budget_limit_if_reached(state: &mut GoalState) {
+    if !matches!(
+        state.status.as_deref(),
+        Some(status::ACTIVE) | Some(status::BUDGET_LIMITED)
+    ) {
+        return;
+    }
+    let Some(budget) = state.token_budget else {
+        return;
+    };
+    if state.tokens_used >= budget {
+        state.status = Some(status::BUDGET_LIMITED.to_string());
     }
 }
 
@@ -134,6 +151,7 @@ pub fn reduce(mut state: GoalState, event: &GoalEvent) -> GoalState {
             state.created_turn_idx = *turn_idx;
             state.tokens_used = 0;
             state.time_used_seconds = 0;
+            apply_budget_limit_if_reached(&mut state);
         }
         GoalEvent::Updated {
             status,
@@ -149,18 +167,23 @@ pub fn reduce(mut state: GoalState, event: &GoalEvent) -> GoalState {
             if let Some(budget) = token_budget {
                 state.token_budget = Some(*budget);
             }
+            apply_budget_limit_if_reached(&mut state);
         }
         GoalEvent::Accounted {
             tokens_used,
             time_used_seconds,
         } => {
-            state.tokens_used = state.tokens_used.saturating_add(*tokens_used);
-            // Elapsed seconds ACCUMULATE across responses (parity: legacy
-            // `goal.accounted` folds `time_used_seconds += delta`,
-            // `browser-use-core/src/goals.rs:110-131`). This previously ASSIGNED
-            // the per-response delta, dropping all prior elapsed time; accumulate
-            // it (saturating) so the folded total is the sum over the log.
-            state.time_used_seconds = state.time_used_seconds.saturating_add(*time_used_seconds);
+            if state.is_active() {
+                state.tokens_used = state.tokens_used.saturating_add(*tokens_used);
+                // Elapsed seconds ACCUMULATE across responses (parity: legacy
+                // `goal.accounted` folds `time_used_seconds += delta`,
+                // `browser-use-core/src/goals.rs:110-131`). This previously ASSIGNED
+                // the per-response delta, dropping all prior elapsed time; accumulate
+                // it (saturating) so the folded total is the sum over the log.
+                state.time_used_seconds =
+                    state.time_used_seconds.saturating_add(*time_used_seconds);
+                apply_budget_limit_if_reached(&mut state);
+            }
         }
         GoalEvent::Completed => {
             state.status = Some(status::COMPLETE.to_string());

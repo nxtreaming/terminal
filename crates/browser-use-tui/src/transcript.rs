@@ -1678,10 +1678,11 @@ fn live_stream_pending_status_allowed(live_events: &[EventRecord]) -> bool {
     let Some(latest_stream) = latest_nonempty_stream_event(live_events) else {
         return false;
     };
-    if live_events
-        .iter()
-        .any(|event| event.seq > latest_stream.seq && event.event_type != "model.stream_delta")
-    {
+    if live_events.iter().any(|event| {
+        event.seq > latest_stream.seq
+            && event.event_type != "model.stream_delta"
+            && event.event_type != "goal.accounted"
+    }) {
         return true;
     }
     now_ms().saturating_sub(latest_stream.ts_ms) >= LIVE_STREAM_QUIET_STATUS_DELAY_MS

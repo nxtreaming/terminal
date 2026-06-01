@@ -15,7 +15,7 @@ use std::process::Command as ProcessCommand;
 use std::process::Stdio;
 use std::sync::{
     atomic::{AtomicBool, Ordering},
-    mpsc, Arc, Once,
+    mpsc, Arc, Mutex, Once,
 };
 use std::thread;
 use std::time::{Duration, Instant};
@@ -32,10 +32,14 @@ use browser_use_agent::config_overrides::{
 use browser_use_agent::context::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
 };
+use browser_use_agent::events::{EventSink, PendingEvent};
 use browser_use_agent::history::{MessageHistoryConfig, MessageHistoryPersistence};
 use browser_use_agent::infra::{install_process_crypto_provider, UnifiedExecShutdownCleanup};
 use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_agent::subagents::cleanup_agent_runtime_state_for_agent_subtree;
+use browser_use_agent::tools::handlers::goal::{
+    goal_response_from_event_records, GoalStore, GOAL_ACCOUNTED_EVENT, GOAL_UPDATED_EVENT,
+};
 use browser_use_protocol::{
     project_workbench, EventRecord, SessionMeta, SessionStatus, WorkbenchState,
 };
@@ -107,6 +111,8 @@ use settings::{
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
 const STORE_FALLBACK_REFRESH_INTERVAL: Duration = Duration::from_millis(750);
+const MAX_THREAD_GOAL_OBJECTIVE_CHARS: usize = 4_000;
+const GOAL_CONTINUATION_STARTED_EVENT: &str = "goal.continuation.started";
 
 // ── Home-screen typewriter examples ──────────────────────────────────────────
 const HOME_EXAMPLES: &[&str] = &[
@@ -218,6 +224,7 @@ enum Surface {
     Browser,
     BrowserSelect,
     CookieSync,
+    Goal,
     History,
     Messages,
     Developer,
@@ -235,6 +242,7 @@ impl Surface {
                 | Self::Browser
                 | Self::BrowserSelect
                 | Self::CookieSync
+                | Self::Goal
                 | Self::History
                 | Self::Messages
                 | Self::Developer
@@ -908,6 +916,29 @@ struct ClipboardPasteEvent {
     result: std::result::Result<PathBuf, String>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct PendingGoalReplacement {
+    session_id: String,
+    objective: String,
+}
+
+#[derive(Default)]
+struct RecordingGoalSink {
+    events: Mutex<Vec<PendingEvent>>,
+}
+
+impl EventSink for RecordingGoalSink {
+    fn emit(&self, ev: PendingEvent) {
+        self.events.lock().unwrap().push(ev);
+    }
+}
+
+impl RecordingGoalSink {
+    fn drain(&self) -> Vec<PendingEvent> {
+        std::mem::take(&mut *self.events.lock().unwrap())
+    }
+}
+
 // ─────────────────────────────────────────────────────────────────────────────
 
 struct App {
@@ -973,6 +1004,8 @@ struct App {
     /// the next successful auth automatically starts the agent for that session
     /// so the user's preserved task runs without any extra keypress.
     pending_auth_resume: Option<String>,
+    pending_initial_goal: Option<String>,
+    pending_goal_replacement: Option<PendingGoalReplacement>,
 }
 
 #[derive(Debug)]
@@ -2250,6 +2283,8 @@ impl App {
             history_filter: String::new(),
             typewriter: TypewriterState::default(),
             pending_auth_resume: None,
+            pending_initial_goal: None,
+            pending_goal_replacement: None,
         };
         app.refresh_cached_projection();
         if resumed_from_reexec {
@@ -2288,6 +2323,10 @@ impl App {
             self.refresh_cached_projection();
         }
         if self.flush_ready_queued_followups()? {
+            changed = true;
+            self.state_cache.refresh_all(&self.store)?;
+            self.refresh_cached_projection();
+        } else if self.maybe_start_goal_continuation()? {
             changed = true;
             self.state_cache.refresh_all(&self.store)?;
             self.refresh_cached_projection();
@@ -2486,6 +2525,387 @@ impl App {
         self.state_cache.events_for_session(session_id)
     }
 
+    fn goal_response_for_session(&self, session_id: &str) -> serde_json::Value {
+        goal_response_from_event_records(session_id, self.cached_events_for_session(session_id))
+    }
+
+    fn current_goal_for_session(&self, session_id: &str) -> Option<serde_json::Value> {
+        self.goal_response_for_session(session_id)
+            .get("goal")
+            .filter(|goal| !goal.is_null())
+            .cloned()
+    }
+
+    fn goal_summary_for_session(&self, session_id: &str) -> String {
+        let Some(goal) = self.current_goal_for_session(session_id) else {
+            return "No goal set for this task.".to_string();
+        };
+        let objective = goal
+            .get("objective")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        let status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active");
+        let tokens_used = goal
+            .get("tokensUsed")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        let time_used_seconds = goal
+            .get("timeUsedSeconds")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        let budget = goal.get("tokenBudget").and_then(serde_json::Value::as_i64);
+        let objective = abbreviated_goal_objective(objective);
+        let mut parts = vec![format!("Goal {}: {objective}", goal_status_label(status))];
+        parts.push(format!(
+            "time {}",
+            format_goal_elapsed_seconds(time_used_seconds)
+        ));
+        match budget {
+            Some(budget) => parts.push(format!(
+                "tokens {}/{}",
+                format_goal_tokens_compact(tokens_used),
+                format_goal_tokens_compact(budget)
+            )),
+            None if tokens_used > 0 => parts.push(format!(
+                "tokens {}",
+                format_goal_tokens_compact(tokens_used)
+            )),
+            None => {}
+        }
+        parts.push(goal_command_hint(status).to_string());
+        parts.join(" · ")
+    }
+
+    fn current_goal_exists(&self, session_id: &str) -> bool {
+        self.current_goal_for_session(session_id).is_some()
+    }
+
+    fn apply_goal_store_mutation(
+        &mut self,
+        session_id: &str,
+        mutate: impl FnOnce(&GoalStore) -> std::result::Result<serde_json::Value, String>,
+    ) -> Result<std::result::Result<serde_json::Value, String>> {
+        let prior_events = self.cached_events_for_session(session_id).to_vec();
+        let sink = Arc::new(RecordingGoalSink::default());
+        let event_sink: Arc<dyn EventSink> = sink.clone();
+        let goal_store =
+            GoalStore::from_event_records(session_id.to_string(), event_sink, &prior_events);
+        let response = mutate(&goal_store);
+        if response.is_ok() {
+            for event in sink.drain() {
+                self.store
+                    .append_event(&event.session_id, &event.event_type, event.payload)?;
+            }
+            self.refresh_state_cache_from_store()?;
+        }
+        Ok(response)
+    }
+
+    fn show_current_goal(&mut self) -> Result<()> {
+        let Some(_session_id) = self.selected_session_id.clone() else {
+            self.status_notice = Some("Open a task before using /goal.".to_string());
+            return Ok(());
+        };
+        self.pending_goal_replacement = None;
+        self.open_surface(Surface::Goal);
+        self.status_notice = None;
+        Ok(())
+    }
+
+    fn goal_status_indicator_for_state(&self, state: &WorkbenchState) -> Option<String> {
+        let session_id = state.current_session.as_ref()?.id.as_str();
+        let goal = self.current_goal_for_session(session_id)?;
+        let status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active");
+        let tokens_used = goal
+            .get("tokensUsed")
+            .and_then(serde_json::Value::as_i64)
+            .unwrap_or_default();
+        let budget = goal.get("tokenBudget").and_then(serde_json::Value::as_i64);
+        let usage = match budget {
+            Some(budget) => format!(
+                " {}/{}",
+                format_goal_tokens_compact(tokens_used),
+                format_goal_tokens_compact(budget)
+            ),
+            None if tokens_used > 0 => format!(" {}", format_goal_tokens_compact(tokens_used)),
+            None => String::new(),
+        };
+        Some(format!("goal {}{}", goal_status_label(status), usage))
+    }
+
+    fn execute_goal_slash_command(&mut self, argument: &str) -> Result<()> {
+        let argument = argument.trim();
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return self.execute_pending_initial_goal_slash_command(argument);
+        };
+        if argument.is_empty() {
+            return self.show_current_goal();
+        }
+
+        let (command, rest) = split_goal_command(argument);
+        self.pending_goal_replacement = None;
+        match command.to_ascii_lowercase().as_str() {
+            "clear" if rest.is_empty() => self.clear_thread_goal(&session_id),
+            "pause" if rest.is_empty() => self.mark_thread_goal_status(&session_id, "paused"),
+            "resume" if rest.is_empty() => self.mark_thread_goal_status(&session_id, "active"),
+            "edit" => self.edit_thread_goal(&session_id, rest),
+            _ => self.set_thread_goal(&session_id, argument),
+        }
+    }
+
+    fn execute_pending_initial_goal_slash_command(&mut self, argument: &str) -> Result<()> {
+        if argument.is_empty() {
+            self.status_notice = Some(match self.pending_initial_goal.as_deref() {
+                Some(objective) => format!(
+                    "Goal queued for next task: {}",
+                    abbreviated_goal_objective(objective)
+                ),
+                None => "No task is open. Use /goal <objective> to queue a goal for the next task."
+                    .to_string(),
+            });
+            return Ok(());
+        }
+
+        let (command, rest) = split_goal_command(argument);
+        match command.to_ascii_lowercase().as_str() {
+            "clear" if rest.is_empty() => {
+                if self.pending_initial_goal.take().is_some() {
+                    self.status_notice = Some("Queued goal cleared.".to_string());
+                } else {
+                    self.status_notice = Some("No goal queued for the next task.".to_string());
+                }
+                Ok(())
+            }
+            "edit" if rest.is_empty() => {
+                if let Some(objective) = self.pending_initial_goal.as_deref() {
+                    self.palette_open = true;
+                    self.palette_filter = format!("goal edit {objective}");
+                    self.clamp_slash_palette_selection();
+                    self.status_notice =
+                        Some("Edit the queued goal objective, then press Enter.".to_string());
+                } else {
+                    self.status_notice = Some("No goal queued for the next task.".to_string());
+                }
+                Ok(())
+            }
+            "edit" => self.queue_initial_goal(rest),
+            "pause" | "resume" if rest.is_empty() => {
+                self.status_notice =
+                    Some("Open a task before pausing or resuming a goal.".to_string());
+                Ok(())
+            }
+            _ => self.queue_initial_goal(argument),
+        }
+    }
+
+    fn queue_initial_goal(&mut self, objective: &str) -> Result<()> {
+        let objective = objective.trim();
+        if objective.is_empty() {
+            self.status_notice = Some("Goal objective must not be empty.".to_string());
+            return Ok(());
+        }
+        if objective.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+            self.status_notice = Some(format!(
+                "Goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters."
+            ));
+            return Ok(());
+        }
+        self.pending_initial_goal = Some(objective.to_string());
+        self.status_notice = Some(format!(
+            "Goal queued for next task: {}",
+            abbreviated_goal_objective(objective)
+        ));
+        Ok(())
+    }
+
+    fn set_thread_goal(&mut self, session_id: &str, objective: &str) -> Result<()> {
+        let objective = objective.trim();
+        if objective.is_empty() {
+            self.status_notice = Some("Goal objective must not be empty.".to_string());
+            return Ok(());
+        }
+        if objective.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+            self.status_notice = Some(format!(
+                "Goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters."
+            ));
+            return Ok(());
+        }
+        let mut replace_existing = false;
+        if let Some(goal) = self.current_goal_for_session(session_id) {
+            let status = goal
+                .get("status")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("active");
+            if !goal_status_is_complete(status) {
+                self.pending_goal_replacement = Some(PendingGoalReplacement {
+                    session_id: session_id.to_string(),
+                    objective: objective.to_string(),
+                });
+                self.status_notice = Some(format!(
+                    "Replace existing goal with \"{}\"? Press Enter to confirm or Esc to cancel.",
+                    abbreviated_goal_objective(objective)
+                ));
+                return Ok(());
+            }
+            replace_existing = true;
+        }
+        let mutation = self.apply_goal_store_mutation(session_id, |store| {
+            if replace_existing {
+                store.replace_goal_response(objective, None)
+            } else {
+                store.create_goal_response(objective, None)
+            }
+        })?;
+        if let Err(error) = mutation {
+            self.status_notice = Some(format!("Goal error: {error}"));
+            return Ok(());
+        }
+        self.status_notice = Some(format!(
+            "Goal set: {}",
+            abbreviated_goal_objective(objective)
+        ));
+        Ok(())
+    }
+
+    fn replace_thread_goal(&mut self, session_id: &str, objective: &str) -> Result<()> {
+        match self.apply_goal_store_mutation(session_id, |store| {
+            store.replace_goal_response(objective, None)
+        })? {
+            Ok(_) => {
+                self.pending_goal_replacement = None;
+                self.status_notice = Some(format!(
+                    "Goal replaced: {}",
+                    abbreviated_goal_objective(objective)
+                ));
+            }
+            Err(error) => self.status_notice = Some(format!("Goal error: {error}")),
+        }
+        Ok(())
+    }
+
+    fn confirm_pending_goal_replacement(&mut self) -> Result<bool> {
+        let Some(pending) = self.pending_goal_replacement.clone() else {
+            return Ok(false);
+        };
+        self.replace_thread_goal(&pending.session_id, &pending.objective)?;
+        Ok(true)
+    }
+
+    fn cancel_pending_goal_replacement(&mut self) -> bool {
+        if self.pending_goal_replacement.take().is_some() {
+            self.status_notice = Some("Goal replacement cancelled.".to_string());
+            return true;
+        }
+        false
+    }
+
+    fn edit_thread_goal(&mut self, session_id: &str, objective: &str) -> Result<()> {
+        let objective = objective.trim();
+        if objective.is_empty() {
+            self.open_goal_edit_prompt(session_id);
+            return Ok(());
+        }
+        if objective.chars().count() > MAX_THREAD_GOAL_OBJECTIVE_CHARS {
+            self.status_notice = Some(format!(
+                "Goal objective must be at most {MAX_THREAD_GOAL_OBJECTIVE_CHARS} characters."
+            ));
+            return Ok(());
+        }
+        let Some(goal) = self.current_goal_for_session(session_id) else {
+            self.status_notice = Some("No goal set for this task.".to_string());
+            return Ok(());
+        };
+        let current_status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active");
+        let status = edited_goal_status(current_status);
+        let mutation = self.apply_goal_store_mutation(session_id, |store| {
+            store.edit_goal_response(objective, Some(status))
+        })?;
+        if let Err(error) = mutation {
+            self.status_notice = Some(format!("Goal error: {error}"));
+            return Ok(());
+        }
+        self.status_notice = Some(self.goal_summary_for_session(session_id));
+        Ok(())
+    }
+
+    fn open_goal_edit_prompt(&mut self, session_id: &str) {
+        let Some(goal) = self.current_goal_for_session(session_id) else {
+            self.status_notice = Some("No goal set for this task.".to_string());
+            return;
+        };
+        let objective = goal
+            .get("objective")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("");
+        self.surface = Surface::Main;
+        self.palette_open = true;
+        self.palette_filter = format!("goal edit {objective}");
+        self.clamp_slash_palette_selection();
+        self.status_notice = Some("Edit the goal objective, then press Enter.".to_string());
+    }
+
+    fn mark_thread_goal_status(&mut self, session_id: &str, status: &str) -> Result<()> {
+        let Some(goal) = self.current_goal_for_session(session_id) else {
+            self.status_notice = Some("No goal set for this task.".to_string());
+            return Ok(());
+        };
+        let current_status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active");
+        if status == "active" {
+            if goal_status_is_active(current_status) {
+                self.status_notice = Some("Goal is already active.".to_string());
+                return Ok(());
+            }
+            if !goal_status_is_resumable(current_status) {
+                self.status_notice = Some(format!(
+                    "Goal is {}; use /goal edit <objective> to restart it or /goal clear.",
+                    goal_status_label(current_status)
+                ));
+                return Ok(());
+            }
+        } else if status == "paused" && goal_status_is_terminal(current_status) {
+            self.status_notice = Some(format!(
+                "Goal is {}; use /goal edit <objective> to restart it or /goal clear.",
+                goal_status_label(current_status)
+            ));
+            return Ok(());
+        }
+        let mutation = self
+            .apply_goal_store_mutation(session_id, |store| store.update_status_response(status))?;
+        if let Err(error) = mutation {
+            self.status_notice = Some(format!("Goal error: {error}"));
+            return Ok(());
+        }
+        self.status_notice = Some(self.goal_summary_for_session(session_id));
+        Ok(())
+    }
+
+    fn clear_thread_goal(&mut self, session_id: &str) -> Result<()> {
+        if !self.current_goal_exists(session_id) {
+            self.status_notice = Some("No goal set for this task.".to_string());
+            return Ok(());
+        }
+        let mutation =
+            self.apply_goal_store_mutation(session_id, |store| store.clear_goal_response())?;
+        if let Err(error) = mutation {
+            self.status_notice = Some(format!("Goal error: {error}"));
+            return Ok(());
+        }
+        self.status_notice = Some("Goal cleared.".to_string());
+        Ok(())
+    }
+
     fn pending_queued_followup_events<'a>(
         &self,
         events: &'a [EventRecord],
@@ -2531,6 +2951,74 @@ impl App {
             )?;
         }
         self.status_notice = Some("Sent queued follow-up.".to_string());
+        self.start_agent_for_session(session_id)?;
+        Ok(true)
+    }
+
+    fn maybe_start_goal_continuation(&mut self) -> Result<bool> {
+        if self.collaboration_mode == CollaborationModeKind::Plan {
+            return Ok(false);
+        }
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(false);
+        };
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(false);
+        };
+        if session.status != SessionStatus::Done {
+            return Ok(false);
+        }
+
+        let events = self.store.events_for_session(&session_id)?;
+        if !pending_queued_followup_events_from_events(&events).is_empty() {
+            return Ok(false);
+        }
+        let response = goal_response_from_event_records(&session_id, &events);
+        let Some(goal) = response.get("goal").filter(|goal| !goal.is_null()) else {
+            return Ok(false);
+        };
+        let status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active");
+        if !goal_status_allows_auto_continuation(status) {
+            return Ok(false);
+        }
+
+        let Some(latest_done_seq) = latest_event_seq(&events, "session.done") else {
+            return Ok(false);
+        };
+        if let Some(last_continuation_seq) =
+            latest_event_seq(&events, GOAL_CONTINUATION_STARTED_EVENT)
+        {
+            let latest_goal_progress_seq = latest_goal_progress_event_seq(&events);
+            if latest_goal_progress_seq.map_or(true, |seq| seq <= last_continuation_seq) {
+                return Ok(false);
+            }
+        }
+
+        let selection = self.session_model_selection_or_current(&session_id)?;
+        if !self.ensure_agent_ready_for_selection(&selection)? {
+            return Ok(false);
+        }
+        self.store.append_event(
+            &session_id,
+            GOAL_CONTINUATION_STARTED_EVENT,
+            serde_json::json!({
+                "reason": "active_goal",
+                "goal_status": canonical_goal_status(status),
+                "after_done_seq": latest_done_seq,
+            }),
+        )?;
+        self.store.append_event(
+            &session_id,
+            "session.status",
+            serde_json::json!({
+                "status": "running",
+                "reason": "goal_continuation",
+            }),
+        )?;
+        self.status_notice = Some("Continuing active goal.".to_string());
         self.start_agent_for_session(session_id)?;
         Ok(true)
     }
@@ -3464,6 +3952,7 @@ impl App {
             "session.notice",
             serde_json::json!({ "text": NO_KEY_NUDGE_TEXT }),
         )?;
+        self.append_pending_initial_goal_to_session(&session.id)?;
         self.prompt_history.record_submission(&submission.text);
         self.selected_session_id = Some(session.id.clone());
         self.pending_auth_resume = Some(session.id.clone());
@@ -3685,6 +4174,7 @@ impl App {
         }
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
+        self.append_pending_initial_goal_to_session(&session.id)?;
         let _ = self.refresh_prompt_history_for(&cwd, &options);
         let input_record = self.store.append_event(
             &session.id,
@@ -3706,6 +4196,21 @@ impl App {
         self.native_history.reset_with_clear();
         self.start_agent_for_session(session.id)?;
         Ok(())
+    }
+
+    fn append_pending_initial_goal_to_session(&mut self, session_id: &str) -> Result<()> {
+        let Some(objective) = self.pending_initial_goal.clone() else {
+            return Ok(());
+        };
+        match self.apply_goal_store_mutation(session_id, |store| {
+            store.create_goal_response(&objective, None)
+        })? {
+            Ok(_) => {
+                self.pending_initial_goal = None;
+                Ok(())
+            }
+            Err(error) => Err(anyhow::anyhow!("queued goal could not be applied: {error}")),
+        }
     }
 
     fn send_followup_submission(
@@ -3880,6 +4385,7 @@ impl App {
             return Ok(false);
         }
         let cancelled_live_run = cancel_agent_run(&id);
+        self.pause_active_goal_for_interrupt(&id)?;
         self.store.request_cancel(&id, "stopped from terminal")?;
         cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
             usize::from(cancel_agent_run(session_id))
@@ -3889,6 +4395,26 @@ impl App {
                 Some("Marked task stopped; no live runtime handle was found.".to_string());
         }
         Ok(true)
+    }
+
+    fn pause_active_goal_for_interrupt(&mut self, session_id: &str) -> Result<()> {
+        let Some(goal) = self.current_goal_for_session(session_id) else {
+            return Ok(());
+        };
+        let status = goal
+            .get("status")
+            .and_then(serde_json::Value::as_str)
+            .unwrap_or("active");
+        if !goal_status_is_active(status) {
+            return Ok(());
+        }
+        match self
+            .apply_goal_store_mutation(session_id, |store| store.update_status_response("paused"))?
+        {
+            Ok(_) => {}
+            Err(error) => self.status_notice = Some(format!("Goal error: {error}")),
+        }
+        Ok(())
     }
 
     fn current_task_is_active(&self) -> Result<bool> {
@@ -4150,6 +4676,28 @@ impl App {
         if !quit_requested && self.handle_request_user_input_key(key)? {
             self.drain_store_notifications()?;
             return Ok(false);
+        }
+        if self.surface == Surface::Main && !self.is_slash_palette_active() {
+            match key {
+                KeyEvent {
+                    code: KeyCode::Esc, ..
+                } if self.pending_goal_replacement.is_some() => {
+                    self.escape_stop_until = None;
+                    self.cancel_pending_goal_replacement();
+                    self.drain_store_notifications()?;
+                    return Ok(false);
+                }
+                KeyEvent {
+                    code: KeyCode::Enter,
+                    modifiers: KeyModifiers::NONE,
+                    ..
+                } if self.composer.is_empty() && self.pending_goal_replacement.is_some() => {
+                    self.confirm_pending_goal_replacement()?;
+                    self.drain_store_notifications()?;
+                    return Ok(false);
+                }
+                _ => {}
+            }
         }
         if self.surface == Surface::Main
             && !self.is_slash_palette_active()
@@ -4801,6 +5349,7 @@ impl App {
                 self.dispatch(AppCommand::SaveBrowser(self.selected_row))?;
             }
             Surface::CookieSync => self.execute_cookie_sync_selection()?,
+            Surface::Goal => self.close_surface(),
             Surface::Messages => self.edit_selected_message()?,
             Surface::Developer => match self.selected_row.min(1) {
                 0 => self.dispatch(AppCommand::ConfigureTelemetry)?,
@@ -5038,6 +5587,7 @@ impl App {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
             PaletteAction::ChangeMode => self.dispatch(AppCommand::ChangeMode)?,
+            PaletteAction::Goal => self.show_current_goal()?,
             PaletteAction::PlanMode => self.dispatch(AppCommand::SetCollaborationMode(
                 CollaborationModeKind::Plan,
             ))?,
@@ -6144,6 +6694,7 @@ impl App {
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::CookieSync => self.cookie_sync_row_count(),
+            Surface::Goal => 0,
             Surface::History => self.history_visible_indices()?.len(),
             Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
@@ -6205,6 +6756,16 @@ impl App {
 
     fn execute_slash_palette_selection(&mut self) -> Result<bool> {
         let filter = self.palette_filter.trim().trim_start_matches('/');
+        if let Some(goal_text) = filter
+            .strip_prefix("goal")
+            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
+            .map(str::trim)
+            .map(str::to_string)
+        {
+            self.close_slash_palette();
+            self.execute_goal_slash_command(&goal_text)?;
+            return Ok(false);
+        }
         if let Some(plan_text) = filter
             .strip_prefix("plan")
             .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
@@ -8223,6 +8784,143 @@ fn flush_pending_hyperlink(
     );
 }
 
+fn abbreviated_goal_objective(value: &str) -> String {
+    const MAX_CHARS: usize = 96;
+    if value.chars().count() <= MAX_CHARS {
+        return value.to_string();
+    }
+    let mut out: String = value.chars().take(MAX_CHARS.saturating_sub(3)).collect();
+    out.push_str("...");
+    out
+}
+
+fn split_goal_command(value: &str) -> (&str, &str) {
+    let value = value.trim();
+    value
+        .split_once(char::is_whitespace)
+        .map(|(command, rest)| (command, rest.trim()))
+        .unwrap_or((value, ""))
+}
+
+fn canonical_goal_status(value: &str) -> &'static str {
+    match value {
+        "usageLimited" | "usage_limited" => "usage_limited",
+        "budgetLimited" | "budget_limited" => "budget_limited",
+        "paused" => "paused",
+        "blocked" => "blocked",
+        "complete" => "complete",
+        _ => "active",
+    }
+}
+
+fn goal_status_label(value: &str) -> &'static str {
+    match canonical_goal_status(value) {
+        "paused" => "paused",
+        "blocked" => "blocked",
+        "usage_limited" => "usage limited",
+        "budget_limited" => "limited by budget",
+        "complete" => "complete",
+        _ => "active",
+    }
+}
+
+fn goal_status_is_active(value: &str) -> bool {
+    canonical_goal_status(value) == "active"
+}
+
+fn goal_status_is_resumable(value: &str) -> bool {
+    matches!(
+        canonical_goal_status(value),
+        "paused" | "blocked" | "usage_limited"
+    )
+}
+
+fn goal_status_is_terminal(value: &str) -> bool {
+    matches!(canonical_goal_status(value), "budget_limited" | "complete")
+}
+
+fn goal_status_is_complete(value: &str) -> bool {
+    canonical_goal_status(value) == "complete"
+}
+
+fn goal_status_allows_auto_continuation(value: &str) -> bool {
+    canonical_goal_status(value) == "active"
+}
+
+fn latest_event_seq(events: &[EventRecord], event_type: &str) -> Option<i64> {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == event_type)
+        .map(|event| event.seq)
+}
+
+fn latest_goal_progress_event_seq(events: &[EventRecord]) -> Option<i64> {
+    events
+        .iter()
+        .rev()
+        .find(|event| {
+            event.event_type == browser_use_agent::goals::GOAL_SET_EVENT
+                || event.event_type == GOAL_UPDATED_EVENT
+                || event.event_type == GOAL_ACCOUNTED_EVENT
+        })
+        .map(|event| event.seq)
+}
+
+fn edited_goal_status(value: &str) -> &'static str {
+    match canonical_goal_status(value) {
+        "budget_limited" | "complete" => "active",
+        status => status,
+    }
+}
+
+fn goal_command_hint(status: &str) -> &'static str {
+    match canonical_goal_status(status) {
+        "active" => "commands: /goal edit <objective>, /goal pause, /goal clear",
+        "paused" | "blocked" | "usage_limited" => {
+            "commands: /goal edit <objective>, /goal resume, /goal clear"
+        }
+        "budget_limited" | "complete" => "commands: /goal edit <objective>, /goal clear",
+        _ => "commands: /goal edit <objective>, /goal clear",
+    }
+}
+
+fn format_goal_elapsed_seconds(seconds: i64) -> String {
+    let seconds = seconds.max(0) as u64;
+    if seconds < 60 {
+        return format!("{seconds}s");
+    }
+    let minutes = seconds / 60;
+    if minutes < 60 {
+        return format!("{minutes}m");
+    }
+    let hours = minutes / 60;
+    let remaining_minutes = minutes % 60;
+    if hours >= 24 {
+        let days = hours / 24;
+        let remaining_hours = hours % 24;
+        return format!("{days}d {remaining_hours}h {remaining_minutes}m");
+    }
+    if remaining_minutes == 0 {
+        format!("{hours}h")
+    } else {
+        format!("{hours}h {remaining_minutes}m")
+    }
+}
+
+fn format_goal_tokens_compact(tokens: i64) -> String {
+    let tokens = tokens.max(0);
+    if tokens < 1_000 {
+        return tokens.to_string();
+    }
+    let thousands = tokens as f64 / 1_000.0;
+    if thousands.fract().abs() < 0.05 {
+        format!("{}k", thousands.round() as i64)
+    } else {
+        format!("{thousands:.1}k")
+    }
+}
+
 fn link_span_fragments(line: &Line<'static>) -> Vec<LinkSpanFragment> {
     let mut fragments = Vec::new();
     let mut col = 0;
@@ -8441,6 +9139,347 @@ mod redesign_tests {
         app.store.set_setting("setup.complete", "1")?;
         app.store.set_setting("browser", "Local Chrome")?;
         Ok(app)
+    }
+
+    #[test]
+    fn slash_goal_sets_and_summarizes_current_goal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("ship the goal command")?;
+        assert!(app
+            .status_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Goal set: ship the goal command")));
+        let event_types: Vec<String> = app
+            .store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect();
+        assert!(event_types
+            .iter()
+            .any(|ty| ty == browser_use_agent::goals::GOAL_SET_EVENT));
+
+        app.execute_goal_slash_command("")?;
+        assert_eq!(app.surface, Surface::Goal);
+        let screen = render::render_dump(&mut app)?;
+        assert!(screen.contains("ship the goal command"), "{screen}");
+        assert!(screen.contains("/goal pause"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn slash_goal_pause_resume_edit_and_clear_update_goal_events() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("finish parity")?;
+        app.execute_goal_slash_command("pause")?;
+        assert!(app
+            .status_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Goal paused: finish parity")));
+        app.execute_goal_slash_command("resume")?;
+        assert!(app
+            .status_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Goal active: finish parity")));
+        app.execute_goal_slash_command("edit finish canonical parity")?;
+        assert!(app
+            .status_notice
+            .as_deref()
+            .is_some_and(|notice| { notice.contains("Goal active: finish canonical parity") }));
+        app.execute_goal_slash_command("clear")?;
+        assert_eq!(app.status_notice.as_deref(), Some("Goal cleared."));
+
+        let event_types: Vec<String> = app
+            .store
+            .events_for_session(&session.id)?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect();
+        assert!(event_types
+            .iter()
+            .any(|ty| ty == browser_use_agent::tools::handlers::goal::GOAL_UPDATED_EVENT));
+        assert!(event_types
+            .iter()
+            .any(|ty| ty == browser_use_agent::tools::handlers::goal::GOAL_CLEARED_EVENT));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_goal_existing_active_goal_requires_edit_command() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("first goal")?;
+        app.execute_goal_slash_command("second goal")?;
+        assert!(app.status_notice.as_deref().is_some_and(|notice| {
+            notice.contains("Replace existing goal") && notice.contains("Press Enter to confirm")
+        }));
+        assert_eq!(
+            app.pending_goal_replacement,
+            Some(PendingGoalReplacement {
+                session_id: session.id.clone(),
+                objective: "second goal".to_string(),
+            })
+        );
+        assert!(app.confirm_pending_goal_replacement()?);
+        assert!(app
+            .goal_summary_for_session(&session.id)
+            .contains("Goal active: second goal"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_goal_edit_without_argument_opens_edit_prompt() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("first goal")?;
+        app.execute_goal_slash_command("edit")?;
+        assert!(app.is_slash_palette_active());
+        assert_eq!(app.palette_filter(), "goal edit first goal");
+        assert_eq!(
+            app.status_notice.as_deref(),
+            Some("Edit the goal objective, then press Enter.")
+        );
+        app.execute_goal_slash_command("edit second goal")?;
+        assert!(app
+            .goal_summary_for_session(&session.id)
+            .contains("Goal active: second goal"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_goal_without_task_queues_goal_for_next_task() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        assert!(app.selected_session_id.is_none());
+
+        app.execute_goal_slash_command("finish queued goal parity")?;
+        assert_eq!(
+            app.pending_initial_goal.as_deref(),
+            Some("finish queued goal parity")
+        );
+        assert!(app.status_notice.as_deref().is_some_and(|notice| {
+            notice.contains("Goal queued for next task: finish queued goal parity")
+        }));
+
+        app.dispatch(AppCommand::StartTask("inspect repo".to_string()))?;
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session")?;
+        assert!(app.pending_initial_goal.is_none());
+        let events = app.store.events_for_session(&session_id)?;
+        let goal_idx = events
+            .iter()
+            .position(|event| event.event_type == browser_use_agent::goals::GOAL_SET_EVENT)
+            .context("goal.created")?;
+        let input_idx = events
+            .iter()
+            .position(|event| event.event_type == "session.input")
+            .context("session.input")?;
+        assert!(
+            goal_idx < input_idx,
+            "queued goal should be persisted before the initial input"
+        );
+        assert_eq!(
+            app.goal_response_for_session(&session_id)["goal"]["objective"],
+            serde_json::json!("finish queued goal parity")
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn slash_goal_without_task_can_show_edit_and_clear_queued_goal() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        app.execute_goal_slash_command("first queued goal")?;
+        app.execute_goal_slash_command("edit")?;
+        assert!(app.is_slash_palette_active());
+        assert_eq!(app.palette_filter(), "goal edit first queued goal");
+
+        app.execute_goal_slash_command("edit second queued goal")?;
+        assert_eq!(
+            app.pending_initial_goal.as_deref(),
+            Some("second queued goal")
+        );
+        app.execute_goal_slash_command("clear")?;
+        assert!(app.pending_initial_goal.is_none());
+        assert_eq!(app.status_notice.as_deref(), Some("Queued goal cleared."));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_goal_complete_and_blocked_are_objectives() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("complete")?;
+        assert_eq!(
+            app.goal_response_for_session(&session.id)["goal"]["objective"],
+            serde_json::json!("complete")
+        );
+        app.execute_goal_slash_command("blocked")?;
+        assert!(app.pending_goal_replacement.is_some());
+        Ok(())
+    }
+
+    #[test]
+    fn slash_goal_budget_limited_goal_requires_replacement_confirmation() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("first goal")?;
+        app.apply_goal_store_mutation(&session.id, |store| {
+            store.update_status_response("budget_limited")
+        })?
+        .expect("mark budget limited");
+        app.execute_goal_slash_command("second goal")?;
+
+        assert_eq!(
+            app.pending_goal_replacement,
+            Some(PendingGoalReplacement {
+                session_id: session.id.clone(),
+                objective: "second goal".to_string(),
+            })
+        );
+        assert!(app
+            .status_notice
+            .as_deref()
+            .is_some_and(|notice| notice.contains("Replace existing goal")));
+        Ok(())
+    }
+
+    #[test]
+    fn active_goal_continues_done_session_once_until_goal_progress() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("finish the goal")?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "partial"}),
+        )?;
+        app.refresh_state_cache_from_store()?;
+
+        assert!(app.maybe_start_goal_continuation()?);
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .context("session")?
+                .status,
+            SessionStatus::Running
+        );
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == GOAL_CONTINUATION_STARTED_EVENT));
+
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "still partial"}),
+        )?;
+        app.refresh_state_cache_from_store()?;
+        assert!(!app.maybe_start_goal_continuation()?);
+        Ok(())
+    }
+
+    #[test]
+    fn budget_limited_goal_does_not_auto_continue_done_session() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("stay inside budget")?;
+        app.apply_goal_store_mutation(&session.id, |store| {
+            store.update_status_response("budget_limited")
+        })?
+        .expect("mark budget limited");
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "budget wrap-up"}),
+        )?;
+        app.refresh_state_cache_from_store()?;
+
+        assert!(!app.maybe_start_goal_continuation()?);
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .context("session")?
+                .status,
+            SessionStatus::Done
+        );
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == GOAL_CONTINUATION_STARTED_EVENT));
+        Ok(())
+    }
+
+    #[test]
+    fn interrupt_pauses_active_goal_before_cancel_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.execute_goal_slash_command("interruptible goal")?;
+        assert!(app.cancel_current_task()?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        let paused_idx = events
+            .iter()
+            .position(|event| {
+                event.event_type == GOAL_UPDATED_EVENT
+                    && event
+                        .payload
+                        .get("status")
+                        .and_then(serde_json::Value::as_str)
+                        == Some("paused")
+            })
+            .context("paused goal event")?;
+        let cancel_idx = events
+            .iter()
+            .position(|event| event.event_type == "session.cancel_requested")
+            .context("cancel requested")?;
+        assert!(paused_idx < cancel_idx);
+        assert_eq!(
+            app.goal_response_for_session(&session.id)["goal"]["status"],
+            serde_json::json!("paused")
+        );
+        Ok(())
     }
 
     fn write_test_png(path: &Path) -> Result<()> {
@@ -8859,6 +9898,7 @@ mod redesign_tests {
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::CookieSync => "Cookie Sync",
+            Surface::Goal => "Goal",
             Surface::History => "History",
             Surface::Messages => "Messages",
             Surface::Developer => "Developer",
@@ -13055,6 +14095,25 @@ wire_api = "responses"
             .composer_input_rect
             .get()
             .context("streaming composer rect")?;
+
+        app.store.append_event(
+            &session.id,
+            "goal.accounted",
+            serde_json::json!({"tokens_used": 4, "time_used_seconds": 0}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let accounted_screen = render_dump(&mut app)?;
+        assert!(accounted_screen.contains("I checked the top-level files and docs."));
+        assert!(!accounted_screen.contains("Thinking..."));
+        let accounted_rect = app
+            .composer_input_rect
+            .get()
+            .context("accounted composer rect")?;
+        assert_eq!(
+            accounted_rect.y, streaming_rect.y,
+            "goal accounting should not be treated as visible live work\nbefore:\n{streaming_screen}\nafter:\n{accounted_screen}"
+        );
 
         app.store.append_event(
             &session.id,

@@ -15,12 +15,15 @@ use browser_use_llm::schema::{
     ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
     MessageRole, Usage,
 };
+use browser_use_protocol::EventRecord;
 use futures_util::stream;
 use tokio_util::sync::CancellationToken;
 
 use crate::events::names;
 use crate::events::{EventSink, TurnCtx};
+use crate::goals::{GOAL_ACCOUNTED_EVENT, GOAL_SET_EVENT};
 use crate::testkit::RecordingSink;
+use crate::tools::handlers::goal::GoalStore;
 use crate::turn::sampling::{EventStream, ModelSamplingDriver, SamplingTransport};
 use crate::turn::SamplingDriver;
 use crate::AgentError;
@@ -137,6 +140,35 @@ fn driver(
     ModelSamplingDriver::new(transport, sink, ctx(), max_retries).without_jitter()
 }
 
+fn event_record(seq: i64, ty: &str, payload: serde_json::Value) -> EventRecord {
+    EventRecord {
+        seq,
+        id: format!("event-{seq}"),
+        session_id: "sess-1".to_string(),
+        ts_ms: seq * 1000,
+        event_type: ty.to_string(),
+        payload,
+    }
+}
+
+fn active_goal_store(sink: Arc<RecordingSink>) -> Arc<GoalStore> {
+    let sink: Arc<dyn EventSink> = sink;
+    Arc::new(GoalStore::from_event_records(
+        "sess-1",
+        sink,
+        &[event_record(
+            1,
+            GOAL_SET_EVENT,
+            serde_json::json!({
+                "goal_id": "goal-1",
+                "objective": "finish the active goal",
+                "status": "active",
+                "token_budget": 1000,
+            }),
+        )],
+    ))
+}
+
 fn user_input() -> Vec<Message> {
     vec![Message::new(
         MessageRole::User,
@@ -208,8 +240,8 @@ async fn tool_call_sets_follow_up_and_records_message_and_events() {
     );
     assert_eq!(out.finish_reason, Some(FinishReason::ToolUse));
 
-    // Events were emitted to the sink: two stream deltas, a tool.started, and a
-    // terminal token_count.
+    // Events were emitted to the sink: two stream deltas, a tool.started, and
+    // terminal token_count. Goal accounting is active-goal gated.
     let events = sink.drain();
     let types: Vec<&str> = events.iter().map(|e| e.event_type.as_str()).collect();
     assert_eq!(
@@ -226,6 +258,58 @@ async fn tool_call_sets_follow_up_and_records_message_and_events() {
     // The tool.started payload carries the tool name.
     let tool_started = &events[3];
     assert_eq!(tool_started.payload["name"], serde_json::json!("search"));
+}
+
+#[tokio::test]
+async fn finish_accounts_usage_only_when_goal_is_active() {
+    let (transport, _opens) =
+        ScriptedTransport::new(vec![OpenScript::Stream(vec![finish(FinishReason::Stop)])]);
+    let sink = Arc::new(RecordingSink::default());
+    let goal_store = active_goal_store(sink.clone());
+    let d = driver(transport, sink.clone(), 5).with_goal_store(goal_store);
+
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let events = sink.drain();
+    let accounted = events
+        .iter()
+        .find(|event| event.event_type == GOAL_ACCOUNTED_EVENT)
+        .expect("active goal should emit accounting");
+    assert_eq!(accounted.payload["tokensUsed"], serde_json::json!(15));
+    assert_eq!(
+        accounted.payload["goal"]["tokensUsed"],
+        serde_json::json!(15)
+    );
+}
+
+#[tokio::test]
+async fn active_goal_context_is_injected_with_codex_envelope() {
+    let (transport, seen) =
+        RecordingTransport::new(vec![text_delta("ok"), finish(FinishReason::Stop)]);
+    let sink = Arc::new(RecordingSink::default());
+    let goal_store = active_goal_store(sink.clone());
+    let d = ModelSamplingDriver::new(transport, sink, ctx(), 5)
+        .without_jitter()
+        .with_goal_store(goal_store);
+
+    let _ = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    let captured = seen.lock().unwrap();
+    let req = captured.first().expect("request captured");
+    assert_eq!(req.messages.len(), 2);
+    let ContentPart::Text { text } = &req.messages[0].content[0] else {
+        panic!("goal context should be text");
+    };
+    assert!(text.starts_with("<goal_context>\n"));
+    assert!(text.ends_with("\n</goal_context>"));
+    assert!(text.contains("<objective>\nfinish the active goal\n</objective>"));
+    assert_eq!(req.messages[1], user_input()[0]);
 }
 
 // ---- (2) text-only stream -> no follow_up ---------------------------------

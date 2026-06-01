@@ -22,9 +22,11 @@ use crate::theme::*;
 use crate::transcript;
 
 use super::{
-    collaboration_mode_label, event_payload_text, pending_active_followup_events_from_events,
-    pending_queued_followup_events_from_events, App, CookieSyncStatus, MessageActionKind,
-    ProductState, RequestUserInputFocus, SetupResultKind, Surface,
+    collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
+    format_goal_tokens_compact, goal_command_hint, goal_status_label,
+    pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
+    CookieSyncStatus, MessageActionKind, ProductState, RequestUserInputFocus, SetupResultKind,
+    Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -1272,6 +1274,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
             "Cookie Sync",
             "Import local browser cookies to Browser Use cloud",
         ),
+        Surface::Goal => ("Goal", "Inspect or change the active task goal"),
         Surface::History => ("History", "Browse and resume previous tasks"),
         Surface::Messages => (
             "Messages",
@@ -1315,6 +1318,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
         Surface::CookieSync => "Enter:select | Esc:close",
+        Surface::Goal => "Esc:close",
         Surface::Developer => "Esc:close",
         _ => "Enter:select | Esc:back",
     }
@@ -1355,6 +1359,7 @@ fn surface_lines(
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
         Surface::CookieSync => cookie_sync_lines(app, width),
+        Surface::Goal => goal_lines(app),
         Surface::History => history_lines(app, state, width),
         Surface::Messages => message_lines(app, width),
         Surface::Developer => developer_lines(app, state),
@@ -1536,6 +1541,10 @@ fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line
         collaboration_mode_label(app.collaboration_mode).to_string(),
         muted(),
     ));
+    if let Some(goal) = app.goal_status_indicator_for_state(state) {
+        spans.push(status_separator());
+        spans.push(Span::styled(goal, muted()));
+    }
     spans.push(status_separator());
     spans.extend(context_bar_spans(
         usage.context_tokens.unwrap_or(0),
@@ -2522,6 +2531,66 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
         ]),
     ]);
     lines
+}
+
+fn goal_lines(app: &App) -> Vec<Line<'static>> {
+    let Some(session_id) = app.selected_session_id.as_deref() else {
+        return vec![Line::from("Open a task before using /goal.")];
+    };
+    let Some(goal) = app.current_goal_for_session(session_id) else {
+        return vec![
+            Line::from("No goal set for this task."),
+            Line::from(""),
+            Line::from(Span::styled("Commands", muted())),
+            Line::from("  /goal <objective>"),
+            Line::from("  /goal clear"),
+        ];
+    };
+    let objective = goal
+        .get("objective")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("");
+    let status = goal
+        .get("status")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or("active");
+    let tokens_used = goal
+        .get("tokensUsed")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    let time_used_seconds = goal
+        .get("timeUsedSeconds")
+        .and_then(serde_json::Value::as_i64)
+        .unwrap_or_default();
+    let budget = goal.get("tokenBudget").and_then(serde_json::Value::as_i64);
+    let token_text = match budget {
+        Some(budget) => format!(
+            "{}/{}",
+            format_goal_tokens_compact(tokens_used),
+            format_goal_tokens_compact(budget)
+        ),
+        None if tokens_used > 0 => format_goal_tokens_compact(tokens_used),
+        None => "0".to_string(),
+    };
+    vec![
+        Line::from(vec![
+            Span::styled("Status  ", muted()),
+            Span::raw(goal_status_label(status).to_string()),
+        ]),
+        Line::from(vec![
+            Span::styled("Time    ", muted()),
+            Span::raw(format_goal_elapsed_seconds(time_used_seconds)),
+        ]),
+        Line::from(vec![
+            Span::styled("Tokens  ", muted()),
+            Span::raw(token_text),
+        ]),
+        Line::from(""),
+        Line::from(Span::styled("Objective", muted())),
+        Line::from(format!("  {objective}")),
+        Line::from(""),
+        Line::from(Span::styled(goal_command_hint(status).to_string(), muted())),
+    ]
 }
 
 pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
