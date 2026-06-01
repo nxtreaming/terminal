@@ -672,7 +672,7 @@ fn media_item_content_part(
         Some(json!({
             "type": "input_image",
             "image_url": resolved,
-            "detail": detail.unwrap_or("high"),
+            "detail": detail.unwrap_or("auto"),
         }))
     } else {
         Some(json!({

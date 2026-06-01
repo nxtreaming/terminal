@@ -165,6 +165,40 @@ pub fn browser_agent_system_prompt() -> String {
     instructions
 }
 
+/// Build the per-run browser-mode instruction inserted ahead of the task.
+///
+/// Mirrors `browser-use-core::browser_mode_instruction` so a selected terminal
+/// browser mode gives the model the same first action on the Rust engine.
+pub fn browser_mode_instruction(mode: &str) -> String {
+    let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
+    match normalized.as_str() {
+        "local" | "local-chrome" => concat!(
+            "Selected browser mode: Local Chrome. Use `browser connect local` before page work. ",
+            "This checks for a local Chromium-family browser exposing CDP and attaches only after remote debugging is enabled. ",
+            "If connection is blocked, run `browser local setup` and wait for the user to approve remote debugging."
+        )
+        .to_string(),
+        "headless" | "headless-chromium" | "managed-headless" => concat!(
+            "Selected browser mode: Headless Chromium. Use `browser connect managed --headless` before page work. ",
+            "This starts a Rust-owned managed browser with an isolated automation profile."
+        )
+        .to_string(),
+        "managed" | "managed-headed" => concat!(
+            "Selected browser mode: managed headed browser. Use `browser connect managed --headed` before page work. ",
+            "This starts a Rust-owned visible browser with an isolated automation profile."
+        )
+        .to_string(),
+        "cloud" | "browser-use-cloud" => concat!(
+            "Selected browser mode: Browser Use cloud. Use `browser remote start` before page work. ",
+            "Remote start means start and connect; use `browser remote live-url` to retrieve the watch URL."
+        )
+        .to_string(),
+        other => format!(
+            "Selected browser mode: {other}. Use `browser status --json` first, then choose an explicit browser connect command."
+        ),
+    }
+}
+
 /// The full browser-harness interaction-skill bundle loaded by main.
 pub fn browser_harness_interaction_skills() -> &'static [(&'static str, &'static str)] {
     &[

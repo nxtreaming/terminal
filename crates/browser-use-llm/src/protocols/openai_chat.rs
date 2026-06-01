@@ -395,10 +395,10 @@ fn chat_image_part(
         (None, Some(data)) => format!("data:{mime_type};base64,{data}"),
         (None, None) => return None,
     };
-    let mut image_url = serde_json::Map::from_iter([("url".to_string(), json!(resolved))]);
-    if let Some(detail) = detail {
-        image_url.insert("detail".to_string(), json!(detail));
-    }
+    let image_url = serde_json::Map::from_iter([
+        ("url".to_string(), json!(resolved)),
+        ("detail".to_string(), json!(detail.unwrap_or("auto"))),
+    ]);
     Some(json!({
         "type": "image_url",
         "image_url": Value::Object(image_url),
@@ -735,6 +735,12 @@ mod tests {
                     url: None,
                     detail: Some("original".into()),
                 },
+                ContentPart::Media {
+                    mime_type: "image/jpeg".into(),
+                    data: Some("BBBB".into()),
+                    url: None,
+                    detail: None,
+                },
             ],
         ));
 
@@ -747,6 +753,11 @@ mod tests {
             json!("data:image/png;base64,AAAA")
         );
         assert_eq!(content[1]["image_url"]["detail"], json!("original"));
+        assert_eq!(
+            content[2]["image_url"]["url"],
+            json!("data:image/jpeg;base64,BBBB")
+        );
+        assert_eq!(content[2]["image_url"]["detail"], json!("auto"));
     }
 
     #[test]
