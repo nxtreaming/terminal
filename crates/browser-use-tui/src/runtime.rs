@@ -79,14 +79,12 @@ pub(crate) fn run_agent_thread(
         config_overrides,
         &mut config,
     );
-    // The new async engine takes a `SharedStore` (`Arc<Mutex<Store>>`) and is
-    // driven on a Tokio runtime. `run_agent_thread` runs on a dedicated OS
-    // thread, so we build a current-thread runtime here and block on the run,
-    // preserving the existing thread-per-session model.
+    // The async engine takes a `SharedStore` (`Arc<Mutex<Store>>`) and is driven
+    // on a Tokio runtime. The live model transport opens streams through
+    // `block_in_place`, so this must be a multi-thread runtime even though the
+    // TUI still keeps the existing one OS thread per session entrypoint.
     let shared_store = Arc::new(Mutex::new(store));
-    let runtime = tokio::runtime::Builder::new_current_thread()
-        .enable_all()
-        .build()?;
+    let runtime = build_agent_runtime()?;
     let result = runtime.block_on(run_session_with_config(
         Arc::clone(&shared_store),
         &session_id,
@@ -103,6 +101,15 @@ pub(crate) fn run_agent_thread(
         return Err(error);
     }
     Ok(())
+}
+
+fn build_agent_runtime() -> Result<tokio::runtime::Runtime> {
+    tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .thread_name("browser-use-agent-runtime")
+        .worker_threads(2)
+        .build()
+        .context("build TUI agent tokio runtime")
 }
 
 fn browser_use_cloud_api_key(store: &Store) -> Result<Option<String>> {
@@ -371,6 +378,13 @@ mod tests {
             .iter()
             .find(|(candidate, _)| candidate == key)
             .map(|(_, value)| value.as_str())
+    }
+
+    #[test]
+    fn tui_agent_runtime_supports_block_in_place() {
+        let runtime = build_agent_runtime().unwrap();
+        let result = runtime.block_on(async { tokio::task::block_in_place(|| 42) });
+        assert_eq!(result, 42);
     }
 
     #[test]
