@@ -23,11 +23,13 @@ use std::collections::HashMap;
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::OnceLock;
 
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+use crate::decision::AutoCompactTokenLimitScope;
 use crate::mcp::McpServerConfig;
 use crate::prompts::CollaborationModeKind;
 use crate::tools::AskForApproval;
@@ -218,6 +220,7 @@ pub struct AgentRunOptions {
     pub session_thread_config: Option<toml::Value>,
     pub base_instructions: Option<String>,
     pub developer_instructions: Option<String>,
+    pub compact_prompt: Option<String>,
     pub model_provider_id: Option<String>,
     pub model_provider_id_source: RunConfigValueSource,
     pub python_tool_timeout_seconds: u64,
@@ -226,6 +229,8 @@ pub struct AgentRunOptions {
     pub final_output_json_schema: Option<Value>,
     pub final_output_json_schema_strict: bool,
     pub model_compaction_enabled: bool,
+    pub model_auto_compact_token_limit: Option<i64>,
+    pub model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope,
     pub analytics_source: Option<String>,
     pub analytics_provider_kind: Option<String>,
     pub analytics_model: Option<String>,
@@ -271,6 +276,7 @@ impl Default for AgentRunOptions {
             session_thread_config: None,
             base_instructions: None,
             developer_instructions: None,
+            compact_prompt: None,
             model_provider_id: None,
             model_provider_id_source: RunConfigValueSource::Default,
             python_tool_timeout_seconds: 120,
@@ -278,7 +284,9 @@ impl Default for AgentRunOptions {
             child_agent_runner: None,
             final_output_json_schema: None,
             final_output_json_schema_strict: true,
-            model_compaction_enabled: false,
+            model_compaction_enabled: true,
+            model_auto_compact_token_limit: None,
+            model_auto_compact_token_limit_scope: AutoCompactTokenLimitScope::Total,
             analytics_source: None,
             analytics_provider_kind: None,
             analytics_model: None,
@@ -358,6 +366,11 @@ impl AgentRunOptions {
         self
     }
 
+    pub fn with_compact_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.compact_prompt = Some(prompt.into());
+        self
+    }
+
     pub fn with_model_provider_id(mut self, model_provider_id: impl Into<String>) -> Self {
         self.model_provider_id = Some(model_provider_id.into());
         self.model_provider_id_source = RunConfigValueSource::Explicit;
@@ -396,6 +409,19 @@ impl AgentRunOptions {
         self
     }
 
+    pub fn with_model_auto_compact_token_limit(mut self, limit: Option<i64>) -> Self {
+        self.model_auto_compact_token_limit = limit;
+        self
+    }
+
+    pub fn with_model_auto_compact_token_limit_scope(
+        mut self,
+        scope: AutoCompactTokenLimitScope,
+    ) -> Self {
+        self.model_auto_compact_token_limit_scope = scope;
+        self
+    }
+
     pub fn with_analytics_source(mut self, source: impl Into<String>) -> Self {
         self.analytics_source = Some(source.into());
         self
@@ -424,11 +450,106 @@ impl AgentRunOptions {
 /// Default model context-window budget in tokens, used when the caller does not
 /// set one explicitly.
 ///
-/// Drives the auto-compaction trigger (compaction fires at 80% of this — codex
+/// Drives the auto-compaction trigger (compaction fires at 90% of this — codex
 /// `Session::auto_compact_token_limit`). Sized to the gpt-5/-codex family window;
 /// callers that know the real model window should set it via
 /// [`ProviderRunConfig::with_context_window_tokens`].
 pub const DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS: usize = 272_000;
+
+const fn default_effective_context_window_percent() -> i64 {
+    95
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct ModelContextMetadata {
+    pub context_window: Option<i64>,
+    pub max_context_window: Option<i64>,
+    pub auto_compact_token_limit: Option<i64>,
+    pub effective_context_window_percent: i64,
+}
+
+impl Default for ModelContextMetadata {
+    fn default() -> Self {
+        Self {
+            context_window: None,
+            max_context_window: None,
+            auto_compact_token_limit: None,
+            effective_context_window_percent: default_effective_context_window_percent(),
+        }
+    }
+}
+
+impl ModelContextMetadata {
+    pub fn resolved_context_window(&self) -> Option<i64> {
+        self.context_window.or(self.max_context_window)
+    }
+
+    pub fn effective_context_window(&self) -> Option<i64> {
+        self.resolved_context_window().map(|context_window| {
+            context_window.saturating_mul(self.effective_context_window_percent) / 100
+        })
+    }
+
+    pub fn auto_compact_token_limit(&self) -> Option<i64> {
+        self.auto_compact_token_limit_with_override(None)
+    }
+
+    pub fn auto_compact_token_limit_with_override(&self, configured: Option<i64>) -> Option<i64> {
+        let context_limit = self
+            .resolved_context_window()
+            .map(|context_window| (context_window * 9) / 10);
+        let config_limit = configured.or(self.auto_compact_token_limit);
+        match (context_limit, config_limit.filter(|limit| *limit > 0)) {
+            (Some(context_limit), Some(configured)) => Some(configured.min(context_limit)),
+            (Some(context_limit), None) => Some(context_limit),
+            (None, configured) => configured,
+        }
+    }
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BundledModels {
+    models: Vec<BundledModelMetadata>,
+}
+
+#[derive(Clone, Debug, Deserialize)]
+struct BundledModelMetadata {
+    slug: String,
+    #[serde(default)]
+    context_window: Option<i64>,
+    #[serde(default)]
+    max_context_window: Option<i64>,
+    #[serde(default)]
+    auto_compact_token_limit: Option<i64>,
+    #[serde(default = "default_effective_context_window_percent")]
+    effective_context_window_percent: i64,
+}
+
+fn bundled_model_metadata() -> &'static [BundledModelMetadata] {
+    static MODELS: OnceLock<Vec<BundledModelMetadata>> = OnceLock::new();
+    MODELS
+        .get_or_init(|| {
+            serde_json::from_str::<BundledModels>(include_str!(
+                "../../../prompts/codex-models.json"
+            ))
+            .map(|catalog| catalog.models)
+            .unwrap_or_default()
+        })
+        .as_slice()
+}
+
+pub fn model_context_metadata_for_model(model: &str) -> ModelContextMetadata {
+    bundled_model_metadata()
+        .iter()
+        .find(|metadata| metadata.slug == model)
+        .map(|metadata| ModelContextMetadata {
+            context_window: metadata.context_window,
+            max_context_window: metadata.max_context_window,
+            auto_compact_token_limit: metadata.auto_compact_token_limit,
+            effective_context_window_percent: metadata.effective_context_window_percent,
+        })
+        .unwrap_or_default()
+}
 
 /// The fully-resolved provider/run configuration handed to the engine.
 ///
@@ -440,8 +561,8 @@ pub struct ProviderRunConfig {
     pub model_source: RunConfigValueSource,
     pub options: AgentRunOptions,
     pub fake_result: Option<String>,
-    /// The model's context-window budget in tokens. Drives the codex 80%
-    /// auto-compaction trigger (`TokenStatus::from_estimate`). `0` disables
+    /// The model's context-window budget in tokens. Drives the codex 90%
+    /// auto-compaction trigger (`TokenStatus::from_usage`). `0` disables
     /// compaction (unknown budget). Defaults to
     /// [`DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS`].
     pub context_window_tokens: usize,
@@ -449,13 +570,19 @@ pub struct ProviderRunConfig {
 
 impl ProviderRunConfig {
     pub fn new(backend: ProviderBackend, model: impl Into<String>) -> Self {
+        let model = model.into();
+        let metadata = model_context_metadata_for_model(&model);
+        let context_window_tokens = metadata
+            .resolved_context_window()
+            .and_then(|tokens| usize::try_from(tokens).ok())
+            .unwrap_or(DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS);
         Self {
             backend,
-            model: model.into(),
+            model,
             model_source: RunConfigValueSource::Explicit,
             options: AgentRunOptions::default(),
             fake_result: None,
-            context_window_tokens: DEFAULT_MODEL_CONTEXT_WINDOW_TOKENS,
+            context_window_tokens,
         }
     }
 
@@ -479,6 +606,19 @@ impl ProviderRunConfig {
     pub fn with_context_window_tokens(mut self, tokens: usize) -> Self {
         self.context_window_tokens = tokens;
         self
+    }
+
+    pub fn model_context_metadata(&self) -> ModelContextMetadata {
+        let mut metadata = model_context_metadata_for_model(&self.model);
+        let context_window = self.context_window_tokens as i64;
+        metadata.context_window = Some(
+            metadata
+                .max_context_window
+                .map_or(context_window, |max_context_window| {
+                    context_window.min(max_context_window)
+                }),
+        );
+        metadata
     }
 }
 
@@ -741,9 +881,6 @@ fn apply_toml_override(root: &mut toml::Value, path: &str, value: toml::Value) {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::sync::{Mutex, OnceLock};
-
-    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
 
     fn ov(pairs: &[&str]) -> Vec<String> {
         pairs.iter().map(|s| s.to_string()).collect()
@@ -837,10 +974,7 @@ mod tests {
 
     #[test]
     fn runtime_config_loads_profile_mcp_approval_and_guardian() {
-        let _guard = ENV_LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .expect("env lock poisoned");
+        let _guard = crate::test_env::lock();
         let temp = tempfile::tempdir().unwrap();
         let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         unsafe {
@@ -908,6 +1042,7 @@ command = "profile-server"
         assert!(options.session_thread_config.is_none());
         assert!(options.base_instructions.is_none());
         assert!(options.developer_instructions.is_none());
+        assert!(options.compact_prompt.is_none());
         assert!(options.model_provider_id.is_none());
         assert_eq!(
             options.model_provider_id_source,
@@ -918,7 +1053,7 @@ command = "profile-server"
         assert!(options.child_agent_runner.is_none());
         assert!(options.final_output_json_schema.is_none());
         assert!(options.final_output_json_schema_strict);
-        assert!(!options.model_compaction_enabled);
+        assert!(options.model_compaction_enabled);
         assert!(options.analytics_source.is_none());
         assert!(options.analytics_provider_kind.is_none());
         assert!(options.analytics_model.is_none());
@@ -937,6 +1072,18 @@ command = "profile-server"
         assert!(config.fake_result.is_none());
         // options default to AgentRunOptions::default()
         assert_eq!(config.options.max_turns, 80);
+    }
+
+    #[test]
+    fn provider_run_config_uses_bundled_model_context_metadata() {
+        let config = ProviderRunConfig::new(ProviderBackend::Codex, "gpt-5.4");
+        assert_eq!(config.context_window_tokens, 272_000);
+        let metadata = config.model_context_metadata();
+        assert_eq!(metadata.context_window, Some(272_000));
+        assert_eq!(metadata.max_context_window, Some(1_000_000));
+        assert_eq!(metadata.effective_context_window_percent, 95);
+        assert_eq!(metadata.effective_context_window(), Some(258_400));
+        assert_eq!(metadata.auto_compact_token_limit(), Some(244_800));
     }
 
     #[test]

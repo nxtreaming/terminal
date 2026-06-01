@@ -75,7 +75,7 @@
 //! `TurnState::compact` (and the production `SamplingDriver` re-runs against the
 //! compacted history) with no change to this driver.
 
-use super::{SamplingDriver, TurnObserver, TurnState};
+use super::{CompactionMode, SamplingDriver, TurnObserver, TurnState};
 use crate::decision::{self, LoopStep};
 use crate::events::TurnCtx;
 use crate::task::{TurnAbortReason, TurnLifecycleEvent};
@@ -185,7 +185,7 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
                     // (real model-based compaction WP pending); the CONTROL FLOW
                     // is codex-faithful: compact (`turn.rs:282`), set the drain
                     // gate from the decision (`turn.rs:306`), loop again.
-                    self.state.compact().await;
+                    self.state.compact(CompactionMode::MidTurn).await?;
                     can_drain = can_drain_next;
                 }
                 LoopStep::Continue => {

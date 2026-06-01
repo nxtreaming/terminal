@@ -406,11 +406,11 @@ fn total_token_usage_zero_when_no_info_and_no_items() {
 #[test]
 fn set_token_usage_full_installs_window_and_preserves_usage() {
     let mut cm = ContextManager::new();
-    // No prior usage: installs a usage-empty info carrying just the window.
+    // No prior usage: installs a full-window usage snapshot.
     cm.set_token_usage_full(4096);
-    assert_eq!(cm.breakdown().last_api_response_total_tokens, 0);
+    assert_eq!(cm.breakdown().last_api_response_total_tokens, 4096);
 
-    // With prior usage, the window fill preserves accumulated last.total.
+    // With prior usage, the window fill records only the delta as the last usage.
     let mut cm2 = ContextManager::new();
     cm2.update_token_info(
         &TokenUsage {
@@ -420,7 +420,7 @@ fn set_token_usage_full_installs_window_and_preserves_usage() {
         None,
     );
     cm2.set_token_usage_full(4096);
-    assert_eq!(cm2.breakdown().last_api_response_total_tokens, 321);
+    assert_eq!(cm2.breakdown().last_api_response_total_tokens, 3775);
 }
 
 // ---------------------------------------------------------------------------

@@ -145,9 +145,10 @@ pub struct CompactionReplayState {
 
 struct CompactionCheckpoint {
     seq: i64,
+    replay_from_seq: Option<i64>,
     messages: Vec<Value>,
     response_items: Option<Vec<Value>>,
-    has_replacement_history: bool,
+    initial_context_already_in_history: bool,
 }
 
 /// lib.rs:8920-8943.
@@ -159,7 +160,7 @@ pub fn latest_compaction_replacement_history(
             Some(response_items) => response_items_to_provider_messages(&response_items),
             None => checkpoint.messages,
         };
-        let mut initial_context_already_in_history = checkpoint.has_replacement_history;
+        let mut initial_context_already_in_history = checkpoint.initial_context_already_in_history;
         let mut messages = messages;
         if !initial_context_already_in_history {
             let mut initial_context =
@@ -171,7 +172,7 @@ pub fn latest_compaction_replacement_history(
             }
         }
         CompactionReplayState {
-            seq: checkpoint.seq,
+            seq: checkpoint.replay_from_seq.unwrap_or(checkpoint.seq),
             messages,
             initial_context_already_in_history,
         }
@@ -194,12 +195,19 @@ fn latest_compaction_checkpoint(events: &[EventRecord]) -> Option<CompactionChec
             .get("replacement_response_items")
             .and_then(Value::as_array)
             .cloned();
+        let has_replacement_history = event.payload.get("replacement_messages").is_some()
+            || event.payload.get("replacement_response_items").is_some();
+        let initial_context_already_in_history = event
+            .payload
+            .get("initial_context_already_in_history")
+            .and_then(Value::as_bool)
+            .unwrap_or(has_replacement_history);
         Some(CompactionCheckpoint {
             seq: event.seq,
+            replay_from_seq: event.payload.get("replay_from_seq").and_then(Value::as_i64),
             messages,
             response_items,
-            has_replacement_history: event.payload.get("replacement_messages").is_some()
-                || event.payload.get("replacement_response_items").is_some(),
+            initial_context_already_in_history,
         })
     })
 }

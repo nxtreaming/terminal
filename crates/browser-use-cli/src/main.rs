@@ -4088,6 +4088,7 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         session_thread_config: None,
         base_instructions: None,
         developer_instructions: None,
+        compact_prompt: None,
         model_provider_id: Some(config.provider.clone()),
         model_provider_id_source: RunConfigValueSource::Explicit,
         python_tool_timeout_seconds: config.python_timeout_seconds,
@@ -4096,6 +4097,9 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         final_output_json_schema: None,
         final_output_json_schema_strict: true,
         model_compaction_enabled: true,
+        model_auto_compact_token_limit: None,
+        model_auto_compact_token_limit_scope: AgentRunOptions::default()
+            .model_auto_compact_token_limit_scope,
         analytics_source: Some("cli".to_string()),
         analytics_provider_kind: Some(config.provider.clone()),
         analytics_model: Some(config.model.clone()),

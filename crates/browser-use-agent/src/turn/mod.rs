@@ -18,6 +18,12 @@ use crate::decision;
 use browser_use_llm::schema::Message;
 use tokio_util::sync::CancellationToken;
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CompactionMode {
+    PreTurn,
+    MidTurn,
+}
+
 /// Reads/writes conversation state. Impl over `ContextManager` + `Session`; tests
 /// use an `InMemoryTurnState`.
 pub trait TurnState: Send + Sync + 'static {
@@ -37,8 +43,11 @@ pub trait TurnState: Send + Sync + 'static {
     /// (over `ContextManager` + `Session`) overrides this to summarize history
     /// and reset token accounting; the loop tests override it to assert the hook
     /// fired exactly when `token_limit_reached && needs_follow_up`.
-    fn compact(&self) -> impl std::future::Future<Output = ()> + Send {
-        async {}
+    fn compact(
+        &self,
+        _mode: CompactionMode,
+    ) -> impl std::future::Future<Output = Result<(), crate::AgentError>> + Send {
+        async { Ok(()) }
     }
 }
 

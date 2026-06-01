@@ -1,5 +1,5 @@
 //! Integration proof that **automatic context compaction fires at the real
-//! ~80%-of-window token threshold**, then the turn CONTINUES with reduced
+//! ~90%-of-window token threshold**, then the turn CONTINUES with reduced
 //! context — driven end-to-end through the production [`TurnLoop`] +
 //! [`CompactingTurnState`] + model-based [`run_compaction`].
 //!
@@ -9,17 +9,17 @@
 //! *control flow* but NOT that the trigger fires at the production threshold.
 //!
 //! Here, the loop's [`TurnState::token_status`] is computed by the **production**
-//! [`decision::TokenStatus::from_estimate`] (the codex/legacy 80%-of-window
+//! [`decision::TokenStatus::from_estimate`] (the codex/legacy 90%-of-window
 //! auto-compact math, `decision/loop_decision.rs`) applied to the **live**
 //! [`ContextManager::estimate_total_tokens`] of the SAME shared history the
 //! turn loop samples. Nothing hardcodes the trigger bool: it is derived, every
-//! iteration, from the real token estimate vs. the real 80% limit. The window
-//! is chosen from that real estimate so the seeded history lands just over 80%;
-//! a control case sizes the window so the identical history sits under 80% and
+//! iteration, from the real token estimate vs. the real 90% limit. The window
+//! is chosen from that real estimate so the seeded history lands just over 90%;
+//! a control case sizes the window so the identical history sits under 90% and
 //! proves NO compaction occurs. So the boundary itself is what is under test.
 //!
 //! ## What is real vs. simulated
-//! - REAL: the 80% threshold function (`from_estimate`), the trigger gate
+//! - REAL: the 90% threshold function (`from_estimate`), the trigger gate
 //!   (`classify_loop_step` → `CompactThenContinue`), the loop sequencing
 //!   (`TurnLoop::run`), the model-based summary pass plumbing
 //!   (`CompactingTurnState::compact` → `run_compaction`), the shared
@@ -41,7 +41,9 @@ use browser_use_llm::schema::Message;
 use serde_json::json;
 use tokio_util::sync::CancellationToken;
 
-use crate::compact::{is_summary_message, CompactingTurnState, CompactionSampler, SUMMARY_PREFIX};
+use crate::compact::{
+    is_summary_message, CompactingTurnState, CompactionSampler, CompactionSummary, SUMMARY_PREFIX,
+};
 use crate::context::assembly::TruncationPolicy;
 use crate::context::{ContextManager, Item};
 use crate::decision::{SamplingOutcome, TokenStatus};
@@ -79,9 +81,9 @@ impl CompactionSampler for ScriptedSummarySampler {
         &self,
         _request: Vec<Message>,
         _cancel: CancellationToken,
-    ) -> Result<String, AgentError> {
+    ) -> Result<CompactionSummary, AgentError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
-        Ok(self.summary.clone())
+        Ok(CompactionSummary::text(self.summary.clone()))
     }
 }
 
@@ -162,13 +164,13 @@ impl TurnObserver for Arc<RecordingObserver> {
 ///
 /// This is the load-bearing seam of the test: the loop's compaction trigger is
 /// recomputed each iteration from the genuine token estimate of the genuine
-/// history vs. the genuine 80% limit — so when the loop decides to compact, it
+/// history vs. the genuine 90% limit — so when the loop decides to compact, it
 /// is the production threshold logic that decided, and once `compact()` shrinks
-/// the shared history the recomputed estimate drops back under 80% on its own
+/// the shared history the recomputed estimate drops back under 90% on its own
 /// (no hand-flipped flag), letting the turn CONTINUE to completion.
 struct ThresholdDrivenState<S: CompactionSampler> {
     inner: CompactingTurnState<S>,
-    /// The model context-window budget the production 80% math runs against.
+    /// The model context-window budget the production 90% math runs against.
     context_window: i64,
     /// Recorded `(estimated_tokens, token_limit_reached)` per `token_status`
     /// read, so the test can prove the boundary crossed exactly as expected.
@@ -213,7 +215,7 @@ impl<S: CompactionSampler + 'static> TurnState for ThresholdDrivenState<S> {
     async fn token_status(&self) -> TokenStatus {
         // REAL token estimate of the REAL live history the loop just sampled.
         let estimated = self.context().lock().unwrap().estimate_total_tokens();
-        // REAL production 80%-of-window auto-compact math.
+        // REAL production 90%-of-window auto-compact math.
         let status = TokenStatus::from_estimate(estimated, self.context_window);
         self.samples
             .lock()
@@ -222,8 +224,8 @@ impl<S: CompactionSampler + 'static> TurnState for ThresholdDrivenState<S> {
         status
     }
 
-    async fn compact(&self) {
-        self.inner.compact().await
+    async fn compact(&self, mode: crate::turn::CompactionMode) -> Result<(), crate::AgentError> {
+        self.inner.compact(mode).await
     }
 }
 
@@ -293,7 +295,7 @@ fn seed_history(n: usize) -> (ContextManager, i64) {
 }
 
 /// The production auto-compact limit for `window`, recomputed exactly like
-/// `decision::TokenStatus::from_estimate` does (`(window as f64 * 0.8) as i64`).
+/// `decision::TokenStatus::from_estimate` does (`(window * 9) / 10`).
 fn production_auto_compact_limit(window: i64) -> i64 {
     TokenStatus::from_estimate(window, window).auto_compact_scope_limit
 }
@@ -311,26 +313,26 @@ async fn auto_compaction_fires_at_production_threshold_then_turn_continues() {
     assert!(original_len >= 2, "seeded history has many items");
 
     // 2. Pick the context window so the REAL estimate lands JUST OVER the real
-    //    80% limit: window = floor(estimate / 0.8) makes limit = (window*0.8) <=
+    //    90% limit: window = floor(estimate / 0.9) makes limit = (window*0.9) <=
     //    estimate, i.e. token_limit_reached == true at exactly this estimate.
     //    The window is derived from the production fraction, not hardcoded.
-    let window = ((estimate as f64) / 0.8).floor() as i64;
+    let window = ((estimate as f64) / 0.9).floor() as i64;
     let limit = production_auto_compact_limit(window);
     assert!(
         estimate >= limit,
-        "precondition: estimate {estimate} >= 80% limit {limit} (over threshold)"
+        "precondition: estimate {estimate} >= 90% limit {limit} (over threshold)"
     );
     assert!(
         estimate < window,
         "precondition: estimate {estimate} < window {window} (not at the hard ceiling — \
-         we are exercising the SOFT 80% auto-compact trigger)"
+         we are exercising the SOFT 90% auto-compact trigger)"
     );
 
     // 3. Wire the REAL CompactingTurnState (shared ContextManager + model-based
     //    summary sampler), wrapped so the loop's token_status comes from the
     //    PRODUCTION from_estimate over the live history. `without_pressure_relief`
     //    is NOT used: we rely on the real post-compaction estimate dropping back
-    //    under 80% to end the loop, proving genuine continuation.
+    //    under 90% to end the loop, proving genuine continuation.
     let summary = ScriptedSummarySampler::new("auto-compaction handoff summary");
     let ctx_handle = Arc::new(Mutex::new(manager));
     let compacting = CompactingTurnState::new(
@@ -347,7 +349,7 @@ async fn auto_compaction_fires_at_production_threshold_then_turn_continues() {
 
     // 4. Loop round-trips: iter 1 the model wants follow-up → with the threshold
     //    crossed this is CompactThenContinue (compaction fires); iter 2 completes
-    //    (the shrunken history is now under 80%).
+    //    (the shrunken history is now under 90%).
     let loop_sampler = LoopSampler::new(vec![
         follow_up("model wants to continue, and we are over budget"),
         complete("done after auto-compaction"),
@@ -368,7 +370,7 @@ async fn auto_compaction_fires_at_production_threshold_then_turn_continues() {
     assert_eq!(
         summary.calls(),
         1,
-        "compaction's model summary pass ran exactly once after the 80% trigger"
+        "compaction's model summary pass ran exactly once after the 90% trigger"
     );
 
     // (b) The trigger was decided by the REAL threshold function: the FIRST
@@ -383,12 +385,12 @@ async fn auto_compaction_fires_at_production_threshold_then_turn_continues() {
     assert!(
         first_over,
         "the production from_estimate flagged the seeded history ({first_estimate} tokens) \
-         as over the 80% limit ({limit})"
+         as over the 90% limit ({limit})"
     );
     let (last_estimate, last_over) = *samples.last().unwrap();
     assert!(
         !last_over,
-        "after compaction the production from_estimate is back under the 80% limit \
+        "after compaction the production from_estimate is back under the 90% limit \
          (estimate dropped {first_estimate} -> {last_estimate})"
     );
     assert!(
@@ -446,19 +448,19 @@ async fn auto_compaction_fires_at_production_threshold_then_turn_continues() {
 #[tokio::test]
 async fn no_compaction_below_production_threshold() {
     // Identical history; but size the window so the SAME real estimate sits
-    // comfortably under the real 80% limit. The production from_estimate must
+    // comfortably under the real 90% limit. The production from_estimate must
     // therefore never flag the limit, the summary pass must never run, and the
     // history must be left intact even though the model asks to continue.
     let (manager, estimate) = seed_history(12);
     let original_len = manager.items().len();
 
-    // window large enough that 80% of it strictly exceeds the estimate:
-    //   limit = (window * 0.8) > estimate  <=>  window > estimate / 0.8.
-    let window = ((estimate as f64) / 0.8).ceil() as i64 + 10_000;
+    // window large enough that 90% of it strictly exceeds the estimate:
+    //   limit = (window * 0.9) > estimate  <=>  window > estimate / 0.9.
+    let window = ((estimate as f64) / 0.9).ceil() as i64 + 10_000;
     let limit = production_auto_compact_limit(window);
     assert!(
         estimate < limit,
-        "precondition: estimate {estimate} < 80% limit {limit} (under threshold)"
+        "precondition: estimate {estimate} < 90% limit {limit} (under threshold)"
     );
 
     let summary = ScriptedSummarySampler::new("should-never-be-produced");
@@ -492,14 +494,14 @@ async fn no_compaction_below_production_threshold() {
     assert_eq!(
         summary.calls(),
         0,
-        "no summary pass below the 80% threshold"
+        "no summary pass below the 90% threshold"
     );
     // The production threshold function never flagged the limit.
     let samples = turn.state().samples();
     assert!(!samples.is_empty(), "token_status was read");
     assert!(
         samples.iter().all(|(_, over)| !*over),
-        "the production from_estimate never crossed 80% for this window"
+        "the production from_estimate never crossed 90% for this window"
     );
     // History untouched; turn still completed via plain follow-up/continue.
     let after = ctx_handle.lock().unwrap().items().to_vec();

@@ -532,6 +532,7 @@ mod tests {
     #[test]
     fn config_for_cwd_uses_terminal_home() -> Result<()> {
         let temp = tempdir()?;
+        let _guard = crate::test_env::lock();
         // Point the terminal home at a scratch dir so the test is hermetic.
         std::env::set_var("BROWSER_USE_TERMINAL_HOME", temp.path());
         let config = message_history_config_for_cwd_with_options(

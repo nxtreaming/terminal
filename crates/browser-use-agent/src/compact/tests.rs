@@ -27,7 +27,8 @@ use tokio_util::sync::CancellationToken;
 
 use crate::compact::{
     build_compacted_history, is_summary_message, run_compaction, CompactingTurnState,
-    CompactionSampler, COMPACT_USER_MESSAGE_MAX_TOKENS, SUMMARY_PREFIX,
+    CompactionSampler, CompactionSummary, COMPACT_USER_MESSAGE_MAX_TOKENS, SUMMARIZATION_PROMPT,
+    SUMMARY_PREFIX,
 };
 use crate::context::assembly::TruncationPolicy;
 use crate::context::{ContextManager, Item};
@@ -44,17 +45,24 @@ use crate::AgentError;
 /// test can assert the drop-oldest retry shrank the request). The summary pass is
 /// always model-based; this is just a network-free stand-in for the real model.
 struct ScriptedSampler {
-    results: Mutex<VecDeque<Result<String, AgentError>>>,
+    results: Mutex<VecDeque<Result<CompactionSummary, AgentError>>>,
     calls: AtomicUsize,
     request_lens: Mutex<Vec<usize>>,
+    request_texts: Mutex<Vec<Vec<String>>>,
 }
 
 impl ScriptedSampler {
     fn new(results: Vec<Result<String, AgentError>>) -> Arc<Self> {
         Arc::new(Self {
-            results: Mutex::new(results.into_iter().collect()),
+            results: Mutex::new(
+                results
+                    .into_iter()
+                    .map(|result| result.map(CompactionSummary::text))
+                    .collect(),
+            ),
             calls: AtomicUsize::new(0),
             request_lens: Mutex::new(Vec::new()),
+            request_texts: Mutex::new(Vec::new()),
         })
     }
 
@@ -68,16 +76,26 @@ impl CompactionSampler for ScriptedSampler {
         &self,
         request: Vec<Message>,
         _cancel: CancellationToken,
-    ) -> Result<String, AgentError> {
+    ) -> Result<CompactionSummary, AgentError> {
         self.calls.fetch_add(1, Ordering::SeqCst);
         self.request_lens.lock().unwrap().push(request.len());
+        self.request_texts.lock().unwrap().push(
+            request
+                .iter()
+                .flat_map(|message| message.content.iter())
+                .filter_map(|part| match part {
+                    ContentPart::Text { text } => Some(text.clone()),
+                    _ => None,
+                })
+                .collect(),
+        );
         // Past the end of the queue, default to an empty summary so a mis-scripted
         // test fails loudly rather than hanging.
         self.results
             .lock()
             .unwrap()
             .pop_front()
-            .unwrap_or_else(|| Ok(String::new()))
+            .unwrap_or_else(|| Ok(CompactionSummary::text(String::new())))
     }
 }
 
@@ -132,6 +150,7 @@ async fn run_compaction_preserves_recent_users_and_appends_prefixed_summary() {
     let compacted = run_compaction(
         &history,
         sampler.as_ref(),
+        SUMMARIZATION_PROMPT,
         COMPACT_USER_MESSAGE_MAX_TOKENS,
         CancellationToken::new(),
     )
@@ -174,6 +193,36 @@ async fn run_compaction_preserves_recent_users_and_appends_prefixed_summary() {
         .strip_prefix(&format!("{SUMMARY_PREFIX}\n"))
         .expect("summary carries the exact prefix");
     assert_eq!(suffix, "model wrote this handoff summary");
+}
+
+#[tokio::test]
+async fn run_compaction_uses_supplied_compact_prompt() {
+    let history = vec![user_item("keep this")];
+    let sampler = ScriptedSampler::new(vec![Ok("summary".to_string())]);
+    let custom_prompt = "Write a tiny checkpoint.";
+
+    run_compaction(
+        &history,
+        sampler.as_ref(),
+        custom_prompt,
+        COMPACT_USER_MESSAGE_MAX_TOKENS,
+        CancellationToken::new(),
+    )
+    .await
+    .expect("compaction should succeed");
+
+    let request_texts = sampler.request_texts.lock().unwrap().clone();
+    let first_request = request_texts.first().expect("summary request recorded");
+    assert_eq!(
+        first_request.last().map(String::as_str),
+        Some(custom_prompt)
+    );
+    assert!(
+        !first_request
+            .iter()
+            .any(|text| text == crate::compact::SUMMARIZATION_PROMPT),
+        "custom compact prompt should replace the default prompt"
+    );
 }
 
 // ---- (2) the summary prefix is byte-identical to legacy/codex --------------
@@ -266,6 +315,7 @@ async fn context_window_exceeded_drops_oldest_then_retries_and_succeeds() {
     let compacted = run_compaction(
         &history,
         sampler.as_ref(),
+        SUMMARIZATION_PROMPT,
         COMPACT_USER_MESSAGE_MAX_TOKENS,
         CancellationToken::new(),
     )
@@ -308,6 +358,7 @@ async fn context_window_exceeded_with_only_prompt_left_propagates() {
     let err = run_compaction(
         &history,
         sampler.as_ref(),
+        SUMMARIZATION_PROMPT,
         COMPACT_USER_MESSAGE_MAX_TOKENS,
         CancellationToken::new(),
     )
@@ -330,6 +381,7 @@ async fn empty_model_summary_yields_prefix_only_summary() {
     let compacted = run_compaction(
         &history,
         sampler.as_ref(),
+        SUMMARIZATION_PROMPT,
         COMPACT_USER_MESSAGE_MAX_TOKENS,
         CancellationToken::new(),
     )

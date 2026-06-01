@@ -2,6 +2,17 @@
 
 use browser_use_llm::schema::FinishReason;
 
+/// Selects which part of the active context is charged against the auto-compact
+/// token limit. Mirrors Codex `AutoCompactTokenLimitScope`.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub enum AutoCompactTokenLimitScope {
+    /// Count the full active context against the limit.
+    #[default]
+    Total,
+    /// Count growth after the carried compaction-window prefix.
+    BodyAfterPrefix,
+}
+
 #[derive(Debug, Clone, Default)]
 pub struct SamplingOutcome {
     /// `turn.rs:250`.
@@ -26,37 +37,107 @@ impl TokenStatus {
         self.token_limit_reached || self.full_context_window_limit_reached
     }
 
-    /// Build a REAL token status from the estimated tokens currently in context
-    /// and the model's context-window budget (codex/legacy `Session` auto-compact
-    /// math) — "compact early and often".
+    /// Build a Codex-parity token status from the active context usage.
     ///
-    /// Parity (legacy `browser-use-core::Session`, itself a codex port, in
-    /// `terminal/crates/browser-use-core/src/lib.rs`; codex
-    /// `model_auto_compact_token_limit`):
-    /// - auto-compact limit = `(context_window as f64 * 0.8) as i64` — the limit
-    ///   falls back to **80% of the model context window** when no explicit
-    ///   `model_auto_compact_token_limit` is configured. The trigger therefore
-    ///   fires at 80% of the window, NOT at 100% (compact early and often).
-    /// - `token_limit_reached` (soft auto-compact trigger) =
-    ///   `estimated_tokens >= auto_compact_limit` (codex `total >= limit`).
-    /// - `full_context_window_limit_reached` (hard ceiling) =
-    ///   `estimated_tokens >= context_window`.
-    ///
-    /// `context_window == 0` means the budget is unknown; codex returns `None`
-    /// from the auto-compact limit and never compacts, so this yields a zeroed
-    /// status and the loop's gate never trips.
+    /// Codex defaults the auto-compact limit to 90% of the model context window,
+    /// clamps explicit limits to that value, and optionally counts only growth
+    /// after a carried compaction-window prefix.
+    pub fn from_usage(
+        active_context_tokens: i64,
+        prefix_prefill_tokens: Option<i64>,
+        context_window: Option<i64>,
+        configured_limit: Option<i64>,
+        scope: AutoCompactTokenLimitScope,
+    ) -> Self {
+        let Some(auto_compact_scope_limit) =
+            auto_compact_token_limit(context_window, configured_limit)
+        else {
+            return Self::default();
+        };
+
+        let (auto_compact_scope_tokens, full_context_window_limit_reached) = match scope {
+            AutoCompactTokenLimitScope::Total => (active_context_tokens, false),
+            AutoCompactTokenLimitScope::BodyAfterPrefix => {
+                let baseline = prefix_prefill_tokens.unwrap_or(active_context_tokens);
+                (
+                    active_context_tokens.saturating_sub(baseline),
+                    context_window.is_some_and(|window| active_context_tokens >= window),
+                )
+            }
+        };
+
+        Self {
+            auto_compact_scope_tokens,
+            auto_compact_scope_limit,
+            full_context_window_limit_reached,
+            token_limit_reached: auto_compact_scope_tokens >= auto_compact_scope_limit
+                || full_context_window_limit_reached,
+        }
+    }
+
+    /// Convenience wrapper for callers that only have a full-context estimate.
     pub fn from_estimate(estimated_tokens: i64, context_window: i64) -> Self {
         if context_window <= 0 {
             return Self::default();
         }
-        // codex/legacy: (context_window as f64 * 0.8) as i64.
-        let auto_compact_limit = (context_window as f64 * 0.8) as i64;
+        Self::from_usage(
+            estimated_tokens,
+            None,
+            Some(context_window),
+            None,
+            AutoCompactTokenLimitScope::Total,
+        )
+    }
+
+    /// Build from Codex's already-resolved pieces:
+    ///
+    /// - `auto_compact_scope_limit` is `model_info.auto_compact_token_limit()`,
+    ///   after config/model metadata overrides and 90%-of-raw-window clamping.
+    /// - `full_context_window_limit` is the effective model window
+    ///   (`effective_context_window_percent`, 95% by default), used only by
+    ///   `BodyAfterPrefix`.
+    pub fn from_codex_usage(
+        active_context_tokens: i64,
+        prefix_prefill_tokens: Option<i64>,
+        auto_compact_scope_limit: Option<i64>,
+        full_context_window_limit: Option<i64>,
+        scope: AutoCompactTokenLimitScope,
+    ) -> Self {
+        let auto_compact_scope_limit = auto_compact_scope_limit
+            .filter(|limit| *limit > 0)
+            .unwrap_or(i64::MAX);
+        let (auto_compact_scope_tokens, full_context_window_limit_reached) = match scope {
+            AutoCompactTokenLimitScope::Total => (active_context_tokens, false),
+            AutoCompactTokenLimitScope::BodyAfterPrefix => {
+                let baseline = prefix_prefill_tokens.unwrap_or(active_context_tokens);
+                (
+                    active_context_tokens.saturating_sub(baseline),
+                    full_context_window_limit.is_some_and(|limit| active_context_tokens >= limit),
+                )
+            }
+        };
+
         Self {
-            auto_compact_scope_tokens: estimated_tokens,
-            auto_compact_scope_limit: auto_compact_limit,
-            full_context_window_limit_reached: estimated_tokens >= context_window,
-            token_limit_reached: estimated_tokens >= auto_compact_limit,
+            auto_compact_scope_tokens,
+            auto_compact_scope_limit,
+            full_context_window_limit_reached,
+            token_limit_reached: auto_compact_scope_tokens >= auto_compact_scope_limit
+                || full_context_window_limit_reached,
         }
+    }
+}
+
+pub fn auto_compact_token_limit(
+    context_window: Option<i64>,
+    configured: Option<i64>,
+) -> Option<i64> {
+    let context_limit = context_window
+        .filter(|window| *window > 0)
+        .map(|window| (window * 9) / 10);
+    match (context_limit, configured.filter(|limit| *limit > 0)) {
+        (Some(context_limit), Some(configured)) => Some(configured.min(context_limit)),
+        (Some(context_limit), None) => Some(context_limit),
+        (None, configured) => configured,
     }
 }
 
@@ -185,32 +266,46 @@ mod tests {
         assert!(should_compact_mid_turn(true, true));
     }
 
-    // ---- TokenStatus::from_estimate (codex 80%-of-window auto-compact) ----
+    // ---- TokenStatus::from_estimate (codex 90%-of-window auto-compact) ----
     #[test]
-    fn from_estimate_fires_at_80_percent_of_window() {
-        // window 1000 -> auto-compact limit = 800 (context_window * 0.8).
-        let below = TokenStatus::from_estimate(799, 1000);
-        assert!(!below.token_limit_reached, "799 < 800 must not trigger");
+    fn from_estimate_fires_at_90_percent_of_window() {
+        // window 1000 -> auto-compact limit = 900 (context_window * 0.9).
+        let below = TokenStatus::from_estimate(899, 1000);
+        assert!(!below.token_limit_reached, "899 < 900 must not trigger");
         assert!(!below.full_context_window_limit_reached);
         assert!(!below.needs_compaction());
 
-        let at = TokenStatus::from_estimate(800, 1000);
-        assert!(at.token_limit_reached, "800 >= 800 must trigger (codex >=)");
+        let at = TokenStatus::from_estimate(900, 1000);
+        assert!(at.token_limit_reached, "900 >= 900 must trigger (codex >=)");
         assert!(at.needs_compaction());
-        assert!(!at.full_context_window_limit_reached, "800 < 1000 window");
-        assert_eq!(at.auto_compact_scope_limit, 800);
-        assert_eq!(at.auto_compact_scope_tokens, 800);
+        assert_eq!(at.auto_compact_scope_limit, 900);
+        assert_eq!(at.auto_compact_scope_tokens, 900);
     }
 
     #[test]
-    fn from_estimate_sets_full_window_at_ceiling() {
+    fn from_usage_body_after_prefix_sets_full_window_at_ceiling() {
         let full = TokenStatus::from_estimate(1000, 1000);
         assert!(full.token_limit_reached);
-        assert!(
-            full.full_context_window_limit_reached,
-            "1000 >= 1000 window is the hard ceiling"
+        assert!(!full.full_context_window_limit_reached);
+
+        let scoped = TokenStatus::from_usage(
+            1000,
+            Some(100),
+            Some(1000),
+            None,
+            AutoCompactTokenLimitScope::BodyAfterPrefix,
         );
-        assert!(full.needs_compaction());
+        assert!(scoped.full_context_window_limit_reached);
+        assert!(scoped.needs_compaction());
+    }
+
+    #[test]
+    fn auto_compact_limit_defaults_to_90_percent_and_clamps_configured_limit() {
+        assert_eq!(auto_compact_token_limit(Some(1000), None), Some(900));
+        assert_eq!(auto_compact_token_limit(Some(1000), Some(950)), Some(900));
+        assert_eq!(auto_compact_token_limit(Some(1000), Some(500)), Some(500));
+        assert_eq!(auto_compact_token_limit(None, Some(500)), Some(500));
+        assert_eq!(auto_compact_token_limit(None, None), None);
     }
 
     #[test]

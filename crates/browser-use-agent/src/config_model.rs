@@ -629,12 +629,8 @@ mod tests {
         assert_eq!(config_override_str(&ov, "absent"), None);
     }
 
-    /// Serializes the `BROWSER_USE_TERMINAL_HOME` env mutation across the
-    /// config.toml-layer tests (they share process-global env state).
-    static HOME_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn with_home<T>(home: &Path, f: impl FnOnce() -> T) -> T {
-        let _guard = HOME_ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let _guard = crate::test_env::lock();
         let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         std::env::set_var("BROWSER_USE_TERMINAL_HOME", home);
         let result = f();

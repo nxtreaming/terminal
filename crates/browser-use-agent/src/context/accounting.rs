@@ -154,17 +154,30 @@ impl TokenUsageInfo {
         }
     }
 
-    /// Record (or overwrite) the model context window.
+    /// Mark usage as filling the model context window, matching Codex
+    /// `TokenUsageInfo::fill_to_context_window`.
     pub fn fill_to_context_window(&mut self, window: i64) {
+        let previous_total = self.total.total;
+        let delta = window.saturating_sub(previous_total).max(0);
         self.model_context_window = Some(window);
+        self.total = TokenUsage {
+            total: window,
+            ..Default::default()
+        };
+        self.last = TokenUsage {
+            total: delta,
+            ..Default::default()
+        };
     }
 
-    /// Construct an info whose context window is set to `window` (no usage yet).
+    /// Construct an info whose usage fills `window`.
     pub fn full_context_window(window: i64) -> Self {
-        Self {
+        let mut info = Self {
             total: TokenUsage::default(),
             last: TokenUsage::default(),
             model_context_window: Some(window),
-        }
+        };
+        info.fill_to_context_window(window);
+        info
     }
 }

@@ -159,9 +159,12 @@ fn token_usage_info_new_or_append() {
 fn token_usage_info_window_helpers() {
     let mut info = TokenUsageInfo::full_context_window(4096);
     assert_eq!(info.model_context_window, Some(4096));
-    assert_eq!(info.total, TokenUsage::default());
+    assert_eq!(info.total.total, 4096);
+    assert_eq!(info.last.total, 4096);
     info.fill_to_context_window(9000);
     assert_eq!(info.model_context_window, Some(9000));
+    assert_eq!(info.total.total, 9000);
+    assert_eq!(info.last.total, 4904);
 }
 
 // ---------------------------------------------------------------------------

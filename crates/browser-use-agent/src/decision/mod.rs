@@ -8,8 +8,9 @@ pub mod retry;
 pub mod tool_decision;
 
 pub use loop_decision::{
-    can_drain_after_compact, classify_loop_step, initial_can_drain, needs_follow_up,
-    should_compact_mid_turn, token_limit_reached, LoopStep, SamplingOutcome, TokenStatus,
+    auto_compact_token_limit, can_drain_after_compact, classify_loop_step, initial_can_drain,
+    needs_follow_up, should_compact_mid_turn, token_limit_reached, AutoCompactTokenLimitScope,
+    LoopStep, SamplingOutcome, TokenStatus,
 };
 pub use retry::{backoff_ms, retry_decision, RetryAction};
 pub use tool_decision::{classify_parallelism, ToolParallelism};
@@ -28,6 +29,11 @@ mod tests {
         assert!(should_compact_mid_turn(true, true));
         assert!(can_drain_after_compact(false));
         assert!(initial_can_drain(false));
+        assert_eq!(auto_compact_token_limit(Some(100), None), Some(90));
+        assert_eq!(
+            AutoCompactTokenLimitScope::default(),
+            AutoCompactTokenLimitScope::Total
+        );
         let out = SamplingOutcome::default();
         let st = TokenStatus {
             auto_compact_scope_tokens: 0,

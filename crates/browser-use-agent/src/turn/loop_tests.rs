@@ -162,7 +162,7 @@ impl TurnState for InMemoryTurnState {
         self.token_status.lock().unwrap().clone()
     }
 
-    async fn compact(&self) {
+    async fn compact(&self, _mode: crate::turn::CompactionMode) -> Result<(), crate::AgentError> {
         self.compactions.fetch_add(1, Ordering::SeqCst);
         // Stub compaction body: after compacting, the (modeled) token pressure is
         // relieved so the loop does not compact forever. This keeps the
@@ -171,6 +171,7 @@ impl TurnState for InMemoryTurnState {
         let mut st = self.token_status.lock().unwrap();
         st.full_context_window_limit_reached = false;
         st.token_limit_reached = false;
+        Ok(())
     }
 }
 

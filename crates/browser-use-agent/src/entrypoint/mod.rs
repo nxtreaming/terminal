@@ -56,21 +56,27 @@ use std::sync::Mutex;
 
 use browser_use_llm::schema::{ContentPart, Message};
 use browser_use_protocol::EventRecord;
+use browser_use_store::Store;
+use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::compact::{run_compaction, CompactionSampler, COMPACT_USER_MESSAGE_MAX_TOKENS};
-use crate::config_overrides::ProviderRunConfig;
+use crate::compact::{
+    compacted_history_from_summary, compaction_prompt_item, compaction_request_messages,
+    is_summary_message, CompactionSampler, CompactionSummary, COMPACT_USER_MESSAGE_MAX_TOKENS,
+};
+use crate::config_overrides::{model_context_metadata_for_model, ProviderRunConfig};
+use crate::context::accounting::TokenUsage;
 use crate::context::assembly::TruncationPolicy;
 use crate::context::workspace_context::append_environment_context_event;
 use crate::context::{ContextManager, Item};
-use crate::decision::SamplingOutcome;
-use crate::decision::TokenStatus;
+use crate::decision::{AutoCompactTokenLimitScope, SamplingOutcome, TokenStatus};
 use crate::events::{names, session_done_payload, EventSink, PendingEvent, TurnCtx};
-use crate::session::provider_messages_from_events;
 use crate::session::SessionId;
 use crate::session::SharedStore;
+use crate::session::{initial_context_messages_from_events, provider_messages_from_events};
 use crate::task::TurnLifecycleEvent;
 use crate::turn::sampling::FusionRecorder;
+use crate::turn::CompactionMode;
 use crate::turn::SamplingDriver;
 use crate::turn::TurnLoop;
 use crate::turn::TurnObserver;
@@ -100,8 +106,80 @@ type RecordedBuffer = Arc<Mutex<Vec<Message>>>;
 /// the facade uses codex's default budget. Wave-E threads the real value through.
 const DEFAULT_STREAM_MAX_RETRIES: u32 = 5;
 const SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT: &str = "session.followup.pending";
+const SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT: &str = "session.followup.interrupt_sent";
 const SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT: &str = "session.followup.cancelled";
+const AGENT_TURN_QUEUE_DRAINED_EVENT: &str = "agent.turn_queue_drained";
 const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
+
+#[derive(Clone, Copy, Debug)]
+struct AutoCompactWindow {
+    ordinal: u64,
+    prefill_input_tokens: Option<AutoCompactWindowPrefill>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum AutoCompactWindowPrefill {
+    ServerObserved(i64),
+    Estimated(i64),
+}
+
+impl Default for AutoCompactWindow {
+    fn default() -> Self {
+        Self {
+            ordinal: 1,
+            prefill_input_tokens: None,
+        }
+    }
+}
+
+impl AutoCompactWindow {
+    fn start_next(&mut self) {
+        self.ordinal = self.ordinal.saturating_add(1);
+        self.prefill_input_tokens = None;
+    }
+
+    fn set_estimated_prefill(&mut self, tokens: i64) {
+        if matches!(
+            self.prefill_input_tokens,
+            Some(AutoCompactWindowPrefill::ServerObserved(_))
+        ) {
+            return;
+        }
+        self.prefill_input_tokens = Some(AutoCompactWindowPrefill::Estimated(tokens.max(0)));
+    }
+
+    fn ensure_server_observed_prefill_from_usage(&mut self, usage: &TokenUsage) {
+        if matches!(
+            self.prefill_input_tokens,
+            Some(AutoCompactWindowPrefill::ServerObserved(_))
+        ) {
+            return;
+        }
+        self.prefill_input_tokens =
+            Some(AutoCompactWindowPrefill::ServerObserved(usage.input.max(0)));
+    }
+
+    fn prefill_input_tokens(&self) -> Option<i64> {
+        match self.prefill_input_tokens {
+            Some(AutoCompactWindowPrefill::ServerObserved(tokens))
+            | Some(AutoCompactWindowPrefill::Estimated(tokens)) => Some(tokens),
+            None => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+struct ActivePromptTokens {
+    active: i64,
+    provider_usage: Option<TokenUsage>,
+}
+
+#[derive(Clone)]
+struct PreviousModelCompaction {
+    model: String,
+    model_context_window: i64,
+    sampler: Arc<dyn DynCompactionSampler>,
+}
 
 /// A [`TurnState`] backed by the session's durable event log, with REAL codex-
 /// parity token accounting + model-based compaction.
@@ -112,12 +190,14 @@ const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
 /// buffer (the fusion seam) for the rest of the run.
 ///
 /// ## Token accounting + compaction (this WP)
-/// - [`token_status`](TurnState::token_status) estimates the CURRENT prompt's
-///   tokens (`ContextManager::estimate_total_tokens`, `bytes.div_ceil(4)` per
-///   item) and compares to the 80%-of-window auto-compact limit
-///   ([`TokenStatus::from_estimate`], codex `Session::auto_compact_token_limit`).
-///   "Compact early and often": the trigger fires at 80%, well before the
-///   provider would reject for length.
+/// - [`token_status`](TurnState::token_status) prefers provider-reported token
+///   usage from the latest post-compaction `token_count`/`model.usage` event,
+///   then adds a local estimate for items appended after that model response
+///   (`ContextManager::total_token_usage`, codex `get_total_token_usage` shape).
+///   If a provider omits usage or no model response has completed yet, it falls
+///   back to the whole-prompt byte estimate (`bytes.div_ceil(4)` per item).
+///   The resulting active usage is compared to the 90%-of-window auto-compact
+///   limit ([`TokenStatus::from_usage`]).
 /// - [`compact`](TurnState::compact) runs the model-based no-tools summary pass
 ///   ([`run_compaction`]) and INSTALLS the codex-parity `[preserved recent user
 ///   messages] + [PREFIX + summary]` as a `compacted` override that REPLACES the
@@ -134,9 +214,18 @@ struct StoreTurnState {
     /// prompt sees them. Shared (`Arc`) with the fused driver's [`FusionRecorder`]
     /// ([`BufferRecorder`]) so what the driver dispatches re-enters the next prompt.
     recorded: RecordedBuffer,
-    /// The model context-window budget (tokens). Drives the 80% auto-compact
-    /// trigger via [`TokenStatus::from_estimate`]. `0` disables compaction.
+    /// The effective model context-window budget (tokens). Codex applies
+    /// `effective_context_window_percent` (95% by default) before using this as a
+    /// full-window guard.
     context_window_tokens: i64,
+    model_auto_compact_token_limit: Option<i64>,
+    auto_compact_scope: AutoCompactTokenLimitScope,
+    auto_compact_window: Mutex<AutoCompactWindow>,
+    pre_turn_replay_from_seq: Mutex<Option<i64>>,
+    compact_prompt: String,
+    base_instructions: String,
+    current_model: Option<String>,
+    previous_model_compaction: Option<PreviousModelCompaction>,
     /// The model-based summary pass for [`compact`](TurnState::compact). `None`
     /// disables compaction (the no-sampler / `Fake` path); the production run sets
     /// a real [`EntrypointSampler`].
@@ -162,6 +251,14 @@ impl StoreTurnState {
             session_id,
             recorded,
             context_window_tokens: 0,
+            model_auto_compact_token_limit: None,
+            auto_compact_scope: AutoCompactTokenLimitScope::Total,
+            auto_compact_window: Mutex::new(AutoCompactWindow::default()),
+            pre_turn_replay_from_seq: Mutex::new(None),
+            compact_prompt: crate::compact::SUMMARIZATION_PROMPT.to_string(),
+            base_instructions: crate::prompts::browser_agent_system_prompt(),
+            current_model: None,
+            previous_model_compaction: None,
             compaction_sampler: None,
             compacted: Mutex::new(None),
         }
@@ -172,10 +269,38 @@ impl StoreTurnState {
     fn with_compaction(
         mut self,
         context_window_tokens: i64,
+        configured_limit: Option<i64>,
+        scope: AutoCompactTokenLimitScope,
         sampler: Arc<dyn DynCompactionSampler>,
     ) -> Self {
         self.context_window_tokens = context_window_tokens;
+        self.model_auto_compact_token_limit = configured_limit;
+        self.auto_compact_scope = scope;
         self.compaction_sampler = Some(sampler);
+        self
+    }
+
+    fn with_compaction_prompt(mut self, prompt: impl Into<String>) -> Self {
+        self.compact_prompt = prompt.into();
+        self
+    }
+
+    fn with_compaction_instructions(
+        mut self,
+        base_instructions: impl Into<String>,
+        _developer_instructions: Option<String>,
+    ) -> Self {
+        self.base_instructions = base_instructions.into();
+        self
+    }
+
+    fn with_current_model(mut self, model: impl Into<String>) -> Self {
+        self.current_model = Some(model.into());
+        self
+    }
+
+    fn with_previous_model_compaction(mut self, previous: Option<PreviousModelCompaction>) -> Self {
+        self.previous_model_compaction = previous;
         self
     }
 
@@ -194,22 +319,155 @@ impl StoreTurnState {
         msgs
     }
 
-    /// Lower the CURRENT prompt history to provider-message [`Item`]s (the shape
-    /// [`run_compaction`] consumes).
-    fn current_prompt_items(&self) -> Vec<Item> {
-        self.assemble_prompt_blocking()
-            .iter()
-            .map(message_to_provider_item)
-            .collect()
+    fn current_prompt_items_for_compaction(&self, mode: CompactionMode) -> Vec<Item> {
+        let events = events_from_store(&self.store, self.session_id.as_str());
+        match mode {
+            CompactionMode::PreTurn => {
+                let replay_from = *self.pre_turn_replay_from_seq.lock().unwrap();
+                let events = events_through_seq(&events, replay_from);
+                self.current_prompt_items_from_events(&events)
+            }
+            CompactionMode::MidTurn => self.current_prompt_items_from_events(&events),
+        }
     }
 
-    /// Estimate the current prompt's tokens via a fresh [`ContextManager`] over the
-    /// lowered prompt items (`bytes.div_ceil(4)` per item — codex byte/token math).
-    fn estimate_prompt_tokens(&self) -> i64 {
-        let items = self.current_prompt_items();
+    fn current_prompt_items_from_events(
+        &self,
+        events: &[browser_use_protocol::EventRecord],
+    ) -> Vec<Item> {
+        let mut items = provider_messages_from_events(events);
+        items.extend(
+            self.recorded
+                .lock()
+                .unwrap()
+                .iter()
+                .map(message_to_provider_item),
+        );
+        items
+    }
+
+    /// Estimate the current prompt's tokens via a fresh [`ContextManager`] over
+    /// the lowered prompt items (`bytes.div_ceil(4)` per item).
+    fn estimate_prompt_tokens_from_items(&self, items: Vec<Item>) -> i64 {
         let mut mgr = ContextManager::new();
         mgr.record_items(items, TruncationPolicy::Bytes(usize::MAX));
         mgr.estimate_total_tokens()
+    }
+
+    /// Active context usage for compaction:
+    ///
+    /// - provider-reported latest response usage + locally estimated tail after
+    ///   the last model-generated item, when a non-zero usage record exists after
+    ///   the latest compaction checkpoint;
+    /// - otherwise the whole-prompt local byte/token estimate.
+    fn active_prompt_tokens_for_status(&self) -> ActivePromptTokens {
+        let events = events_from_store(&self.store, self.session_id.as_str());
+        let replay_from = *self.pre_turn_replay_from_seq.lock().unwrap();
+        let events = events_through_seq(&events, replay_from);
+        self.active_prompt_tokens_from_events(&events)
+    }
+
+    fn active_prompt_tokens_from_events(
+        &self,
+        events: &[browser_use_protocol::EventRecord],
+    ) -> ActivePromptTokens {
+        let items = self.current_prompt_items_from_events(events);
+
+        if let Some(usage) = latest_provider_token_usage_after_compaction(events) {
+            let mut mgr = ContextManager::new();
+            mgr.record_items(items, TruncationPolicy::Bytes(usize::MAX));
+            mgr.update_token_info(&usage, self.context_window());
+            let active = mgr.total_token_usage(true);
+            if active > 0 {
+                return ActivePromptTokens {
+                    active,
+                    provider_usage: Some(usage),
+                };
+            }
+            return ActivePromptTokens {
+                active: mgr.estimate_total_tokens(),
+                provider_usage: None,
+            };
+        }
+
+        ActivePromptTokens {
+            active: self.estimate_prompt_tokens_from_items(items),
+            provider_usage: None,
+        }
+    }
+
+    fn context_window(&self) -> Option<i64> {
+        (self.context_window_tokens > 0).then_some(self.context_window_tokens)
+    }
+
+    fn token_status_blocking(&self) -> TokenStatus {
+        if self.compaction_sampler.is_none() {
+            return TokenStatus::default();
+        }
+        let tokens = self.active_prompt_tokens_for_status();
+        let prefill = {
+            let mut window = self.auto_compact_window.lock().unwrap();
+            if tokens.provider_usage.is_some()
+                && matches!(
+                    self.auto_compact_scope,
+                    AutoCompactTokenLimitScope::BodyAfterPrefix
+                )
+            {
+                let usage = tokens.provider_usage.unwrap();
+                window.ensure_server_observed_prefill_from_usage(&usage);
+            }
+            window.prefill_input_tokens()
+        };
+        TokenStatus::from_codex_usage(
+            tokens.active,
+            prefill,
+            self.model_auto_compact_token_limit,
+            self.context_window(),
+            self.auto_compact_scope,
+        )
+    }
+
+    fn should_run_previous_model_downshift_compaction(&self) -> bool {
+        let Some(previous) = &self.previous_model_compaction else {
+            return false;
+        };
+        let Some(current_model) = self.current_model.as_deref() else {
+            return false;
+        };
+        if previous.model == current_model {
+            return false;
+        }
+        let Some(new_context_window) = self.context_window() else {
+            return false;
+        };
+        if previous.model_context_window <= new_context_window {
+            return false;
+        }
+
+        let active_context_tokens = self.active_prompt_tokens_for_status().active;
+        match self.auto_compact_scope {
+            AutoCompactTokenLimitScope::Total => {
+                active_context_tokens > self.model_auto_compact_token_limit.unwrap_or(i64::MAX)
+                    || active_context_tokens >= new_context_window
+            }
+            AutoCompactTokenLimitScope::BodyAfterPrefix => {
+                active_context_tokens >= new_context_window
+            }
+        }
+    }
+
+    async fn compact_previous_model_downshift_if_needed(&self) -> Result<bool, AgentError> {
+        if !self.should_run_previous_model_downshift_compaction() {
+            return Ok(false);
+        }
+        let previous = self
+            .previous_model_compaction
+            .as_ref()
+            .expect("checked previous model compaction")
+            .clone();
+        self.compact_with_sampler(CompactionMode::PreTurn, previous.sampler)
+            .await?;
+        Ok(true)
     }
 }
 
@@ -247,6 +505,7 @@ struct EntrypointSampler {
     route: browser_use_llm::route::Route,
     model: String,
     provider: String,
+    base_instructions: String,
 }
 
 impl CompactionSampler for EntrypointSampler {
@@ -254,18 +513,19 @@ impl CompactionSampler for EntrypointSampler {
         &self,
         request: Vec<Message>,
         cancel: CancellationToken,
-    ) -> Result<String, AgentError> {
-        use browser_use_llm::schema::{LlmEvent, LlmRequest, SystemPart};
+    ) -> Result<CompactionSummary, AgentError> {
+        use browser_use_llm::schema::LlmEvent;
         use futures_util::StreamExt;
 
         // Tool-free request (tools deliberately empty — the summary pass must not
         // call tools). `request` already carries the history + the summarization
         // prompt as its final user message (assembled by `run_compaction`).
-        let mut req = LlmRequest::new(self.model.clone(), self.provider.clone());
-        req.system.push(SystemPart::new(
-            crate::prompts::browser_agent_system_prompt(),
-        ));
-        req.messages = request;
+        let req = build_summary_llm_request(
+            &self.model,
+            &self.provider,
+            &self.base_instructions,
+            request,
+        );
 
         // Open the model stream. `ModelClient::stream` is async; the entrypoint
         // runs on the multi-thread runtime, so we await it directly here.
@@ -277,6 +537,7 @@ impl CompactionSampler for EntrypointSampler {
         // Concatenate assistant text. Tool calls (if any) are ignored — the compact
         // pass never dispatches. Cancellation aborts the pass.
         let mut summary = String::new();
+        let mut token_usage = None;
         loop {
             let next = tokio::select! {
                 _ = cancel.cancelled() => return Err(AgentError::TurnAborted),
@@ -284,13 +545,38 @@ impl CompactionSampler for EntrypointSampler {
             };
             match next {
                 Some(Ok(LlmEvent::TextDelta { delta, .. })) => summary.push_str(&delta),
+                Some(Ok(LlmEvent::StepFinish { usage, .. }))
+                | Some(Ok(LlmEvent::Finish { usage, .. })) => {
+                    let usage = TokenUsage::from_llm_usage(&usage);
+                    if usage.total > 0 {
+                        token_usage = Some(usage);
+                    }
+                }
                 Some(Ok(_)) => {}
                 Some(Err(e)) => return Err(map_summary_error(&e)),
                 None => break,
             }
         }
-        Ok(summary)
+        Ok(CompactionSummary {
+            text: summary,
+            token_usage,
+        })
     }
+}
+
+fn build_summary_llm_request(
+    model: &str,
+    provider: &str,
+    base_instructions: &str,
+    request: Vec<Message>,
+) -> browser_use_llm::schema::LlmRequest {
+    use browser_use_llm::schema::{LlmRequest, SystemPart};
+
+    let mut req = LlmRequest::new(model.to_string(), provider.to_string());
+    req.system
+        .push(SystemPart::new(base_instructions.to_string()));
+    req.messages.extend(request);
+    req
 }
 
 /// Object-safe ("dyn-compatible") view of [`CompactionSampler`].
@@ -308,7 +594,7 @@ trait DynCompactionSampler: Send + Sync {
         &self,
         request: Vec<Message>,
         cancel: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = Result<String, AgentError>> + Send + '_>>;
+    ) -> Pin<Box<dyn Future<Output = Result<CompactionSummary, AgentError>> + Send + '_>>;
 }
 
 impl<T: CompactionSampler> DynCompactionSampler for T {
@@ -316,7 +602,7 @@ impl<T: CompactionSampler> DynCompactionSampler for T {
         &self,
         request: Vec<Message>,
         cancel: CancellationToken,
-    ) -> Pin<Box<dyn Future<Output = Result<String, AgentError>> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<CompactionSummary, AgentError>> + Send + '_>> {
         Box::pin(self.summarize(request, cancel))
     }
 }
@@ -326,7 +612,7 @@ impl CompactionSampler for dyn DynCompactionSampler + '_ {
         &self,
         request: Vec<Message>,
         cancel: CancellationToken,
-    ) -> impl Future<Output = Result<String, AgentError>> + Send {
+    ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
         self.summarize_boxed(request, cancel)
     }
 }
@@ -351,11 +637,14 @@ fn map_summary_error(e: &browser_use_llm::schema::LlmError) -> AgentError {
 /// Build the live [`EntrypointSampler`] for a real backend, reusing the same
 /// offline route construction the main driver uses
 /// ([`provider::provider_choice_for_backend`] + [`build_route`](crate::turn::build_route)).
-/// Returns `None` when the backend has no real provider (Fake) or no credentials —
-/// compaction then stays disabled and the run keeps its prior (uncompacted)
-/// behavior. No network I/O.
-fn build_compaction_sampler(config: &ProviderRunConfig) -> Option<Arc<dyn DynCompactionSampler>> {
-    let choice = provider::provider_choice_for_backend(config.backend, None).ok()??;
+/// Returns `None` when the backend has no real provider (Fake) or credentials
+/// cannot be resolved from the same env/store sources as the main driver. No
+/// network I/O.
+fn build_compaction_sampler(
+    config: &ProviderRunConfig,
+    store: Option<&Store>,
+) -> Option<Arc<dyn DynCompactionSampler>> {
+    let choice = provider::provider_choice_for_backend(config.backend, store).ok()??;
     let route = crate::turn::build_route(&choice, &config.model).ok()?;
     let client = Arc::new(browser_use_llm::route::ModelClient::default());
     Some(Arc::new(EntrypointSampler {
@@ -363,7 +652,73 @@ fn build_compaction_sampler(config: &ProviderRunConfig) -> Option<Arc<dyn DynCom
         route,
         model: config.model.clone(),
         provider: format!("{:?}", config.backend).to_ascii_lowercase(),
+        base_instructions: base_instructions_for_config(config),
     }))
+}
+
+fn base_instructions_for_config(config: &ProviderRunConfig) -> String {
+    config
+        .options
+        .base_instructions
+        .clone()
+        .unwrap_or_else(|| crate::prompts::browser_agent_system_prompt())
+}
+
+fn compact_prompt_for_config(config: &ProviderRunConfig) -> String {
+    config
+        .options
+        .compact_prompt
+        .clone()
+        .or_else(|| config_override_string(&config.options.config_overrides, "compact_prompt"))
+        .unwrap_or_else(|| crate::compact::SUMMARIZATION_PROMPT.to_string())
+}
+
+fn config_override_string(overrides: &[(String, toml::Value)], key: &str) -> Option<String> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == key)
+        .and_then(|(_, value)| value.as_str().map(str::to_string))
+}
+
+fn config_for_model(config: &ProviderRunConfig, model: &str) -> ProviderRunConfig {
+    let mut config = config.clone();
+    config.model = model.to_string();
+    let metadata = model_context_metadata_for_model(model);
+    if let Some(context_window) = metadata.resolved_context_window() {
+        config.context_window_tokens = usize::try_from(context_window).unwrap_or(usize::MAX);
+    }
+    config
+}
+
+fn effective_context_window_for_config(config: &ProviderRunConfig) -> Option<i64> {
+    config
+        .model_context_metadata()
+        .effective_context_window()
+        .filter(|window| *window > 0)
+}
+
+fn previous_model_compaction_for_config(
+    store: &SharedStore,
+    session_id: &SessionId,
+    config: &ProviderRunConfig,
+) -> Option<PreviousModelCompaction> {
+    let events = events_from_store(store, session_id.as_str());
+    let previous_model = latest_model_request_model(&events)?;
+    if previous_model == config.model {
+        return None;
+    }
+    let previous_config = config_for_model(config, &previous_model);
+    let previous_context_window = effective_context_window_for_config(&previous_config)?;
+    let sampler = {
+        let store_guard = store.lock().expect("store mutex poisoned");
+        build_compaction_sampler(&previous_config, Some(&store_guard))?
+    };
+    Some(PreviousModelCompaction {
+        model: previous_model,
+        model_context_window: previous_context_window,
+        sampler,
+    })
 }
 
 /// Lower a session's durable event log into typed prompt messages: blocking store
@@ -418,7 +773,7 @@ fn event_closes_after_next_tool_call_followup(event: &EventRecord, followup_seq:
         return false;
     }
     match event.event_type.as_str() {
-        "agent.turn_queue_drained" => {
+        AGENT_TURN_QUEUE_DRAINED_EVENT => {
             let drained_session_messages = event
                 .payload
                 .get("session_messages")
@@ -431,7 +786,7 @@ fn event_closes_after_next_tool_call_followup(event: &EventRecord, followup_seq:
                 .unwrap_or_default();
             drained_session_messages > 0 && last_seq >= followup_seq
         }
-        SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT => {
+        SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT | SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT => {
             followup_marker_seqs(event).contains(&followup_seq)
         }
         _ => false,
@@ -488,7 +843,7 @@ fn drain_one_pending_active_followup(store: &SharedStore, session_id: &str) {
     };
     let _ = store.append_event(
         session_id,
-        "agent.turn_queue_drained",
+        AGENT_TURN_QUEUE_DRAINED_EVENT,
         serde_json::json!({
             "phase": "after_tool_outputs",
             "session_messages": 1,
@@ -558,6 +913,511 @@ fn ensure_fallback_capture_recording(store: &SharedStore, session_id: &str) {
     }
 }
 
+fn events_from_store(
+    store: &SharedStore,
+    session_id: &str,
+) -> Vec<browser_use_protocol::EventRecord> {
+    store
+        .lock()
+        .expect("store mutex poisoned")
+        .events_for_session(session_id)
+        .unwrap_or_default()
+}
+
+fn events_through_seq(
+    events: &[browser_use_protocol::EventRecord],
+    through_seq: Option<i64>,
+) -> Vec<browser_use_protocol::EventRecord> {
+    match through_seq {
+        Some(seq) => events
+            .iter()
+            .filter(|event| event.seq <= seq)
+            .cloned()
+            .collect(),
+        None => events.to_vec(),
+    }
+}
+
+fn latest_real_user_event_seq(events: &[browser_use_protocol::EventRecord]) -> Option<i64> {
+    events.iter().rev().find_map(|event| {
+        matches!(
+            event.event_type.as_str(),
+            names::SESSION_INPUT | names::SESSION_FOLLOWUP
+        )
+        .then_some(event.seq)
+    })
+}
+
+fn latest_replay_seq_before_fresh_input(
+    events: &[browser_use_protocol::EventRecord],
+) -> Option<i64> {
+    latest_real_user_event_seq(events).map(|seq| seq.saturating_sub(1))
+}
+
+fn latest_model_request_model(events: &[browser_use_protocol::EventRecord]) -> Option<String> {
+    events.iter().rev().find_map(|event| {
+        (event.event_type == names::MODEL_TURN_REQUEST)
+            .then(|| event.payload.get("model").and_then(Value::as_str))
+            .flatten()
+            .map(str::to_string)
+    })
+}
+
+fn latest_provider_token_usage_after_compaction(
+    events: &[browser_use_protocol::EventRecord],
+) -> Option<TokenUsage> {
+    let latest_compaction_seq = events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == "session.compacted")
+        .map(|event| event.seq)
+        .unwrap_or(0);
+
+    events
+        .iter()
+        .rev()
+        .filter(|event| event.seq > latest_compaction_seq)
+        .find_map(provider_token_usage_from_event)
+}
+
+fn provider_token_usage_from_event(
+    event: &browser_use_protocol::EventRecord,
+) -> Option<TokenUsage> {
+    match event.event_type.as_str() {
+        names::TOKEN_COUNT => event
+            .payload
+            .get("info")
+            .and_then(|info| info.get("last_token_usage"))
+            .and_then(token_usage_from_value),
+        "model.usage" => event
+            .payload
+            .get("usage")
+            .or(Some(&event.payload))
+            .and_then(token_usage_from_value),
+        _ => None,
+    }
+}
+
+fn token_usage_from_value(value: &Value) -> Option<TokenUsage> {
+    let input = value_i64_any(value, &["input_tokens"]).unwrap_or(0);
+    let cached_input =
+        value_i64_any(value, &["cached_input_tokens", "input_cached_tokens"]).unwrap_or(0);
+    let output = value_i64_any(value, &["output_tokens"]).unwrap_or(0);
+    let reasoning_output = value_i64_any(value, &["reasoning_output_tokens"]).unwrap_or(0);
+    let total = value_i64_any(value, &["total_tokens"]).unwrap_or_else(|| {
+        input
+            .saturating_add(output)
+            .saturating_add(reasoning_output)
+    });
+
+    let usage = TokenUsage {
+        input,
+        cached_input,
+        output,
+        reasoning_output,
+        total,
+    };
+    (usage.input > 0
+        || usage.cached_input > 0
+        || usage.output > 0
+        || usage.reasoning_output > 0
+        || usage.total > 0)
+        .then_some(usage)
+}
+
+fn value_i64_any(value: &Value, keys: &[&str]) -> Option<i64> {
+    keys.iter()
+        .find_map(|key| value.get(*key))
+        .and_then(value_to_nonnegative_i64)
+}
+
+fn value_to_nonnegative_i64(value: &Value) -> Option<i64> {
+    value
+        .as_i64()
+        .or_else(|| value.as_u64().and_then(|n| i64::try_from(n).ok()))
+        .map(|n| n.max(0))
+}
+
+fn provider_item_text(item: &Item) -> String {
+    let Some(content) = item.get("content") else {
+        return String::new();
+    };
+    match content {
+        Value::String(text) => text.clone(),
+        Value::Array(parts) => parts
+            .iter()
+            .filter_map(|part| {
+                part.get("text")
+                    .and_then(Value::as_str)
+                    .or_else(|| part.as_str())
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+        other if !other.is_null() => other.to_string(),
+        _ => String::new(),
+    }
+}
+
+fn is_real_user_provider_item(item: &Item) -> bool {
+    item.get("role").and_then(Value::as_str) == Some("user")
+        && item.get("name").and_then(Value::as_str).is_none()
+        && !is_summary_message(&provider_item_text(item))
+}
+
+fn insert_initial_context_before_last_real_user_or_summary(
+    mut replacement: Vec<Item>,
+    initial_context: Vec<Item>,
+) -> Vec<Item> {
+    if initial_context.is_empty() {
+        return replacement;
+    }
+    let last_user_or_summary = replacement
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, item)| {
+            (item.get("role").and_then(Value::as_str) == Some("user")).then_some(idx)
+        });
+    let last_real_user = replacement
+        .iter()
+        .enumerate()
+        .rev()
+        .find_map(|(idx, item)| is_real_user_provider_item(item).then_some(idx));
+    let insertion_index = last_real_user
+        .or(last_user_or_summary)
+        .unwrap_or(replacement.len());
+    replacement.splice(insertion_index..insertion_index, initial_context);
+    replacement
+}
+
+async fn run_compaction_with_retries(
+    session_id: &SessionId,
+    store: &SharedStore,
+    history: &[Item],
+    sampler: &dyn DynCompactionSampler,
+    compact_prompt: &str,
+    token_limit: usize,
+    max_retries: u32,
+    context_window: Option<i64>,
+) -> Result<crate::compact::CompactedHistory, AgentError> {
+    let mut retries = 0;
+    let mut working: Vec<Item> = history.to_vec();
+    working.push(compaction_prompt_item(compact_prompt));
+    loop {
+        let request = compaction_request_messages(&working);
+        let request_len = request.len();
+        match sampler.summarize(request, CancellationToken::new()).await {
+            Ok(summary) => {
+                append_compaction_token_usage(
+                    store,
+                    session_id.as_str(),
+                    summary.token_usage.as_ref(),
+                    context_window,
+                );
+                return Ok(compacted_history_from_summary(
+                    history,
+                    summary,
+                    token_limit,
+                ));
+            }
+            Err(AgentError::ContextWindowExceeded) => {
+                if request_len > 1 && working.len() > 1 {
+                    working.remove(0);
+                    retries = 0;
+                    continue;
+                }
+                append_context_window_full(store, session_id.as_str(), context_window);
+                append_model_turn_context_overflow(store, session_id.as_str());
+                return Err(AgentError::ContextWindowExceeded);
+            }
+            Err(AgentError::TurnAborted) => return Err(AgentError::TurnAborted),
+            Err(error) if error.is_retryable() && retries < max_retries => {
+                retries += 1;
+                append_stream_error(
+                    store,
+                    session_id.as_str(),
+                    &format!("Reconnecting... {retries}/{max_retries}"),
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(
+                    crate::decision::backoff_ms(retries),
+                ))
+                .await;
+            }
+            Err(error) => return Err(error),
+        }
+    }
+}
+
+fn append_model_turn_context_overflow(store: &SharedStore, session_id: &str) {
+    if let Ok(store) = store.lock() {
+        let _ = store.append_event(
+            session_id,
+            "model.turn.context_overflow",
+            json!({ "action": "compaction_failed" }),
+        );
+        let _ = store.append_event(
+            session_id,
+            names::MODEL_TURN_ERROR,
+            json!({
+                "error": "context window exceeded while compacting",
+                "code": "context_window_exceeded",
+                "recoverable": false,
+            }),
+        );
+    }
+}
+
+fn append_stream_error(store: &SharedStore, session_id: &str, message: &str) {
+    if let Ok(store) = store.lock() {
+        let _ = store.append_event(
+            session_id,
+            names::STREAM_ERROR,
+            json!({ "message": message }),
+        );
+    }
+}
+
+fn append_compaction_started(store: &SharedStore, session_id: &str, mode: CompactionMode) {
+    if let Ok(store) = store.lock() {
+        let _ = store.append_event(
+            session_id,
+            "session.compaction_started",
+            json!({
+                "reason": "token_budget",
+                "mode": compaction_mode_name(mode),
+            }),
+        );
+    }
+}
+
+fn append_compaction_failed(
+    store: &SharedStore,
+    session_id: &str,
+    mode: CompactionMode,
+    error: &AgentError,
+) {
+    if let Ok(store) = store.lock() {
+        let _ = store.append_event(
+            session_id,
+            "session.compaction_failed",
+            json!({
+                "reason": "token_budget",
+                "mode": compaction_mode_name(mode),
+                "error": error.to_string(),
+            }),
+        );
+        if !matches!(error, AgentError::ContextWindowExceeded) {
+            let _ = store.append_event(
+                session_id,
+                names::MODEL_TURN_ERROR,
+                json!({
+                    "error": error.to_string(),
+                    "code": compaction_error_code(error),
+                    "recoverable": false,
+                }),
+            );
+        }
+    }
+}
+
+fn compaction_mode_name(mode: CompactionMode) -> &'static str {
+    match mode {
+        CompactionMode::PreTurn => "pre_turn",
+        CompactionMode::MidTurn => "mid_turn",
+    }
+}
+
+fn compaction_error_code(error: &AgentError) -> &'static str {
+    match error {
+        AgentError::ContextWindowExceeded => "context_window_exceeded",
+        AgentError::TurnAborted => "interrupted",
+        AgentError::UsageLimitReached => "usage_limit_reached",
+        _ => "compaction_failed",
+    }
+}
+
+fn compacted_event_payload(
+    summary_text: &str,
+    replacement_messages: &[Item],
+    initial_context_already_in_history: bool,
+    replay_from_seq: Option<i64>,
+) -> Value {
+    let mut payload = json!({
+        "message": summary_text,
+        "replacement_messages": replacement_messages,
+        "initial_context_already_in_history": initial_context_already_in_history,
+    });
+    if let Some(seq) = replay_from_seq {
+        payload["replay_from_seq"] = json!(seq);
+    }
+    payload
+}
+
+fn recomputed_token_count_payload(
+    tokens: i64,
+    window: Option<i64>,
+    previous_total: &Value,
+) -> Value {
+    let last_usage = token_usage_value_with_total(tokens);
+    let total_usage = if previous_total.is_null() {
+        token_usage_value_with_total(0)
+    } else {
+        previous_total.clone()
+    };
+    json!({
+        "info": {
+            "total_token_usage": total_usage,
+            "last_token_usage": last_usage,
+            "model_context_window": window,
+        },
+        "turn_idx": 0,
+    })
+}
+
+fn token_usage_value(usage: &TokenUsage) -> Value {
+    json!({
+        "input_tokens": usage.input.max(0),
+        "cached_input_tokens": usage.cached_input.max(0),
+        "output_tokens": usage.output.max(0),
+        "reasoning_output_tokens": usage.reasoning_output.max(0),
+        "total_tokens": usage.total.max(0),
+    })
+}
+
+fn token_count_payload_from_usage(
+    usage: &TokenUsage,
+    window: Option<i64>,
+    previous_total: &Value,
+) -> Value {
+    let last_usage = token_usage_value(usage);
+    let total_usage = if previous_total.is_null() {
+        last_usage.clone()
+    } else {
+        add_token_usage_values(previous_total, &last_usage)
+    };
+    json!({
+        "info": {
+            "total_token_usage": total_usage,
+            "last_token_usage": last_usage,
+            "model_context_window": window,
+        },
+        "turn_idx": 0,
+    })
+}
+
+fn append_compaction_token_usage(
+    store: &SharedStore,
+    session_id: &str,
+    usage: Option<&TokenUsage>,
+    window: Option<i64>,
+) {
+    let Some(usage) = usage.filter(|usage| usage.total > 0) else {
+        return;
+    };
+    if let Ok(store) = store.lock() {
+        let events = store.events_for_session(session_id).unwrap_or_default();
+        let previous_total = latest_total_token_usage_value(&events);
+        let _ = store.append_event(
+            session_id,
+            names::TOKEN_COUNT,
+            token_count_payload_from_usage(usage, window, &previous_total),
+        );
+    }
+}
+
+fn append_context_window_full(store: &SharedStore, session_id: &str, window: Option<i64>) {
+    let Some(window) = window.filter(|window| *window > 0) else {
+        return;
+    };
+    if let Ok(store) = store.lock() {
+        let events = store.events_for_session(session_id).unwrap_or_default();
+        let previous_total = latest_total_token_usage_value(&events);
+        let previous_total_tokens = token_usage_total_tokens(&previous_total);
+        let delta = window.saturating_sub(previous_total_tokens).max(0);
+        let total_usage = token_usage_value_with_total(window);
+        let last_usage = token_usage_value_with_total(delta);
+        let _ = store.append_event(
+            session_id,
+            names::TOKEN_COUNT,
+            json!({
+                "info": {
+                    "total_token_usage": total_usage,
+                    "last_token_usage": last_usage,
+                    "model_context_window": window,
+                },
+                "turn_idx": 0,
+            }),
+        );
+    }
+}
+
+fn token_usage_value_with_total(total_tokens: i64) -> Value {
+    json!({
+        "input_tokens": 0,
+        "cached_input_tokens": 0,
+        "output_tokens": 0,
+        "reasoning_output_tokens": 0,
+        "total_tokens": total_tokens.max(0),
+    })
+}
+
+fn latest_total_token_usage_value(events: &[browser_use_protocol::EventRecord]) -> Value {
+    events
+        .iter()
+        .rev()
+        .find(|event| event.event_type == names::TOKEN_COUNT)
+        .and_then(|event| {
+            event
+                .payload
+                .get("info")
+                .and_then(|info| info.get("total_token_usage"))
+        })
+        .cloned()
+        .unwrap_or(Value::Null)
+}
+
+fn token_usage_total_tokens(value: &Value) -> i64 {
+    value
+        .get("total_tokens")
+        .and_then(Value::as_i64)
+        .unwrap_or_default()
+        .max(0)
+}
+
+fn add_token_usage_values(previous: &Value, addition: &Value) -> Value {
+    let get = |value: &Value, key: &str| value.get(key).and_then(Value::as_i64).unwrap_or(0);
+    json!({
+        "input_tokens": get(previous, "input_tokens") + get(addition, "input_tokens"),
+        "cached_input_tokens": get(previous, "cached_input_tokens") + get(addition, "cached_input_tokens"),
+        "output_tokens": get(previous, "output_tokens") + get(addition, "output_tokens"),
+        "reasoning_output_tokens": get(previous, "reasoning_output_tokens") + get(addition, "reasoning_output_tokens"),
+        "total_tokens": get(previous, "total_tokens") + get(addition, "total_tokens"),
+    })
+}
+
+fn enrich_token_count_payload(
+    mut payload: Value,
+    previous_total: &Value,
+    window: Option<i64>,
+) -> Value {
+    let Some(info) = payload.get_mut("info").and_then(Value::as_object_mut) else {
+        return payload;
+    };
+    let Some(last_token_usage) = info.get("last_token_usage").cloned() else {
+        return payload;
+    };
+    let total_token_usage = if previous_total.is_null() {
+        last_token_usage.clone()
+    } else {
+        add_token_usage_values(previous_total, &last_token_usage)
+    };
+    info.insert("total_token_usage".to_string(), total_token_usage);
+    if let Some(window) = window {
+        info.insert("model_context_window".to_string(), json!(window));
+    }
+    payload
+}
+
 impl TurnState for StoreTurnState {
     async fn clone_history_for_prompt(&self) -> Vec<Message> {
         // Once compacted, the prompt base is the compacted override (codex's
@@ -606,56 +1466,127 @@ impl TurnState for StoreTurnState {
     }
 
     async fn token_status(&self) -> TokenStatus {
-        // REAL codex-parity accounting (this WP). With compaction disabled (no
-        // sampler / zero window) this yields a zeroed status, so the loop's
-        // compaction gate never trips (the `Fake`/no-sampler path keeps its old
-        // behavior). Otherwise estimate the current prompt's tokens and compare to
-        // the 80%-of-window auto-compact limit.
-        if self.compaction_sampler.is_none() || self.context_window_tokens <= 0 {
-            return TokenStatus::default();
-        }
-        let estimated = self.estimate_prompt_tokens();
-        TokenStatus::from_estimate(estimated, self.context_window_tokens)
+        self.token_status_blocking()
     }
 
-    async fn compact(&self) {
+    async fn compact(&self, mode: CompactionMode) -> Result<(), AgentError> {
         // codex: ask the model to write a handoff summary, then REPLACE history
         // with `[preserved recent user messages] + [PREFIX + summary]`.
         let Some(sampler) = self.compaction_sampler.clone() else {
-            return; // compaction disabled — keep the loop's no-op default.
+            return Ok(()); // compaction disabled — keep the loop's no-op default.
         };
+        self.compact_with_sampler(mode, sampler).await
+    }
+}
 
+impl StoreTurnState {
+    async fn compact_with_sampler(
+        &self,
+        mode: CompactionMode,
+        sampler: Arc<dyn DynCompactionSampler>,
+    ) -> Result<(), AgentError> {
         // Snapshot the current prompt as provider-message items (codex
         // `clone_history`): the durable log (or the prior compacted override) plus
         // this run's recorded turns.
-        let items = self.current_prompt_items();
+        let items = self.current_prompt_items_for_compaction(mode);
+        append_compaction_started(&self.store, self.session_id.as_str(), mode);
 
         // Model-based no-tools summary pass + codex-parity compacted-history
         // assembly (preserved recent user messages capped at 20k tokens + the
-        // PREFIX'd summary). On failure, leave history untouched (codex propagates
-        // the error; here we simply do not replace), so the loop's control flow is
-        // unchanged.
-        let compacted = match run_compaction(
+        // PREFIX'd summary). Failures propagate so the caller surfaces the same
+        // compaction failure Codex would surface.
+        let compacted = match run_compaction_with_retries(
+            &self.session_id,
+            &self.store,
             &items,
             sampler.as_ref(),
+            &self.compact_prompt,
             COMPACT_USER_MESSAGE_MAX_TOKENS,
-            CancellationToken::new(),
+            DEFAULT_STREAM_MAX_RETRIES,
+            self.context_window(),
         )
         .await
         {
-            Ok(c) => c,
-            Err(_) => return,
+            Ok(compacted) => compacted,
+            Err(error) => {
+                append_compaction_failed(&self.store, self.session_id.as_str(), mode, &error);
+                return Err(error);
+            }
         };
 
-        // Lower the compacted items to typed prompt messages and INSTALL them as
-        // the override; clear the recorded buffer (its content is now folded into
-        // the summary). The next `clone_history_for_prompt` returns the small
-        // compacted prompt + any turns recorded AFTER this point — so the estimate
-        // drops back below the auto-compact limit and the loop continues (codex
-        // `replace_compacted_history` + `recompute_token_usage`).
-        let lowered = ContextManager::new().lower_to_messages(&compacted.items);
-        *self.compacted.lock().unwrap() = Some(lowered);
+        let events = events_from_store(&self.store, self.session_id.as_str());
+        let initial_context = initial_context_messages_from_events(&events, None, true, true);
+        let initial_context_already_in_history = matches!(mode, CompactionMode::MidTurn);
+        let replay_from_seq = match mode {
+            CompactionMode::PreTurn => *self.pre_turn_replay_from_seq.lock().unwrap(),
+            CompactionMode::MidTurn => None,
+        };
+        let replacement_messages = if initial_context_already_in_history {
+            insert_initial_context_before_last_real_user_or_summary(
+                compacted.items,
+                initial_context,
+            )
+        } else {
+            compacted.items
+        };
+
+        {
+            let store = self.store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    self.session_id.as_str(),
+                    "session.compacted",
+                    compacted_event_payload(
+                        &compacted.summary_text,
+                        &replacement_messages,
+                        initial_context_already_in_history,
+                        replay_from_seq,
+                    ),
+                )
+                .map_err(|error| AgentError::Store(error.into()))?;
+        }
+
+        let active_after_compact = {
+            let lowered = history_from_store(&self.store, self.session_id.as_str());
+            let items = lowered
+                .iter()
+                .map(message_to_provider_item)
+                .collect::<Vec<_>>();
+            let mut mgr = ContextManager::new();
+            mgr.record_items(items, TruncationPolicy::Bytes(usize::MAX));
+            *self.compacted.lock().unwrap() = Some(lowered);
+            mgr.estimate_total_tokens()
+                .saturating_add(crate::compact::approx_token_count(&self.base_instructions) as i64)
+        };
+        {
+            let store = self.store.lock().expect("store mutex poisoned");
+            let previous_total = latest_total_token_usage_value(
+                &store
+                    .events_for_session(self.session_id.as_str())
+                    .unwrap_or_default(),
+            );
+            store
+                .append_event(
+                    self.session_id.as_str(),
+                    names::TOKEN_COUNT,
+                    recomputed_token_count_payload(
+                        active_after_compact,
+                        self.context_window(),
+                        &previous_total,
+                    ),
+                )
+                .map_err(|error| AgentError::Store(error.into()))?;
+        }
         self.recorded.lock().unwrap().clear();
+        let mut window = self.auto_compact_window.lock().unwrap();
+        window.start_next();
+        if matches!(
+            self.auto_compact_scope,
+            AutoCompactTokenLimitScope::BodyAfterPrefix
+        ) {
+            window.set_estimated_prefill(active_after_compact);
+        }
+        Ok(())
     }
 }
 
@@ -914,7 +1845,17 @@ async fn drive_run<Sd: SamplingDriver>(
     driver: Sd,
     turn_has_fresh_input: bool,
     recorded: RecordedBuffer,
-    compaction: Option<(i64, Arc<dyn DynCompactionSampler>)>,
+    compaction: Option<(
+        i64,
+        Option<i64>,
+        AutoCompactTokenLimitScope,
+        Arc<dyn DynCompactionSampler>,
+    )>,
+    current_model: Option<String>,
+    compact_prompt: Option<String>,
+    base_instructions: Option<String>,
+    developer_instructions: Option<String>,
+    previous_model_compaction: Option<PreviousModelCompaction>,
     cancel: CancellationToken,
 ) -> Result<Option<String>, AgentError> {
     let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded);
@@ -922,9 +1863,33 @@ async fn drive_run<Sd: SamplingDriver>(
     // available (the real backend path). The Fake/no-credential path passes `None`
     // and keeps the inert (never-compacts) behavior.
     let state = match compaction {
-        Some((window, sampler)) => state.with_compaction(window, sampler),
+        Some((window, configured_limit, scope, sampler)) => {
+            state.with_compaction(window, configured_limit, scope, sampler)
+        }
         None => state,
+    }
+    .with_current_model(current_model.unwrap_or_default())
+    .with_compaction_prompt(
+        compact_prompt.unwrap_or_else(|| crate::compact::SUMMARIZATION_PROMPT.to_string()),
+    )
+    .with_compaction_instructions(
+        base_instructions.unwrap_or_else(|| crate::prompts::browser_agent_system_prompt()),
+        developer_instructions,
+    )
+    .with_previous_model_compaction(previous_model_compaction);
+
+    let pre_turn_replay_from_seq = if turn_has_fresh_input {
+        let events = events_from_store(&store, session_id.as_str());
+        latest_replay_seq_before_fresh_input(&events)
+    } else {
+        None
     };
+    *state.pre_turn_replay_from_seq.lock().unwrap() = pre_turn_replay_from_seq;
+    state.compact_previous_model_downshift_if_needed().await?;
+    if state.token_status().await.token_limit_reached {
+        state.compact(CompactionMode::PreTurn).await?;
+    }
+    *state.pre_turn_replay_from_seq.lock().unwrap() = None;
 
     // The observer persists the terminal agent message through a synchronous
     // durable sink over the SharedStore. (The async `events::StoreSink` writer
@@ -948,7 +1913,17 @@ async fn drive_run<Sd: SamplingDriver>(
 /// lifecycle observer persists through a small synchronous adapter over the
 /// `SharedStore` instead.
 fn make_ui_sink(store: SharedStore) -> Arc<dyn EventSink> {
-    Arc::new(SharedStoreSink { store })
+    make_ui_sink_with_context_window(store, None)
+}
+
+fn make_ui_sink_with_context_window(
+    store: SharedStore,
+    model_context_window: Option<i64>,
+) -> Arc<dyn EventSink> {
+    Arc::new(SharedStoreSink {
+        store,
+        model_context_window,
+    })
 }
 
 /// A synchronous [`EventSink`] over a [`SharedStore`] for lifecycle persistence.
@@ -959,12 +1934,20 @@ fn make_ui_sink(store: SharedStore) -> Arc<dyn EventSink> {
 /// the result), matching the infallible-fan-out contract of [`EventSink::emit`].
 struct SharedStoreSink {
     store: SharedStore,
+    model_context_window: Option<i64>,
 }
 
 impl EventSink for SharedStoreSink {
     fn emit(&self, ev: PendingEvent) {
         if let Ok(store) = self.store.lock() {
-            let _ = store.append_event(&ev.session_id, &ev.event_type, ev.payload);
+            let payload = if ev.event_type == names::TOKEN_COUNT {
+                let events = store.events_for_session(&ev.session_id).unwrap_or_default();
+                let previous_total = latest_total_token_usage_value(&events);
+                enrich_token_count_payload(ev.payload, &previous_total, self.model_context_window)
+            } else {
+                ev.payload
+            };
+            let _ = store.append_event(&ev.session_id, &ev.event_type, payload);
         }
     }
 }
@@ -1012,7 +1995,9 @@ pub async fn run_session_with_config_with_cancel(
     //     backend the driver is fused with the production tool dispatcher + a
     //     recorder writing into `recorded`, so model tool-calls EXECUTE and their
     //     outputs re-enter the prompt.
-    let driver_sink: Arc<dyn EventSink> = make_ui_sink(Arc::clone(&store));
+    let model_context_window = effective_context_window_for_config(&config);
+    let driver_sink: Arc<dyn EventSink> =
+        make_ui_sink_with_context_window(Arc::clone(&store), model_context_window);
     let fusion_recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
         buffer: Arc::clone(&recorded),
     });
@@ -1064,14 +2049,33 @@ pub async fn run_session_with_config_with_cancel(
     //     `recorded` buffer the recorder writes is handed to the state, so the
     //     fused tool outputs re-enter the prompt on the loop's next iteration.
     // The real path enables codex-parity compaction: real token accounting (the
-    // 80%-of-window auto-compact trigger) + a model-based summary pass over the
+    // 90%-of-window auto-compact trigger) + a model-based summary pass over the
     // SAME backend/model (`build_compaction_sampler`). Long runs auto-summarize
-    // before hitting the context window. A backend with no real provider/
-    // credentials yields `None` and compaction stays disabled.
+    // before hitting the context window. Fake/no-sampler paths stay inert because
+    // there is no real model to write the handoff summary.
     match resolved {
         ResolvedProvider::Real(driver) => {
-            let compaction = build_compaction_sampler(&config)
-                .map(|sampler| (config.context_window_tokens as i64, sampler));
+            let metadata = config.model_context_metadata();
+            let context_window = metadata
+                .effective_context_window()
+                .unwrap_or(config.context_window_tokens as i64);
+            let auto_compact_limit = metadata.auto_compact_token_limit_with_override(
+                config.options.model_auto_compact_token_limit,
+            );
+            let previous_model_compaction =
+                previous_model_compaction_for_config(&store, &session_id, &config);
+            let compaction_sampler = {
+                let store_guard = store.lock().expect("store mutex poisoned");
+                build_compaction_sampler(&config, Some(&store_guard))
+            };
+            let compaction = compaction_sampler.map(|sampler| {
+                (
+                    context_window,
+                    auto_compact_limit,
+                    config.options.model_auto_compact_token_limit_scope,
+                    sampler,
+                )
+            });
             drive_run(
                 Arc::clone(&store),
                 session_id.clone(),
@@ -1080,6 +2084,11 @@ pub async fn run_session_with_config_with_cancel(
                 turn_has_fresh_input,
                 Arc::clone(&recorded),
                 compaction,
+                Some(config.model.clone()),
+                Some(compact_prompt_for_config(&config)),
+                Some(base_instructions_for_config(&config)),
+                config.options.developer_instructions.clone(),
+                previous_model_compaction,
                 cancel.clone(),
             )
             .await?;
@@ -1098,6 +2107,11 @@ pub async fn run_session_with_config_with_cancel(
                 driver,
                 turn_has_fresh_input,
                 Arc::clone(&recorded),
+                None,
+                None,
+                None,
+                None,
+                None,
                 None,
                 cancel.clone(),
             )
@@ -1159,6 +2173,7 @@ mod tests {
     use crate::config_overrides::ProviderBackend;
     use crate::config_overrides::ProviderRunConfig;
     use browser_use_store::Store;
+    use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
 
     /// A tempdir-backed `SharedStore` with a fresh session row (the `events` table
@@ -1200,6 +2215,218 @@ mod tests {
                 serde_json::json!({ "text": text }),
             )
             .expect("seed user input");
+    }
+
+    fn append_user_input(store: &SharedStore, session_id: &str, text: &str) -> i64 {
+        let store = store.lock().expect("store mutex poisoned");
+        store
+            .append_event(
+                session_id,
+                "session.input",
+                serde_json::json!({ "text": text }),
+            )
+            .expect("seed user input")
+            .seq
+    }
+
+    fn seed_token_count(store: &SharedStore, session_id: &str, total_tokens: i64) {
+        seed_token_count_usage(store, session_id, total_tokens, 0, total_tokens);
+    }
+
+    fn seed_token_count_usage(
+        store: &SharedStore,
+        session_id: &str,
+        input_tokens: i64,
+        output_tokens: i64,
+        total_tokens: i64,
+    ) {
+        let usage = serde_json::json!({
+            "input_tokens": input_tokens,
+            "cached_input_tokens": 0,
+            "output_tokens": output_tokens,
+            "reasoning_output_tokens": 0,
+            "total_tokens": total_tokens,
+        });
+        let store = store.lock().expect("store mutex poisoned");
+        store
+            .append_event(
+                session_id,
+                names::TOKEN_COUNT,
+                serde_json::json!({
+                    "info": {
+                        "total_token_usage": usage,
+                        "last_token_usage": usage,
+                        "model_context_window": 1_000,
+                    },
+                    "turn_idx": 0,
+                }),
+            )
+            .expect("seed token_count");
+    }
+
+    fn seed_model_turn_request(store: &SharedStore, session_id: &str, model: &str) {
+        let store = store.lock().expect("store mutex poisoned");
+        store
+            .append_event(
+                session_id,
+                names::MODEL_TURN_REQUEST,
+                serde_json::json!({
+                    "model": model,
+                    "provider": "fake",
+                    "turn_idx": 0,
+                    "attempt": 0,
+                }),
+            )
+            .expect("seed model turn request");
+    }
+
+    fn assistant_text_message(text: &str) -> Message {
+        Message::new(
+            browser_use_llm::schema::MessageRole::Assistant,
+            vec![browser_use_llm::schema::ContentPart::text(text)],
+        )
+    }
+
+    fn user_text_message(text: &str) -> Message {
+        Message::new(
+            browser_use_llm::schema::MessageRole::User,
+            vec![browser_use_llm::schema::ContentPart::text(text)],
+        )
+    }
+
+    fn seed_workspace_context(store: &SharedStore, session_id: &str, content: &str) {
+        let store = store.lock().expect("store mutex poisoned");
+        store
+            .append_event(
+                session_id,
+                "workspace.context",
+                serde_json::json!({
+                    "kind": "environment_context",
+                    "content": content,
+                }),
+            )
+            .expect("seed workspace context");
+    }
+
+    struct StaticSummarySampler(&'static str);
+
+    impl CompactionSampler for StaticSummarySampler {
+        fn summarize(
+            &self,
+            _request: Vec<Message>,
+            _cancel: CancellationToken,
+        ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
+            let summary = self.0.to_string();
+            async move { Ok(CompactionSummary::text(summary)) }
+        }
+    }
+
+    struct UsageSummarySampler {
+        summary: &'static str,
+        usage: TokenUsage,
+    }
+
+    impl CompactionSampler for UsageSummarySampler {
+        fn summarize(
+            &self,
+            _request: Vec<Message>,
+            _cancel: CancellationToken,
+        ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
+            let summary = self.summary.to_string();
+            let usage = self.usage;
+            async move { Ok(CompactionSummary::with_usage(summary, usage)) }
+        }
+    }
+
+    struct FlakySummarySampler {
+        attempts: AtomicUsize,
+    }
+
+    impl CompactionSampler for FlakySummarySampler {
+        fn summarize(
+            &self,
+            _request: Vec<Message>,
+            _cancel: CancellationToken,
+        ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                if attempt == 0 {
+                    Err(AgentError::Provider("temporary stream failure".to_string()))
+                } else {
+                    Ok(CompactionSummary::text("handoff after retry"))
+                }
+            }
+        }
+    }
+
+    struct CapturingSummarySampler {
+        summary: &'static str,
+        requests: Mutex<Vec<Vec<Message>>>,
+    }
+
+    impl CapturingSummarySampler {
+        fn new(summary: &'static str) -> Self {
+            Self {
+                summary,
+                requests: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CompactionSampler for CapturingSummarySampler {
+        fn summarize(
+            &self,
+            request: Vec<Message>,
+            _cancel: CancellationToken,
+        ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
+            self.requests.lock().unwrap().push(request);
+            let summary = self.summary.to_string();
+            async move { Ok(CompactionSummary::text(summary)) }
+        }
+    }
+
+    struct AlwaysWindowExceededSampler;
+
+    impl CompactionSampler for AlwaysWindowExceededSampler {
+        fn summarize(
+            &self,
+            _request: Vec<Message>,
+            _cancel: CancellationToken,
+        ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
+            async { Err(AgentError::ContextWindowExceeded) }
+        }
+    }
+
+    struct WindowThenRetryableThenSuccessSampler {
+        attempts: AtomicUsize,
+        request_lens: Mutex<Vec<usize>>,
+    }
+
+    impl WindowThenRetryableThenSuccessSampler {
+        fn new() -> Self {
+            Self {
+                attempts: AtomicUsize::new(0),
+                request_lens: Mutex::new(Vec::new()),
+            }
+        }
+    }
+
+    impl CompactionSampler for WindowThenRetryableThenSuccessSampler {
+        fn summarize(
+            &self,
+            request: Vec<Message>,
+            _cancel: CancellationToken,
+        ) -> impl Future<Output = Result<CompactionSummary, AgentError>> + Send {
+            self.request_lens.lock().unwrap().push(request.len());
+            let attempt = self.attempts.fetch_add(1, Ordering::SeqCst);
+            async move {
+                match attempt {
+                    0 => Err(AgentError::ContextWindowExceeded),
+                    1 => Err(AgentError::Provider("temporary stream failure".to_string())),
+                    _ => Ok(CompactionSummary::text("handoff after mixed failures")),
+                }
+            }
+        }
     }
 
     /// The full config-driven facade drives the Fake backend end-to-end over a
@@ -1319,6 +2546,783 @@ mod tests {
         );
         assert!(!state.has_pending_input().await);
         assert!(!state.token_status().await.token_limit_reached);
+    }
+
+    #[tokio::test]
+    async fn pending_active_followup_drains_into_history_once() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        let pending_seq = {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                    serde_json::json!({
+                        "text": "steer after tool",
+                        "delivery": FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL,
+                    }),
+                )
+                .expect("pending followup")
+                .seq
+        };
+
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+
+        assert!(state.has_pending_input().await);
+        assert!(
+            state.take_pending_input().await.is_empty(),
+            "drained followups are made durable before prompt assembly, so the returned ad-hoc input stays empty"
+        );
+        assert!(!state.has_pending_input().await);
+
+        let prompt = state.clone_history_for_prompt().await;
+        let prompt_text = prompt
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(prompt_text.contains("steer after tool"));
+
+        let log = events(&store, &session_id);
+        let committed_followup_seq = log
+            .iter()
+            .find(|event| {
+                event.event_type == names::SESSION_FOLLOWUP
+                    && event
+                        .payload
+                        .get("pending_from_seq")
+                        .and_then(Value::as_i64)
+                        == Some(pending_seq)
+            })
+            .map(|event| event.seq)
+            .expect("pending followup should be committed as a durable followup");
+        assert!(log.iter().any(|event| {
+            event.event_type == AGENT_TURN_QUEUE_DRAINED_EVENT
+                && event.payload.get("last_seq").and_then(Value::as_i64)
+                    == Some(committed_followup_seq)
+        }));
+        assert!(log.iter().any(|event| {
+            event.event_type == "model.response.continued"
+                && event.payload.get("reason").and_then(Value::as_str)
+                    == Some("active_turn_queue_drained")
+        }));
+    }
+
+    #[tokio::test]
+    async fn token_status_prefers_provider_usage_over_whole_prompt_estimate() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, &"x".repeat(2_000)).await;
+        seed_token_count(&store, &session_id, 100);
+
+        let recorded = Arc::new(Mutex::new(vec![assistant_text_message("done")]));
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state =
+            StoreTurnState::new(Arc::clone(&store), SessionId(session_id.clone()), recorded)
+                .with_compaction(1_000, Some(300), AutoCompactTokenLimitScope::Total, sampler);
+
+        let status = state.token_status().await;
+        assert_eq!(
+            status.auto_compact_scope_tokens, 100,
+            "provider-reported usage should be the active token source"
+        );
+        assert!(
+            !status.token_limit_reached,
+            "the huge old prompt would trip a whole-prompt estimate, but provider usage should not"
+        );
+    }
+
+    #[tokio::test]
+    async fn token_status_falls_back_to_local_estimate_without_provider_usage() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, &"x".repeat(2_000)).await;
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, Some(300), AutoCompactTokenLimitScope::Total, sampler);
+
+        let status = state.token_status().await;
+        assert!(
+            status.auto_compact_scope_tokens >= 300,
+            "without provider usage, the whole-prompt local estimate is the fallback"
+        );
+        assert!(status.token_limit_reached);
+    }
+
+    #[tokio::test]
+    async fn token_status_ignores_provider_usage_before_latest_compaction() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, &"x".repeat(2_000)).await;
+        seed_token_count(&store, &session_id, 900);
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    "session.compacted",
+                    serde_json::json!({
+                        "message": "handoff",
+                        "replacement_messages": [
+                            { "role": "user", "content": "small compacted prompt" }
+                        ],
+                        "initial_context_already_in_history": true,
+                    }),
+                )
+                .expect("seed compaction checkpoint");
+        }
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, Some(300), AutoCompactTokenLimitScope::Total, sampler);
+
+        let status = state.token_status().await;
+        assert!(
+            !status.token_limit_reached,
+            "pre-compaction provider usage must not leak into the compacted prompt window"
+        );
+        assert!(
+            status.auto_compact_scope_tokens < 300,
+            "post-compaction prompt should be sized from the compacted replacement history"
+        );
+    }
+
+    #[test]
+    fn shared_store_sink_accumulates_token_counts_and_sets_context_window() {
+        let (_dir, store, session_id) = store_with_session();
+        let sink = make_ui_sink_with_context_window(Arc::clone(&store), Some(950));
+        sink.emit(PendingEvent::new(
+            session_id.clone(),
+            names::TOKEN_COUNT,
+            serde_json::json!({
+                "info": {
+                    "total_token_usage": token_usage_value_with_total(10),
+                    "last_token_usage": token_usage_value_with_total(10),
+                    "model_context_window": null,
+                },
+                "turn_idx": 0,
+            }),
+        ));
+        sink.emit(PendingEvent::new(
+            session_id.clone(),
+            names::TOKEN_COUNT,
+            serde_json::json!({
+                "info": {
+                    "total_token_usage": token_usage_value_with_total(20),
+                    "last_token_usage": token_usage_value_with_total(20),
+                    "model_context_window": null,
+                },
+                "turn_idx": 0,
+            }),
+        ));
+
+        let log = events(&store, &session_id);
+        let latest = log
+            .iter()
+            .rev()
+            .find(|event| event.event_type == names::TOKEN_COUNT)
+            .expect("token count");
+        assert_eq!(
+            latest.payload["info"]["total_token_usage"]["total_tokens"].as_i64(),
+            Some(30)
+        );
+        assert_eq!(
+            latest.payload["info"]["model_context_window"].as_i64(),
+            Some(950)
+        );
+    }
+
+    #[tokio::test]
+    async fn body_after_prefix_prefill_uses_first_provider_usage_sample() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial request").await;
+        seed_token_count_usage(&store, &session_id, 80, 20, 100);
+
+        let recorded = Arc::new(Mutex::new(vec![assistant_text_message("done")]));
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::clone(&recorded),
+        )
+        .with_compaction(
+            1_000,
+            Some(50),
+            AutoCompactTokenLimitScope::BodyAfterPrefix,
+            sampler,
+        );
+
+        let first = state.token_status().await;
+        assert_eq!(
+            first.auto_compact_scope_tokens, 20,
+            "the first response output remains body growth; only provider input is the prefix baseline"
+        );
+
+        recorded.lock().unwrap().push(user_text_message(
+            "small follow-up after the provider response",
+        ));
+
+        let second = state.token_status().await;
+        assert!(
+            second.auto_compact_scope_tokens > 0,
+            "new user input after the provider response should count against the body budget"
+        );
+        assert!(
+            second.auto_compact_scope_tokens < 50,
+            "the baseline should be provider usage, not the full prompt"
+        );
+    }
+
+    #[tokio::test]
+    async fn body_after_prefix_uses_effective_context_window_for_full_guard() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial request").await;
+        seed_token_count_usage(&store, &session_id, 95, 0, 95);
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(
+            95,
+            Some(1_000),
+            AutoCompactTokenLimitScope::BodyAfterPrefix,
+            sampler,
+        );
+
+        let status = state.token_status().await;
+        assert!(
+            status.full_context_window_limit_reached,
+            "BodyAfterPrefix should use Codex's effective context window as the full-window guard"
+        );
+        assert!(status.token_limit_reached);
+    }
+
+    #[tokio::test]
+    async fn mid_turn_compaction_persists_checkpoint_with_initial_context_in_history() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_workspace_context(
+            &store,
+            &session_id,
+            "<environment_context>\n<cwd>/work</cwd>\n</environment_context>",
+        );
+        seed_user_input(&store, &session_id, "please compact this session").await;
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler);
+
+        state
+            .compact(CompactionMode::MidTurn)
+            .await
+            .expect("mid-turn compaction should persist a checkpoint");
+
+        let log = events(&store, &session_id);
+        let compacted = log
+            .iter()
+            .find(|event| event.event_type == "session.compacted")
+            .expect("session.compacted event");
+        assert_eq!(
+            compacted
+                .payload
+                .get("initial_context_already_in_history")
+                .and_then(Value::as_bool),
+            Some(true)
+        );
+        let replacement = compacted
+            .payload
+            .get("replacement_messages")
+            .and_then(Value::as_array)
+            .expect("replacement messages");
+
+        let workspace_idx = replacement
+            .iter()
+            .position(|item| item.get("name").and_then(Value::as_str) == Some("workspace_context"))
+            .expect("workspace context is inserted into mid-turn replacement history");
+        let user_idx = replacement
+            .iter()
+            .position(|item| provider_item_text(item).contains("please compact this session"))
+            .expect("real user input is preserved");
+        let summary_idx = replacement
+            .iter()
+            .position(|item| provider_item_text(item).contains("handoff"))
+            .expect("summary is appended");
+        assert!(
+            workspace_idx < user_idx,
+            "initial context should be reinserted before the real user message"
+        );
+        assert_eq!(
+            summary_idx,
+            replacement.len() - 1,
+            "summary should remain the final replacement message"
+        );
+        assert!(provider_item_text(&replacement[summary_idx])
+            .starts_with(crate::compact::SUMMARY_PREFIX));
+
+        let reconstructed = provider_messages_from_events(&log);
+        let workspace_count = reconstructed
+            .iter()
+            .filter(|item| item.get("name").and_then(Value::as_str) == Some("workspace_context"))
+            .count();
+        assert_eq!(
+            workspace_count, 1,
+            "mid-turn replay should not prepend duplicate initial context"
+        );
+    }
+
+    #[tokio::test]
+    async fn pre_turn_compaction_reducer_prepends_initial_context_to_checkpoint() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_workspace_context(
+            &store,
+            &session_id,
+            "<environment_context>\n<cwd>/work</cwd>\n</environment_context>",
+        );
+        seed_user_input(&store, &session_id, "please compact before the turn").await;
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler);
+
+        state
+            .compact(CompactionMode::PreTurn)
+            .await
+            .expect("pre-turn compaction should persist a checkpoint");
+
+        let log = events(&store, &session_id);
+        let compacted = log
+            .iter()
+            .find(|event| event.event_type == "session.compacted")
+            .expect("session.compacted event");
+        assert_eq!(
+            compacted
+                .payload
+                .get("initial_context_already_in_history")
+                .and_then(Value::as_bool),
+            Some(false)
+        );
+        let replacement = compacted
+            .payload
+            .get("replacement_messages")
+            .and_then(Value::as_array)
+            .expect("replacement messages");
+        assert!(
+            replacement
+                .iter()
+                .all(|item| item.get("name").and_then(Value::as_str).is_none()),
+            "pre-turn checkpoint should store only compacted conversation, not initial context"
+        );
+
+        let reconstructed = provider_messages_from_events(&log);
+        let workspace_idx = reconstructed
+            .iter()
+            .position(|item| item.get("name").and_then(Value::as_str) == Some("workspace_context"))
+            .expect("replay prepends workspace context");
+        let user_idx = reconstructed
+            .iter()
+            .position(|item| provider_item_text(item).contains("please compact before the turn"))
+            .expect("real user input remains in replayed history");
+        let summary_idx = reconstructed
+            .iter()
+            .position(|item| provider_item_text(item).contains("handoff"))
+            .expect("summary remains in replayed history");
+        assert!(
+            workspace_idx < user_idx,
+            "pre-turn replay should prepend initial context before the compacted user history"
+        );
+        assert!(user_idx < summary_idx);
+    }
+
+    #[tokio::test]
+    async fn pre_turn_compaction_replays_fresh_input_after_checkpoint() {
+        let (_dir, store, session_id) = store_with_session();
+        append_user_input(&store, &session_id, "old request");
+        let fresh_seq = append_user_input(&store, &session_id, "fresh request");
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler);
+        *state.pre_turn_replay_from_seq.lock().unwrap() = Some(fresh_seq - 1);
+
+        state
+            .compact(CompactionMode::PreTurn)
+            .await
+            .expect("pre-turn compaction should persist a checkpoint");
+
+        let log = events(&store, &session_id);
+        let compacted = log
+            .iter()
+            .find(|event| event.event_type == "session.compacted")
+            .expect("session.compacted event");
+        assert_eq!(
+            compacted
+                .payload
+                .get("replay_from_seq")
+                .and_then(Value::as_i64),
+            Some(fresh_seq - 1)
+        );
+        let replacement_text = compacted
+            .payload
+            .get("replacement_messages")
+            .and_then(Value::as_array)
+            .unwrap()
+            .iter()
+            .map(provider_item_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(replacement_text.contains("old request"));
+        assert!(
+            !replacement_text.contains("fresh request"),
+            "fresh input is recorded after pre-turn compaction, not summarized into it"
+        );
+
+        let replayed_text = provider_messages_from_events(&log)
+            .iter()
+            .map(provider_item_text)
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(replayed_text.contains("old request"));
+        assert!(replayed_text.contains("fresh request"));
+    }
+
+    #[tokio::test]
+    async fn compaction_recomputes_token_count_after_checkpoint() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "please compact").await;
+        seed_token_count(&store, &session_id, 900);
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(StaticSummarySampler("handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler);
+
+        state
+            .compact(CompactionMode::MidTurn)
+            .await
+            .expect("compaction should succeed");
+
+        let log = events(&store, &session_id);
+        let compacted_seq = log
+            .iter()
+            .find(|event| event.event_type == "session.compacted")
+            .expect("session.compacted")
+            .seq;
+        let token_count = log
+            .iter()
+            .find(|event| event.event_type == names::TOKEN_COUNT && event.seq > compacted_seq)
+            .expect("post-compaction token_count");
+        assert!(
+            token_count.payload["info"]["last_token_usage"]["total_tokens"]
+                .as_i64()
+                .unwrap_or_default()
+                > 0
+        );
+        assert_eq!(
+            token_count.payload["info"]["total_token_usage"]["total_tokens"].as_i64(),
+            Some(900),
+            "Codex recompute preserves cumulative total usage and replaces only last usage"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_summary_usage_is_counted_before_recompute() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "please compact").await;
+        seed_token_count(&store, &session_id, 900);
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(UsageSummarySampler {
+            summary: "handoff",
+            usage: TokenUsage {
+                input: 30,
+                cached_input: 5,
+                output: 20,
+                reasoning_output: 0,
+                total: 50,
+            },
+        });
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler);
+
+        state
+            .compact(CompactionMode::MidTurn)
+            .await
+            .expect("compaction should succeed");
+
+        let log = events(&store, &session_id);
+        let compacted_seq = log
+            .iter()
+            .find(|event| event.event_type == "session.compacted")
+            .expect("session.compacted")
+            .seq;
+        let summary_usage = log
+            .iter()
+            .find(|event| {
+                event.event_type == names::TOKEN_COUNT
+                    && event.seq < compacted_seq
+                    && event.payload["info"]["last_token_usage"]["total_tokens"].as_i64()
+                        == Some(50)
+            })
+            .expect("summary token usage is recorded before the checkpoint");
+        assert_eq!(
+            summary_usage.payload["info"]["total_token_usage"]["total_tokens"].as_i64(),
+            Some(950)
+        );
+        let recomputed = log
+            .iter()
+            .find(|event| event.event_type == names::TOKEN_COUNT && event.seq > compacted_seq)
+            .expect("post-compaction token_count");
+        assert_eq!(
+            recomputed.payload["info"]["total_token_usage"]["total_tokens"].as_i64(),
+            Some(950),
+            "post-compaction recompute preserves cumulative usage including the summary model call"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_retries_retryable_summary_failures() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "please compact").await;
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(FlakySummarySampler {
+            attempts: AtomicUsize::new(0),
+        });
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler);
+
+        state
+            .compact(CompactionMode::MidTurn)
+            .await
+            .expect("retryable provider failure should be retried");
+
+        let log = events(&store, &session_id);
+        assert!(log.iter().any(|event| {
+            event.event_type == names::STREAM_ERROR
+                && event
+                    .payload
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .is_some_and(|message| message.contains("Reconnecting... 1/"))
+        }));
+        assert!(log
+            .iter()
+            .any(|event| event.event_type == "session.compacted"));
+    }
+
+    #[tokio::test]
+    async fn compaction_retry_preserves_context_window_trimmed_history() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "old request").await;
+        seed_user_input(&store, &session_id, "new request").await;
+
+        let sampler = Arc::new(WindowThenRetryableThenSuccessSampler::new());
+        let sampler_dyn: Arc<dyn DynCompactionSampler> = sampler.clone();
+
+        let compacted = run_compaction_with_retries(
+            &SessionId(session_id.clone()),
+            &store,
+            &[
+                serde_json::json!({"role": "user", "content": [{"type": "text", "text": "old request"}]}),
+                serde_json::json!({"role": "user", "content": [{"type": "text", "text": "new request"}]}),
+            ],
+            sampler_dyn.as_ref(),
+            crate::compact::SUMMARIZATION_PROMPT,
+            COMPACT_USER_MESSAGE_MAX_TOKENS,
+            1,
+            Some(1_000),
+        )
+        .await
+        .expect("mixed window and retryable errors should eventually succeed");
+
+        assert!(compacted
+            .summary_text
+            .contains("handoff after mixed failures"));
+        assert_eq!(
+            *sampler.request_lens.lock().unwrap(),
+            vec![3, 2, 2],
+            "after ContextWindowExceeded trims the oldest item, the retryable provider failure must retry the trimmed request"
+        );
+    }
+
+    #[tokio::test]
+    async fn compaction_marks_tokens_full_when_summary_cannot_fit() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_token_count(&store, &session_id, 400);
+
+        let sampler: Arc<dyn DynCompactionSampler> = Arc::new(AlwaysWindowExceededSampler);
+        let err = run_compaction_with_retries(
+            &SessionId(session_id.clone()),
+            &store,
+            &[],
+            sampler.as_ref(),
+            crate::compact::SUMMARIZATION_PROMPT,
+            COMPACT_USER_MESSAGE_MAX_TOKENS,
+            0,
+            Some(1_000),
+        )
+        .await
+        .expect_err("unshrinkable summary request should fail");
+        assert!(matches!(err, AgentError::ContextWindowExceeded));
+
+        let log = events(&store, &session_id);
+        let token_count = log
+            .iter()
+            .rev()
+            .find(|event| event.event_type == names::TOKEN_COUNT)
+            .expect("token full event");
+        assert_eq!(
+            token_count.payload["info"]["total_token_usage"]["total_tokens"].as_i64(),
+            Some(1_000)
+        );
+        assert_eq!(
+            token_count.payload["info"]["last_token_usage"]["total_tokens"].as_i64(),
+            Some(600)
+        );
+        assert!(log
+            .iter()
+            .any(|event| event.event_type == "model.turn.context_overflow"));
+    }
+
+    #[tokio::test]
+    async fn previous_model_downshift_compacts_before_current_model_sampling() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_model_turn_request(&store, &session_id, "larger-model");
+        seed_token_count(&store, &session_id, 800);
+
+        let current_sampler: Arc<dyn DynCompactionSampler> =
+            Arc::new(StaticSummarySampler("current model handoff"));
+        let previous_sampler: Arc<dyn DynCompactionSampler> =
+            Arc::new(StaticSummarySampler("previous model handoff"));
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(
+            700,
+            Some(700),
+            AutoCompactTokenLimitScope::Total,
+            current_sampler,
+        )
+        .with_current_model("smaller-model")
+        .with_previous_model_compaction(Some(PreviousModelCompaction {
+            model: "larger-model".to_string(),
+            model_context_window: 1_000,
+            sampler: previous_sampler,
+        }));
+
+        assert!(state
+            .compact_previous_model_downshift_if_needed()
+            .await
+            .expect("downshift compaction succeeds"));
+        let log = events(&store, &session_id);
+        let compacted = log
+            .iter()
+            .find(|event| event.event_type == "session.compacted")
+            .expect("session.compacted");
+        assert!(
+            compacted
+                .payload
+                .get("message")
+                .and_then(Value::as_str)
+                .is_some_and(|message| message.contains("previous model handoff")),
+            "downshift compaction should use the previous model sampler"
+        );
+    }
+
+    #[tokio::test]
+    async fn store_compaction_uses_custom_compact_prompt() {
+        let (_dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "please compact").await;
+
+        let sampler = Arc::new(CapturingSummarySampler::new("handoff"));
+        let sampler_dyn: Arc<dyn DynCompactionSampler> = sampler.clone();
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_compaction(1_000, None, AutoCompactTokenLimitScope::Total, sampler_dyn)
+        .with_compaction_prompt("CUSTOM COMPACT PROMPT")
+        .with_compaction_instructions(
+            "BASE INSTRUCTIONS",
+            Some("DEVELOPER INSTRUCTIONS".to_string()),
+        );
+
+        state
+            .compact(CompactionMode::MidTurn)
+            .await
+            .expect("compaction should succeed");
+
+        let requests = sampler.requests.lock().unwrap();
+        let request = requests.first().expect("request captured");
+        let texts = request
+            .iter()
+            .flat_map(|message| message.content.iter())
+            .filter_map(|part| match part {
+                ContentPart::Text { text } => Some(text.as_str()),
+                _ => None,
+            })
+            .collect::<Vec<_>>();
+        assert!(texts.contains(&"CUSTOM COMPACT PROMPT"));
+        assert!(
+            !texts.contains(&crate::compact::SUMMARIZATION_PROMPT),
+            "custom prompt should replace the built-in compact prompt"
+        );
+    }
+
+    #[test]
+    fn summary_llm_request_carries_base_instructions_without_extra_developer_message() {
+        let req = build_summary_llm_request(
+            "model",
+            "provider",
+            "BASE INSTRUCTIONS",
+            vec![user_text_message("summary prompt")],
+        );
+
+        assert_eq!(req.system.len(), 1);
+        assert_eq!(req.system[0].text, "BASE INSTRUCTIONS");
+        assert_eq!(req.messages.len(), 1);
+        assert!(matches!(req.messages[0].role, MessageRole::User));
     }
 
     // -----------------------------------------------------------------------

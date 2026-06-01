@@ -55,10 +55,11 @@ use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
 
+use crate::context::accounting::TokenUsage;
 use crate::context::assembly::TruncationPolicy;
 use crate::context::{ContextManager, Item};
 use crate::decision::TokenStatus;
-use crate::turn::TurnState;
+use crate::turn::{CompactionMode, TurnState};
 use crate::AgentError;
 
 #[cfg(test)]
@@ -132,14 +133,38 @@ fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
     text[..end].to_string()
 }
 
+/// Result of one successful no-tools summary pass.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CompactionSummary {
+    pub text: String,
+    pub token_usage: Option<TokenUsage>,
+}
+
+impl CompactionSummary {
+    pub fn text(text: impl Into<String>) -> Self {
+        Self {
+            text: text.into(),
+            token_usage: None,
+        }
+    }
+
+    pub fn with_usage(text: impl Into<String>, token_usage: TokenUsage) -> Self {
+        Self {
+            text: text.into(),
+            token_usage: Some(token_usage),
+        }
+    }
+}
+
 /// The no-tools summary pass: run ONE model round-trip over the summary request
-/// and return the assistant's summary text (codex `drain_to_completed` collecting
-/// the assistant message of the compact turn, `compact.rs:208/262`).
+/// and return the assistant's summary text plus provider token usage when the
+/// stream reports it (codex records `Completed { token_usage, .. }` before
+/// recomputing active context, `compact.rs:208/572`).
 ///
 /// This MUST be model-based. Implementors drive the real `ModelClient` with tool
 /// dispatch DISABLED; tests inject a scripted response. The pass returns:
-/// - `Ok(summary)` with the assistant summary text (empty string allowed — codex
-///   falls back to `(no summary available)` downstream),
+/// - `Ok(summary)` with the assistant summary text and optional usage (empty
+///   string allowed — codex falls back to `(no summary available)` downstream),
 /// - `Err(AgentError::ContextWindowExceeded)` so [`run_compaction`] can drop the
 ///   oldest item and retry (codex `compact.rs:224`),
 /// - any other `Err` to abort compaction.
@@ -148,12 +173,12 @@ fn truncate_to_tokens(text: &str, max_tokens: usize) -> String {
 /// [`crate::turn::SamplingDriver`] (no `async_trait` macro).
 pub trait CompactionSampler: Send + Sync {
     /// Summarize `request` (the conversation so far + the summarization prompt) in
-    /// a single no-tools model round-trip, returning the assistant summary text.
+    /// a single no-tools model round-trip.
     fn summarize(
         &self,
         request: Vec<Message>,
         cancel: CancellationToken,
-    ) -> impl std::future::Future<Output = Result<String, AgentError>> + Send;
+    ) -> impl std::future::Future<Output = Result<CompactionSummary, AgentError>> + Send;
 }
 
 /// Lower a history [`Item`] (provider-message `Value`) to its plain user text iff
@@ -165,6 +190,9 @@ fn real_user_message_text(item: &Item) -> Option<String> {
     let obj = item.as_object()?;
     let role = obj.get("role").and_then(Value::as_str)?;
     if role != "user" {
+        return None;
+    }
+    if obj.get("name").and_then(Value::as_str).is_some() {
         return None;
     }
     let text = item_text(item);
@@ -215,6 +243,11 @@ fn user_text_item(text: &str) -> Item {
     })
 }
 
+/// Build the final user message appended to a compaction summary request.
+pub fn compaction_prompt_item(compact_prompt: &str) -> Item {
+    user_text_item(compact_prompt)
+}
+
 /// Assemble the compacted replacement history: the most-recent real user messages
 /// (oldest-first) within the token budget, then the summary message last.
 ///
@@ -263,6 +296,23 @@ pub fn build_compacted_history(
     history
 }
 
+/// Build the replacement history from a completed summary suffix.
+pub fn compacted_history_from_summary(
+    history: &[Item],
+    summary_suffix: CompactionSummary,
+    token_limit: usize,
+) -> CompactedHistory {
+    let summary_text = format!("{SUMMARY_PREFIX}\n{}", summary_suffix.text);
+    let user_messages: Vec<String> = history.iter().filter_map(real_user_message_text).collect();
+    let items = build_compacted_history(&user_messages, &summary_text, token_limit);
+
+    CompactedHistory {
+        items,
+        summary_text,
+        summary_token_usage: summary_suffix.token_usage,
+    }
+}
+
 /// The compacted replacement history produced by [`run_compaction`]: a fresh item
 /// buffer that REPLACES the pre-compaction history (codex
 /// `replace_compacted_history`, `compact.rs:284`).
@@ -273,6 +323,8 @@ pub struct CompactedHistory {
     /// The full summary message text (`"{SUMMARY_PREFIX}\n{summary_suffix}"`), the
     /// last item's text. Surfaced for the lifecycle/compacted-item event.
     pub summary_text: String,
+    /// Provider-reported usage for the no-tools compaction model call.
+    pub summary_token_usage: Option<TokenUsage>,
 }
 
 /// Run **model-based** compaction over `history` and return the compacted
@@ -296,19 +348,20 @@ pub struct CompactedHistory {
 pub async fn run_compaction<S: CompactionSampler + ?Sized>(
     history: &[Item],
     sampler: &S,
+    compact_prompt: &str,
     token_limit: usize,
     cancel: CancellationToken,
 ) -> Result<CompactedHistory, AgentError> {
     // 1. Working history = original history + the summarization prompt (recorded as
     //    the final user item, codex `compact.rs:182`).
     let mut working: Vec<Item> = history.to_vec();
-    working.push(user_text_item(SUMMARIZATION_PROMPT));
+    working.push(compaction_prompt_item(compact_prompt));
 
     // 2. No-tools summary pass with the drop-oldest-on-ContextWindowExceeded loop
     //    (codex `compact.rs:195-258`). Lower items to typed messages each attempt
     //    because the working set may shrink between retries.
     let summary_suffix = loop {
-        let request = lower_items(&working);
+        let request = compaction_request_messages(&working);
         match sampler.summarize(request, cancel.clone()).await {
             Ok(summary) => break summary,
             Err(AgentError::ContextWindowExceeded) => {
@@ -324,24 +377,19 @@ pub async fn run_compaction<S: CompactionSampler + ?Sized>(
         }
     };
 
-    // 3. Prefix the summary (codex `compact.rs:263`).
-    let summary_text = format!("{SUMMARY_PREFIX}\n{summary_suffix}");
-
-    // 4. Preserve recent real user messages (from the ORIGINAL history) + summary
+    // 3-4. Prefix the summary and preserve recent real user messages (from the ORIGINAL history)
     //    (codex `compact.rs:264-266`).
-    let user_messages: Vec<String> = history.iter().filter_map(real_user_message_text).collect();
-    let items = build_compacted_history(&user_messages, &summary_text, token_limit);
-
-    Ok(CompactedHistory {
-        items,
-        summary_text,
-    })
+    Ok(compacted_history_from_summary(
+        history,
+        summary_suffix,
+        token_limit,
+    ))
 }
 
 /// Lower provider-message `Item`s to typed [`Message`]s for an `LlmRequest`,
 /// reusing [`ContextManager::lower_to_messages`] so the summary request is built
 /// exactly like a normal sampling request.
-fn lower_items(items: &[Item]) -> Vec<Message> {
+pub fn compaction_request_messages(items: &[Item]) -> Vec<Message> {
     ContextManager::new().lower_to_messages(items)
 }
 
@@ -443,7 +491,7 @@ impl<S: CompactionSampler + 'static> TurnState for CompactingTurnState<S> {
             .clone()
     }
 
-    async fn compact(&self) {
+    async fn compact(&self, _mode: CompactionMode) -> Result<(), AgentError> {
         // Snapshot current history (codex `clone_history`, `compact.rs:182`).
         let items: Vec<Item> = {
             let ctx = self.ctx.lock().expect("context manager poisoned");
@@ -454,17 +502,14 @@ impl<S: CompactionSampler + 'static> TurnState for CompactingTurnState<S> {
         let compacted = match run_compaction(
             &items,
             self.sampler.as_ref(),
+            SUMMARIZATION_PROMPT,
             self.token_limit,
             CancellationToken::new(),
         )
         .await
         {
             Ok(c) => c,
-            // A failed compaction leaves history untouched (codex propagates the
-            // error to the turn; here we simply do not replace history). The loop's
-            // control flow still set the drain gate, matching codex's post-compact
-            // sequencing.
-            Err(_) => return,
+            Err(error) => return Err(error),
         };
 
         // Replace history with the compacted items (codex `replace_compacted_history`,
@@ -482,6 +527,7 @@ impl<S: CompactionSampler + 'static> TurnState for CompactingTurnState<S> {
             st.full_context_window_limit_reached = false;
             st.token_limit_reached = false;
         }
+        Ok(())
     }
 }
 
