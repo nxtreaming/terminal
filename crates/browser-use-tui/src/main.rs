@@ -12955,6 +12955,55 @@ wire_api = "responses"
     }
 
     #[test]
+    fn running_status_notice_survives_tail_cropped_viewport() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.args.height = 16;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep the selected task open"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "browser.page",
+            serde_json::json!({
+                "url": "https://news.ycombinator.com",
+                "title": "Hacker News",
+            }),
+        )?;
+        let committed_seq = app
+            .store
+            .events_for_session(&session.id)?
+            .last()
+            .map(|event| event.seq)
+            .unwrap_or_default();
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({
+                "text": (1..=24)
+                    .map(|idx| format!("stream line {idx:02}"))
+                    .collect::<Vec<_>>()
+                    .join("\n")
+            }),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history
+            .reset_for_session(session.id, committed_seq);
+        app.status_notice = Some("Resumed previous session after reload.".to_string());
+
+        let screen = render_dump(&mut app)?;
+
+        assert!(
+            screen.contains("Resumed previous session after reload."),
+            "running notices must stay visible even when transcript lines are tail-cropped\n{screen}"
+        );
+        Ok(())
+    }
+
+    #[test]
     fn live_status_appearing_does_not_shift_composer_mouse_rect() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;

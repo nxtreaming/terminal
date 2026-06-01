@@ -204,6 +204,16 @@ fn render_main(
             max_body_h,
             stream_skip_lines,
         );
+        if let Some(notice) = app
+            .status_notice
+            .as_ref()
+            .filter(|_| status_notice_needs_tail_visibility(app, product_state))
+        {
+            if !lines.is_empty() {
+                lines.push(Line::from(""));
+            }
+            lines.push(Line::from(Span::styled(notice.clone(), muted())));
+        }
         if lines.is_empty() {
             if let Some(next) = next_action_lines(state, app, product_state) {
                 lines = next;
@@ -2697,7 +2707,8 @@ fn work_lines(
 ) -> Vec<Line<'static>> {
     let mut out = Vec::new();
     out.extend(crate::welcome::session_header_lines(width));
-    if let Some(notice) = app.status_notice.as_ref() {
+    let notice_at_tail = status_notice_needs_tail_visibility(app, product_state);
+    if let Some(notice) = app.status_notice.as_ref().filter(|_| !notice_at_tail) {
         out.push(Line::from(Span::styled(notice.clone(), muted())));
         out.push(Line::from(""));
     }
@@ -2720,6 +2731,12 @@ fn work_lines(
             })
             .unwrap_or_default(),
     );
+    if let Some(notice) = app.status_notice.as_ref().filter(|_| notice_at_tail) {
+        if !out.is_empty() {
+            out.push(Line::from(""));
+        }
+        out.push(Line::from(Span::styled(notice.clone(), muted())));
+    }
     if out.is_empty() {
         append_task_section(&mut out, state);
     }
@@ -2728,6 +2745,14 @@ fn work_lines(
         out.extend(next);
     }
     out
+}
+
+fn status_notice_needs_tail_visibility(app: &App, product_state: ProductState) -> bool {
+    matches!(product_state, ProductState::Running)
+        && matches!(
+            app.status_notice.as_deref(),
+            Some("Resumed previous session after reload.")
+        )
 }
 
 fn next_action_lines(
