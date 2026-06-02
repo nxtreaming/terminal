@@ -68,6 +68,7 @@ use serde_json::Value;
 
 const MESSAGE_KIND_FOLLOWUP: &str = "followup";
 const APPROX_CHARS_PER_TOKEN: usize = 4;
+const DATASET_BROWSER_CLEANUP_TIMEOUT: Duration = Duration::from_secs(15);
 
 #[derive(Debug, Parser)]
 #[command(name = "browser-use-terminal", bin_name = "browser-use-terminal")]
@@ -4496,20 +4497,13 @@ fn run_dataset_case_with_provider<R: DatasetRunner>(
         collab_enabled: AgentRunOptions::default().collab_enabled,
         agent_roles: AgentRunOptions::default().agent_roles,
     };
-    let mut run_error = runner
+    let run_error = runner
         .run_dataset_session(store, &session_id, agent_options)
         .err()
         .map(|error| format!("{error:#}"));
-    if let Err(error) = cleanup_dataset_browser_session(store, &session_id) {
-        let cleanup_error = format!("dataset browser cleanup failed: {error:#}");
-        if let Some(run_error) = run_error.as_mut() {
-            run_error.push_str("\n");
-            run_error.push_str(&cleanup_error);
-        } else {
-            run_error = Some(cleanup_error);
-        }
-    }
-    dataset_attempt_result(store, case, &session_id, config, attempt, run_error)
+    let result = dataset_attempt_result(store, case, &session_id, config, attempt, run_error)?;
+    spawn_dataset_browser_cleanup(store, &session_id);
+    Ok(result)
 }
 
 fn cleanup_dataset_browser_session(store: &Store, session_id: &str) -> Result<usize> {
@@ -4523,6 +4517,67 @@ fn cleanup_dataset_browser_session(store: &Store, session_id: &str) -> Result<us
         }),
     )?;
     Ok(removed_sessions)
+}
+
+fn spawn_dataset_browser_cleanup(store: &Store, session_id: &str) {
+    let state_dir = store.state_dir().to_path_buf();
+    let session_id = session_id.to_string();
+    thread::spawn(move || {
+        let (done_tx, done_rx) = mpsc::channel();
+        let cleanup_state_dir = state_dir.clone();
+        let cleanup_session_id = session_id.clone();
+        thread::spawn(move || {
+            let started = Instant::now();
+            let cleanup_result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                browser_use_browser::cleanup_session(&cleanup_session_id)
+            }));
+            if let Ok(cleanup_store) = Store::open(&cleanup_state_dir) {
+                match cleanup_result {
+                    Ok(removed_sessions) => {
+                        let _ = cleanup_store.append_event(
+                            &cleanup_session_id,
+                            "browser.cleaned_up",
+                            serde_json::json!({
+                                "source": "dataset-run",
+                                "removed_sessions": removed_sessions,
+                                "duration_ms": started.elapsed().as_millis() as u64,
+                                "async": true,
+                            }),
+                        );
+                    }
+                    Err(panic) => {
+                        let _ = cleanup_store.append_event(
+                            &cleanup_session_id,
+                            "browser.cleanup_failed",
+                            serde_json::json!({
+                                "source": "dataset-run",
+                                "error": format!("cleanup panicked: {}", panic_payload_message(panic)),
+                                "duration_ms": started.elapsed().as_millis() as u64,
+                                "async": true,
+                            }),
+                        );
+                    }
+                }
+            }
+            let _ = done_tx.send(());
+        });
+        if done_rx
+            .recv_timeout(DATASET_BROWSER_CLEANUP_TIMEOUT)
+            .is_err()
+        {
+            if let Ok(timeout_store) = Store::open(&state_dir) {
+                let _ = timeout_store.append_event(
+                    &session_id,
+                    "browser.cleanup_timed_out",
+                    serde_json::json!({
+                        "source": "dataset-run",
+                        "timeout_ms": DATASET_BROWSER_CLEANUP_TIMEOUT.as_millis() as u64,
+                        "async": true,
+                    }),
+                );
+            }
+        }
+    });
 }
 
 fn dataset_attempt_result(
@@ -5785,6 +5840,42 @@ command = "test-mcp"
     }
 
     #[test]
+    fn dataset_browser_cleanup_can_run_asynchronously() -> Result<()> {
+        let temp = unique_cli_test_dir("dataset-browser-cleanup-async")?;
+        let state_dir = temp.join("state");
+        let cwd = temp.join("cwd");
+        std::fs::create_dir_all(&cwd)?;
+        let store = Store::open(&state_dir)?;
+        let session = store.create_session(None, &cwd)?;
+
+        spawn_dataset_browser_cleanup(&store, &session.id);
+
+        let cleanup = {
+            let started = Instant::now();
+            loop {
+                let events = store.events_for_session(&session.id)?;
+                if let Some(event) = events
+                    .iter()
+                    .find(|event| event.event_type == "browser.cleaned_up")
+                {
+                    break event.payload.clone();
+                }
+                assert!(
+                    started.elapsed() < Duration::from_secs(2),
+                    "timed out waiting for async cleanup event"
+                );
+                thread::sleep(Duration::from_millis(20));
+            }
+        };
+        assert_eq!(cleanup["source"], "dataset-run");
+        assert_eq!(cleanup["removed_sessions"], 0);
+        assert_eq!(cleanup["async"], true);
+
+        std::fs::remove_dir_all(temp)?;
+        Ok(())
+    }
+
+    #[test]
     fn dataset_manifest_usage_summary_aggregates_reasoning_tokens() {
         let manifest = serde_json::json!({
             "sessions": [
@@ -6606,6 +6697,7 @@ command = "test-mcp"
     }
 
     fn unique_cli_test_dir(name: &str) -> Result<std::path::PathBuf> {
+        std::env::set_var("BUT_PRODUCT_ANALYTICS", "false");
         let nanos = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)?
             .as_nanos();
