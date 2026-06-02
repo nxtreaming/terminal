@@ -105,14 +105,12 @@ struct Args {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CollaborationModeArg {
     Default,
-    Plan,
 }
 
 impl From<CollaborationModeArg> for CollaborationModeKind {
     fn from(value: CollaborationModeArg) -> Self {
         match value {
             CollaborationModeArg::Default => CollaborationModeKind::Default,
-            CollaborationModeArg::Plan => CollaborationModeKind::Plan,
         }
     }
 }
@@ -5596,15 +5594,15 @@ mod tests {
     }
 
     #[test]
-    fn cli_agent_options_pass_collaboration_mode_to_core() -> Result<()> {
+    fn cli_collaboration_mode_defaults_to_core_default() -> Result<()> {
         let options = cli_agent_options(
             None,
             &[],
-            CollaborationModeKind::Plan,
+            CollaborationModeArg::Default.into(),
             &CliRuntimeOptions::default(),
         )?;
 
-        assert_eq!(options.collaboration_mode, CollaborationModeKind::Plan);
+        assert_eq!(options.collaboration_mode, CollaborationModeKind::Default);
         Ok(())
     }
 

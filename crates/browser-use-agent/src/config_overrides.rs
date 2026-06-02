@@ -383,7 +383,11 @@ impl AgentRunOptions {
     }
 
     pub fn with_collaboration_mode(mut self, mode: CollaborationModeKind) -> Self {
-        self.collaboration_mode = mode;
+        self.collaboration_mode = match mode {
+            CollaborationModeKind::Default | CollaborationModeKind::Plan => {
+                CollaborationModeKind::Default
+            }
+        };
         self
     }
 
@@ -1871,23 +1875,15 @@ command = "profile-server"
     }
 
     #[test]
-    fn collaboration_mode_kind_parity_with_core() {
-        // The agent crate reuses `crate::prompts::CollaborationModeKind` instead
-        // of duplicating it. Assert the two variants map to the same override
-        // strings core's `CollaborationModeKind::as_str` produces ("plan" /
-        // "default", `lib.rs:306-313`), keeping the engines in lock-step.
-        fn as_str(mode: CollaborationModeKind) -> &'static str {
-            match mode {
-                CollaborationModeKind::Plan => "plan",
-                CollaborationModeKind::Default => "default",
-            }
-        }
-        assert_eq!(as_str(CollaborationModeKind::Plan), "plan");
-        assert_eq!(as_str(CollaborationModeKind::Default), "default");
-
-        // The default mode matches core's `#[default] Default`.
+    fn deprecated_plan_mode_normalizes_to_default() {
         assert_eq!(
             AgentRunOptions::default().collaboration_mode,
+            CollaborationModeKind::Default
+        );
+        assert_eq!(
+            AgentRunOptions::default()
+                .with_collaboration_mode(CollaborationModeKind::Plan)
+                .collaboration_mode,
             CollaborationModeKind::Default
         );
     }
