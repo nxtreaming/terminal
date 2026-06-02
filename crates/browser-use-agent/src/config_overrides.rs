@@ -43,7 +43,7 @@ use crate::tools::AskForApproval;
 pub const DEFAULT_MAX_CONTEXT_CHARS: usize = 240_000;
 
 /// Codex MultiAgentV2 defaults. These mirror Codex's `MultiAgentV2Config`
-/// values and the feature's under-development default-off gate.
+/// values, with v2 enabled by default for this terminal's model-visible toolset.
 pub const DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION: usize = 4;
 pub const DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS: i64 = 10_000;
 pub const DEFAULT_MULTI_AGENT_V2_MAX_WAIT_TIMEOUT_MS: i64 = 3_600_000;
@@ -77,7 +77,7 @@ pub struct MultiAgentV2Options {
 impl Default for MultiAgentV2Options {
     fn default() -> Self {
         Self {
-            enabled: false,
+            enabled: true,
             max_concurrent_threads_per_session:
                 DEFAULT_MULTI_AGENT_V2_MAX_CONCURRENT_THREADS_PER_SESSION,
             min_wait_timeout_ms: DEFAULT_MULTI_AGENT_V2_MIN_WAIT_TIMEOUT_MS,

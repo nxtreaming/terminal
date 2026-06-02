@@ -1539,13 +1539,14 @@ The biggest remaining categories are:
   enforcement/listing UX, plugin/cloud hook discovery, stricter output
   validation, exact streaming futures for mutating tools, and a full Codex
   `TurnDiffTracker` lifecycle across every tool runtime.
-- Multi-agent family routing now follows Codex's feature gate for represented
-  sessions: `features.multi_agent_v2.enabled = true` selects the v2 task-path
-  surface, while the default surface is the namespaced legacy
-  `multi_agent_v1` family. The v1 wrappers cover `spawn_agent`, `send_input`,
-  `resume_agent`, `wait_agent`, and `close_agent` with Codex-shaped schemas and
-  output payloads, adapting to the local session store. The latest slice also
-  preserves typed v1 `items` for child context: Codex-style `message`/`items`
+- Multi-agent family routing now defaults represented sessions to the v2
+  task-path surface; set `features.multi_agent_v2.enabled = false` to disable
+  v2, and set `features.multi_agent = true` or `features.collab = true` to use
+  the namespaced legacy `multi_agent_v1` family instead. The v1 wrappers cover
+  `spawn_agent`, `send_input`, `resume_agent`, `wait_agent`, and `close_agent`
+  with Codex-shaped schemas and output payloads, adapting to the local session
+  store. The latest slice also preserves typed v1 `items` for child context:
+  Codex-style `message`/`items`
   validation is enforced, text/image/local_image/skill/mention inputs persist
   alongside preview text on `session.input` and `session.followup`, provider
   replay uses typed content parts, `skill` items inject Codex-shaped `<skill>`

@@ -2579,6 +2579,36 @@ mod tests {
     /// tools while the feature is enabled; a spawn still fails honestly when no
     /// child runner is wired.
     #[test]
+    fn subagent_tools_are_registered_by_default_in_the_dispatcher() {
+        let options = crate::config_overrides::AgentRunOptions::default();
+        let config =
+            ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
+        let dispatcher = build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
+        let names: Vec<&str> = dispatcher
+            .tool_specs()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        for tool in [
+            "spawn_agent",
+            "wait_agent",
+            "send_message",
+            "followup_task",
+            "list_agents",
+            "close_agent",
+        ] {
+            assert!(
+                names.contains(&tool),
+                "{tool} must be registered by default in the production dispatcher; got {names:?}"
+            );
+        }
+        assert!(
+            !names.contains(&"send_input"),
+            "send_input is a v1 tool and must not be exposed in the default Codex-v2 flat tool surface"
+        );
+    }
+
+    #[test]
     fn subagent_tools_are_registered_in_the_dispatcher() {
         let options = crate::config_overrides::AgentRunOptions {
             multi_agent_v2: crate::config_overrides::MultiAgentV2Options {
