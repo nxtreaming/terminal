@@ -95,6 +95,9 @@ pub struct SubagentToolDeps {
     /// Optional child runner used to wake an existing child when `followup_task`
     /// targets an idle Store-backed agent.
     pub child_runner: Option<ChildAgentRunner>,
+    /// Per-session runtime cleanup used by close_agent to tear down resources
+    /// that live outside the durable store, such as unified exec sessions.
+    pub cleanup_session_runtime: Option<Arc<dyn Fn(&str) -> usize + Send + Sync>>,
     /// Serializes the durable store limit check with the in-memory manager
     /// reservation. Store-backed child creation is synchronous before the runner
     /// returns, so the next spawn sees the just-created child in the store.
@@ -112,6 +115,13 @@ impl SubagentToolDeps {
             payload,
         ));
     }
+}
+
+fn cleanup_runtime_for_session(deps: &SubagentToolDeps, session_id: &str) -> usize {
+    deps.cleanup_session_runtime
+        .as_ref()
+        .map(|cleanup| cleanup(session_id))
+        .unwrap_or(0)
 }
 
 fn now_ms() -> i64 {
@@ -909,6 +919,118 @@ fn current_child_run_events<'a>(
     (marker_run_id == expected_run_id).then_some(&events[marker_idx + 1..])
 }
 
+#[derive(Clone, Debug, Default, PartialEq)]
+struct StoredChildRunConfig {
+    model: Option<String>,
+    reasoning_effort: Option<String>,
+    service_tier: Option<String>,
+    config_overrides: Vec<(String, toml::Value)>,
+}
+
+fn latest_child_run_config(
+    store: &Store,
+    child_session_id: &str,
+) -> Result<StoredChildRunConfig, ToolError> {
+    let event = store
+        .latest_event_for_session_by_type(child_session_id, "agent.run.started")
+        .map_err(|err| tool_err("load child run config failed", err))?;
+    Ok(event
+        .as_ref()
+        .map(child_run_config_from_marker)
+        .unwrap_or_default())
+}
+
+fn child_run_config_from_marker(event: &browser_use_protocol::EventRecord) -> StoredChildRunConfig {
+    StoredChildRunConfig {
+        model: payload_optional_string(&event.payload, "model"),
+        reasoning_effort: payload_optional_string(&event.payload, "reasoning_effort"),
+        service_tier: payload_optional_string(&event.payload, "service_tier"),
+        config_overrides: child_config_overrides_from_payload(&event.payload),
+    }
+}
+
+fn payload_optional_string(payload: &Value, key: &str) -> Option<String> {
+    payload
+        .get(key)
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(ToOwned::to_owned)
+}
+
+fn child_config_overrides_from_payload(payload: &Value) -> Vec<(String, toml::Value)> {
+    payload
+        .get("config_overrides")
+        .and_then(Value::as_array)
+        .map(|items| {
+            items
+                .iter()
+                .filter_map(child_config_override_from_value)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+fn child_config_override_from_value(entry: &Value) -> Option<(String, toml::Value)> {
+    if let Some(object) = entry.as_object() {
+        let key = object
+            .get("key")
+            .and_then(Value::as_str)
+            .map(str::trim)
+            .filter(|key| !key.is_empty())?;
+        let value = object.get("value")?;
+        return serde_json::from_value::<toml::Value>(value.clone())
+            .ok()
+            .map(|value| (key.to_string(), value));
+    }
+
+    let array = entry.as_array()?;
+    if array.len() != 2 {
+        return None;
+    }
+    let key = array[0].as_str()?.trim();
+    if key.is_empty() {
+        return None;
+    }
+    serde_json::from_value::<toml::Value>(array[1].clone())
+        .ok()
+        .map(|value| (key.to_string(), value))
+}
+
+fn store_child_run_request(
+    shared_store: &SharedStore,
+    summary: &browser_use_store::AgentSummary,
+    child_session_id: String,
+    agent_path: Option<String>,
+    run_id: String,
+    message: String,
+    input_items: Option<Value>,
+    run_config: StoredChildRunConfig,
+) -> ChildAgentRunRequest {
+    ChildAgentRunRequest {
+        parent_session_id: summary.parent_session_id.clone(),
+        child_session_id: child_session_id.clone(),
+        run_id: Some(run_id.clone()),
+        message,
+        input_items,
+        input_is_inter_agent_communication: false,
+        agent_path,
+        nickname: summary.agent_nickname.clone(),
+        role: summary.agent_role.clone(),
+        fork_turns: Some("none".to_string()),
+        model: run_config.model,
+        reasoning_effort: run_config.reasoning_effort,
+        service_tier: run_config.service_tier,
+        config_overrides: run_config.config_overrides,
+        completion_handler: Some(store_completion_handler(
+            Arc::clone(shared_store),
+            summary.parent_session_id.clone(),
+            child_session_id,
+            Some(run_id),
+        )),
+    }
+}
+
 fn store_message_tool(
     deps: &SubagentToolDeps,
     target: &str,
@@ -981,31 +1103,22 @@ fn store_message_tool(
             .map_err(|err| tool_err("load target agent failed", err))?
             .is_some_and(|session| session.status == browser_use_protocol::SessionStatus::Running);
         let wake_request = if trigger_turn && !target_is_running {
-            target.summary.as_ref().map(|summary| {
+            if let Some(summary) = target.summary.as_ref() {
                 let run_id = browser_use_store::new_thread_id();
-                ChildAgentRunRequest {
-                    parent_session_id: summary.parent_session_id.clone(),
-                    child_session_id: target.session_id.clone(),
-                    run_id: Some(run_id.clone()),
-                    message: message.to_string(),
-                    input_items: None,
-                    input_is_inter_agent_communication: false,
-                    agent_path: Some(target.agent_path.clone()),
-                    nickname: summary.agent_nickname.clone(),
-                    role: summary.agent_role.clone(),
-                    fork_turns: Some("none".to_string()),
-                    model: None,
-                    reasoning_effort: None,
-                    service_tier: None,
-                    config_overrides: Vec::new(),
-                    completion_handler: Some(store_completion_handler(
-                        Arc::clone(shared_store),
-                        summary.parent_session_id.clone(),
-                        target.session_id.clone(),
-                        Some(run_id),
-                    )),
-                }
-            })
+                let run_config = latest_child_run_config(&store, &target.session_id)?;
+                Some(store_child_run_request(
+                    shared_store,
+                    summary,
+                    target.session_id.clone(),
+                    Some(target.agent_path.clone()),
+                    run_id,
+                    message.to_string(),
+                    None,
+                    run_config,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1167,31 +1280,22 @@ fn store_message_tool_v1(
             .agent_summary_for_child(target)
             .map_err(|err| tool_err("load target child edge failed", err))?;
         let wake_request = if !target_is_running {
-            summary.as_ref().map(|summary| {
+            if let Some(summary) = summary.as_ref() {
                 let run_id = browser_use_store::new_thread_id();
-                ChildAgentRunRequest {
-                    parent_session_id: summary.parent_session_id.clone(),
-                    child_session_id: target.to_string(),
-                    run_id: Some(run_id.clone()),
-                    message: message.to_string(),
-                    input_items: input_items.clone(),
-                    input_is_inter_agent_communication: false,
-                    agent_path: Some(recipient_path.clone()),
-                    nickname: summary.agent_nickname.clone(),
-                    role: summary.agent_role.clone(),
-                    fork_turns: Some("none".to_string()),
-                    model: None,
-                    reasoning_effort: None,
-                    service_tier: None,
-                    config_overrides: Vec::new(),
-                    completion_handler: Some(store_completion_handler(
-                        Arc::clone(shared_store),
-                        summary.parent_session_id.clone(),
-                        target.to_string(),
-                        Some(run_id),
-                    )),
-                }
-            })
+                let run_config = latest_child_run_config(&store, target)?;
+                Some(store_child_run_request(
+                    shared_store,
+                    summary,
+                    target.to_string(),
+                    Some(recipient_path.clone()),
+                    run_id,
+                    message.to_string(),
+                    input_items.clone(),
+                    run_config,
+                ))
+            } else {
+                None
+            }
         } else {
             None
         };
@@ -1267,28 +1371,17 @@ fn store_resume_requests_for_agent_subtree(
                 | browser_use_protocol::SessionStatus::Cancelled
         ) {
             let run_id = browser_use_store::new_thread_id();
-            requests.push(ChildAgentRunRequest {
-                parent_session_id: summary.parent_session_id.clone(),
-                child_session_id: child_id.clone(),
-                run_id: Some(run_id.clone()),
+            let run_config = latest_child_run_config(&store, &child_id)?;
+            requests.push(store_child_run_request(
+                shared_store,
+                &summary,
+                child_id.clone(),
+                Some(agent_path),
+                run_id,
                 message,
-                input_items: None,
-                input_is_inter_agent_communication: false,
-                agent_path: Some(agent_path),
-                nickname: summary.agent_nickname.clone(),
-                role: summary.agent_role.clone(),
-                fork_turns: Some("none".to_string()),
-                model: None,
-                reasoning_effort: None,
-                service_tier: None,
-                config_overrides: Vec::new(),
-                completion_handler: Some(store_completion_handler(
-                    Arc::clone(shared_store),
-                    summary.parent_session_id.clone(),
-                    child_id.clone(),
-                    Some(run_id),
-                )),
-            });
+                None,
+                run_config,
+            ));
         }
         for child in store
             .list_child_agents(&child_id)
@@ -1623,7 +1716,10 @@ fn store_close_agent(
         })?;
     let previous_status = local_agent_status_value(&store, &child, Some(&summary))
         .map_err(|err| tool_err("read previous status failed", err))?;
-    cleanup_agent_runtime_state_for_agent_subtree(&store, &target.session_id, |_| 0)
+    let _cleaned_runtime =
+        cleanup_agent_runtime_state_for_agent_subtree(&store, &target.session_id, |session_id| {
+            cleanup_runtime_for_session(deps, session_id)
+        })
         .map_err(|err| tool_err("cleanup close target failed", err))?;
     store
         .close_child_agent(&target.session_id, "closed by close_agent")
@@ -1665,7 +1761,10 @@ fn store_close_agent_v1(
         .ok_or_else(|| ToolError::Other(anyhow::anyhow!("root is not a spawned agent")))?;
     let previous_status = local_agent_status_value(&store, &child, Some(&summary))
         .map_err(|err| tool_err("read previous status failed", err))?;
-    cleanup_agent_runtime_state_for_agent_subtree(&store, target, |_| 0)
+    let _cleaned_runtime =
+        cleanup_agent_runtime_state_for_agent_subtree(&store, target, |session_id| {
+            cleanup_runtime_for_session(deps, session_id)
+        })
         .map_err(|err| tool_err("cleanup close target failed", err))?;
     store
         .close_child_agent(target, "closed by close_agent")

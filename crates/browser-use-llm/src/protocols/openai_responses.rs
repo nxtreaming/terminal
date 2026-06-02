@@ -28,7 +28,7 @@ use crate::route::framing::SseFrame;
 use crate::route::protocol::{Protocol, ProtocolStream};
 use crate::schema::{
     ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
-    MessageRole, ReasoningEffort, ToolChoice, ToolDefinition, Usage,
+    MessageRole, ReasoningEffort, TextPhase, ToolChoice, ToolDefinition, Usage,
 };
 
 use super::utils::{Lifecycle, ToolStream};
@@ -424,7 +424,11 @@ struct ResponsesDecoder {
     open: OpenBlock,
     /// Maps a streaming item id (`output_item` id) to its tool call id, because
     /// argument deltas key off `item_id` while [`ToolStream`] keys off call id.
-    item_to_call: std::collections::HashMap<String, String>,
+    item_to_call: HashMap<String, String>,
+    /// Optional assistant message phase keyed by the same text item id used by
+    /// `response.output_text.*` events. Codex uses this to preempt mailbox mail
+    /// only for commentary text; missing phase defaults to final-answer semantics.
+    text_phases: HashMap<String, TextPhase>,
 }
 
 impl ResponsesDecoder {
@@ -436,7 +440,8 @@ impl ResponsesDecoder {
             finish_reason: Some(FinishReason::Stop),
             finished: false,
             open: OpenBlock::None,
-            item_to_call: std::collections::HashMap::new(),
+            item_to_call: HashMap::new(),
+            text_phases: HashMap::new(),
         }
     }
 
@@ -448,10 +453,47 @@ impl ResponsesDecoder {
             .unwrap_or_else(|| item_id.to_string())
     }
 
+    fn record_text_phase_from_message_item(&mut self, item: &Value) {
+        if item.get("role").and_then(Value::as_str) != Some("assistant") {
+            return;
+        }
+        let Some(item_id) = item
+            .get("id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        if let Some(phase) = parse_text_phase(item.get("phase")) {
+            self.text_phases.insert(item_id.to_string(), phase);
+        }
+    }
+
+    fn record_text_phase_for_output_text_event(&mut self, value: &Value) {
+        let Some(item_id) = value
+            .get("item_id")
+            .and_then(Value::as_str)
+            .filter(|id| !id.is_empty())
+        else {
+            return;
+        };
+        let phase = parse_text_phase(value.get("phase")).or_else(|| {
+            value
+                .get("item")
+                .and_then(|item| parse_text_phase(item.get("phase")))
+        });
+        if let Some(phase) = phase {
+            self.text_phases.insert(item_id.to_string(), phase);
+        }
+    }
+
     /// Close whichever text/reasoning block is currently open.
     fn close_open(&mut self, out: &mut Vec<LlmEvent>) {
         match std::mem::replace(&mut self.open, OpenBlock::None) {
-            OpenBlock::Text(id) => out.extend(self.lifecycle.text_end(id)),
+            OpenBlock::Text(id) => {
+                let phase = self.text_phases.remove(&id);
+                out.extend(self.lifecycle.text_end_with_phase(id, phase));
+            }
             OpenBlock::Reasoning(id) => out.extend(self.lifecycle.reasoning_end(id)),
             OpenBlock::None => {}
         }
@@ -473,6 +515,15 @@ impl ResponsesDecoder {
             self.open = OpenBlock::Reasoning(id.to_string());
         }
         out.extend(self.lifecycle.reasoning_delta(id, delta));
+    }
+}
+
+fn parse_text_phase(value: Option<&Value>) -> Option<TextPhase> {
+    let phase = value?.as_str()?.to_ascii_lowercase();
+    match phase.as_str() {
+        "commentary" => Some(TextPhase::Commentary),
+        "final" | "final_answer" | "final-answer" => Some(TextPhase::FinalAnswer),
+        _ => None,
     }
 }
 
@@ -531,6 +582,8 @@ impl ProtocolStream for ResponsesDecoder {
                         self.close_open(&mut out);
                         out.extend(self.tools.start_with_namespace(&call_id, name, namespace));
                         self.finish_reason = Some(FinishReason::ToolUse);
+                    } else if item.get("type").and_then(Value::as_str) == Some("message") {
+                        self.record_text_phase_from_message_item(item);
                     }
                 }
             }
@@ -545,7 +598,9 @@ impl ProtocolStream for ResponsesDecoder {
                     self.push_text(&id, delta, &mut out);
                 }
             }
-            "response.output_text.done" => {}
+            "response.output_text.done" => {
+                self.record_text_phase_for_output_text_event(&value);
+            }
 
             "response.reasoning_summary_text.delta" | "response.reasoning_text.delta" => {
                 if let Some(delta) = value.get("delta").and_then(Value::as_str) {
@@ -576,6 +631,9 @@ impl ProtocolStream for ResponsesDecoder {
             "response.output_item.done" => {
                 // Function-call items are finalised by
                 // `response.function_call_arguments.done`; nothing extra here.
+                if let Some(item) = value.get("item") {
+                    self.record_text_phase_from_message_item(item);
+                }
             }
 
             "response.completed" => {
@@ -884,7 +942,10 @@ mod tests {
                 delta: "check.".into(),
             },
             // output_item.added (function_call) closes the open text block.
-            LlmEvent::TextEnd { id: "msg_1".into() },
+            LlmEvent::TextEnd {
+                id: "msg_1".into(),
+                phase: None,
+            },
             LlmEvent::ToolInputStart {
                 id: "call_1".into(),
                 name: "get_weather".into(),
@@ -932,6 +993,51 @@ mod tests {
     }
 
     #[test]
+    fn decoder_preserves_commentary_text_phase() {
+        let proto = OpenAiResponsesProtocol::new();
+        let mut dec = proto.decoder();
+        let frames = vec![
+            frame(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"message","id":"msg_1","role":"assistant","phase":"commentary"}}"#,
+            ),
+            frame(
+                "response.output_text.delta",
+                r#"{"type":"response.output_text.delta","item_id":"msg_1","delta":"still working"}"#,
+            ),
+            frame(
+                "response.output_item.added",
+                r#"{"type":"response.output_item.added","item":{"type":"function_call","id":"item_1","call_id":"call_1","name":"get_weather"}}"#,
+            ),
+        ];
+
+        let mut events = Vec::new();
+        for f in &frames {
+            events.extend(dec.on_frame(f).expect("on_frame"));
+        }
+
+        assert_eq!(
+            events,
+            vec![
+                LlmEvent::StepStart,
+                LlmEvent::TextStart { id: "msg_1".into() },
+                LlmEvent::TextDelta {
+                    id: "msg_1".into(),
+                    delta: "still working".into(),
+                },
+                LlmEvent::TextEnd {
+                    id: "msg_1".into(),
+                    phase: Some(TextPhase::Commentary),
+                },
+                LlmEvent::ToolInputStart {
+                    id: "call_1".into(),
+                    name: "get_weather".into(),
+                },
+            ]
+        );
+    }
+
+    #[test]
     fn decoder_reasoning_then_text() {
         let proto = OpenAiResponsesProtocol::new();
         let mut dec = proto.decoder();
@@ -968,7 +1074,10 @@ mod tests {
                     id: "t1".into(),
                     delta: "hi".into()
                 },
-                LlmEvent::TextEnd { id: "t1".into() },
+                LlmEvent::TextEnd {
+                    id: "t1".into(),
+                    phase: None,
+                },
                 LlmEvent::StepFinish {
                     usage: Usage {
                         input_tokens: 1,

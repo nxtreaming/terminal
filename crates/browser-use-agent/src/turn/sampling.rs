@@ -51,6 +51,8 @@
 //! the decision core is preserved. Tests disable jitter (it only affects sleep wall
 //! time, never control flow or the returned outcome).
 
+use std::collections::HashMap;
+use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
 use std::time::Instant;
@@ -58,7 +60,7 @@ use std::time::Instant;
 use browser_use_llm::route::{ModelClient, Route};
 use browser_use_llm::schema::{
     ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
-    MessageRole, SystemPart, Usage,
+    MessageRole, SystemPart, TextPhase, Usage,
 };
 use futures_util::{Stream, StreamExt};
 use serde_json::Value;
@@ -74,6 +76,9 @@ use crate::AgentError;
 /// A normalized model event stream: the exact shape [`ModelClient::stream`]
 /// yields. Borrows the transport for the duration of one attempt.
 pub type EventStream<'a> = Pin<Box<dyn Stream<Item = Result<LlmEvent, LlmError>> + Send + 'a>>;
+
+pub type MailboxPreemptionProbe =
+    Arc<dyn Fn() -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> + Send + Sync>;
 
 /// Abstraction over "open one model stream for this request".
 ///
@@ -343,6 +348,11 @@ pub struct ModelSamplingDriver<
     /// accounting are folded through the same store as the model-facing goal
     /// tools.
     goal_store: Option<Arc<GoalStore>>,
+    /// Codex-style mid-stream mailbox preemption. After an assistant text item or
+    /// reasoning item is done, the driver checks this probe; pending mailbox mail
+    /// stops the current response and reports follow-up so the turn loop drains
+    /// that mail on the next iteration.
+    mailbox_preemption_probe: Option<MailboxPreemptionProbe>,
 }
 
 impl<T: SamplingTransport> ModelSamplingDriver<T> {
@@ -365,6 +375,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             dispatcher: None,
             recorder: None,
             goal_store: None,
+            mailbox_preemption_probe: None,
         }
     }
 
@@ -392,6 +403,7 @@ impl<T: SamplingTransport> ModelSamplingDriver<T> {
             dispatcher: Some(dispatcher),
             recorder: Some(recorder),
             goal_store: self.goal_store,
+            mailbox_preemption_probe: self.mailbox_preemption_probe,
         }
     }
 }
@@ -406,6 +418,18 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     pub fn with_goal_store(mut self, goal_store: Arc<GoalStore>) -> Self {
         self.goal_store = Some(goal_store);
         self
+    }
+
+    pub fn with_mailbox_preemption_probe(mut self, probe: MailboxPreemptionProbe) -> Self {
+        self.mailbox_preemption_probe = Some(probe);
+        self
+    }
+
+    async fn has_mailbox_preemption(&self) -> bool {
+        match &self.mailbox_preemption_probe {
+            Some(probe) => probe().await,
+            None => false,
+        }
     }
 
     /// Map an [`LlmEvent`] to UI events and emit them through the sink.
@@ -522,8 +546,24 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
         // Emit UI events first (map is pure; emit is the only side effect).
         self.emit_event(&ev);
         match ev {
-            LlmEvent::TextDelta { delta, .. } => {
+            LlmEvent::TextDelta { id, delta } => {
+                let has_content = !delta.trim().is_empty();
                 acc.full_text.push_str(&delta);
+                if has_content {
+                    acc.text_items_with_content.insert(id, true);
+                }
+                StreamProgress::Continue
+            }
+            LlmEvent::TextEnd { id, phase } => {
+                let text_item_has_content = acc.text_items_with_content.remove(&id).unwrap_or(
+                    // Older/non-Responses decoders may not preserve per-item
+                    // phase. If text exists and the close is untagged, treat it
+                    // as final-answer output rather than commentary.
+                    !acc.full_text.trim().is_empty(),
+                );
+                if text_item_has_content && !matches!(phase, Some(TextPhase::Commentary)) {
+                    acc.defers_mailbox_delivery_to_next_turn = true;
+                }
                 StreamProgress::Continue
             }
             LlmEvent::ToolCall {
@@ -559,10 +599,23 @@ impl<T: SamplingTransport, R: CallRunner + 'static> ModelSamplingDriver<T, R> {
     }
 }
 
+fn checks_mailbox_preemption_after_event(ev: &LlmEvent) -> bool {
+    matches!(
+        ev,
+        LlmEvent::ReasoningEnd { .. }
+            | LlmEvent::TextEnd {
+                phase: Some(TextPhase::Commentary),
+                ..
+            }
+    )
+}
+
 /// Accumulated state for one assistant turn, threaded through the stream loop.
 #[derive(Default)]
 struct TurnAccumulator {
     full_text: String,
+    text_items_with_content: HashMap<String, bool>,
+    defers_mailbox_delivery_to_next_turn: bool,
     /// The tool calls the model emitted, in model order. The length doubles as
     /// the "did the model request follow-up" signal (codex
     /// `!tool_calls.is_empty()`); the calls themselves feed the fused dispatch.
@@ -826,6 +879,7 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
             // Set when a retryable mid-stream error tells us to restart the outer
             // loop (codex breaks the inner loop then re-opens).
             let mut restart = false;
+            let mut preempted_for_mailbox = false;
 
             loop {
                 let maybe_event = tokio::select! {
@@ -836,10 +890,18 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                 };
 
                 match maybe_event {
-                    Some(Ok(ev)) => match self.consume_event(&mut acc, ev, started_at) {
-                        StreamProgress::Continue => {}
-                        StreamProgress::Done => break,
-                    },
+                    Some(Ok(ev)) => {
+                        let check_mailbox_preemption = checks_mailbox_preemption_after_event(&ev);
+                        match self.consume_event(&mut acc, ev, started_at) {
+                            StreamProgress::Continue => {
+                                if check_mailbox_preemption && self.has_mailbox_preemption().await {
+                                    preempted_for_mailbox = true;
+                                    break;
+                                }
+                            }
+                            StreamProgress::Done => break,
+                        }
+                    }
                     Some(Err(e)) => {
                         match handle_stream_error(e, &mut attempt, self.max_retries, self.jitter)
                             .await
@@ -860,7 +922,8 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
             }
 
             // ---- assemble the outcome (codex parity) ----
-            let mut last_agent_message = (!acc.full_text.is_empty()).then(|| acc.full_text.clone());
+            let mut last_agent_message =
+                (!acc.full_text.trim().is_empty()).then(|| acc.full_text.clone());
 
             // Fused tool dispatch (codex `try_run_turn` / `try_run_sampling_request`):
             // when a dispatcher + recorder are configured AND the model emitted
@@ -881,6 +944,9 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                         // the loop returns the summary (codex keeps the final message).
                         if is_terminal && last_agent_message.is_none() {
                             last_agent_message = done_summary(&tool_calls);
+                            if last_agent_message.is_some() {
+                                acc.defers_mailbox_delivery_to_next_turn = true;
+                            }
                         }
 
                         // 1. Record the assistant message (text + tool calls), so the
@@ -921,10 +987,13 @@ impl<T: SamplingTransport + 'static, R: CallRunner + 'static> SamplingDriver
                     // signals the loop the same way it did pre-fusion (WP-B5).
                     _ => decision::needs_follow_up(!acc.tool_calls.is_empty(), false),
                 };
+            let model_needs_follow_up =
+                decision::needs_follow_up(model_needs_follow_up, preempted_for_mailbox);
 
             return Ok(SamplingOutcome {
                 model_needs_follow_up,
                 last_agent_message,
+                defers_mailbox_delivery_to_next_turn: acc.defers_mailbox_delivery_to_next_turn,
                 finish_reason: acc.finish_reason,
             });
         }

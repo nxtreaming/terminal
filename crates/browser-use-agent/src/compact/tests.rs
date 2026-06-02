@@ -433,6 +433,7 @@ impl SamplingDriver for LoopSampler {
             .unwrap_or_else(|| SamplingOutcome {
                 model_needs_follow_up: false,
                 last_agent_message: Some("end".to_string()),
+                defers_mailbox_delivery_to_next_turn: true,
                 finish_reason: None,
             }))
     }
@@ -481,6 +482,7 @@ fn follow_up(msg: &str) -> SamplingOutcome {
     SamplingOutcome {
         model_needs_follow_up: true,
         last_agent_message: Some(msg.to_string()),
+        defers_mailbox_delivery_to_next_turn: false,
         finish_reason: None,
     }
 }
@@ -488,6 +490,7 @@ fn complete(msg: &str) -> SamplingOutcome {
     SamplingOutcome {
         model_needs_follow_up: false,
         last_agent_message: Some(msg.to_string()),
+        defers_mailbox_delivery_to_next_turn: true,
         finish_reason: None,
     }
 }

@@ -163,7 +163,10 @@ fn lifecycle_markers_map_to_nothing() {
     let empties = [
         LlmEvent::StepStart,
         LlmEvent::TextStart { id: "t".into() },
-        LlmEvent::TextEnd { id: "t".into() },
+        LlmEvent::TextEnd {
+            id: "t".into(),
+            phase: None,
+        },
         LlmEvent::ReasoningStart { id: "r".into() },
         LlmEvent::ReasoningEnd { id: "r".into() },
         LlmEvent::ToolInputStart {

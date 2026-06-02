@@ -25,6 +25,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         6,
         include_str!("../migrations/0006_agent_message_input_items.sql"),
     ),
+    (
+        7,
+        include_str!("../migrations/0007_events_session_type_seq.sql"),
+    ),
 ];
 
 pub struct Store {
@@ -485,6 +489,21 @@ impl Store {
             .query_map(params![session_id], row_to_event)?
             .collect::<std::result::Result<Vec<_>, _>>()?;
         Ok(rows)
+    }
+
+    pub fn latest_event_for_session_by_type(
+        &self,
+        session_id: &str,
+        event_type: &str,
+    ) -> Result<Option<EventRecord>> {
+        self.conn
+            .query_row(
+                "SELECT seq, id, session_id, ts_ms, type, payload_json FROM events WHERE session_id = ?1 AND type = ?2 ORDER BY seq DESC LIMIT 1",
+                params![session_id, event_type],
+                row_to_event,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn events_after_seq(&self, session_id: &str, after_seq: i64) -> Result<Vec<EventRecord>> {
@@ -1331,6 +1350,36 @@ mod tests {
         let waited =
             store.wait_for_events_after_seq(&session.id, first.seq, Duration::from_millis(1))?;
         assert_eq!(waited, vec![second]);
+        Ok(())
+    }
+
+    #[test]
+    fn latest_event_for_session_by_type_returns_latest_matching_event() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let store = Store::open(temp.path())?;
+        let session = store.create_session(None, "/tmp")?;
+        store.append_event(
+            &session.id,
+            "agent.run.started",
+            serde_json::json!({"run": 1}),
+        )?;
+        store.append_event(&session.id, "other", serde_json::json!({"run": 2}))?;
+        let latest = store.append_event(
+            &session.id,
+            "agent.run.started",
+            serde_json::json!({"run": 3}),
+        )?;
+
+        assert_eq!(
+            store
+                .latest_event_for_session_by_type(&session.id, "agent.run.started")?
+                .expect("latest event")
+                .seq,
+            latest.seq
+        );
+        assert!(store
+            .latest_event_for_session_by_type(&session.id, "missing")?
+            .is_none());
         Ok(())
     }
 

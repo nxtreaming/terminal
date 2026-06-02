@@ -915,7 +915,10 @@ mod tests {
                 id: "call_42".into(),
                 delta: "\"Paris\"}".into(),
             },
-            LlmEvent::TextEnd { id: TEXT_ID.into() },
+            LlmEvent::TextEnd {
+                id: TEXT_ID.into(),
+                phase: None,
+            },
             LlmEvent::ToolInputEnd {
                 id: "call_42".into(),
             },
@@ -972,7 +975,10 @@ mod tests {
                     id: TEXT_ID.into(),
                     delta: "hi".into(),
                 },
-                LlmEvent::TextEnd { id: TEXT_ID.into() },
+                LlmEvent::TextEnd {
+                    id: TEXT_ID.into(),
+                    phase: None,
+                },
                 LlmEvent::StepFinish {
                     usage,
                     finish_reason: Some(FinishReason::Stop),

@@ -895,6 +895,7 @@ mod tests {
             },
             LlmEvent::TextEnd {
                 id: "block-0".into(),
+                phase: None,
             },
             LlmEvent::ToolInputStart {
                 id: "toolu_1".into(),

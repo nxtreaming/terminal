@@ -89,7 +89,10 @@ mod tests {
                 id: "t0".into(),
                 delta: "he".into(),
             },
-            LlmEvent::TextEnd { id: "t0".into() },
+            LlmEvent::TextEnd {
+                id: "t0".into(),
+                phase: None,
+            },
             LlmEvent::ToolInputStart {
                 id: "c0".into(),
                 name: "shell".into(),

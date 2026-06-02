@@ -450,16 +450,20 @@ impl SubagentManager {
         Ok(target)
     }
 
-    /// Best-effort in-memory interrupt for legacy v1 `send_input`. Production
-    /// Store-backed children are cancelled by the store path; the isolated
-    /// manager path has no task driver to stop, so this validates the target and
-    /// leaves the agent open for the follow-up message.
+    /// Legacy no-store managers do not own the child task driver or cancellation
+    /// token, so they cannot provide Codex-style interrupt semantics. Production
+    /// store-backed children are cancelled by the store path.
     pub fn interrupt_agent_id(&self, target_id: &str) -> Result<AgentRecord, SubagentError> {
-        self.registry
+        let target = self
+            .registry
             .list_agents()
             .into_iter()
             .find(|record| record.agent_id == target_id)
-            .ok_or_else(|| SubagentError(format!("agent with id {target_id} not found")))
+            .ok_or_else(|| SubagentError(format!("agent with id {target_id} not found")))?;
+        Err(SubagentError(format!(
+            "interrupt is only supported for store-backed agents; `{}` has no cancellable runtime handle",
+            target.agent_path
+        )))
     }
 
     /// List the live agents (codex `live_agents`).

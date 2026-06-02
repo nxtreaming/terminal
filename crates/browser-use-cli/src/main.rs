@@ -13,11 +13,11 @@ use browser_use_agent::config_model::{
     model_catalog_for_cwd_with_options,
 };
 use browser_use_agent::config_overrides::{
-    load_mcp_servers_for_profile, parse_config_overrides, resolve_agent_roles_for_profile,
-    resolve_approval_policy_for_profile, resolve_collab_for_profile, resolve_guardian_for_profile,
-    resolve_multi_agent_v2_for_profile, AgentRunOptions, ChildAgentRunCompletion,
-    ChildAgentRunRequest, ChildAgentRunner, ConfigOverrides, ProviderBackend, ProviderRunConfig,
-    RunConfigValueSource,
+    apply_child_request_runtime_config, load_mcp_servers_for_profile, parse_config_overrides,
+    resolve_agent_roles_for_profile, resolve_approval_policy_for_profile,
+    resolve_collab_for_profile, resolve_guardian_for_profile, resolve_multi_agent_v2_for_profile,
+    AgentRunOptions, ChildAgentRunCompletion, ChildAgentRunRequest, ChildAgentRunner,
+    ConfigOverrides, ProviderBackend, ProviderRunConfig, RunConfigValueSource,
 };
 use browser_use_agent::context::{
     append_user_shell_command_context_event, typed_user_input_payload_from_items_for_cwd,
@@ -1439,6 +1439,7 @@ fn run_cli_child_agent_thread(
                 .options
                 .config_overrides
                 .extend(request.config_overrides.clone());
+            apply_child_request_runtime_config(&mut config, &request)?;
         }
         if let Some(reasoning) = request.reasoning_effort.clone() {
             config.options.config_overrides.push((
@@ -1558,6 +1559,16 @@ fn record_child_run_marker_from_request(
     let Some(run_id) = request.run_id.as_deref() else {
         return Ok(());
     };
+    let config_overrides = request
+        .config_overrides
+        .iter()
+        .map(|(key, value)| {
+            serde_json::json!({
+                "key": key,
+                "value": value,
+            })
+        })
+        .collect::<Vec<_>>();
     store.append_event(
         child_id,
         "agent.run.started",
@@ -1566,6 +1577,10 @@ fn record_child_run_marker_from_request(
             "parent_session_id": request.parent_session_id.as_str(),
             "child_session_id": child_id,
             "agent_path": request.agent_path.as_deref(),
+            "model": request.model.as_deref(),
+            "reasoning_effort": request.reasoning_effort.as_deref(),
+            "service_tier": request.service_tier.as_deref(),
+            "config_overrides": config_overrides,
         }),
     )?;
     Ok(())
@@ -5643,7 +5658,7 @@ command = "test-mcp"
         let request = ChildAgentRunRequest {
             parent_session_id: parent.id.clone(),
             child_session_id: "00000000abcd".to_string(),
-            run_id: None,
+            run_id: Some("run-1".to_string()),
             message: "Investigate the failing case".to_string(),
             input_items: None,
             input_is_inter_agent_communication: false,
@@ -5652,13 +5667,17 @@ command = "test-mcp"
             role: Some("explorer".to_string()),
             fork_turns: Some("all".to_string()),
             model: Some("gpt-test".to_string()),
-            reasoning_effort: None,
-            service_tier: None,
-            config_overrides: Vec::new(),
+            reasoning_effort: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
+            config_overrides: vec![(
+                "model_provider".to_string(),
+                toml::Value::String("anthropic".to_string()),
+            )],
             completion_handler: None,
         };
 
         let child = create_agent_child_session_from_request(&store, &request)?;
+        record_child_run_marker_from_request(&store, &child.id, &request)?;
 
         assert_eq!(child.id, "00000000abcd");
         assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
@@ -5669,6 +5688,22 @@ command = "test-mcp"
         assert!(child_events
             .iter()
             .any(|event| event.event_type == "session.input"));
+        let marker = child_events
+            .iter()
+            .find(|event| event.event_type == "agent.run.started")
+            .expect("run marker");
+        assert_eq!(marker.payload["model"], "gpt-test");
+        assert_eq!(marker.payload["reasoning_effort"], "high");
+        assert_eq!(marker.payload["service_tier"], "priority");
+        let model_provider_override = marker.payload["config_overrides"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("key").and_then(serde_json::Value::as_str) == Some("model_provider")
+                })
+            })
+            .expect("model_provider override");
+        assert_eq!(model_provider_override["value"], "anthropic");
         let parent_events = store.events_for_session(&parent.id)?;
         assert!(parent_events
             .iter()

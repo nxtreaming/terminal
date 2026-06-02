@@ -207,6 +207,7 @@ fn spawn_tui_child_agent(
         .filter(|value| !value.trim().is_empty())
         .map(ToOwned::to_owned)
         .unwrap_or(model);
+    let child_browser = child_request_browser(&request).unwrap_or(browser);
     let child_model_provider_id = child_request_provider_id(&request).or(model_provider_id);
     let child_backend = child_model_provider_id
         .as_deref()
@@ -235,7 +236,7 @@ fn spawn_tui_child_agent(
                 child_backend,
                 child_model,
                 child_model_provider_id,
-                browser,
+                child_browser,
                 collaboration_mode,
                 config_profile,
                 config_overrides,
@@ -344,6 +345,16 @@ fn record_child_run_marker_from_request(
     let Some(run_id) = request.run_id.as_deref() else {
         return Ok(());
     };
+    let config_overrides = request
+        .config_overrides
+        .iter()
+        .map(|(key, value)| {
+            serde_json::json!({
+                "key": key,
+                "value": value,
+            })
+        })
+        .collect::<Vec<_>>();
     store.append_event(
         child_id,
         "agent.run.started",
@@ -352,6 +363,10 @@ fn record_child_run_marker_from_request(
             "parent_session_id": request.parent_session_id.as_str(),
             "child_session_id": child_id,
             "agent_path": request.agent_path.as_deref(),
+            "model": request.model.as_deref(),
+            "reasoning_effort": request.reasoning_effort.as_deref(),
+            "service_tier": request.service_tier.as_deref(),
+            "config_overrides": config_overrides,
         }),
     )?;
     Ok(())
@@ -439,6 +454,23 @@ fn child_request_provider_id(request: &ChildAgentRunRequest) -> Option<String> {
         .map(str::trim)
         .filter(|value| !value.is_empty())
         .map(ToOwned::to_owned)
+}
+
+fn child_request_browser(request: &ChildAgentRunRequest) -> Option<String> {
+    let browser_mode = request
+        .config_overrides
+        .iter()
+        .rev()
+        .find(|(key, _)| key == "browser_mode")
+        .and_then(|(_, value)| value.as_str())
+        .map(str::trim)
+        .filter(|value| !value.is_empty())?;
+    match browser_mode {
+        "managed-headless" => Some("Headless Chromium".to_string()),
+        "cloud" => Some(BROWSER_USE_CLOUD.to_string()),
+        "local" => Some("Local Chrome".to_string()),
+        _ => None,
+    }
 }
 
 fn child_request_agent_context_payload(
@@ -775,7 +807,7 @@ command = "test-mcp"
         let request = ChildAgentRunRequest {
             parent_session_id: parent.id.clone(),
             child_session_id: "00000000dcba".to_string(),
-            run_id: None,
+            run_id: Some("run-1".to_string()),
             message: "Handle the child task".to_string(),
             input_items: None,
             input_is_inter_agent_communication: false,
@@ -783,14 +815,18 @@ command = "test-mcp"
             nickname: Some("Worker".to_string()),
             role: Some("explorer".to_string()),
             fork_turns: Some("all".to_string()),
-            model: None,
-            reasoning_effort: None,
-            service_tier: None,
-            config_overrides: Vec::new(),
+            model: Some("gpt-test".to_string()),
+            reasoning_effort: Some("high".to_string()),
+            service_tier: Some("priority".to_string()),
+            config_overrides: vec![(
+                "model_provider".to_string(),
+                toml::Value::String("anthropic".to_string()),
+            )],
             completion_handler: None,
         };
 
         let child = create_tui_child_session_from_request(&store, &request).unwrap();
+        record_child_run_marker_from_request(&store, &child.id, &request).unwrap();
 
         assert_eq!(child.id, "00000000dcba");
         assert_eq!(child.parent_id.as_deref(), Some(parent.id.as_str()));
@@ -801,6 +837,22 @@ command = "test-mcp"
         assert!(child_events
             .iter()
             .any(|event| event.event_type == "session.input"));
+        let marker = child_events
+            .iter()
+            .find(|event| event.event_type == "agent.run.started")
+            .expect("run marker");
+        assert_eq!(marker.payload["model"], "gpt-test");
+        assert_eq!(marker.payload["reasoning_effort"], "high");
+        assert_eq!(marker.payload["service_tier"], "priority");
+        let model_provider_override = marker.payload["config_overrides"]
+            .as_array()
+            .and_then(|items| {
+                items.iter().find(|item| {
+                    item.get("key").and_then(serde_json::Value::as_str) == Some("model_provider")
+                })
+            })
+            .expect("model_provider override");
+        assert_eq!(model_provider_override["value"], "anthropic");
         let parent_events = store.events_for_session(&parent.id).unwrap();
         assert!(parent_events
             .iter()

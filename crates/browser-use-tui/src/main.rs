@@ -14280,6 +14280,74 @@ wire_api = "responses"
     }
 
     #[test]
+    fn quiet_followup_streaming_does_not_show_thinking_until_boundary() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "describe this repo"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "session.done",
+            serde_json::json!({"result": "It is a Rust browser-agent workbench."}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.native_history.reset_for_session(
+            session.id.clone(),
+            app.store
+                .events_for_session(&session.id)?
+                .last()
+                .map(|event| event.seq)
+                .unwrap_or_default(),
+        );
+
+        app.dispatch(AppCommand::SendFollowup {
+            session_id: session.id.clone(),
+            text: "yo".to_string(),
+        })?;
+        app.store.append_event(
+            &session.id,
+            "model.turn.request",
+            serde_json::json!({"model": "GPT-5.5", "provider": "codex", "turn_idx": 1}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "file.read",
+            serde_json::json!({"path": "Cargo.toml"}),
+        )?;
+        app.store.append_event_with_identity(
+            &session.id,
+            "quiet-followup-stream".to_string(),
+            browser_use_store::now_ms().saturating_sub(1_000),
+            "model.stream_delta",
+            serde_json::json!({
+                "text": "I'll inspect the repo structure before summarizing.",
+                "turn_idx": 1,
+            }),
+        )?;
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("I'll inspect the repo structure"));
+        assert!(!screen.contains("Thinking..."));
+
+        app.store.append_event(
+            &session.id,
+            "model.response.output_item.completed",
+            serde_json::json!({"item_type": "message", "phase": "commentary", "turn_idx": 1}),
+        )?;
+        app.drain_store_notifications()?;
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("I'll inspect the repo structure"));
+        assert!(screen.contains("Thinking..."));
+        Ok(())
+    }
+
+    #[test]
     fn commentary_completion_restores_thinking_status_without_debounce() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;

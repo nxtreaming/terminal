@@ -126,6 +126,7 @@ fn deps_with_fake() -> (Arc<SubagentManager>, Arc<CaptureSink>, SubagentToolDeps
         session_id: "test-session".to_string(),
         store: None,
         child_runner: None,
+        cleanup_session_runtime: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,
@@ -182,12 +183,53 @@ fn deps_with_store_tree() -> (
         session_id: root.id.clone(),
         store: Some(shared_store.clone()),
         child_runner: None,
+        cleanup_session_runtime: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,
         max_concurrent_threads_per_session: None,
     };
     (dir, shared_store, root.id, child.id, sink, deps)
+}
+
+fn seed_child_run_config_marker(store: &crate::session::SharedStore, child_id: &str) {
+    store
+        .lock()
+        .unwrap()
+        .append_event(
+            child_id,
+            "agent.run.started",
+            serde_json::json!({
+                "run_id": "seed-run",
+                "model": "child-model",
+                "reasoning_effort": "high",
+                "service_tier": "priority",
+                "config_overrides": [
+                    { "key": "model_provider", "value": "anthropic" },
+                    { "key": "features.multi_agent_v2.notify", "value": false }
+                ],
+            }),
+        )
+        .expect("seed child run config marker");
+}
+
+fn assert_child_run_config_replayed(request: &ChildAgentRunRequest) {
+    assert_eq!(request.model.as_deref(), Some("child-model"));
+    assert_eq!(request.reasoning_effort.as_deref(), Some("high"));
+    assert_eq!(request.service_tier.as_deref(), Some("priority"));
+    assert_eq!(
+        request.config_overrides,
+        vec![
+            (
+                "model_provider".to_string(),
+                toml::Value::String("anthropic".to_string())
+            ),
+            (
+                "features.multi_agent_v2.notify".to_string(),
+                toml::Value::Boolean(false)
+            ),
+        ]
+    );
 }
 
 fn ctx() -> ToolCtx {
@@ -531,6 +573,43 @@ async fn send_input_enqueues_and_emits_event() {
 }
 
 #[tokio::test]
+async fn send_input_interrupt_requires_store_backed_runtime() {
+    let (manager, _sink, deps) = deps_with_fake();
+    let spawn = SpawnAgentTool::new(deps.clone());
+    let send = SendInputTool::new(deps);
+
+    run_handler(&spawn, &spawn_args("worker", "work"))
+        .await
+        .expect("spawn ok");
+    manager.mailbox().drain();
+    manager
+        .registry()
+        .update_status("/root/worker", AgentStatus::Running);
+    let agent_id = manager.registry().get("/root/worker").unwrap().agent_id;
+
+    let err = run_handler(
+        &send,
+        &SendInputRequest {
+            target: agent_id,
+            message: Some("redirect now".to_string()),
+            items: None,
+            interrupt: Some(true),
+        },
+    )
+    .await
+    .expect_err("no-store interrupt must fail honestly");
+
+    assert!(
+        format!("{err:?}").contains("interrupt is only supported for store-backed agents"),
+        "unexpected error: {err:?}"
+    );
+
+    let record = manager.registry().get("/root/worker").unwrap();
+    assert_eq!(record.status, AgentStatus::Running);
+    assert_eq!(record.last_task_message.as_deref(), Some("work"));
+}
+
+#[tokio::test]
 async fn legacy_v1_send_and_close_reject_path_targets() {
     let (_manager, _sink, deps) = deps_with_fake();
     let send = SendInputTool::new(deps.clone());
@@ -796,6 +875,7 @@ async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
             .set_status(&child_id, SessionStatus::Done)
             .expect("child idle");
     }
+    seed_child_run_config_marker(&store, &child_id);
 
     let captured: Arc<Mutex<Vec<ChildAgentRunRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_for_runner = Arc::clone(&captured);
@@ -841,6 +921,7 @@ async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
     assert_eq!(requests[0].child_session_id, child_id);
     assert_eq!(requests[0].fork_turns.as_deref(), Some("none"));
     assert!(requests[0].run_id.is_some());
+    assert_child_run_config_replayed(&requests[0]);
     drop(requests);
 
     let store = store.lock().unwrap();
@@ -1038,6 +1119,7 @@ async fn store_completion_handler_writes_current_run_completion_once() {
 #[tokio::test]
 async fn send_input_interrupt_cancels_and_restarts_store_backed_child() {
     let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    seed_child_run_config_marker(&store, &child_id);
     let captured: Arc<Mutex<Vec<ChildAgentRunRequest>>> = Arc::new(Mutex::new(Vec::new()));
     let captured_for_runner = Arc::clone(&captured);
     deps.child_runner = Some(ChildAgentRunner::new(move |request| {
@@ -1065,6 +1147,7 @@ async fn send_input_interrupt_cancels_and_restarts_store_backed_child() {
     assert_eq!(requests[0].child_session_id, child_id);
     assert_eq!(requests[0].fork_turns.as_deref(), Some("none"));
     assert_eq!(requests[0].message, "redirect now");
+    assert_child_run_config_replayed(&requests[0]);
     drop(requests);
 
     let store = store.lock().unwrap();
@@ -1237,6 +1320,7 @@ async fn send_input_wakes_resumed_store_backed_child() {
 #[tokio::test]
 async fn resume_completed_store_backed_child_restarts_target() {
     let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    seed_child_run_config_marker(&store, &child_id);
     {
         let store = store.lock().unwrap();
         store.set_status(&child_id, SessionStatus::Done).unwrap();
@@ -1263,11 +1347,34 @@ async fn resume_completed_store_backed_child_restarts_target() {
     let requests = captured.lock().unwrap();
     assert_eq!(requests.len(), 1);
     assert_eq!(requests[0].child_session_id, child_id);
+    assert_child_run_config_replayed(&requests[0]);
 }
 
 #[tokio::test]
 async fn store_backed_tools_use_durable_agent_tree() {
-    let (_dir, store, root_id, child_id, sink, deps) = deps_with_store_tree();
+    let (_dir, store, root_id, child_id, sink, mut deps) = deps_with_store_tree();
+    let grandchild_id = {
+        let store = store.lock().unwrap();
+        store
+            .create_child_session(
+                &child_id,
+                std::path::Path::new("/tmp"),
+                Some("/root/worker/helper"),
+                Some("Helper"),
+                Some("explorer"),
+            )
+            .unwrap()
+            .id
+    };
+    let cleaned_sessions: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let cleaned_sessions_for_callback = Arc::clone(&cleaned_sessions);
+    deps.cleanup_session_runtime = Some(Arc::new(move |session_id| {
+        cleaned_sessions_for_callback
+            .lock()
+            .unwrap()
+            .push(session_id.to_string());
+        1
+    }));
     let send = SendMessageTool::new(deps.clone());
     let list = ListAgentsTool::new(deps.clone());
     let close = CloseAgentTool::new(deps);
@@ -1328,6 +1435,11 @@ async fn store_backed_tools_use_durable_agent_tree() {
             "closed"
         );
     }
+    let cleaned_sessions = cleaned_sessions.lock().unwrap();
+    assert_eq!(
+        cleaned_sessions.as_slice(),
+        &[child_id.clone(), grandchild_id]
+    );
     assert!(sink.types().contains(&"subagent.input".to_string()));
     assert!(sink.types().contains(&"subagent.closed".to_string()));
 }
@@ -1350,6 +1462,7 @@ async fn spawn_failure_surfaces_as_tool_error() {
         session_id: "s".to_string(),
         store: None,
         child_runner: None,
+        cleanup_session_runtime: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,
