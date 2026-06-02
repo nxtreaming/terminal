@@ -2760,9 +2760,13 @@ impl App {
                     return Ok(());
                 }
                 self.composer.take_trimmed();
-                self.dispatch(AppCommand::SetCollaborationMode(
-                    CollaborationModeKind::Plan,
-                ))?;
+                if plan_text.is_empty() {
+                    self.toggle_plan_mode()?;
+                } else {
+                    self.dispatch(AppCommand::SetCollaborationMode(
+                        CollaborationModeKind::Plan,
+                    ))?;
+                }
                 if !plan_text.is_empty() {
                     self.submit_plain_text(plan_text.to_string())?;
                 }
@@ -3024,10 +3028,6 @@ impl App {
                 }
                 self.collaboration_mode = mode;
                 self.persist_runtime_settings()?;
-                self.status_notice = Some(format!(
-                    "Collaboration mode set to {}.",
-                    collaboration_mode_label(mode)
-                ));
             }
             AppCommand::SignIn => self.open_surface(Surface::Account),
             AppCommand::ConfigureTelemetry => self.start_telemetry_entry(),
@@ -4477,9 +4477,7 @@ impl App {
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
             PaletteAction::ChangeMode => self.dispatch(AppCommand::ChangeMode)?,
             PaletteAction::Goal => self.show_current_goal()?,
-            PaletteAction::PlanMode => self.dispatch(AppCommand::SetCollaborationMode(
-                CollaborationModeKind::Plan,
-            ))?,
+            PaletteAction::PlanMode => self.toggle_plan_mode()?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
@@ -5662,9 +5660,13 @@ impl App {
             .map(str::to_string)
         {
             self.close_slash_palette();
-            self.dispatch(AppCommand::SetCollaborationMode(
-                CollaborationModeKind::Plan,
-            ))?;
+            if plan_text.is_empty() {
+                self.toggle_plan_mode()?;
+            } else {
+                self.dispatch(AppCommand::SetCollaborationMode(
+                    CollaborationModeKind::Plan,
+                ))?;
+            }
             if !plan_text.is_empty() {
                 self.submit_plain_text(plan_text.to_string())?;
             }
@@ -5676,6 +5678,12 @@ impl App {
             return self.execute_palette_action(action);
         }
         Ok(false)
+    }
+
+    fn toggle_plan_mode(&mut self) -> Result<()> {
+        self.dispatch(AppCommand::SetCollaborationMode(next_collaboration_mode(
+            self.collaboration_mode,
+        )))
     }
 
     fn main_selection_count(&mut self) -> Result<usize> {
@@ -8843,6 +8851,29 @@ mod redesign_tests {
     }
 
     #[test]
+    fn empty_plan_slash_command_toggles_plan_mode_off() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.dispatch(AppCommand::SetCollaborationMode(
+            CollaborationModeKind::Plan,
+        ))?;
+
+        app.set_input("/plan".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
+        assert_eq!(
+            app.store
+                .get_setting(COLLABORATION_MODE_SETTING)?
+                .as_deref(),
+            Some("default")
+        );
+        assert!(app.status_notice.is_none());
+        assert!(app.composer.input().is_empty());
+        Ok(())
+    }
+
+    #[test]
     fn plan_slash_command_does_not_submit_old_mode_followup_while_running() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
@@ -9866,6 +9897,41 @@ mod redesign_tests {
         let screen = render_dump(&mut app)?;
         assert!(screen.contains("/task"));
         assert!(screen.contains("/model"));
+        Ok(())
+    }
+
+    #[test]
+    fn slash_palette_plan_row_toggles_plan_mode_off() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.dispatch(AppCommand::SetCollaborationMode(
+            CollaborationModeKind::Plan,
+        ))?;
+        app.status_notice = None;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("/plan"));
+        assert!(screen.contains("switch off Plan mode"));
+        assert!(!screen.contains("switch to Plan mode"));
+        let plan_row = app
+            .slash_palette_items()
+            .iter()
+            .position(|item| item.command == "/plan")
+            .context("plan palette row")?;
+        app.selected_row = plan_row;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+        assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
+        assert!(!app.is_slash_palette_active());
+        assert_eq!(
+            app.store
+                .get_setting(COLLABORATION_MODE_SETTING)?
+                .as_deref(),
+            Some("default")
+        );
+        assert!(app.status_notice.is_none());
         Ok(())
     }
 
