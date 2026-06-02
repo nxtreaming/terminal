@@ -1902,7 +1902,7 @@ impl App {
         if changed {
             self.refresh_cached_projection();
         }
-        if self.flush_ready_queued_followups()? {
+        if self.flush_ready_pending_active_followups()? || self.flush_ready_queued_followups()? {
             changed = true;
             self.state_cache.refresh_all(&self.store)?;
             self.refresh_cached_projection();
@@ -2093,7 +2093,7 @@ impl App {
         if changed {
             self.refresh_cached_projection();
         }
-        if self.flush_ready_queued_followups()? {
+        if self.flush_ready_pending_active_followups()? || self.flush_ready_queued_followups()? {
             changed = true;
             self.state_cache.refresh_all(&self.store)?;
             self.refresh_cached_projection();
@@ -2498,6 +2498,67 @@ impl App {
             self.cached_events_for_session(session_id),
             followup_seq,
         )
+    }
+
+    fn flush_ready_pending_active_followups(&mut self) -> Result<bool> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(false);
+        };
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(false);
+        };
+        if session.status.is_active() {
+            return Ok(false);
+        }
+        let events = self.store.events_for_session(&session_id)?;
+        let pending = pending_active_followup_events_from_events(&events)
+            .into_iter()
+            .map(|event| (event.seq, event.payload.clone()))
+            .collect::<Vec<_>>();
+        if pending.is_empty() {
+            return Ok(false);
+        }
+        let queued = pending_queued_followup_events_from_events(&events)
+            .into_iter()
+            .map(|event| (event.seq, event.payload.clone()))
+            .collect::<Vec<_>>();
+        let selection = self.session_model_selection_or_current(&session_id)?;
+        if !self.ensure_agent_ready_for_selection(&selection)? {
+            return Ok(false);
+        }
+        let followup_seqs = pending.iter().map(|(seq, _)| *seq).collect::<Vec<_>>();
+        for (pending_seq, mut payload) in pending {
+            if let Some(object) = payload.as_object_mut() {
+                object.remove("delivery");
+                object.insert(
+                    "pending_from_seq".to_string(),
+                    serde_json::Value::from(pending_seq),
+                );
+            }
+            self.store
+                .append_event(&session_id, "session.followup", payload)?;
+        }
+        for (queued_seq, mut payload) in queued {
+            payload["queued_from_seq"] = serde_json::json!(queued_seq);
+            self.store
+                .append_event(&session_id, "session.followup", payload)?;
+            self.store.append_event(
+                &session_id,
+                SESSION_QUEUED_FOLLOWUP_SENT_EVENT,
+                serde_json::json!({ "queued_seq": queued_seq }),
+            )?;
+        }
+        self.store.append_event(
+            &session_id,
+            SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT,
+            serde_json::json!({
+                "followup_seqs": followup_seqs,
+                "reason": "submitted after interrupted turn",
+            }),
+        )?;
+        self.status_notice = Some("Sent pending follow-up.".to_string());
+        self.start_agent_for_session(session_id)?;
+        Ok(true)
     }
 
     fn flush_ready_queued_followups(&mut self) -> Result<bool> {
@@ -14477,6 +14538,67 @@ wire_api = "responses"
             "pending detail should stay attached to its preview\n{screen}"
         );
         assert!(!screen.contains("> anchored steer"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn stopping_turn_submits_pending_active_followup() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let running = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &running.id,
+            "session.input",
+            serde_json::json!({"text": "write an essay"}),
+        )?;
+        app.store.append_event(
+            &running.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "partial answer"}),
+        )?;
+        app.selected_session_id = Some(running.id.clone());
+
+        app.set_input("hi".to_string());
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        let events = app.store.events_for_session(&running.id)?;
+        let pending_seq = events
+            .iter()
+            .find(|event| {
+                event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+                    && event.payload["text"] == "hi"
+            })
+            .context("pending active follow-up")?
+            .seq;
+        assert!(active_followup_is_pending_in_events(&events, pending_seq));
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL))?);
+
+        let events = app.store.events_for_session(&running.id)?;
+        assert!(!active_followup_is_pending_in_events(&events, pending_seq));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.followup"
+                && event.payload["text"] == "hi"
+                && event.payload["pending_from_seq"] == pending_seq
+                && event.payload.get("delivery").is_none()
+        }));
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT
+                && event
+                    .payload
+                    .get("followup_seqs")
+                    .and_then(serde_json::Value::as_array)
+                    .is_some_and(|seqs| seqs.iter().any(|seq| seq.as_i64() == Some(pending_seq)))
+                && event.payload["reason"] == "submitted after interrupted turn"
+        }));
+        assert_eq!(
+            app.store
+                .load_session(&running.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(!screen.contains("Messages to be submitted after next tool call"));
+        assert!(screen.contains("> hi"), "{screen}");
         Ok(())
     }
 
