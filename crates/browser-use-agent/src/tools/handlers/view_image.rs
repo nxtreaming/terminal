@@ -43,12 +43,9 @@
 //! * **Inline size cap** — legacy `MAX_INLINE_LOCAL_IMAGE_BYTES = 20 * 1024 * 1024`
 //!   (`browser-use-core/src/lib.rs`); oversize images are rejected
 //!   (legacy `files.rs:319-326`).
-//! * **Path safety** — reuses the same approach as `apply_patch`
-//!   (`tools/handlers/apply_patch.rs::ensure_real_path_stays_under_root`):
-//!   absolute paths are rejected, the joined path is normalized lexically, must
-//!   stay under the canonical root, and the existing prefix is symlink-resolved
-//!   and re-checked. Legacy parity: `ensure_real_path_stays_under_root`
-//!   (`files.rs:1604`).
+//! * **Path resolution** — relative paths are resolved against the request/context
+//!   cwd, absolute paths are honored as-is, and the existing prefix is
+//!   symlink-resolved. This intentionally does NOT enforce a workspace boundary.
 //!
 //! # Parity caveats / TODOs
 //!
@@ -86,14 +83,6 @@ use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
 /// (`browser-use-core/src/lib.rs`). Images above this are rejected.
 pub const MAX_INLINE_LOCAL_IMAGE_BYTES: usize = 20 * 1024 * 1024;
 
-/// Error message when a path escapes the workspace root.
-///
-/// Reproduced from the `apply_patch` tool's [`PATH_ESCAPE_ERROR`]
-/// (`tools/handlers/apply_patch.rs`), itself verbatim from legacy
-/// `browser-use-core/src/tools/files.rs:16-17`.
-pub const PATH_ESCAPE_ERROR: &str =
-    "path escapes project root (resolved outside the allowed workspace)";
-
 /// Prefix on the [`ExecOutput::stdout`] data URL so a later content-aware layer
 /// can recognize the payload and re-wrap it as an `input_image` content part.
 ///
@@ -104,10 +93,9 @@ pub const VIEW_IMAGE_STDOUT_PREFIX: &str = "view_image:";
 /// Typed request for the `view_image` tool.
 ///
 /// Field shape follows codex `ViewImageArgs { path, .. }`
-/// (`core/src/tools/handlers/view_image.rs:53-58`): a path to a local image,
-/// resolved under the workspace root. `cwd` overrides [`ToolCtx::cwd`] as the
-/// root (and the path-safety boundary), mirroring [`super::shell::ShellRequest`]
-/// / [`super::apply_patch::ApplyPatchRequest`].
+/// (`core/src/tools/handlers/view_image.rs:53-58`): a path to a local image.
+/// `cwd` overrides [`ToolCtx::cwd`] as the base used for relative paths, mirroring
+/// [`super::shell::ShellRequest`] / [`super::apply_patch::ApplyPatchRequest`].
 ///
 /// # Wire shape (model-facing args)
 ///
@@ -123,10 +111,11 @@ pub const VIEW_IMAGE_STDOUT_PREFIX: &str = "view_image:";
 /// deserialization of `{ "path": ... }` succeeds.
 #[derive(Clone, Debug, PartialEq, Eq, serde::Deserialize)]
 pub struct ViewImageRequest {
-    /// Path to the local image file, resolved under the workspace root.
+    /// Path to the local image file. Absolute paths are used as-is; relative paths
+    /// are resolved against `cwd`.
     pub path: PathBuf,
-    /// Workspace root the path is resolved under. When `None`, the
-    /// [`ToolCtx::cwd`] is used.
+    /// Base directory for relative paths. When `None`, the [`ToolCtx::cwd`] is
+    /// used.
     #[serde(default)]
     pub cwd: Option<PathBuf>,
 }
@@ -247,9 +236,9 @@ impl ToolRuntime<ViewImageRequest, ExecOutput> for ViewImageTool {
 
         let root = req.cwd.clone().unwrap_or_else(|| ctx.cwd.clone());
 
-        // Resolve + path-safety-check the path under the root. Escapes are
-        // `Rejected`.
-        let real = ensure_real_path_stays_under_root(&root, &req.path)?;
+        // Resolve the path. Absolute paths are honored; relative paths use the
+        // request/context cwd as their base.
+        let real = resolve_local_path(&root, &req.path);
 
         // Detect the MIME from the extension BEFORE reading, so an unsupported
         // extension is a clean rejection rather than a wasted read.
@@ -321,56 +310,21 @@ fn encode_data_url(mime: &str, bytes: &[u8]) -> ViewImageContent {
     }
 }
 
-// ---- Path safety (reused from apply_patch / legacy files.rs:1604) ----
+// ---- Path resolution ----
 
-/// Resolve `rel` under `root`, ensuring the real path stays within the root.
+/// Resolve `path` for local image reads.
 ///
-/// This mirrors `apply_patch`'s `ensure_real_path_stays_under_root`
-/// (`tools/handlers/apply_patch.rs`) and legacy
-/// `ensure_real_path_stays_under_root` (`files.rs:1604`): absolute paths are
-/// rejected outright; the joined path is normalized lexically (resolving
-/// `.`/`..` without touching the FS) and must `starts_with` the canonical root;
-/// the longest existing prefix is then canonicalized (resolving symlinks) and
-/// re-checked. Violations are [`ToolError::Rejected`] with [`PATH_ESCAPE_ERROR`].
-fn ensure_real_path_stays_under_root(root: &Path, rel: &Path) -> Result<PathBuf, ToolError> {
-    // Absolute paths cannot be scoped under the root.
-    if rel.is_absolute() {
-        return Err(ToolError::Rejected(format!(
-            "{PATH_ESCAPE_ERROR}: {}",
-            rel.display()
-        )));
-    }
-
-    // Canonicalize the root (it must exist).
-    let canonical_root = root.canonicalize().map_err(|e| {
-        ToolError::Other(anyhow::anyhow!(
-            "canonicalizing workspace root {}: {e}",
-            root.display()
-        ))
-    })?;
-
-    // Join and normalize the candidate path lexically (handling `.`/`..`).
-    let joined = canonical_root.join(rel);
-    let normalized = normalize_lexically(&joined);
-
-    // The normalized path must remain under the canonical root.
-    if !normalized.starts_with(&canonical_root) {
-        return Err(ToolError::Rejected(format!(
-            "{PATH_ESCAPE_ERROR}: {}",
-            rel.display()
-        )));
-    }
-
-    // Resolve symlinks for the longest existing prefix and re-check.
-    let real = resolve_existing_prefix(&normalized);
-    if !real.starts_with(&canonical_root) {
-        return Err(ToolError::Rejected(format!(
-            "{PATH_ESCAPE_ERROR}: {}",
-            rel.display()
-        )));
-    }
-
-    Ok(real)
+/// Absolute paths are used as-is. Relative paths are joined to `root`, normalized
+/// lexically, and then the longest existing prefix is canonicalized so symlink
+/// targets are followed. No workspace-boundary check is applied.
+fn resolve_local_path(root: &Path, path: &Path) -> PathBuf {
+    let candidate = if path.is_absolute() {
+        path.to_path_buf()
+    } else {
+        root.join(path)
+    };
+    let normalized = normalize_lexically(&candidate);
+    resolve_existing_prefix(&normalized)
 }
 
 /// Normalize a path lexically, resolving `.` and `..` without touching the FS.

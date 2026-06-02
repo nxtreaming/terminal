@@ -168,7 +168,7 @@ These already exist in some form, but under the parity rule each must be **audit
 
 - **Dispatch:** giant `match` over `ToolHandlerKind` enum vs codex's trait-object registry. Both share `ToolExposure {Direct, Deferred, DirectModelOnly, Hidden}` and bm25 tool-search gating.
 - **Model-visible tools:** shell (`shell_command` / `exec_command`+`write_stdin`), `apply_patch`, `view_image`, goals, `update_plan`, `request_user_input`, browser family, `done`, multi-agent, MCP. **Not real specs (prompt-described, name-fallback dispatch):** `python`, `read_file`/`search_files`/`list_files`. **No write/edit tool** — all edits via `apply_patch` (V4A). `request_permissions` is **codex-only** (we only have a permissions *context message*).
-- **Shell exec:** bare `std::process::Command` (pipe + `portable_pty`), default 10s timeout (no upper cap), 1 MiB/stream output cap then token-budget truncation. **No OS sandbox at all.** Path confinement exists only for `apply_patch` (`ensure_real_path_stays_under_root`) and is bypassable via shell.
+- **Shell exec:** bare `std::process::Command` (pipe + `portable_pty`), default 10s timeout (no upper cap), 1 MiB/stream output cap then token-budget truncation. **No OS sandbox at all.** `apply_patch` and `view_image` resolve absolute paths and `..` escapes permissively; `cwd` is only the base for relative paths.
 - See §5 for the full safety gap and rebuild order.
 
 ## C. Prompts · providers · auth

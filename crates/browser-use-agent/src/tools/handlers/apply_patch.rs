@@ -33,13 +33,10 @@
 //!   view (context + added), locate the before-block as a contiguous
 //!   subsequence, splice in the after-block. The original trailing-newline state
 //!   is preserved.
-//! * **Path safety** — legacy `ensure_real_path_stays_under_root`
-//!   (files.rs ~1604) + `normalize_lexically` + `resolve_existing_prefix`:
-//!   absolute paths are rejected outright; the joined path is normalized
-//!   lexically (resolving `.`/`..` without touching the FS) and must
-//!   `starts_with` the canonical root; the longest existing prefix is then
-//!   canonicalized (resolving symlinks) and re-checked. The rejection message is
-//!   the legacy [`PATH_ESCAPE_ERROR`] string (files.rs:16-17).
+//! * **Path resolution** — absolute patch paths are honored as-is; relative paths
+//!   are resolved against `cwd`, normalized lexically, and symlink-resolved for
+//!   the existing prefix. This intentionally does NOT enforce a workspace
+//!   boundary.
 //!
 //! # Parity caveats / TODOs
 //!
@@ -60,12 +57,6 @@ use crate::tools::runtime::{
 };
 use crate::tools::sandbox::{SandboxPermissions, SandboxPreference};
 
-/// Error message when a path escapes the project root.
-///
-/// Reproduced verbatim from the legacy impl (`browser-use-core/src/tools/files.rs:16-17`).
-pub const PATH_ESCAPE_ERROR: &str =
-    "path escapes project root (resolved outside the allowed workspace)";
-
 /// V4A patch envelope + section markers.
 ///
 /// Parity: legacy `files.rs:21-29` and codex `apply-patch/src/parser.rs:193-200`.
@@ -81,7 +72,7 @@ const HUNK_MARKER: &str = "@@";
 /// Typed request for the `apply_patch` tool.
 ///
 /// `patch` is the full V4A envelope text; `cwd` overrides [`ToolCtx::cwd`] as the
-/// workspace root the patch is applied under (and the path-safety boundary).
+/// base directory for relative patch paths.
 ///
 /// # Wire shape (model-facing args)
 ///
@@ -267,7 +258,7 @@ impl ToolRuntime<ApplyPatchRequest, ExecOutput> for ApplyPatchTool {
         let operations = parse_patch(&req.patch)
             .map_err(|e| ToolError::Rejected(format!("apply_patch parse error: {e}")))?;
 
-        // Apply. Path-safety violations are `Rejected`; I/O failures are `Other`.
+        // Apply. I/O failures are `Other`; paths are resolved permissively.
         let summary = apply_patch_operations(&operations, &root)?;
 
         Ok(summary.into_exec_output())
@@ -483,9 +474,8 @@ fn parse_update_hunks(lines: &[&str], start: usize) -> Result<(Vec<UpdateHunk>, 
 /// Apply a sequence of parsed operations under `root`.
 ///
 /// Parity: legacy `apply_patch_operations` (files.rs:698). Each path is resolved
-/// under `root` and checked with [`ensure_real_path_stays_under_root`] before any
-/// write. Path-safety violations are [`ToolError::Rejected`]; I/O failures are
-/// [`ToolError::Other`].
+/// under `root` for relative paths before any write. Absolute paths are used
+/// as-is. I/O failures are [`ToolError::Other`].
 pub fn apply_patch_operations(
     operations: &[PatchOperation],
     root: &Path,
@@ -495,7 +485,7 @@ pub fn apply_patch_operations(
     for op in operations {
         match op {
             PatchOperation::AddFile { path, contents } => {
-                let real = ensure_real_path_stays_under_root(root, path)?;
+                let real = resolve_patch_path(root, path);
                 if let Some(parent) = real.parent() {
                     std::fs::create_dir_all(parent).map_err(|e| {
                         ToolError::Other(anyhow::anyhow!("creating parent dirs for {path}: {e}"))
@@ -507,7 +497,7 @@ pub fn apply_patch_operations(
                 changed.push(path.clone());
             }
             PatchOperation::DeleteFile { path } => {
-                let real = ensure_real_path_stays_under_root(root, path)?;
+                let real = resolve_patch_path(root, path);
                 std::fs::remove_file(&real)
                     .map_err(|e| ToolError::Other(anyhow::anyhow!("deleting file {path}: {e}")))?;
                 changed.push(path.clone());
@@ -517,7 +507,7 @@ pub fn apply_patch_operations(
                 move_to,
                 hunks,
             } => {
-                let real = ensure_real_path_stays_under_root(root, path)?;
+                let real = resolve_patch_path(root, path);
                 let original = std::fs::read_to_string(&real).map_err(|e| {
                     ToolError::Other(anyhow::anyhow!("reading file to update {path}: {e}"))
                 })?;
@@ -527,7 +517,7 @@ pub fn apply_patch_operations(
 
                 // Honor an optional move/rename.
                 let dest = if let Some(dest_rel) = move_to {
-                    ensure_real_path_stays_under_root(root, dest_rel)?
+                    resolve_patch_path(root, dest_rel)
                 } else {
                     real.clone()
                 };
@@ -626,47 +616,22 @@ fn find_subsequence(haystack: &[String], needle: &[&String]) -> Option<usize> {
     None
 }
 
-// ---- Path safety (legacy files.rs:1604-1680 parity) ----
+// ---- Path resolution ----
 
-/// Resolve `rel` under `root`, ensuring the real path stays within the root.
+/// Resolve a patch path.
 ///
-/// Parity: legacy `ensure_real_path_stays_under_root` (files.rs:1604). Mirrors
-/// the codex `apply_patch` safety check: the resolved path (after normalizing
-/// `.`/`..` components) must remain under the project root, and symlinks are
-/// resolved for any existing prefix so a symlink cannot escape the workspace.
-/// Absolute paths and paths that escape the root are [`ToolError::Rejected`]
-/// with the [`PATH_ESCAPE_ERROR`] message.
-fn ensure_real_path_stays_under_root(root: &Path, rel: &str) -> Result<PathBuf, ToolError> {
-    // Absolute paths in a patch are always rejected (they cannot be scoped).
-    let rel_path = Path::new(rel);
-    if rel_path.is_absolute() {
-        return Err(ToolError::Rejected(format!("{PATH_ESCAPE_ERROR}: {rel}")));
-    }
-
-    // Canonicalize the root (it must exist).
-    let canonical_root = root.canonicalize().map_err(|e| {
-        ToolError::Other(anyhow::anyhow!(
-            "canonicalizing project root {}: {e}",
-            root.display()
-        ))
-    })?;
-
-    // Join and normalize the candidate path lexically (handling `.`/`..`).
-    let joined = canonical_root.join(rel_path);
-    let normalized = normalize_lexically(&joined);
-
-    // The normalized path must remain under the canonical root.
-    if !normalized.starts_with(&canonical_root) {
-        return Err(ToolError::Rejected(format!("{PATH_ESCAPE_ERROR}: {rel}")));
-    }
-
-    // Resolve symlinks for the longest existing prefix and re-check.
-    let real = resolve_existing_prefix(&normalized);
-    if !real.starts_with(&canonical_root) {
-        return Err(ToolError::Rejected(format!("{PATH_ESCAPE_ERROR}: {rel}")));
-    }
-
-    Ok(real)
+/// Absolute paths are used as-is. Relative paths are joined to `root`, normalized
+/// lexically, and then the longest existing prefix is canonicalized so symlink
+/// targets are followed. No workspace-boundary check is applied.
+fn resolve_patch_path(root: &Path, path: &str) -> PathBuf {
+    let input = Path::new(path);
+    let candidate = if input.is_absolute() {
+        input.to_path_buf()
+    } else {
+        root.join(input)
+    };
+    let normalized = normalize_lexically(&candidate);
+    resolve_existing_prefix(&normalized)
 }
 
 /// Normalize a path lexically, resolving `.` and `..` without touching the FS.

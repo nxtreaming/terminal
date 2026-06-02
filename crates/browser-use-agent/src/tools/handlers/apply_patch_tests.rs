@@ -7,7 +7,6 @@
 
 use super::apply_patch::{
     apply_patch_operations, parse_patch, ApplyPatchRequest, ApplyPatchTool, PatchOperation,
-    PATH_ESCAPE_ERROR,
 };
 use crate::tools::approval::AskForApproval;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
@@ -201,11 +200,13 @@ async fn delete_file_removes_file() {
     assert!(!target.exists(), "file should be deleted");
 }
 
-// (4a) A patch targeting a `../escape` path is REJECTED with the path-safety error.
+// (4a) A patch targeting a `../escape` path writes outside the cwd.
 #[tokio::test]
-async fn relative_escape_path_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = ctx_in(dir.path());
+async fn relative_escape_path_is_allowed() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let ctx = ctx_in(&root);
     let patch = "\
 *** Begin Patch
 *** Add File: ../escape.txt
@@ -213,43 +214,35 @@ async fn relative_escape_path_is_rejected() {
 *** End Patch
 ";
     let req = ApplyPatchRequest::new(patch);
-    match run_direct(&req, &ctx).await {
-        Err(ToolError::Rejected(msg)) => {
-            assert!(
-                msg.contains(PATH_ESCAPE_ERROR),
-                "rejection should carry the path-safety error, got: {msg}"
-            );
-        }
-        other => panic!("expected Rejected for ../escape, got {other:?}"),
-    }
-    // The escaping file must not have been created above the root.
-    assert!(
-        !dir.path().parent().unwrap().join("escape.txt").exists(),
-        "escaping file must not be written outside the root"
+    run_direct(&req, &ctx)
+        .await
+        .expect("../escape patch should apply");
+    assert_eq!(
+        std::fs::read_to_string(outer.path().join("escape.txt")).unwrap(),
+        "pwned"
     );
 }
 
-// (4b) A patch targeting an absolute path is REJECTED with the path-safety error.
+// (4b) A patch targeting an absolute path writes to that path.
 #[tokio::test]
-async fn absolute_path_is_rejected() {
+async fn absolute_path_is_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx_in(dir.path());
-    let patch = "\
+    let target = dir.path().join("abs_escape.txt");
+    let patch = format!(
+        "\
 *** Begin Patch
-*** Add File: /tmp/abs_escape.txt
+*** Add File: {}
 +pwned
 *** End Patch
-";
+",
+        target.display()
+    );
     let req = ApplyPatchRequest::new(patch);
-    match run_direct(&req, &ctx).await {
-        Err(ToolError::Rejected(msg)) => {
-            assert!(
-                msg.contains(PATH_ESCAPE_ERROR),
-                "rejection should carry the path-safety error, got: {msg}"
-            );
-        }
-        other => panic!("expected Rejected for absolute path, got {other:?}"),
-    }
+    run_direct(&req, &ctx)
+        .await
+        .expect("absolute path patch should apply");
+    assert_eq!(std::fs::read_to_string(target).unwrap(), "pwned");
 }
 
 // (4c) A deep `..` traversal that lands back inside the root is allowed.
@@ -404,7 +397,7 @@ fn approval_accessors() {
     assert!(tool.exec_approval_requirement(&req).is_none());
 }
 
-// The request cwd overrides the ctx cwd as the workspace root.
+// The request cwd overrides the ctx cwd as the base for relative paths.
 #[tokio::test]
 async fn request_cwd_overrides_ctx_cwd() {
     let ctx_dir = tempfile::tempdir().unwrap();
@@ -478,9 +471,11 @@ async fn orchestrated_add_file_completes_under_none() {
 }
 
 #[tokio::test]
-async fn orchestrated_escape_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = ctx_in(dir.path());
+async fn orchestrated_escape_is_allowed() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let ctx = ctx_in(&root);
     let orch = ToolOrchestrator::new(NoneSandboxProvider, AutoApprover);
     let tool = ApplyPatchTool::new();
     let req = ApplyPatchRequest::new(
@@ -492,12 +487,13 @@ async fn orchestrated_escape_is_rejected() {
 ",
     );
 
-    let err = orch
+    let result = orch
         .run(&tool, &req, &ctx, &turn_env(false), AskForApproval::Never)
         .await
-        .expect_err("escaping patch must not complete through the orchestrator");
-    assert!(
-        matches!(err, ToolError::Rejected(_)),
-        "expected Rejected, got {err:?}"
+        .expect("escaping patch should complete through the orchestrator");
+    assert_eq!(result.output.exit_code, 0);
+    assert_eq!(
+        std::fs::read_to_string(outer.path().join("orch_escape.txt")).unwrap(),
+        "nope"
     );
 }

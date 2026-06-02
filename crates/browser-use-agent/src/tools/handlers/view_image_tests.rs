@@ -9,7 +9,7 @@ use base64::Engine as _;
 
 use super::view_image::{
     mime_from_extension, ViewImageRequest, ViewImageTool, MAX_INLINE_LOCAL_IMAGE_BYTES,
-    PATH_ESCAPE_ERROR, VIEW_IMAGE_STDOUT_PREFIX,
+    VIEW_IMAGE_STDOUT_PREFIX,
 };
 use crate::tools::approval::AskForApproval;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
@@ -128,41 +128,34 @@ async fn jpeg_extension_yields_jpeg_mime() {
     );
 }
 
-// (2) A path outside cwd is REJECTED (path-safety): both ../escape and absolute.
+// (2) Paths outside cwd are allowed: both ../escape and absolute.
 #[tokio::test]
-async fn relative_escape_path_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = ctx_in(dir.path());
-    // Place a real image just outside the root, then try to escape to it.
-    std::fs::write(dir.path().parent().unwrap().join("outside.png"), TINY_PNG).unwrap();
+async fn relative_escape_path_is_allowed() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    let ctx = ctx_in(&root);
+    std::fs::write(outer.path().join("outside.png"), TINY_PNG).unwrap();
 
     let req = ViewImageRequest::new("../outside.png");
-    match run_direct(&req, &ctx).await {
-        Err(ToolError::Rejected(msg)) => {
-            assert!(
-                msg.contains(PATH_ESCAPE_ERROR),
-                "rejection should carry the path-safety error, got: {msg}"
-            );
-        }
-        other => panic!("expected Rejected for ../escape, got {other:?}"),
-    }
+    let out = run_direct(&req, &ctx)
+        .await
+        .expect("../escape image should be readable");
+    assert!(data_url(&out).starts_with("data:image/png;base64,"));
 }
 
 #[tokio::test]
-async fn absolute_path_is_rejected() {
+async fn absolute_path_is_allowed() {
     let dir = tempfile::tempdir().unwrap();
     let ctx = ctx_in(dir.path());
+    let image = dir.path().join("absolute.png");
+    std::fs::write(&image, TINY_PNG).unwrap();
 
-    let req = ViewImageRequest::new("/etc/hostname.png");
-    match run_direct(&req, &ctx).await {
-        Err(ToolError::Rejected(msg)) => {
-            assert!(
-                msg.contains(PATH_ESCAPE_ERROR),
-                "rejection should carry the path-safety error, got: {msg}"
-            );
-        }
-        other => panic!("expected Rejected for absolute path, got {other:?}"),
-    }
+    let req = ViewImageRequest::new(image);
+    let out = run_direct(&req, &ctx)
+        .await
+        .expect("absolute image path should be readable");
+    assert!(data_url(&out).starts_with("data:image/png;base64,"));
 }
 
 // (3) A nonexistent file returns an error (not a panic).
@@ -292,7 +285,7 @@ fn approval_accessors() {
     assert!(tool.exec_approval_requirement(&req).is_none());
 }
 
-// The request cwd overrides the ctx cwd as the workspace root.
+// The request cwd overrides the ctx cwd as the base for relative paths.
 #[tokio::test]
 async fn request_cwd_overrides_ctx_cwd() {
     let ctx_dir = tempfile::tempdir().unwrap();
@@ -349,19 +342,20 @@ async fn orchestrated_view_completes_under_none() {
 }
 
 #[tokio::test]
-async fn orchestrated_escape_is_rejected() {
-    let dir = tempfile::tempdir().unwrap();
-    let ctx = ctx_in(dir.path());
+async fn orchestrated_escape_is_allowed() {
+    let outer = tempfile::tempdir().unwrap();
+    let root = outer.path().join("root");
+    std::fs::create_dir(&root).unwrap();
+    std::fs::write(outer.path().join("orch_escape.png"), TINY_PNG).unwrap();
+    let ctx = ctx_in(&root);
     let orch = ToolOrchestrator::new(NoneSandboxProvider, AutoApprover);
     let tool = ViewImageTool::new();
     let req = ViewImageRequest::new("../orch_escape.png");
 
-    let err = orch
+    let result = orch
         .run(&tool, &req, &ctx, &turn_env(false), AskForApproval::Never)
         .await
-        .expect_err("escaping read must not complete through the orchestrator");
-    assert!(
-        matches!(err, ToolError::Rejected(_)),
-        "expected Rejected, got {err:?}"
-    );
+        .expect("escaping read should complete through the orchestrator");
+    assert_eq!(result.output.exit_code, 0);
+    assert!(result.output.stdout.starts_with(VIEW_IMAGE_STDOUT_PREFIX));
 }

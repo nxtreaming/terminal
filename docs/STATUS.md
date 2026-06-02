@@ -161,8 +161,8 @@ FINAL CUTOVER (TUI/CLI: browser-use-core → browser-use-agent; retire core) = [
 
 ## Tools port (on decodex, M3 core complete @ a21047b base)
 - [x] T-shell — async shell/exec tool over ToolRuntime seam (tokio::process, 10s default timeout/exit124, 1MiB cap, simple rm-rf denylist; full tree-sitter denylist TODO) — 212 tests
-- [x] T-apply_patch — async V4A apply_patch over ToolRuntime seam (envelope+hunks, path-safety reject-outside-root; fuzzy-match/turn_diff_tracker/metadata-denylist deferred) — 231 tests
-- [x] T-view_image — sync/serial (INTENTIONAL divergence, parallel_safe=false), blocking std::fs::read, base64 data-url in ExecOutput.stdout (resize/structured-content deferred) — 244 tests
+- [x] T-apply_patch — async V4A apply_patch over ToolRuntime seam (envelope+hunks, permissive absolute/escape path resolution; fuzzy-match/turn_diff_tracker/metadata-denylist deferred) — 231 tests
+- [x] T-view_image — sync/serial (INTENTIONAL divergence, parallel_safe=false), blocking std::fs::read, permissive absolute/escape path resolution, base64 data-url in ExecOutput.stdout (resize/structured-content deferred) — 244 tests
 - [x] T-update_plan — async update_plan over seam (codex StepStatus pending/in_progress/completed wire vals, one-in_progress validation, parallel_safe=false matches codex) — 258 tests
 - [x] T-request_user_input — async (request side; host round-trip deferred), codex questions/options wire shape + normalize validation, parallel_safe=false — 269 tests
 - [x] T-tool_search — async BM25 deferred-tool ranking (codex bm25 2.3.2 SearchEngine, default limit 8, parallel_safe=true matches codex; registry/catalog wiring deferred) — 280 tests
