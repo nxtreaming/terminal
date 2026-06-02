@@ -195,14 +195,12 @@ struct Args {
 #[derive(Clone, Copy, Debug, PartialEq, Eq, ValueEnum)]
 enum CollaborationModeArg {
     Default,
-    Plan,
 }
 
 impl From<CollaborationModeArg> for CollaborationModeKind {
     fn from(value: CollaborationModeArg) -> Self {
         match value {
             CollaborationModeArg::Default => CollaborationModeKind::Default,
-            CollaborationModeArg::Plan => CollaborationModeKind::Plan,
         }
     }
 }
@@ -436,7 +434,6 @@ enum AppCommand {
     OpenHistory,
     SelectHistory(String),
     ChangeModel,
-    ChangeMode,
     SetCollaborationMode(CollaborationModeKind),
     SignIn,
     ConfigureTelemetry,
@@ -1567,29 +1564,20 @@ fn is_prompt_history_search_clear_key(key: KeyEvent) -> bool {
 pub(crate) fn collaboration_mode_label(mode: CollaborationModeKind) -> &'static str {
     match mode {
         CollaborationModeKind::Default => "Default",
-        CollaborationModeKind::Plan => "Plan",
+        CollaborationModeKind::Plan => "Default",
     }
 }
 
 fn collaboration_mode_setting_value(mode: CollaborationModeKind) -> &'static str {
     match mode {
-        CollaborationModeKind::Default => "default",
-        CollaborationModeKind::Plan => "plan",
+        CollaborationModeKind::Default | CollaborationModeKind::Plan => "default",
     }
 }
 
 fn collaboration_mode_from_setting(value: &str) -> Option<CollaborationModeKind> {
     match value.trim().to_ascii_lowercase().as_str() {
-        "default" => Some(CollaborationModeKind::Default),
-        "plan" => Some(CollaborationModeKind::Plan),
+        "default" | "plan" => Some(CollaborationModeKind::Default),
         _ => None,
-    }
-}
-
-fn next_collaboration_mode(mode: CollaborationModeKind) -> CollaborationModeKind {
-    match mode {
-        CollaborationModeKind::Default => CollaborationModeKind::Plan,
-        CollaborationModeKind::Plan => CollaborationModeKind::Default,
     }
 }
 
@@ -2536,9 +2524,6 @@ impl App {
     }
 
     fn maybe_start_goal_continuation(&mut self) -> Result<bool> {
-        if self.collaboration_mode == CollaborationModeKind::Plan {
-            return Ok(false);
-        }
         let Some(session_id) = self.selected_session_id.clone() else {
             return Ok(false);
         };
@@ -2812,40 +2797,6 @@ impl App {
             self.status_notice = Some(IMAGE_PASTE_MATERIALIZING_NOTICE.to_string());
             return Ok(());
         }
-        if !has_local_images {
-            if let Some(plan_text) = text
-                .strip_prefix("/plan")
-                .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-                .map(str::trim)
-            {
-                if self.current_task_is_active()?
-                    && self.collaboration_mode != CollaborationModeKind::Plan
-                {
-                    self.status_notice = Some(
-                        "Collaboration mode can change after the running turn finishes."
-                            .to_string(),
-                    );
-                    return Ok(());
-                }
-                self.composer.take_trimmed();
-                if plan_text.is_empty() {
-                    self.toggle_plan_mode()?;
-                } else {
-                    self.dispatch(AppCommand::SetCollaborationMode(
-                        CollaborationModeKind::Plan,
-                    ))?;
-                }
-                if !plan_text.is_empty() {
-                    self.submit_plain_text(plan_text.to_string())?;
-                }
-                return Ok(());
-            }
-        }
-        if !has_local_images && text == "/mode" {
-            self.composer.take_trimmed();
-            self.dispatch(AppCommand::ChangeMode)?;
-            return Ok(());
-        }
         if text.is_empty() && !has_local_images {
             if let Some(session) = self
                 .selected_session_id
@@ -2992,27 +2943,6 @@ impl App {
         Ok(true)
     }
 
-    fn submit_plain_text(&mut self, text: String) -> Result<()> {
-        if let Some(session) = self
-            .selected_session_id
-            .as_deref()
-            .and_then(|id| {
-                self.state_cache
-                    .sessions
-                    .iter()
-                    .find(|session| session.id == id)
-            })
-            .cloned()
-        {
-            self.dispatch(AppCommand::SendFollowup {
-                session_id: session.id,
-                text,
-            })
-        } else {
-            self.dispatch(AppCommand::StartTask(text))
-        }
-    }
-
     fn ensure_agent_ready(&mut self) -> Result<bool> {
         let selection = self.current_model_selection();
         self.ensure_agent_ready_for_selection(&selection)
@@ -3085,8 +3015,12 @@ impl App {
                 self.close_surface();
             }
             AppCommand::ChangeModel => self.open_surface(Surface::Model),
-            AppCommand::ChangeMode => self.open_surface(Surface::Mode),
             AppCommand::SetCollaborationMode(mode) => {
+                let mode = match mode {
+                    CollaborationModeKind::Default | CollaborationModeKind::Plan => {
+                        CollaborationModeKind::Default
+                    }
+                };
                 if self.collaboration_mode != mode && self.current_task_is_active()? {
                     self.status_notice = Some(
                         "Collaboration mode can change after the running turn finishes."
@@ -3121,18 +3055,6 @@ impl App {
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session(None, &cwd)?;
         self.append_session_model_selection(&session.id, &selection)?;
-        // Record the collaboration mode for the session BEFORE the first user
-        // turn, so the engine sees the plan-mode context ahead of `session.input`
-        // (origin/main seeded the plan-mode workspace context at session start).
-        if self.collaboration_mode == CollaborationModeKind::Plan {
-            self.store.append_event(
-                &session.id,
-                "session.collaboration_mode",
-                serde_json::json!({
-                    "mode": collaboration_mode_setting_value(self.collaboration_mode),
-                }),
-            )?;
-        }
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
         self.append_pending_initial_goal_to_session(&session.id)?;
@@ -3615,6 +3537,12 @@ impl App {
         if self.reclaim_latest_queued_followup()? {
             return Ok(());
         }
+        if self.cancel_current_task()? {
+            self.escape_stop_until = None;
+            self.quit_hint_until = None;
+            self.close_surface();
+            return Ok(());
+        }
         if self.escape_stop_is_pending() {
             self.open_message_actions()?;
             self.quit_hint_until = None;
@@ -3808,18 +3736,7 @@ impl App {
             KeyEvent {
                 code: KeyCode::BackTab,
                 ..
-            } if self.surface == Surface::Main => {
-                if self.current_task_is_active()? {
-                    self.status_notice = Some(
-                        "Collaboration mode can change after the running turn finishes."
-                            .to_string(),
-                    );
-                } else {
-                    self.dispatch(AppCommand::SetCollaborationMode(next_collaboration_mode(
-                        self.collaboration_mode,
-                    )))?;
-                }
-            }
+            } if self.surface == Surface::Main => {}
             KeyEvent {
                 code: KeyCode::Tab, ..
             } if self.is_slash_palette_active() => {
@@ -4313,12 +4230,10 @@ impl App {
                 self.dispatch(AppCommand::SaveModel(model_index))?;
             }
             Surface::Mode => {
-                let mode = match self.selected_row.min(1) {
-                    0 => CollaborationModeKind::Default,
-                    _ => CollaborationModeKind::Plan,
-                };
                 self.close_surface();
-                self.dispatch(AppCommand::SetCollaborationMode(mode))?;
+                self.dispatch(AppCommand::SetCollaborationMode(
+                    CollaborationModeKind::Default,
+                ))?;
             }
             Surface::Browser => match self.selected_row.min(2) {
                 0 => self.dispatch(AppCommand::OpenBrowser)?,
@@ -4587,9 +4502,7 @@ impl App {
         match action {
             PaletteAction::NewTask => self.dispatch(AppCommand::NewTask)?,
             PaletteAction::ChangeBrowser => self.dispatch(AppCommand::ChangeBrowser)?,
-            PaletteAction::ChangeMode => self.dispatch(AppCommand::ChangeMode)?,
             PaletteAction::Goal => self.show_current_goal()?,
-            PaletteAction::PlanMode => self.toggle_plan_mode()?,
             PaletteAction::PreviousWork => self.dispatch(AppCommand::OpenHistory)?,
             PaletteAction::ChooseModel => self.dispatch(AppCommand::ChangeModel)?,
             PaletteAction::Authenticate => self.dispatch(AppCommand::SignIn)?,
@@ -6051,7 +5964,7 @@ impl App {
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
             Surface::Model => self.model_choices.len(),
-            Surface::Mode => 2,
+            Surface::Mode => 1,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::EnableDebuggingConfirm => {
@@ -6134,37 +6047,14 @@ impl App {
             self.execute_goal_slash_command(&goal_text)?;
             return Ok(false);
         }
-        if let Some(plan_text) = filter
-            .strip_prefix("plan")
-            .filter(|rest| rest.is_empty() || rest.starts_with(char::is_whitespace))
-            .map(str::trim)
-            .map(str::to_string)
-        {
-            self.close_slash_palette();
-            if plan_text.is_empty() {
-                self.toggle_plan_mode()?;
-            } else {
-                self.dispatch(AppCommand::SetCollaborationMode(
-                    CollaborationModeKind::Plan,
-                ))?;
-            }
-            if !plan_text.is_empty() {
-                self.submit_plain_text(plan_text.to_string())?;
-            }
-            return Ok(false);
-        }
         let action = palette::selected_action(&self.palette_filter, self.selected_row);
         if let Some(action) = action {
             self.close_slash_palette();
             return self.execute_palette_action(action);
         }
+        self.close_slash_palette();
+        self.submit()?;
         Ok(false)
-    }
-
-    fn toggle_plan_mode(&mut self) -> Result<()> {
-        self.dispatch(AppCommand::SetCollaborationMode(next_collaboration_mode(
-            self.collaboration_mode,
-        )))
     }
 
     fn main_selection_count(&mut self) -> Result<usize> {
@@ -8876,6 +8766,42 @@ mod redesign_tests {
         Ok(())
     }
 
+    #[test]
+    fn single_escape_stops_active_task_without_double_escape() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, temp.path())?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "keep working"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "model.stream_delta",
+            serde_json::json!({"text": "Working..."}),
+        )?;
+        app.selected_session_id = Some(session.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        assert!(app.current_task_is_active()?);
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Esc, KeyModifiers::NONE))?);
+
+        let events = app.store.events_for_session(&session.id)?;
+        assert!(events
+            .iter()
+            .any(|event| event.event_type == "session.cancel_requested"));
+        assert_eq!(
+            app.store
+                .load_session(&session.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Cancelled)
+        );
+        assert!(app.escape_stop_until.is_none());
+        assert_ne!(app.surface, Surface::Messages);
+        Ok(())
+    }
+
     fn write_test_png(path: &Path) -> Result<()> {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -9328,58 +9254,12 @@ mod redesign_tests {
         Ok(())
     }
 
-    // `/plan` flips collaboration mode to Plan; `start_task_submission` then
-    // records the `session.collaboration_mode` event before the `session.input`
-    // turn, so the engine sees the plan-mode context ahead of the first user
-    // message.
     #[test]
-    fn plan_slash_command_starts_task_with_plan_mode_context() -> Result<()> {
+    fn plan_slash_text_starts_plain_default_task() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
 
         app.set_input("/plan draft a migration".to_string());
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-
-        assert_eq!(app.collaboration_mode, CollaborationModeKind::Plan);
-        assert_eq!(
-            app.store
-                .get_setting(COLLABORATION_MODE_SETTING)?
-                .as_deref(),
-            Some("plan")
-        );
-        let session_id = app
-            .selected_session_id
-            .clone()
-            .context("selected session")?;
-        let events = app.store.events_for_session(&session_id)?;
-        let mode_idx = events
-            .iter()
-            .position(|event| {
-                event.event_type == "session.collaboration_mode"
-                    && event.payload["mode"] == serde_json::json!("plan")
-            })
-            .context("plan mode event")?;
-        let input_idx = events
-            .iter()
-            .position(|event| {
-                event.event_type == "session.input"
-                    && event.payload["text"] == serde_json::json!("draft a migration")
-            })
-            .context("session input event")?;
-
-        assert!(mode_idx < input_idx);
-        Ok(())
-    }
-
-    #[test]
-    fn empty_plan_slash_command_toggles_plan_mode_off() -> Result<()> {
-        let temp = tempfile::tempdir()?;
-        let mut app = ready_app(&temp)?;
-        app.dispatch(AppCommand::SetCollaborationMode(
-            CollaborationModeKind::Plan,
-        ))?;
-
-        app.set_input("/plan".to_string());
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
 
         assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
@@ -9387,15 +9267,39 @@ mod redesign_tests {
             app.store
                 .get_setting(COLLABORATION_MODE_SETTING)?
                 .as_deref(),
-            Some("default")
+            None
         );
-        assert!(app.status_notice.is_none());
-        assert!(app.composer.input().is_empty());
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session")?;
+        let events = app.store.events_for_session(&session_id)?;
+        assert!(!events
+            .iter()
+            .any(|event| event.event_type == "session.collaboration_mode"));
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.input"
+                && event.payload["text"] == serde_json::json!("/plan draft a migration")
+        }));
         Ok(())
     }
 
     #[test]
-    fn plan_slash_command_does_not_submit_old_mode_followup_while_running() -> Result<()> {
+    fn stored_plan_mode_loads_as_default() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        {
+            let store = Store::open(temp.path())?;
+            store.set_setting(COLLABORATION_MODE_SETTING, "plan")?;
+        }
+
+        let app = App::new(args(&temp))?;
+
+        assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
+        Ok(())
+    }
+
+    #[test]
+    fn plan_slash_text_submits_normal_pending_followup_while_running() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -9405,7 +9309,7 @@ mod redesign_tests {
             serde_json::json!({"text": "existing turn"}),
         )?;
         app.selected_session_id = Some(session.id.clone());
-        app.drain_store_notifications()?;
+        app.refresh_state_cache_from_store()?;
 
         app.set_input("/plan revise this".to_string());
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
@@ -9414,14 +9318,16 @@ mod redesign_tests {
         assert_eq!(
             events
                 .iter()
-                .filter(|event| event.event_type == "session.followup")
+                .filter(|event| event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT)
                 .count(),
-            0
+            1
         );
         assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
-        assert_eq!(app.composer.input(), "/plan revise this");
-        assert!(app.status_notice.as_deref().is_some_and(|notice| notice
-            .contains("Collaboration mode can change after the running turn finishes")));
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT
+                && event.payload["text"] == serde_json::json!("/plan revise this")
+        }));
+        assert!(app.composer.input().is_empty());
         Ok(())
     }
 
@@ -9499,7 +9405,7 @@ mod redesign_tests {
     }
 
     #[test]
-    fn streaming_proposed_plan_renders_as_plan_not_raw_tags() -> Result<()> {
+    fn streaming_proposed_plan_tags_are_plain_text_without_plan_mode() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let session = app.store.create_session(None, std::env::current_dir()?)?;
@@ -9529,10 +9435,10 @@ mod redesign_tests {
 
         assert!(text.contains("Intro"));
         assert!(text.contains("Outro"));
-        assert!(text.contains("Proposed Plan"));
+        assert!(text.contains("<proposed_plan>"));
         assert!(text.contains("Step 1"));
-        assert!(!text.contains("<proposed_plan>"));
-        assert!(!text.contains("</proposed_plan>"));
+        assert!(text.contains("</proposed_plan>"));
+        assert!(!text.contains("Proposed Plan"));
         Ok(())
     }
 
@@ -10367,15 +10273,15 @@ mod redesign_tests {
         assert!(screen.contains("/task"));
         assert!(screen.contains("/history"));
         assert!(screen.contains("/browser"));
-        assert!(screen.contains("/mode"));
-        assert!(screen.contains("/plan"));
+        assert!(!screen.contains("/mode"));
+        assert!(!screen.contains("/plan"));
         assert!(screen.contains("/model"));
         assert!(!screen.contains("/auth"));
         assert!(!screen.contains("/laminar"));
         assert!(screen.contains("start a new task"));
         assert!(screen.contains("change browser backend"));
-        assert!(screen.contains("choose collaboration mode"));
-        assert!(screen.contains("switch to Plan mode"));
+        assert!(!screen.contains("choose collaboration mode"));
+        assert!(!screen.contains("Plan mode"));
         assert!(!screen.contains("filter actions"));
         assert!(!screen.contains("tab history"));
         assert!(!screen.contains("Open browser"));
@@ -10424,37 +10330,19 @@ mod redesign_tests {
     }
 
     #[test]
-    fn slash_palette_plan_row_toggles_plan_mode_off() -> Result<()> {
+    fn slash_palette_does_not_offer_plan_mode() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
-        app.dispatch(AppCommand::SetCollaborationMode(
-            CollaborationModeKind::Plan,
-        ))?;
-        app.status_notice = None;
 
         assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("/plan"));
-        assert!(screen.contains("switch off Plan mode"));
-        assert!(!screen.contains("switch to Plan mode"));
-        let plan_row = app
+        assert!(!screen.contains("/plan"));
+        assert!(!screen.contains("Plan mode"));
+        assert!(!app
             .slash_palette_items()
             .iter()
-            .position(|item| item.command == "/plan")
-            .context("plan palette row")?;
-        app.selected_row = plan_row;
-
-        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
-
+            .any(|item| item.command == "/plan"));
         assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
-        assert!(!app.is_slash_palette_active());
-        assert_eq!(
-            app.store
-                .get_setting(COLLABORATION_MODE_SETTING)?
-                .as_deref(),
-            Some("default")
-        );
-        assert!(app.status_notice.is_none());
         Ok(())
     }
 
@@ -11221,7 +11109,7 @@ wire_api = "responses"
             let count = match surface {
                 Surface::Setup | Surface::Account => ACCOUNT_CHOICES.len(),
                 Surface::Model => app.model_choices.len(),
-                Surface::Mode => 2,
+                Surface::Mode => 1,
                 Surface::Browser | Surface::BrowserSelect => BROWSER_CHOICES.len(),
                 Surface::CookieSync => app.cookie_sync_row_count(),
                 _ => unreachable!(),
