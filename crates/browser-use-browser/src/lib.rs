@@ -1272,10 +1272,13 @@ fn home_dir() -> Option<PathBuf> {
 
 pub fn cleanup_session(session_id: &str) -> usize {
     cancel_browser_script_runs_for_session(session_id);
-    let mut sessions = sessions()
-        .lock()
-        .expect("browser session registry poisoned");
-    if let Some(mut session) = sessions.remove(session_id) {
+    let session = {
+        let mut sessions = sessions()
+            .lock()
+            .expect("browser session registry poisoned");
+        sessions.remove(session_id)
+    };
+    if let Some(mut session) = session {
         session.stop_owned_managed();
         if session.owner == BrowserOwner::Rust && session.mode == BrowserMode::RemoteCloud {
             let _ = session.stop_owned_remote();
@@ -2721,6 +2724,9 @@ enum CdpDispatchCmd {
         msg: String,
         resp: std::sync::mpsc::Sender<Result<Value>>,
     },
+    Cancel {
+        id: u64,
+    },
     Shutdown,
 }
 
@@ -2734,10 +2740,7 @@ impl CdpDispatcher {
     fn connect(ws_url: &str) -> Result<Arc<Self>> {
         let (mut socket, _) =
             connect(ws_url).with_context(|| format!("connect CDP websocket {ws_url}"))?;
-        if let MaybeTlsStream::Plain(stream) = socket.get_mut() {
-            let _ = stream.set_read_timeout(Some(Duration::from_millis(20)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
-        }
+        set_cdp_dispatcher_socket_timeouts(&mut socket);
         let (tx, rx) = std::sync::mpsc::channel::<CdpDispatchCmd>();
         let reader = thread::spawn(move || cdp_dispatcher_loop(socket, rx));
         Ok(Arc::new(Self {
@@ -2765,7 +2768,17 @@ impl CdpDispatcher {
             .map_err(|_| anyhow!("CDP dispatcher is shut down"))?;
         match rrx.recv_timeout(Duration::from_secs(30)) {
             Ok(result) => result,
-            Err(_) => bail!("CDP {method} timed out"),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => {
+                let _ = self
+                    .tx
+                    .lock()
+                    .expect("cdp tx lock poisoned")
+                    .send(CdpDispatchCmd::Cancel { id });
+                bail!("CDP {method} timed out")
+            }
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => {
+                bail!("CDP dispatcher is shut down")
+            }
         }
     }
 }
@@ -2778,7 +2791,9 @@ impl Drop for CdpDispatcher {
             .expect("cdp tx lock poisoned")
             .send(CdpDispatchCmd::Shutdown);
         if let Some(handle) = self.reader.lock().expect("cdp reader lock poisoned").take() {
-            let _ = handle.join();
+            if !join_bridge_with_timeout(handle, Duration::from_secs(2)) {
+                eprintln!("timed out joining CDP dispatcher reader during cleanup");
+            }
         }
     }
 }
@@ -2799,6 +2814,11 @@ fn cdp_dispatcher_loop(
                         pending.insert(id, resp);
                     }
                 }
+                Ok(CdpDispatchCmd::Cancel { id }) => {
+                    if let Some(resp) = pending.remove(&id) {
+                        let _ = resp.send(Err(anyhow!("CDP request canceled")));
+                    }
+                }
                 Ok(CdpDispatchCmd::Shutdown) => shutting = true,
                 Err(std::sync::mpsc::TryRecvError::Empty) => break,
                 Err(std::sync::mpsc::TryRecvError::Disconnected) => {
@@ -2807,7 +2827,10 @@ fn cdp_dispatcher_loop(
                 }
             }
         }
-        if shutting && pending.is_empty() {
+        if shutting {
+            for (_, resp) in pending.drain() {
+                let _ = resp.send(Err(anyhow!("CDP dispatcher shutting down")));
+            }
             break;
         }
         match socket.read() {
@@ -2844,14 +2867,26 @@ fn cdp_dispatcher_loop(
 }
 
 fn set_cdp_socket_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
+    set_cdp_socket_timeouts_for(socket, Duration::from_secs(20), Duration::from_secs(20));
+}
+
+fn set_cdp_dispatcher_socket_timeouts(socket: &mut WebSocket<MaybeTlsStream<TcpStream>>) {
+    set_cdp_socket_timeouts_for(socket, Duration::from_millis(20), Duration::from_secs(20));
+}
+
+fn set_cdp_socket_timeouts_for(
+    socket: &mut WebSocket<MaybeTlsStream<TcpStream>>,
+    read_timeout: Duration,
+    write_timeout: Duration,
+) {
     match socket.get_mut() {
         MaybeTlsStream::Plain(stream) => {
-            let _ = stream.set_read_timeout(Some(Duration::from_secs(20)));
-            let _ = stream.set_write_timeout(Some(Duration::from_secs(20)));
+            let _ = stream.set_read_timeout(Some(read_timeout));
+            let _ = stream.set_write_timeout(Some(write_timeout));
         }
         MaybeTlsStream::Rustls(stream) => {
-            let _ = stream.sock.set_read_timeout(Some(Duration::from_secs(20)));
-            let _ = stream.sock.set_write_timeout(Some(Duration::from_secs(20)));
+            let _ = stream.sock.set_read_timeout(Some(read_timeout));
+            let _ = stream.sock.set_write_timeout(Some(write_timeout));
         }
         _ => {}
     }
@@ -6048,7 +6083,9 @@ pub struct CurationResult {
     pub frames_dir: PathBuf,
 }
 
-/// Most-recent `.bs-*.frames` capture dir under `artifact_root` (by mtime).
+/// Most-recent capture dir under `artifact_root` (by mtime) that has a frame
+/// manifest. Browser-script scratch frame dirs can exist without
+/// `frames.ndjson`; those are not usable for summary artifacts.
 fn latest_frames_dir(artifact_root: &Path) -> Option<PathBuf> {
     let mut best: Option<(std::time::SystemTime, PathBuf)> = None;
     for entry in fs::read_dir(artifact_root).ok()?.flatten() {
@@ -6057,7 +6094,7 @@ fn latest_frames_dir(artifact_root: &Path) -> Option<PathBuf> {
         let name = name.to_string_lossy();
         let is_frames_dir =
             name == ".capture.frames" || (name.starts_with(".bs-") && name.ends_with(".frames"));
-        if path.is_dir() && is_frames_dir {
+        if path.is_dir() && is_frames_dir && path.join("frames.ndjson").is_file() {
             if let Ok(mtime) = entry.metadata().and_then(|m| m.modified()) {
                 if best.as_ref().map(|(t, _)| mtime > *t).unwrap_or(true) {
                     best = Some((mtime, path));
@@ -6689,6 +6726,28 @@ mod tests {
             }
             None => println!("\nno frames found under {}", root.display()),
         }
+    }
+
+    #[test]
+    fn latest_frames_dir_ignores_capture_dirs_without_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path();
+        let capture = root.join(".capture.frames");
+        fs::create_dir_all(&capture).unwrap();
+        fs::write(capture.join("frames.ndjson"), "{}\n").unwrap();
+
+        std::thread::sleep(Duration::from_millis(20));
+        let scratch = root.join(".bs-newer.frames");
+        fs::create_dir_all(&scratch).unwrap();
+
+        assert_eq!(latest_frames_dir(root).unwrap(), capture);
+
+        std::thread::sleep(Duration::from_millis(20));
+        let newer_valid = root.join(".bs-valid.frames");
+        fs::create_dir_all(&newer_valid).unwrap();
+        fs::write(newer_valid.join("frames.ndjson"), "{}\n").unwrap();
+
+        assert_eq!(latest_frames_dir(root).unwrap(), newer_valid);
     }
 
     // Run: STITCH_TEST_FRAMES_DIR=/path/to/.frames \

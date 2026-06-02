@@ -474,7 +474,18 @@ fn kill_worker_child(child: &mut Child) {
         }
     }
     let _ = child.kill();
-    let _ = child.wait();
+    let deadline = Instant::now() + Duration::from_secs(5);
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => break,
+            Ok(None) if Instant::now() < deadline => std::thread::sleep(Duration::from_millis(20)),
+            Ok(None) => {
+                eprintln!("timed out waiting for python worker process to exit after kill");
+                break;
+            }
+            Err(_) => break,
+        }
+    }
 }
 
 impl Drop for PythonWorker {
