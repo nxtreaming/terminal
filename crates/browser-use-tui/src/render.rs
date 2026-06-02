@@ -1595,7 +1595,7 @@ fn slash_palette_rows(app: &App, width: usize) -> Vec<Line<'static>> {
             let cmd_style = if is_selected { accent() } else { text_style() };
             let desc_style = if is_selected { text_style() } else { muted() };
             let desc_max = width.saturating_sub(cmd_col + 4).max(4);
-            let description = truncate(item.description, desc_max);
+            let description = truncate(slash_palette_item_description(app, item), desc_max);
             highlight_selectable_row(
                 vec![
                     Span::styled(marker, accent()),
@@ -1608,6 +1608,16 @@ fn slash_palette_rows(app: &App, width: usize) -> Vec<Line<'static>> {
             )
         })
         .collect()
+}
+
+fn slash_palette_item_description(app: &App, item: &palette::PaletteItem) -> &'static str {
+    if item.action == palette::PaletteAction::PlanMode
+        && app.collaboration_mode == CollaborationModeKind::Plan
+    {
+        "switch off Plan mode"
+    } else {
+        item.description
+    }
 }
 
 /// Fallback budget for older sessions that predate Codex-style `token_count`
