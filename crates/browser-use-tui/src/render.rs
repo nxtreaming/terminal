@@ -1269,6 +1269,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
+        Surface::EnableDebuggingConfirm => ("Chrome", ""),
         Surface::CookieSync => (
             "Cookie Sync",
             "Import local browser cookies to Browser Use cloud",
@@ -1316,6 +1317,7 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::Setup | Surface::SetupConfirm => "Enter:continue | Esc:back",
         Surface::SetupResult => "Enter:select | Esc:back",
         Surface::Browser => "Enter:select | Esc:back",
+        Surface::EnableDebuggingConfirm => "Enter:select | Esc:cancel",
         Surface::CookieSync => "Enter:select | Esc:close",
         Surface::Goal => "Esc:close",
         Surface::Developer => "Esc:close",
@@ -1357,6 +1359,7 @@ fn surface_lines(
         Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
+        Surface::EnableDebuggingConfirm => enable_debugging_confirm_lines(app),
         Surface::CookieSync => cookie_sync_lines(app, width),
         Surface::Goal => goal_lines(app),
         Surface::History => history_lines(app, state, width),
@@ -2516,6 +2519,96 @@ fn browser_select_lines(app: &App) -> Vec<Line<'static>> {
             ),
         ]),
     ]);
+    lines
+}
+
+/// Braille spinner — same family as the rest of the TUI's loading indicators.
+const ENABLE_DEBUG_SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Total body-line count this modal renders in every state. Keeping it
+/// constant prevents the bottom-pane height from changing when the modal
+/// transitions between states — which was causing the chat above to reflow
+/// and snap visually. Set to the highest natural line count across the four
+/// states; shorter states pad with empty lines.
+const ENABLE_DEBUG_MODAL_LINE_COUNT: usize = 7;
+
+fn enable_debugging_confirm_lines(app: &App) -> Vec<Line<'static>> {
+    let disabled = &app.pending_local_chrome_debugging_disabled;
+    // Same predicate the Continue handler uses to decide whether to send the
+    // user to chrome://inspect first (vs. spawn the agent immediately). Keep
+    // these in lock-step so the modal copy matches what actually happens.
+    let needs_toggle = disabled
+        .iter()
+        .any(|entry| entry.user_enabled != Some(true));
+    let waiting_for_toggle = app.pending_local_chrome_debugging_setup_wait;
+    let waiting_for_per_session = app.pending_chrome_per_session_prompt.is_some();
+    let spinner =
+        ENABLE_DEBUG_SPINNER_FRAMES[app.live_spinner_frame % ENABLE_DEBUG_SPINNER_FRAMES.len()];
+    let mut lines = Vec::new();
+    if waiting_for_per_session {
+        // Timing-neutral. Chrome may have already popped, be about to pop, or
+        // never pop (if permission is granted persistently in this Chrome
+        // version). All three cases collapse to: "if you see Chrome asking,
+        // click Allow." Modal auto-closes the moment CDP connects.
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(spinner.to_string(), accent()),
+            Span::raw(" "),
+            Span::styled("Connecting to Chrome…", bold()),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "  If Chrome asks 'Allow remote debugging?', click Allow.",
+        ));
+        lines.push(Line::from(""));
+        lines.push(selected("Cancel", 0, app.selected_row));
+    } else if needs_toggle && waiting_for_toggle {
+        lines.push(Line::from(vec![
+            Span::raw("  "),
+            Span::styled(spinner.to_string(), accent()),
+            Span::raw(" "),
+            Span::styled("Waiting for you in Chrome…", bold()),
+        ]));
+        lines.push(Line::from(""));
+        lines.push(Line::from(
+            "  Please go to Chrome and press the checkbox to allow remote",
+        ));
+        lines.push(Line::from("  debugging."));
+        lines.push(Line::from(""));
+        lines.push(selected(
+            "Reopen Chrome permission page",
+            0,
+            app.selected_row,
+        ));
+        lines.push(selected("Cancel", 1, app.selected_row));
+    } else if needs_toggle {
+        lines.push(Line::from(
+            "  Chrome needs permission before I can connect to it.",
+        ));
+        lines.push(Line::from(""));
+        lines.push(selected("Continue", 0, app.selected_row));
+        lines.push(selected("Cancel", 1, app.selected_row));
+    } else {
+        // Permission is already granted in Local State, so no checkbox
+        // step is needed. Chrome will pop its per-session "Allow remote
+        // debugging?" prompt straight away on the next CDP connect.
+        lines.push(Line::from(
+            "  Permission is already granted. Press Continue and Chrome will",
+        ));
+        lines.push(Line::from(
+            "  pop up its 'Allow remote debugging?' prompt — click Allow.",
+        ));
+        lines.push(Line::from(""));
+        lines.push(selected("Continue", 0, app.selected_row));
+        lines.push(selected("Cancel", 1, app.selected_row));
+    }
+    // Pad to the fixed line count so the surrounding bottom-pane reserves
+    // the same height across every state transition. Without this the chat
+    // viewport above visibly jumps when the modal flips e.g. from the
+    // pre-Continue copy to the per-session waiting copy.
+    while lines.len() < ENABLE_DEBUG_MODAL_LINE_COUNT {
+        lines.push(Line::from(""));
+    }
     lines
 }
 
