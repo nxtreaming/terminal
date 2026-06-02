@@ -406,7 +406,10 @@ mod tests {
                 id: "m".into(),
                 delta: text.into(),
             },
-            LlmEvent::TextEnd { id: "m".into() },
+            LlmEvent::TextEnd {
+                id: "m".into(),
+                phase: None,
+            },
             LlmEvent::Finish {
                 usage: Usage {
                     input_tokens: 7,

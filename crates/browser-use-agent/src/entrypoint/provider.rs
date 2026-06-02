@@ -41,6 +41,8 @@
 //! as [`ProviderResolveError::MissingCredentials`] (honest, never a panic).
 
 use std::collections::{BTreeSet, HashMap};
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex, OnceLock};
 
 use browser_use_llm::auth::{load_codex_auth, CodexAuth};
@@ -85,6 +87,7 @@ use crate::turn::model_path::build_transport;
 use crate::turn::model_path::ModelPathError;
 use crate::turn::model_path::ProviderChoice;
 use crate::turn::sampling::FusionRecorder;
+use crate::turn::sampling::MailboxPreemptionProbe;
 use crate::turn::sampling::ModelClientTransport;
 use crate::turn::sampling::ModelSamplingDriver;
 
@@ -157,6 +160,28 @@ pub fn cleanup_all_unified_exec_managers() -> usize {
         .into_iter()
         .map(|manager| manager.terminate_all_best_effort())
         .sum()
+}
+
+fn mailbox_preemption_probe(
+    user_input: &Option<(SharedStore, SessionId)>,
+) -> Option<MailboxPreemptionProbe> {
+    let (store, session_id) = user_input.as_ref()?;
+    let store = Arc::clone(store);
+    let session_id = session_id.as_str().to_string();
+    let probe: MailboxPreemptionProbe = Arc::new(
+        move || -> Pin<Box<dyn Future<Output = bool> + Send + 'static>> {
+            let store = Arc::clone(&store);
+            let session_id = session_id.clone();
+            Box::pin(async move {
+                tokio::task::spawn_blocking(move || {
+                    super::has_pending_agent_mail(&store, &session_id)
+                })
+                .await
+                .unwrap_or(false)
+            })
+        },
+    );
+    Some(probe)
 }
 
 #[cfg(test)]
@@ -598,11 +623,12 @@ fn resolve_provider_with_python(
     // its output re-enters the prompt via `recorder`, and the loop re-samples.
     let goal_store = build_goal_store(&user_input);
     let goals_enabled = goal_runtime_enabled(config, &user_input);
+    let preemption_probe = mailbox_preemption_probe(&user_input);
     let mut driver = build_sampling_driver(transport, Arc::clone(&sink), ctx, max_retries);
     if goals_enabled {
         driver = driver.with_goal_store(goal_store.clone());
     }
-    let driver = driver.with_fusion(
+    let mut driver = driver.with_fusion(
         build_tool_dispatcher_with_cwd_and_goal_store(
             python_backend,
             config,
@@ -614,6 +640,9 @@ fn resolve_provider_with_python(
         ),
         recorder,
     );
+    if let Some(probe) = preemption_probe {
+        driver = driver.with_mailbox_preemption_probe(probe);
+    }
     Ok(ResolvedProvider::Real(Box::new(driver)))
 }
 
@@ -1127,6 +1156,7 @@ struct ChildAgentRunnerSpawner {
     parent_session_id: String,
     parent_link: Arc<Mutex<Option<ChildAgentRunnerParentLink>>>,
     store: Option<SharedStore>,
+    parent_run_config: ProviderRunConfig,
 }
 
 #[derive(Clone)]
@@ -1201,7 +1231,7 @@ impl ChildSpawner for ChildAgentRunnerSpawner {
             model: Some(spec.config.model.clone()),
             reasoning_effort: spec.config.reasoning_effort.clone(),
             service_tier: spec.config.service_tier.clone(),
-            config_overrides: child_role_config_overrides(&spec.config),
+            config_overrides: child_run_config_overrides(&self.parent_run_config, &spec.config),
             completion_handler,
         };
         self.runner
@@ -1298,6 +1328,7 @@ fn register_subagent_tools<S, A>(
             parent_session_id,
             parent_link: Arc::clone(&parent_link),
             store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
+            parent_run_config: config.clone(),
         }),
         None => Arc::new(UnconfiguredChildSpawner),
     };
@@ -1350,6 +1381,7 @@ fn register_subagent_tools<S, A>(
         session_id,
         store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
         child_runner: config.options.child_agent_runner.clone(),
+        cleanup_session_runtime: Some(Arc::new(cleanup_unified_exec_manager_for_session_id)),
         spawn_gate,
         wait_timeouts: WaitAgentTimeoutOptions {
             default_timeout_ms: config.options.multi_agent_v2.default_wait_timeout_ms,
@@ -1468,6 +1500,7 @@ fn register_legacy_subagent_tools<S, A>(
             parent_session_id,
             parent_link: Arc::clone(&parent_link),
             store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
+            parent_run_config: config.clone(),
         }),
         None => Arc::new(UnconfiguredChildSpawner),
     };
@@ -1513,6 +1546,7 @@ fn register_legacy_subagent_tools<S, A>(
         session_id,
         store: user_input.as_ref().map(|(store, _)| Arc::clone(store)),
         child_runner: config.options.child_agent_runner.clone(),
+        cleanup_session_runtime: Some(Arc::new(cleanup_unified_exec_manager_for_session_id)),
         spawn_gate,
         wait_timeouts: WaitAgentTimeoutOptions {
             default_timeout_ms: config.options.multi_agent_v2.default_wait_timeout_ms,
@@ -1648,8 +1682,53 @@ fn locked_role_settings_note(role: &crate::subagents::role::AgentRoleConfig) -> 
     format!("{model_and_reasoning_note}{service_tier_note}")
 }
 
-fn child_role_config_overrides(config: &AgentConfigLayer) -> Vec<(String, toml::Value)> {
-    let mut overrides = config.config_overrides.clone();
+fn child_run_config_overrides(
+    parent: &ProviderRunConfig,
+    config: &AgentConfigLayer,
+) -> Vec<(String, toml::Value)> {
+    let mut overrides = parent.options.config_overrides.clone();
+    push_string_override(
+        &mut overrides,
+        "browser_mode",
+        parent.options.browser_mode.as_deref(),
+    );
+    push_string_override(
+        &mut overrides,
+        "base_instructions",
+        parent.options.base_instructions.as_deref(),
+    );
+    push_string_override(
+        &mut overrides,
+        "compact_prompt",
+        parent.options.compact_prompt.as_deref(),
+    );
+    push_u64_override(
+        &mut overrides,
+        "python_tool_timeout_seconds",
+        parent.options.python_tool_timeout_seconds,
+    );
+    push_bool_override(
+        &mut overrides,
+        "model_compaction_enabled",
+        parent.options.model_compaction_enabled,
+    );
+    if let Some(limit) = parent.options.model_auto_compact_token_limit {
+        push_i64_override(&mut overrides, "model_auto_compact_token_limit", limit);
+    }
+    push_string_override(
+        &mut overrides,
+        "model_auto_compact_token_limit_scope",
+        Some(match parent.options.model_auto_compact_token_limit_scope {
+            crate::decision::AutoCompactTokenLimitScope::Total => "total",
+            crate::decision::AutoCompactTokenLimitScope::BodyAfterPrefix => "body_after_prefix",
+        }),
+    );
+    if let Some(policy) = approval_policy_config_value(parent.options.approval_policy) {
+        push_string_override(&mut overrides, "approval_policy", Some(policy));
+    }
+    push_bool_override(&mut overrides, "use_guardian", parent.options.use_guardian);
+
+    overrides.extend(config.config_overrides.clone());
     let instructions = config.instructions.trim();
     if !instructions.is_empty() {
         overrides.push((
@@ -1692,6 +1771,40 @@ fn child_role_config_overrides(config: &AgentConfigLayer) -> Vec<(String, toml::
         toml::Value::Boolean(config.can_write),
     ));
     overrides
+}
+
+fn push_string_override(
+    overrides: &mut Vec<(String, toml::Value)>,
+    key: &str,
+    value: Option<&str>,
+) {
+    if let Some(value) = value.map(str::trim).filter(|value| !value.is_empty()) {
+        overrides.push((key.to_string(), toml::Value::String(value.to_string())));
+    }
+}
+
+fn push_bool_override(overrides: &mut Vec<(String, toml::Value)>, key: &str, value: bool) {
+    overrides.push((key.to_string(), toml::Value::Boolean(value)));
+}
+
+fn push_i64_override(overrides: &mut Vec<(String, toml::Value)>, key: &str, value: i64) {
+    overrides.push((key.to_string(), toml::Value::Integer(value)));
+}
+
+fn push_u64_override(overrides: &mut Vec<(String, toml::Value)>, key: &str, value: u64) {
+    if let Ok(value) = i64::try_from(value) {
+        push_i64_override(overrides, key, value);
+    }
+}
+
+fn approval_policy_config_value(policy: AskForApproval) -> Option<&'static str> {
+    match policy {
+        AskForApproval::Never => Some("never"),
+        AskForApproval::OnFailure => Some("on-failure"),
+        AskForApproval::OnRequest => Some("on-request"),
+        AskForApproval::UnlessTrusted => Some("unless-trusted"),
+        AskForApproval::Granular(_) => None,
+    }
 }
 
 fn parent_agent_path_from_store(user_input: &Option<(SharedStore, SessionId)>) -> Option<String> {
@@ -3025,6 +3138,89 @@ mod tests {
         assert_eq!(layer.service_tier.as_deref(), Some("priority"));
         assert_eq!(layer.tool_allowlist, vec!["shell"]);
         assert!(!layer.can_write);
+    }
+
+    #[test]
+    fn child_run_config_overrides_snapshot_parent_runtime_and_child_role() {
+        let options = crate::config_overrides::AgentRunOptions::default()
+            .with_browser_mode("managed-headless")
+            .with_compact_prompt("compact child this way")
+            .with_model_auto_compact_token_limit(Some(1234))
+            .with_model_auto_compact_token_limit_scope(
+                crate::decision::AutoCompactTokenLimitScope::BodyAfterPrefix,
+            )
+            .with_approval_policy(AskForApproval::UnlessTrusted)
+            .with_guardian(true)
+            .with_config_overrides(vec![(
+                "developer_instructions".to_string(),
+                toml::Value::String("parent developer".to_string()),
+            )]);
+        let parent =
+            ProviderRunConfig::new(ProviderBackend::Openai, "gpt-5.5").with_options(options);
+        let mut child = parent_agent_config_layer(&parent, &std::env::temp_dir());
+        child.instructions = "role developer".to_string();
+        child.provider = "anthropic".to_string();
+        child.service_tier = Some("priority".to_string());
+        child.tool_allowlist = vec!["shell".to_string()];
+        child.can_write = false;
+        child.config_overrides.push((
+            "custom_child_key".to_string(),
+            toml::Value::String("custom".to_string()),
+        ));
+
+        let overrides = child_run_config_overrides(&parent, &child);
+        let lookup = |key: &str| {
+            overrides
+                .iter()
+                .rev()
+                .find(|(candidate, _)| candidate == key)
+                .map(|(_, value)| value)
+        };
+
+        assert_eq!(
+            lookup("browser_mode").and_then(toml::Value::as_str),
+            Some("managed-headless")
+        );
+        assert_eq!(
+            lookup("compact_prompt").and_then(toml::Value::as_str),
+            Some("compact child this way")
+        );
+        assert_eq!(
+            lookup("model_auto_compact_token_limit").and_then(toml::Value::as_integer),
+            Some(1234)
+        );
+        assert_eq!(
+            lookup("model_auto_compact_token_limit_scope").and_then(toml::Value::as_str),
+            Some("body_after_prefix")
+        );
+        assert_eq!(
+            lookup("approval_policy").and_then(toml::Value::as_str),
+            Some("unless-trusted")
+        );
+        assert_eq!(
+            lookup("use_guardian").and_then(toml::Value::as_bool),
+            Some(true)
+        );
+        assert_eq!(
+            lookup("developer_instructions").and_then(toml::Value::as_str),
+            Some("role developer")
+        );
+        assert_eq!(
+            lookup("model_provider").and_then(toml::Value::as_str),
+            Some("anthropic")
+        );
+        assert_eq!(
+            lookup("service_tier").and_then(toml::Value::as_str),
+            Some("priority")
+        );
+        assert_eq!(
+            lookup("can_write").and_then(toml::Value::as_bool),
+            Some(false)
+        );
+        assert_eq!(
+            lookup("custom_child_key").and_then(toml::Value::as_str),
+            Some("custom")
+        );
     }
 
     #[test]

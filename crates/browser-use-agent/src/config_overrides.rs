@@ -714,6 +714,53 @@ impl ProviderRunConfig {
     }
 }
 
+/// Re-apply runtime options that were snapshotted into a
+/// [`ChildAgentRunRequest`]. Child wake/resume paths may run under a different
+/// parent process/config than the original spawn, so these values must travel
+/// with the child run marker rather than relying on the current parent config.
+pub fn apply_child_request_runtime_config(
+    config: &mut ProviderRunConfig,
+    request: &ChildAgentRunRequest,
+) -> Result<()> {
+    let overrides = &request.config_overrides;
+    if let Some(value) = config_override_str(overrides, "browser_mode") {
+        config.options.browser_mode = Some(value);
+    }
+    if let Some(value) = config_override_str(overrides, "base_instructions") {
+        config.options.base_instructions = Some(value);
+    }
+    if let Some(value) = config_override_str(overrides, "developer_instructions") {
+        config.options.developer_instructions = Some(value);
+    }
+    if let Some(value) = config_override_str(overrides, "compact_prompt") {
+        config.options.compact_prompt = Some(value);
+    }
+    if let Some(value) = config_override_u64(overrides, "python_tool_timeout_seconds") {
+        config.options.python_tool_timeout_seconds = value;
+    }
+    if let Some(value) = config_override_bool(overrides, "model_compaction_enabled") {
+        config.options.model_compaction_enabled = value;
+    }
+    if let Some(value) = config_override_i64(overrides, "model_auto_compact_token_limit") {
+        config.options.model_auto_compact_token_limit = Some(value);
+    }
+    if let Some(value) = config_override_str(overrides, "model_auto_compact_token_limit_scope") {
+        config.options.model_auto_compact_token_limit_scope =
+            parse_auto_compact_token_limit_scope(&value)?;
+    }
+    if let Some(value) = config_override_str(overrides, "approval_policy")
+        .or_else(|| config_override_str(overrides, "ask_for_approval"))
+    {
+        config.options.approval_policy = parse_approval_policy(&value)?;
+    }
+    if let Some(value) = config_override_bool(overrides, "use_guardian")
+        .or_else(|| config_override_bool(overrides, "guardian"))
+    {
+        config.options.use_guardian = value;
+    }
+    Ok(())
+}
+
 /// Parse raw `key=value` override strings into an ordered [`ConfigOverrides`].
 ///
 /// Behavior is byte-identical to `browser-use-core::parse_config_overrides`
@@ -1482,6 +1529,28 @@ fn config_override_bool(overrides: &ConfigOverrides, key: &str) -> Option<bool> 
         .rev()
         .find(|(candidate, _)| candidate == key)
         .and_then(|(_, value)| value.as_bool())
+}
+
+fn config_override_i64(overrides: &ConfigOverrides, key: &str) -> Option<i64> {
+    overrides
+        .iter()
+        .rev()
+        .find(|(candidate, _)| candidate == key)
+        .and_then(|(_, value)| value.as_integer())
+}
+
+fn config_override_u64(overrides: &ConfigOverrides, key: &str) -> Option<u64> {
+    config_override_i64(overrides, key).and_then(|value| u64::try_from(value).ok())
+}
+
+fn parse_auto_compact_token_limit_scope(raw: &str) -> Result<AutoCompactTokenLimitScope> {
+    match raw.trim().to_ascii_lowercase().replace('-', "_").as_str() {
+        "total" => Ok(AutoCompactTokenLimitScope::Total),
+        "body_after_prefix" | "bodyafterprefix" => Ok(AutoCompactTokenLimitScope::BodyAfterPrefix),
+        other => bail!(
+            "invalid model_auto_compact_token_limit_scope {other:?}; expected total or body_after_prefix"
+        ),
+    }
 }
 
 /// Mirrors `browser-use-core::canonicalize_config_override_key`

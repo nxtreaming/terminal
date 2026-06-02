@@ -111,6 +111,8 @@ struct InMemoryTurnState {
     drains: Arc<AtomicUsize>,
     /// The size of each drain, in order (so a test can see WHICH iteration drained).
     drain_sizes: Arc<Mutex<Vec<usize>>>,
+    /// Number of times the loop asked the state to defer mailbox delivery.
+    deferrals: Arc<AtomicUsize>,
 }
 
 impl InMemoryTurnState {
@@ -122,6 +124,7 @@ impl InMemoryTurnState {
             compactions: Arc::new(AtomicUsize::new(0)),
             drains: Arc::new(AtomicUsize::new(0)),
             drain_sizes: Arc::new(Mutex::new(Vec::new())),
+            deferrals: Arc::new(AtomicUsize::new(0)),
         }
     }
 
@@ -135,6 +138,10 @@ impl InMemoryTurnState {
 
     fn drain_sizes_handle(&self) -> Arc<Mutex<Vec<usize>>> {
         self.drain_sizes.clone()
+    }
+
+    fn deferrals_handle(&self) -> Arc<AtomicUsize> {
+        self.deferrals.clone()
     }
 }
 
@@ -172,6 +179,10 @@ impl TurnState for InMemoryTurnState {
         st.full_context_window_limit_reached = false;
         st.token_limit_reached = false;
         Ok(())
+    }
+
+    async fn defer_mailbox_delivery_to_next_turn(&self) {
+        self.deferrals.fetch_add(1, Ordering::SeqCst);
     }
 }
 
@@ -227,6 +238,7 @@ fn follow_up(msg: &str) -> SamplingOutcome {
     SamplingOutcome {
         model_needs_follow_up: true,
         last_agent_message: Some(msg.to_string()),
+        defers_mailbox_delivery_to_next_turn: false,
         finish_reason: None,
     }
 }
@@ -236,6 +248,16 @@ fn complete(msg: &str) -> SamplingOutcome {
     SamplingOutcome {
         model_needs_follow_up: false,
         last_agent_message: Some(msg.to_string()),
+        defers_mailbox_delivery_to_next_turn: true,
+        finish_reason: None,
+    }
+}
+
+fn commentary_complete(msg: &str) -> SamplingOutcome {
+    SamplingOutcome {
+        model_needs_follow_up: false,
+        last_agent_message: Some(msg.to_string()),
+        defers_mailbox_delivery_to_next_turn: false,
         finish_reason: None,
     }
 }
@@ -345,6 +367,52 @@ async fn pending_input_continues_loop_when_model_not_following_up() {
         "pending input drains once, on the iteration after the gate opens"
     );
     assert_eq!(observer.kinds(), vec!["started", "complete"]);
+}
+
+#[tokio::test]
+async fn terminal_output_defers_mailbox_only_when_sampling_outcome_says_so() {
+    let sampler = ScriptedSamplingDriver::new(vec![SamplingScript::Ok(complete("final"))]);
+    let state = InMemoryTurnState::new(Vec::new(), token_status(false));
+    let deferrals = state.deferrals_handle();
+    let observer = RecordingObserver::new();
+
+    let out = TurnLoop::new(state, sampler, observer)
+        .run(
+            ctx(),
+            /* turn_has_fresh_input */ true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("loop should complete");
+
+    assert_eq!(out.as_deref(), Some("final"));
+    assert_eq!(
+        deferrals.load(Ordering::SeqCst),
+        1,
+        "final assistant output should defer mailbox delivery to next turn"
+    );
+
+    let sampler =
+        ScriptedSamplingDriver::new(vec![SamplingScript::Ok(commentary_complete("thinking"))]);
+    let state = InMemoryTurnState::new(Vec::new(), token_status(false));
+    let deferrals = state.deferrals_handle();
+    let observer = RecordingObserver::new();
+
+    let out = TurnLoop::new(state, sampler, observer)
+        .run(
+            ctx(),
+            /* turn_has_fresh_input */ true,
+            CancellationToken::new(),
+        )
+        .await
+        .expect("loop should complete");
+
+    assert_eq!(out.as_deref(), Some("thinking"));
+    assert_eq!(
+        deferrals.load(Ordering::SeqCst),
+        0,
+        "commentary assistant output should leave mailbox delivery current-turn"
+    );
 }
 
 // ---- (3) token_limit_reached + needs_follow_up → CompactThenContinue ------

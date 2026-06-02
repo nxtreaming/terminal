@@ -33,6 +33,16 @@ pub trait TurnState: Send + Sync + 'static {
     fn take_pending_input(&self) -> impl std::future::Future<Output = Vec<Message>> + Send;
     fn token_status(&self) -> impl std::future::Future<Output = decision::TokenStatus> + Send;
 
+    /// Called after a terminal visible assistant answer and before pending input
+    /// is classified for the current loop iteration.
+    ///
+    /// Codex treats mailbox mail that arrives after the answer boundary as next
+    /// turn input, unless fresh user/steer input has already reopened the current
+    /// turn. Non-mailbox turn states can ignore this hook.
+    fn defer_mailbox_delivery_to_next_turn(&self) -> impl std::future::Future<Output = ()> + Send {
+        async {}
+    }
+
     /// Mid-turn compaction hook, invoked by [`TurnLoop`] on a
     /// [`decision::LoopStep::CompactThenContinue`] step (codex `turn.rs:282`).
     ///

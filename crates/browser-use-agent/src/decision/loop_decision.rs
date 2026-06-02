@@ -18,6 +18,10 @@ pub struct SamplingOutcome {
     /// `turn.rs:250`.
     pub model_needs_follow_up: bool,
     pub last_agent_message: Option<String>,
+    /// Codex defers inter-agent mailbox delivery only after output that closes a
+    /// turn boundary, such as final assistant text. Commentary text remains a
+    /// current-turn preemption/drain point.
+    pub defers_mailbox_delivery_to_next_turn: bool,
     pub finish_reason: Option<FinishReason>,
 }
 
@@ -198,6 +202,7 @@ mod tests {
         SamplingOutcome {
             model_needs_follow_up: model_nfu,
             last_agent_message: None,
+            defers_mailbox_delivery_to_next_turn: false,
             finish_reason: None,
         }
     }

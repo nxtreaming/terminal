@@ -50,6 +50,8 @@ pub enum LlmEvent {
     },
     TextEnd {
         id: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        phase: Option<TextPhase>,
     },
     ReasoningStart {
         id: String,
@@ -96,6 +98,13 @@ pub enum LlmEvent {
         #[serde(default)]
         retryable: bool,
     },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TextPhase {
+    Commentary,
+    FinalAnswer,
 }
 
 /// The aggregated, non-streaming result of a turn.

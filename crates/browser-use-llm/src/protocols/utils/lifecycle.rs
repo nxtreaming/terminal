@@ -5,7 +5,7 @@
 
 use std::collections::BTreeSet;
 
-use crate::schema::{FinishReason, LlmEvent, Usage};
+use crate::schema::{FinishReason, LlmEvent, TextPhase, Usage};
 
 #[derive(Debug, Default)]
 pub struct Lifecycle {
@@ -45,9 +45,17 @@ impl Lifecycle {
 
     /// Close a text block (no-op if it was never opened / already closed).
     pub fn text_end(&mut self, id: impl Into<String>) -> Vec<LlmEvent> {
+        self.text_end_with_phase(id, None)
+    }
+
+    pub fn text_end_with_phase(
+        &mut self,
+        id: impl Into<String>,
+        phase: Option<TextPhase>,
+    ) -> Vec<LlmEvent> {
         let id = id.into();
         if self.open_text.remove(&id) {
-            vec![LlmEvent::TextEnd { id }]
+            vec![LlmEvent::TextEnd { id, phase }]
         } else {
             Vec::new()
         }
@@ -93,7 +101,7 @@ impl Lifecycle {
 
         let open_text: Vec<String> = std::mem::take(&mut self.open_text).into_iter().collect();
         for id in open_text {
-            out.push(LlmEvent::TextEnd { id });
+            out.push(LlmEvent::TextEnd { id, phase: None });
         }
         let open_reasoning: Vec<String> = std::mem::take(&mut self.open_reasoning)
             .into_iter()
@@ -157,7 +165,10 @@ mod tests {
         assert_eq!(
             evts,
             vec![
-                LlmEvent::TextEnd { id: "t0".into() },
+                LlmEvent::TextEnd {
+                    id: "t0".into(),
+                    phase: None,
+                },
                 LlmEvent::ReasoningEnd { id: "r0".into() },
                 LlmEvent::StepFinish {
                     usage: Usage::default(),
@@ -177,7 +188,10 @@ mod tests {
         lc.text_delta("t0", "hi");
         assert_eq!(
             lc.text_end("t0"),
-            vec![LlmEvent::TextEnd { id: "t0".into() }]
+            vec![LlmEvent::TextEnd {
+                id: "t0".into(),
+                phase: None,
+            }]
         );
         let evts = lc.finish(Usage::default(), None);
         // no extra TextEnd, just step_finish + finish

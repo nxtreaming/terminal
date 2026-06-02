@@ -1400,6 +1400,7 @@ fn active_node_for_session(
         .map(str::trim_end)
         .filter(|text| !text.is_empty())
         .filter(|_| !live_stream_has_committed_successor(live_events));
+    let live_turn_is_followup = state.transcript.last().is_some_and(|turn| turn.is_followup);
 
     let mut active_nodes = Vec::new();
     let live_status = live_status_for_session(active_child_count, live_thinking_text, live_events);
@@ -1467,7 +1468,8 @@ fn active_node_for_session(
         }
     }
     if live_streaming_text.is_none()
-        || (live_status == "Thinking..." && live_stream_pending_status_allowed(live_events))
+        || (live_status == "Thinking..."
+            && live_stream_pending_status_allowed(live_events, !live_turn_is_followup))
     {
         active_nodes.push(pending_status_node(
             root,
@@ -1674,7 +1676,10 @@ fn live_stream_has_committed_successor(live_events: &[EventRecord]) -> bool {
     })
 }
 
-fn live_stream_pending_status_allowed(live_events: &[EventRecord]) -> bool {
+fn live_stream_pending_status_allowed(
+    live_events: &[EventRecord],
+    allow_quiet_status: bool,
+) -> bool {
     let Some(latest_stream) = latest_nonempty_stream_event(live_events) else {
         return false;
     };
@@ -1685,7 +1690,8 @@ fn live_stream_pending_status_allowed(live_events: &[EventRecord]) -> bool {
     }) {
         return true;
     }
-    now_ms().saturating_sub(latest_stream.ts_ms) >= LIVE_STREAM_QUIET_STATUS_DELAY_MS
+    allow_quiet_status
+        && now_ms().saturating_sub(latest_stream.ts_ms) >= LIVE_STREAM_QUIET_STATUS_DELAY_MS
 }
 
 fn latest_nonempty_stream_event(live_events: &[EventRecord]) -> Option<&EventRecord> {

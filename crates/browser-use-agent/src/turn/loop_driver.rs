@@ -172,6 +172,9 @@ impl<St: TurnState, Sd: SamplingDriver, Ob: TurnObserver> TurnLoop<St, Sd, Ob> {
             if outcome.last_agent_message.is_some() {
                 last_agent_message = outcome.last_agent_message.clone();
             }
+            if outcome.defers_mailbox_delivery_to_next_turn && !outcome.model_needs_follow_up {
+                self.state.defer_mailbox_delivery_to_next_turn().await;
+            }
 
             // ---- 3. classify the step via the PURE decision core ----
             let has_pending_input = self.state.has_pending_input().await;

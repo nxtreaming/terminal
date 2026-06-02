@@ -863,7 +863,10 @@ mod tests {
                 id: "msg_1".into(),
                 delta: "check.".into(),
             },
-            LlmEvent::TextEnd { id: "msg_1".into() },
+            LlmEvent::TextEnd {
+                id: "msg_1".into(),
+                phase: None,
+            },
             LlmEvent::ToolInputStart {
                 id: "call_1".into(),
                 name: "get_weather".into(),

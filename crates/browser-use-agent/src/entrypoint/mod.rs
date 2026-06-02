@@ -189,6 +189,12 @@ struct PreviousModelCompaction {
     sampler: Arc<dyn DynCompactionSampler>,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum MailboxDeliveryPhase {
+    CurrentTurn,
+    NextTurn,
+}
+
 /// A [`TurnState`] backed by the session's durable event log, with REAL codex-
 /// parity token accounting + model-based compaction.
 ///
@@ -213,8 +219,9 @@ struct PreviousModelCompaction {
 ///   cleared (its content is now folded into the summary), so the next prompt is
 ///   small again and the loop continues.
 ///
-/// Phase-E seam: a pending steer/input queue is still not wired
-/// (`has_pending_input` is always false). Wave-E adds it.
+/// Pending input is store-backed: active follow-ups are committed into the
+/// durable log, while inter-agent mailbox messages are delivered through a
+/// Codex-style current-turn/next-turn phase gate.
 struct StoreTurnState {
     store: SharedStore,
     session_id: SessionId,
@@ -229,6 +236,7 @@ struct StoreTurnState {
     model_auto_compact_token_limit: Option<i64>,
     auto_compact_scope: AutoCompactTokenLimitScope,
     auto_compact_window: Mutex<AutoCompactWindow>,
+    mailbox_delivery_phase: Mutex<MailboxDeliveryPhase>,
     pre_turn_replay_from_seq: Mutex<Option<i64>>,
     compact_prompt: String,
     base_instructions: String,
@@ -262,6 +270,7 @@ impl StoreTurnState {
             model_auto_compact_token_limit: None,
             auto_compact_scope: AutoCompactTokenLimitScope::Total,
             auto_compact_window: Mutex::new(AutoCompactWindow::default()),
+            mailbox_delivery_phase: Mutex::new(MailboxDeliveryPhase::CurrentTurn),
             pre_turn_replay_from_seq: Mutex::new(None),
             compact_prompt: crate::compact::SUMMARIZATION_PROMPT.to_string(),
             base_instructions: crate::prompts::browser_agent_system_prompt(),
@@ -906,6 +915,16 @@ fn has_pending_agent_mail(store: &SharedStore, session_id: &str) -> bool {
     store
         .messages_for_agent(session_id)
         .map(|messages| !messages.is_empty())
+        .unwrap_or(false)
+}
+
+fn has_pending_trigger_turn_agent_mail(store: &SharedStore, session_id: &str) -> bool {
+    let Ok(store) = store.lock() else {
+        return false;
+    };
+    store
+        .messages_for_agent(session_id)
+        .map(|messages| messages.iter().any(|message| message.trigger_turn))
         .unwrap_or(false)
 }
 
@@ -1560,19 +1579,37 @@ impl TurnState for StoreTurnState {
     async fn has_pending_input(&self) -> bool {
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
+        let mailbox_delivery_phase = *self.mailbox_delivery_phase.lock().unwrap();
         tokio::task::spawn_blocking(move || {
             has_pending_active_followup(&store, &session_id)
-                || has_pending_agent_mail(&store, &session_id)
+                || (mailbox_delivery_phase == MailboxDeliveryPhase::CurrentTurn
+                    && has_pending_agent_mail(&store, &session_id))
         })
         .await
         .unwrap_or(false)
     }
 
     async fn take_pending_input(&self) -> Vec<Message> {
+        let store_for_followup = Arc::clone(&self.store);
+        let session_id_for_followup = self.session_id.as_str().to_string();
+        let followup_pending = tokio::task::spawn_blocking(move || {
+            has_pending_active_followup(&store_for_followup, &session_id_for_followup)
+        })
+        .await
+        .unwrap_or(false);
+        if followup_pending {
+            *self.mailbox_delivery_phase.lock().unwrap() = MailboxDeliveryPhase::CurrentTurn;
+        }
+        let mailbox_delivery_phase = *self.mailbox_delivery_phase.lock().unwrap();
+        if !followup_pending && mailbox_delivery_phase == MailboxDeliveryPhase::NextTurn {
+            return Vec::new();
+        }
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
         tokio::task::spawn_blocking(move || {
-            drain_one_pending_active_followup(&store, &session_id);
+            if followup_pending {
+                drain_one_pending_active_followup(&store, &session_id);
+            }
             drain_agent_mailbox_as_pending_input(&store, &session_id)
         })
         .await
@@ -1590,6 +1627,18 @@ impl TurnState for StoreTurnState {
             return Ok(()); // compaction disabled — keep the loop's no-op default.
         };
         self.compact_with_sampler(mode, sampler).await
+    }
+
+    async fn defer_mailbox_delivery_to_next_turn(&self) {
+        let store = Arc::clone(&self.store);
+        let session_id = self.session_id.as_str().to_string();
+        let followup_pending =
+            tokio::task::spawn_blocking(move || has_pending_active_followup(&store, &session_id))
+                .await
+                .unwrap_or(false);
+        if !followup_pending {
+            *self.mailbox_delivery_phase.lock().unwrap() = MailboxDeliveryPhase::NextTurn;
+        }
     }
 }
 
@@ -1925,6 +1974,7 @@ impl SamplingDriver for FakeSamplingDriver {
         Ok(SamplingOutcome {
             model_needs_follow_up: false,
             last_agent_message: Some(self.message.clone()),
+            defers_mailbox_delivery_to_next_turn: true,
             finish_reason: None,
         })
     }
@@ -2031,7 +2081,6 @@ async fn drive_run<Sd: SamplingDriver>(
     let result = turn_loop
         .run(ctx, turn_has_fresh_input, cancel.clone())
         .await;
-    cancel.cancel();
     cancel_monitor.abort();
     if result.is_ok() {
         ensure_fallback_capture_recording(&store, session_id.as_str());
@@ -2145,6 +2194,29 @@ pub async fn run_session_with_config_with_cancel(
     cancel: CancellationToken,
 ) -> anyhow::Result<SessionId> {
     let session_id = SessionId(session_id.to_string());
+    loop {
+        run_session_once_with_config_with_cancel(
+            Arc::clone(&store),
+            session_id.clone(),
+            config.clone(),
+            cancel.clone(),
+        )
+        .await?;
+
+        if cancel.is_cancelled()
+            || !has_pending_trigger_turn_agent_mail(&store, session_id.as_str())
+        {
+            return Ok(session_id);
+        }
+    }
+}
+
+async fn run_session_once_with_config_with_cancel(
+    store: SharedStore,
+    session_id: SessionId,
+    config: ProviderRunConfig,
+    cancel: CancellationToken,
+) -> anyhow::Result<()> {
     let ctx = turn_ctx(&session_id, &config);
 
     // The single in-run conversation buffer, shared (by `Arc`) between the fused
@@ -2215,11 +2287,12 @@ pub async fn run_session_with_config_with_cancel(
     }
 
     // The run drives over the session's existing durable history (the prompt the
-    // caller already seeded). `turn_has_fresh_input` is true iff that log already
-    // carries a real user turn (a `session.input` event), so the loop's initial
-    // drain gate matches codex (`initial_can_drain`): fresh input is sampled
-    // before any queued steer is drained.
-    let turn_has_fresh_input = log_has_user_input(&store, session_id.as_str());
+    // caller already seeded). Fresh user input is sampled before queued steer
+    // unless the reason this run exists is already-buffered mailbox mail; that
+    // case matches Codex's "next turn" delivery and must drain immediately.
+    let pending_mail_at_start = has_pending_agent_mail(&store, session_id.as_str());
+    let turn_has_fresh_input =
+        log_has_user_input(&store, session_id.as_str()) && !pending_mail_at_start;
 
     // (3) drive the loop to quiescence with the resolved driver. The SAME
     //     `recorded` buffer the recorder writes is handed to the state, so the
@@ -2295,8 +2368,7 @@ pub async fn run_session_with_config_with_cancel(
         }
     }
 
-    // (4) return the session id of the completed run.
-    Ok(session_id)
+    Ok(())
 }
 
 /// True iff the session's durable log already contains a real user turn
@@ -2720,6 +2792,36 @@ mod tests {
         );
         // The agent still produced (and persisted) a visible result.
         assert!(log.iter().any(|e| e.event_type == "session.done"));
+    }
+
+    #[tokio::test]
+    async fn config_facade_drains_trigger_turn_mail_at_run_start() {
+        let (_dir, store, root_id) = store_with_session();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            let child = store
+                .create_child_session(
+                    &root_id,
+                    std::path::Path::new("/work"),
+                    Some("/root/worker"),
+                    Some("Atlas"),
+                    Some("explorer"),
+                )
+                .expect("child session");
+            store
+                .send_agent_message(&child.id, &root_id, "queued trigger update", true)
+                .expect("agent message");
+        }
+
+        run_session_with_config(Arc::clone(&store), &root_id, fake_config())
+            .await
+            .expect("facade must run with queued trigger-turn mail");
+
+        assert!(!has_pending_agent_mail(&store, &root_id));
+        let log = events(&store, &root_id);
+        assert!(log
+            .iter()
+            .any(|event| event.event_type == "agent.mailbox_input"));
     }
 
     /// The codex backend is a REAL provider again: with codex OAuth creds in the
@@ -3622,6 +3724,143 @@ mod tests {
             .expect("mailbox input event");
         assert_eq!(mailbox_event.payload["author_session_id"], child_id);
         assert_eq!(mailbox_event.payload["target_session_id"], root_id);
+    }
+
+    #[tokio::test]
+    async fn store_turn_state_defers_mailbox_after_answer_boundary() {
+        let (_dir, store, root_id) = store_with_session();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            let child = store
+                .create_child_session(
+                    &root_id,
+                    std::path::Path::new("/work"),
+                    Some("/root/worker"),
+                    Some("Atlas"),
+                    Some("explorer"),
+                )
+                .expect("child session");
+            store
+                .send_agent_message(&child.id, &root_id, "late queue-only update", false)
+                .expect("agent message");
+        }
+
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(root_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        state.defer_mailbox_delivery_to_next_turn().await;
+
+        assert!(
+            !state.has_pending_input().await,
+            "mailbox-only input should not extend the current turn after a visible answer"
+        );
+        assert!(
+            state.take_pending_input().await.is_empty(),
+            "deferred mailbox input should remain buffered for the next turn"
+        );
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            assert_eq!(store.messages_for_agent(&root_id).unwrap().len(), 1);
+        }
+
+        let next_turn_state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(root_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        assert!(next_turn_state.has_pending_input().await);
+        assert_eq!(next_turn_state.take_pending_input().await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn store_turn_state_defers_trigger_turn_mail_after_answer_boundary() {
+        let (_dir, store, root_id) = store_with_session();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            let child = store
+                .create_child_session(
+                    &root_id,
+                    std::path::Path::new("/work"),
+                    Some("/root/worker"),
+                    Some("Atlas"),
+                    Some("explorer"),
+                )
+                .expect("child session");
+            store
+                .send_agent_message(&child.id, &root_id, "late trigger update", true)
+                .expect("agent message");
+        }
+
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(root_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        state.defer_mailbox_delivery_to_next_turn().await;
+
+        assert!(
+            !state.has_pending_input().await,
+            "trigger-turn mailbox input should not stretch the just-answered turn"
+        );
+        assert!(has_pending_trigger_turn_agent_mail(&store, &root_id));
+    }
+
+    #[tokio::test]
+    async fn store_turn_state_active_followup_reopens_deferred_mailbox() {
+        let (_dir, store, root_id) = store_with_session();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            let child = store
+                .create_child_session(
+                    &root_id,
+                    std::path::Path::new("/work"),
+                    Some("/root/worker"),
+                    Some("Atlas"),
+                    Some("explorer"),
+                )
+                .expect("child session");
+            store
+                .send_agent_message(&child.id, &root_id, "queued child update", false)
+                .expect("agent message");
+        }
+
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(root_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        );
+        state.defer_mailbox_delivery_to_next_turn().await;
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &root_id,
+                    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                    json!({
+                        "text": "operator follow-up",
+                        "delivery": FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL,
+                    }),
+                )
+                .expect("pending follow-up");
+        }
+
+        assert!(
+            state.has_pending_input().await,
+            "active follow-up input should reopen the current turn mailbox"
+        );
+        let drained = state.take_pending_input().await;
+        assert_eq!(drained.len(), 1);
+        assert!(!has_pending_agent_mail(&store, &root_id));
+
+        let log = events(&store, &root_id);
+        assert!(log
+            .iter()
+            .any(|event| event.event_type == names::SESSION_FOLLOWUP));
+        assert!(log
+            .iter()
+            .any(|event| event.event_type == "agent.mailbox_input"));
     }
 
     struct CancelAwareDriver;

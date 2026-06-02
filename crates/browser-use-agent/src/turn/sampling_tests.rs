@@ -13,7 +13,7 @@ use std::sync::{Arc, Mutex};
 
 use browser_use_llm::schema::{
     ContentPart, FinishReason, LlmError, LlmErrorReason, LlmEvent, LlmRequest, Message,
-    MessageRole, Usage,
+    MessageRole, TextPhase, Usage,
 };
 use browser_use_protocol::EventRecord;
 use futures_util::stream;
@@ -183,6 +183,33 @@ fn text_delta(s: &str) -> Result<LlmEvent, LlmError> {
     })
 }
 
+fn text_end() -> Result<LlmEvent, LlmError> {
+    Ok(LlmEvent::TextEnd {
+        id: "t0".to_string(),
+        phase: None,
+    })
+}
+
+fn commentary_text_end() -> Result<LlmEvent, LlmError> {
+    Ok(LlmEvent::TextEnd {
+        id: "t0".to_string(),
+        phase: Some(TextPhase::Commentary),
+    })
+}
+
+fn final_answer_text_end() -> Result<LlmEvent, LlmError> {
+    Ok(LlmEvent::TextEnd {
+        id: "t0".to_string(),
+        phase: Some(TextPhase::FinalAnswer),
+    })
+}
+
+fn reasoning_end() -> Result<LlmEvent, LlmError> {
+    Ok(LlmEvent::ReasoningEnd {
+        id: "r0".to_string(),
+    })
+}
+
 fn tool_call(name: &str) -> Result<LlmEvent, LlmError> {
     Ok(LlmEvent::ToolCall {
         id: "call-1".to_string(),
@@ -333,12 +360,39 @@ async fn text_only_stream_does_not_request_follow_up() {
         "no tool call -> model_needs_follow_up must be false"
     );
     assert_eq!(out.last_agent_message.as_deref(), Some("All done."));
+    assert!(
+        !out.defers_mailbox_delivery_to_next_turn,
+        "without a text close, the driver should not infer a turn boundary"
+    );
     assert_eq!(out.finish_reason, Some(FinishReason::Stop));
 
     let types: Vec<String> = sink.drain().iter().map(|e| e.event_type.clone()).collect();
     assert!(
         !types.iter().any(|t| t == names::TOOL_STARTED),
         "no tool.started event for a text-only turn"
+    );
+}
+
+#[tokio::test]
+async fn final_answer_text_end_defers_mailbox_delivery_to_next_turn() {
+    let (transport, _opens) = ScriptedTransport::new(vec![OpenScript::Stream(vec![
+        text_delta("All done."),
+        final_answer_text_end(),
+        finish(FinishReason::Stop),
+    ])]);
+    let sink = Arc::new(RecordingSink::default());
+    let d = driver(transport, sink, 5);
+
+    let out = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    assert!(!out.model_needs_follow_up);
+    assert_eq!(out.last_agent_message.as_deref(), Some("All done."));
+    assert!(
+        out.defers_mailbox_delivery_to_next_turn,
+        "final-answer text is a Codex next-turn mailbox boundary"
     );
 }
 
@@ -737,5 +791,163 @@ async fn text_only_driver_sends_no_tool_specs() {
     assert!(
         captured[0].tools.is_empty(),
         "a driver with no dispatcher must not advertise any tools"
+    );
+}
+
+#[tokio::test]
+async fn mailbox_preemption_after_commentary_text_end_stops_stream_and_requests_follow_up() {
+    let (transport, opens) = ScriptedTransport::new(vec![OpenScript::Stream(vec![
+        text_delta("Working."),
+        commentary_text_end(),
+        tool_call("search"),
+        finish(FinishReason::ToolUse),
+    ])]);
+    let sink = Arc::new(RecordingSink::default());
+    let probe_calls = Arc::new(AtomicUsize::new(0));
+    let d = driver(transport, sink.clone(), 5).with_mailbox_preemption_probe({
+        let probe_calls = Arc::clone(&probe_calls);
+        Arc::new(
+            move || -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = bool> + Send + 'static>,
+            > {
+                let probe_calls = Arc::clone(&probe_calls);
+                Box::pin(async move {
+                    probe_calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                })
+            },
+        )
+    });
+
+    let out = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(probe_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        out.model_needs_follow_up,
+        "commentary mailbox preemption must force a follow-up sampling iteration"
+    );
+    assert_eq!(out.last_agent_message.as_deref(), Some("Working."));
+    assert!(
+        !out.defers_mailbox_delivery_to_next_turn,
+        "commentary text remains current-turn deliverable in Codex"
+    );
+
+    let types: Vec<String> = sink.drain().iter().map(|e| e.event_type.clone()).collect();
+    assert!(
+        !types.iter().any(|t| t == names::TOOL_STARTED),
+        "events after the preempted assistant commentary item must not be consumed"
+    );
+    assert!(
+        !types.iter().any(|t| t == names::TOKEN_COUNT),
+        "preempted streams stop before provider finish/token events"
+    );
+}
+
+#[tokio::test]
+async fn mailbox_preemption_after_reasoning_end_stops_stream_and_requests_follow_up() {
+    let (transport, opens) = ScriptedTransport::new(vec![OpenScript::Stream(vec![
+        text_delta("Working."),
+        reasoning_end(),
+        tool_call("search"),
+        finish(FinishReason::ToolUse),
+    ])]);
+    let sink = Arc::new(RecordingSink::default());
+    let probe_calls = Arc::new(AtomicUsize::new(0));
+    let d = driver(transport, sink.clone(), 5).with_mailbox_preemption_probe({
+        let probe_calls = Arc::clone(&probe_calls);
+        Arc::new(
+            move || -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = bool> + Send + 'static>,
+            > {
+                let probe_calls = Arc::clone(&probe_calls);
+                Box::pin(async move {
+                    probe_calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                })
+            },
+        )
+    });
+
+    let out = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(probe_calls.load(Ordering::SeqCst), 1);
+    assert!(
+        out.model_needs_follow_up,
+        "mailbox preemption must force a follow-up sampling iteration"
+    );
+    assert_eq!(out.last_agent_message.as_deref(), Some("Working."));
+    assert!(
+        !out.defers_mailbox_delivery_to_next_turn,
+        "reasoning preemption must not manufacture a final-answer boundary"
+    );
+
+    let types: Vec<String> = sink.drain().iter().map(|e| e.event_type.clone()).collect();
+    assert!(
+        !types.iter().any(|t| t == names::TOOL_STARTED),
+        "events after the preempted assistant text item must not be consumed"
+    );
+    assert!(
+        !types.iter().any(|t| t == names::TOKEN_COUNT),
+        "preempted streams stop before provider finish/token events"
+    );
+}
+
+#[tokio::test]
+async fn mailbox_preemption_ignores_untagged_text_end() {
+    let (transport, opens) = ScriptedTransport::new(vec![OpenScript::Stream(vec![
+        text_delta("Final."),
+        text_end(),
+        finish(FinishReason::Stop),
+    ])]);
+    let sink = Arc::new(RecordingSink::default());
+    let probe_calls = Arc::new(AtomicUsize::new(0));
+    let d = driver(transport, sink.clone(), 5).with_mailbox_preemption_probe({
+        let probe_calls = Arc::clone(&probe_calls);
+        Arc::new(
+            move || -> std::pin::Pin<
+                Box<dyn std::future::Future<Output = bool> + Send + 'static>,
+            > {
+                let probe_calls = Arc::clone(&probe_calls);
+                Box::pin(async move {
+                    probe_calls.fetch_add(1, Ordering::SeqCst);
+                    true
+                })
+            },
+        )
+    });
+
+    let out = d
+        .run_sampling_request(user_input(), CancellationToken::new())
+        .await
+        .expect("sampling should succeed");
+
+    assert_eq!(opens.load(Ordering::SeqCst), 1);
+    assert_eq!(
+        probe_calls.load(Ordering::SeqCst),
+        0,
+        "untagged assistant text must not check mailbox preemption"
+    );
+    assert!(
+        !out.model_needs_follow_up,
+        "untagged assistant text follows Codex's safe default: final-answer text defers mailbox mail"
+    );
+    assert_eq!(out.last_agent_message.as_deref(), Some("Final."));
+    assert!(
+        out.defers_mailbox_delivery_to_next_turn,
+        "untagged text is treated as final-answer output"
+    );
+
+    let types: Vec<String> = sink.drain().iter().map(|e| e.event_type.clone()).collect();
+    assert!(
+        types.iter().any(|t| t == names::TOKEN_COUNT),
+        "the stream must continue through provider finish/token events"
     );
 }
