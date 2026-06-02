@@ -7,7 +7,7 @@
 
 use std::collections::HashMap;
 use std::io::{Read, Write};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::process::{Child as StdChild, Command as StdCommand, Stdio};
 use std::sync::Arc;
 use std::thread;
@@ -35,6 +35,8 @@ const TRAILING_OUTPUT_GRACE_MS: u64 = 100;
 const WAIT_FOR_READERS_MS: u64 = 2_000;
 const EXIT_WATCH_INTERVAL_MS: u64 = 100;
 const MAX_UNIFIED_EXEC_PROCESSES: usize = 64;
+const AGENT_TOOLS_DIR_ENV: &str = "BUT_AGENT_TOOLS_DIR";
+const PATH_ENV: &str = "PATH";
 const UNIFIED_EXEC_ENV: [(&str, &str); 10] = [
     ("NO_COLOR", "1"),
     ("TERM", "dumb"),
@@ -1234,7 +1236,48 @@ fn apply_unified_exec_env(mut env: HashMap<String, String>) -> HashMap<String, S
     for (key, value) in UNIFIED_EXEC_ENV {
         env.insert(key.to_string(), value.to_string());
     }
+    prepend_managed_agent_tools_dir(&mut env);
     env
+}
+
+fn prepend_managed_agent_tools_dir(env: &mut HashMap<String, String>) {
+    let Ok(agent_tools_dir) = std::env::var(AGENT_TOOLS_DIR_ENV) else {
+        return;
+    };
+    let agent_tools_dir = PathBuf::from(agent_tools_dir);
+    if !agent_tools_dir_contains_ripgrep(&agent_tools_dir) {
+        return;
+    }
+    prepend_path_dir(env, &agent_tools_dir);
+}
+
+fn agent_tools_dir_contains_ripgrep(dir: &Path) -> bool {
+    let binary_name = if cfg!(windows) { "rg.exe" } else { "rg" };
+    dir.join(binary_name).is_file()
+}
+
+fn prepend_path_dir(env: &mut HashMap<String, String>, dir: &Path) {
+    let dir = dir.to_string_lossy().to_string();
+    if dir.is_empty() {
+        return;
+    }
+
+    let separator = if cfg!(windows) { ';' } else { ':' };
+    let existing_path = env
+        .get(PATH_ENV)
+        .cloned()
+        .or_else(|| std::env::var(PATH_ENV).ok())
+        .unwrap_or_default();
+
+    let mut entries = Vec::with_capacity(existing_path.split(separator).count() + 1);
+    entries.push(dir.clone());
+    entries.extend(
+        existing_path
+            .split(separator)
+            .filter(|entry| !entry.is_empty() && *entry != dir)
+            .map(str::to_string),
+    );
+    env.insert(PATH_ENV.to_string(), entries.join(&separator.to_string()));
 }
 
 async fn wait_for_std_child_exit(child: &mut StdChild, max_wait: Duration) {

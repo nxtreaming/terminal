@@ -7744,6 +7744,7 @@ fn main() -> Result<()> {
     install_agent_panic_hook();
     load_dotenv()?;
     let args = Args::parse();
+    theme::init(theme::detect_palette());
     if args.dump_screen {
         let mut app = App::new(args)?;
         let text = render_dump(&mut app)?;
@@ -7756,7 +7757,6 @@ fn main() -> Result<()> {
         return Ok(());
     }
     app.track_app_opened();
-    theme::init(theme::detect_palette());
     run_terminal(app)
 }
 
