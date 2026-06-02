@@ -13,7 +13,6 @@ pub mod done;
 pub mod goal;
 pub mod mcp;
 pub mod python;
-pub mod request_user_input;
 pub mod shell;
 pub mod subagent;
 pub mod tool_search;
@@ -31,8 +30,6 @@ mod done_tests;
 mod mcp_tests;
 #[cfg(test)]
 mod python_tests;
-#[cfg(test)]
-mod request_user_input_tests;
 #[cfg(test)]
 mod shell_tests;
 #[cfg(test)]
@@ -55,10 +52,6 @@ pub use mcp::{
     MCP_ERROR_EXIT_CODE, MCP_EVENT_RESULT_MAX_CHARS,
 };
 pub use python::{PythonApprovalKey, PythonBackend, PythonRequest, PythonTool};
-pub use request_user_input::{
-    RequestUserInputApprovalKey, RequestUserInputRequest, RequestUserInputResponse,
-    RequestUserInputTool, UserInputAnswer, UserInputOption, UserInputQuestion,
-};
 pub use shell::{
     ExecCommandApprovalKey, ExecCommandRequest, ExecCommandTool, ShellApprovalKey, ShellRequest,
     ShellTool, WriteStdinApprovalKey, WriteStdinRequest, WriteStdinTool,

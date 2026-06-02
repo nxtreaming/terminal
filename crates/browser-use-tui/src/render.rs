@@ -25,8 +25,7 @@ use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
     format_goal_tokens_compact, goal_command_hint, goal_status_label,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
-    CookieSyncStatus, MessageActionKind, ProductState, RequestUserInputFocus, SetupResultKind,
-    Surface,
+    CookieSyncStatus, MessageActionKind, ProductState, SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -1742,23 +1741,10 @@ fn format_token_count(tokens: i64) -> String {
 
 fn render_composer_input(frame: &mut Frame<'_>, area: Rect, app: &App, state: &WorkbenchState) {
     let current_session = state.current_session.as_ref();
-    let pending_request = current_session
-        .filter(|session| session.status.is_active())
-        .and_then(|session| app.pending_request_user_input(&session.id));
     // Compute the home placeholder separately so it can own a String when
     // the typewriter produces a dynamic substring.
     let home_placeholder_owned: String;
-    let placeholder: &str = if pending_request.is_some() {
-        if app
-            .request_input
-            .as_ref()
-            .is_some_and(|state| state.focus == RequestUserInputFocus::Notes)
-        {
-            "Add notes..."
-        } else {
-            "Answer the agent's question..."
-        }
-    } else if current_session.is_some_and(|session| session.status.is_active()) {
+    let placeholder: &str = if current_session.is_some_and(|session| session.status.is_active()) {
         "Type to steer the agent..."
     } else if current_session.is_some() {
         "Ask a follow-up..."

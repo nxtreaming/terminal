@@ -1,16 +1,17 @@
 //! Tests for the tool registry: dispatch-by-name, type-erased routing through
 //! the orchestrator, model-visible definitions, and parallel-safe surfacing.
 //!
-//! All tests are offline. The original tests use the four originally-`Deserialize`
-//! handlers (`update_plan`, `tool_search`, `web_search`, `request_user_input`),
+//! All tests are offline. The original tests use the three originally-`Deserialize`
+//! handlers (`update_plan`, `tool_search`, `web_search`),
 //! each a pure / hosted / in-memory tool that touches no network, filesystem,
 //! browser, or python interpreter. The registry-gap-closing tests at the bottom
-//! exercise ALL TEN handlers: `shell` (dispatched against a real `echo`, which is
-//! permitted), `apply_patch` / `view_image` (real filesystem under a tempdir),
-//! and `browser` / `python` / `mcp` (injected FAKE backends so no Bun / Chrome /
-//! Python / network is touched). They assert every tool registers + dispatches
-//! to the right handler, that `model_visible_definitions()` returns 10, and that
-//! each tool's wire args round-trip through deserialization.
+//! exercise the default callable tool set: `shell` (dispatched against a real
+//! `echo`, which is permitted), `apply_patch` / `view_image` (real filesystem
+//! under a tempdir), and `browser` / `python` / `mcp` (injected FAKE backends so
+//! no Bun / Chrome / Python / network is touched). They assert every tool
+//! registers + dispatches to the right handler, that `model_visible_definitions()`
+//! returns the expected tool count, and that each tool's wire args round-trip
+//! through deserialization.
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -27,7 +28,6 @@ use crate::tools::handlers::mcp::{
     McpCallResult, McpClient, McpTool, McpToolCallRequest, McpWireArgs,
 };
 use crate::tools::handlers::python::{PythonBackend, PythonRequest, PythonTool};
-use crate::tools::handlers::request_user_input::{RequestUserInputRequest, RequestUserInputTool};
 use crate::tools::handlers::shell::{ShellRequest, ShellTool};
 use crate::tools::handlers::tool_search::{ToolSearchEntry, ToolSearchRequest, ToolSearchTool};
 use crate::tools::handlers::update_plan::{UpdatePlanRequest, UpdatePlanTool};
@@ -84,13 +84,6 @@ fn registry_with_basics() -> ToolRegistry {
         def("update_plan"),
         false,
         UpdatePlanTool::new(),
-    );
-    // request_user_input: pure (request side), serial.
-    reg.register::<_, RequestUserInputRequest>(
-        "request_user_input",
-        def("request_user_input"),
-        false,
-        RequestUserInputTool::new(),
     );
     // tool_search: BM25 over an in-memory catalog, parallel-safe.
     reg.register::<_, ToolSearchRequest>(
@@ -274,15 +267,7 @@ fn model_visible_definitions_lists_all_registered_tools() {
     let defs = reg.model_visible_definitions();
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
     names.sort_unstable();
-    assert_eq!(
-        names,
-        vec![
-            "request_user_input",
-            "tool_search",
-            "update_plan",
-            "web_search"
-        ]
-    );
+    assert_eq!(names, vec!["tool_search", "update_plan", "web_search"]);
     assert_eq!(defs.len(), reg.len());
     // Definitions carry the handler's description + schema.
     let plan = defs
@@ -296,10 +281,8 @@ fn model_visible_definitions_lists_all_registered_tools() {
 #[test]
 fn parallel_safe_is_surfaced_per_tool() {
     let reg = registry_with_basics();
-    // update_plan / request_user_input are serial; tool_search / web_search are
-    // parallel-safe.
+    // update_plan is serial; tool_search / web_search are parallel-safe.
     assert_eq!(reg.parallel_safe("update_plan"), Some(false));
-    assert_eq!(reg.parallel_safe("request_user_input"), Some(false));
     assert_eq!(reg.parallel_safe("tool_search"), Some(true));
     assert_eq!(reg.parallel_safe("web_search"), Some(true));
     assert_eq!(reg.parallel_safe("nope"), None);
@@ -377,7 +360,7 @@ fn last_registration_for_a_name_wins() {
 }
 
 // ===========================================================================
-// Registry-gap-closing tests: all TEN tools register + dispatch.
+// Registry-gap-closing tests: the default callable tools register + dispatch.
 // ===========================================================================
 
 /// A fake browser backend: records the last call and returns canned output, so
@@ -513,7 +496,6 @@ fn full_registry() -> ToolRegistry {
         PythonTool::with_backend(Arc::new(FakePythonBackend)),
         McpTool::new(Arc::new(FakeMcpClient)),
         UpdatePlanTool::new(),
-        RequestUserInputTool::new(),
         ToolSearchTool::new(vec![ToolSearchEntry::new(
             "kubernetes",
             "manage k8s clusters",
@@ -537,11 +519,11 @@ fn ctx_at(name: &str, cwd: PathBuf) -> ToolCtx {
 #[test]
 fn default_registry_registers_all_tools() {
     let reg = full_registry();
-    assert_eq!(reg.len(), 13, "all tools must register");
+    assert_eq!(reg.len(), 12, "all tools must register");
     let defs = reg.model_visible_definitions();
     assert_eq!(
         defs.len(),
-        13,
+        12,
         "model_visible_definitions must list all tools"
     );
     let mut names: Vec<&str> = defs.iter().map(|d| d.name.as_str()).collect();
@@ -555,7 +537,6 @@ fn default_registry_registers_all_tools() {
             "exec_command",
             "mcp",
             "python",
-            "request_user_input",
             "shell",
             "tool_search",
             "update_plan",
@@ -590,7 +571,6 @@ fn parallel_safe_flags_match_registration() {
         "python",
         "mcp",
         "update_plan",
-        "request_user_input",
         "done",
     ] {
         assert_eq!(
@@ -756,7 +736,7 @@ async fn mcp_dispatches_through_the_wire_args() {
 }
 
 #[tokio::test]
-async fn update_plan_and_request_user_input_dispatch() {
+async fn update_plan_dispatches() {
     let reg = full_registry();
     let orch = ToolOrchestrator::stub();
     // update_plan
@@ -780,32 +760,6 @@ async fn update_plan_and_request_user_input_dispatch() {
         "update_plan: {:?}",
         out.stdout
     );
-
-    // request_user_input: a full valid question (non-empty id/question +
-    // non-empty options, per the handler's validation rules).
-    let q = serde_json::json!({
-        "questions": [{
-            "id": "name",
-            "header": "Name",
-            "question": "What is your name?",
-            "options": [
-                { "label": "Alice", "description": "the first option" },
-                { "label": "Bob", "description": "the second option" }
-            ]
-        }]
-    });
-    let out = reg
-        .dispatch(
-            "request_user_input",
-            &q,
-            &ctx("request_user_input"),
-            &env(),
-            AskForApproval::Never,
-            &orch,
-        )
-        .await
-        .expect("request_user_input should dispatch");
-    assert_eq!(out.exit_code, 0);
 }
 
 #[tokio::test]
@@ -1106,77 +1060,6 @@ fn legacy_subagent_items_schema_advertises_full_user_input_fields() {
     assert_eq!(
         send_item_properties["detail"]["enum"],
         serde_json::json!(["high", "original"])
-    );
-}
-
-/// REGRESSION (fix 1): the `request_user_input` schema must advertise the shape
-/// the handler ACTUALLY accepts — `{ "questions": [...] }` — NOT the old flat
-/// `{ "prompt": ... }`, which a model would follow and then hit a deserialize
-/// error. The advertised schema's `required`/`properties` and a model-shaped
-/// payload must both line up with `RequestUserInputRequest`.
-#[test]
-fn request_user_input_schema_matches_the_handler_questions_shape() {
-    let schema = definitions::request_user_input().input_schema;
-
-    // The advertised schema requires `questions` (an array), NOT `prompt`.
-    assert_eq!(
-        schema["required"][0], "questions",
-        "schema must require `questions`"
-    );
-    assert!(
-        schema["properties"].get("questions").is_some(),
-        "schema must advertise a `questions` property"
-    );
-    assert_eq!(schema["properties"]["questions"]["type"], "array");
-    // The OLD buggy `prompt` field must be gone (it was never accepted).
-    assert!(
-        schema["properties"].get("prompt").is_none(),
-        "schema must NOT advertise the old `prompt` field"
-    );
-    assert_ne!(
-        schema["required"][0], "prompt",
-        "schema must not require the old `prompt`"
-    );
-    // Each question item advertises id/header/question/options.
-    let item_required = &schema["properties"]["questions"]["items"]["required"];
-    let req_set: Vec<&str> = item_required
-        .as_array()
-        .unwrap()
-        .iter()
-        .map(|v| v.as_str().unwrap())
-        .collect();
-    for field in ["id", "header", "question", "options"] {
-        assert!(
-            req_set.contains(&field),
-            "question item must require `{field}`"
-        );
-    }
-
-    // A MODEL-shaped payload that follows the advertised schema deserializes into
-    // the handler's real `RequestUserInputRequest`.
-    let model_payload = serde_json::json!({
-        "questions": [{
-            "id": "deploy",
-            "header": "Deploy",
-            "question": "Ship it?",
-            "options": [
-                { "label": "Yes", "description": "deploy now" },
-                { "label": "No", "description": "hold off" }
-            ]
-        }]
-    });
-    let parsed: RequestUserInputRequest =
-        serde_json::from_value(model_payload).expect("model `questions` payload must deserialize");
-    assert_eq!(parsed.questions.len(), 1);
-    assert_eq!(parsed.questions[0].id, "deploy");
-    assert_eq!(parsed.questions[0].options.as_ref().unwrap().len(), 2);
-
-    // The OLD advertised payload `{ "prompt": ... }` is NOT what the handler
-    // accepts (proving the old schema was a real correctness bug).
-    let old_payload = serde_json::json!({ "prompt": "Ship it?" });
-    assert!(
-        serde_json::from_value::<RequestUserInputRequest>(old_payload).is_err(),
-        "the old `{{prompt}}` shape must NOT deserialize into the handler's request"
     );
 }
 

@@ -1,7 +1,7 @@
 //! `web_search` tool: the HOSTED, provider-executed web-search capability.
 //!
 //! Unlike the other handlers in this module (`shell`, `apply_patch`,
-//! `view_image`, `update_plan`, `request_user_input`, `tool_search`), `web_search`
+//! `view_image`, `update_plan`, `tool_search`), `web_search`
 //! is **not locally dispatched**. It is a *hosted tool*: the model provider runs
 //! the search server-side and streams the result back inline. The client's only
 //! responsibilities are:

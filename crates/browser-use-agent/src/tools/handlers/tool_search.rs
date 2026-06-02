@@ -10,9 +10,8 @@
 //! merged [`ToolRuntime`](crate::tools::runtime::ToolRuntime) seam. It implements
 //! the full trait stack ([`Approvable`] + [`Sandboxable`] + [`ToolRuntime`]) so it
 //! can be driven by the [`ToolOrchestrator`](crate::tools::orchestrator::ToolOrchestrator),
-//! mirroring the `update_plan` / `request_user_input` tools' structure
-//! (`tools/handlers/update_plan.rs`, `tools/handlers/request_user_input.rs`): a
-//! non-FS, validate-rank-and-return tool that spawns no process.
+//! mirroring the `update_plan` tool's structure: a non-FS,
+//! validate-rank-and-return tool that spawns no process.
 //!
 //! # Catalog injection — registry wiring is DEFERRED (TODO)
 //!
@@ -347,10 +346,9 @@ impl ToolSearchTool {
 }
 
 /// Approval key: the query + limit identify a call for session caching, mirroring
-/// the shape the other non-FS tools use (`update_plan.rs:207-210`,
-/// `request_user_input.rs:319-322`). In practice this tool never prompts (it is
-/// read-only and benign — see below), so the key is rarely consulted; it exists
-/// to satisfy the [`Approvable`] contract uniformly.
+/// the shape the other non-FS tools use. In practice this tool never prompts (it
+/// is read-only and benign), so the key is rarely consulted; it exists to satisfy
+/// the [`Approvable`] contract uniformly.
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct ToolSearchApprovalKey {
     query: String,
@@ -368,8 +366,7 @@ impl Approvable<ToolSearchRequest> for ToolSearchTool {
     }
 
     /// `tool_search` touches no filesystem; request the default sandbox
-    /// permissions (no escalation), mirroring the update_plan / request_user_input
-    /// tools (`update_plan.rs:236-238`, `request_user_input.rs:336-338`).
+    /// permissions (no escalation), mirroring the other non-FS tools.
     fn sandbox_permissions(&self, _req: &ToolSearchRequest) -> SandboxPermissions {
         SandboxPermissions::UseDefault
     }
@@ -385,16 +382,14 @@ impl Approvable<ToolSearchRequest> for ToolSearchTool {
 impl Sandboxable for ToolSearchTool {
     fn sandbox_preference(&self) -> SandboxPreference {
         // Let the provider decide (today everything resolves to
-        // `SandboxType::None`). Matches the other non-FS tools
-        // (`update_plan.rs:249-255`, `request_user_input.rs:350-357`). The tool
-        // does no I/O, so the sandbox is moot, but `Auto` keeps the seam uniform.
+        // `SandboxType::None`). The tool does no I/O, so the sandbox is moot, but
+        // `Auto` keeps the seam uniform.
         SandboxPreference::Auto
     }
 
     fn escalate_on_failure(&self) -> bool {
         // The tool never produces a sandbox denial (it does no I/O), so this is
-        // moot; `true` keeps it uniform with the other tools
-        // (`update_plan.rs:257-262`, `request_user_input.rs:359-364`).
+        // moot; `true` keeps it uniform with the other tools.
         true
     }
 }
@@ -405,7 +400,7 @@ impl ToolRuntime<ToolSearchRequest, ExecOutput> for ToolSearchTool {
         // Match codex: PARALLEL-SAFE (true). Codex's `ToolSearchHandler`
         // OVERRIDES `supports_parallel_tool_calls -> true`
         // (`core/src/tools/handlers/tool_search.rs:66-68`) — unlike shell /
-        // update_plan / request_user_input, which inherit the `false` default.
+        // update_plan, which inherit the `false` default.
         // tool_search is a pure, read-only BM25 ranking over an IMMUTABLE catalog:
         // it mutates no shared state, so it is safe to run concurrently with other
         // tools. We follow codex exactly: `true`.

@@ -61,8 +61,8 @@ Do not ask questions that can be answered from the repo or system (for example, 
 
 Critical rules:
 
-* Strongly prefer using the `request_user_input` tool to ask any questions.
-* Offer only meaningful multiple‑choice options; don’t include filler choices that are obviously wrong or irrelevant.
+* Ask questions directly in chat.
+* Offer only meaningful options when options clarify the decision; don’t include filler choices that are obviously wrong or irrelevant.
 * In rare cases where an unavoidable, important question can’t be expressed with reasonable multiple‑choice options (due to extreme ambiguity), you may ask it directly without the tool.
 
 You SHOULD ask many questions, but each question must:
@@ -72,7 +72,7 @@ You SHOULD ask many questions, but each question must:
 * choose between meaningful tradeoffs.
 * not be answerable by non-mutating commands.
 
-Use the `request_user_input` tool only for decisions that materially change the plan, for confirming important assumptions, or for information that cannot be discovered via non-mutating exploration.
+Ask only for decisions that materially change the plan, for confirming important assumptions, or for information that cannot be discovered via non-mutating exploration.
 
 ## Two kinds of unknowns (treat differently)
 

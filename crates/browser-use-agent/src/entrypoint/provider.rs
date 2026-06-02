@@ -75,7 +75,6 @@ use crate::subagents::role::AgentConfigLayer;
 use crate::tools::approval::AskForApproval;
 use crate::tools::handlers::mcp::{McpClient, McpTool};
 use crate::tools::handlers::python::PythonBackend;
-use crate::tools::handlers::request_user_input::StoreRoundTripResponder;
 use crate::tools::orchestrator::{ToolOrchestrator, TurnEnv};
 use crate::tools::runtime::ToolCtx;
 use crate::tools::sandbox::{FileSystemSandboxPolicy, NoneSandboxProvider};
@@ -525,9 +524,9 @@ pub fn resolve_provider_with_tool_paths(
     // start the run's single Python worker EAGERLY here, then thread its backend
     // through. `start_python_backend` only runs once we know the route builds.
     //
-    // `user_input` is the (SharedStore, SessionId) the production `request_user_input`
-    // responder round-trips through (Some on the live run path, None for tests /
-    // headless callers — which fall back to the Echo auto-responder).
+    // `user_input` is the (SharedStore, SessionId) used by store-backed runtime
+    // tools for this session. It is Some on the live run path and None for tests /
+    // headless callers.
     resolve_provider_with_python(
         config,
         store,
@@ -660,9 +659,7 @@ fn resolve_provider_with_python(
 ///
 /// ## Which tools are wired here
 /// The registry registers the backend-free handlers — `shell`, `apply_patch`,
-/// `view_image`, `update_plan`, `request_user_input` (default
-/// [`EchoAutoResponder`](crate::tools::handlers::request_user_input::EchoAutoResponder)),
-/// `done`, `tool_search` (catalog populated from the registered tools' defs),
+/// `view_image`, `update_plan`, `done`, `tool_search` (catalog populated from the registered tools' defs),
 /// `web_search` (ENABLED; the Responses builder encodes it as the hosted
 /// `web_search_preview` tool) — plus the two product-surface tools that drive
 /// real subsystems:
@@ -758,9 +755,6 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
     use crate::tools::handlers::done::{DoneRequest, DoneTool};
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::{PythonRequest, PythonTool};
-    use crate::tools::handlers::request_user_input::{
-        RequestUserInputRequest, RequestUserInputTool,
-    };
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, ShellTool, WriteStdinRequest,
         WriteStdinTool,
@@ -833,23 +827,6 @@ fn build_tool_dispatcher_with_cwd_and_goal_store(
         definitions::update_plan(),
         false,
         UpdatePlanTool::new(),
-    );
-    // `request_user_input`: production path round-trips the question/answer
-    // through the session store so the TUI (or any consumer of the
-    // `request_user_input.requested` / `.response` control-channel events) can
-    // surface it to the operator and deliver the answer back. With no store /
-    // session available (tests, headless), fall back to the Echo auto-responder.
-    let request_user_input_tool = match &user_input {
-        Some((store, session_id)) => RequestUserInputTool::with_responder(Arc::new(
-            StoreRoundTripResponder::new(store.clone(), session_id.clone()),
-        )),
-        None => RequestUserInputTool::new(),
-    };
-    reg.register::<_, RequestUserInputRequest>(
-        "request_user_input",
-        definitions::request_user_input(),
-        false,
-        request_user_input_tool,
     );
     // `web_search` is ENABLED (hosted/provider-side). The OpenAI Responses
     // request builder encodes it as the hosted `{"type":"web_search_preview"}`
@@ -2509,7 +2486,7 @@ mod tests {
     /// exercised with a FAKE backend so no real worker is started.
     #[test]
     fn production_builder_accepts_injected_python_backend() {
-        // No MCP servers, no user-input store -> mcp tool absent, Echo responder.
+        // No MCP servers -> mcp tool absent.
         let config = ProviderRunConfig::new(ProviderBackend::Fake, "fake-model");
         let _dispatcher: Arc<RealToolDispatcher> =
             build_tool_dispatcher(Arc::new(MarkerPythonBackend), &config, None);
@@ -2528,6 +2505,10 @@ mod tests {
         assert!(
             !names.contains(&"mcp"),
             "no mcp tool without configured servers"
+        );
+        assert!(
+            !names.contains(&"request_user_input"),
+            "request_user_input is intentionally not exposed as a model tool"
         );
         // The other core tools are still present.
         assert!(names.contains(&"browser"));
