@@ -966,8 +966,13 @@ struct App {
     /// Session id of an agent we just spawned that's about to trigger Chrome's
     /// per-session "Allow remote debugging?" popup. While this is Some the
     /// modal stays open in its "click Allow in Chrome" hand-holding state and
-    /// auto-closes the moment `state.browser.status` flips to "connected".
+    /// auto-closes the moment a new `browser.connected` event lands on this
+    /// session (seq > `pending_chrome_per_session_baseline_seq`). Watching a
+    /// fresh event instead of `state.browser.status` avoids the mid-conversation
+    /// bug where a previous turn's "connected" status leaked through and
+    /// closed the modal before the new attach even started.
     pending_chrome_per_session_prompt: Option<String>,
+    pending_chrome_per_session_baseline_seq: Option<i64>,
 }
 
 /// Work that was paused mid-flight because `Surface::EnableDebuggingConfirm`
@@ -1859,6 +1864,7 @@ impl App {
             pending_local_chrome_debugging_setup_wait: false,
             last_local_chrome_debugging_poll: None,
             pending_chrome_per_session_prompt: None,
+            pending_chrome_per_session_baseline_seq: None,
         };
         app.refresh_cached_projection();
         if resumed_from_reexec {
@@ -2774,14 +2780,17 @@ impl App {
             self.pending_local_chrome_debugging_setup_wait = false;
             self.last_local_chrome_debugging_poll = None;
             self.pending_chrome_per_session_prompt = None;
-            // Esc out = same effect as Skip for any deferred work: don't leave
-            // the deferred session spinning, mark it failed so the user sees
-            // a clear "the agent didn't start" instead of a forever-loading row.
-            if let Some(action) = self.pending_post_debugging_action.take() {
-                let (PendingPostDebuggingAction::StartAgent { session_id }
-                | PendingPostDebuggingAction::ReconnectBrowser { session_id }) = &action;
+            self.pending_chrome_per_session_baseline_seq = None;
+            // Esc out = Skip for any deferred work. Only fail the session for
+            // StartAgent — that session was newly created with no agent
+            // thread to back it. A ReconnectBrowser action belongs to an
+            // existing active session; declining the reconnect must not kill
+            // the whole session.
+            if let Some(PendingPostDebuggingAction::StartAgent { session_id }) =
+                self.pending_post_debugging_action.take()
+            {
                 let _ = self.store.append_event(
-                    session_id,
+                    &session_id,
                     "session.status",
                     serde_json::json!({
                         "status": "failed",
@@ -5245,8 +5254,7 @@ impl App {
                 .map(|entry| entry.browser_name.as_str());
             let result = browser_use_browser::open_local_chrome_debugging_setup(hint);
             let notice = if result.opened {
-                "Opened Chrome's permission page. Check the box, and I'll resume."
-                    .to_string()
+                "Opened Chrome's permission page. Check the box, and I'll resume.".to_string()
             } else {
                 "Couldn't open Chrome's permission page from here. In Chrome, go to chrome://inspect and flip the switch — I'll pick it up.".to_string()
             };
@@ -5283,11 +5291,10 @@ impl App {
     }
 
     /// Auto-close the EnableDebuggingConfirm modal the instant the agent
-    /// records a successful CDP connect. The modal was kept open after the
-    /// user pressed Continue so we could hand-hold through Chrome's
-    /// per-session "Allow remote debugging?" popup; the moment that popup
-    /// is accepted, `state.browser.status` flips to "connected" and we
-    /// dismiss the modal.
+    /// records a FRESH `browser.connected` event on the session we're
+    /// hand-holding. "Fresh" means seq > baseline that we captured when the
+    /// per-session wait started; this avoids leftover "connected" state from
+    /// previous turns closing the modal before the new attach even runs.
     fn poll_pending_chrome_per_session_prompt(&mut self) -> Result<bool> {
         let Some(session_id) = self.pending_chrome_per_session_prompt.clone() else {
             return Ok(false);
@@ -5295,16 +5302,27 @@ impl App {
         if !matches!(self.surface, Surface::EnableDebuggingConfirm) {
             // Modal closed by something else (Cancel, Esc) — drop the watch.
             self.pending_chrome_per_session_prompt = None;
+            self.pending_chrome_per_session_baseline_seq = None;
             return Ok(false);
         }
-        if self.selected_session_id.as_deref() != Some(session_id.as_str()) {
-            return Ok(false);
-        }
-        let state = self.workbench_state()?;
-        if state.browser.status != "connected" {
+        let baseline = self.pending_chrome_per_session_baseline_seq;
+        let latest_connected_seq = self
+            .store
+            .events_for_session(&session_id)?
+            .iter()
+            .rev()
+            .find(|event| event.event_type == "browser.connected")
+            .map(|event| event.seq);
+        let is_fresh = match (latest_connected_seq, baseline) {
+            (Some(latest), Some(baseline)) => latest > baseline,
+            (Some(_), None) => true,
+            _ => false,
+        };
+        if !is_fresh {
             return Ok(false);
         }
         self.pending_chrome_per_session_prompt = None;
+        self.pending_chrome_per_session_baseline_seq = None;
         self.status_notice = Some("Connected to Chrome.".to_string());
         self.close_surface();
         Ok(true)
@@ -5355,6 +5373,7 @@ impl App {
         self.pending_local_chrome_debugging_setup_wait = false;
         self.last_local_chrome_debugging_poll = None;
         let was_awaiting_per_session = self.pending_chrome_per_session_prompt.take().is_some();
+        self.pending_chrome_per_session_baseline_seq = None;
         let resume_action = self.pending_post_debugging_action.take();
         // If the agent thread is already running and we'd just dismiss the
         // hand-holding modal, treat this as "close the modal, leave the agent
@@ -5373,19 +5392,25 @@ impl App {
                 .to_string(),
         );
         if let Some(action) = resume_action.as_ref() {
-            // Don't leave the deferred session stuck in `running` — flip it to
-            // `failed` with a reason so the user gets a clear "agent did not
-            // start" instead of a permanent spinner.
-            let (PendingPostDebuggingAction::StartAgent { session_id }
-            | PendingPostDebuggingAction::ReconnectBrowser { session_id }) = action;
-            self.store.append_event(
-                session_id,
-                "session.status",
-                serde_json::json!({
-                    "status": "failed",
-                    "reason": "local-chrome-debugging-disabled",
-                }),
-            )?;
+            match action {
+                // The deferred session was newly created with status=running
+                // and no agent thread spawned. Without flipping it to failed
+                // the row sits spinning forever.
+                PendingPostDebuggingAction::StartAgent { session_id } => {
+                    self.store.append_event(
+                        session_id,
+                        "session.status",
+                        serde_json::json!({
+                            "status": "failed",
+                            "reason": "local-chrome-debugging-disabled",
+                        }),
+                    )?;
+                }
+                // A reconnect request belongs to an existing, active session.
+                // The user is declining to reconnect the browser; that should
+                // not kill the session. Just close the modal.
+                PendingPostDebuggingAction::ReconnectBrowser { .. } => {}
+            }
             self.close_surface();
             return Ok(());
         }
@@ -5420,8 +5445,21 @@ impl App {
                     }
                     // Keep the modal open in its "click Allow on Chrome's
                     // popup" hand-holding state. `poll_pending_chrome_per_session_prompt`
-                    // closes it the moment the agent records browser.connected.
+                    // closes it the moment a NEW browser.connected event lands
+                    // (seq > baseline). The baseline is the latest
+                    // browser.connected seq this session has seen so far — a
+                    // previous turn's connected state must NOT trigger the
+                    // close, otherwise mid-conversation grants close the
+                    // modal before Chrome's actual per-session prompt fires.
+                    let baseline = self
+                        .store
+                        .events_for_session(&session_id)?
+                        .iter()
+                        .rev()
+                        .find(|event| event.event_type == "browser.connected")
+                        .map(|event| event.seq);
                     self.pending_chrome_per_session_prompt = Some(session_id.clone());
+                    self.pending_chrome_per_session_baseline_seq = baseline;
                     self.pending_local_chrome_debugging_setup_wait = false;
                     self.last_local_chrome_debugging_poll = None;
                     self.selected_row = 0;
@@ -10229,7 +10267,9 @@ mod redesign_tests {
 
         let screen = render_dump(&mut app)?;
 
-        assert!(screen.contains(BROWSER_USE_CLOUD));
+        // The bottom-border render display-transforms the legacy lowercase
+        // identifier into its branded form. See `composer_bottom_border`.
+        assert!(screen.contains("Browser Use Cloud"), "{screen}");
         Ok(())
     }
 

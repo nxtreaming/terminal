@@ -4278,7 +4278,16 @@ pub fn open_local_chrome_debugging_setup(
     browser_name_hint: Option<&str>,
 ) -> OpenLocalChromeDebuggingSetupResult {
     const URL: &str = "chrome://inspect/#remote-debugging";
-    let installs = known_local_browser_installs();
+    // `known_local_browser_installs` includes installs detected purely by the
+    // presence of a leftover `user_data_dir` (e.g. after the user uninstalled
+    // Chrome but didn't wipe `~/Library/Application Support/...`). Picking one
+    // of those would hand `chrome://` to a binary that doesn't exist —
+    // `open -a` fails, `Command::new(path).spawn()` fails — so filter to
+    // installs whose executable is actually on disk before selecting.
+    let installs: Vec<LocalBrowserInstall> = known_local_browser_installs()
+        .into_iter()
+        .filter(|install| install.browser_path.exists())
+        .collect();
     let target = browser_name_hint
         .and_then(|hint| installs.iter().find(|install| install.browser_name == hint))
         .or_else(|| {

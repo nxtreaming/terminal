@@ -2561,7 +2561,7 @@ fn enable_debugging_confirm_lines(app: &App) -> Vec<Line<'static>> {
         ]));
         lines.push(Line::from(""));
         lines.push(Line::from(
-            "  If Chrome asks 'Allow remote debugging?', click Allow.",
+            "  If Chrome asks 'Allow remote debugging?', click Allow. This may take up to 30 seconds to appear.",
         ));
         lines.push(Line::from(""));
         lines.push(selected("Cancel", 0, app.selected_row));
