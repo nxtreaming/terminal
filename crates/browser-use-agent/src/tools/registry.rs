@@ -20,20 +20,21 @@
 //! registry maps an advertised name to `(handler, spec)`: the spec is not
 //! derived from the handler trait either.
 //!
-//! ## All ten handlers register (registry gap closed)
+//! ## Default handlers register (registry gap closed)
 //!
 //! [`register`](ToolRegistry::register) requires the handler's `Req` to be
 //! [`DeserializeOwned`] so the registry can build it from the model-emitted JSON
-//! `input`. All ten handlers now satisfy that, so ALL TEN register via the single
-//! [`register`](ToolRegistry::register) path:
+//! `input`. The default callable handlers satisfy that, so they register via the
+//! single [`register`](ToolRegistry::register) path:
 //!
-//! * EIGHT have a `Req` that maps DIRECTLY to the model's argument object: the
-//!   four originally-`Deserialize` tools (`update_plan`, `request_user_input`,
-//!   `tool_search`, `web_search`) plus `shell` ([`ShellRequest`]),
+//! * TEN have a `Req` that maps DIRECTLY to the model's argument object: the
+//!   three originally-`Deserialize` tools (`update_plan`, `tool_search`,
+//!   `web_search`) plus `shell` ([`ShellRequest`]),
 //!   `apply_patch` ([`ApplyPatchRequest`]), `view_image` ([`ViewImageRequest`]),
-//!   and `python` ([`PythonRequest`]) — each now derives `serde::Deserialize`
-//!   with `#[serde(default)]` on the carried-but-optional plumbing fields so the
-//!   MODEL's argument object deserializes cleanly.
+//!   `python` ([`PythonRequest`]), `done`, and the unified exec helpers — each
+//!   now derives `serde::Deserialize` with `#[serde(default)]` on the
+//!   carried-but-optional plumbing fields so the MODEL's argument object
+//!   deserializes cleanly.
 //! * TWO carry a PARSED / namespaced `Req` that is not a direct match for the
 //!   model's JSON: `browser` ([`BrowserRequest`]) and `mcp`
 //!   ([`McpToolCallRequest`]). Each defines a small `Deserialize`-able wire-args
@@ -44,7 +45,8 @@
 //!
 //! See [`crate::tools::registry::definitions`] for the per-tool
 //! [`ToolDefinition`] (name + description + input schema) supplied at
-//! registration, and [`default_registry`] for a registry preloaded with all ten.
+//! registration, and [`default_registry`] for a registry preloaded with the
+//! default callable tool set.
 //!
 //! [`ShellRequest`]: crate::tools::handlers::shell::ShellRequest
 //! [`ApplyPatchRequest`]: crate::tools::handlers::apply_patch::ApplyPatchRequest
@@ -632,7 +634,7 @@ where
     }
 }
 
-/// Model-facing [`ToolDefinition`] builders for each of the ten handlers.
+/// Model-facing [`ToolDefinition`] builders.
 ///
 /// The registry takes a tool's name + description + input schema at registration
 /// (it does NOT derive them from the handler trait — see the module docs). These
@@ -1071,85 +1073,6 @@ to the single frame that proves the task succeeded."
                 },
                 "required": ["plan"],
                 "additionalProperties": true
-            }),
-            output_schema: None,
-            namespace: None,
-            namespace_description: None,
-        }
-    }
-
-    /// `request_user_input`: ask the user one to three short questions, each with
-    /// mutually-exclusive options, and pause until they respond.
-    ///
-    /// Parity: codex `RequestUserInputArgs { questions:
-    /// Vec<RequestUserInputQuestion> }` (`protocol/src/request_user_input.rs`),
-    /// where each question carries `id`, `header`, `question`, the camelCase
-    /// `isOther` / `isSecret` flags, and an `options` array of `{ label,
-    /// description }`. The schema MUST match what the handler actually accepts —
-    /// [`RequestUserInputRequest`](crate::tools::handlers::request_user_input::RequestUserInputRequest),
-    /// which deserializes `{ "questions": [...] }`, NOT a flat `{ "prompt": ... }`
-    /// (the old schema advertised a shape the handler rejects — a real
-    /// correctness bug).
-    pub fn request_user_input() -> ToolDefinition {
-        ToolDefinition {
-            name: "request_user_input".to_string(),
-            description: "Ask the user one to three short questions (each with \
-                          mutually-exclusive options) and pause until they respond."
-                .to_string(),
-            input_schema: json!({
-                "type": "object",
-                "properties": {
-                    "questions": {
-                        "type": "array",
-                        "description": "The questions to show the user (prefer 1, do not exceed 3).",
-                        "items": {
-                            "type": "object",
-                            "properties": {
-                                "id": {
-                                    "type": "string",
-                                    "description": "Stable snake_case identifier for mapping the answer."
-                                },
-                                "header": {
-                                    "type": "string",
-                                    "description": "Short header label shown in the UI (12 or fewer chars)."
-                                },
-                                "question": {
-                                    "type": "string",
-                                    "description": "Single-sentence prompt shown to the user."
-                                },
-                                "isOther": {
-                                    "type": "boolean",
-                                    "description": "Whether to add a free-form \"Other\" option (forced true on normalize)."
-                                },
-                                "isSecret": {
-                                    "type": "boolean",
-                                    "description": "Whether the answer is a secret (masked input)."
-                                },
-                                "options": {
-                                    "type": "array",
-                                    "description": "The mutually-exclusive choices (required, non-empty).",
-                                    "items": {
-                                        "type": "object",
-                                        "properties": {
-                                            "label": {
-                                                "type": "string",
-                                                "description": "User-facing label (1-5 words)."
-                                            },
-                                            "description": {
-                                                "type": "string",
-                                                "description": "One short sentence explaining the impact if selected."
-                                            }
-                                        },
-                                        "required": ["label", "description"]
-                                    }
-                                }
-                            },
-                            "required": ["id", "header", "question", "options"]
-                        }
-                    }
-                },
-                "required": ["questions"],
-                "additionalProperties": false
             }),
             output_schema: None,
             namespace: None,
@@ -1978,10 +1901,10 @@ Agent-role guidance below only helps choose which agent to use after spawning is
     }
 }
 
-/// Build a [`ToolRegistry`] preloaded with all eleven handlers, each carrying its
+/// Build a [`ToolRegistry`] preloaded with the default callable handlers, each carrying its
 /// parity-grounded [`ToolDefinition`] and static `parallel_safe` flag.
 ///
-/// This is the single place the dispatch loop wires the full tool set. Nine
+/// This is the single place the dispatch loop wires the full tool set. Most
 /// tools register directly; `browser` and `mcp` register via
 /// [`register_with_wire`](ToolRegistry::register_with_wire) over their
 /// `WireArgs` types. The browser/python/mcp handlers need an injected backend
@@ -1989,9 +1912,9 @@ Agent-role guidance below only helps choose which agent to use after spawning is
 ///
 /// `parallel_safe` per tool: `exec_command` / `tool_search` / `web_search` =
 /// `true`; `shell` / `apply_patch` / `view_image` / `browser` / `python` /
-/// `update_plan` / `request_user_input` = `false` (serial). `mcp` is registered
-/// `false` here (a serial default); its per-request read-only hint still drives
-/// the handler's own [`ToolRuntime::parallel_safe`](crate::tools::ToolRuntime::parallel_safe).
+/// `update_plan` / `done` = `false` (serial). `mcp` is registered `false` here
+/// (a serial default); its per-request read-only hint still drives the handler's
+/// own [`ToolRuntime::parallel_safe`](crate::tools::ToolRuntime::parallel_safe).
 #[allow(clippy::too_many_arguments)]
 pub fn default_registry<S, A>(
     shell: crate::tools::handlers::shell::ShellTool,
@@ -2001,7 +1924,6 @@ pub fn default_registry<S, A>(
     python: crate::tools::handlers::python::PythonTool,
     mcp: crate::tools::handlers::mcp::McpTool,
     update_plan: crate::tools::handlers::update_plan::UpdatePlanTool,
-    request_user_input: crate::tools::handlers::request_user_input::RequestUserInputTool,
     tool_search: crate::tools::handlers::tool_search::ToolSearchTool,
     web_search: crate::tools::handlers::web_search::WebSearchTool,
     done: crate::tools::handlers::done::DoneTool,
@@ -2015,7 +1937,6 @@ where
     use crate::tools::handlers::done::DoneRequest;
     use crate::tools::handlers::mcp::McpToolCallRequest;
     use crate::tools::handlers::python::PythonRequest;
-    use crate::tools::handlers::request_user_input::RequestUserInputRequest;
     use crate::tools::handlers::shell::{
         ExecCommandRequest, ExecCommandTool, ShellRequest, WriteStdinRequest, WriteStdinTool,
     };
@@ -2059,12 +1980,6 @@ where
         definitions::update_plan(),
         false,
         update_plan,
-    );
-    reg.register::<_, RequestUserInputRequest>(
-        "request_user_input",
-        definitions::request_user_input(),
-        false,
-        request_user_input,
     );
     reg.register::<_, ToolSearchRequest>(
         "tool_search",

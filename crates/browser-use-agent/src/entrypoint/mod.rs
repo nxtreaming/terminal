@@ -2240,8 +2240,8 @@ async fn run_session_once_with_config_with_cancel(
     // Thread the run's credential store into provider resolution so API keys (and
     // codex tokens) resolve env-first, then from the stored `auth.<provider>.*`
     // settings the `auth login` command writes (fixes the env-only regression).
-    // Provider/tool construction also builds live goal/request-input helpers that
-    // lock the SharedStore, so do not hold the shared mutex while resolving.
+    // Provider/tool construction builds live store-backed helpers that lock the
+    // SharedStore, so do not hold the shared mutex while resolving.
     let user_input_ctx = Some((Arc::clone(&store), session_id.clone()));
     let (state_dir, tool_cwd, tool_artifact_root) = {
         let store_guard = store.lock().expect("store mutex poisoned");

@@ -6,10 +6,8 @@
 //! seam. It implements the full trait stack ([`Approvable`] + [`Sandboxable`] +
 //! [`ToolRuntime`]) so it can be driven by the
 //! [`ToolOrchestrator`](crate::tools::orchestrator::ToolOrchestrator), mirroring
-//! the `update_plan` / `request_user_input` tools' structure
-//! (`tools/handlers/update_plan.rs`, `tools/handlers/request_user_input.rs`): a
-//! non-FS, accept-and-return tool that touches no filesystem and spawns no
-//! process.
+//! the `update_plan` tool's structure: a non-FS, accept-and-return tool that
+//! touches no filesystem and spawns no process.
 //!
 //! # What this tool does (and does NOT) do
 //!
@@ -104,9 +102,8 @@ impl DoneTool {
 }
 
 /// Approval key: the final text identifies a call for session caching, mirroring
-/// the shape the other non-FS tools use (`update_plan.rs:207-210`,
-/// `request_user_input.rs:319-322`). This tool never prompts (it is benign), so
-/// the key is rarely consulted; it exists to satisfy [`Approvable`] uniformly.
+/// the shape the other non-FS tools use. This tool never prompts (it is benign),
+/// so the key is rarely consulted; it exists to satisfy [`Approvable`] uniformly.
 #[derive(serde::Serialize, Clone, Debug, Eq, PartialEq, Hash)]
 pub struct DoneApprovalKey {
     text: Option<String>,
@@ -122,7 +119,7 @@ impl Approvable<DoneRequest> for DoneTool {
     }
 
     /// `done` touches no filesystem; request the default sandbox permissions (no
-    /// escalation), mirroring the update_plan / request_user_input tools.
+    /// escalation), mirroring the other non-FS tools.
     fn sandbox_permissions(&self, _req: &DoneRequest) -> SandboxPermissions {
         SandboxPermissions::UseDefault
     }

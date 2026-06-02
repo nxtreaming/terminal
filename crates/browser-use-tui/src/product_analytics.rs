@@ -20,7 +20,6 @@ pub use browser_use_agent::infra::analytics::capture_async;
 
 pub const MESSAGE_KIND_INITIAL: &str = "initial";
 pub const MESSAGE_KIND_FOLLOWUP: &str = "followup";
-pub const MESSAGE_KIND_REQUEST_INPUT_RESPONSE: &str = "request_input_response";
 pub const BLOCKED_REASON_NO_AUTH: &str = "no_auth";
 
 const APPROX_CHARS_PER_TOKEN: usize = 4;
