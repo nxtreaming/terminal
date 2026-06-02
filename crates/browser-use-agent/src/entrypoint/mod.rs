@@ -2240,13 +2240,12 @@ async fn run_session_once_with_config_with_cancel(
     // Thread the run's credential store into provider resolution so API keys (and
     // codex tokens) resolve env-first, then from the stored `auth.<provider>.*`
     // settings the `auth login` command writes (fixes the env-only regression).
-    // The store read happens under the shared lock for the duration of resolution.
-    // The production `request_user_input` responder round-trips through the
-    // session store, so hand resolution a clone of the SharedStore handle + the
-    // session id (separate from the borrowed guard used for credential reads).
+    // Provider/tool construction also builds live goal/request-input helpers that
+    // lock the SharedStore, so do not hold the shared mutex while resolving.
     let user_input_ctx = Some((Arc::clone(&store), session_id.clone()));
-    let resolved = {
+    let (state_dir, tool_cwd, tool_artifact_root) = {
         let store_guard = store.lock().expect("store mutex poisoned");
+        let state_dir = store_guard.state_dir().to_path_buf();
         let session_meta = store_guard.load_session(session_id.as_str())?;
         let tool_cwd = session_meta
             .as_ref()
@@ -2256,19 +2255,21 @@ async fn run_session_once_with_config_with_cancel(
             .as_ref()
             .map(|session| std::path::PathBuf::from(&session.artifact_root))
             .unwrap_or_else(|| tool_cwd.clone());
-        provider::resolve_provider_with_tool_paths(
-            &config,
-            Some(&store_guard),
-            driver_sink,
-            ctx.clone(),
-            max_retries(&config),
-            fusion_recorder,
-            user_input_ctx,
-            tool_cwd,
-            tool_artifact_root,
-        )
-        .map_err(|e| anyhow::anyhow!("{e}"))?
+        (state_dir, tool_cwd, tool_artifact_root)
     };
+    let provider_store = Store::open(&state_dir)?;
+    let resolved = provider::resolve_provider_with_tool_paths(
+        &config,
+        Some(&provider_store),
+        driver_sink,
+        ctx.clone(),
+        max_retries(&config),
+        fusion_recorder,
+        user_input_ctx,
+        tool_cwd,
+        tool_artifact_root,
+    )
+    .map_err(|e| anyhow::anyhow!("{e}"))?;
 
     // (2) seed the environment workspace-context durable event (de-duped per kind).
     let env_content = environment_context_content(&config);
