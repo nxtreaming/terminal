@@ -1509,7 +1509,10 @@ fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
     }
     let inner_w = width.saturating_sub(2) as usize;
     let mut spans: Vec<Span<'static>> = vec![Span::styled("╰", border())];
-    let browser = app.browser.trim();
+    let browser = match app.browser.trim() {
+        "Browser Use cloud" => "Browser Use Cloud",
+        other => other,
+    };
     if !browser.is_empty() {
         // ` browser ` with one cell of dash padding on each side, so the
         // background dashes hug right up to the spaces around the tag.
