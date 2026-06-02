@@ -1266,7 +1266,7 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::ApiKey => ("API key", "Enter your provider API key"),
         Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
         Surface::Model => ("Model", "Choose the model and provider for this session"),
-        Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
+        Surface::Mode => ("Mode", "Default execution mode is active"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
         Surface::EnableDebuggingConfirm => ("Chrome", ""),
@@ -1616,14 +1616,8 @@ fn slash_palette_rows(app: &App, width: usize) -> Vec<Line<'static>> {
         .collect()
 }
 
-fn slash_palette_item_description(app: &App, item: &palette::PaletteItem) -> &'static str {
-    if item.action == palette::PaletteAction::PlanMode
-        && app.collaboration_mode == CollaborationModeKind::Plan
-    {
-        "switch off Plan mode"
-    } else {
-        item.description
-    }
+fn slash_palette_item_description(_app: &App, item: &palette::PaletteItem) -> &'static str {
+    item.description
 }
 
 /// Fallback budget for older sessions that predate Codex-style `token_count`
@@ -2447,22 +2441,13 @@ fn fixed_width_cell(value: &str, width: usize) -> String {
 }
 
 fn mode_lines(app: &App) -> Vec<Line<'static>> {
-    vec![
-        mode_row(
-            0,
-            app,
-            CollaborationModeKind::Default,
-            "Default",
-            "execute tasks and update TODOs",
-        ),
-        mode_row(
-            1,
-            app,
-            CollaborationModeKind::Plan,
-            "Plan",
-            "propose a plan before implementation",
-        ),
-    ]
+    vec![mode_row(
+        0,
+        app,
+        CollaborationModeKind::Default,
+        "Default",
+        "execute tasks and update TODOs",
+    )]
 }
 
 fn mode_row(

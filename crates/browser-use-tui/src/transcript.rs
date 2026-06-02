@@ -1,4 +1,3 @@
-use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_protocol::{
     normalize_result_text, turn_streaming_text_from_events, EventRecord, SessionMeta,
     WorkbenchState,
@@ -78,9 +77,6 @@ enum TranscriptKind {
     StreamingAssistant {
         markdown: String,
     },
-    ProposedPlan {
-        markdown: String,
-    },
     ResultFile {
         file_path: String,
         bytes: Option<u64>,
@@ -149,7 +145,6 @@ impl TranscriptNode {
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown_cell_lines(markdown, width, mode)
             }
-            TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
             TranscriptKind::ResultFile {
                 file_path,
                 bytes,
@@ -212,11 +207,6 @@ impl TranscriptNode {
             }
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown.lines().map(str::to_string).collect()
-            }
-            TranscriptKind::ProposedPlan { markdown } => {
-                let mut out = vec!["Proposed Plan".to_string()];
-                out.extend(markdown.lines().map(str::to_string));
-                out
             }
             TranscriptKind::ResultFile {
                 file_path,
@@ -388,7 +378,6 @@ impl TranscriptNode {
                 }
                 lines
             }
-            TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
             _ => self.display_lines(width, DisplayMode::Active),
         }
     }
@@ -403,7 +392,6 @@ impl TranscriptNode {
             TranscriptKind::StreamingAssistant { markdown } => {
                 markdown_cell_lines(markdown, width, DisplayMode::Active)
             }
-            TranscriptKind::ProposedPlan { markdown } => proposed_plan_lines(markdown, width),
             _ => Vec::new(),
         }
     }
@@ -676,7 +664,6 @@ fn gap_lines_between(previous: &TranscriptKind, next: &TranscriptKind) -> usize 
         (
             TranscriptKind::Prompt { .. } | TranscriptKind::PendingStatus { .. },
             TranscriptKind::Assistant { .. }
-            | TranscriptKind::ProposedPlan { .. }
             | TranscriptKind::ResultFile { .. }
             | TranscriptKind::StreamingAssistant { .. }
             | TranscriptKind::Error { .. }
@@ -771,15 +758,7 @@ fn committed_node_for_event(
         }
         "model.turn.response" => pre_tool_commentary_node(root, events, event),
         "model.response.continued" => continued_response_commentary_node(root, events, event),
-        "plan.proposed" => {
-            let text = payload_string(event, "text")?;
-            Some(TranscriptNode {
-                id,
-                seq: event.seq,
-                revision: event.seq.max(0) as u64,
-                kind: TranscriptKind::ProposedPlan { markdown: text },
-            })
-        }
+        "plan.proposed" => None,
         "session.failed" => {
             let text =
                 payload_string(event, "error").unwrap_or_else(|| "The task failed.".to_string());
@@ -1389,28 +1368,14 @@ fn active_node_for_session(
 
     if let Some(text) = live_streaming_text {
         let seq = events.last().map(|event| event.seq).unwrap_or_default();
-        let mode = collaboration_mode_from_events(events);
-        let (visible_text, proposed_plan) = if mode == CollaborationModeKind::Plan {
-            split_proposed_plan_blocks(text)
-        } else {
-            (text.to_string(), None)
-        };
-        if !visible_text.trim().is_empty() {
+        if !text.trim().is_empty() {
             active_nodes.push(TranscriptNode {
                 id: format!("{}:active-stream", root.id),
                 seq,
                 revision: seq.max(0) as u64,
                 kind: TranscriptKind::StreamingAssistant {
-                    markdown: visible_text,
+                    markdown: text.to_string(),
                 },
-            });
-        }
-        if let Some(plan) = proposed_plan.filter(|plan| !plan.trim().is_empty()) {
-            active_nodes.push(TranscriptNode {
-                id: format!("{}:active-plan", root.id),
-                seq,
-                revision: seq.max(0) as u64,
-                kind: TranscriptKind::ProposedPlan { markdown: plan },
             });
         }
     }
@@ -2391,79 +2356,6 @@ fn markdown_cell_lines(markdown: &str, width: u16, mode: DisplayMode) -> Vec<Lin
     lines
 }
 
-fn proposed_plan_lines(markdown: &str, width: u16) -> Vec<Line<'static>> {
-    let plan_lines = markdown_cell_lines(
-        markdown,
-        width.saturating_sub(2).max(1),
-        DisplayMode::Active,
-    )
-    .into_iter()
-    .map(|line| {
-        let mut spans = vec![Span::styled("  ".to_string(), muted())];
-        spans.extend(line.spans);
-        Line::from(spans)
-    })
-    .collect::<Vec<_>>();
-    let mut out = vec![Line::from(Span::styled("Proposed Plan", accent()))];
-    out.extend(plan_lines);
-    out
-}
-
-fn split_proposed_plan_blocks(text: &str) -> (String, Option<String>) {
-    let mut visible = String::new();
-    let mut latest_plan = None;
-    let mut current_plan = String::new();
-    let mut in_plan = false;
-    let mut saw_plan = false;
-
-    for line in text.split_inclusive('\n') {
-        let line_without_newline = line.strip_suffix('\n').unwrap_or(line);
-        let slug = line_without_newline.trim_start().trim_end();
-        if !in_plan && slug == "<proposed_plan>" {
-            in_plan = true;
-            saw_plan = true;
-            current_plan.clear();
-            continue;
-        }
-        if in_plan && slug == "</proposed_plan>" {
-            in_plan = false;
-            latest_plan = Some(current_plan.clone());
-            continue;
-        }
-        if in_plan {
-            current_plan.push_str(line);
-        } else {
-            visible.push_str(line);
-        }
-    }
-
-    if in_plan && saw_plan {
-        latest_plan = Some(current_plan);
-    }
-    (visible, latest_plan)
-}
-
-fn collaboration_mode_from_events(events: &[EventRecord]) -> CollaborationModeKind {
-    events
-        .iter()
-        .rev()
-        .find_map(|event| {
-            if event.event_type != "session.collaboration_mode" {
-                return None;
-            }
-            match event
-                .payload
-                .get("mode")
-                .and_then(serde_json::Value::as_str)
-            {
-                Some("plan") => Some(CollaborationModeKind::Plan),
-                Some("default") => Some(CollaborationModeKind::Default),
-                _ => None,
-            }
-        })
-        .unwrap_or(CollaborationModeKind::Default)
-}
-
 fn source_display_lines(source: &str, width: u16) -> Vec<Line<'static>> {
     let prefix = "source ";
     let first_width = width.saturating_sub(prefix.chars().count() as u16).max(1);
@@ -3428,21 +3320,6 @@ mod tests {
             .collect::<String>()
             .trim_end()
             .to_string()
-    }
-
-    fn test_workbench_state() -> WorkbenchState {
-        WorkbenchState {
-            setup_complete: true,
-            current_session: None,
-            task: None,
-            result: None,
-            failure: None,
-            activity: Vec::new(),
-            transcript: Vec::new(),
-            browser: Default::default(),
-            telemetry: Default::default(),
-            history: Vec::new(),
-        }
     }
 
     #[test]
