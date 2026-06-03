@@ -5767,6 +5767,7 @@ impl App {
         self.browser = (*choice).to_string();
         self.track_browser_selected();
         self.persist_runtime_settings()?;
+        self.append_browser_backend_change_if_needed(&previous_browser)?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             self.status_notice = Some(
                 "Browser Use Cloud key is required before cloud browser tasks can run.".to_string(),
@@ -5774,7 +5775,6 @@ impl App {
             self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(());
         }
-        self.append_browser_backend_change_if_needed(&previous_browser)?;
         self.status_notice = Some(format!("Browser set to {}.", self.browser));
         if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
             self.complete_setup()?;
@@ -5820,8 +5820,10 @@ impl App {
             self.store
                 .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, secret.trim())?;
             if !return_to_cookie_sync {
+                let previous_browser = self.browser.clone();
                 self.browser = BROWSER_USE_CLOUD.to_string();
                 self.persist_runtime_settings()?;
+                self.append_browser_backend_change_if_needed(&previous_browser)?;
             }
             self.api_key_account = None;
             self.pending_cookie_sync_after_auth = false;
@@ -10204,6 +10206,87 @@ mod redesign_tests {
                 Some(session_id.as_str()),
                 "pending_auth_resume should point to the nudge session"
             );
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn switching_to_cloud_without_key_records_backend_change_before_auth() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let session = app.store.create_session(None, std::env::current_dir()?)?;
+            app.store.append_event(
+                &session.id,
+                "browser.state",
+                serde_json::json!({"url": "https://example.com", "title": "Example"}),
+            )?;
+            app.selected_session_id = Some(session.id.clone());
+            app.open_surface(Surface::BrowserSelect);
+            app.selected_row = BROWSER_CHOICES
+                .iter()
+                .position(|browser| *browser == BROWSER_USE_CLOUD)
+                .context("cloud browser choice")?;
+
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+            assert_eq!(app.surface, Surface::ApiKey);
+            assert_eq!(app.api_key_account.as_deref(), Some(BROWSER_USE_CLOUD));
+
+            let events = app.store.events_for_session(&session.id)?;
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == "browser.backend_changed"));
+            let state = app.workbench_state()?;
+            assert_eq!(state.browser.backend, BROWSER_USE_CLOUD);
+            assert_eq!(state.browser.url, None);
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
+    fn saving_cloud_key_records_backend_change_when_it_selects_cloud() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+            let session = app.store.create_session(None, std::env::current_dir()?)?;
+            app.store.append_event(
+                &session.id,
+                "browser.state",
+                serde_json::json!({"url": "https://example.com", "title": "Example"}),
+            )?;
+            app.selected_session_id = Some(session.id.clone());
+
+            app.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
+            app.set_input("bu-test-key".to_string());
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+
+            let events = app.store.events_for_session(&session.id)?;
+            assert!(events
+                .iter()
+                .any(|event| event.event_type == "browser.backend_changed"));
+            let state = app.workbench_state()?;
+            assert_eq!(state.browser.backend, BROWSER_USE_CLOUD);
+            assert_eq!(state.browser.url, None);
             Ok(())
         })();
         if let Some(value) = saved {
