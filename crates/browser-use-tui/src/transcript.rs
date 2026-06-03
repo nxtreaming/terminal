@@ -1,10 +1,11 @@
 use browser_use_protocol::{
     normalize_result_text, turn_streaming_text_from_events, EventRecord, SessionMeta,
-    WorkbenchState,
+    SessionStatus, WorkbenchState,
 };
 use browser_use_store::now_ms;
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
+use std::cell::RefCell;
 use std::path::{Path, PathBuf};
 use unicode_width::UnicodeWidthChar;
 
@@ -26,6 +27,10 @@ const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
 const GROUP_VALUE_LAST_PREFIX: &str = "  └ ";
 const ACTIVE_FALLBACK_STATUS: &str = "running browser task";
 const LIVE_STREAM_QUIET_STATUS_DELAY_MS: i64 = 500;
+/// Mirror of the agent crate's `pub(crate)` rollback event type. Used only to
+/// decide whether the rollback-filtered event buffer can be extended in place
+/// (append-only, no rollback) or must be rebuilt from scratch.
+const SESSION_ROLLBACK_EVENT_TYPE: &str = "session.rollback";
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(crate) enum DisplayMode {
@@ -40,13 +45,142 @@ pub(crate) struct TranscriptModel {
     terminal_committed: Vec<TranscriptNode>,
     pub(crate) active: Option<TranscriptNode>,
     pub(crate) last_event_seq: i64,
-    pub(crate) revision: u64,
     live_phase: usize,
 }
 
 pub(crate) struct TerminalScrollbackEmission {
     pub(crate) lines: Vec<Line<'static>>,
     pub(crate) last_seq: i64,
+}
+
+#[derive(Default)]
+pub(crate) struct TranscriptModelCache {
+    entry: RefCell<Option<CachedTranscriptModel>>,
+}
+
+struct CachedTranscriptModel {
+    key: TranscriptModelCacheKey,
+    model: TranscriptModel,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct TranscriptModelCacheKey {
+    session_id: String,
+    session_status: SessionStatus,
+    state_revision: u64,
+    event_count: usize,
+    last_event_seq: i64,
+    native_scrollback_active: bool,
+    native_history_last_seq: i64,
+}
+
+impl TranscriptModelCache {
+    fn with_model<R>(
+        &self,
+        key: TranscriptModelCacheKey,
+        live_phase: usize,
+        build: impl FnOnce() -> TranscriptModel,
+        read: impl FnOnce(&TranscriptModel) -> R,
+    ) -> R {
+        {
+            let mut cached = self.entry.borrow_mut();
+            if let Some(entry) = cached.as_mut().filter(|entry| entry.key == key) {
+                entry.model.live_phase = live_phase;
+                return read(&entry.model);
+            }
+        }
+
+        let model = build();
+        let mut cached = self.entry.borrow_mut();
+        *cached = Some(CachedTranscriptModel { key, model });
+        let entry = cached.as_ref().expect("transcript cache populated");
+        read(&entry.model)
+    }
+}
+
+/// Caches the rollback-filtered, owned event buffer for the current session.
+///
+/// `build_transcript_model` used to clone *every* event in the session on every
+/// frame (`rollback_filtered_event_records(..).cloned().collect()`). During a
+/// streaming session the model cache misses each frame (new tokens bump the
+/// event count), so that O(events) deep clone ran on every keystroke and grew
+/// with session length — the dominant typing-latency cost.
+///
+/// Rollback filtering of an append-only event log is itself append-only as long
+/// as no new event is a rollback: the filtered list for `raw[..n+k]` is the
+/// filtered list for `raw[..n]` plus the new non-rollback events. So when the
+/// raw log only grew (same prefix, no rollback in the new tail) we clone just
+/// the new events and extend the cached buffer; otherwise we rebuild it.
+#[derive(Default)]
+pub(crate) struct FilteredEventCache {
+    entry: RefCell<Option<FilteredEventEntry>>,
+}
+
+struct FilteredEventEntry {
+    session_id: String,
+    raw_len: usize,
+    raw_last_seq: i64,
+    filtered: Vec<EventRecord>,
+}
+
+impl FilteredEventCache {
+    /// Refresh the cached buffer for `session_id`/`raw` and run `read` against
+    /// the rollback-filtered events. Equivalent to passing
+    /// `rollback_filtered_event_records(raw).cloned().collect()` but reusing the
+    /// previous buffer when the log only grew without a rollback.
+    fn with_filtered<R>(
+        &self,
+        session_id: &str,
+        raw: &[EventRecord],
+        read: impl FnOnce(&[EventRecord]) -> R,
+    ) -> R {
+        self.refresh(session_id, raw);
+        let entry = self.entry.borrow();
+        read(&entry.as_ref().expect("filtered cache populated").filtered)
+    }
+
+    fn refresh(&self, session_id: &str, raw: &[EventRecord]) {
+        let mut slot = self.entry.borrow_mut();
+        let can_extend = slot.as_ref().is_some_and(|entry| {
+            entry.session_id == session_id
+                && entry.raw_len > 0
+                && raw.len() >= entry.raw_len
+                // The event at the previous boundary is unchanged (the log is
+                // append-only with unique, increasing seq), so the existing
+                // filtered prefix still holds.
+                && raw.get(entry.raw_len - 1).map(|event| event.seq) == Some(entry.raw_last_seq)
+                // No rollback in the new tail — otherwise the filtered prefix
+                // would be truncated and the in-place extend would be wrong.
+                && raw[entry.raw_len..]
+                    .iter()
+                    .all(|event| event.event_type != SESSION_ROLLBACK_EVENT_TYPE)
+        });
+
+        if can_extend {
+            let entry = slot.as_mut().expect("can_extend implies populated");
+            if raw.len() > entry.raw_len {
+                entry.filtered.extend(raw[entry.raw_len..].iter().cloned());
+                entry.raw_len = raw.len();
+                entry.raw_last_seq = raw
+                    .last()
+                    .map(|event| event.seq)
+                    .unwrap_or(entry.raw_last_seq);
+            }
+            return;
+        }
+
+        let filtered =
+            browser_use_agent::context::workspace_context::rollback_filtered_event_records(raw)
+                .into_iter()
+                .cloned()
+                .collect::<Vec<_>>();
+        *slot = Some(FilteredEventEntry {
+            session_id: session_id.to_string(),
+            raw_len: raw.len(),
+            raw_last_seq: raw.last().map(|event| event.seq).unwrap_or_default(),
+            filtered,
+        });
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -428,19 +562,70 @@ impl TranscriptNode {
 }
 
 pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<TranscriptModel> {
+    with_transcript_model(app, state, |model| model.clone())
+}
+
+pub(crate) fn with_transcript_model<R>(
+    app: &App,
+    state: &WorkbenchState,
+    read: impl FnOnce(&TranscriptModel) -> R,
+) -> Option<R> {
     let session = state.current_session.as_ref()?;
     let raw_events = app.cached_events_for_session(&session.id);
     let last_event_seq = raw_events.last().map(|event| event.seq).unwrap_or_default();
-    let events =
-        browser_use_agent::context::workspace_context::rollback_filtered_event_records(raw_events)
-            .into_iter()
-            .cloned()
-            .collect::<Vec<_>>();
-    let events = events.as_slice();
+    let native_scrollback_active = app.native_scrollback_is_active();
+    let cache_key = TranscriptModelCacheKey {
+        session_id: session.id.clone(),
+        session_status: session.status.clone(),
+        state_revision: app.state_cache.revision,
+        event_count: raw_events.len(),
+        last_event_seq,
+        native_scrollback_active,
+        native_history_last_seq: if native_scrollback_active {
+            app.native_history.last_seq
+        } else {
+            0
+        },
+    };
+    Some(app.transcript_model_cache.with_model(
+        cache_key,
+        app.live_spinner_frame,
+        || build_transcript_model(app, state, session, raw_events, last_event_seq),
+        read,
+    ))
+}
+
+fn build_transcript_model(
+    app: &App,
+    state: &WorkbenchState,
+    session: &SessionMeta,
+    raw_events: &[EventRecord],
+    last_event_seq: i64,
+) -> TranscriptModel {
+    // The rollback-filtered owned event buffer is cached and extended in place
+    // (see `FilteredEventCache`) instead of re-cloning every event each frame.
+    app.transcript_filtered_cache
+        .with_filtered(&session.id, raw_events, |events| {
+            build_transcript_model_from_events(app, state, session, events, last_event_seq)
+        })
+}
+
+fn build_transcript_model_from_events(
+    app: &App,
+    state: &WorkbenchState,
+    session: &SessionMeta,
+    events: &[EventRecord],
+    last_event_seq: i64,
+) -> TranscriptModel {
     let mut committed = Vec::new();
     let mut terminal_committed = Vec::new();
+    let commit_after_seq = if app.native_scrollback_is_active() {
+        app.native_history.last_seq
+    } else {
+        0
+    };
 
-    for event in events {
+    for event in events.iter().filter(|event| event.seq > commit_after_seq) {
         if let Some(node) = committed_node_for_event(app, state, session, events, event) {
             terminal_committed.push(node.clone());
             push_committed_node(&mut committed, node);
@@ -453,16 +638,14 @@ pub(crate) fn transcript_model(app: &App, state: &WorkbenchState) -> Option<Tran
         None
     };
 
-    let revision = last_event_seq.max(0) as u64;
-    Some(TranscriptModel {
+    TranscriptModel {
         session_id: session.id.clone(),
         committed,
         terminal_committed,
         active,
         last_event_seq,
-        revision,
         live_phase: app.live_spinner_frame,
-    })
+    }
 }
 
 pub(crate) fn all_scrollback_lines(model: &TranscriptModel, width: u16) -> Vec<Line<'static>> {
@@ -3330,6 +3513,112 @@ fn browser_event_label(event: &EventRecord) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use browser_use_agent::context::workspace_context::rollback_filtered_event_records;
+
+    fn ev(seq: i64, event_type: &str, text: &str) -> EventRecord {
+        EventRecord {
+            seq,
+            id: format!("e{seq}"),
+            session_id: "s".to_string(),
+            ts_ms: 0,
+            event_type: event_type.to_string(),
+            payload: serde_json::json!({ "text": text }),
+        }
+    }
+
+    fn filtered_seqs(events: &[EventRecord]) -> Vec<i64> {
+        events.iter().map(|event| event.seq).collect()
+    }
+
+    // The cache's extend path must produce exactly what a full rebuild would,
+    // including truncating on a rollback in the appended tail.
+    #[test]
+    fn filtered_event_cache_extend_matches_full_rebuild() {
+        let cache = FilteredEventCache::default();
+        let mut raw = vec![
+            ev(1, "session.input", "hi"),
+            ev(2, "model.turn.response", "a"),
+        ];
+        let baseline = |raw: &[EventRecord]| {
+            rollback_filtered_event_records(raw)
+                .into_iter()
+                .map(|event| event.seq)
+                .collect::<Vec<_>>()
+        };
+
+        cache.with_filtered("s", &raw, |events| {
+            assert_eq!(filtered_seqs(events), baseline(&raw));
+        });
+
+        // Append-only growth -> extend path.
+        raw.push(ev(3, "agent.message", "b"));
+        raw.push(ev(4, "model.turn.response", "c"));
+        cache.with_filtered("s", &raw, |events| {
+            assert_eq!(filtered_seqs(events), baseline(&raw));
+        });
+
+        // A rollback in the tail must force a rebuild, not a naive append.
+        raw.push(ev(5, SESSION_ROLLBACK_EVENT_TYPE, ""));
+        cache.with_filtered("s", &raw, |events| {
+            assert_eq!(filtered_seqs(events), baseline(&raw));
+        });
+
+        // Switching sessions rebuilds for the new id.
+        let other = vec![ev(1, "session.input", "other")];
+        cache.with_filtered("other", &other, |events| {
+            assert_eq!(filtered_seqs(events), baseline(&other));
+        });
+    }
+
+    // Run with: cargo test -p browser-use-tui filtered_event_cache_streaming_cost -- --ignored --nocapture
+    #[test]
+    #[ignore]
+    fn filtered_event_cache_streaming_cost() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        let body = "x".repeat(400);
+        let mut raw: Vec<EventRecord> = (0..3000)
+            .map(|i| {
+                let ty = if i % 2 == 0 {
+                    "model.turn.response"
+                } else {
+                    "agent.message"
+                };
+                ev(i + 1, ty, &format!("{i}: {body}"))
+            })
+            .collect();
+
+        let reps = 50;
+        // Old behavior: clone every filtered event, every frame.
+        let t = Instant::now();
+        for _ in 0..reps {
+            let cloned: Vec<EventRecord> = rollback_filtered_event_records(&raw)
+                .into_iter()
+                .cloned()
+                .collect();
+            black_box(cloned);
+        }
+        let full_clone_us = t.elapsed().as_micros() as f64 / reps as f64;
+
+        // New behavior: prime once, then each streaming frame appends one event
+        // and the cache extends in place.
+        let cache = FilteredEventCache::default();
+        cache.with_filtered("s", &raw, |events| black_box(events.len()));
+        let t = Instant::now();
+        for i in 0..reps {
+            raw.push(ev(raw.last().unwrap().seq + 1, "model.turn.response", &body));
+            cache.with_filtered("s", &raw, |events| black_box(events.len()));
+            black_box(i);
+        }
+        let extend_us = t.elapsed().as_micros() as f64 / reps as f64;
+
+        eprintln!(
+            "TIMING2 events={} full_clone_per_frame={full_clone_us:.0}us \
+             incremental_extend_per_frame={extend_us:.1}us",
+            raw.len()
+        );
+    }
 
     fn line_text(line: &Line<'static>) -> String {
         line.spans
@@ -3429,7 +3718,6 @@ mod tests {
             terminal_committed: Vec::new(),
             active: Some(active),
             last_event_seq: 3,
-            revision: 3,
             live_phase: 0,
         };
 
@@ -3456,7 +3744,6 @@ mod tests {
                     },
                 }),
                 last_event_seq: 1,
-                revision: 1,
                 live_phase: 0,
             }
         }
@@ -3804,7 +4091,6 @@ mod tests {
             terminal_committed: raw_nodes,
             active: None,
             last_event_seq: 3,
-            revision: 3,
             live_phase: 0,
         };
 

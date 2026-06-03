@@ -102,12 +102,12 @@ pub(crate) fn lines_plain_text(lines: &[Line<'static>]) -> String {
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let full_area = frame.area();
     let area = app_surface(full_area);
-    let state = app
-        .workbench_state()
-        .unwrap_or_else(|_| app.empty_workbench_state_with_failure());
-    let product_state = app.product_state(&state);
 
     if app.is_first_run_setup_visible().unwrap_or(false) {
+        app.modal_background = None;
+        let state = app
+            .workbench_state()
+            .unwrap_or_else(|_| app.empty_workbench_state_with_failure());
         // First-run setup always renders full-screen, whatever step it is on.
         let surface = if app.surface == Surface::Main {
             Surface::Setup
@@ -120,20 +120,81 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
 
     match app.surface {
         surface if surface.is_popup() => {
+            if !app.native_scrollback_is_active() {
+                if let Some(snapshot) = app
+                    .modal_background
+                    .as_ref()
+                    .filter(|snapshot| snapshot.area == full_area)
+                {
+                    snapshot
+                        .buffer
+                        .merge_into(frame.buffer_mut(), snapshot.area);
+                    let state = app.modal_overlay_state();
+                    render_active_modal_overlay(frame, full_area, app, &state);
+                    return;
+                }
+            }
+            let state = main_render_state(app);
+            let product_state = app.product_state(&state);
             render_main(frame, area, app, &state, product_state);
             if !app.native_scrollback_is_active() {
+                app.modal_background = Some(super::ModalBackgroundSnapshot {
+                    area: full_area,
+                    buffer: frame.buffer_mut().clone(),
+                });
                 render_active_modal_overlay(frame, full_area, app, &state);
             }
         }
         surface if surface.uses_main_view() => {
-            if app.is_slash_palette_active() && !app.native_scrollback_is_active() {
+            if (app.is_slash_palette_active() || app.prompt_history.search.is_some())
+                && !app.native_scrollback_is_active()
+            {
+                if let Some(snapshot) = app
+                    .modal_background
+                    .as_ref()
+                    .filter(|snapshot| snapshot.area == full_area)
+                {
+                    snapshot
+                        .buffer
+                        .merge_into(frame.buffer_mut(), snapshot.area);
+                    let state = app.modal_overlay_state();
+                    render_active_modal_overlay(frame, full_area, app, &state);
+                    return;
+                }
+                let state = main_render_state(app);
+                let product_state = app.product_state(&state);
                 render_main(frame, area, app, &state, product_state);
+                app.modal_background = Some(super::ModalBackgroundSnapshot {
+                    area: full_area,
+                    buffer: frame.buffer_mut().clone(),
+                });
                 render_active_modal_overlay(frame, full_area, app, &state);
             } else {
+                let state = main_render_state(app);
+                let product_state = app.product_state(&state);
                 render_main(frame, area, app, &state, product_state);
+                app.modal_background = Some(super::ModalBackgroundSnapshot {
+                    area: full_area,
+                    buffer: frame.buffer_mut().clone(),
+                });
             }
         }
-        surface => render_surface(frame, area, app, &state, surface),
+        surface => {
+            app.modal_background = None;
+            let state = app
+                .workbench_state()
+                .unwrap_or_else(|_| app.empty_workbench_state_with_failure());
+            render_surface(frame, area, app, &state, surface)
+        }
+    }
+}
+
+fn main_render_state(app: &mut App) -> WorkbenchState {
+    if app.native_scrollback_is_active() {
+        app.session_render_state()
+    } else {
+        app.workbench_state()
+            .unwrap_or_else(|_| app.empty_workbench_state_with_failure())
     }
 }
 
@@ -185,26 +246,29 @@ fn render_main(
         .height
         .saturating_sub(bottom_h)
         .saturating_sub(footer_h);
-    let transcript_model = if native_scrollback_active {
-        transcript::transcript_model(app, state)
-    } else {
-        None
-    };
-    let body = if native_scrollback_active {
-        let stream_skip_lines = state
-            .current_session
-            .as_ref()
-            .map(|session| {
-                app.native_history
-                    .live_stream_emitted_lines_for(&session.id, body_width)
+    let (body, reserve_live_status_row) = if native_scrollback_active {
+        let (mut lines, reserve_live_status_row) =
+            transcript::with_transcript_model(app, state, |model| {
+                let stream_skip_lines = state
+                    .current_session
+                    .as_ref()
+                    .map(|session| {
+                        app.native_history
+                            .live_stream_emitted_lines_for(&session.id, body_width)
+                    })
+                    .unwrap_or(0);
+                let lines = transcript::active_viewport_lines_with_stream_skip(
+                    Some(model),
+                    body_width,
+                    max_body_h,
+                    stream_skip_lines,
+                );
+                (
+                    lines,
+                    transcript::active_viewport_needs_status_row_reserve(Some(model)),
+                )
             })
-            .unwrap_or(0);
-        let mut lines = transcript::active_viewport_lines_with_stream_skip(
-            transcript_model.as_ref(),
-            body_width,
-            max_body_h,
-            stream_skip_lines,
-        );
+            .unwrap_or_default();
         if let Some(notice) = app
             .status_notice
             .as_ref()
@@ -220,23 +284,23 @@ fn render_main(
                 lines = next;
             }
         }
-        lines
+        (lines, reserve_live_status_row)
     } else {
-        match product_state {
+        let lines = match product_state {
             ProductState::SetupNeeded => setup_lines(app, body_width as usize),
             ProductState::Ready => ready_lines(app, state, body_width, max_body_h),
             ProductState::Running
             | ProductState::Result
             | ProductState::Failed
             | ProductState::Cancelled => work_lines(state, app, body_width, product_state),
-        }
+        };
+        (lines, false)
     };
     let pin_bottom = should_pin_main_bottom(product_state, native_scrollback_active)
         && !layout_surface.is_bottom_pane();
     let attach_bottom_to_body =
         native_scrollback_active && !body.is_empty() && !layout_surface.is_bottom_pane();
-    let reserve_live_status_row = attach_bottom_to_body
-        && transcript::active_viewport_needs_status_row_reserve(transcript_model.as_ref());
+    let reserve_live_status_row = attach_bottom_to_body && reserve_live_status_row;
     let layout_body_len = body
         .len()
         .saturating_add(usize::from(reserve_live_status_row));
