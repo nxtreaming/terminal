@@ -494,11 +494,8 @@ fn mailbox_preemption_probe(
                         )
                         .unwrap_or(false);
                 }
-                tokio::task::spawn_blocking(move || {
-                    super::has_pending_agent_mail(&store, &session_id)
-                })
-                .await
-                .unwrap_or(false)
+                let _ = (store, session_id);
+                false
             })
         },
     );

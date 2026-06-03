@@ -942,6 +942,7 @@ fn drain_one_pending_active_followup(store: &SharedStore, session_id: &str) {
     );
 }
 
+#[cfg(test)]
 fn has_pending_agent_mail(store: &SharedStore, session_id: &str) -> bool {
     let Ok(store) = store.lock() else {
         return false;
@@ -952,6 +953,7 @@ fn has_pending_agent_mail(store: &SharedStore, session_id: &str) -> bool {
         .unwrap_or(false)
 }
 
+#[cfg(test)]
 fn has_pending_trigger_turn_agent_mail(store: &SharedStore, session_id: &str) -> bool {
     let Ok(store) = store.lock() else {
         return false;
@@ -1035,72 +1037,6 @@ fn initial_runtime_mailbox_delivery_phase(
     } else {
         MailboxDeliveryPhase::CurrentTurn
     }
-}
-
-fn drain_agent_mailbox_as_pending_input(store: &SharedStore, session_id: &str) -> Vec<Message> {
-    let Ok(store) = store.lock() else {
-        return Vec::new();
-    };
-    let messages = store
-        .drain_agent_messages_for_agent(session_id)
-        .unwrap_or_default();
-    messages
-        .into_iter()
-        .flat_map(|message| {
-            let author_path = display_agent_path_for_session(&store, &message.author_session_id)
-                .unwrap_or_else(|_| "/root".to_string());
-            let recipient_path = display_agent_path_for_session(&store, &message.target_session_id)
-                .unwrap_or_else(|_| "/root".to_string());
-            let content = message.content.clone();
-            let trigger_turn = message.trigger_turn;
-            if message.input_kind == "user_input" {
-                let cwd = store
-                    .load_session(&message.target_session_id)
-                    .ok()
-                    .flatten()
-                    .map(|session| session.cwd)
-                    .unwrap_or_else(|| ".".to_string());
-                let payload = if let Some(items) = message.input_items.as_ref() {
-                    typed_user_input_payload_from_items_for_cwd(items, &cwd)
-                } else {
-                    typed_user_input_payload_from_text_for_cwd(&content, &cwd)
-                };
-                if let Ok(payload) = payload {
-                    let _ = store.append_event(
-                        &message.target_session_id,
-                        names::SESSION_FOLLOWUP,
-                        payload.clone(),
-                    );
-                    return user_input_payload_to_messages(&payload);
-                }
-            } else {
-                let _ = store.append_event(
-                    &message.target_session_id,
-                    "agent.mailbox_input",
-                    serde_json::json!({
-                        "id": message.id,
-                        "author_session_id": message.author_session_id,
-                        "target_session_id": message.target_session_id,
-                        "author_path": author_path,
-                        "recipient_path": recipient_path,
-                        "content": content,
-                        "trigger_turn": trigger_turn,
-                    }),
-                );
-            }
-            let label = if trigger_turn {
-                "Direct task from parent"
-            } else {
-                "Inter-agent message"
-            };
-            vec![Message::new(
-                MessageRole::User,
-                vec![ContentPart::text(format!(
-                    "{label} {author_path} to you {recipient_path}:\n{content}"
-                ))],
-            )]
-        })
-        .collect()
 }
 
 fn drain_runtime_agent_mailbox_as_pending_input(
@@ -1862,13 +1798,9 @@ impl TurnState for LiveTurnState {
                     ),
                 }
             } else {
-                has_pending_agent_mail(&store, &session_id)
+                false
             };
-            has_pending_active_followup(&store, &session_id)
-                || (runtime_backed && has_pending_mail)
-                || (!runtime_backed
-                    && mailbox_delivery_phase == MailboxDeliveryPhase::CurrentTurn
-                    && has_pending_mail)
+            has_pending_active_followup(&store, &session_id) || (runtime_backed && has_pending_mail)
         })
         .await
         .unwrap_or(false)
@@ -1914,7 +1846,7 @@ impl TurnState for LiveTurnState {
                     mailbox_delivery_phase,
                 )
             } else {
-                drain_agent_mailbox_as_pending_input(&store, &session_id)
+                Vec::new()
             }
         })
         .await
@@ -2644,7 +2576,7 @@ pub async fn run_session_with_config_with_cancel_and_runtime(
                     session_id.as_str(),
                 )
             })
-            .unwrap_or_else(|| has_pending_trigger_turn_agent_mail(&store, session_id.as_str()));
+            .unwrap_or(false);
         if cancel.is_cancelled() || !has_pending_trigger_turn_mail {
             return Ok(session_id);
         }
@@ -2742,7 +2674,7 @@ async fn run_session_once_with_config_with_cancel(
     let pending_mail_at_start = runtime_handle
         .as_ref()
         .map(|runtime| has_pending_runtime_agent_mail_any_phase(runtime, session_id.as_str()))
-        .unwrap_or_else(|| has_pending_agent_mail(&store, session_id.as_str()));
+        .unwrap_or(false);
     let turn_has_fresh_input =
         log_has_user_input(&store, session_id.as_str()) && !pending_mail_at_start;
 
@@ -4221,7 +4153,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn store_turn_state_drains_agent_mailbox_as_pending_input() {
+    async fn store_mailbox_rows_are_not_live_pending_input_without_runtime() {
         let (_dir, store, root_id) = store_with_session();
         let child_id = {
             let store = store.lock().expect("store mutex poisoned");
@@ -4245,27 +4177,32 @@ mod tests {
             SessionId(root_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
         );
-        assert!(state.has_pending_input().await);
-        let drained = state.take_pending_input().await;
-        assert_eq!(drained.len(), 1);
-        assert!(!state.has_pending_input().await);
-
-        assert_eq!(drained[0].role, MessageRole::User);
-        let ContentPart::Text { text } = &drained[0].content[0] else {
-            panic!("mailbox input should be direct task text");
-        };
-        assert_eq!(
-            text,
-            "Inter-agent message /root/worker to you /root:\nchild update"
+        assert!(
+            !state.has_pending_input().await,
+            "SQLite mailbox rows are durable replay/debug data, not live wakeup state"
         );
+        let drained = state.take_pending_input().await;
+        assert!(
+            drained.is_empty(),
+            "Store mailbox rows must not be drained into live model input without a runtime"
+        );
+        assert!(!state.has_pending_input().await);
+        assert!(has_pending_agent_mail(&store, &root_id));
 
         let root_events = events(&store, &root_id);
-        let mailbox_event = root_events
-            .iter()
-            .find(|event| event.event_type == "agent.mailbox_input")
-            .expect("mailbox input event");
-        assert_eq!(mailbox_event.payload["author_session_id"], child_id);
-        assert_eq!(mailbox_event.payload["target_session_id"], root_id);
+        assert!(
+            root_events
+                .iter()
+                .all(|event| event.event_type != "agent.mailbox_input"),
+            "live mailbox input projection is runtime-owned"
+        );
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            let messages = store.messages_for_agent(&root_id).unwrap();
+            assert_eq!(messages.len(), 1);
+            assert_eq!(messages[0].author_session_id, child_id);
+            assert_eq!(messages[0].target_session_id, root_id);
+        }
     }
 
     #[tokio::test]
@@ -4520,8 +4457,12 @@ mod tests {
             SessionId(root_id.clone()),
             Arc::new(Mutex::new(Vec::new())),
         );
-        assert!(next_turn_state.has_pending_input().await);
-        assert_eq!(next_turn_state.take_pending_input().await.len(), 1);
+        assert!(
+            !next_turn_state.has_pending_input().await,
+            "the next live turn still needs the runtime mailbox to deliver Store-backed mail"
+        );
+        assert!(next_turn_state.take_pending_input().await.is_empty());
+        assert!(has_pending_agent_mail(&store, &root_id));
     }
 
     #[tokio::test]
@@ -4601,8 +4542,14 @@ mod tests {
             "active follow-up input should reopen the current turn mailbox"
         );
         let drained = state.take_pending_input().await;
-        assert_eq!(drained.len(), 1);
-        assert!(!has_pending_agent_mail(&store, &root_id));
+        assert!(
+            drained.is_empty(),
+            "Store-only active follow-up commits journal input but must not synthesize mailbox messages"
+        );
+        assert!(
+            has_pending_agent_mail(&store, &root_id),
+            "operator follow-up should not implicitly drain Store mailbox rows"
+        );
 
         let log = events(&store, &root_id);
         assert!(log
@@ -4610,7 +4557,7 @@ mod tests {
             .any(|event| event.event_type == names::SESSION_FOLLOWUP));
         assert!(log
             .iter()
-            .any(|event| event.event_type == "agent.mailbox_input"));
+            .all(|event| event.event_type != "agent.mailbox_input"));
     }
 
     struct CancelAwareDriver;

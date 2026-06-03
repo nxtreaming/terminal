@@ -627,7 +627,7 @@ async fn wait_uses_configured_timeout_bounds() {
 }
 
 #[tokio::test]
-async fn store_backed_wait_times_out_when_mailbox_is_empty() {
+async fn store_backed_wait_requires_live_runtime_mailbox() {
     let (_dir, store, _root_id, child_id, _sink, mut deps) = deps_with_store_tree();
     {
         let store = store.lock().unwrap();
@@ -649,11 +649,12 @@ async fn store_backed_wait_times_out_when_mailbox_is_empty() {
         },
     )
     .await
-    .expect("wait timeout ok");
-    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
-    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
-    assert!(body.get("status").is_none(), "{body}");
+    .expect_err("Store-backed live wait should be rejected");
+    let out = format!("{out:?}");
+    assert!(
+        out.contains("wait_agent requires a live runtime mailbox"),
+        "{out}"
+    );
 }
 
 #[tokio::test]
