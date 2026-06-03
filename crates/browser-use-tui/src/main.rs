@@ -144,6 +144,8 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
+pub(crate) const FEEDBACK_THANKS_FRAME_MS: u64 = 250;
+const FEEDBACK_THANKS_AUTO_DISMISS: Duration = Duration::from_millis(2500);
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
@@ -232,6 +234,8 @@ enum Surface {
     History,
     Messages,
     Developer,
+    Feedback,
+    FeedbackThanks,
 }
 
 impl Surface {
@@ -253,6 +257,7 @@ impl Surface {
                 | Self::History
                 | Self::Messages
                 | Self::Developer
+                | Self::Feedback
         )
     }
 
@@ -448,6 +453,103 @@ impl Default for CookieSyncState {
     }
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Feedback questionnaire state
+
+const FEEDBACK_INGEST_URL: &str = "https://feedback-ingest-production.up.railway.app";
+const FEEDBACK_INSTALL_ID_SETTING: &str = "install.id";
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedbackStep {
+    Category,
+    Description,
+    UploadLogs,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum FeedbackCategory {
+    Bug,
+    BadResult,
+    GoodResult,
+    SafetyCheck,
+    Other,
+}
+
+impl FeedbackCategory {
+    const ALL: [FeedbackCategory; 5] = [
+        FeedbackCategory::Bug,
+        FeedbackCategory::BadResult,
+        FeedbackCategory::GoodResult,
+        FeedbackCategory::SafetyCheck,
+        FeedbackCategory::Other,
+    ];
+
+    fn label(self) -> &'static str {
+        match self {
+            FeedbackCategory::Bug => "bug",
+            FeedbackCategory::BadResult => "bad result",
+            FeedbackCategory::GoodResult => "good result",
+            FeedbackCategory::SafetyCheck => "safety check",
+            FeedbackCategory::Other => "other",
+        }
+    }
+
+    fn description(self) -> &'static str {
+        match self {
+            FeedbackCategory::Bug => "Crash, error message, hang, or broken UI/behavior.",
+            FeedbackCategory::BadResult => {
+                "Output was off-target, incorrect, incomplete, or unhelpful."
+            }
+            FeedbackCategory::GoodResult => {
+                "Helpful, correct, high-quality, or delightful result worth celebrating."
+            }
+            FeedbackCategory::SafetyCheck => {
+                "Benign usage blocked due to safety checks or refusals."
+            }
+            FeedbackCategory::Other => {
+                "Slowness, feature suggestion, UX feedback, or anything else."
+            }
+        }
+    }
+
+    fn api_value(self) -> &'static str {
+        match self {
+            FeedbackCategory::Bug => "bug",
+            FeedbackCategory::BadResult => "bad_result",
+            FeedbackCategory::GoodResult => "good_result",
+            FeedbackCategory::SafetyCheck => "safety_check",
+            FeedbackCategory::Other => "other",
+        }
+    }
+}
+
+#[derive(Debug)]
+struct FeedbackState {
+    step: FeedbackStep,
+    category_index: usize,
+    description: String,
+    upload_yes: bool,
+}
+
+impl Default for FeedbackState {
+    fn default() -> Self {
+        Self {
+            step: FeedbackStep::Category,
+            category_index: 0,
+            description: String::new(),
+            upload_yes: false,
+        }
+    }
+}
+
+#[derive(Debug)]
+enum FeedbackSubmitResult {
+    Ok,
+    Err(String),
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+
 #[derive(Clone, Debug, PartialEq, Eq)]
 enum AppCommand {
     StartTask(String),
@@ -486,6 +588,7 @@ enum AppCommand {
     SaveBrowser(usize),
     SaveAuth(String),
     SaveTelemetry(String),
+    OpenFeedback,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -1008,6 +1111,9 @@ struct App {
     pending_auth_resume: Option<String>,
     pending_initial_goal: Option<String>,
     pending_goal_replacement: Option<PendingGoalReplacement>,
+    feedback: FeedbackState,
+    feedback_rx: Option<tokio::sync::mpsc::Receiver<FeedbackSubmitResult>>,
+    feedback_thanks_started: Option<Instant>,
 }
 
 #[derive(Clone)]
@@ -1920,6 +2026,9 @@ impl App {
             pending_auth_resume: None,
             pending_initial_goal: None,
             pending_goal_replacement: None,
+            feedback: FeedbackState::default(),
+            feedback_rx: None,
+            feedback_thanks_started: None,
         };
         app.refresh_cached_projection();
         if resumed_from_reexec {
@@ -3725,6 +3834,10 @@ impl App {
             AppCommand::SaveBrowser(index) => self.save_browser(index)?,
             AppCommand::SaveAuth(secret) => self.save_auth(secret)?,
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
+            AppCommand::OpenFeedback => {
+                self.feedback = FeedbackState::default();
+                self.open_surface(Surface::Feedback);
+            }
         }
         self.drain_store_notifications()?;
         Ok(())
@@ -4243,10 +4356,18 @@ impl App {
         if quit_requested {
             return Ok(true);
         }
+        if self.surface == Surface::FeedbackThanks {
+            self.surface = Surface::Main;
+            self.feedback_thanks_started = None;
+            return Ok(false);
+        }
         if self.prompt_history.search.is_some() {
             self.handle_prompt_history_search_key(key)?;
             self.drain_store_notifications()?;
             return Ok(false);
+        }
+        if self.surface == Surface::Feedback {
+            return self.handle_feedback_key(key);
         }
         if self.surface == Surface::Main && !self.is_slash_palette_active() {
             match key {
@@ -4928,6 +5049,15 @@ impl App {
                 0 => self.dispatch(AppCommand::ConfigureTelemetry)?,
                 _ => self.close_surface(),
             },
+            Surface::Feedback => {
+                // Feedback key handling is done in handle_feedback_key; Enter
+                // here is a no-op (the early return in handle_key prevents
+                // reaching execute_surface_selection while Feedback is active).
+            }
+            Surface::FeedbackThanks => {
+                self.surface = Surface::Main;
+                self.feedback_thanks_started = None;
+            }
             Surface::Main => {
                 self.close_surface();
             }
@@ -5167,6 +5297,7 @@ impl App {
             PaletteAction::Reload => self.dispatch(AppCommand::Reload)?,
             PaletteAction::Update => self.dispatch(AppCommand::Update)?,
             PaletteAction::Exit => return Ok(true),
+            PaletteAction::Feedback => self.dispatch(AppCommand::OpenFeedback)?,
         }
         Ok(false)
     }
@@ -5198,6 +5329,221 @@ impl App {
         }
         Ok(())
     }
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Feedback
+
+    fn or_create_install_id(&mut self) -> Result<String> {
+        if let Some(id) = self.store.get_setting(FEEDBACK_INSTALL_ID_SETTING)? {
+            return Ok(id);
+        }
+        let id = uuid::Uuid::new_v4().to_string();
+        self.store.set_setting(FEEDBACK_INSTALL_ID_SETTING, &id)?;
+        Ok(id)
+    }
+
+    fn handle_feedback_key(&mut self, key: KeyEvent) -> Result<bool> {
+        match self.feedback.step {
+            FeedbackStep::Category => {
+                let count = FeedbackCategory::ALL.len();
+                match key.code {
+                    KeyCode::Up => {
+                        if self.feedback.category_index > 0 {
+                            self.feedback.category_index -= 1;
+                        }
+                    }
+                    KeyCode::Down => {
+                        if self.feedback.category_index + 1 < count {
+                            self.feedback.category_index += 1;
+                        }
+                    }
+                    KeyCode::Char('1') => self.feedback.category_index = 0,
+                    KeyCode::Char('2') => self.feedback.category_index = 1,
+                    KeyCode::Char('3') => self.feedback.category_index = 2,
+                    KeyCode::Char('4') => self.feedback.category_index = 3,
+                    KeyCode::Char('5') => self.feedback.category_index = 4,
+                    KeyCode::Enter => {
+                        self.feedback.step = FeedbackStep::Description;
+                    }
+                    KeyCode::Esc => {
+                        self.close_surface();
+                    }
+                    _ => {}
+                }
+            }
+            FeedbackStep::Description => match key.code {
+                KeyCode::Enter => {
+                    // The "Upload logs?" step only makes sense when there's a
+                    // session whose event log we could attach. On the home
+                    // screen (no selected session) there are no logs to share,
+                    // so submit the feedback directly without that step.
+                    if self.selected_session_id.is_some() {
+                        self.feedback.step = FeedbackStep::UploadLogs;
+                    } else {
+                        self.feedback.upload_yes = false;
+                        self.submit_feedback()?;
+                    }
+                }
+                KeyCode::Backspace => {
+                    self.feedback.description.pop();
+                }
+                KeyCode::Esc => {
+                    self.feedback.step = FeedbackStep::Category;
+                }
+                KeyCode::Char(ch)
+                    if !key.modifiers.contains(KeyModifiers::CONTROL)
+                        && !key.modifiers.contains(KeyModifiers::ALT) =>
+                {
+                    self.feedback.description.push(ch);
+                }
+                _ => {}
+            },
+            FeedbackStep::UploadLogs => match key.code {
+                KeyCode::Up | KeyCode::Left => {
+                    self.feedback.upload_yes = true;
+                }
+                KeyCode::Down | KeyCode::Right => {
+                    self.feedback.upload_yes = false;
+                }
+                KeyCode::Char('y') | KeyCode::Char('Y') => {
+                    self.feedback.upload_yes = true;
+                }
+                KeyCode::Char('n') | KeyCode::Char('N') => {
+                    self.feedback.upload_yes = false;
+                }
+                KeyCode::Enter => {
+                    self.submit_feedback()?;
+                }
+                KeyCode::Esc => {
+                    self.feedback.step = FeedbackStep::Description;
+                }
+                _ => {}
+            },
+        }
+        Ok(false)
+    }
+
+    fn submit_feedback(&mut self) -> Result<()> {
+        let category = FeedbackCategory::ALL
+            .get(self.feedback.category_index)
+            .copied()
+            .unwrap_or(FeedbackCategory::Other);
+        let description = if self.feedback.description.trim().is_empty() {
+            None
+        } else {
+            Some(self.feedback.description.trim().to_string())
+        };
+        let include_logs = self.feedback.upload_yes;
+        let session_id = self.selected_session_id.clone();
+        let session_events: Option<serde_json::Value> = if include_logs {
+            session_id.as_deref().map(|id| {
+                let events = self.cached_events_for_session(id);
+                serde_json::to_value(events).unwrap_or(serde_json::Value::Null)
+            })
+        } else {
+            None
+        };
+        let app_version = env!("CARGO_PKG_VERSION").to_string();
+        let os = std::env::consts::OS.to_string();
+        // Only attach a model when the feedback is about an actual session.
+        // Home-screen feedback has no run context, so leave it null instead of
+        // recording the default selection.
+        let model = if session_id.is_some() {
+            let sel = self.current_model_selection();
+            if sel.provider_model.is_empty() {
+                None
+            } else {
+                Some(sel.provider_model)
+            }
+        } else {
+            None
+        };
+        let install_id = self.or_create_install_id().unwrap_or_default();
+
+        let base_url = std::env::var("BUT_FEEDBACK_URL")
+            .unwrap_or_else(|_| FEEDBACK_INGEST_URL.to_string());
+        let url = format!("{base_url}/feedback");
+
+        let payload = serde_json::json!({
+            "category": category.api_value(),
+            "description": description,
+            "include_logs": include_logs,
+            "session_id": session_id,
+            "session_events": session_events,
+            "app_version": app_version,
+            "os": os,
+            "model": model,
+            "install_id": install_id,
+        });
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1);
+        self.feedback_rx = Some(rx);
+
+        // The TUI event loop is not running inside a Tokio runtime, so we can't
+        // `tokio::spawn` here (that panics with "no reactor running"). Run the
+        // POST on a dedicated OS thread with its own current-thread runtime and
+        // report the result back over the channel.
+        std::thread::spawn(move || {
+            let runtime = match tokio::runtime::Builder::new_current_thread()
+                .enable_all()
+                .build()
+            {
+                Ok(runtime) => runtime,
+                Err(error) => {
+                    let _ = tx.blocking_send(FeedbackSubmitResult::Err(error.to_string()));
+                    return;
+                }
+            };
+            runtime.block_on(async move {
+                let result = async {
+                    let client = reqwest::Client::new();
+                    client
+                        .post(&url)
+                        .json(&payload)
+                        .send()
+                        .await
+                        .map_err(|e| e.to_string())?
+                        .error_for_status()
+                        .map_err(|e| e.to_string())?;
+                    Ok::<(), String>(())
+                }
+                .await;
+                let outcome = match result {
+                    Ok(()) => FeedbackSubmitResult::Ok,
+                    Err(e) => FeedbackSubmitResult::Err(e),
+                };
+                let _ = tx.send(outcome).await;
+            });
+        });
+
+        self.surface = Surface::FeedbackThanks;
+        self.feedback_thanks_started = Some(Instant::now());
+        Ok(())
+    }
+
+    fn drain_feedback_notifications(&mut self) -> Result<bool> {
+        let Some(rx) = self.feedback_rx.as_mut() else {
+            return Ok(false);
+        };
+        match rx.try_recv() {
+            Ok(FeedbackSubmitResult::Ok) => {
+                self.feedback_rx = None;
+                Ok(true)
+            }
+            Ok(FeedbackSubmitResult::Err(e)) => {
+                self.status_notice = Some(format!("Feedback send failed: {e}"));
+                self.feedback_rx = None;
+                Ok(true)
+            }
+            Err(tokio::sync::mpsc::error::TryRecvError::Empty) => Ok(false),
+            Err(tokio::sync::mpsc::error::TryRecvError::Disconnected) => {
+                self.feedback_rx = None;
+                Ok(false)
+            }
+        }
+    }
+
+    // ─────────────────────────────────────────────────────────────────────────
 
     fn request_reexec(&mut self) -> Result<()> {
         // Close the slash palette and any other overlay BEFORE the exec so
@@ -6315,6 +6661,8 @@ impl App {
             Surface::History => self.history_visible_indices()?.len(),
             Surface::Messages => self.message_action_rows().len(),
             Surface::Developer => 1,
+            Surface::Feedback => 0,
+            Surface::FeedbackThanks => 0,
         })
     }
 
@@ -6452,6 +6800,10 @@ impl App {
 
     fn tick_live_spinner(&mut self) {
         self.live_spinner_frame = self.live_spinner_frame.wrapping_add(1);
+    }
+
+    fn should_animate_feedback_thanks(&self) -> bool {
+        self.surface == Surface::FeedbackThanks
     }
 
     #[cfg(test)]
@@ -7494,6 +7846,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_clipboard_paste_notifications()?;
             draw_needed |= app.drain_cookie_sync_notifications()?;
             draw_needed |= app.drain_provider_fetch()?;
+            draw_needed |= app.drain_feedback_notifications()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -7531,6 +7884,10 @@ fn run_terminal(mut app: App) -> Result<()> {
             if app.is_home_examples_active() {
                 poll_interval = poll_interval.min(TYPEWRITER_TICK_INTERVAL);
             }
+            if app.should_animate_feedback_thanks() {
+                poll_interval =
+                    poll_interval.min(Duration::from_millis(FEEDBACK_THANKS_FRAME_MS));
+            }
             if !event::poll(poll_interval)? {
                 // Animate the welcome-screen logo by advancing the anim and
                 // triggering a redraw every ~70ms while the welcome surface
@@ -7556,6 +7913,17 @@ fn run_terminal(mut app: App) -> Result<()> {
                         draw_needed = true;
                     }
                     last_typewriter_tick = Instant::now();
+                }
+                // Handle FeedbackThanks animation and auto-dismiss.
+                if app.should_animate_feedback_thanks() {
+                    if app
+                        .feedback_thanks_started
+                        .is_some_and(|t| t.elapsed() >= FEEDBACK_THANKS_AUTO_DISMISS)
+                    {
+                        app.surface = Surface::Main;
+                        app.feedback_thanks_started = None;
+                    }
+                    draw_needed = true;
                 }
                 continue;
             }
@@ -9726,6 +10094,7 @@ mod redesign_tests {
             Surface::ApiKey => "API key",
             Surface::Telemetry => "Laminar",
             Surface::Setup | Surface::SetupConfirm | Surface::SetupResult => "Setup",
+            Surface::Feedback | Surface::FeedbackThanks => "Feedback",
             Surface::Main => "",
         }
     }

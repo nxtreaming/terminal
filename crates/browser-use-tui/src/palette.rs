@@ -10,6 +10,7 @@ pub(crate) enum PaletteAction {
     Reload,
     Update,
     Exit,
+    Feedback,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -19,7 +20,7 @@ pub(crate) struct PaletteItem {
     pub(crate) action: PaletteAction,
 }
 
-const VISIBLE_ITEMS: [PaletteItem; 6] = [
+const VISIBLE_ITEMS: [PaletteItem; 7] = [
     PaletteItem {
         command: "/task",
         description: "start a new task",
@@ -49,6 +50,11 @@ const VISIBLE_ITEMS: [PaletteItem; 6] = [
         command: "/sync-cookies",
         description: "sync local cookies",
         action: PaletteAction::SyncCookies,
+    },
+    PaletteItem {
+        command: "/feedback",
+        description: "report a bug or share feedback",
+        action: PaletteAction::Feedback,
     },
 ];
 

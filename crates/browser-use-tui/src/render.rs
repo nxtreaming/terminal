@@ -26,7 +26,8 @@ use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
     format_goal_tokens_compact, goal_command_hint, goal_status_label, ModelSearchEntry,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
-    CookieSyncStatus, MessageActionKind, ProductState, SetupResultKind, Surface,
+    CookieSyncStatus, FeedbackCategory, FeedbackStep, MessageActionKind, ProductState,
+    SetupResultKind, Surface,
 };
 
 pub(crate) const APP_HORIZONTAL_MARGIN: u16 = 2;
@@ -179,6 +180,10 @@ pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
                     buffer: frame.buffer_mut().clone(),
                 });
             }
+        }
+        Surface::FeedbackThanks => {
+            app.modal_background = None;
+            render_feedback_thanks(frame, area, app);
         }
         surface => {
             app.modal_background = None;
@@ -1350,6 +1355,8 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
             "Edit submitted prompts or cancel queued follow-ups",
         ),
         Surface::Developer => ("Developer", "Developer tools and diagnostics"),
+        Surface::Feedback => ("Feedback", "Report a bug or share feedback"),
+        Surface::FeedbackThanks => ("Feedback", ""),
         Surface::Main => ("", ""),
     }
 }
@@ -1389,6 +1396,8 @@ fn surface_footer(surface: Surface) -> &'static str {
         Surface::CookieSync => "Enter:select | Esc:close",
         Surface::Goal => "Esc:close",
         Surface::Developer => "Esc:close",
+        Surface::Feedback => "Enter:next | Esc:back",
+        Surface::FeedbackThanks => "",
         _ => "Enter:select | Esc:back",
     }
 }
@@ -1402,10 +1411,23 @@ fn messages_footer(app: &App) -> &'static str {
 }
 
 fn surface_footer_for_app(surface: Surface, app: &App) -> &'static str {
-    if surface == Surface::Messages {
-        messages_footer(app)
+    match surface {
+        Surface::Messages => messages_footer(app),
+        Surface::Feedback => feedback_footer(app),
+        _ => surface_footer(surface),
+    }
+}
+
+fn feedback_footer(app: &App) -> &'static str {
+    // The final step submits on Enter; earlier steps advance. On the home
+    // screen (no selected session) the description step is the last one.
+    let submits = matches!(app.feedback.step, FeedbackStep::UploadLogs)
+        || (matches!(app.feedback.step, FeedbackStep::Description)
+            && app.selected_session_id.is_none());
+    if submits {
+        "Enter:submit | Esc:back"
     } else {
-        surface_footer(surface)
+        "Enter:next | Esc:back"
     }
 }
 
@@ -1435,6 +1457,8 @@ fn surface_lines(
         Surface::History => history_lines(app, state, width),
         Surface::Messages => message_lines(app, width),
         Surface::Developer => developer_lines(app, state),
+        Surface::Feedback => feedback_lines(app),
+        Surface::FeedbackThanks => Vec::new(),
         Surface::Main => Vec::new(),
     }
 }
@@ -1894,6 +1918,8 @@ fn render_footer(
         "esc again to edit messages"
     } else if app.surface == Surface::Messages {
         messages_footer(app)
+    } else if app.surface == Surface::Feedback {
+        feedback_footer(app)
     } else if app.surface.is_bottom_pane() {
         surface_footer(app.surface)
     } else {
@@ -2295,6 +2321,44 @@ fn centered_line_in_width(text: &str, width: usize, style: Style) -> Line<'stati
         Span::raw(" ".repeat(width.saturating_sub(text.chars().count()) / 2)),
         Span::styled(text.to_string(), style),
     ])
+}
+
+const FEEDBACK_THANKS_FACE_FRAME_0: &str = r"\(•◡•)/";
+const FEEDBACK_THANKS_FACE_FRAME_1: &str = r"/(•◡•)\";
+const FEEDBACK_THANKS_MESSAGE: &str = "Thanks for the feedback!";
+const FEEDBACK_THANKS_HINT: &str = "press any key to continue";
+
+fn render_feedback_thanks(frame: &mut Frame<'_>, area: Rect, app: &App) {
+    frame.render_widget(Clear, frame.area());
+    let elapsed_ms = app
+        .feedback_thanks_started
+        .map(|t| t.elapsed().as_millis() as u64)
+        .unwrap_or(0);
+    let frame_idx = (elapsed_ms / crate::FEEDBACK_THANKS_FRAME_MS) % 2;
+    let face = if frame_idx == 0 {
+        FEEDBACK_THANKS_FACE_FRAME_0
+    } else {
+        FEEDBACK_THANKS_FACE_FRAME_1
+    };
+    let w = area.width as usize;
+    let content_lines: Vec<Line<'static>> = vec![
+        centered_line(face, w, accent()),
+        Line::from(""),
+        centered_line(FEEDBACK_THANKS_MESSAGE, w, accent()),
+        Line::from(""),
+        centered_line(FEEDBACK_THANKS_HINT, w, muted()),
+    ];
+    let content_h = content_lines.len() as u16;
+    let top_pad = area.height.saturating_sub(content_h) / 2;
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Length(top_pad),
+            Constraint::Length(content_h),
+            Constraint::Min(0),
+        ])
+        .split(area);
+    frame.render_widget(Paragraph::new(content_lines), chunks[1]);
 }
 
 fn line_width(line: &Line<'_>) -> usize {
@@ -3548,6 +3612,104 @@ fn truncate(value: &str, max: usize) -> String {
     let mut out = value.chars().take(max - 3).collect::<String>();
     out.push_str("...");
     out
+}
+
+fn feedback_lines(app: &App) -> Vec<Line<'static>> {
+    let state = &app.feedback;
+    match state.step {
+        FeedbackStep::Category => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                "  Choose a category:",
+                text_style(),
+            )));
+            lines.push(Line::from(""));
+            for (i, cat) in FeedbackCategory::ALL.iter().enumerate() {
+                let number = format!("{}. ", i + 1);
+                let label = cat.label();
+                let desc = cat.description();
+                let is_selected = i == state.category_index;
+                let row_style = if is_selected { accent() } else { text_style() };
+                let prefix_style = if is_selected { accent() } else { muted() };
+                lines.push(Line::from(vec![
+                    Span::styled(format!("  {number}"), prefix_style),
+                    Span::styled(label.to_string(), row_style),
+                    Span::styled(format!(" — {desc}"), muted()),
+                ]));
+            }
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  1-5 or ↑↓ to select, Enter to continue",
+                dim(),
+            )));
+            lines
+        }
+        FeedbackStep::Description => {
+            let category = FeedbackCategory::ALL
+                .get(state.category_index)
+                .copied()
+                .unwrap_or(FeedbackCategory::Other);
+            let label = format!("  Tell us more ({})", category.label());
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled(label, text_style())));
+            lines.push(Line::from(""));
+            let input = state.description.clone();
+            let display = if input.is_empty() {
+                Line::from(Span::styled("  (optional)", dim()))
+            } else {
+                Line::from(vec![
+                    Span::raw("  "),
+                    Span::styled(input, text_style()),
+                    Span::styled("█", accent()),
+                ])
+            };
+            lines.push(display);
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Type your message, Enter to continue, Esc to go back",
+                dim(),
+            )));
+            lines
+        }
+        FeedbackStep::UploadLogs => {
+            let mut lines: Vec<Line<'static>> = Vec::new();
+            lines.push(Line::from(Span::styled(
+                "  Upload logs?",
+                text_style(),
+            )));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  Shares this session's full transcript and tool activity",
+                muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  (plus app version, OS, model). It may contain page or file",
+                muted(),
+            )));
+            lines.push(Line::from(Span::styled(
+                "  contents \u{2014} skip if anything here is sensitive.",
+                muted(),
+            )));
+            lines.push(Line::from(""));
+            let (yes_style, no_style) = if state.upload_yes {
+                (accent(), muted())
+            } else {
+                (muted(), accent())
+            };
+            lines.push(Line::from(vec![
+                Span::raw("  "),
+                Span::styled("[ Yes ]", yes_style),
+                Span::raw("   "),
+                Span::styled("[ No ]", no_style),
+            ]));
+            lines.push(Line::from(""));
+            lines.push(Line::from(Span::styled(
+                "  ↑↓ or y/n to choose, Enter to submit, Esc to go back",
+                dim(),
+            )));
+            lines
+        }
+    }
 }
 
 fn first_line(value: &str) -> String {
