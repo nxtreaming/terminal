@@ -49,6 +49,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 use browser_use_llm::auth::{load_codex_auth, CodexAuth};
 use browser_use_llm::route::ModelClient;
 use browser_use_runtime::{
+    AgentId as RuntimeAgentId, BrowserConfig as RuntimeBrowserConfig,
+    BrowserId as RuntimeBrowserId, BrowserLease as RuntimeBrowserLease,
     MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, RuntimeHandle,
     SessionId as RuntimeSessionId,
 };
@@ -132,7 +134,93 @@ const MCP_CLIENT_RESOURCE_PREFIX: &str = "tools.mcp_client";
 
 struct RuntimeBrowserBackend {
     session_id: String,
+    runtime: RuntimeHandle,
+    agent_id: RuntimeAgentId,
+    browser_id: RuntimeBrowserId,
     backend: Arc<dyn BrowserBackend>,
+}
+
+impl RuntimeBrowserBackend {
+    fn claim_browser(&self) -> anyhow::Result<RuntimeBrowserLease> {
+        self.runtime
+            .browsers()
+            .claim_browser(&self.browser_id, self.agent_id.clone())
+    }
+
+    fn release_browser(&self, lease: RuntimeBrowserLease) -> anyhow::Result<()> {
+        self.runtime.browsers().release_browser(&lease)
+    }
+
+    fn with_browser_lease<T>(
+        &self,
+        action: impl FnOnce(&dyn BrowserBackend) -> anyhow::Result<T>,
+    ) -> anyhow::Result<T> {
+        let lease = self.claim_browser()?;
+        let result = action(self.backend.as_ref());
+        let release_result = self.release_browser(lease);
+        match (result, release_result) {
+            (Ok(value), Ok(())) => Ok(value),
+            (Ok(_), Err(error)) => Err(error),
+            (Err(error), _) => Err(error),
+        }
+    }
+}
+
+impl BrowserBackend for RuntimeBrowserBackend {
+    fn command(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        command: &str,
+    ) -> anyhow::Result<browser_use_browser::BrowserCommandOutput> {
+        self.with_browser_lease(|backend| backend.command(session_id, cwd, artifact_dir, command))
+    }
+
+    fn run_script(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+        self.with_browser_lease(|backend| {
+            backend.run_script(session_id, cwd, artifact_dir, code, timeout_secs)
+        })
+    }
+
+    fn start_script(
+        &self,
+        session_id: &str,
+        cwd: &std::path::Path,
+        artifact_dir: &std::path::Path,
+        code: &str,
+        timeout_secs: u64,
+    ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+        self.with_browser_lease(|backend| {
+            backend.start_script(session_id, cwd, artifact_dir, code, timeout_secs)
+        })
+    }
+
+    fn observe_script(
+        &self,
+        session_id: &str,
+        run_id: &str,
+        observe_timeout_ms: u64,
+    ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+        self.with_browser_lease(|backend| {
+            backend.observe_script(session_id, run_id, observe_timeout_ms)
+        })
+    }
+
+    fn cancel_script(
+        &self,
+        session_id: &str,
+        run_id: &str,
+    ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+        self.with_browser_lease(|backend| backend.cancel_script(session_id, run_id))
+    }
 }
 
 struct RuntimePythonBackend {
@@ -251,22 +339,45 @@ fn browser_backend_for_runtime_or_config(
     );
     if let (Some(handle), Some(session_id)) = (runtime_handle, session_id) {
         if let Some(runtime_session_id) = runtime_session_id_for_agent_session(session_id) {
+            let Ok(agent_id) = RuntimeAgentId::from_string(session_id.as_str()) else {
+                return Arc::new(
+                    crate::tools::handlers::browser::RealBackend::with_browser_mode(
+                        config.options.browser_mode.clone(),
+                    ),
+                );
+            };
             if let Ok(resource) = handle.get_or_insert_session_resource(
                 &runtime_session_id,
                 &key,
-                || RuntimeBrowserBackend {
-                    session_id: session_id.as_str().to_string(),
-                    backend: Arc::new(
-                        crate::tools::handlers::browser::RealBackend::with_browser_mode(
-                            config.options.browser_mode.clone(),
+                || {
+                    let browser_id = handle.browsers().create_browser(RuntimeBrowserConfig {
+                        keep_alive: true,
+                        headless: None,
+                        profile_id: Some(session_id.as_str().to_string()),
+                    });
+                    RuntimeBrowserBackend {
+                        session_id: session_id.as_str().to_string(),
+                        runtime: handle.clone(),
+                        agent_id,
+                        browser_id,
+                        backend: Arc::new(
+                            crate::tools::handlers::browser::RealBackend::with_browser_mode(
+                                config.options.browser_mode.clone(),
+                            ),
                         ),
-                    ),
+                    }
                 },
                 |resource: Arc<RuntimeBrowserBackend>| {
-                    browser_use_browser::cleanup_session(&resource.session_id)
+                    let cleaned = browser_use_browser::cleanup_session(&resource.session_id);
+                    let _ = resource
+                        .runtime
+                        .browsers()
+                        .close_browser(&resource.browser_id);
+                    cleaned
                 },
             ) {
-                return Arc::clone(&resource.backend);
+                let backend: Arc<dyn BrowserBackend> = resource;
+                return backend;
             }
         }
     }
@@ -4013,6 +4124,17 @@ mod tests {
                 "browser status --json",
             )
             .expect("browser status should create a browser-use-browser session");
+        let browser_snapshots = handle.snapshot().browsers;
+        assert_eq!(browser_snapshots.len(), 1);
+        assert_eq!(
+            browser_snapshots[0].status,
+            browser_use_runtime::BrowserStatus::Released,
+            "browser calls should claim and release the runtime browser lease"
+        );
+        assert!(
+            browser_snapshots[0].active_agent_id.is_none(),
+            "browser lease should not remain active after a synchronous browser command"
+        );
         assert_eq!(
             handle
                 .cleanup_session_resources(root.session_id())
