@@ -135,7 +135,7 @@ pub(crate) fn submit_runtime_user_input(
 }
 
 #[cfg(test)]
-fn tui_runtime_handle(state_dir: &Path) -> Result<RuntimeHandle> {
+pub(crate) fn tui_runtime_handle(state_dir: &Path) -> Result<RuntimeHandle> {
     tui_runtime_handle_with_notifier(state_dir, None)
 }
 

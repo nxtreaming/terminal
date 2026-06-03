@@ -632,7 +632,9 @@ fn build_transcript_model_from_events(
         }
     }
 
-    let active = if session.status.is_active() {
+    let has_live_subagent_work = active_child_session_count(app, &session.id) > 0
+        || pending_agent_mailbox_count(app, &session.id) > 0;
+    let active = if session.status.is_active() || has_live_subagent_work {
         active_node_for_session(app, state, session, events)
     } else {
         None
@@ -1520,6 +1522,7 @@ fn active_node_for_session(
     }
 
     let active_child_count = active_child_session_count(app, &root.id);
+    let pending_mailbox_count = pending_agent_mailbox_count(app, &root.id);
     let live_thinking_text = state
         .transcript
         .last()
@@ -1574,9 +1577,18 @@ fn active_node_for_session(
             }
         }
     }
-    if live_streaming_text.is_none()
-        || (live_status == "Thinking..."
-            && live_stream_pending_status_allowed(live_events, !live_turn_is_followup))
+    if pending_mailbox_count > 0 && live_streaming_text.is_none() {
+        active_nodes.push(pending_status_node(
+            root,
+            events,
+            "subagent results ready",
+            pending_mailbox_summary(pending_mailbox_count).as_deref(),
+        ));
+    }
+    if pending_mailbox_count == 0
+        && (live_streaming_text.is_none()
+            || (live_status == "Thinking..."
+                && live_stream_pending_status_allowed(live_events, !live_turn_is_followup)))
     {
         active_nodes.push(pending_status_node(
             root,
@@ -1642,6 +1654,19 @@ fn active_child_session_count(app: &App, root_id: &str) -> usize {
         .count()
 }
 
+fn pending_agent_mailbox_count(app: &App, session_id: &str) -> usize {
+    crate::runtime::pending_runtime_agent_mailbox_count(&app.args.state_dir, session_id)
+        .ok()
+        .flatten()
+        .or_else(|| {
+            app.store
+                .messages_for_agent(session_id)
+                .ok()
+                .map(|items| items.len())
+        })
+        .unwrap_or(0)
+}
+
 fn active_subagent_summary(active_child_count: usize) -> Option<String> {
     if active_child_count == 0 {
         return None;
@@ -1652,6 +1677,18 @@ fn active_subagent_summary(active_child_count: usize) -> Option<String> {
         "subagents"
     };
     Some(format!("({active_child_count} {noun} running)"))
+}
+
+fn pending_mailbox_summary(pending_mailbox_count: usize) -> Option<String> {
+    if pending_mailbox_count == 0 {
+        return None;
+    }
+    let noun = if pending_mailbox_count == 1 {
+        "result"
+    } else {
+        "results"
+    };
+    Some(format!("({pending_mailbox_count} subagent {noun} queued)"))
 }
 
 fn active_timeline_tail_node(

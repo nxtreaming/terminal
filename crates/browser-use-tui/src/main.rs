@@ -12497,6 +12497,78 @@ wire_api = "responses"
     }
 
     #[test]
+    fn runtime_pending_subagent_mail_keeps_done_parent_visible() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let cwd = std::env::current_dir()?;
+        let parent = app.store.create_session(None, cwd.clone())?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "research this repo"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "Spawned agents; waiting later."}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            cwd.clone(),
+            Some("/root/repo_explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.selected_session_id = Some(parent.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        let runtime = runtime::tui_runtime_handle(&app.args.state_dir)?;
+        runtime.attach_root_agent(browser_use_runtime::AttachRootAgentRequest {
+            session_id: browser_use_runtime::SessionId::from_string(parent.id.clone())?,
+            cwd: cwd.clone(),
+            task: "research this repo".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        runtime.attach_child_agent(browser_use_runtime::AttachChildAgentRequest {
+            parent_agent_id: browser_use_runtime::AgentId::from_string(parent.id.clone())?,
+            child_agent_id: browser_use_runtime::AgentId::from_string(child.id.clone())?,
+            child_session_id: browser_use_runtime::SessionId::from_string(child.id.clone())?,
+            cwd,
+            agent_path: "/root/repo_explorer".to_string(),
+            nickname: Some("repo-explorer".to_string()),
+            role: Some("explorer".to_string()),
+        })?;
+        runtime.send_agent_message(browser_use_runtime::SendAgentMessageRequest {
+            author_agent_id: browser_use_runtime::AgentId::from_string(child.id.clone())?,
+            target_agent_id: browser_use_runtime::AgentId::from_string(parent.id.clone())?,
+            content: "<subagent_notification><agent_name>/root/repo_explorer</agent_name><status>completed</status></subagent_notification>".to_string(),
+            trigger_turn: false,
+            kind: browser_use_runtime::MailboxItemKind::Completion,
+            delivery_phase: browser_use_runtime::MailboxDeliveryPhase::NextTurn,
+            payload: serde_json::json!({"source": "test"}),
+        })?;
+
+        assert_eq!(
+            runtime::pending_runtime_agent_mailbox_count(&app.args.state_dir, &parent.id)?,
+            Some(1)
+        );
+        assert_eq!(
+            app.store
+                .load_session(&parent.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Done)
+        );
+        let state = app.workbench_state()?;
+        let model = transcript::transcript_model(&app, &state).expect("model");
+        let text = lines_plain_text(&transcript::active_viewport_lines(Some(&model), 100, 20));
+
+        assert!(text.contains("subagent results ready"), "{text}");
+        assert!(text.contains("(1 subagent result queued)"), "{text}");
+        assert!(!text.contains("Working..."), "{text}");
+        Ok(())
+    }
+
+    #[test]
     fn active_child_progress_stays_out_of_parent_viewport() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
