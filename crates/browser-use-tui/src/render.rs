@@ -2465,7 +2465,8 @@ fn model_lines(app: &App, height: usize) -> Vec<Line<'static>> {
         let is_selected = row_idx == app.selected_row;
         lines.push((Some(row_idx), model_custom_row(is_selected)));
     }
-    crop_model_lines(lines, app.selected_row, height)
+    // Plain catalog list — no pinned header, scroll every row.
+    crop_model_lines(lines, app.selected_row, height, 0)
 }
 
 /// The trailing "enter a custom model" row on the OpenRouter model screen.
@@ -2533,13 +2534,19 @@ fn model_search_lines(app: &App, height: usize) -> Vec<Line<'static>> {
             }
         }
     }
-    crop_model_lines(lines, app.selected_row, height)
+    // Pin the query-input line (index 0) so the caret stays visible.
+    crop_model_lines(lines, app.selected_row, height, 1)
 }
 
+/// Crop `lines` to `height` rows, centering on `selected_row`. `pinned_head`
+/// leading lines are kept fixed at the top (used by the search surface to keep
+/// its query-input line — and the popup caret — visible while the rows beneath
+/// scroll); pass `0` for a plain list with no header to scroll normally.
 fn crop_model_lines(
     lines: Vec<(Option<usize>, Line<'static>)>,
     selected_row: usize,
     height: usize,
+    pinned_head: usize,
 ) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
@@ -2547,12 +2554,7 @@ fn crop_model_lines(
     if lines.len() <= height {
         return lines.into_iter().map(|(_, line)| line).collect();
     }
-    // Pin the leading query-input line at the top so the text caret stays
-    // visible and the popup's cursor lookup can always find the input row;
-    // scroll only the selectable rows beneath it. Without this, centering the
-    // window on a deep `selected_row` scrolls the input off-screen and the
-    // caret disappears.
-    let pinned = 1.min(height);
+    let pinned = pinned_head.min(height);
     let head: Vec<Line<'static>> = lines[..pinned].iter().map(|(_, line)| line.clone()).collect();
     let body = &lines[pinned..];
     let visible = height - pinned;
