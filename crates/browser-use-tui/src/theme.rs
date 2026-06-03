@@ -229,6 +229,14 @@ pub(crate) fn done() -> Style {
     Style::default().fg(palette().done)
 }
 
+/// Style for the list item that is currently in use (the active model/provider),
+/// distinct from the blue cursor highlight so the active choice stands out.
+pub(crate) fn current() -> Style {
+    Style::default()
+        .fg(palette().done)
+        .add_modifier(Modifier::BOLD)
+}
+
 pub(crate) fn running() -> Style {
     Style::default().fg(palette().running)
 }
