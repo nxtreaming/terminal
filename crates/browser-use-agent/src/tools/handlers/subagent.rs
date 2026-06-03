@@ -749,12 +749,11 @@ fn parent_can_receive_completion_mail(
     store: &browser_use_store::Store,
     parent_session_id: &str,
 ) -> anyhow::Result<bool> {
-    let Some(parent) = store.load_session(parent_session_id)? else {
+    let Some(_parent) = store.load_session(parent_session_id)? else {
         return Ok(false);
     };
-    if !parent.status.is_active() {
-        return Ok(false);
-    }
+    // A child can finish after the parent has already ended its current turn.
+    // Keep that completion durable so the next parent turn or wait_agent can drain it.
     if store
         .agent_summary_for_child(parent_session_id)?
         .is_some_and(|agent| agent.status == "closed")

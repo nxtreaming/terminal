@@ -453,6 +453,41 @@ async fn store_backed_v2_wait_ignores_manager_mailbox_notifications() {
 }
 
 #[tokio::test]
+async fn store_backed_v2_wait_returns_immediately_for_queued_completion_mail() {
+    let (_dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    let handler = store_completion_handler(store.clone(), root_id.clone(), child_id, None);
+    handler
+        .notify(ChildAgentRunCompletion::success(Some(
+            "queued result".to_string(),
+        )))
+        .expect("completion should queue parent mail");
+
+    deps.wait_timeouts = WaitAgentTimeoutOptions {
+        default_timeout_ms: 1,
+        min_timeout_ms: 1,
+        max_timeout_ms: 50,
+    };
+    let wait = WaitAgentTool::new(deps);
+
+    let out = run_handler(
+        &wait,
+        &WaitAgentRequest {
+            timeout_ms: Some(1),
+        },
+    )
+    .await
+    .expect("queued completion mail should wake wait_agent");
+    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait completed."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(false), "{body}");
+
+    let store = store.lock().unwrap();
+    let parent_mail = store.messages_for_agent(&root_id).unwrap();
+    assert_eq!(parent_mail.len(), 1);
+    assert!(parent_mail[0].content.contains("queued result"));
+}
+
+#[tokio::test]
 async fn wait_returns_child_completion_via_mailbox() {
     let (_manager, sink, deps) = deps_with_fake();
     let spawn = SpawnAgentTool::new(deps.clone());
@@ -1035,6 +1070,53 @@ async fn followup_task_wakes_idle_store_backed_child_and_reports_completion() {
         .unwrap()
         .iter()
         .any(|event| event.event_type == "agent.completed"));
+}
+
+#[tokio::test]
+async fn store_completion_handler_queues_mail_for_done_parent() {
+    let (_dir, store, root_id, child_id, _sink, _deps) = deps_with_store_tree();
+    let run_id = "late-run".to_string();
+    let handler = store_completion_handler(
+        store.clone(),
+        root_id.clone(),
+        child_id.clone(),
+        Some(run_id.clone()),
+    );
+
+    {
+        let store = store.lock().unwrap();
+        store
+            .append_event(
+                &child_id,
+                "agent.run.started",
+                serde_json::json!({ "run_id": run_id.as_str() }),
+            )
+            .unwrap();
+        store
+            .set_status(&root_id, SessionStatus::Done)
+            .expect("parent marked done before child completion");
+    }
+
+    handler
+        .notify(ChildAgentRunCompletion::success(Some(
+            "late result".to_string(),
+        )))
+        .expect("late completion should notify idle parent");
+
+    let store = store.lock().unwrap();
+    let parent_events = store.events_for_session(&root_id).unwrap();
+    assert_eq!(
+        parent_events
+            .iter()
+            .filter(|event| event.event_type == "agent.completed")
+            .count(),
+        1
+    );
+    let parent_mail = store.messages_for_agent(&root_id).unwrap();
+    assert_eq!(parent_mail.len(), 1);
+    assert!(parent_mail[0].content.contains("<subagent_notification>"));
+    assert!(parent_mail[0].content.contains("late result"));
+    assert!(!parent_mail[0].trigger_turn);
 }
 
 #[tokio::test]
