@@ -429,7 +429,7 @@ async fn store_backed_spawn_does_not_emit_duplicate_legacy_spawn_event() {
 }
 
 #[tokio::test]
-async fn store_backed_v2_wait_ignores_manager_mailbox_notifications() {
+async fn store_backed_v2_wait_requires_live_runtime_mailbox() {
     let (_dir, _store, _root_id, _child_id, _sink, mut deps) = deps_with_store_tree();
     deps.wait_timeouts = WaitAgentTimeoutOptions {
         default_timeout_ms: 1,
@@ -445,22 +445,22 @@ async fn store_backed_v2_wait_ignores_manager_mailbox_notifications() {
     ));
     let wait = WaitAgentTool::new(deps);
 
-    let out = run_handler(
+    let err = run_handler(
         &wait,
         &WaitAgentRequest {
             timeout_ms: Some(1),
         },
     )
     .await
-    .expect("store-backed v2 wait should return from the durable store path");
-    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(body["message"].as_str(), Some("Wait timed out."), "{body}");
-    assert_eq!(body["timed_out"].as_bool(), Some(true), "{body}");
-    assert!(body.get("status").is_none(), "{body}");
+    .expect_err("Store-backed v2 wait must not be a live wakeup path");
+    assert!(
+        format!("{err:?}").contains("requires a live runtime mailbox"),
+        "{err:?}"
+    );
 }
 
 #[tokio::test]
-async fn store_backed_v2_wait_returns_immediately_for_queued_completion_mail() {
+async fn store_backed_v2_wait_does_not_consume_durable_completion_mail() {
     let (_dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
     let handler = store_completion_handler(store.clone(), root_id.clone(), child_id, None);
     handler
@@ -476,17 +476,18 @@ async fn store_backed_v2_wait_returns_immediately_for_queued_completion_mail() {
     };
     let wait = WaitAgentTool::new(deps);
 
-    let out = run_handler(
+    let err = run_handler(
         &wait,
         &WaitAgentRequest {
             timeout_ms: Some(1),
         },
     )
     .await
-    .expect("queued completion mail should wake wait_agent");
-    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
-    assert_eq!(body["message"].as_str(), Some("Wait completed."), "{body}");
-    assert_eq!(body["timed_out"].as_bool(), Some(false), "{body}");
+    .expect_err("durable completion mail must not wake Store-backed wait");
+    assert!(
+        format!("{err:?}").contains("requires a live runtime mailbox"),
+        "{err:?}"
+    );
 
     let store = store.lock().unwrap();
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
@@ -1531,7 +1532,8 @@ async fn wait_closed_completed_store_child_reports_shutdown() {
         .unwrap();
     store.set_child_agent_status(&child_id, "closed").unwrap();
 
-    let statuses = final_statuses_for_v1_wait(&store, &[child_id.as_str()]).unwrap();
+    let statuses =
+        crate::subagents::final_statuses_for_v1_wait(&store, &[child_id.as_str()]).unwrap();
     assert_eq!(statuses["/root/worker"], serde_json::json!("shutdown"));
 }
 

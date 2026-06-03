@@ -1658,12 +1658,6 @@ fn pending_agent_mailbox_count(app: &App, session_id: &str) -> usize {
     crate::runtime::pending_runtime_agent_mailbox_count(&app.args.state_dir, session_id)
         .ok()
         .flatten()
-        .or_else(|| {
-            app.store
-                .messages_for_agent(session_id)
-                .ok()
-                .map(|items| items.len())
-        })
         .unwrap_or(0)
 }
 

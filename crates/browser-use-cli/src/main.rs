@@ -48,8 +48,8 @@ use browser_use_agent::session::{
 use browser_use_agent::subagents::{
     canonical_agent_path_from_task_name, canonical_agent_reference,
     cleanup_agent_runtime_state_for_agent_subtree, display_agent_path_for_session,
-    final_statuses_for_v1_wait, last_task_message_for_agent, local_agent_status_value,
-    session_was_interrupted, store_collect_agent_tree as collect_agent_tree,
+    last_task_message_for_agent, local_agent_status_value, session_was_interrupted,
+    store_collect_agent_tree as collect_agent_tree,
     store_resolve_agent_reference_in_tree as resolve_agent_reference_in_tree,
     store_root_session_id as root_session_id, ResolvedAgentReference,
 };
@@ -4693,54 +4693,42 @@ fn send_agent_message_via_live_runtime(
 fn wait_agent(store: &Store, target_id: &str, targets: Vec<String>, timeout_ms: u64) -> Result<()> {
     let session = ensure_task_exists(store, target_id)?;
     if !targets.is_empty() {
-        return wait_agent_targets(store, &session.id, &targets, timeout_ms);
+        if let Some(invalid) = targets.iter().find(|target| !is_local_agent_id(target)) {
+            bail!("invalid agent id `{invalid}`");
+        }
+        if targets.len() > 1 {
+            bail!("runtime-backed wait-agent accepts at most one target; omit targets to wait for any child");
+        }
+        if wait_agent_via_live_runtime(
+            store,
+            &session.id,
+            Some(LocalRuntimeWaitTarget::AgentId(targets[0].clone())),
+            timeout_ms,
+        )? {
+            return Ok(());
+        }
+        bail!("wait-agent requires a live runtime socket; Store-backed wait is replay-only");
     }
-    if wait_agent_via_live_runtime(store, &session.id, timeout_ms)? {
+    if wait_agent_via_live_runtime(
+        store,
+        &session.id,
+        Some(LocalRuntimeWaitTarget::Any),
+        timeout_ms,
+    )? {
         return Ok(());
     }
-    store.append_event(
-        &session.id,
-        "agent.wait.started",
-        serde_json::json!({
-            "timeout_ms": timeout_ms,
-        }),
-    )?;
-    let started = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    let timed_out = loop {
-        if !store.messages_for_agent(target_id)?.is_empty() {
-            break false;
-        }
-        if started.elapsed() >= timeout {
-            break true;
-        }
-        std::thread::sleep(
-            Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())),
-        );
-    };
-    let waited_ms = started.elapsed().as_millis() as u64;
-    store.append_event(
-        &session.id,
-        "agent.wait.finished",
-        serde_json::json!({
-            "timed_out": timed_out,
-            "waited_ms": waited_ms,
-        }),
-    )?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "message": if timed_out { "Wait timed out." } else { "Wait completed." },
-            "timed_out": timed_out,
-        }))?
-    );
-    Ok(())
+    bail!("wait-agent requires a live runtime socket; Store-backed wait is replay-only")
 }
 
-fn wait_agent_via_live_runtime(store: &Store, session_id: &str, timeout_ms: u64) -> Result<bool> {
+fn wait_agent_via_live_runtime(
+    store: &Store,
+    session_id: &str,
+    target: Option<LocalRuntimeWaitTarget>,
+    timeout_ms: u64,
+) -> Result<bool> {
     let request = LocalRuntimeRequest::WaitAgent {
         parent_agent_id: session_id.to_string(),
-        target: Some(LocalRuntimeWaitTarget::Any),
+        target,
         timeout_ms,
     };
     let Some(response) = send_local_runtime_request(
@@ -4779,65 +4767,6 @@ fn wait_agent_via_live_runtime(store: &Store, session_id: &str, timeout_ms: u64)
         }))?
     );
     Ok(true)
-}
-
-fn wait_agent_targets(
-    store: &Store,
-    waiter_id: &str,
-    targets: &[String],
-    timeout_ms: u64,
-) -> Result<()> {
-    if let Some(invalid) = targets.iter().find(|target| !is_local_agent_id(target)) {
-        bail!("invalid agent id `{invalid}`");
-    }
-    let target_refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
-    let timeout_ms = if timeout_ms == 0 {
-        0
-    } else {
-        timeout_ms.clamp(10_000, 3_600_000)
-    };
-    store.append_event(
-        waiter_id,
-        "agent.wait.started",
-        serde_json::json!({
-            "targets": targets,
-            "timeout_ms": timeout_ms,
-        }),
-    )?;
-    let started = Instant::now();
-    let timeout = Duration::from_millis(timeout_ms);
-    let statuses = loop {
-        let statuses = final_statuses_for_v1_wait(store, &target_refs)?;
-        if !statuses.is_empty() {
-            break statuses;
-        }
-        if started.elapsed() >= timeout {
-            break serde_json::Map::new();
-        }
-        std::thread::sleep(
-            Duration::from_millis(50).min(timeout.saturating_sub(started.elapsed())),
-        );
-    };
-    let timed_out = statuses.is_empty();
-    let waited_ms = started.elapsed().as_millis() as u64;
-    store.append_event(
-        waiter_id,
-        "agent.wait.finished",
-        serde_json::json!({
-            "targets": targets,
-            "timed_out": timed_out,
-            "waited_ms": waited_ms,
-            "status": statuses,
-        }),
-    )?;
-    println!(
-        "{}",
-        serde_json::to_string_pretty(&serde_json::json!({
-            "status": statuses,
-            "timed_out": timed_out,
-        }))?
-    );
-    Ok(())
 }
 
 fn dataset_list() -> Result<()> {
@@ -7180,7 +7109,7 @@ command = "test-mcp"
     }
 
     #[test]
-    fn cli_wait_agent_records_wait_events_without_dumping_mail() -> Result<()> {
+    fn cli_wait_agent_requires_live_runtime_socket() -> Result<()> {
         let temp = unique_cli_test_dir("wait-agent-events")?;
         let state_dir = temp.join("state");
         let parent_cwd = temp.join("parent");
@@ -7188,14 +7117,18 @@ command = "test-mcp"
         let store = Store::open(&state_dir)?;
         let parent = store.create_session(None, &parent_cwd)?;
 
-        wait_agent(&store, &parent.id, Vec::new(), 0)?;
+        let err = wait_agent(&store, &parent.id, Vec::new(), 0)
+            .expect_err("Store-backed wait must not be a live CLI wait path");
+        assert!(
+            err.to_string().contains("requires a live runtime socket"),
+            "{err}"
+        );
         let events = store.events_for_session(&parent.id)?;
-        assert!(events
-            .iter()
-            .any(|event| event.event_type == "agent.wait.started"));
-        assert!(events.iter().any(|event| {
-            event.event_type == "agent.wait.finished"
-                && event.payload["timed_out"].as_bool() == Some(true)
+        assert!(events.iter().all(|event| {
+            event.event_type != "agent.wait.started"
+                && event.event_type != "agent.wait.finished"
+                && event.event_type != "wait_agent.started"
+                && event.event_type != "wait_agent.timed_out"
         }));
 
         std::fs::remove_dir_all(temp)?;
@@ -7569,7 +7502,7 @@ command = "test-mcp"
     }
 
     #[test]
-    fn cli_wait_agent_targets_returns_final_statuses_like_v1() -> Result<()> {
+    fn cli_wait_agent_target_uses_live_runtime_socket() -> Result<()> {
         let temp = unique_cli_test_dir("wait-agent-targets")?;
         let state_dir = temp.join("state");
         let parent_cwd = temp.join("parent");
@@ -7583,29 +7516,54 @@ command = "test-mcp"
             Some("CliNick"),
             Some("worker"),
         )?;
-        store.append_event(
-            &child.id,
-            "session.done",
-            serde_json::json!({"result": "complete"}),
-        )?;
+
+        let err = wait_agent(&store, &parent.id, vec!["not_an_id".to_string()], 0)
+            .expect_err("invalid target id should fail before runtime lookup");
+        assert!(err.to_string().contains("invalid agent id `not_an_id`"));
+
+        let journal = Arc::new(SqliteJournal::from_store(Store::open(&state_dir)?));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime.attach_root_agent(AttachRootAgentRequest {
+            session_id: SessionId::from_string(parent.id.clone())?,
+            cwd: parent_cwd.clone(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        runtime.attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: AgentId::from_string(parent.id.clone())?,
+            child_agent_id: AgentId::from_string(child.id.clone())?,
+            child_session_id: SessionId::from_string(child.id.clone())?,
+            cwd: parent_cwd.clone(),
+            agent_path: "/root/cli_child".to_string(),
+            nickname: Some("CliNick".to_string()),
+            role: Some("worker".to_string()),
+        })?;
+        let socket_path =
+            browser_use_runtime::spawn_local_runtime_server(&state_dir, runtime.clone())?;
+        runtime.send_agent_message(browser_use_runtime::SendAgentMessageRequest {
+            author_agent_id: AgentId::from_string(child.id.clone())?,
+            target_agent_id: AgentId::from_string(parent.id.clone())?,
+            content: "child finished".to_string(),
+            trigger_turn: false,
+            kind: RuntimeMailboxItemKind::Completion,
+            delivery_phase: RuntimeMailboxDeliveryPhase::NextTurn,
+            payload: serde_json::json!({"source": "test", "result": "complete", "success": true, "agent_path": "/root/cli_child"}),
+        })?;
 
         wait_agent(&store, &parent.id, vec![child.id.clone()], 0)?;
 
         let events = store.events_for_session(&parent.id)?;
-        let finished = events
+        assert!(events
             .iter()
-            .rev()
-            .find(|event| event.event_type == "agent.wait.finished")
-            .context("agent.wait.finished")?;
-        assert_eq!(finished.payload["timed_out"], false);
-        assert_eq!(
-            finished.payload["status"]["/root/cli_child"]["completed"],
-            "complete"
-        );
-        let err = wait_agent(&store, &parent.id, vec!["not_an_id".to_string()], 0)
-            .expect_err("invalid target id should fail");
-        assert!(err.to_string().contains("invalid agent id `not_an_id`"));
+            .any(|event| event.event_type == "wait_agent.completed"));
+        assert!(events
+            .iter()
+            .all(|event| event.event_type != "agent.wait.finished"));
+        assert!(store.messages_for_agent(&parent.id)?.is_empty());
 
+        let _ = std::fs::remove_file(socket_path);
         std::fs::remove_dir_all(temp)?;
         Ok(())
     }

@@ -29,7 +29,7 @@ use browser_use_runtime::{
     RuntimeError, RuntimeHandle, SendAgentMessageRequest as RuntimeSendAgentMessageRequest,
     SessionId as RuntimeSessionId, WaitAgentOutcome as RuntimeWaitAgentOutcome,
 };
-use browser_use_store::{Store, StoreNotificationWatcher};
+use browser_use_store::Store;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 use serde_json::Value;
@@ -49,9 +49,9 @@ use crate::subagents::manager::{ParentContext, SubagentManager};
 use crate::subagents::spawn::{check_spawn_depth, SpawnAgentArgs};
 use crate::subagents::{
     cleanup_agent_runtime_state_for_agent_subtree, display_agent_path_for_session,
-    final_statuses_for_v1_wait, last_task_message_for_agent, local_agent_status_value,
-    resolve_agent_path_v2, resolve_agent_reference_in_tree_v2, session_was_interrupted,
-    store_collect_agent_tree, store_resolve_agent_reference_in_tree_v2, store_root_session_id,
+    last_task_message_for_agent, local_agent_status_value, resolve_agent_path_v2,
+    resolve_agent_reference_in_tree_v2, session_was_interrupted, store_collect_agent_tree,
+    store_resolve_agent_reference_in_tree_v2, store_root_session_id,
 };
 use crate::tools::runtime::{
     Approvable, ExecOutput, SandboxAttempt, Sandboxable, ToolCtx, ToolError, ToolRuntime,
@@ -1932,43 +1932,6 @@ fn store_list_agents(
     Ok(Some(ok_output(json!({ "agents": agents }))))
 }
 
-async fn store_wait_agent(
-    deps: &SubagentToolDeps,
-    timeout: Duration,
-) -> Result<Option<ExecOutput>, ToolError> {
-    let Some(shared_store) = deps.store.as_ref() else {
-        return Ok(None);
-    };
-    let (watcher, mut cursor) = store_notification_watcher(shared_store)?;
-    let deadline = Instant::now() + timeout;
-
-    loop {
-        let has_mail = {
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            !store
-                .messages_for_agent(&deps.session_id)
-                .map_err(|err| tool_err("read agent mailbox failed", err))?
-                .is_empty()
-        };
-        if has_mail {
-            return Ok(Some(ok_output(json!({
-                "message": "Wait completed.",
-                "timed_out": false,
-            }))));
-        }
-        if Instant::now() >= deadline
-            || !wait_for_store_change(&watcher, &mut cursor, deadline).await?
-        {
-            return Ok(Some(ok_output(json!({
-                "message": "Wait timed out.",
-                "timed_out": true,
-            }))));
-        }
-    }
-}
-
 async fn runtime_wait_agent(
     deps: &SubagentToolDeps,
     timeout: Duration,
@@ -1997,38 +1960,63 @@ async fn runtime_wait_agent(
     Ok(Some(output))
 }
 
-async fn store_wait_agent_v1(
+async fn runtime_wait_agent_v1(
     deps: &SubagentToolDeps,
     targets: &[String],
     timeout: Duration,
 ) -> Result<Option<ExecOutput>, ToolError> {
-    let Some(shared_store) = deps.store.as_ref() else {
+    let Some(runtime) = deps.runtime_handle.as_ref() else {
         return Ok(None);
     };
-    let (watcher, mut cursor) = store_notification_watcher(shared_store)?;
-    let target_refs = targets.iter().map(String::as_str).collect::<Vec<_>>();
-    let deadline = Instant::now() + timeout;
-    loop {
-        let statuses = {
-            let store = shared_store
-                .lock()
-                .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-            final_statuses_for_v1_wait(&store, &target_refs)
-                .map_err(|err| tool_err("read target statuses failed", err))?
-        };
-        if !statuses.is_empty() || Instant::now() >= deadline {
-            return Ok(Some(ok_output(json!({
-                "status": Value::Object(statuses.clone()),
-                "timed_out": statuses.is_empty(),
-            }))));
+    let parent_agent_id = RuntimeAgentId::from_string(deps.session_id.clone())
+        .map_err(|err| tool_err("invalid runtime parent agent id", err))?;
+    let target = match targets {
+        [] => RuntimeAgentTarget::Any,
+        [target] => RuntimeAgentTarget::AgentId(
+            RuntimeAgentId::from_string(legacy_agent_id_target(target)?.to_string())
+                .map_err(|err| tool_err("invalid runtime wait target", err))?,
+        ),
+        _ => {
+            return Err(ToolError::Other(anyhow::anyhow!(
+                "runtime-backed wait_agent accepts at most one target; omit targets to wait for any child"
+            )));
         }
-        if !wait_for_store_change(&watcher, &mut cursor, deadline).await? {
-            return Ok(Some(ok_output(json!({
-                "status": {},
-                "timed_out": true,
-            }))));
+    };
+    let outcome = runtime
+        .wait_agent(&parent_agent_id, target, timeout)
+        .await
+        .map_err(|err| tool_err("runtime wait_agent failed", err))?;
+    let output = match outcome {
+        RuntimeWaitAgentOutcome::Completed(item) => {
+            let key = item
+                .payload
+                .get("agent_path")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| item.author_agent_id.as_str())
+                .to_string();
+            let result = item
+                .payload
+                .get("result")
+                .cloned()
+                .unwrap_or_else(|| Value::String(item.content.clone()));
+            let status = if item.payload.get("success").and_then(Value::as_bool) == Some(false) {
+                json!({ "errored": result })
+            } else {
+                json!({ "completed": result })
+            };
+            ok_output(json!({
+                "status": { key: status },
+                "timed_out": false,
+                "mailbox_seq": item.seq,
+                "author_agent_id": item.author_agent_id.as_str(),
+            }))
         }
-    }
+        RuntimeWaitAgentOutcome::TimedOut => ok_output(json!({
+            "status": {},
+            "timed_out": true,
+        })),
+    };
+    Ok(Some(output))
 }
 
 fn wait_timeout(
@@ -2059,39 +2047,6 @@ fn wait_timeout_v1(
     }
     let timeout_ms = timeout_ms.clamp(options.min_timeout_ms, options.max_timeout_ms);
     Ok(Duration::from_millis(timeout_ms as u64))
-}
-
-fn store_notification_watcher(
-    shared_store: &SharedStore,
-) -> Result<(StoreNotificationWatcher, u64), ToolError> {
-    let store = shared_store
-        .lock()
-        .map_err(|_| ToolError::Other(anyhow::anyhow!("store mutex poisoned")))?;
-    let watcher = store.notification_watcher();
-    let cursor = watcher.cursor();
-    Ok((watcher, cursor))
-}
-
-async fn wait_for_store_change(
-    watcher: &StoreNotificationWatcher,
-    cursor: &mut u64,
-    deadline: Instant,
-) -> Result<bool, ToolError> {
-    if Instant::now() >= deadline {
-        return Ok(false);
-    }
-    let timeout = deadline.saturating_duration_since(Instant::now());
-    let wait_cursor = *cursor;
-    let watcher = watcher.clone();
-    let (changed, next_cursor) = tokio::task::spawn_blocking(move || {
-        let changed = watcher.wait_for_change(wait_cursor, timeout);
-        let next_cursor = watcher.cursor();
-        (changed, next_cursor)
-    })
-    .await
-    .map_err(|err| ToolError::Other(anyhow::anyhow!("store notification wait failed: {err}")))?;
-    *cursor = next_cursor;
-    Ok(changed)
 }
 
 fn wait_finished_payload(output: &ExecOutput) -> Value {
@@ -2701,17 +2656,9 @@ impl ToolRuntime<WaitAgentRequest, ExecOutput> for WaitAgentTool {
             return Ok(output);
         }
         if self.deps.store.is_some() {
-            let output = store_wait_agent(&self.deps, timeout)
-                .await?
-                .ok_or_else(|| {
-                    ToolError::Other(anyhow::anyhow!(
-                        "store-backed wait unexpectedly unavailable"
-                    ))
-                })?;
-            emit_collab_waiting_end(&self.deps, ctx, serde_json::Map::new(), Vec::new());
-            self.deps
-                .emit("agent.wait.finished", wait_finished_payload(&output));
-            return Ok(output);
+            return Err(ToolError::Other(anyhow::anyhow!(
+                "wait_agent requires a live runtime mailbox; Store-backed wait is replay-only"
+            )));
         }
         let woken = self.deps.manager.wait_any(timeout).await;
         let output = ok_output(json!({
@@ -2782,13 +2729,18 @@ impl ToolRuntime<WaitAgentV1Request, ExecOutput> for WaitAgentV1Tool {
                 "tool": "wait_agent",
             }),
         );
-        if let Some(output) = store_wait_agent_v1(&self.deps, &req.targets, timeout).await? {
+        if let Some(output) = runtime_wait_agent_v1(&self.deps, &req.targets, timeout).await? {
             let (statuses, agent_statuses) =
                 wait_final_event_statuses(&self.deps, &req.targets, &output);
             emit_collab_waiting_end(&self.deps, ctx, statuses, agent_statuses);
             self.deps
                 .emit("agent.wait.finished", wait_finished_payload(&output));
             return Ok(output);
+        }
+        if self.deps.store.is_some() {
+            return Err(ToolError::Other(anyhow::anyhow!(
+                "wait_agent requires a live runtime mailbox; Store-backed wait is replay-only"
+            )));
         }
         let deadline = Instant::now() + timeout;
         loop {

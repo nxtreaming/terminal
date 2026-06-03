@@ -2633,10 +2633,7 @@ impl App {
             return Ok(false);
         }
         let mailbox_count =
-            match pending_runtime_agent_mailbox_count(&self.args.state_dir, &session_id)? {
-                Some(count) => count,
-                None => self.store.messages_for_agent(&session_id)?.len(),
-            };
+            pending_runtime_agent_mailbox_count(&self.args.state_dir, &session_id)?.unwrap_or(0);
         if mailbox_count == 0 {
             return Ok(false);
         }
@@ -12442,7 +12439,7 @@ wire_api = "responses"
     }
 
     #[test]
-    fn pending_subagent_mailbox_resumes_done_parent() -> Result<()> {
+    fn store_backed_pending_subagent_mailbox_does_not_resume_done_parent() -> Result<()> {
         let temp = tempfile::tempdir()?;
         let mut app = ready_app(&temp)?;
         let parent = app.store.create_session(None, std::env::current_dir()?)?;
@@ -12478,11 +12475,11 @@ wire_api = "responses"
             app.store
                 .load_session(&parent.id)?
                 .map(|session| session.status),
-            Some(SessionStatus::Running)
+            Some(SessionStatus::Done)
         );
         assert_eq!(app.store.messages_for_agent(&parent.id)?.len(), 1);
         let events = app.store.events_for_session(&parent.id)?;
-        assert!(events.iter().any(|event| {
+        assert!(!events.iter().any(|event| {
             event.event_type == SESSION_MAILBOX_CONTINUATION_STARTED_EVENT
                 && event
                     .payload
@@ -12491,8 +12488,8 @@ wire_api = "responses"
                     == Some(1)
         }));
         let screen = render_dump(&mut app)?;
-        assert!(screen.contains("subagent results ready"), "{screen}");
-        assert!(screen.contains("1 mailbox update queued"), "{screen}");
+        assert!(!screen.contains("subagent results ready"), "{screen}");
+        assert!(!screen.contains("1 mailbox update queued"), "{screen}");
         Ok(())
     }
 
