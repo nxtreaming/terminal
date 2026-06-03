@@ -11,7 +11,8 @@
 //!   recorded for metadata.
 //! - role application: `core/src/agent/role.rs:38-83`.
 //! - EVENT-NOTIFY mailbox wait: `core/src/tools/handlers/multi_agents_v2/
-//!   wait.rs:151-159` (parent `rx.changed().await`, then drain).
+//!   wait.rs:151-159` (parent `rx.changed().await`; wait observes mail but
+//!   does not return child content directly).
 //! - child-completion fragment: `core/src/context/subagent_notification.rs`.
 //! - registry / `<subagents>`: `core/src/agent/registry.rs` + legacy
 //!   `environment_context_subagents_for_session`.
@@ -19,9 +20,7 @@
 //! BUDGET ACCOUNTING: codex tracks per-thread token usage and the parent reads
 //! children's usage when assembling context (legacy `multi_agent_usage_hint`).
 //! Here that is modeled directly: each child's reported output-token count is
-//! aggregated onto the parent's [`SubagentManager::child_usage_total`]. This is a
-//! deliberate, simplified addition (see the WP report's caveats), not a 1:1 copy
-//! of a single codex call site.
+//! aggregated onto the parent's [`SubagentManager::child_usage_total`].
 
 use std::collections::BTreeSet;
 use std::sync::atomic::AtomicU64;
@@ -30,6 +29,7 @@ use std::sync::Arc;
 use std::sync::Mutex;
 
 use browser_use_providers::model_request_info_for_catalog;
+use browser_use_runtime::RuntimeError;
 use tokio::time::Duration;
 use tokio::time::Instant;
 
@@ -572,17 +572,22 @@ impl SubagentManager {
         let Some(limit) = self.max_concurrent_threads_per_session else {
             return Ok(());
         };
-        let live_threads = self
+        let max_open_spawned_agents = limit.saturating_sub(1);
+        let open_spawned_agents = self
             .registry
             .list_agents()
             .into_iter()
             .filter(|record| record.agent_path != ROOT_AGENT_PATH && record.status.is_live())
             .count()
             + reserved;
-        if live_threads >= limit {
-            return Err(SubagentError(format!(
-                "max_concurrent_threads_per_session limit reached ({limit})"
-            )));
+        if open_spawned_agents >= max_open_spawned_agents {
+            return Err(SubagentError(
+                RuntimeError::AgentLimitReached {
+                    limit: max_open_spawned_agents,
+                    open_spawned_agents,
+                }
+                .to_string(),
+            ));
         }
         Ok(())
     }

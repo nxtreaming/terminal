@@ -74,37 +74,33 @@ async fn spawn_succeeds_below_depth_limit() {
 }
 
 #[tokio::test]
-async fn v2_concurrent_thread_cap_counts_only_subagents() {
-    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(1));
+async fn v2_concurrent_thread_cap_counts_root_like_codex() {
+    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(2));
     let parent = parent_ctx("/root", 0);
     manager
         .spawn(spawn_args("first", "ok"), &parent)
         .await
-        .expect("root does not count against the subagent cap");
+        .expect("cap 2 allows root plus one spawned agent");
     let err = manager
         .spawn(spawn_args("second", "no room"), &parent)
         .await
-        .expect_err("second child exceeds cap 1");
-    assert!(err
-        .to_string()
-        .contains("max_concurrent_threads_per_session limit reached (1)"));
+        .expect_err("second child exceeds cap 2 because root consumes one slot");
+    assert!(err.to_string().contains("agent limit reached"));
 
-    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(2));
+    let manager = fake_manager_with_limit(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH, Some(3));
     manager
         .spawn(spawn_args("first", "ok"), &parent)
         .await
-        .expect("first child fits under cap 2");
+        .expect("first child fits under cap 3");
     manager
         .spawn(spawn_args("second", "ok"), &parent)
         .await
-        .expect("second child fits under cap 2");
+        .expect("second child fits under cap 3");
     let err = manager
         .spawn(spawn_args("third", "no room"), &parent)
         .await
-        .expect_err("third child exceeds cap 2");
-    assert!(err
-        .to_string()
-        .contains("max_concurrent_threads_per_session limit reached (2)"));
+        .expect_err("third child exceeds cap 3 because root consumes one slot");
+    assert!(err.to_string().contains("agent limit reached"));
 }
 
 // ---------------------------------------------------------------------------

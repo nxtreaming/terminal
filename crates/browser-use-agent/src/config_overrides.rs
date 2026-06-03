@@ -2068,6 +2068,7 @@ nickname_candidates = ["Hypatia", "Noether"]
 
     #[test]
     fn rejects_invalid_multi_agent_v2_config() {
+        let _guard = crate::test_env::lock();
         let overrides = parse_config_overrides(&ov(&[
             "features.multi_agent_v2.max_concurrent_threads_per_session=0",
             "features.multi_agent_v2.min_wait_timeout_ms=1",

@@ -28,6 +28,11 @@ use crate::subagents::DEFAULT_AGENT_MAX_DEPTH;
 use crate::tools::runtime::{SandboxAttempt, ToolCtx};
 use crate::tools::sandbox::{SandboxLaunch, SandboxPermissions, SandboxType};
 use browser_use_protocol::SessionStatus;
+use browser_use_runtime::{
+    AgentId as RuntimeAgentId, AttachChildAgentRequest, AttachRootAgentRequest, BrowserUseRuntime,
+    CompleteAgentRequest, LiveThreadPersistence, SessionId as RuntimeSessionId, SqliteJournal,
+    StateIndex,
+};
 use browser_use_store::Store;
 
 /// A fake child-spawner that simulates a child running to completion: it flips
@@ -127,6 +132,7 @@ fn deps_with_fake() -> (Arc<SubagentManager>, Arc<CaptureSink>, SubagentToolDeps
         store: None,
         child_runner: None,
         cleanup_session_runtime: None,
+        runtime_handle: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,
@@ -184,6 +190,7 @@ fn deps_with_store_tree() -> (
         store: Some(shared_store.clone()),
         child_runner: None,
         cleanup_session_runtime: None,
+        runtime_handle: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,
@@ -485,6 +492,70 @@ async fn store_backed_v2_wait_returns_immediately_for_queued_completion_mail() {
     let parent_mail = store.messages_for_agent(&root_id).unwrap();
     assert_eq!(parent_mail.len(), 1);
     assert!(parent_mail[0].content.contains("queued result"));
+}
+
+#[tokio::test]
+async fn runtime_backed_v2_wait_uses_live_mailbox_without_store_mail() {
+    let (dir, store, root_id, child_id, _sink, mut deps) = deps_with_store_tree();
+    let journal = Arc::new(SqliteJournal::from_store(
+        Store::open(dir.path()).expect("runtime store"),
+    ));
+    let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+    let state_index: Arc<dyn StateIndex> = journal;
+    let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+    runtime
+        .attach_root_agent(AttachRootAgentRequest {
+            session_id: RuntimeSessionId::from_string(root_id.clone()).expect("root session id"),
+            cwd: "/tmp".into(),
+            task: "root".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })
+        .expect("attach root");
+    runtime
+        .attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: RuntimeAgentId::from_string(root_id.clone()).expect("parent id"),
+            child_agent_id: RuntimeAgentId::from_string(child_id.clone()).expect("child id"),
+            child_session_id: RuntimeSessionId::from_string(child_id.clone())
+                .expect("child session id"),
+            cwd: "/tmp".into(),
+            agent_path: "/root/worker".to_string(),
+            nickname: Some("Atlas".to_string()),
+            role: Some("explorer".to_string()),
+        })
+        .expect("attach child");
+    runtime
+        .complete_agent(CompleteAgentRequest {
+            child_agent_id: RuntimeAgentId::from_string(child_id).expect("child id"),
+            result: "runtime result".to_string(),
+        })
+        .expect("complete child");
+
+    deps.runtime_handle = Some(runtime);
+    deps.wait_timeouts = WaitAgentTimeoutOptions {
+        default_timeout_ms: 1,
+        min_timeout_ms: 1,
+        max_timeout_ms: 50,
+    };
+    let wait = WaitAgentTool::new(deps);
+
+    let out = run_handler(
+        &wait,
+        &WaitAgentRequest {
+            timeout_ms: Some(1),
+        },
+    )
+    .await
+    .expect("runtime completion mail should wake wait_agent");
+    let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
+    assert_eq!(body["message"].as_str(), Some("Wait completed."), "{body}");
+    assert_eq!(body["timed_out"].as_bool(), Some(false), "{body}");
+    assert!(body["mailbox_seq"].as_u64().is_some(), "{body}");
+    assert!(store
+        .lock()
+        .unwrap()
+        .messages_for_agent(&root_id)
+        .unwrap()
+        .is_empty());
 }
 
 #[tokio::test]
@@ -987,7 +1058,7 @@ async fn store_thread_limit_ignores_terminal_child_edges() {
             .set_child_agent_status(&child_id, "done")
             .expect("mark child terminal");
     }
-    deps.max_concurrent_threads_per_session = Some(1);
+    deps.max_concurrent_threads_per_session = Some(2);
     let spawn = SpawnAgentTool::new(deps);
 
     let out = run_handler(&spawn, &spawn_args("next", "new task"))
@@ -995,6 +1066,21 @@ async fn store_thread_limit_ignores_terminal_child_edges() {
         .expect("terminal persisted edge must not consume spawn capacity");
     let body: serde_json::Value = serde_json::from_str(&out.stdout).unwrap();
     assert_eq!(body["task_name"].as_str(), Some("/root/next"));
+}
+
+#[tokio::test]
+async fn store_thread_limit_rejects_immediately_when_open_spawned_capacity_is_full() {
+    let (_dir, _store, _root_id, _child_id, sink, mut deps) = deps_with_store_tree();
+    deps.max_concurrent_threads_per_session = Some(2);
+    let spawn = SpawnAgentTool::new(deps);
+
+    let err = run_handler(&spawn, &spawn_args("next", "new task"))
+        .await
+        .expect_err("root plus one open child fills cap 2");
+    assert!(format!("{err:?}").contains("agent limit reached"));
+    assert!(sink
+        .types()
+        .contains(&"subagent.spawn_rejected".to_string()));
 }
 
 #[tokio::test]
@@ -1530,7 +1616,34 @@ async fn resume_completed_store_backed_child_restarts_target() {
 
 #[tokio::test]
 async fn store_backed_tools_use_durable_agent_tree() {
-    let (_dir, store, root_id, child_id, sink, mut deps) = deps_with_store_tree();
+    let (dir, store, root_id, child_id, sink, mut deps) = deps_with_store_tree();
+    let journal = Arc::new(SqliteJournal::from_store(
+        Store::open(dir.path()).expect("runtime store"),
+    ));
+    let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+    let state_index: Arc<dyn StateIndex> = journal;
+    let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+    runtime
+        .attach_root_agent(AttachRootAgentRequest {
+            session_id: RuntimeSessionId::from_string(root_id.clone()).expect("root session id"),
+            cwd: "/tmp".into(),
+            task: "root".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })
+        .expect("attach root");
+    let runtime_child = runtime
+        .attach_child_agent(AttachChildAgentRequest {
+            parent_agent_id: RuntimeAgentId::from_string(root_id.clone()).expect("parent id"),
+            child_agent_id: RuntimeAgentId::from_string(child_id.clone()).expect("child id"),
+            child_session_id: RuntimeSessionId::from_string(child_id.clone())
+                .expect("child session id"),
+            cwd: "/tmp".into(),
+            agent_path: "/root/worker".to_string(),
+            nickname: Some("Worker".to_string()),
+            role: Some("explorer".to_string()),
+        })
+        .expect("attach child");
+    deps.runtime_handle = Some(runtime.clone());
     let grandchild_id = {
         let store = store.lock().unwrap();
         store
@@ -1571,15 +1684,23 @@ async fn store_backed_tools_use_durable_agent_tree() {
     {
         let store = store.lock().unwrap();
         let mail = store.messages_for_agent(&child_id).unwrap();
-        assert_eq!(mail.len(), 1);
-        assert_eq!(mail[0].content, "durable note");
-        assert!(!mail[0].trigger_turn);
-        assert!(store
-            .events_for_session(&root_id)
-            .unwrap()
+        assert!(
+            mail.is_empty(),
+            "runtime-backed send_message should not use store agent_messages rows"
+        );
+        let root_events = store.events_for_session(&root_id).unwrap();
+        assert!(root_events
             .iter()
             .any(|event| event.event_type == "agent.message"));
+        let child_events = store.events_for_session(&child_id).unwrap();
+        assert!(child_events
+            .iter()
+            .any(|event| event.event_type == "mailbox.enqueued"));
     }
+    let live_mail = runtime_child.mailbox().pending_items();
+    assert_eq!(live_mail.len(), 1);
+    assert_eq!(live_mail[0].content, "durable note");
+    assert!(!live_mail[0].trigger_turn);
 
     let listed = run_handler(&list, &ListAgentsRequest::default())
         .await
@@ -1612,11 +1733,19 @@ async fn store_backed_tools_use_durable_agent_tree() {
                 .status,
             "closed"
         );
+        assert_eq!(
+            store
+                .agent_summary_for_child(&grandchild_id)
+                .unwrap()
+                .unwrap()
+                .status,
+            "closed"
+        );
     }
     let cleaned_sessions = cleaned_sessions.lock().unwrap();
-    assert_eq!(
-        cleaned_sessions.as_slice(),
-        &[child_id.clone(), grandchild_id]
+    assert!(
+        cleaned_sessions.is_empty(),
+        "runtime-backed close should use runtime resource cleanup, not the store fallback callback"
     );
     assert!(sink.types().contains(&"subagent.input".to_string()));
     assert!(sink.types().contains(&"subagent.closed".to_string()));
@@ -1641,6 +1770,7 @@ async fn spawn_failure_surfaces_as_tool_error() {
         store: None,
         child_runner: None,
         cleanup_session_runtime: None,
+        runtime_handle: None,
         spawn_gate: Arc::new(tokio::sync::Mutex::new(())),
         wait_timeouts: Default::default(),
         hide_spawn_agent_metadata: false,

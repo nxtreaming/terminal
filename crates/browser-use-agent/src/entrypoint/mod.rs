@@ -57,6 +57,11 @@ use std::time::Duration;
 
 use browser_use_llm::schema::{ContentPart, Message, MessageRole};
 use browser_use_protocol::{EventRecord, SessionStatus};
+use browser_use_runtime::{
+    DrainAgentMailboxRequest as RuntimeDrainAgentMailboxRequest, Durability as RuntimeDurability,
+    MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase, MailboxItem as RuntimeMailboxItem,
+    MailboxItemKind as RuntimeMailboxItemKind, RuntimeHandle, SessionId as RuntimeSessionId,
+};
 use browser_use_store::Store;
 use serde_json::{json, Value};
 use tokio_util::sync::CancellationToken;
@@ -195,6 +200,15 @@ enum MailboxDeliveryPhase {
     NextTurn,
 }
 
+impl MailboxDeliveryPhase {
+    fn to_runtime(self) -> RuntimeMailboxDeliveryPhase {
+        match self {
+            Self::CurrentTurn => RuntimeMailboxDeliveryPhase::CurrentTurn,
+            Self::NextTurn => RuntimeMailboxDeliveryPhase::NextTurn,
+        }
+    }
+}
+
 /// A [`TurnState`] backed by the session's durable event log, with REAL codex-
 /// parity token accounting + model-based compaction.
 ///
@@ -225,6 +239,7 @@ enum MailboxDeliveryPhase {
 struct StoreTurnState {
     store: SharedStore,
     session_id: SessionId,
+    runtime_handle: Option<RuntimeHandle>,
     /// Assistant turns + dispatched tool outputs recorded this run, so a follow-up
     /// prompt sees them. Shared (`Arc`) with the fused driver's [`FusionRecorder`]
     /// ([`BufferRecorder`]) so what the driver dispatches re-enters the next prompt.
@@ -265,6 +280,7 @@ impl StoreTurnState {
         Self {
             store,
             session_id,
+            runtime_handle: None,
             recorded,
             context_window_tokens: 0,
             model_auto_compact_token_limit: None,
@@ -294,6 +310,11 @@ impl StoreTurnState {
         self.model_auto_compact_token_limit = configured_limit;
         self.auto_compact_scope = scope;
         self.compaction_sampler = Some(sampler);
+        self
+    }
+
+    fn with_runtime_handle(mut self, runtime_handle: Option<RuntimeHandle>) -> Self {
+        self.runtime_handle = runtime_handle;
         self
     }
 
@@ -850,6 +871,13 @@ fn next_pending_active_followup(events: &[EventRecord]) -> Option<&EventRecord> 
         .iter()
         .filter(|event| event.event_type == SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT)
         .filter(|event| event.payload.get("pending_from_seq").is_none())
+        .filter(|event| {
+            !event
+                .payload
+                .get("runtime_mailbox_id")
+                .and_then(Value::as_str)
+                .is_some_and(|value| !value.trim().is_empty())
+        })
         .filter(|event| pending_after_next_tool_call_followup(events, event))
         .min_by_key(|event| event.seq)
 }
@@ -928,6 +956,19 @@ fn has_pending_trigger_turn_agent_mail(store: &SharedStore, session_id: &str) ->
         .unwrap_or(false)
 }
 
+fn has_pending_runtime_agent_mail(
+    runtime_handle: &RuntimeHandle,
+    session_id: &str,
+    delivery_phase: MailboxDeliveryPhase,
+) -> bool {
+    let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) else {
+        return false;
+    };
+    runtime_handle
+        .has_pending_agent_mail_for_session(&runtime_session_id, delivery_phase.to_runtime())
+        .unwrap_or(false)
+}
+
 fn drain_agent_mailbox_as_pending_input(store: &SharedStore, session_id: &str) -> Vec<Message> {
     let Ok(store) = store.lock() else {
         return Vec::new();
@@ -983,6 +1024,162 @@ fn drain_agent_mailbox_as_pending_input(store: &SharedStore, session_id: &str) -
                 "Direct task from parent"
             } else {
                 "Inter-agent message"
+            };
+            vec![Message::new(
+                MessageRole::User,
+                vec![ContentPart::text(format!(
+                    "{label} {author_path} to you {recipient_path}:\n{content}"
+                ))],
+            )]
+        })
+        .collect()
+}
+
+fn drain_runtime_agent_mailbox_as_pending_input(
+    runtime_handle: &RuntimeHandle,
+    store: &SharedStore,
+    session_id: &str,
+    delivery_phase: MailboxDeliveryPhase,
+) -> Vec<Message> {
+    let Ok(runtime_session_id) = RuntimeSessionId::from_string(session_id.to_string()) else {
+        return Vec::new();
+    };
+    let response = match runtime_handle.drain_agent_mailbox(RuntimeDrainAgentMailboxRequest {
+        session_id: runtime_session_id,
+        delivery_phase: delivery_phase.to_runtime(),
+    }) {
+        Ok(response) => response,
+        Err(_) => return Vec::new(),
+    };
+    if response.mailbox_items.is_empty() {
+        return Vec::new();
+    }
+    let store_guard = store.lock().ok();
+    runtime_mailbox_items_as_pending_input(
+        store_guard.as_deref(),
+        session_id,
+        response.mailbox_items,
+    )
+}
+
+fn runtime_mailbox_items_as_pending_input(
+    store: Option<&Store>,
+    session_id: &str,
+    items: Vec<RuntimeMailboxItem>,
+) -> Vec<Message> {
+    items
+        .into_iter()
+        .flat_map(|item| {
+            let item_kind = item.kind.clone();
+            let author_session_id = item
+                .payload
+                .get("author_session_id")
+                .and_then(Value::as_str)
+                .or_else(|| item.payload.get("child_session_id").and_then(Value::as_str))
+                .unwrap_or_else(|| item.author_agent_id.as_str())
+                .to_string();
+            let target_session_id = item
+                .payload
+                .get("target_session_id")
+                .and_then(Value::as_str)
+                .unwrap_or_else(|| item.target_agent_id.as_str())
+                .to_string();
+            let author_path = store
+                .and_then(|store| display_agent_path_for_session(store, &author_session_id).ok())
+                .or_else(|| {
+                    item.payload
+                        .get("author_path")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .unwrap_or_else(|| author_session_id.clone());
+            let recipient_path = store
+                .and_then(|store| display_agent_path_for_session(store, &target_session_id).ok())
+                .or_else(|| {
+                    item.payload
+                        .get("target_path")
+                        .and_then(Value::as_str)
+                        .map(ToString::to_string)
+                })
+                .or_else(|| item.target_path.clone())
+                .unwrap_or_else(|| target_session_id.clone());
+            let content = item.content.clone();
+            let trigger_turn = item.trigger_turn;
+
+            if item_kind == RuntimeMailboxItemKind::Followup || item.trigger_turn {
+                let cwd = store
+                    .and_then(|store| store.load_session(session_id).ok().flatten())
+                    .map(|session| session.cwd)
+                    .unwrap_or_else(|| ".".to_string());
+                let payload = item
+                    .payload
+                    .get("input_items")
+                    .filter(|value| !value.is_null())
+                    .map(|items| typed_user_input_payload_from_items_for_cwd(items, &cwd))
+                    .unwrap_or_else(|| typed_user_input_payload_from_text_for_cwd(&content, &cwd));
+                if let Ok(payload) = payload {
+                    let mut payload = payload;
+                    let pending_from_seq =
+                        item.payload.get("pending_from_seq").and_then(Value::as_i64);
+                    if let Some(pending_from_seq) = pending_from_seq {
+                        if let Some(obj) = payload.as_object_mut() {
+                            obj.insert(
+                                "pending_from_seq".to_string(),
+                                Value::from(pending_from_seq),
+                            );
+                        }
+                    }
+                    if let Some(store) = store {
+                        if let Ok(committed) =
+                            store.append_event(session_id, names::SESSION_FOLLOWUP, payload.clone())
+                        {
+                            if let Some(pending_from_seq) = pending_from_seq {
+                                let _ = store.append_event(
+                                    session_id,
+                                    AGENT_TURN_QUEUE_DRAINED_EVENT,
+                                    serde_json::json!({
+                                        "phase": "runtime_mailbox",
+                                        "session_messages": 1,
+                                        "mailbox_messages": 1,
+                                        "last_seq": committed.seq,
+                                        "followup_seqs": [pending_from_seq],
+                                        "runtime_mailbox_id": item.id,
+                                        "runtime_mailbox_seq": item.seq,
+                                    }),
+                                );
+                            }
+                        }
+                    }
+                    return user_input_payload_to_messages(&payload);
+                }
+            }
+
+            if let Some(store) = store {
+                let _ = store.append_event(
+                    session_id,
+                    "agent.mailbox_input",
+                    serde_json::json!({
+                        "id": item.id,
+                        "runtime_mailbox_seq": item.seq,
+                        "author_session_id": author_session_id.clone(),
+                        "target_session_id": target_session_id.clone(),
+                        "author_path": author_path.clone(),
+                        "recipient_path": recipient_path.clone(),
+                        "content": content.clone(),
+                        "trigger_turn": trigger_turn,
+                        "delivery_phase": item.delivery_phase,
+                        "kind": item_kind.clone(),
+                        "source": "runtime",
+                    }),
+                );
+            }
+            let label = match item_kind {
+                RuntimeMailboxItemKind::Completion => "Subagent completion",
+                RuntimeMailboxItemKind::Notification => "Inter-agent notification",
+                RuntimeMailboxItemKind::Followup if trigger_turn => "Direct task from parent",
+                RuntimeMailboxItemKind::Followup => "Follow-up task",
+                RuntimeMailboxItemKind::Input if trigger_turn => "Direct task from parent",
+                RuntimeMailboxItemKind::Input => "Inter-agent message",
             };
             vec![Message::new(
                 MessageRole::User,
@@ -1580,10 +1777,15 @@ impl TurnState for StoreTurnState {
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
         let mailbox_delivery_phase = *self.mailbox_delivery_phase.lock().unwrap();
+        let runtime_handle = self.runtime_handle.clone();
         tokio::task::spawn_blocking(move || {
+            let has_pending_mail = if let Some(runtime_handle) = runtime_handle {
+                has_pending_runtime_agent_mail(&runtime_handle, &session_id, mailbox_delivery_phase)
+            } else {
+                has_pending_agent_mail(&store, &session_id)
+            };
             has_pending_active_followup(&store, &session_id)
-                || (mailbox_delivery_phase == MailboxDeliveryPhase::CurrentTurn
-                    && has_pending_agent_mail(&store, &session_id))
+                || (mailbox_delivery_phase == MailboxDeliveryPhase::CurrentTurn && has_pending_mail)
         })
         .await
         .unwrap_or(false)
@@ -1606,11 +1808,21 @@ impl TurnState for StoreTurnState {
         }
         let store = Arc::clone(&self.store);
         let session_id = self.session_id.as_str().to_string();
+        let runtime_handle = self.runtime_handle.clone();
         tokio::task::spawn_blocking(move || {
             if followup_pending {
                 drain_one_pending_active_followup(&store, &session_id);
             }
-            drain_agent_mailbox_as_pending_input(&store, &session_id)
+            if let Some(runtime_handle) = runtime_handle {
+                drain_runtime_agent_mailbox_as_pending_input(
+                    &runtime_handle,
+                    &store,
+                    &session_id,
+                    mailbox_delivery_phase,
+                )
+            } else {
+                drain_agent_mailbox_as_pending_input(&store, &session_id)
+            }
         })
         .await
         .unwrap_or_default()
@@ -2033,9 +2245,11 @@ async fn drive_run<Sd: SamplingDriver>(
     base_instructions: Option<String>,
     developer_instructions: Option<String>,
     previous_model_compaction: Option<PreviousModelCompaction>,
+    runtime_handle: Option<RuntimeHandle>,
     cancel: CancellationToken,
 ) -> Result<Option<String>, AgentError> {
-    let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded);
+    let state = StoreTurnState::new(Arc::clone(&store), session_id.clone(), recorded)
+        .with_runtime_handle(runtime_handle);
     // Enable REAL token accounting + model-based compaction when a sampler is
     // available (the real backend path). The Fake/no-credential path passes `None`
     // and keeps the inert (never-compacts) behavior.
@@ -2165,6 +2379,56 @@ impl EventSink for SharedStoreSink {
     }
 }
 
+/// Runtime-backed protocol-event sink.
+///
+/// This is the live-runtime cutover point for model/tool events: callers that
+/// have a [`RuntimeHandle`] make the runtime perform the journal append and
+/// publish a live event. The SQLite row remains byte-shape-compatible with the
+/// old store sink because `append_observed_session_event` writes the original
+/// `event_type` and payload, not a runtime envelope.
+struct RuntimeStoreSink {
+    runtime: RuntimeHandle,
+    store: SharedStore,
+    model_context_window: Option<i64>,
+}
+
+impl EventSink for RuntimeStoreSink {
+    fn emit(&self, ev: PendingEvent) {
+        let payload = if ev.event_type == names::TOKEN_COUNT {
+            if let Ok(store) = self.store.lock() {
+                let events = store.events_for_session(&ev.session_id).unwrap_or_default();
+                let previous_total = latest_total_token_usage_value(&events);
+                enrich_token_count_payload(ev.payload, &previous_total, self.model_context_window)
+            } else {
+                ev.payload
+            }
+        } else {
+            ev.payload
+        };
+        let Ok(session_id) = RuntimeSessionId::from_string(ev.session_id) else {
+            return;
+        };
+        let _ = self.runtime.append_observed_session_event(
+            session_id,
+            &ev.event_type,
+            payload,
+            durability_for_protocol_event(&ev.event_type),
+        );
+    }
+}
+
+fn durability_for_protocol_event(event_type: &str) -> RuntimeDurability {
+    if event_type.ends_with(".output_delta")
+        || event_type == "tool.output_delta"
+        || event_type == "model.stream_delta"
+        || event_type == "model.thinking_delta"
+    {
+        RuntimeDurability::BestEffort
+    } else {
+        RuntimeDurability::Barrier
+    }
+}
+
 /// Run a session on the new async engine using a resolved provider config.
 ///
 /// This is the binary-facing facade. It seeds the environment workspace-context
@@ -2193,6 +2457,16 @@ pub async fn run_session_with_config_with_cancel(
     config: ProviderRunConfig,
     cancel: CancellationToken,
 ) -> anyhow::Result<SessionId> {
+    run_session_with_config_with_cancel_and_runtime(store, session_id, config, cancel, None).await
+}
+
+pub async fn run_session_with_config_with_cancel_and_runtime(
+    store: SharedStore,
+    session_id: &str,
+    config: ProviderRunConfig,
+    cancel: CancellationToken,
+    runtime_handle: Option<RuntimeHandle>,
+) -> anyhow::Result<SessionId> {
     let session_id = SessionId(session_id.to_string());
     loop {
         run_session_once_with_config_with_cancel(
@@ -2200,6 +2474,7 @@ pub async fn run_session_with_config_with_cancel(
             session_id.clone(),
             config.clone(),
             cancel.clone(),
+            runtime_handle.clone(),
         )
         .await?;
 
@@ -2216,6 +2491,7 @@ async fn run_session_once_with_config_with_cancel(
     session_id: SessionId,
     config: ProviderRunConfig,
     cancel: CancellationToken,
+    runtime_handle: Option<RuntimeHandle>,
 ) -> anyhow::Result<()> {
     let ctx = turn_ctx(&session_id, &config);
 
@@ -2232,8 +2508,14 @@ async fn run_session_once_with_config_with_cancel(
     //     recorder writing into `recorded`, so model tool-calls EXECUTE and their
     //     outputs re-enter the prompt.
     let model_context_window = effective_context_window_for_config(&config);
-    let driver_sink: Arc<dyn EventSink> =
-        make_ui_sink_with_context_window(Arc::clone(&store), model_context_window);
+    let driver_sink: Arc<dyn EventSink> = match runtime_handle.clone() {
+        Some(runtime) => Arc::new(RuntimeStoreSink {
+            runtime,
+            store: Arc::clone(&store),
+            model_context_window,
+        }),
+        None => make_ui_sink_with_context_window(Arc::clone(&store), model_context_window),
+    };
     let fusion_recorder: Arc<dyn FusionRecorder> = Arc::new(BufferRecorder {
         buffer: Arc::clone(&recorded),
     });
@@ -2268,6 +2550,7 @@ async fn run_session_once_with_config_with_cancel(
         user_input_ctx,
         tool_cwd,
         tool_artifact_root,
+        runtime_handle.clone(),
     )
     .map_err(|e| anyhow::anyhow!("{e}"))?;
 
@@ -2291,7 +2574,16 @@ async fn run_session_once_with_config_with_cancel(
     // caller already seeded). Fresh user input is sampled before queued steer
     // unless the reason this run exists is already-buffered mailbox mail; that
     // case matches Codex's "next turn" delivery and must drain immediately.
-    let pending_mail_at_start = has_pending_agent_mail(&store, session_id.as_str());
+    let pending_mail_at_start = runtime_handle
+        .as_ref()
+        .map(|runtime| {
+            has_pending_runtime_agent_mail(
+                runtime,
+                session_id.as_str(),
+                MailboxDeliveryPhase::CurrentTurn,
+            )
+        })
+        .unwrap_or_else(|| has_pending_agent_mail(&store, session_id.as_str()));
     let turn_has_fresh_input =
         log_has_user_input(&store, session_id.as_str()) && !pending_mail_at_start;
 
@@ -2339,6 +2631,7 @@ async fn run_session_once_with_config_with_cancel(
                 Some(base_instructions_for_config(&config)),
                 config.options.developer_instructions.clone(),
                 previous_model_compaction,
+                runtime_handle.clone(),
                 cancel.clone(),
             )
             .await?;
@@ -2363,6 +2656,7 @@ async fn run_session_once_with_config_with_cancel(
                 None,
                 None,
                 None,
+                runtime_handle.clone(),
                 cancel.clone(),
             )
             .await?;
@@ -2462,6 +2756,13 @@ mod tests {
     use crate::config_overrides::MultiAgentV2Options;
     use crate::config_overrides::ProviderBackend;
     use crate::config_overrides::ProviderRunConfig;
+    use browser_use_runtime::{
+        AgentId as RuntimeAgentId, AttachRootAgentRequest, BrowserUseRuntime,
+        LiveThreadPersistence, MailboxDeliveryPhase as RuntimeMailboxDeliveryPhase,
+        MailboxItemKind as RuntimeMailboxItemKind,
+        SendAgentMessageRequest as RuntimeSendAgentMessageRequest, SessionId as RuntimeSessionId,
+        SpawnChildRequest, SqliteJournal, StateIndex,
+    };
     use browser_use_store::Store;
     use std::sync::atomic::{AtomicUsize, Ordering};
     use tempfile::TempDir;
@@ -2966,6 +3267,90 @@ mod tests {
             event.event_type == "model.response.continued"
                 && event.payload.get("reason").and_then(Value::as_str)
                     == Some("active_turn_queue_drained")
+        }));
+    }
+
+    #[tokio::test]
+    async fn runtime_backed_active_followup_drains_from_mailbox_not_store_marker() {
+        let (dir, store, session_id) = store_with_session();
+        seed_user_input(&store, &session_id, "initial").await;
+        let pending_seq = {
+            let store = store.lock().expect("store mutex poisoned");
+            store
+                .append_event(
+                    &session_id,
+                    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                    serde_json::json!({
+                        "text": "runtime steer",
+                        "delivery": FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL,
+                        "runtime_mailbox_id": "pending",
+                    }),
+                )
+                .expect("pending followup")
+                .seq
+        };
+
+        let journal = Arc::new(SqliteJournal::from_store(
+            Store::open(dir.path()).expect("open runtime store"),
+        ));
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime = BrowserUseRuntime::new(persistence, state_index).handle();
+        runtime
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: RuntimeSessionId::from_string(session_id.clone()).unwrap(),
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .expect("attach root");
+        runtime
+            .send_agent_message(RuntimeSendAgentMessageRequest {
+                author_agent_id: RuntimeAgentId::from_string(session_id.clone()).unwrap(),
+                target_agent_id: RuntimeAgentId::from_string(session_id.clone()).unwrap(),
+                content: "runtime steer".to_string(),
+                trigger_turn: true,
+                kind: RuntimeMailboxItemKind::Followup,
+                delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                payload: serde_json::json!({
+                    "pending_from_seq": pending_seq,
+                    "source": "test",
+                }),
+            })
+            .expect("enqueue runtime followup");
+
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(session_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime));
+
+        assert!(state.has_pending_input().await);
+        let drained = state.take_pending_input().await;
+        assert_eq!(drained.len(), 1);
+        assert!(!state.has_pending_input().await);
+
+        let log = events(&store, &session_id);
+        let committed = log
+            .iter()
+            .filter(|event| event.event_type == names::SESSION_FOLLOWUP)
+            .collect::<Vec<_>>();
+        assert_eq!(committed.len(), 1);
+        assert_eq!(
+            committed[0]
+                .payload
+                .get("pending_from_seq")
+                .and_then(Value::as_i64),
+            Some(pending_seq)
+        );
+        assert!(log.iter().any(|event| {
+            event.event_type == AGENT_TURN_QUEUE_DRAINED_EVENT
+                && event
+                    .payload
+                    .get("followup_seqs")
+                    .and_then(Value::as_array)
+                    .is_some_and(|seqs| seqs.iter().any(|seq| seq.as_i64() == Some(pending_seq)))
         }));
     }
 
@@ -3726,6 +4111,86 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn runtime_turn_state_drains_runtime_mailbox_without_store_mail() {
+        let (dir, store, root_id) = store_with_session();
+        let journal = Arc::new(browser_use_runtime::SqliteJournal::open(dir.path()).unwrap());
+        let persistence: Arc<dyn LiveThreadPersistence> = journal.clone();
+        let state_index: Arc<dyn StateIndex> = journal;
+        let runtime_handle = BrowserUseRuntime::new(persistence, state_index).handle();
+        let root_runtime_id = RuntimeSessionId::from_string(root_id.clone()).unwrap();
+        let root = runtime_handle
+            .attach_root_agent(AttachRootAgentRequest {
+                session_id: root_runtime_id,
+                cwd: std::path::PathBuf::from("/work"),
+                task: "root".to_string(),
+                max_concurrent_threads_per_session: 3,
+            })
+            .unwrap();
+        let child = runtime_handle
+            .spawn_child(SpawnChildRequest {
+                parent_agent_id: root.agent_id().clone(),
+                child_agent_id: Some(RuntimeAgentId::from_string("child-agent").unwrap()),
+                child_session_id: None,
+                task_name: "worker".to_string(),
+                message: "inspect".to_string(),
+                nickname: Some("Atlas".to_string()),
+                role: Some("explorer".to_string()),
+            })
+            .unwrap();
+        runtime_handle
+            .send_agent_message(RuntimeSendAgentMessageRequest {
+                author_agent_id: child.agent_id().clone(),
+                target_agent_id: root.agent_id().clone(),
+                content: "runtime-only child update".to_string(),
+                trigger_turn: false,
+                kind: RuntimeMailboxItemKind::Input,
+                delivery_phase: RuntimeMailboxDeliveryPhase::CurrentTurn,
+                payload: json!({"source": "test"}),
+            })
+            .unwrap();
+        {
+            let store = store.lock().expect("store mutex poisoned");
+            assert!(
+                store.messages_for_agent(&root_id).unwrap().is_empty(),
+                "runtime mailbox delivery must not rely on agent_messages rows"
+            );
+        }
+
+        let state = StoreTurnState::new(
+            Arc::clone(&store),
+            SessionId(root_id.clone()),
+            Arc::new(Mutex::new(Vec::new())),
+        )
+        .with_runtime_handle(Some(runtime_handle.clone()));
+        assert!(state.has_pending_input().await);
+        let drained = state.take_pending_input().await;
+        assert_eq!(drained.len(), 1);
+        assert!(!state.has_pending_input().await);
+
+        let ContentPart::Text { text } = &drained[0].content[0] else {
+            panic!("mailbox input should be direct task text");
+        };
+        assert_eq!(
+            text,
+            "Inter-agent message /root/worker to you /root:\nruntime-only child update"
+        );
+
+        let root_events = events(&store, &root_id);
+        assert!(root_events
+            .iter()
+            .any(|event| event.event_type == "mailbox.consumed"));
+        let mailbox_input = root_events
+            .iter()
+            .find(|event| event.event_type == "agent.mailbox_input")
+            .expect("mailbox projection event");
+        assert_eq!(mailbox_input.payload["source"], "runtime");
+        assert_eq!(
+            mailbox_input.payload["content"],
+            "runtime-only child update"
+        );
+    }
+
+    #[tokio::test]
     async fn store_turn_state_defers_mailbox_after_answer_boundary() {
         let (_dir, store, root_id) = store_with_session();
         {
@@ -3902,6 +4367,7 @@ mod tests {
                 CancelAwareDriver,
                 true,
                 Arc::new(Mutex::new(Vec::new())),
+                None,
                 None,
                 None,
                 None,
