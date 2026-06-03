@@ -817,6 +817,59 @@ fn resolve_browser_command_for_selected_mode(
     }
 }
 
+fn local_connect_profile_preflight(
+    has_stored_profile: bool,
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    resolved_command: &str,
+) -> anyhow::Result<Option<BrowserCommandOutput>> {
+    if !is_plain_local_connect_command(resolved_command) {
+        return Ok(None);
+    }
+    if has_stored_profile {
+        return Ok(None);
+    }
+    let Ok(profiles) = backend.command(
+        session_id,
+        cwd,
+        artifact_dir,
+        "browser local profiles --json",
+    ) else {
+        return Ok(None);
+    };
+    let local_profiles = profiles
+        .content
+        .get("profiles")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    if local_profiles.len() <= 1 {
+        return Ok(None);
+    }
+    Ok(Some(BrowserCommandOutput {
+        content: json!({
+            "status": "needs-user-action",
+            "reason": "Multiple local Chromium profiles are available. Ask the user which profile to use before connecting.",
+            "local_profiles": local_profiles,
+            "next_step": "Ask the user which profile to use, then run browser profile use <profile-id> before browser connect local.",
+        }),
+        events: Vec::new(),
+    }))
+}
+
+fn is_plain_local_connect_command(command: &str) -> bool {
+    browser_command_words(command)
+        .map(|argv| {
+            let args = strip_browser_prefix(&argv);
+            args.len() == 2
+                && args.first().is_some_and(|arg| arg == "connect")
+                && args.get(1).is_some_and(|arg| arg == "local")
+        })
+        .unwrap_or(false)
+}
+
 fn effective_browser_mode(
     store: Option<&Store>,
     selected_browser_mode: Option<&str>,
@@ -1658,10 +1711,28 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
                                 selected_browser_mode,
                             )
                             .map_err(|error| ToolError::Rejected(format!("{error:#}")))?;
+                            let has_stored_profile = store
+                                .get_setting(BROWSER_PREF_PROFILE)
+                                .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                                .as_deref()
+                                .is_some_and(|profile| !profile.trim().is_empty());
                             drop(store);
-                            backend
-                                .command(&session_id, &cwd, &artifact_dir, &resolved)
-                                .map_err(ToolError::Other)?
+                            if let Some(preflight) = local_connect_profile_preflight(
+                                has_stored_profile,
+                                backend.as_ref(),
+                                &session_id,
+                                &cwd,
+                                &artifact_dir,
+                                &resolved,
+                            )
+                            .map_err(|error| ToolError::Rejected(format!("{error:#}")))?
+                            {
+                                preflight
+                            } else {
+                                backend
+                                    .command(&session_id, &cwd, &artifact_dir, &resolved)
+                                    .map_err(ToolError::Other)?
+                            }
                         }
                     } else {
                         let resolved = resolve_browser_command_for_selected_mode(
