@@ -189,6 +189,7 @@ fn unified_exec_manager_for_runtime_or_session(
                 return (*manager).clone();
             }
         }
+        return UnifiedExecManager::default();
     }
     unified_exec_manager_for_session(Some(session_id))
 }
@@ -3951,6 +3952,27 @@ mod tests {
             second.terminate_all().await,
             1,
             "second provider borrow must see the process created by the first borrow"
+        );
+    }
+
+    #[test]
+    fn runtime_unattached_unified_exec_does_not_use_global_fallback() {
+        let (runtime, _journal) = browser_use_runtime::BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let session_id = SessionId("missing-runtime-session".to_string());
+        unified_exec_managers()
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+
+        let _ = unified_exec_manager_for_runtime_or_session(Some(&handle), Some(&session_id));
+
+        assert!(
+            !unified_exec_managers()
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .contains_key(session_id.as_str()),
+            "runtime-backed lookup failures must not silently fall back to the legacy global manager"
         );
     }
 
