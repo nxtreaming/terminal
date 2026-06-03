@@ -166,8 +166,17 @@ pub fn browser_mode_instruction(mode: &str) -> String {
     match normalized.as_str() {
         "local" | "local-chrome" => concat!(
             "Selected browser mode: Local Chrome. Use `browser connect local` before page work. ",
-            "This checks for a local Chromium-family browser exposing CDP and attaches only after remote debugging is enabled. ",
-            "If connection is blocked, run `browser local setup` and wait for the user to approve remote debugging."
+            "This attaches to a local Chromium-family browser exposing CDP.\n\n",
+            "When the connection is blocked, READ THE CANDIDATE FIELDS (`browser_running`, `remote_debugging_enabled`, `state`) to figure out which problem you're solving, then act and retry. Don't stop after one attempt — each fix changes Chrome's state, so re-run `browser connect local` to see what's next. Some problems chain (Chrome's not running → launch it → retry → now it's running but permission is off → walk through chrome://inspect → retry → connected).\n\n",
+            "Two distinct fixes, picked by candidate state:\n\n",
+            "  A) `browser_running: false` (no Chrome process; covers `browser-not-running` and `stale-port` with browser_running=false):\n",
+            "      1. Always use the `shell` tool to open Chrome — DO NOT ask the user to do this manually. macOS: `open -a \"Google Chrome\"`. Linux: `google-chrome &` (or whichever Chromium binary is on PATH — `chromium`, `brave-browser`, `microsoft-edge`). Windows: `cmd /c start chrome`. Only fall back to asking the user if the shell command errors AND you can't recover.\n",
+            "      2. Give Chrome a moment to start, then retry `browser connect local`. Loop on the new state.\n\n",
+            "  B) `browser_running: true` AND `remote_debugging_enabled: false` (covers `cdp-disabled`; also `stale-port` with running=true):\n",
+            "      1. Run `browser local setup` to fetch the canonical URL (`chrome://inspect/#remote-debugging`) and step list. Then ALWAYS use the `shell` tool to open that URL for the user — DO NOT ask them to type chrome://inspect themselves. macOS: `open -a \"Google Chrome\" \"chrome://inspect/#remote-debugging\"` (Apple Events route chrome:// URLs; passing the URL as a plain CLI arg to the Chrome binary silently opens a blank tab on macOS — use `open -a`, not the binary). Linux: `google-chrome chrome://inspect/#remote-debugging`. Windows: `cmd /c start chrome chrome://inspect/#remote-debugging`. Adjust the app/binary if the user runs Edge/Brave/Canary. Only fall back to asking the user as a last resort if the shell command errors.\n",
+            "      2. Tell the user to tick 'Allow remote debugging for this browser instance' on the page you just opened, and reply when done. STOP — do NOT retry yet, and do NOT mention any Chrome popup. There is no popup at this stage.\n",
+            "      3. After they confirm, in the SAME chat message, warn them BEFORE you retry: Chrome is about to pop up asking 'Allow remote debugging?' and they should click Allow on it. THEN call `browser connect local` again in that same response. The user has to see the heads-up first so the popup doesn't blindside them.\n\n",
+            "Keep chat the only place these steps live; never describe a terminal modal or button to click."
         )
         .to_string(),
         "headless" | "headless-chromium" | "managed-headless" => concat!(
