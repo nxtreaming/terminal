@@ -537,7 +537,7 @@ impl Default for FeedbackState {
             step: FeedbackStep::Category,
             category_index: 0,
             description: String::new(),
-            upload_yes: false,
+            upload_yes: true,
         }
     }
 }
