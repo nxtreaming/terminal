@@ -1473,11 +1473,11 @@ fn local_setup_user_action_response(profile: Option<LocalBrowserProfile>) -> Val
         "url": "chrome://inspect/#remote-debugging",
         "profile": profile,
         "instructions": [
-            "Get the user to chrome://inspect/#remote-debugging — pick your method (shell tool, `browser_script`, asking the user to navigate manually).",
+            "Use the `shell` tool to open chrome://inspect/#remote-debugging in the user's Chrome. macOS: `open -a \"Google Chrome\" \"chrome://inspect/#remote-debugging\"` (Apple Events route chrome:// URLs; passing the URL as a plain CLI arg to the Chrome binary silently opens a blank tab on macOS). Linux: `google-chrome chrome://inspect/#remote-debugging`. Windows: `cmd /c start chrome chrome://inspect/#remote-debugging`. Adjust the binary if the user runs Edge/Brave/Canary. Only fall back to asking the user to type chrome://inspect themselves if the shell command errors. `browser_script` is NOT an option here — there is no CDP connection yet, which is what this whole flow is establishing.",
             "Tell the user to enable 'Allow remote debugging for this browser instance' on that page.",
             "Do not retry until the user confirms that permission is enabled, then run `browser connect local` again."
         ],
-        "next_step": "Open the URL however you prefer, wait for user confirmation, then run `browser connect local`."
+        "next_step": "Open the URL via `shell`, wait for user confirmation, then run `browser connect local`."
     })
 }
 
