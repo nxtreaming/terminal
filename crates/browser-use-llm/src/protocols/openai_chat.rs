@@ -168,7 +168,6 @@ fn build_simple_message(role: &str, message: &Message) -> Value {
 fn build_assistant_message(message: &Message) -> Result<Value, LlmError> {
     let mut obj = Map::new();
     obj.insert("role".to_string(), json!("assistant"));
-    obj.insert("content".to_string(), json!(collect_text(message)));
 
     let mut tool_calls: Vec<Value> = Vec::new();
     for part in &message.content {
@@ -188,6 +187,14 @@ fn build_assistant_message(message: &Message) -> Result<Value, LlmError> {
                 "function": { "name": name, "arguments": arguments },
             }));
         }
+    }
+    // Omit `content` for a tool-only assistant turn rather than sending an empty
+    // string. OpenAI tolerates `content: ""`, but strict downstream providers
+    // (e.g. Amazon Bedrock via OpenRouter) reject a blank text content block:
+    // "The text field in the ContentBlock object ... is blank."
+    let text = collect_text(message);
+    if !text.is_empty() || tool_calls.is_empty() {
+        obj.insert("content".to_string(), json!(text));
     }
     if !tool_calls.is_empty() {
         obj.insert("tool_calls".to_string(), Value::Array(tool_calls));
@@ -681,7 +688,6 @@ mod tests {
                 { "role": "user", "content": "what is the weather?" },
                 {
                     "role": "assistant",
-                    "content": "",
                     "tool_calls": [
                         {
                             "id": "call_1",

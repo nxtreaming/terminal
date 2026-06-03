@@ -73,6 +73,31 @@ pub(crate) struct ModelChoice {
     pub(crate) group: ModelChoiceGroup,
 }
 
+/// A starter pick surfaced at the top of the provider screen
+pub(crate) struct RecommendedModel {
+    pub(crate) display: &'static str,
+    pub(crate) account: &'static str,
+    pub(crate) provider_model: &'static str,
+}
+
+pub(crate) const RECOMMENDED_MODELS: &[RecommendedModel] = &[
+    RecommendedModel {
+        display: "GPT-5.5",
+        account: ACCOUNT_CODEX,
+        provider_model: "gpt-5.5",
+    },
+    RecommendedModel {
+        display: "Claude Opus 4.8",
+        account: ACCOUNT_ANTHROPIC,
+        provider_model: "claude-opus-4-8",
+    },
+    RecommendedModel {
+        display: "Gemini 3.1 Pro",
+        account: ACCOUNT_OPENROUTER,
+        provider_model: "google/gemini-3.1-pro-preview",
+    },
+];
+
 pub(crate) const ACCOUNT_CODEX: &str = "Codex login";
 pub(crate) const ACCOUNT_CLAUDE_CODE: &str = "Claude Code subscription";
 pub(crate) const ACCOUNT_CLAUDE_CODE_LEGACY: &str = "Claude Code login";
@@ -89,7 +114,7 @@ pub(crate) const ACCOUNT_CHOICES: [&str; 5] = [
     ACCOUNT_DEEPSEEK,
 ];
 
-pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use cloud";
+pub(crate) const BROWSER_USE_CLOUD: &str = "Browser Use Cloud";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_SETTING: &str = "auth.browser_use_cloud.api_key";
 pub(crate) const BROWSER_USE_CLOUD_API_KEY_ENV: &str = "BROWSER_USE_API_KEY";
 pub(crate) const BROWSER_LOCAL_CHROME: &str = "Local Chrome";
@@ -104,13 +129,23 @@ pub(crate) fn is_claude_code_account(account: &str) -> bool {
     account == ACCOUNT_CLAUDE_CODE || account == ACCOUNT_CLAUDE_CODE_LEGACY
 }
 
+/// Catalog (OpenAI/Codex) model slugs to keep out of the picker even when the
+/// catalog marks them `visibility: "list"`. Trims the GPT section down to the
+/// ones we want to surface (`gpt-5.5`, `gpt-5.4-mini`) without touching the
+/// catalog file or the models' capabilities — they remain runnable via config.
+const PICKER_HIDDEN_CATALOG_SLUGS: &[&str] = &["gpt-5.4", "gpt-5.3-codex", "gpt-5.2"];
+
+fn preset_hidden_from_picker(preset: &ModelPresetInfo) -> bool {
+    PICKER_HIDDEN_CATALOG_SLUGS.contains(&preset.id.as_str())
+}
+
 pub(crate) fn model_choices_for_catalog(catalog: &ModelCatalog) -> Vec<ModelChoice> {
     let mut choices = Vec::new();
     let chatgpt_presets = catalog.presets(true);
     choices.extend(
         chatgpt_presets
             .iter()
-            .filter(|preset| preset.show_in_picker)
+            .filter(|preset| preset.show_in_picker && !preset_hidden_from_picker(preset))
             .map(|preset| {
                 preset_choice(
                     preset,
@@ -124,7 +159,7 @@ pub(crate) fn model_choices_for_catalog(catalog: &ModelCatalog) -> Vec<ModelChoi
     choices.extend(
         api_presets
             .iter()
-            .filter(|preset| preset.show_in_picker)
+            .filter(|preset| preset.show_in_picker && !preset_hidden_from_picker(preset))
             .map(|preset| {
                 preset_choice(
                     preset,
@@ -138,7 +173,26 @@ pub(crate) fn model_choices_for_catalog(catalog: &ModelCatalog) -> Vec<ModelChoi
     if choices.is_empty() {
         return model_choices_for_catalog(&bundled_model_catalog());
     }
+    // Keep the stored order identical to the grouped render order
+    // (Recommended → BringYourOwnKey → OpenRouter → Deepseek). The picker treats
+    // `selected_row` as an index into this vec (navigation clamp, Enter/save),
+    // while `render::model_lines` highlights rows by a grouped row counter.
+    // Without this stable regroup the two index spaces diverge for interleaved
+    // rows (e.g. the BYOK Claude rows that sit between OpenRouter entries),
+    // which would highlight one model but save another.
+    choices.sort_by_key(|choice| group_render_rank(&choice.group));
     choices
+}
+
+/// Rank of a picker group in the order the picker renders its sections, so a
+/// stable sort by this key makes a choice's index match its highlighted row.
+fn group_render_rank(group: &ModelChoiceGroup) -> u8 {
+    match group {
+        ModelChoiceGroup::Recommended => 0,
+        ModelChoiceGroup::BringYourOwnKey => 1,
+        ModelChoiceGroup::OpenRouter => 2,
+        ModelChoiceGroup::Deepseek => 3,
+    }
 }
 
 pub(crate) fn fallback_model_choices() -> Vec<ModelChoice> {
@@ -238,10 +292,18 @@ fn static_external_model_choices() -> Vec<ModelChoice> {
             group: ModelChoiceGroup::BringYourOwnKey,
         },
         ModelChoice {
-            display: "Claude Opus 4.7".to_string(),
+            display: "Claude Opus 4.8".to_string(),
             account: ACCOUNT_ANTHROPIC,
             backend: AgentBackend::Anthropic,
-            provider_model: "claude-opus-4-7".to_string(),
+            provider_model: "claude-opus-4-8".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::BringYourOwnKey,
+        },
+        ModelChoice {
+            display: "Claude Haiku 4.5".to_string(),
+            account: ACCOUNT_ANTHROPIC,
+            backend: AgentBackend::Anthropic,
+            provider_model: "claude-haiku-4-5".to_string(),
             descriptor: "needs key".to_string(),
             group: ModelChoiceGroup::BringYourOwnKey,
         },
@@ -262,6 +324,38 @@ fn static_external_model_choices() -> Vec<ModelChoice> {
             group: ModelChoiceGroup::OpenRouter,
         },
         ModelChoice {
+            display: "Gemini 3.1 Pro".to_string(),
+            account: ACCOUNT_OPENROUTER,
+            backend: AgentBackend::Openrouter,
+            provider_model: "google/gemini-3.1-pro-preview".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::OpenRouter,
+        },
+        ModelChoice {
+            display: "GLM-5".to_string(),
+            account: ACCOUNT_OPENROUTER,
+            backend: AgentBackend::Openrouter,
+            provider_model: "z-ai/glm-5".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::OpenRouter,
+        },
+        ModelChoice {
+            display: "GLM-4.7".to_string(),
+            account: ACCOUNT_OPENROUTER,
+            backend: AgentBackend::Openrouter,
+            provider_model: "z-ai/glm-4.7".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::OpenRouter,
+        },
+        ModelChoice {
+            display: "MiniMax M2.5".to_string(),
+            account: ACCOUNT_OPENROUTER,
+            backend: AgentBackend::Openrouter,
+            provider_model: "minimax/minimax-m2.5".to_string(),
+            descriptor: "needs key".to_string(),
+            group: ModelChoiceGroup::OpenRouter,
+        },
+        ModelChoice {
             display: "DeepSeek V4 Pro".to_string(),
             account: ACCOUNT_OPENROUTER,
             backend: AgentBackend::Openrouter,
@@ -278,6 +372,106 @@ fn static_external_model_choices() -> Vec<ModelChoice> {
             group: ModelChoiceGroup::Deepseek,
         },
     ]
+}
+
+/// The model rows belonging to a single provider/account, in picker order. Used
+/// by the provider-scoped model screen so each provider shows only its models.
+pub(crate) fn provider_model_choices<'a>(
+    account: &str,
+    choices: &'a [ModelChoice],
+) -> Vec<&'a ModelChoice> {
+    choices
+        .iter()
+        .filter(|choice| choice.account == account)
+        .collect()
+}
+
+/// The backend that serves a given provider account.
+pub(crate) fn provider_backend_for_account(account: &str) -> AgentBackend {
+    if account == ACCOUNT_CODEX {
+        AgentBackend::Codex
+    } else if account == ACCOUNT_OPENAI {
+        AgentBackend::Openai
+    } else if account == ACCOUNT_ANTHROPIC {
+        AgentBackend::Anthropic
+    } else if account == ACCOUNT_DEEPSEEK {
+        AgentBackend::Deepseek
+    } else {
+        AgentBackend::Openrouter
+    }
+}
+
+/// Build a `ModelChoice` for a (dynamically-fetched or recommended) model id on a
+/// given provider account, so it flows through the normal save/persist path.
+pub(crate) fn model_choice_for(
+    account: &'static str,
+    provider_model: &str,
+    display: &str,
+) -> ModelChoice {
+    ModelChoice {
+        display: display.to_string(),
+        account,
+        backend: provider_backend_for_account(account),
+        provider_model: provider_model.to_string(),
+        descriptor: "needs key".to_string(),
+        group: ModelChoiceGroup::Recommended,
+    }
+}
+
+/// A synthetic choice for a free-text OpenRouter model id typed by the user.
+#[allow(dead_code)] // superseded by model_choice_for; retained for a unit test
+pub(crate) fn custom_openrouter_choice(model_id: &str) -> ModelChoice {
+    ModelChoice {
+        display: model_id.to_string(),
+        account: ACCOUNT_OPENROUTER,
+        backend: AgentBackend::Openrouter,
+        provider_model: model_id.to_string(),
+        descriptor: "custom".to_string(),
+        group: ModelChoiceGroup::OpenRouter,
+    }
+}
+
+pub(crate) fn bundled_openrouter_model_ids() -> Vec<String> {
+    [
+        // Anthropic
+        "anthropic/claude-sonnet-4.6", // verified
+        "anthropic/claude-opus-4.8",
+        "anthropic/claude-haiku-4.5",
+        // OpenAI
+        "openai/gpt-5.5", // verified
+        "openai/gpt-5.1",
+        // Google
+        "google/gemini-3.1-pro-preview", // verified
+        "google/gemini-2.5-pro",         // verified
+        "google/gemini-3.5-flash",
+        // xAI
+        "x-ai/grok-4.3", // verified
+        "x-ai/grok-4.20",
+        // DeepSeek
+        "deepseek/deepseek-v4-pro",
+        "deepseek/deepseek-v3.2",
+        // Qwen
+        "qwen/qwen3-max", // verified
+        "qwen/qwen3.7-max",
+        // Moonshot (Kimi)
+        "moonshotai/kimi-k2.5", // verified
+        "moonshotai/kimi-k2.6",
+        // Z-AI (GLM)
+        "z-ai/glm-5", // verified
+        "z-ai/glm-5.1",
+        "z-ai/glm-4.7",
+        // MiniMax
+        "minimax/minimax-m2.5",
+        "minimax/minimax-m3",
+        // Meta (Llama)
+        "meta-llama/llama-4-maverick",
+        // Mistral
+        "mistralai/mistral-large",
+        "mistralai/mistral-medium-3.1",
+    ]
+    .iter()
+    .map(|id| id.to_string())
+    .collect()
 }
 
 pub(crate) fn provider_model_for_display(display: &str, choices: &[ModelChoice]) -> String {
@@ -307,4 +501,64 @@ pub(crate) fn display_and_provider_model_for_input(
         return (choice.display.clone(), choice.provider_model.clone());
     }
     (input.to_string(), input.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn provider_model_choices_scopes_to_account() {
+        let choices = fallback_model_choices();
+        let openrouter = provider_model_choices(ACCOUNT_OPENROUTER, &choices);
+        assert!(!openrouter.is_empty());
+        assert!(openrouter
+            .iter()
+            .all(|choice| choice.account == ACCOUNT_OPENROUTER));
+        // The Codex provider must not leak OpenRouter rows and vice versa.
+        let codex = provider_model_choices(ACCOUNT_CODEX, &choices);
+        assert!(codex.iter().all(|choice| choice.account == ACCOUNT_CODEX));
+    }
+
+    #[test]
+    fn custom_openrouter_choice_wraps_raw_id() {
+        let choice = custom_openrouter_choice("vendor/some-model");
+        assert_eq!(choice.account, ACCOUNT_OPENROUTER);
+        assert_eq!(choice.backend, AgentBackend::Openrouter);
+        assert_eq!(choice.provider_model, "vendor/some-model");
+        assert_eq!(choice.display, "vendor/some-model");
+    }
+
+    #[test]
+    fn bundled_openrouter_ids_are_the_verified_curated_set() {
+        let ids = bundled_openrouter_model_ids();
+        // Verified frontier + top open-source picks.
+        for id in [
+            "anthropic/claude-sonnet-4.6",
+            "openai/gpt-5.5",
+            "x-ai/grok-4.3",
+            "moonshotai/kimi-k2.5",
+            "qwen/qwen3-max",
+        ] {
+            assert!(ids.iter().any(|got| got == id), "missing {id}");
+        }
+        // Every curated id carries a vendor prefix (vendor/model).
+        assert!(ids.iter().all(|id| id.contains('/')));
+    }
+
+    #[test]
+    fn recommended_models_have_a_matching_provider_row() {
+        let choices = fallback_model_choices();
+        for rec in RECOMMENDED_MODELS {
+            let scoped = provider_model_choices(rec.account, &choices);
+            assert!(
+                scoped
+                    .iter()
+                    .any(|choice| choice.provider_model == rec.provider_model),
+                "recommended {} has no row under {}",
+                rec.provider_model,
+                rec.account
+            );
+        }
+    }
 }

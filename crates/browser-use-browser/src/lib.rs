@@ -1523,10 +1523,10 @@ fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions
     if !browser_use_api_key_configured(command_options) {
         return Ok(json!({
             "status": "needs-auth",
-            "provider": "Browser Use cloud",
+            "provider": "Browser Use Cloud",
             "missing": "BROWSER_USE_API_KEY",
             "instructions": [
-                "Open /auth, choose Browser Use cloud, and save a Browser Use API key.",
+                "Open /auth, choose Browser Use Cloud, and save a Browser Use API key.",
                 "Alternatively export BROWSER_USE_API_KEY before launching Browser Use Terminal."
             ],
             "next_step": "/auth"
@@ -1617,10 +1617,10 @@ fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions
     })();
     let stop_result = stop_cloud_browser_with_options(&remote_browser_id, command_options);
     if let Err(error) = sync_result {
-        return Err(error.context("set cookies in Browser Use cloud browser"));
+        return Err(error.context("set cookies in Browser Use Cloud browser"));
     }
     if let Err(error) = stop_result {
-        return Err(error.context("stop Browser Use cloud browser after cookie sync"));
+        return Err(error.context("stop Browser Use Cloud browser after cookie sync"));
     }
 
     Ok(json!({
@@ -1643,7 +1643,7 @@ fn sync_profile_cookies(argv: &[String], command_options: &BrowserCommandOptions
         "synced_cookie_count": cookies.len(),
         "domain_count": domain_count,
         "cookie_summary": cookie_summary,
-        "next_step": "Use browser remote start --profile-id <cloud_profile.id> to start a Browser Use cloud browser with these cookies."
+        "next_step": "Use browser remote start --profile-id <cloud_profile.id> to start a Browser Use Cloud browser with these cookies."
     }))
 }
 
@@ -2145,7 +2145,7 @@ impl BrowserSession {
             .get("liveUrl")
             .and_then(Value::as_str)
             .map(ToOwned::to_owned);
-        self.browser_name = Some("Browser Use cloud".to_string());
+        self.browser_name = Some("Browser Use Cloud".to_string());
         Ok(json!({
             "status": "connected",
             "remote_browser": browser,
@@ -2158,7 +2158,7 @@ impl BrowserSession {
         if !(self.owner == BrowserOwner::Rust && self.mode == BrowserMode::RemoteCloud) {
             return Ok(json!({
                 "stopped": false,
-                "reason": "current browser is not a Rust-owned Browser Use cloud browser",
+                "reason": "current browser is not a Rust-owned Browser Use Cloud browser",
             }));
         }
         let Some(id) = self.remote_browser_id.clone() else {
@@ -2356,7 +2356,7 @@ impl BrowserSession {
         checks.push(json!({
             "name": "Browser Use API key",
             "ok": std::env::var("BROWSER_USE_API_KEY").is_ok_and(|value| !value.trim().is_empty()),
-            "detail": "Only required for Browser Use cloud browsers and cloud profiles",
+            "detail": "Only required for Browser Use Cloud browsers and cloud profiles",
         }));
         if let Some(endpoint) = self.endpoint.as_ref() {
             let endpoint_probe = probe_endpoint(endpoint);
