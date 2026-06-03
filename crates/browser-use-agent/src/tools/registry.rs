@@ -651,7 +651,7 @@ pub mod definitions {
     pub const MULTI_AGENT_V1_NAMESPACE: &str = "multi_agent_v1";
     const MULTI_AGENT_V1_NAMESPACE_DESCRIPTION: &str =
         "Tools for spawning and managing sub-agents.";
-    const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed.";
+    const SPAWN_AGENT_INHERITED_MODEL_GUIDANCE: &str = "Spawned agents inherit your current model by default. Omit `model` to use that preferred default; set `model` only when an explicit override is needed. If you set `agent_type`, `model`, or `reasoning_effort`, also set `fork_turns` to `none` or a positive integer; full-history forks inherit those fields.";
     const SPAWN_AGENT_MODEL_OVERRIDE_DESCRIPTION: &str = "Optional model override for the new agent. Leave unset to inherit the same model as the parent, which is the preferred default. Only set this when the user explicitly asks for a different model or the task clearly requires one.";
     const SPAWN_AGENT_SERVICE_TIER_OVERRIDE_DESCRIPTION: &str =
         "Optional service tier override for the new agent. Leave unset unless the user explicitly asks for one.";
@@ -1253,6 +1253,8 @@ The spawned agent will have the same tools as you and the ability to spawn its o
 {SPAWN_AGENT_INHERITED_MODEL_GUIDANCE}
 It will be able to send you and other running agents messages, and its final answer will be provided to you when it finishes.
 The new agent's canonical task name will be provided to it along with the message.
+When the user asks you to spawn subagents to research, compare, inspect, or report back on something, spawn the subagents, then call `wait_agent` and synthesize their returned mailbox results. Do not end with only a list of spawned agents or "I'll wait when you want" unless the user explicitly asked for background-only work.
+If multiple spawned agents are expected to contribute to the answer, keep waiting and integrating mailbox updates until the requested comparison/summary is complete or every spawned agent has finished/failed.
 {concurrency_guidance}"#,
             available_models_description
         );
@@ -1654,7 +1656,7 @@ Agent-role guidance below only helps choose which agent to use after spawning is
     /// `multi_agents_v2/wait.rs`: targetless mailbox wait.
     pub fn wait_agent() -> ToolDefinition {
         wait_agent_with_timeouts(WaitAgentDefinitionOptions {
-            default_timeout_ms: 30_000,
+            default_timeout_ms: 300_000,
             min_timeout_ms: 1,
             max_timeout_ms: 3_600_000,
         })
@@ -1665,7 +1667,7 @@ Agent-role guidance below only helps choose which agent to use after spawning is
         let min_timeout_ms = options.min_timeout_ms.clamp(1, max_timeout_ms);
         ToolDefinition {
             name: "wait_agent".to_string(),
-            description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline."
+            description: "Wait for a mailbox update from any live agent, including queued messages and final-status notifications. Does not return the content; returns either a summary of which agents have updates (if any), or a timeout summary if no mailbox update arrives before the deadline. Use this after spawning agents when the user expects their findings, comparison, or final synthesis; after it completes, consume the mailbox update in the next model step and continue waiting if more spawned agents still need to report."
                 .to_string(),
             input_schema: json!({
                 "type": "object",

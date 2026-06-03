@@ -475,10 +475,15 @@ fn fork_turns_parses_none_all_numeric() {
 }
 
 #[tokio::test]
-async fn full_history_spawn_rejects_agent_model_reasoning_overrides() {
-    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+async fn full_history_spawn_metadata_overrides_become_non_forked_role_spawn() {
+    let spawner = Arc::new(RecordingSpawner::default());
+    let manager = SubagentManager::with_config(
+        spawner.clone(),
+        RoleRegistry::new(),
+        DEFAULT_AGENT_MAX_DEPTH,
+    );
     let parent = parent_ctx("/root", 0);
-    let err = manager
+    let handle = manager
         .spawn(
             SpawnAgentArgs::from_value(serde_json::json!({
                 "message": "do it",
@@ -490,17 +495,22 @@ async fn full_history_spawn_rejects_agent_model_reasoning_overrides() {
             &parent,
         )
         .await
-        .expect_err("full-history fork must reject role/model/reasoning overrides");
-    assert!(
-        err.0.contains("Full-history forked agents inherit"),
-        "unexpected error: {}",
-        err.0
-    );
+        .expect("metadata override should normalize instead of failing");
+    assert_eq!(handle.agent_path, "/root/worker");
+    let specs = spawner.specs.lock().unwrap();
+    let spec = specs.last().expect("recorded spec");
+    assert_eq!(spec.fork_turns.as_deref(), Some("none"));
+    assert_eq!(spec.config.role.as_deref(), Some("explorer"));
 }
 
 #[tokio::test]
-async fn omitted_fork_turns_with_agent_type_rejects_like_full_history_fork() {
-    let manager = fake_manager(RoleRegistry::new(), DEFAULT_AGENT_MAX_DEPTH);
+async fn omitted_fork_turns_with_agent_type_normalizes_instead_of_failing() {
+    let spawner = Arc::new(RecordingSpawner::default());
+    let manager = SubagentManager::with_config(
+        spawner.clone(),
+        RoleRegistry::new(),
+        DEFAULT_AGENT_MAX_DEPTH,
+    );
     let parent = parent_ctx("/root", 0);
     let args = SpawnAgentArgs::from_value(serde_json::json!({
         "message": "inspect disk usage",
@@ -509,15 +519,15 @@ async fn omitted_fork_turns_with_agent_type_rejects_like_full_history_fork() {
     }))
     .expect("valid args");
 
-    let err = manager
+    let handle = manager
         .spawn(args, &parent)
         .await
-        .expect_err("omitted fork_turns defaults to full-history and must reject overrides");
-    assert!(
-        err.0.contains("Full-history forked agents inherit"),
-        "unexpected error: {}",
-        err.0
-    );
+        .expect("omitted fork_turns with agent_type should normalize instead of failing");
+    assert_eq!(handle.agent_path, "/root/home_large_dirs");
+    let specs = spawner.specs.lock().unwrap();
+    let spec = specs.last().expect("recorded spec");
+    assert_eq!(spec.fork_turns.as_deref(), Some("none"));
+    assert_eq!(spec.config.role.as_deref(), Some("explorer"));
 }
 
 #[test]

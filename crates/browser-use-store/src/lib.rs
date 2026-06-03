@@ -29,6 +29,10 @@ const MIGRATIONS: &[(i64, &str)] = &[
         7,
         include_str!("../migrations/0007_events_session_type_seq.sql"),
     ),
+    (
+        8,
+        include_str!("../migrations/0008_agent_message_consumed.sql"),
+    ),
 ];
 
 pub struct Store {
@@ -865,7 +869,7 @@ impl Store {
 
     pub fn messages_for_agent(&self, target_session_id: &str) -> Result<Vec<AgentMessage>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, author_session_id, target_session_id, content, input_items, input_kind, trigger_turn, created_ms FROM agent_messages WHERE target_session_id = ?1 ORDER BY created_ms ASC, id ASC",
+            "SELECT id, author_session_id, target_session_id, content, input_items, input_kind, trigger_turn, created_ms FROM agent_messages WHERE target_session_id = ?1 AND consumed_ms IS NULL ORDER BY created_ms ASC, id ASC",
         )?;
         let rows = stmt
             .query_map(params![target_session_id], row_to_agent_message)?
@@ -883,11 +887,12 @@ impl Store {
         if messages.is_empty() {
             return Ok(messages);
         }
+        let consumed_ms = now_ms();
         let tx = self.conn.unchecked_transaction()?;
         for message in &messages {
             tx.execute(
-                "DELETE FROM agent_messages WHERE id = ?1",
-                params![message.id],
+                "UPDATE agent_messages SET consumed_ms = ?2 WHERE id = ?1 AND consumed_ms IS NULL",
+                params![message.id, consumed_ms],
             )?;
         }
         tx.commit()?;
@@ -1721,6 +1726,12 @@ mod tests {
         let drained = store.drain_agent_messages_for_agent(&child.id)?;
         assert_eq!(drained, messages);
         assert!(store.messages_for_agent(&child.id)?.is_empty());
+        let retained: i64 = store.conn.query_row(
+            "SELECT COUNT(*) FROM agent_messages WHERE target_session_id = ?1 AND consumed_ms IS NOT NULL",
+            params![child.id],
+            |row| row.get(0),
+        )?;
+        assert_eq!(retained, 1);
         assert!(store.drain_agent_messages_for_agent(&child.id)?.is_empty());
         Ok(())
     }

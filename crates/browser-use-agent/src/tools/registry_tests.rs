@@ -982,7 +982,7 @@ fn subagent_v2_definitions_match_codex_output_schema_surface() {
     assert_eq!(
         wait.input_schema["properties"]["timeout_ms"]["description"],
         serde_json::json!(
-            "Optional timeout in milliseconds. Defaults to 30000, min 1, max 3600000."
+            "Optional timeout in milliseconds. Defaults to 300000, min 1, max 3600000."
         )
     );
     assert_eq!(

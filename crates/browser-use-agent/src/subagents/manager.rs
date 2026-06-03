@@ -215,9 +215,14 @@ impl SubagentManager {
 
             args.validate_task_name().map_err(SubagentError)?;
             args.validate_overrides().map_err(SubagentError)?;
-            // Validate fork_turns up front (parity with codex rejecting bad values).
+            // Validate fork_turns up front, then normalize the common model
+            // shape where it asks for a role/model override but omits
+            // `fork_turns`. A full-history fork cannot change those inherited
+            // fields, so preserve the requested override by making it a
+            // non-forked child instead of surfacing a failed tool call.
             let fork_turns_mode = args.fork_turns_mode().map_err(SubagentError)?;
-            reject_full_history_spawn_overrides(&args, fork_turns_mode).map_err(SubagentError)?;
+            let (args, fork_turns_mode) =
+                normalize_full_history_metadata_spawn(args, fork_turns_mode);
 
             // 1. Depth metadata. Codex v2 keeps subagent tools available even at
             // `agent_max_depth`; it only disables older/v1 collaboration tools there.
@@ -583,17 +588,15 @@ impl SubagentManager {
     }
 }
 
-fn reject_full_history_spawn_overrides(
-    args: &SpawnAgentArgs,
+fn normalize_full_history_metadata_spawn(
+    mut args: SpawnAgentArgs,
     fork_turns_mode: ForkTurns,
-) -> Result<(), String> {
+) -> (SpawnAgentArgs, ForkTurns) {
     if matches!(fork_turns_mode, ForkTurns::All) && args.has_full_history_metadata_override() {
-        return Err(
-            "Full-history forked agents inherit the parent agent type, model, and reasoning effort; omit agent_type, model, and reasoning_effort, or spawn without a full-history fork."
-                .to_string(),
-        );
+        args.fork_turns = Some("none".to_string());
+        return (args, ForkTurns::None);
     }
-    Ok(())
+    (args, fork_turns_mode)
 }
 
 fn apply_requested_spawn_agent_model_overrides(

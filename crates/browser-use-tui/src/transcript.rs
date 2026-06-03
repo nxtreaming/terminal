@@ -19,8 +19,8 @@ use crate::theme::{
 use super::{
     active_followup_is_after_next_tool_call, active_followup_is_cancelled_in_events,
     active_followup_is_pending_in_events, user_input_display_text_from_payload, App,
-    PENDING_FOLLOWUP_INTERRUPT_REASON, SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
-    SESSION_QUEUED_FOLLOWUP_EVENT,
+    PENDING_FOLLOWUP_INTERRUPT_REASON, SESSION_MAILBOX_CONTINUATION_STARTED_EVENT,
+    SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT, SESSION_QUEUED_FOLLOWUP_EVENT,
 };
 
 const GROUP_VALUE_RAIL_PREFIX: &str = "  │ ";
@@ -1069,6 +1069,7 @@ fn committed_node_for_event(
         )),
         "agent.wait.started" => None,
         "agent.wait.finished" => agent_wait_finished_node(event),
+        SESSION_MAILBOX_CONTINUATION_STARTED_EVENT => Some(mailbox_continuation_node(event)),
         "agent.resumed" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -3483,6 +3484,20 @@ fn agent_wait_finished_node(event: &EventRecord) -> Option<TranscriptNode> {
         Vec::new(),
         NodeStyle::Muted,
     ))
+}
+
+fn mailbox_continuation_node(event: &EventRecord) -> TranscriptNode {
+    let count = event
+        .payload
+        .get("mailbox_messages")
+        .and_then(serde_json::Value::as_u64)
+        .unwrap_or(0) as usize;
+    let lines = if count == 0 {
+        Vec::new()
+    } else {
+        vec![format!("{count} mailbox update{} queued", plural(count))]
+    };
+    timeline_node(event, "subagent results ready", lines, NodeStyle::Normal)
 }
 
 #[cfg(test)]

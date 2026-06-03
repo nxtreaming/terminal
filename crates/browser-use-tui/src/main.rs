@@ -148,6 +148,7 @@ const SESSION_QUEUED_FOLLOWUP_CANCELLED_EVENT: &str = "session.queued_followup.c
 pub(crate) const SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT: &str = "session.followup.pending";
 const SESSION_ACTIVE_FOLLOWUP_INTERRUPTED_EVENT: &str = "session.followup.interrupt_sent";
 pub(crate) const SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT: &str = "session.followup.cancelled";
+const SESSION_MAILBOX_CONTINUATION_STARTED_EVENT: &str = "session.mailbox_continuation.started";
 const SESSION_ROLLBACK_EVENT: &str = "session.rollback";
 pub(crate) const FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL: &str = "after_next_tool_call";
 const FOLLOWUP_DELIVERY_AFTER_CURRENT_TURN: &str = "after_current_turn";
@@ -1908,6 +1909,7 @@ impl App {
             self.last_followup_check_session = self.selected_session_id.clone();
             if self.flush_ready_pending_active_followups()?
                 || self.flush_ready_queued_followups()?
+                || self.flush_ready_agent_mailbox_continuation()?
             {
                 changed = true;
                 self.state_cache.refresh_all(&self.store)?;
@@ -2100,7 +2102,10 @@ impl App {
         if changed {
             self.refresh_cached_projection();
         }
-        if self.flush_ready_pending_active_followups()? || self.flush_ready_queued_followups()? {
+        if self.flush_ready_pending_active_followups()?
+            || self.flush_ready_queued_followups()?
+            || self.flush_ready_agent_mailbox_continuation()?
+        {
             changed = true;
             self.state_cache.refresh_all(&self.store)?;
             self.refresh_cached_projection();
@@ -2599,6 +2604,51 @@ impl App {
             )?;
         }
         self.status_notice = Some("Sent queued follow-up.".to_string());
+        self.start_agent_for_session(session_id)?;
+        Ok(true)
+    }
+
+    fn flush_ready_agent_mailbox_continuation(&mut self) -> Result<bool> {
+        let Some(session_id) = self.selected_session_id.clone() else {
+            return Ok(false);
+        };
+        let Some(session) = self.store.load_session(&session_id)? else {
+            return Ok(false);
+        };
+        if session.status != SessionStatus::Done {
+            return Ok(false);
+        }
+        let mailbox_messages = self.store.messages_for_agent(&session_id)?;
+        if mailbox_messages.is_empty() {
+            return Ok(false);
+        }
+        let selection = self.session_model_selection_or_current(&session_id)?;
+        if !self.ensure_agent_ready_for_selection(&selection)? {
+            return Ok(false);
+        }
+        let mailbox_count = mailbox_messages.len();
+        self.store.append_event(
+            &session_id,
+            SESSION_MAILBOX_CONTINUATION_STARTED_EVENT,
+            serde_json::json!({
+                "reason": "pending_agent_mailbox",
+                "mailbox_messages": mailbox_count,
+            }),
+        )?;
+        self.store.append_event(
+            &session_id,
+            "session.status",
+            serde_json::json!({
+                "status": "running",
+                "reason": "pending_agent_mailbox",
+                "mailbox_messages": mailbox_count,
+            }),
+        )?;
+        self.status_notice = Some(if mailbox_count == 1 {
+            "Resuming for subagent result.".to_string()
+        } else {
+            format!("Resuming for {mailbox_count} subagent results.")
+        });
         self.start_agent_for_session(session_id)?;
         Ok(true)
     }
@@ -12316,6 +12366,61 @@ wire_api = "responses"
         assert!(!text.contains("writing Mapping the main crates."));
         assert!(!text.contains("Mapping the main crates."));
         assert!(!text.contains("spawn_agent requested"));
+        Ok(())
+    }
+
+    #[test]
+    fn pending_subagent_mailbox_resumes_done_parent() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let parent = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &parent.id,
+            "session.input",
+            serde_json::json!({"text": "research this repo"}),
+        )?;
+        app.store.append_event(
+            &parent.id,
+            "session.done",
+            serde_json::json!({"result": "Spawned agents; waiting later."}),
+        )?;
+        let child = app.store.create_child_session(
+            &parent.id,
+            std::env::current_dir()?,
+            Some("/root/repo_explorer"),
+            Some("repo-explorer"),
+            Some("explorer"),
+        )?;
+        app.selected_session_id = Some(parent.id.clone());
+        app.refresh_state_cache_from_store()?;
+
+        app.store.send_agent_message(
+            &child.id,
+            &parent.id,
+            "<subagent_notification><agent_name>/root/repo_explorer</agent_name><status>completed</status></subagent_notification>",
+            false,
+        )?;
+        app.drain_store_notifications()?;
+
+        assert_eq!(
+            app.store
+                .load_session(&parent.id)?
+                .map(|session| session.status),
+            Some(SessionStatus::Running)
+        );
+        assert_eq!(app.store.messages_for_agent(&parent.id)?.len(), 1);
+        let events = app.store.events_for_session(&parent.id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == SESSION_MAILBOX_CONTINUATION_STARTED_EVENT
+                && event
+                    .payload
+                    .get("mailbox_messages")
+                    .and_then(serde_json::Value::as_u64)
+                    == Some(1)
+        }));
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("subagent results ready"), "{screen}");
+        assert!(screen.contains("1 mailbox update queued"), "{screen}");
         Ok(())
     }
 

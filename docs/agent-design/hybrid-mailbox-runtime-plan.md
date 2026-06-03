@@ -1,5 +1,20 @@
 # Hybrid Mailbox Runtime Plan
 
+Regression prompt:
+
+```text
+can you spin up a few subagents that research this codebase pls
+```
+
+Expected behavior:
+
+- no red `spawn_agent failed` rows for normal role-based spawn attempts
+- subagents start with distinct bounded tasks
+- the parent does not answer with "I'll wait when you want" for a request that expects findings
+- `wait_agent` waits on mailbox notifications, not UI lifecycle rows
+- if the parent already answered, child completion mail still wakes the selected parent session through a mailbox continuation
+- the TUI keeps enough subagent state visible to understand running, timed out, completed, and results-ready states
+
 ```text
 Browser Use Terminal
         |
@@ -50,7 +65,8 @@ child finishes
         +-- persist mailbox row
         +-- bump parent mailbox watch seq
         +-- active wait_agent wakes
-        +-- idle parent keeps pending mail for next turn/resume
+        +-- idle selected parent gets mailbox-continuation wakeup
+        +-- unselected/offline parent keeps pending mail for next turn/resume
 ```
 
 ## Goal
@@ -66,7 +82,55 @@ SQLite = durability
 runtime = wakeups/scheduling
 ```
 
-The bug this fixes: a child can append `agent.completed` to the parent session while no parent mailbox message exists, so `wait_agent` times out and the model never sees the subagent result unless it manually calls `list_agents`.
+The bug this fixes: a child can append `agent.completed` to the parent session while the parent model never sees the subagent result. `agent.completed` is useful for UI history, but the synchronization path must be mailbox mail plus a runtime wakeup.
+
+## Codex Versus Browser Use Hybrid
+
+```text
+Codex-style shape
+
+model tool call
+    |
+    v
+AgentControl
+    |
+    +-- ThreadManager
+    |       thread lifecycle
+    |       active/background state
+    |       status subscriptions
+    |
+    +-- Mailbox
+            in-memory wakeups
+            notification delivery
+            wait_agent subscription
+
+
+Browser Use hybrid target
+
+model tool call
+    |
+    v
+AgentControl
+    |
+    +-- Runtime Mailbox
+    |       fast wakeups while loaded
+    |       wait_agent subscription
+    |
+    +-- SQLite Mailbox Ledger
+    |       agent_messages pending/consumed rows
+    |       crash/restart durability
+    |
+    +-- Scheduler
+    |       queued/running limits
+    |       child start promotion
+    |
+    +-- TUI Projection
+            lifecycle rows from events
+            results-ready mailbox state
+            parent continuation wakeups
+```
+
+Browser Use should keep SQLite as the source of truth. Codex's in-memory mailbox is better for live wakeups; Browser Use's SQLite mailbox is better for debugging, replay, and restart recovery. The target is both: live wakeups backed by durable rows.
 
 ## Non-Negotiable Semantics
 
@@ -101,12 +165,16 @@ The bug this fixes: a child can append `agent.completed` to the parent session w
 
    The next parent prompt sees drained mailbox messages as contextual user messages and persists `agent.mailbox_input` events.
 
-5. `trigger_turn` means "start an idle agent turn."
+5. `trigger_turn` means "start an idle target for a delegated task."
 
    - Initial child task: `trigger_turn = true`
    - `followup_task`: `trigger_turn = true`
    - `send_message`: `trigger_turn = false`
    - child completion notification: `trigger_turn = false`
+
+   Completion notifications are the special non-trigger mail that may still wake
+   the parent through the mailbox-continuation path. They do not become ordinary
+   user follow-up text; prompt assembly drains them as mailbox context.
 
 6. Late child completion must not be lost.
 
@@ -198,14 +266,16 @@ Rules:
 - before answer boundary: current-turn mailbox delivery is allowed
 - after answer boundary: mailbox delivery is deferred to the next turn
 - `trigger_turn = true` can start an idle target session
-- `trigger_turn = false` does not auto-start, but it wakes `wait_agent` and is delivered on the next prompt
+- `trigger_turn = false` wakes `wait_agent`
+- child completion mail can schedule a parent mailbox continuation when the parent is idle and selected in the TUI
+- ordinary non-trigger peer mail remains pending until a turn is otherwise started
 
 Implementation notes:
 
 - keep or refine existing `MailboxDeliveryPhase`
 - append `agent.mailbox_input` when draining durable mailbox rows
-- prefer marking rows consumed over deleting rows if we want better debugging/replay
-- if keeping deletion initially, ensure the event log records enough information to reconstruct history
+- mark rows consumed instead of deleting them, so SQLite remains useful for replay/debugging
+- keep `agent.mailbox_input` events as the prompt-visible drain record
 
 Acceptance:
 
@@ -360,6 +430,13 @@ Acceptance:
 - timeout does not make the UI look empty
 - finished rows do not appear without any visible next state
 
+Current implementation checkpoint:
+
+- lifecycle rows remain visible
+- timed-out waits remain visible
+- pending completion mail creates a `subagent results ready` row
+- selected done parent sessions resume through `session.mailbox_continuation.started`
+
 ## Phase 8: Live Model Verification
 
 Run real end-to-end scenarios.
@@ -400,10 +477,32 @@ Scenarios:
    - `wait_agent` returns completed immediately
    - prompt sees notifications
 
+## Implementation Checklist
+
+Done on this branch:
+
+- completion handler enqueues durable parent mailbox mail even after parent `session.done`
+- CLI child completion mirror uses the same durable-mail rule
+- v2 `wait_agent` waits on pending mailbox rows
+- prompt assembly drains mailbox rows into `agent.mailbox_input`
+- consumed mailbox rows are retained with `consumed_ms`
+- `agent_type`/model/reasoning metadata with default/full fork normalizes into a non-forked role spawn instead of failing
+- default v2 wait timeout is long enough for research-style subagents
+- TUI can resume a selected done parent when pending mailbox mail arrives
+
+Still required for the full target:
+
+- move scattered subagent store/runtime operations behind `AgentControl`
+- replace manager-only live mailbox with a hydrated runtime mailbox backed by `agent_messages`
+- add scheduler/backpressure so excess subagents queue instead of rejecting or starting unlimited work
+- add compact aggregate TUI grouping for many agents, not just lifecycle rows
+- add restart hydration tests for pending mailbox rows
+- add many-subagent live smoke tests once scheduler exists
+
 ## Things To Avoid
 
 - Do not make `agent.completed` the `wait_agent` condition.
-- Do not auto-run the parent on every child completion if we want Codex parity.
+- Do not turn ordinary non-trigger peer mail into user follow-up text.
 - Do not lose mailbox rows because parent session is `done`.
 - Do not return child result content directly from v2 `wait_agent`.
 - Do not start unlimited subagent model calls.
@@ -421,4 +520,3 @@ durable completion mail
 ```
 
 That milestone fixes the observed failure and establishes the real mailbox contract. After that, introduce `AgentRuntime`, then scheduler/backpressure.
-
