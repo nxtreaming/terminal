@@ -103,6 +103,9 @@ pub(crate) fn lines_plain_text(lines: &[Line<'static>]) -> String {
 pub(crate) fn render(frame: &mut Frame<'_>, app: &mut App) {
     let full_area = frame.area();
     let area = app_surface(full_area);
+    // Reset each frame; only the composer status line re-records it when the
+    // live URL is actually drawn. Prevents a stale link after disconnect.
+    *app.live_link_overlay.borrow_mut() = None;
 
     if app.is_first_run_setup_visible().unwrap_or(false) {
         app.modal_background = None;
@@ -1559,14 +1562,26 @@ fn render_composer(
             vertical: 0,
             horizontal: 2,
         });
-        frame.render_widget(
-            Paragraph::new(composer_status_line(
-                app,
-                state,
-                status_inner.width as usize,
-            )),
-            status_inner,
-        );
+        let (status_line, live_link) =
+            composer_status_line(app, state, status_inner.width as usize);
+        frame.render_widget(Paragraph::new(status_line), status_inner);
+        // Record where the live URL landed so the caller can paint an OSC-8
+        // hyperlink over it after the frame is flushed (see LiveLinkOverlay).
+        if let Some(link) = live_link {
+            let col = status_inner.x.saturating_add(link.col as u16);
+            let max_visible = status_inner.right().saturating_sub(col) as usize;
+            let width = link.width.min(max_visible);
+            if width > 0 {
+                let text: String = link.text.chars().take(width).collect();
+                *app.live_link_overlay.borrow_mut() = Some(LiveLinkOverlay {
+                    col,
+                    row: status_inner.y,
+                    text,
+                    url: link.url,
+                    fg: muted().fg.unwrap_or(ratatui::style::Color::Reset),
+                });
+            }
+        }
     }
 }
 
@@ -1602,10 +1617,53 @@ fn composer_bottom_border(width: u16, app: &App) -> Line<'static> {
     Line::from(spans)
 }
 
+/// Geometry of the clickable live-view link inside the status row, as built
+/// by `composer_status_line`. Columns are relative to the status row origin;
+/// the caller resolves them to absolute screen coordinates.
+struct LiveLink {
+    /// Column of the first URL cell, relative to the status row origin.
+    col: usize,
+    /// Visible width (in cells) of the truncated URL text.
+    width: usize,
+    /// The visible (possibly truncated) URL text actually drawn.
+    text: String,
+    /// The full, untruncated live-view URL to open on click.
+    url: String,
+}
+
+/// On-screen placement of the live-view link, in absolute terminal
+/// coordinates, recorded during render so the caller can paint an OSC-8
+/// hyperlink over the already-drawn cells *after* the frame is flushed.
+///
+/// The link can't be bound inside the frame buffer: ratatui's draw diff
+/// measures each cell's symbol display width, so escape bytes embedded in a
+/// cell are counted as visible columns and corrupt the layout (skipped
+/// cells, misaligned click region). Painting it post-draw, the way the
+/// manual modal overlay does, sidesteps the diff entirely.
+pub(crate) struct LiveLinkOverlay {
+    /// Absolute column of the first URL cell.
+    pub(crate) col: u16,
+    /// Absolute row of the status line.
+    pub(crate) row: u16,
+    /// The visible URL text to reprint between the OSC-8 open/close.
+    pub(crate) text: String,
+    /// The full URL bound as the hyperlink target.
+    pub(crate) url: String,
+    /// Foreground color to reprint the text with (matches `muted()`).
+    pub(crate) fg: ratatui::style::Color,
+}
+
 /// Status row below the composer: active model and context-fill bar,
 /// plus running cost when there is one. The browser lives on the box's
 /// bottom border, not here.
-fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line<'static> {
+///
+/// Returns the rendered line plus, when present, the geometry of the live
+/// URL so the caller can attach an OSC-8 hyperlink to the full URL.
+fn composer_status_line(
+    app: &App,
+    state: &WorkbenchState,
+    width: usize,
+) -> (Line<'static>, Option<LiveLink>) {
     let usage = session_usage(app, state);
     let mut spans = vec![Span::styled(app.model.clone(), accent())];
     spans.push(status_separator());
@@ -1626,6 +1684,7 @@ fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line
         spans.push(status_separator());
         spans.push(Span::styled(format!("${:.4}", usage.cost_usd), muted()));
     }
+    let mut live_link = None;
     if let Some(live_url) = state
         .browser
         .live_url
@@ -1637,14 +1696,21 @@ fn composer_status_line(app: &App, state: &WorkbenchState, width: usize) -> Line
         let prefix_width = status_separator_width() + "live ".chars().count();
         if width > used.saturating_add(prefix_width).saturating_add(8) {
             let available = width.saturating_sub(used + prefix_width);
+            let shown = truncate(live_url, available);
+            // The URL text starts after everything rendered so far plus the
+            // separator and the "live " label.
+            let url_col = used + prefix_width;
+            live_link = Some(LiveLink {
+                col: url_col,
+                width: shown.chars().count(),
+                text: shown.clone(),
+                url: live_url.to_string(),
+            });
             spans.push(status_separator());
-            spans.push(Span::styled(
-                format!("live {}", truncate(live_url, available)),
-                muted(),
-            ));
+            spans.push(Span::styled(format!("live {shown}"), muted()));
         }
     }
-    Line::from(spans)
+    (Line::from(spans), live_link)
 }
 
 /// Dropdown rows used by the fused composer. No top/bottom rules and no
