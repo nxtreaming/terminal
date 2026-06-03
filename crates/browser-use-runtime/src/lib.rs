@@ -1673,6 +1673,21 @@ pub struct SendAgentMessageResponse {
     pub mailbox_item: MailboxItem,
 }
 
+#[derive(Clone, Debug)]
+pub struct SubmitInputRequest {
+    pub target_agent_id: AgentId,
+    pub content: String,
+    pub trigger_turn: bool,
+    pub delivery_phase: MailboxDeliveryPhase,
+    pub input_items: Option<Value>,
+    pub payload: Value,
+}
+
+#[derive(Clone, Debug)]
+pub struct SubmitInputResponse {
+    pub mailbox_item: MailboxItem,
+}
+
 #[derive(Clone, Debug, Deserialize, Serialize)]
 #[serde(tag = "method", rename_all = "snake_case")]
 pub enum LocalRuntimeRequest {
@@ -2336,6 +2351,14 @@ impl RuntimeHandle {
         self.inner.send_agent_message(request)
     }
 
+    pub fn submit_input(&self, request: SubmitInputRequest) -> Result<SubmitInputResponse> {
+        self.inner.submit_input(request)
+    }
+
+    pub fn submit_followup(&self, request: SubmitInputRequest) -> Result<SubmitInputResponse> {
+        self.inner.submit_input(request)
+    }
+
     pub fn has_pending_agent_mail_for_session(
         &self,
         session_id: &SessionId,
@@ -2883,6 +2906,36 @@ impl BrowserUseRuntime {
         Ok(SendAgentMessageResponse { mailbox_item })
     }
 
+    pub fn submit_input(&self, mut request: SubmitInputRequest) -> Result<SubmitInputResponse> {
+        let target = self.agents.thread(&request.target_agent_id)?;
+        if !request.payload.is_object() {
+            request.payload = json!({});
+        }
+        if let Some(obj) = request.payload.as_object_mut() {
+            obj.entry("source".to_string())
+                .or_insert_with(|| json!("user_input"));
+            obj.insert(
+                "target_session_id".to_string(),
+                json!(target.session_id.as_str()),
+            );
+            if let Some(input_items) = request.input_items.take() {
+                obj.insert("input_items".to_string(), input_items);
+            }
+        }
+        let response = self.send_agent_message(SendAgentMessageRequest {
+            author_agent_id: target.agent_id.clone(),
+            target_agent_id: target.agent_id.clone(),
+            content: request.content,
+            trigger_turn: request.trigger_turn,
+            kind: MailboxItemKind::Followup,
+            delivery_phase: request.delivery_phase,
+            payload: request.payload,
+        })?;
+        Ok(SubmitInputResponse {
+            mailbox_item: response.mailbox_item,
+        })
+    }
+
     pub fn has_pending_agent_mail_for_session(
         &self,
         session_id: &SessionId,
@@ -3054,27 +3107,15 @@ pub fn handle_local_runtime_request(
             trigger_turn,
             delivery_phase,
             input_items,
-            mut payload,
+            payload,
         } => {
             let agent_id = AgentId::from_string(session_id.clone())?;
-            if !payload.is_object() {
-                payload = json!({});
-            }
-            if let Some(obj) = payload.as_object_mut() {
-                obj.entry("source".to_string())
-                    .or_insert_with(|| json!("user_input"));
-                obj.insert("target_session_id".to_string(), json!(session_id));
-                if let Some(input_items) = input_items {
-                    obj.insert("input_items".to_string(), input_items);
-                }
-            }
-            let response = runtime.send_agent_message(SendAgentMessageRequest {
-                author_agent_id: agent_id.clone(),
+            let response = runtime.submit_input(SubmitInputRequest {
                 target_agent_id: agent_id,
                 content,
                 trigger_turn,
-                kind: MailboxItemKind::Followup,
                 delivery_phase,
+                input_items,
                 payload,
             })?;
             Ok(json!({
@@ -4285,6 +4326,54 @@ mod tests {
             })
             .expect_err("trigger_turn messages to root must be rejected");
         assert!(err.to_string().contains("root agent"));
+        Ok(())
+    }
+
+    #[test]
+    fn runtime_submit_input_is_barrier_backed_self_followup() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+
+        let submitted = handle.submit_input(SubmitInputRequest {
+            target_agent_id: root.agent_id().clone(),
+            content: "operator follow-up".to_string(),
+            trigger_turn: true,
+            delivery_phase: MailboxDeliveryPhase::CurrentTurn,
+            input_items: Some(json!([{ "type": "text", "text": "operator follow-up" }])),
+            payload: json!({ "source": "test" }),
+        })?;
+
+        assert_eq!(submitted.mailbox_item.kind, MailboxItemKind::Followup);
+        assert!(submitted.mailbox_item.trigger_turn);
+        assert_eq!(
+            submitted.mailbox_item.author_agent_id,
+            root.agent_id().clone()
+        );
+        assert_eq!(
+            submitted.mailbox_item.target_agent_id,
+            root.agent_id().clone()
+        );
+        assert_eq!(
+            submitted.mailbox_item.payload["target_session_id"].as_str(),
+            Some(root.session_id().as_str())
+        );
+        assert!(submitted.mailbox_item.payload["input_items"].is_array());
+        assert_eq!(root.mailbox().pending_items().len(), 1);
+
+        let root_events = journal.events_for_session(root.session_id())?;
+        let mailbox_event = root_events
+            .iter()
+            .find(|event| event.event_type == "mailbox.enqueued")
+            .context("mailbox.enqueued event")?;
+        assert_eq!(
+            mailbox_event.payload["payload"]["mailbox_item"]["id"],
+            submitted.mailbox_item.id
+        );
         Ok(())
     }
 
