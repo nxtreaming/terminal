@@ -132,6 +132,25 @@ async def _test_agent_stream_yields_runtime_events_and_final_history() -> None:
     assert runtime.calls[-1][1]["max_steps"] == 4
 
 
+def test_runtime_client_routes_agent_events_by_run_and_session_id() -> None:
+    runtime = RuntimeClient(command=["unused"])
+
+    runtime._handle_message(
+        {
+            "jsonrpc": "2.0",
+            "method": "agent.event",
+            "params": {
+                "run_id": "run-1",
+                "session_id": "session-1",
+                "event": {"kind": "agent_started"},
+            },
+        }
+    )
+
+    assert runtime.event_queue("run-1").get_nowait() == {"kind": "agent_started"}
+    assert runtime.event_queue("session-1").get_nowait() == {"kind": "agent_started"}
+
+
 def test_two_running_agents_cannot_share_one_browser() -> None:
     asyncio.run(_test_two_running_agents_cannot_share_one_browser())
 

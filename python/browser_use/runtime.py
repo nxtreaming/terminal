@@ -149,8 +149,12 @@ class RuntimeClient:
         if message.get("method") == "agent.event":
             params = message.get("params") or {}
             run_id = params.get("run_id")
+            session_id = params.get("session_id")
+            event = params.get("event") or {}
             if isinstance(run_id, str):
-                self.event_queue(run_id).put_nowait(params.get("event") or {})
+                self.event_queue(run_id).put_nowait(event)
+            if isinstance(session_id, str) and session_id != run_id:
+                self.event_queue(session_id).put_nowait(event)
 
     def _fail_all(self, error: BaseException) -> None:
         for future in self._pending.values():
