@@ -62,7 +62,6 @@ use crate::guardian::approval::GuardianApprover;
 use crate::guardian::reviewer::{GuardianReviewer, StaticReviewer};
 use crate::guardian::Guardian;
 use crate::mcp::McpConnectionManager;
-use crate::prompts::CollaborationModeKind;
 use crate::session::{SessionId, SharedStore};
 use crate::subagents::display_agent_path_for_session;
 use crate::subagents::mailbox::Mailbox;
@@ -1819,12 +1818,9 @@ fn build_goal_store(
 }
 
 fn goal_runtime_enabled(
-    config: &ProviderRunConfig,
+    _config: &ProviderRunConfig,
     user_input: &Option<(SharedStore, SessionId)>,
 ) -> bool {
-    if config.options.collaboration_mode == CollaborationModeKind::Plan {
-        return false;
-    }
     let Some((store, sid)) = user_input else {
         return false;
     };
@@ -2513,6 +2509,7 @@ mod tests {
         // The other core tools are still present.
         assert!(names.contains(&"browser"));
         assert!(names.contains(&"done"));
+        assert!(names.contains(&"update_plan"));
     }
 
     /// A non-empty `mcp_servers` map registers the `mcp` tool. The stdio server
@@ -3252,11 +3249,11 @@ mod tests {
     }
 
     #[test]
-    fn goal_tools_are_hidden_in_plan_mode() {
+    fn deprecated_plan_mode_keeps_goal_tools_available() {
         use browser_use_store::Store;
 
         let options = crate::config_overrides::AgentRunOptions::default()
-            .with_collaboration_mode(CollaborationModeKind::Plan);
+            .with_collaboration_mode(crate::prompts::CollaborationModeKind::Plan);
         let config =
             ProviderRunConfig::new(ProviderBackend::Fake, "fake-model").with_options(options);
         let dir = tempfile::tempdir().expect("tempdir");
@@ -3281,8 +3278,8 @@ mod tests {
             .collect();
         for tool in ["get_goal", "create_goal", "update_goal"] {
             assert!(
-                !names.contains(&tool),
-                "{tool} must not be registered in plan mode; got {names:?}"
+                names.contains(&tool),
+                "{tool} must stay registered because plan mode is no longer a separate runtime; got {names:?}"
             );
         }
     }

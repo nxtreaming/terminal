@@ -655,7 +655,7 @@ mod tests {
     }
 
     #[test]
-    fn tui_agent_options_pass_collaboration_mode_to_core() {
+    fn tui_agent_options_normalize_deprecated_plan_mode() {
         let options = tui_agent_options(
             "Local Chrome",
             "abc123",
@@ -666,7 +666,7 @@ mod tests {
             Vec::new(),
         )
         .unwrap();
-        assert_eq!(options.collaboration_mode, CollaborationModeKind::Plan);
+        assert_eq!(options.collaboration_mode, CollaborationModeKind::Default);
         assert_eq!(options.model_provider_id.as_deref(), Some("codex"));
     }
 

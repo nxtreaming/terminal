@@ -14,7 +14,6 @@ fn model_facing_prompts() -> Vec<(&'static str, &'static str)> {
         ),
         ("BROWSER_CONNECTION_GUIDANCE", BROWSER_CONNECTION_GUIDANCE),
         ("COLLABORATION_MODE_DEFAULT", COLLABORATION_MODE_DEFAULT),
-        ("COLLABORATION_MODE_PLAN", COLLABORATION_MODE_PLAN),
         ("COMPACTED_CONTEXT_SYSTEM", COMPACTED_CONTEXT_SYSTEM),
         ("HELPER_SESSION_IDENTITY", HELPER_SESSION_IDENTITY),
         (
@@ -90,15 +89,14 @@ fn browser_mode_instruction_matches_main_local_connection_guidance() {
     assert!(prompt.contains("browser local setup"));
 }
 
-/// The collaboration selector returns the right asset per mode, wrapped in the
-/// collaboration-mode tags, with `{{KNOWN_MODE_NAMES}}` substituted, and the
-/// two modes differ.
+/// Plan mode was removed. The compatibility enum value now renders the Default
+/// asset so stale configs do not re-enable planning behavior.
 #[test]
-fn collaboration_mode_selector_picks_distinct_assets() {
+fn deprecated_plan_mode_renders_default_asset() {
     let default = collaboration_mode_prompt(CollaborationModeKind::Default);
     let plan = collaboration_mode_prompt(CollaborationModeKind::Plan);
 
-    assert_ne!(default, plan, "default and plan modes must differ");
+    assert_eq!(default, plan, "plan mode must resolve to default");
 
     for rendered in [&default, &plan] {
         assert!(rendered.starts_with(COLLABORATION_MODE_OPEN_TAG));
@@ -107,10 +105,9 @@ fn collaboration_mode_selector_picks_distinct_assets() {
         assert!(!rendered.contains("{{KNOWN_MODE_NAMES}}"));
     }
 
-    // Default mode carries its own asset content; Plan carries the plan asset.
     assert!(default.contains("Collaboration Mode: Default"));
     assert!(default.contains(KNOWN_MODE_NAMES));
-    assert!(plan.contains("Plan Mode"));
+    assert!(!default.contains("Plan Mode"));
 }
 
 /// The browser tool descriptions preserve their interaction-skills content,

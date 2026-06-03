@@ -35,7 +35,7 @@
 pub enum CollaborationModeKind {
     /// Default execution-oriented behavior.
     Default,
-    /// Plan mode: conversational planning before execution.
+    /// Deprecated compatibility alias for [`Self::Default`].
     Plan,
 }
 
@@ -56,7 +56,7 @@ pub const COLLABORATION_MODE_CLOSE_TAG: &str = "</collaboration_mode>";
 ///
 /// Mirrors the legacy replacement value in
 /// `crates/browser-use-core/src/prompts.rs:48`.
-pub const KNOWN_MODE_NAMES: &str = "Default and Plan";
+pub const KNOWN_MODE_NAMES: &str = "Default";
 
 /// The browser-agent base system prompt (the BROWSER_AGENT preamble / base
 /// instructions sent to the model).
@@ -96,14 +96,6 @@ pub const BROWSER_CONNECTION_GUIDANCE: &str =
 /// (legacy `include_str!` at `crates/browser-use-core/src/prompts.rs:44`).
 pub const COLLABORATION_MODE_DEFAULT: &str =
     include_str!("../../../../prompts/collaboration-mode-default.md");
-
-/// Plan collaboration-mode developer instructions (raw asset, before
-/// `{{KNOWN_MODE_NAMES}}` substitution and tag wrapping).
-///
-/// Sourced from `prompts/collaboration-mode-plan.md`
-/// (legacy `include_str!` at `crates/browser-use-core/src/prompts.rs:46`).
-pub const COLLABORATION_MODE_PLAN: &str =
-    include_str!("../../../../prompts/collaboration-mode-plan.md");
 
 /// The compacted-context system prompt template (re-establishes the operating
 /// contract after context compaction).
@@ -303,7 +295,7 @@ pub fn review_prompt() -> &'static str {
 pub fn collaboration_mode_prompt(mode: CollaborationModeKind) -> String {
     let template = match mode {
         CollaborationModeKind::Default => COLLABORATION_MODE_DEFAULT,
-        CollaborationModeKind::Plan => COLLABORATION_MODE_PLAN,
+        CollaborationModeKind::Plan => COLLABORATION_MODE_DEFAULT,
     };
     let text = template.replace("{{KNOWN_MODE_NAMES}}", KNOWN_MODE_NAMES);
     format!("{COLLABORATION_MODE_OPEN_TAG}{text}{COLLABORATION_MODE_CLOSE_TAG}")
