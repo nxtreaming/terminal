@@ -1,7 +1,6 @@
 //! Centered "Grok-style" welcome screen: animated 3D braille BU logo + menu.
 //! Port of mockup A from the HTML compare page.
 
-use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 use ratatui::text::{Line, Span};
@@ -262,11 +261,8 @@ pub fn welcome_lines(
     let mut out: Vec<Line<'static>> = Vec::new();
     let width = width as usize;
 
-    // Header: just the cwd, muted.
-    out.push(Line::from(Span::styled(short_cwd(), muted())));
-
     let block_h = splash_block_h();
-    let header_h = 1_usize;
+    let header_h = 0_usize;
     let target = target_h as usize;
     let available_below_header = target.saturating_sub(header_h);
     let pad_top = (available_below_header.saturating_sub(block_h) / 2).max(1);
@@ -328,36 +324,14 @@ pub fn welcome_lines(
 // ─────────────────────── Session header ───────────────────────
 const SESSION_TITLE: &str = "Browser Use Terminal";
 
-/// Header block for an individual session: the product title and cwd, left-
+/// Header block for an individual session: just the product title, left-
 /// aligned. Rendered as plain committed scrollback text, so it sits at the top
 /// of the conversation and scrolls away naturally as the session grows.
 pub fn session_header_lines(_width: u16) -> Vec<Line<'static>> {
     vec![
         Line::from(Span::styled(SESSION_TITLE.to_string(), bold())),
-        Line::from(Span::styled(short_cwd(), muted())),
         Line::from(""),
     ]
-}
-
-/// Current working directory as a friendly short label. Replaces the home
-/// prefix with `~` so paths like `/home/foo/projects/bar` render as
-/// `~/projects/bar`.
-fn short_cwd() -> String {
-    let cwd = std::env::current_dir().unwrap_or_default();
-    let home = std::env::var_os("HOME").map(PathBuf::from);
-    shorten_cwd(&cwd, home.as_deref())
-}
-
-fn shorten_cwd(cwd: &Path, home: Option<&Path>) -> String {
-    if let Some(home) = home.filter(|home| !home.as_os_str().is_empty()) {
-        if let Ok(relative) = cwd.strip_prefix(home) {
-            if relative.as_os_str().is_empty() {
-                return "~".to_string();
-            }
-            return format!("~/{}", relative.to_string_lossy());
-        }
-    }
-    cwd.to_string_lossy().to_string()
 }
 
 #[cfg(test)]
@@ -365,7 +339,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn session_header_is_left_aligned_title_and_cwd() {
+    fn session_header_is_left_aligned_title() {
         let lines = session_header_lines(80);
         let text: Vec<String> = lines
             .iter()
@@ -380,25 +354,7 @@ mod tests {
         for line in &text {
             println!("|{}|", line.trim_end());
         }
-        // Text-only header: title flush-left on the first row, then the cwd.
+        // Text-only header: title flush-left on the first row, no cwd.
         assert!(text[0].starts_with("Browser Use Terminal"));
-        assert!(text
-            .iter()
-            .any(|line| line.contains('~') || line.contains('/')));
-    }
-
-    #[test]
-    fn cwd_shortening_only_applies_to_real_home_children() {
-        let home = Path::new("/tmp/browser-use-home");
-
-        assert_eq!(
-            shorten_cwd(Path::new("/tmp/browser-use-home/project"), Some(home)),
-            "~/project"
-        );
-        assert_eq!(shorten_cwd(home, Some(home)), "~");
-        assert_eq!(
-            shorten_cwd(Path::new("/tmp/browser-use-home-other/project"), Some(home)),
-            "/tmp/browser-use-home-other/project"
-        );
     }
 }

@@ -2928,8 +2928,11 @@ impl App {
     /// Sets `pending_auth_resume` so the next successful auth automatically
     /// starts the agent for this session.
     fn inject_no_key_nudge(&mut self, submission: UserSubmission) -> Result<()> {
+        // The agent runs out of (and saves files into) the per-session tmp dir,
+        // not wherever the process was launched. `cwd` here is only used to
+        // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
-        let session = self.store.create_session(None, &cwd)?;
+        let session = self.store.create_session_in_artifact_root(None)?;
         // Record the user's task as the standard input event (preserved for retry).
         let input_record = self.store.append_event(
             &session.id,
@@ -3106,8 +3109,11 @@ impl App {
         if !self.ensure_agent_ready_for_selection(&selection)? {
             return Ok(());
         }
+        // The agent runs out of (and saves files into) the per-session tmp dir,
+        // not wherever the process was launched. `cwd` here is only used to
+        // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
-        let session = self.store.create_session(None, &cwd)?;
+        let session = self.store.create_session_in_artifact_root(None)?;
         self.append_session_model_selection(&session.id, &selection)?;
         let options = self.configured_agent_options()?;
         self.append_workspace_context_event_blocking(&session.id, &options)?;
