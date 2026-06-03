@@ -269,9 +269,7 @@ impl Store {
         self.create_session_with_id_and_artifact_root(parent_id, cwd, artifact_root, id)
     }
 
-    /// Create a session whose working directory *is* its artifact root, so the
-    /// agent reads/writes everything inside the per-session tmp dir under the
-    /// state directory rather than wherever the process was launched from.
+    /// Agent reads/writes everything inside the per-session tmp dir
     pub fn create_session_in_artifact_root(
         &self,
         parent_id: Option<&str>,

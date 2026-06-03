@@ -67,7 +67,7 @@ pub(crate) fn run_agent_thread(
         None
     };
     if browser == BROWSER_USE_CLOUD && browser_use_cloud_api_key.is_none() {
-        let error = "Browser Use cloud selected, but BROWSER_USE_API_KEY is not set";
+        let error = "Browser Use Cloud selected, but BROWSER_USE_API_KEY is not set";
         let _ = store.append_event(
             &session_id,
             "session.failed",
@@ -673,7 +673,7 @@ mod tests {
     #[test]
     fn browser_use_cloud_keeps_cloud_mode() {
         let options = tui_agent_options(
-            "Browser Use cloud",
+            BROWSER_USE_CLOUD,
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),
@@ -689,7 +689,7 @@ mod tests {
     #[test]
     fn browser_use_cloud_passes_stored_key_to_worker_env() {
         let options = tui_agent_options(
-            "Browser Use cloud",
+            BROWSER_USE_CLOUD,
             "abc123",
             CollaborationModeKind::Default,
             Some("codex"),

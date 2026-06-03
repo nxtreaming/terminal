@@ -33,7 +33,9 @@ use browser_use_agent::context::{
     typed_user_input_payload_from_items_for_cwd, typed_user_input_payload_from_text_for_cwd,
 };
 use browser_use_agent::events::{EventSink, PendingEvent};
-use browser_use_agent::history::{MessageHistoryConfig, MessageHistoryPersistence};
+use browser_use_agent::history::{
+    browser_use_terminal_home_dir, MessageHistoryConfig, MessageHistoryPersistence,
+};
 use browser_use_agent::infra::{install_process_crypto_provider, UnifiedExecShutdownCleanup};
 use browser_use_agent::prompts::CollaborationModeKind;
 use browser_use_agent::subagents::cleanup_agent_runtime_state_for_agent_subtree;
@@ -92,6 +94,10 @@ mod theme;
 mod transcript;
 mod welcome;
 
+use browser_use_providers::openrouter::{
+    fetch_provider_models, load_cached_provider_models, save_cached_provider_models, ModelSource,
+    ProviderCredential, ProviderModel,
+};
 use composer::Composer;
 use palette::PaletteAction;
 use render::{
@@ -100,12 +106,13 @@ use render::{
 };
 use runtime::{cancel_agent_run, run_agent_thread};
 use settings::{
-    browser_use_cloud_env_key_present, display_and_provider_model_for_input,
-    display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
-    model_choices_for_config, provider_model_for_display, AgentBackend, ModelChoice,
-    ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI,
-    ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD,
-    BROWSER_USE_CLOUD_API_KEY_ENV, BROWSER_USE_CLOUD_API_KEY_SETTING,
+    browser_use_cloud_env_key_present, bundled_openrouter_model_ids,
+    display_and_provider_model_for_input, display_model_for_provider_model, fallback_model_choices,
+    is_claude_code_account, model_choices_for_config, provider_model_choices,
+    provider_model_for_display, AgentBackend, ModelChoice, ACCOUNT_ANTHROPIC,
+    ACCOUNT_CHOICES, ACCOUNT_CODEX, ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER,
+    BROWSER_CHOICES, BROWSER_LOCAL_CHROME, BROWSER_USE_CLOUD, BROWSER_USE_CLOUD_API_KEY_ENV,
+    BROWSER_USE_CLOUD_API_KEY_SETTING, RECOMMENDED_MODELS,
 };
 
 const DOUBLE_ESCAPE_STOP_WINDOW: Duration = Duration::from_millis(1500);
@@ -213,7 +220,10 @@ enum Surface {
     Account,
     ApiKey,
     Telemetry,
+    Provider,
+    OpenAiAuth,
     Model,
+    ModelSearch,
     Mode,
     Browser,
     BrowserSelect,
@@ -231,7 +241,10 @@ impl Surface {
             Self::Account
                 | Self::ApiKey
                 | Self::Telemetry
+                | Self::Provider
+                | Self::OpenAiAuth
                 | Self::Model
+                | Self::ModelSearch
                 | Self::Mode
                 | Self::Browser
                 | Self::BrowserSelect
@@ -253,12 +266,39 @@ impl Surface {
     /// of these is active the composer must not also be rendered underneath —
     /// the popup itself is the input field, with its own cursor.
     fn is_text_input_popup(self) -> bool {
-        matches!(self, Self::ApiKey | Self::Telemetry)
+        matches!(self, Self::ApiKey | Self::Telemetry | Self::ModelSearch)
     }
 
     fn uses_main_view(self) -> bool {
         self == Self::Main || self.is_bottom_pane()
     }
+}
+
+/// An entry in the model-search list: a non-selectable section header or a
+/// selectable model id.
+enum ModelSearchEntry {
+    Header(String),
+    Item(String),
+}
+
+/// A row on the provider screen. `submenu` rows (OpenAI) open a sub-dialogue of
+/// auth methods; other rows connect their `account` directly.
+struct ProviderRow {
+    label: String,
+    account: &'static str,
+    submenu: bool,
+}
+
+/// The OpenAI auth methods shown in the sub-dialogue.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum OpenAiAuthMethod {
+    Codex,
+    ApiKey,
+}
+
+struct OpenAiAuthRow {
+    label: String,
+    method: OpenAiAuthMethod,
 }
 
 #[derive(Clone, Copy, Debug, ValueEnum)]
@@ -439,7 +479,10 @@ enum AppCommand {
     Reload,
     Update,
     SaveAccount(String),
-    SaveModel(usize),
+    SelectProvider(&'static str),
+    SelectRecommended(usize),
+    OpenModelSearch,
+    SaveCustomModel(String),
     SaveBrowser(usize),
     SaveAuth(String),
     SaveTelemetry(String),
@@ -908,10 +951,25 @@ struct App {
     provider_model: String,
     model_provider_id: Option<String>,
     model_choices: Vec<ModelChoice>,
+    /// Provider/account chosen on the provider screen; scopes the model search to
+    /// that provider's models.
+    selected_provider: Option<&'static str>,
+    /// Live model ids for the typeahead of the currently-selected provider,
+    /// seeded from the per-source cache and refreshed in the background.
+    provider_models: Vec<ProviderModel>,
+    /// Receiver for an in-flight background provider model-list fetch. The
+    /// payload carries the `ModelSource` it was fetched for so a result that
+    /// arrives after the user switched providers can be discarded rather than
+    /// attributed to (and cached under) the wrong provider.
+    provider_fetch: Option<mpsc::Receiver<(ModelSource, Vec<ProviderModel>)>>,
     collaboration_mode: CollaborationModeKind,
     browser: String,
     api_key_account: Option<String>,
-    pending_model_after_auth: Option<usize>,
+    pending_model_after_auth: Option<ModelChoice>,
+    /// Set when auth was started from the `/model` provider flow, so it opens the
+    /// provider's searchable model list once connected (vs first-run setup, which
+    /// auto-picks a default).
+    pending_model_search_after_auth: bool,
     setup_pending_account: Option<String>,
     setup_result: Option<SetupResult>,
     claude_code_oauth: Option<ClaudeCodeOAuthFlow>,
@@ -1564,6 +1622,37 @@ fn model_provider_id_for_backend(backend: AgentBackend) -> &'static str {
     backend.as_setting()
 }
 
+/// Resolve a runtime account string to its `'static` constant, so it can be
+/// stored in `selected_provider: Option<&'static str>`.
+fn account_static(account: &str) -> Option<&'static str> {
+    [
+        ACCOUNT_CODEX,
+        ACCOUNT_OPENAI,
+        ACCOUNT_ANTHROPIC,
+        ACCOUNT_OPENROUTER,
+        ACCOUNT_DEEPSEEK,
+    ]
+    .into_iter()
+    .find(|known| *known == account)
+}
+
+/// The model-list source for a provider account (for the dynamic `/models` fetch).
+fn model_source_for_account(account: &str) -> Option<ModelSource> {
+    Some(if account == ACCOUNT_CODEX {
+        ModelSource::Codex
+    } else if account == ACCOUNT_OPENAI {
+        ModelSource::OpenAi
+    } else if account == ACCOUNT_ANTHROPIC {
+        ModelSource::Anthropic
+    } else if account == ACCOUNT_OPENROUTER {
+        ModelSource::OpenRouter
+    } else if account == ACCOUNT_DEEPSEEK {
+        ModelSource::DeepSeek
+    } else {
+        return None;
+    })
+}
+
 fn default_provider_model_for_backend(
     backend: AgentBackend,
     current_dir: &Path,
@@ -1802,10 +1891,14 @@ impl App {
             provider_model,
             model_provider_id,
             model_choices,
+            selected_provider: None,
+            provider_models: Vec::new(),
+            provider_fetch: None,
             collaboration_mode,
             browser,
             api_key_account: None,
             pending_model_after_auth: None,
+            pending_model_search_after_auth: false,
             setup_pending_account: None,
             setup_result: None,
             claude_code_oauth: None,
@@ -2827,11 +2920,539 @@ impl App {
     fn open_surface(&mut self, surface: Surface) {
         self.close_slash_palette();
         self.surface = surface;
-        self.selected_row = 0;
+        // Open the model picker on the currently active model
+        self.selected_row = match surface {
+            Surface::Provider => self.current_provider_screen_index().unwrap_or(0),
+            Surface::Model => self.current_model_surface_index().unwrap_or(0),
+            Surface::ModelSearch => self.current_model_search_index().unwrap_or(0),
+            Surface::OpenAiAuth => self
+                .current_openai_method()
+                .and_then(|method| {
+                    self.openai_auth_rows()
+                        .iter()
+                        .position(|row| row.method == method)
+                })
+                .unwrap_or(0),
+            _ => 0,
+        };
         self.history_filter.clear();
         if surface != Surface::Browser {
             self.browser_notice = None;
         }
+    }
+
+    /// The model rows shown on the model screen: scoped to the selected provider,
+    /// or every model when no provider is selected (e.g. direct/legacy opens).
+    fn model_surface_choices(&self) -> Vec<ModelChoice> {
+        match self.selected_provider {
+            Some(account) => provider_model_choices(account, &self.model_choices)
+                .into_iter()
+                .cloned()
+                .collect(),
+            None => self.model_choices.clone(),
+        }
+    }
+
+    /// Whether the model screen shows the trailing "enter a custom model" row,
+    /// which only applies to OpenRouter (a passthrough that serves any model id).
+    fn model_surface_has_custom_row(&self) -> bool {
+        self.selected_provider == Some(ACCOUNT_OPENROUTER)
+    }
+
+    fn model_surface_row_count(&self) -> usize {
+        self.model_surface_choices().len() + usize::from(self.model_surface_has_custom_row())
+    }
+
+    /// Index into the model-screen rows of the currently-active model, matched the
+    /// same way the picker marks the current row (display name + account). `None`
+    /// when no model is configured or it isn't in the scoped list.
+    fn current_model_surface_index(&self) -> Option<usize> {
+        if !self.model_configured {
+            return None;
+        }
+        self.model_surface_choices()
+            .iter()
+            .position(|choice| self.model == choice.display && self.account == choice.account)
+    }
+
+    /// The provider/auth rows shown beneath the recommended quick-picks. OpenAI
+    /// splits into "sign in" (OAuth) and "API key"; the "Codex login (detected)"
+    /// row appears only when an external codex login is present.
+    fn provider_rows(&self) -> Vec<ProviderRow> {
+        vec![
+            ProviderRow {
+                label: "OpenAI".to_string(),
+                account: ACCOUNT_CODEX,
+                submenu: true,
+            },
+            ProviderRow {
+                label: "Anthropic · API key".to_string(),
+                account: ACCOUNT_ANTHROPIC,
+                submenu: false,
+            },
+            ProviderRow {
+                label: "OpenRouter · API key".to_string(),
+                account: ACCOUNT_OPENROUTER,
+                submenu: false,
+            },
+            ProviderRow {
+                label: "DeepSeek · API key".to_string(),
+                account: ACCOUNT_DEEPSEEK,
+                submenu: false,
+            },
+        ]
+    }
+
+    /// Whether a provider row is the one currently in use (for the highlight).
+    fn provider_row_is_current(&self, row: &ProviderRow) -> bool {
+        if !self.model_configured {
+            return false;
+        }
+        if row.submenu {
+            self.account == ACCOUNT_CODEX || self.account == ACCOUNT_OPENAI
+        } else {
+            self.account == row.account
+        }
+    }
+
+    /// Index of the recommended quick-pick that matches the active model, if any.
+    fn current_recommended_index(&self) -> Option<usize> {
+        if !self.model_configured {
+            return None;
+        }
+        RECOMMENDED_MODELS
+            .iter()
+            .position(|rec| self.account == rec.account && self.provider_model == rec.provider_model)
+    }
+
+    /// Row to start the cursor on when opening the provider screen: the active
+    /// model's recommended row (top) if it's a top pick, else its provider row
+    /// (bottom), so the current selection is visible and pre-highlighted.
+    fn current_provider_screen_index(&self) -> Option<usize> {
+        if let Some(idx) = self.current_recommended_index() {
+            return Some(idx);
+        }
+        if !self.model_configured {
+            return None;
+        }
+        let base = RECOMMENDED_MODELS.len();
+        self.provider_rows()
+            .iter()
+            .position(|row| self.provider_row_is_current(row))
+            .map(|pos| base + pos)
+    }
+
+    /// The active model id, but only when it belongs to the provider currently
+    /// being searched — so the model search can mark/preselect it.
+    fn current_search_model_id(&self) -> Option<&str> {
+        if !self.model_configured {
+            return None;
+        }
+        let provider = self.selected_provider?;
+        if self.account != provider {
+            return None;
+        }
+        Some(self.provider_model.as_str())
+    }
+
+    /// Row index of the active model within the model-search list, if present.
+    fn current_model_search_index(&self) -> Option<usize> {
+        let current = self.current_search_model_id()?.to_string();
+        self.model_search_rows().iter().position(|id| *id == current)
+    }
+
+    /// Provider screen selection: a recommended quick-pick (top rows) or a
+    /// provider row (lower rows). OpenAI opens its auth sub-dialogue.
+    fn provider_surface_select(&mut self) -> Result<()> {
+        let rec_count = RECOMMENDED_MODELS.len();
+        if self.selected_row < rec_count {
+            self.dispatch(AppCommand::SelectRecommended(self.selected_row))?;
+            return Ok(());
+        }
+        let rows = self.provider_rows();
+        if let Some(row) = rows.get(self.selected_row - rec_count) {
+            if row.submenu {
+                self.open_surface(Surface::OpenAiAuth);
+            } else {
+                let account = row.account;
+                self.dispatch(AppCommand::SelectProvider(account))?;
+            }
+        }
+        Ok(())
+    }
+
+    /// The OpenAI auth-method rows: Sign in (OAuth), Codex (only when an external
+    /// login is detected), and API key.
+    fn openai_auth_rows(&self) -> Vec<OpenAiAuthRow> {
+        let mut rows = Vec::new();
+        if self.has_external_codex_login() {
+            rows.push(OpenAiAuthRow {
+                label: "Use detected Codex login".to_string(),
+                method: OpenAiAuthMethod::Codex,
+            });
+        }
+        rows.push(OpenAiAuthRow {
+            label: "Use an API key".to_string(),
+            method: OpenAiAuthMethod::ApiKey,
+        });
+        rows
+    }
+
+    /// The OpenAI auth method currently in use (highlighted in the sub-dialogue).
+    fn current_openai_method(&self) -> Option<OpenAiAuthMethod> {
+        if !self.model_configured {
+            return None;
+        }
+        if self.account == ACCOUNT_OPENAI {
+            return Some(OpenAiAuthMethod::ApiKey);
+        }
+        if self.account == ACCOUNT_CODEX {
+            return Some(OpenAiAuthMethod::Codex);
+        }
+        None
+    }
+
+    /// OpenAI sub-dialogue Enter: route the chosen method through auth-first.
+    fn openai_auth_select(&mut self) -> Result<()> {
+        let rows = self.openai_auth_rows();
+        let Some(method) = rows.get(self.selected_row).map(|row| row.method) else {
+            return Ok(());
+        };
+        match method {
+            OpenAiAuthMethod::ApiKey => self.select_provider(ACCOUNT_OPENAI),
+            OpenAiAuthMethod::Codex => self.select_provider(ACCOUNT_CODEX),
+        }
+    }
+
+    /// Auth-first: connect the provider, then open its searchable model list. If
+    /// the provider isn't connected, run its auth flow first; the model search
+    /// opens after auth completes (`advance_after_auth`).
+    fn select_provider(&mut self, account: &'static str) -> Result<()> {
+        self.selected_provider = Some(account);
+        if self.account_ready(account)? {
+            self.open_provider_model_search(account)
+        } else {
+            self.pending_model_after_auth = None;
+            self.pending_model_search_after_auth = true;
+            self.start_auth_flow(account.to_string())
+        }
+    }
+
+    /// Apply a recommended quick-pick directly: build its choice and save it,
+    /// auto-authenticating first if the provider isn't connected yet.
+    fn select_recommended(&mut self, index: usize) -> Result<()> {
+        let Some(rec) = RECOMMENDED_MODELS.get(index) else {
+            return Ok(());
+        };
+        self.selected_provider = Some(rec.account);
+        let choice = settings::model_choice_for(rec.account, rec.provider_model, rec.display);
+        self.save_model_with_choice(choice)
+    }
+
+    /// Model screen Enter (legacy catalog surface, still exercised by tests):
+    /// save the highlighted model, or open the search via the custom row.
+    fn model_surface_select(&mut self) -> Result<()> {
+        let choices = self.model_surface_choices();
+        if self.model_surface_has_custom_row() && self.selected_row == choices.len() {
+            self.dispatch(AppCommand::OpenModelSearch)?;
+        } else if let Some(choice) = choices.get(self.selected_row).cloned() {
+            self.save_model_with_choice(choice)?;
+        }
+        Ok(())
+    }
+
+    /// Open the searchable, dynamically-fetched model list for a connected
+    /// provider: seed from the per-source cache and refresh in the background.
+    fn open_provider_model_search(&mut self, account: &str) -> Result<()> {
+        self.selected_provider = account_static(account);
+        self.composer.clear();
+        self.provider_models.clear();
+        self.provider_fetch = None;
+        self.seed_provider_models(account);
+        self.start_provider_fetch(account);
+        self.open_surface(Surface::ModelSearch);
+        Ok(())
+    }
+
+    fn open_model_search(&mut self) -> Result<()> {
+        let account = self.selected_provider.unwrap_or(ACCOUNT_OPENROUTER);
+        self.open_provider_model_search(account)
+    }
+
+    /// Seed the typeahead from the per-source disk cache (and the bundled
+    /// OpenRouter ids as an offline fallback) so it shows instantly.
+    fn seed_provider_models(&mut self, account: &str) {
+        let Some(source) = model_source_for_account(account) else {
+            return;
+        };
+        if let Some(dir) = browser_use_terminal_home_dir() {
+            if let Some((models, _fresh)) = load_cached_provider_models(&dir, source) {
+                if !models.is_empty() {
+                    self.provider_models = models;
+                    return;
+                }
+            }
+        }
+        if account == ACCOUNT_OPENROUTER {
+            self.provider_models = bundled_openrouter_model_ids()
+                .into_iter()
+                .map(|id| ProviderModel {
+                    id,
+                    name: None,
+                    vision: false,
+                    supports_tools: None,
+                })
+                .collect();
+        }
+    }
+
+    fn start_provider_fetch(&mut self, account: &str) {
+        if self.provider_fetch.is_some() {
+            return;
+        }
+        let Some(source) = model_source_for_account(account) else {
+            return;
+        };
+        let credential = self.get_provider_credential(account);
+        let (tx, rx) = mpsc::channel();
+        std::thread::spawn(move || {
+            if let Ok(models) = fetch_provider_models(source, credential) {
+                let _ = tx.send((source, models));
+            }
+        });
+        self.provider_fetch = Some(rx);
+    }
+
+    /// Resolve the credential used to authenticate a provider's `/models` request.
+    fn get_provider_credential(&self, account: &str) -> ProviderCredential {
+        if account == ACCOUNT_CODEX {
+            return self.codex_credential();
+        }
+        if account == ACCOUNT_OPENROUTER {
+            return ProviderCredential::None; // OpenRouter's model list is public.
+        }
+        let (key_setting, env_names): (&str, &[&str]) = if account == ACCOUNT_OPENAI {
+            (
+                "auth.openai.api_key",
+                &["LLM_BROWSER_OPENAI_API_KEY", "OPENAI_API_KEY"],
+            )
+        } else if account == ACCOUNT_ANTHROPIC {
+            (
+                "auth.anthropic.api_key",
+                &["LLM_BROWSER_ANTHROPIC_API_KEY", "ANTHROPIC_API_KEY"],
+            )
+        } else if account == ACCOUNT_DEEPSEEK {
+            (
+                "auth.deepseek.api_key",
+                &["LLM_BROWSER_DEEPSEEK_API_KEY", "DEEPSEEK_API_KEY"],
+            )
+        } else {
+            return ProviderCredential::None;
+        };
+        match self.resolved_secret(key_setting, env_names) {
+            Some(key) => ProviderCredential::ApiKey(key),
+            None => ProviderCredential::None,
+        }
+    }
+
+    fn codex_credential(&self) -> ProviderCredential {
+        let store_token = self
+            .store
+            .get_setting("auth.codex.access_token")
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        let store_account = self
+            .store
+            .get_setting("auth.codex.account_id")
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty());
+        if let (Some(access_token), Some(account_id)) = (store_token, store_account) {
+            return ProviderCredential::Oauth {
+                access_token,
+                account_id,
+            };
+        }
+        if let Ok(auth) = load_codex_auth() {
+            return ProviderCredential::Oauth {
+                access_token: auth.access_token,
+                account_id: auth.account_id,
+            };
+        }
+        ProviderCredential::None
+    }
+
+    /// Read a secret from the store, falling back to env vars.
+    fn resolved_secret(&self, setting_key: &str, env_names: &[&str]) -> Option<String> {
+        if let Some(value) = self
+            .store
+            .get_setting(setting_key)
+            .ok()
+            .flatten()
+            .filter(|value| !value.trim().is_empty())
+        {
+            return Some(value);
+        }
+        env_names
+            .iter()
+            .find_map(|name| std::env::var(name).ok().filter(|value| !value.trim().is_empty()))
+    }
+
+    /// Pump a finished background provider fetch into state + per-source cache.
+    fn drain_provider_fetch(&mut self) -> Result<bool> {
+        let Some(rx) = self.provider_fetch.as_ref() else {
+            return Ok(false);
+        };
+        match rx.try_recv() {
+            Ok((source, models)) => {
+                self.provider_fetch = None;
+                // Discard a result whose source no longer matches the selected
+                // provider — the user switched away while it was in flight, so
+                // applying it would show (and cache) the wrong provider's models.
+                if self.selected_provider.and_then(model_source_for_account) != Some(source) {
+                    return Ok(false);
+                }
+                if models.is_empty() {
+                    return Ok(false);
+                }
+                if let Some(dir) = browser_use_terminal_home_dir() {
+                    let _ = save_cached_provider_models(&dir, source, &models);
+                }
+                self.provider_models = models;
+                Ok(self.surface == Surface::ModelSearch)
+            }
+            Err(mpsc::TryRecvError::Empty) => Ok(false),
+            Err(mpsc::TryRecvError::Disconnected) => {
+                self.provider_fetch = None;
+                Ok(false)
+            }
+        }
+    }
+
+    /// The model-search list as ordered entries (section headers + selectable
+    /// model rows). While searching it's a flat filtered list; with an empty
+    /// query it leads with a "recommended" section, then the rest alphabetized
+    /// and grouped by provider (the vendor prefix before `/`).
+    /// Models the agent can actually run: drop ones we KNOW lack tool support
+    /// (this agent requires tool calling). Every tool-capable model is browsable,
+    /// across all providers; any model id can also be typed in directly.
+    fn usable_provider_models(&self) -> Vec<&ProviderModel> {
+        self.provider_models
+            .iter()
+            .filter(|model| model.supports_tools != Some(false))
+            .collect()
+    }
+
+    /// Whether a model in the current list accepts image input (vision).
+    fn provider_model_is_vision(&self, id: &str) -> bool {
+        self.provider_models
+            .iter()
+            .any(|model| model.id == id && model.vision)
+    }
+
+    fn model_search_entries(&self) -> Vec<ModelSearchEntry> {
+        let typed = self.composer.input().trim().to_string();
+        let query = typed.to_ascii_lowercase();
+        let usable = self.usable_provider_models();
+
+        if !query.is_empty() {
+            let mut entries = Vec::new();
+            let exact = usable.iter().any(|model| model.id == typed);
+            if !exact {
+                // Offer the raw typed id so any valid model can be submitted.
+                entries.push(ModelSearchEntry::Item(typed.clone()));
+            }
+            for model in &usable {
+                if model.id.to_ascii_lowercase().contains(&query) {
+                    entries.push(ModelSearchEntry::Item(model.id.clone()));
+                }
+            }
+            return entries;
+        }
+
+        let recommended = self.recommended_search_ids();
+        let mut entries = Vec::new();
+        if !recommended.is_empty() {
+            entries.push(ModelSearchEntry::Header("recommended".to_string()));
+            for id in &recommended {
+                entries.push(ModelSearchEntry::Item(id.clone()));
+            }
+        }
+        // Group the remaining models by provider prefix, alphabetically; ids
+        // within a group inherit the fetch's alphabetical order.
+        let mut groups: std::collections::BTreeMap<String, Vec<String>> =
+            std::collections::BTreeMap::new();
+        for model in &usable {
+            if recommended.contains(&model.id) {
+                continue;
+            }
+            let group = model
+                .id
+                .split_once('/')
+                .map(|(prefix, _)| prefix.to_string())
+                .unwrap_or_else(|| "models".to_string());
+            groups.entry(group).or_default().push(model.id.clone());
+        }
+        for (group, mut ids) in groups {
+            ids.sort();
+            entries.push(ModelSearchEntry::Header(group));
+            for id in ids {
+                entries.push(ModelSearchEntry::Item(id));
+            }
+        }
+        entries
+    }
+
+    /// Curated "top" model ids for the recommended section of the current
+    /// provider's search (only the usable ids present in the fetched list).
+    fn recommended_search_ids(&self) -> Vec<String> {
+        if self.selected_provider != Some(ACCOUNT_OPENROUTER) {
+            return Vec::new();
+        }
+        let available: std::collections::HashSet<&str> = self
+            .usable_provider_models()
+            .iter()
+            .map(|model| model.id.as_str())
+            .collect();
+        bundled_openrouter_model_ids()
+            .into_iter()
+            .filter(|id| available.contains(id.as_str()))
+            .collect()
+    }
+
+    /// The flat list of selectable model ids, in rendered order (headers excluded).
+    fn model_search_rows(&self) -> Vec<String> {
+        self.model_search_entries()
+            .into_iter()
+            .filter_map(|entry| match entry {
+                ModelSearchEntry::Item(id) => Some(id),
+                ModelSearchEntry::Header(_) => None,
+            })
+            .collect()
+    }
+
+    fn model_search_row_count(&self) -> usize {
+        self.model_search_rows().len()
+    }
+
+    /// Model-search Enter: save the highlighted suggestion / typed id.
+    fn model_search_select(&mut self) -> Result<()> {
+        let rows = self.model_search_rows();
+        if let Some(id) = rows.get(self.selected_row).cloned() {
+            self.dispatch(AppCommand::SaveCustomModel(id))?;
+        }
+        Ok(())
+    }
+
+    fn save_provider_model(&mut self, model_id: String) -> Result<()> {
+        let id = model_id.trim();
+        if id.is_empty() {
+            return Ok(());
+        }
+        let account = self.selected_provider.unwrap_or(ACCOUNT_OPENROUTER);
+        self.composer.clear();
+        self.save_model_with_choice(settings::model_choice_for(account, id, id))
     }
 
     fn close_surface(&mut self) {
@@ -2934,7 +3555,7 @@ impl App {
     fn inject_no_key_nudge(&mut self, submission: UserSubmission) -> Result<()> {
         // The agent runs out of (and saves files into) the per-session tmp dir,
         // not wherever the process was launched. `cwd` here is only used to
-        // resolve files the user references and to scope prompt history.
+        // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
         // Record the user's task as the standard input event (preserved for retry).
@@ -3075,7 +3696,7 @@ impl App {
                 self.native_history.reset_with_clear();
                 self.close_surface();
             }
-            AppCommand::ChangeModel => self.open_surface(Surface::Model),
+            AppCommand::ChangeModel => self.open_surface(Surface::Provider),
             AppCommand::SetCollaborationMode(mode) => {
                 let mode = match mode {
                     CollaborationModeKind::Default | CollaborationModeKind::Plan => {
@@ -3099,7 +3720,10 @@ impl App {
             AppCommand::Reload => self.request_reexec()?,
             AppCommand::Update => self.run_update()?,
             AppCommand::SaveAccount(account) => self.save_account(account)?,
-            AppCommand::SaveModel(index) => self.save_model(index)?,
+            AppCommand::SelectProvider(account) => self.select_provider(account)?,
+            AppCommand::SelectRecommended(index) => self.select_recommended(index)?,
+            AppCommand::OpenModelSearch => self.open_model_search()?,
+            AppCommand::SaveCustomModel(model_id) => self.save_provider_model(model_id)?,
             AppCommand::SaveBrowser(index) => self.save_browser(index)?,
             AppCommand::SaveAuth(secret) => self.save_auth(secret)?,
             AppCommand::SaveTelemetry(secret) => self.save_telemetry(secret)?,
@@ -3115,7 +3739,7 @@ impl App {
         }
         // The agent runs out of (and saves files into) the per-session tmp dir,
         // not wherever the process was launched. `cwd` here is only used to
-        // resolve files the user references and to scope prompt history.
+        // resolve files the user references and to scope prompt history
         let cwd = std::env::current_dir()?;
         let session = self.store.create_session_in_artifact_root(None)?;
         self.append_session_model_selection(&session.id, &selection)?;
@@ -3743,6 +4367,21 @@ impl App {
                 self.escape_stop_until = None;
                 self.cancel_secret_entry();
             }
+            // Model search: Esc goes back to the provider screen.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::ModelSearch => {
+                self.escape_stop_until = None;
+                self.composer.clear();
+                self.open_surface(Surface::Provider);
+            }
+            // OpenAI auth sub-dialogue: Esc goes back to the provider list.
+            KeyEvent {
+                code: KeyCode::Esc, ..
+            } if self.surface == Surface::OpenAiAuth => {
+                self.escape_stop_until = None;
+                self.open_surface(Surface::Provider);
+            }
             KeyEvent {
                 code: KeyCode::Esc, ..
             } if self.surface == Surface::Main => self.handle_main_escape()?,
@@ -3902,8 +4541,10 @@ impl App {
                 modifiers: KeyModifiers::NONE,
                 ..
             } => self.submit()?,
-            _ if matches!(self.surface, Surface::ApiKey | Surface::Telemetry)
-                && self.handle_api_key_key(key) => {}
+            _ if matches!(
+                self.surface,
+                Surface::ApiKey | Surface::Telemetry | Surface::ModelSearch
+            ) && self.handle_api_key_key(key) => {}
             // A leading `/` opens the slash palette popup. Once the composer
             // has text, slash is regular prompt input.
             KeyEvent {
@@ -4264,12 +4905,10 @@ impl App {
                 }
                 _ => self.cancel_secret_entry(),
             },
-            Surface::Model => {
-                let model_index = self
-                    .selected_row
-                    .min(self.model_choices.len().saturating_sub(1));
-                self.dispatch(AppCommand::SaveModel(model_index))?;
-            }
+            Surface::Provider => self.provider_surface_select()?,
+            Surface::OpenAiAuth => self.openai_auth_select()?,
+            Surface::Model => self.model_surface_select()?,
+            Surface::ModelSearch => self.model_search_select()?,
             Surface::Mode => {
                 self.close_surface();
                 self.dispatch(AppCommand::SetCollaborationMode(
@@ -4424,8 +5063,8 @@ impl App {
         self.setup_result = None;
         self.setup_pending_account = None;
         self.account = account;
-        if let Some(index) = self.pending_model_after_auth.take() {
-            return self.save_model(index);
+        if let Some(choice) = self.pending_model_after_auth.take() {
+            return self.save_model_with_choice(choice);
         }
         self.advance_after_auth()
     }
@@ -4607,6 +5246,14 @@ impl App {
     }
 
     fn advance_after_auth(&mut self) -> Result<()> {
+        // The /model provider flow connects first, then lets the user choose from
+        // the provider's live model list. First-run setup keeps auto-picking a
+        // default so onboarding stays one step.
+        if self.pending_model_search_after_auth {
+            self.pending_model_search_after_auth = false;
+            let account = self.account.clone();
+            return self.open_provider_model_search(&account);
+        }
         if let Some(index) = self.default_model_for_account(&self.account) {
             return self.save_model(index);
         }
@@ -4622,6 +5269,13 @@ impl App {
             .cloned()
             .or_else(|| fallback_model_choices().into_iter().next())
             .context("no model choices available")?;
+        self.save_model_with_choice(choice)
+    }
+
+    /// Apply a concrete model choice (a catalog row, a provider-scoped row, or a
+    /// synthetic free-text OpenRouter model) — persisting it and routing through
+    /// auth if the provider isn't ready yet.
+    fn save_model_with_choice(&mut self, choice: ModelChoice) -> Result<()> {
         self.model = choice.display.clone();
         self.account = choice.account.to_string();
         self.provider_model = choice.provider_model.clone();
@@ -4630,13 +5284,13 @@ impl App {
         self.model_configured = true;
         self.track_model_selected();
         if self.account == ACCOUNT_CODEX && !self.has_codex_login()? {
-            self.pending_model_after_auth = Some(index);
+            self.pending_model_after_auth = Some(choice);
             self.start_codex_device_login(self.account.clone())?;
             return Ok(());
         }
         self.persist_runtime_settings()?;
         if !self.account_ready(&self.account)? {
-            self.pending_model_after_auth = Some(index);
+            self.pending_model_after_auth = Some(choice);
             self.start_auth_flow(self.account.clone())?;
             return Ok(());
         }
@@ -4647,10 +5301,10 @@ impl App {
             }
             self.complete_setup()?;
             self.persist_runtime_settings()?;
-            self.status_notice = None;
-        } else {
-            self.status_notice = Some(format!("Model set to {}.", self.model));
         }
+        // No top "Model set to X" notice — the active model already shows in the
+        // composer status line at the bottom.
+        self.status_notice = None;
         if let Some(session_id) = self.selected_session_id.as_deref() {
             if self
                 .store
@@ -5116,7 +5770,7 @@ impl App {
         self.persist_runtime_settings()?;
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             self.status_notice = Some(
-                "Browser Use cloud key is required before cloud browser tasks can run.".to_string(),
+                "Browser Use Cloud key is required before cloud browser tasks can run.".to_string(),
             );
             self.start_auth_flow(BROWSER_USE_CLOUD.to_string())?;
             return Ok(());
@@ -5157,7 +5811,7 @@ impl App {
                 self.open_cookie_sync()?;
                 return Ok(());
             }
-            self.status_notice = Some("Saved Browser Use cloud key.".to_string());
+            self.status_notice = Some("Saved Browser Use Cloud key.".to_string());
             if !self.setup_complete && self.model_configured && self.account_ready(&self.account)? {
                 self.complete_setup()?;
                 self.close_surface();
@@ -5181,8 +5835,8 @@ impl App {
             return Ok(());
         }
         self.status_notice = Some(format!("Saved {}.", auth_secret_label(&account)));
-        if let Some(index) = self.pending_model_after_auth.take() {
-            return self.save_model(index);
+        if let Some(choice) = self.pending_model_after_auth.take() {
+            return self.save_model_with_choice(choice);
         }
         self.advance_after_auth()
     }
@@ -5317,9 +5971,17 @@ impl App {
         Ok(())
     }
 
+    /// Whether a codex login exists OUTSIDE our own OAuth store keys (an external
+    /// `~/.codex/auth.json`, managed auth, or env). Drives the "Codex login
+    /// detected" provider row so it appears only for a pre-existing login.
+    fn has_external_codex_login(&self) -> bool {
+        load_codex_managed_auth().is_ok() || load_codex_auth().is_ok() || codex_env_auth_present()
+    }
+
     fn cancel_auth_entry(&mut self) {
         self.api_key_account = None;
         self.pending_model_after_auth = None;
+        self.pending_model_search_after_auth = false;
         self.pending_cookie_sync_after_auth = false;
         if !self.setup_complete {
             self.setup_pending_account = None;
@@ -5621,8 +6283,11 @@ impl App {
             Surface::SetupResult => self.setup_result_row_count(),
             Surface::Account => ACCOUNT_CHOICES.len(),
             Surface::ApiKey | Surface::Telemetry => 2,
-            Surface::Model => self.model_choices.len(),
-            Surface::Mode => 1,
+            Surface::Provider => RECOMMENDED_MODELS.len() + self.provider_rows().len(),
+            Surface::OpenAiAuth => self.openai_auth_rows().len(),
+            Surface::Model => self.model_surface_row_count(),
+            Surface::ModelSearch => self.model_search_row_count(),
+            Surface::Mode => 2,
             Surface::Browser => 3,
             Surface::BrowserSelect => BROWSER_CHOICES.len(),
             Surface::CookieSync => self.cookie_sync_row_count(),
@@ -5901,7 +6566,7 @@ impl App {
     fn browser_notice(&self) -> Result<Option<String>> {
         if self.browser == BROWSER_USE_CLOUD && !self.browser_use_cloud_key_ready()? {
             Ok(Some(
-                "Browser Use cloud key is missing. Set BROWSER_USE_API_KEY or choose Local Chrome."
+                "Browser Use Cloud key is missing. Set BROWSER_USE_API_KEY or choose Local Chrome."
                     .to_string(),
             ))
         } else {
@@ -6108,7 +6773,7 @@ fn cookie_sync_success_message(value: &serde_json::Value) -> String {
         .get("cloud_profile")
         .and_then(|profile| profile.get("name"))
         .and_then(serde_json::Value::as_str)
-        .unwrap_or("Browser Use cloud profile");
+        .unwrap_or("Browser Use Cloud profile");
     let synced_count = value
         .get("synced_cookie_count")
         .and_then(serde_json::Value::as_u64)
@@ -6193,7 +6858,7 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
-        BROWSER_USE_CLOUD => "Browser Use cloud key",
+        BROWSER_USE_CLOUD => "Browser Use Cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "credential",
     }
@@ -6808,6 +7473,7 @@ fn run_terminal(mut app: App) -> Result<()> {
             draw_needed |= app.drain_codex_login_notifications()?;
             draw_needed |= app.drain_clipboard_paste_notifications()?;
             draw_needed |= app.drain_cookie_sync_notifications()?;
+            draw_needed |= app.drain_provider_fetch()?;
             if last_fallback_refresh.elapsed() >= STORE_FALLBACK_REFRESH_INTERVAL {
                 draw_needed |= app.refresh_state_cache_from_store()?;
                 last_fallback_refresh = Instant::now();
@@ -9062,7 +9728,10 @@ mod redesign_tests {
     fn surface_heading_for_test(surface: Surface) -> &'static str {
         match surface {
             Surface::Account => "Authenticate",
+            Surface::Provider => "Model",
+            Surface::OpenAiAuth => "Model",
             Surface::Model => "Model",
+            Surface::ModelSearch => "Model",
             Surface::Mode => "Mode",
             Surface::Browser | Surface::BrowserSelect => "Browser",
             Surface::CookieSync => "Cookie Sync",
@@ -9484,13 +10153,13 @@ mod redesign_tests {
 
             let _screen = render_dump(&mut app)?;
             // NOTE: the ready/welcome screen no longer carries the
-            // "Browser Use cloud needs key" warning. That warning still
+            // "Browser Use Cloud needs key" warning. That warning still
             // shows on the BrowserSelect surface (asserted below); the
             // welcome screen redesign needs a follow-up surface for it.
 
             app.open_surface(Surface::BrowserSelect);
             let screen = render_dump(&mut app)?;
-            assert!(screen.contains("Browser Use cloud . needs key"));
+            assert!(screen.contains("Browser Use Cloud . needs key"));
             Ok(())
         })();
         if let Some(value) = saved {
@@ -10879,7 +11548,7 @@ wire_api = "responses"
                 .iter()
                 .position(|choice| {
                     choice.account == settings::ACCOUNT_ANTHROPIC
-                        && choice.provider_model == "claude-opus-4-7"
+                        && choice.provider_model == "claude-opus-4-8"
                 })
                 .context("Anthropic Opus model row")?;
             app.selected_row = opus_index;
@@ -10891,7 +11560,12 @@ wire_api = "responses"
 
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::ApiKey);
-            assert_eq!(app.pending_model_after_auth, Some(opus_index));
+            assert_eq!(
+                app.pending_model_after_auth
+                    .as_ref()
+                    .map(|choice| choice.provider_model.as_str()),
+                Some("claude-opus-4-8")
+            );
             assert_eq!(
                 app.api_key_account.as_deref(),
                 Some(settings::ACCOUNT_ANTHROPIC)
@@ -10901,8 +11575,8 @@ wire_api = "responses"
             assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
             assert_eq!(app.surface, Surface::Main);
             assert_eq!(app.account, settings::ACCOUNT_ANTHROPIC);
-            assert_eq!(app.model, "Claude Opus 4.7");
-            assert_eq!(app.provider_model, "claude-opus-4-7");
+            assert_eq!(app.model, "Claude Opus 4.8");
+            assert_eq!(app.provider_model, "claude-opus-4-8");
             Ok(())
         })();
         if let Some(value) = saved_anthropic {
@@ -10912,6 +11586,205 @@ wire_api = "responses"
             std::env::set_var("LLM_BROWSER_ANTHROPIC_API_KEY", value);
         }
         result
+    }
+
+    #[test]
+    fn change_model_opens_provider_first_screen() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        assert_eq!(app.surface, Surface::Provider);
+        // Row count = recommended quick-picks + the computed provider rows (the
+        // "Codex login (detected)" row is machine-dependent, so compare to the
+        // computed list rather than a fixed number).
+        assert_eq!(
+            app.selectable_row_count()?,
+            RECOMMENDED_MODELS.len() + app.provider_rows().len()
+        );
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("recommended"), "{screen}");
+        assert!(screen.contains("providers"), "{screen}");
+        assert!(screen.contains(RECOMMENDED_MODELS[0].display), "{screen}");
+        assert!(screen.contains("OpenAI"), "{screen}");
+        assert!(screen.contains("Anthropic · API key"), "{screen}");
+        assert!(screen.contains("OpenRouter · API key"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn provider_rows_collapse_openai_into_a_submenu() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let app = ready_app(&temp)?;
+        let rows = app.provider_rows();
+        // OpenAI is a single row that opens the auth sub-dialogue.
+        let openai = rows.iter().find(|row| row.label == "OpenAI").expect("OpenAI row");
+        assert!(openai.submenu);
+        assert_eq!(openai.account, settings::ACCOUNT_CODEX);
+        // No split "OpenAI · sign in" / "OpenAI · API key" rows anymore.
+        assert!(!rows.iter().any(|row| row.label.contains("OpenAI ·")));
+        // Other providers are single non-submenu rows; Anthropic stays BYOK-only.
+        assert!(rows.iter().any(
+            |row| row.label == "Anthropic · API key" && row.account == settings::ACCOUNT_ANTHROPIC
+        ));
+        assert!(!rows.iter().any(|row| row.label.contains("Anthropic · sign in")));
+        Ok(())
+    }
+
+    #[test]
+    fn provider_screen_cursor_starts_on_current_model() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        // Current model is a recommended pick → cursor + current land on its
+        // recommended row (top).
+        app.model_configured = true;
+        app.account = RECOMMENDED_MODELS[1].account.to_string();
+        app.provider_model = RECOMMENDED_MODELS[1].provider_model.to_string();
+        assert_eq!(app.current_recommended_index(), Some(1));
+        app.open_surface(Surface::Provider);
+        assert_eq!(app.selected_row, 1);
+
+        // Current model is NOT a recommended pick → cursor + current land on the
+        // matching provider row (bottom).
+        app.account = settings::ACCOUNT_OPENROUTER.to_string();
+        app.provider_model = "vendor/custom-model".to_string();
+        assert_eq!(app.current_recommended_index(), None);
+        let or_row = app
+            .provider_rows()
+            .iter()
+            .position(|row| row.account == settings::ACCOUNT_OPENROUTER)
+            .context("openrouter provider row")?;
+        app.open_surface(Surface::Provider);
+        assert_eq!(app.selected_row, RECOMMENDED_MODELS.len() + or_row);
+        Ok(())
+    }
+
+    #[test]
+    fn openai_row_opens_auth_submenu_with_methods() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.dispatch(AppCommand::ChangeModel)?;
+        app.selected_row = RECOMMENDED_MODELS.len(); // first provider row = OpenAI
+        app.execute_surface_selection()?;
+        assert_eq!(app.surface, Surface::OpenAiAuth);
+        // OAuth sign-in is gone; OpenAI connects via API key (or a detected Codex
+        // login). The API-key method is always offered.
+        let methods: Vec<OpenAiAuthMethod> =
+            app.openai_auth_rows().iter().map(|row| row.method).collect();
+        assert!(methods.contains(&OpenAiAuthMethod::ApiKey));
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("Use an API key"), "{screen}");
+        Ok(())
+    }
+
+    #[test]
+    fn recommended_quick_pick_applies_model_when_connected() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // Use the OpenRouter recommended (deterministic auth: a stored key).
+        let idx = RECOMMENDED_MODELS
+            .iter()
+            .position(|rec| rec.account == settings::ACCOUNT_OPENROUTER)
+            .context("openrouter recommended")?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "sk-or-test")?;
+        app.select_recommended(idx)?;
+        assert_eq!(app.provider_model, RECOMMENDED_MODELS[idx].provider_model);
+        assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
+        Ok(())
+    }
+
+    #[test]
+    fn provider_selection_is_auth_first_then_searches_models() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        // Without a key, selecting OpenRouter asks for the key first (auth-first).
+        app.select_provider(settings::ACCOUNT_OPENROUTER)?;
+        assert_eq!(app.surface, Surface::ApiKey);
+        // With a key, it goes straight to the searchable model list.
+        app.store
+            .set_setting("auth.openrouter.api_key", "sk-or-test")?;
+        app.select_provider(settings::ACCOUNT_OPENROUTER)?;
+        assert_eq!(app.surface, Surface::ModelSearch);
+        assert_eq!(app.selected_provider, Some(settings::ACCOUNT_OPENROUTER));
+        // Typeahead filters the seeded ids; the raw query is offered too.
+        app.composer.set_input("kimi".to_string());
+        let rows = app.model_search_rows();
+        assert!(rows.iter().any(|id| id.contains("kimi")));
+        app.composer.set_input("vendor/brand-new-model".to_string());
+        let rows = app.model_search_rows();
+        assert_eq!(rows.first().map(String::as_str), Some("vendor/brand-new-model"));
+        Ok(())
+    }
+
+    #[test]
+    fn model_search_is_uncapped_recommended_then_grouped_by_provider() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.selected_provider = Some(settings::ACCOUNT_OPENROUTER);
+        // A long list across several vendors, plus a bundled "recommended"
+        // id, a tool-less model, and an obscure-vendor model.
+        let model = |id: &str, vision: bool, tools: Option<bool>| ProviderModel {
+            id: id.to_string(),
+            name: None,
+            vision,
+            supports_tools: tools,
+        };
+        let mut models: Vec<ProviderModel> = (0..40)
+            .map(|i| model(&format!("deepseek/model-{i:02}"), false, Some(true)))
+            .collect();
+        models.push(model("qwen/vision-x", true, Some(true))); // vision
+        models.push(model("moonshotai/kimi-k2.5", false, Some(true))); // recommended
+        models.push(model("deepseek/notools", false, Some(false))); // hidden: no tools
+        models.push(model("aion-labs/aion-2.0", false, Some(true))); // obscure vendor, still browsable
+        app.provider_models = models;
+
+        let rows = app.model_search_rows();
+        assert!(rows.len() >= 43);
+        // Only tool-less models are hidden; every tool-capable vendor is browsable.
+        assert!(!rows.iter().any(|id| id == "deepseek/notools"));
+        assert!(rows.iter().any(|id| id == "aion-labs/aion-2.0"));
+        // The hidden tool-less model can still be typed in directly (free-text).
+        app.composer.set_input("deepseek/notools".to_string());
+        assert!(app
+            .model_search_rows()
+            .iter()
+            .any(|id| id == "deepseek/notools"));
+        app.composer.set_input(String::new());
+        // Vision is detectable per-model.
+        assert!(app.provider_model_is_vision("qwen/vision-x"));
+        assert!(!app.provider_model_is_vision("deepseek/model-00"));
+
+        let entries = app.model_search_entries();
+        // Recommended section leads, and includes the bundled id.
+        assert!(matches!(&entries[0], ModelSearchEntry::Header(h) if h == "recommended"));
+        assert!(entries.iter().any(|e| matches!(e, ModelSearchEntry::Item(id) if id == "moonshotai/kimi-k2.5")));
+        // Provider group headers appear, alphabetically (deepseek before qwen).
+        let headers: Vec<&str> = entries
+            .iter()
+            .filter_map(|e| match e {
+                ModelSearchEntry::Header(h) => Some(h.as_str()),
+                _ => None,
+            })
+            .collect();
+        let ds = headers.iter().position(|h| *h == "deepseek");
+        let qw = headers.iter().position(|h| *h == "qwen");
+        assert!(ds.is_some() && qw.is_some() && ds < qw, "{headers:?}");
+        Ok(())
+    }
+
+    #[test]
+    fn save_provider_model_persists_raw_id_for_selected_provider() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        app.store
+            .set_setting("auth.openrouter.api_key", "sk-or-test")?;
+        app.selected_provider = Some(settings::ACCOUNT_OPENROUTER);
+        app.save_provider_model("vendor/custom-xl".to_string())?;
+        assert_eq!(app.provider_model, "vendor/custom-xl");
+        assert_eq!(app.account, settings::ACCOUNT_OPENROUTER);
+        assert_eq!(app.agent_backend, settings::AgentBackend::Openrouter);
+        Ok(())
     }
 
     #[test]

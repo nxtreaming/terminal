@@ -1061,7 +1061,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
     let normalized = mode.to_ascii_lowercase().replace(['_', ' '], "-");
     match normalized.as_str() {
         "local" | "local-chrome" => Ok("local"),
-        "cloud" | "browser-use-cloud" => Ok("cloud"),
+        "cloud" | "browser-use-cloud" | "remote-cloud" => Ok("cloud"),
         "headless" | "headless-chromium" | "managed-headless" => Ok("managed-headless"),
         "managed" | "managed-headed" | "headed" => Ok("managed-headed"),
         other => bail!("unknown browser preference mode: {other}"),
@@ -1070,7 +1070,7 @@ fn normalize_browser_preference_mode(mode: &str) -> anyhow::Result<&'static str>
 
 fn browser_display_name(mode: &str) -> &'static str {
     match mode {
-        "cloud" => "Browser Use cloud",
+        "cloud" => "Browser Use Cloud",
         "managed-headless" => "Headless Chromium",
         "managed-headed" => "Managed Chromium",
         _ => "Local Chrome",
@@ -1079,7 +1079,7 @@ fn browser_display_name(mode: &str) -> &'static str {
 
 fn display_browser_to_mode(display: &str) -> Option<&'static str> {
     match display {
-        "Browser Use cloud" => Some("cloud"),
+        "Browser Use Cloud" => Some("cloud"),
         "Headless Chromium" => Some("managed-headless"),
         "Managed Chromium" => Some("managed-headed"),
         "Local Chrome" => Some("local"),
@@ -1666,5 +1666,33 @@ impl ToolRuntime<BrowserRequest, ExecOutput> for BrowserTool {
         .map_err(|e| ToolError::Other(anyhow::anyhow!("browser task panicked: {e}")))?;
 
         result
+    }
+}
+
+#[cfg(test)]
+mod browser_mode_tests {
+    use super::*;
+
+    #[test]
+    fn normalizes_remote_cloud_as_cloud() {
+        // The browser layer serializes its cloud mode as "remote-cloud"; the
+        // preference normalizer must treat it as cloud rather than bailing with
+        // "unknown browser preference mode".
+        assert_eq!(normalize_browser_preference_mode("remote-cloud").unwrap(), "cloud");
+        assert_eq!(normalize_browser_preference_mode("remote_cloud").unwrap(), "cloud");
+        assert_eq!(normalize_browser_preference_mode("cloud").unwrap(), "cloud");
+        assert_eq!(normalize_browser_preference_mode("browser-use-cloud").unwrap(), "cloud");
+    }
+
+    #[test]
+    fn enforce_allows_cloud_command_when_run_locked_to_remote_cloud() {
+        // A run locked to the cloud browser reports its mode as "remote-cloud";
+        // issuing `browser remote ...` must be permitted, not rejected.
+        enforce_selected_browser_mode(Some("remote-cloud"), "cloud").unwrap();
+        enforce_browser_command_matches_selected_mode(
+            &["remote".to_string(), "start".to_string()],
+            Some("remote-cloud"),
+        )
+        .unwrap();
     }
 }

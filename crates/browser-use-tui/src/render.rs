@@ -15,15 +15,16 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use crate::palette;
 use crate::settings::{
-    is_claude_code_account, ModelChoiceGroup, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
+    is_claude_code_account, ModelChoice, ACCOUNT_ANTHROPIC, ACCOUNT_CHOICES, ACCOUNT_CODEX,
     ACCOUNT_DEEPSEEK, ACCOUNT_OPENAI, ACCOUNT_OPENROUTER, BROWSER_CHOICES, BROWSER_USE_CLOUD,
+    RECOMMENDED_MODELS,
 };
 use crate::theme::*;
 use crate::transcript;
 
 use super::{
     collaboration_mode_label, event_payload_text, format_goal_elapsed_seconds,
-    format_goal_tokens_compact, goal_command_hint, goal_status_label,
+    format_goal_tokens_compact, goal_command_hint, goal_status_label, ModelSearchEntry,
     pending_active_followup_events_from_events, pending_queued_followup_events_from_events, App,
     CookieSyncStatus, MessageActionKind, ProductState, SetupResultKind, Surface,
 };
@@ -918,6 +919,8 @@ fn render_surface_popup_box(
                 let account = app.api_key_account.as_deref().unwrap_or("");
                 masked_secret_for_account(account, app.composer.input())
             }
+            // The model search field is not a secret — show the raw query.
+            Surface::ModelSearch => app.composer.input().to_string(),
             _ => String::new(),
         };
         let target = format!("  {masked}");
@@ -1332,13 +1335,16 @@ fn surface_heading(surface: Surface) -> (&'static str, &'static str) {
         Surface::Account => ("Authenticate", "Sign in to a model provider"),
         Surface::ApiKey => ("API key", "Enter your provider API key"),
         Surface::Telemetry => ("Laminar", "Configure Laminar telemetry"),
+        Surface::Provider => ("Model", "Pick a recommended model or choose a provider"),
+        Surface::OpenAiAuth => ("OpenAI", "Choose how to connect to OpenAI"),
         Surface::Model => ("Model", "Choose the model and provider for this session"),
-        Surface::Mode => ("Mode", "Default execution mode is active"),
+        Surface::ModelSearch => ("Model", "Search this provider's models"),
+        Surface::Mode => ("Mode", "Choose the collaboration mode for the next turn"),
         Surface::Browser => ("Browser", "Change the browser backend"),
         Surface::BrowserSelect => ("Browser", "Choose a browser backend"),
         Surface::CookieSync => (
             "Cookie Sync",
-            "Import local browser cookies to Browser Use cloud",
+            "Import local browser cookies to Browser Use Cloud",
         ),
         Surface::Goal => ("Goal", "Inspect or change the active task goal"),
         Surface::History => ("History", "Browse and resume previous tasks"),
@@ -1420,7 +1426,10 @@ fn surface_lines(
         Surface::Account => account_lines(app),
         Surface::ApiKey => api_key_lines(app),
         Surface::Telemetry => telemetry_key_lines(app),
+        Surface::Provider => provider_lines(app),
+        Surface::OpenAiAuth => openai_auth_lines(app),
         Surface::Model => model_lines(app, height),
+        Surface::ModelSearch => model_search_lines(app, height),
         Surface::Mode => mode_lines(app),
         Surface::Browser => browser_panel_lines(app, state),
         Surface::BrowserSelect => browser_select_lines(app),
@@ -2446,51 +2455,164 @@ fn telemetry_key_lines(app: &App) -> Vec<Line<'static>> {
     lines
 }
 
+/// The provider screen: recommended quick-picks, then the provider/account list
+/// with auth status. One flat `selected_row` spans recommended-then-provider rows.
+fn provider_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push(Line::from(Span::styled(notice.clone(), failed())));
+        lines.push(Line::from(""));
+    }
+    // The active model is shown current on its recommended row (if it's one of
+    // the top picks) OR on its provider row below (so it's visible either way).
+    let current_recommended = app.current_recommended_index();
+    lines.push(Line::from(Span::styled("recommended", muted())));
+    for (idx, rec) in RECOMMENDED_MODELS.iter().enumerate() {
+        lines.push(selectable_row(
+            &format!("{:<22} {}", rec.display, access_label(rec.account)),
+            idx,
+            app.selected_row,
+            current_recommended == Some(idx),
+        ));
+    }
+    lines.push(Line::from(""));
+    lines.push(Line::from(Span::styled("providers", muted())));
+    let base = RECOMMENDED_MODELS.len();
+    for (idx, row) in app.provider_rows().iter().enumerate() {
+        let status = if app.account_ready(row.account).unwrap_or(false) {
+            "connected"
+        } else if row.account.contains("API key") {
+            "needs key"
+        } else {
+            "needs auth"
+        };
+        // Mark the provider row current only when the active model isn't a
+        // recommended pick (avoids double-marking top + bottom).
+        let is_current = current_recommended.is_none() && app.provider_row_is_current(row);
+        lines.push(selectable_row(
+            &format!("{:<24} {status}", row.label),
+            base + idx,
+            app.selected_row,
+            is_current,
+        ));
+    }
+    lines
+}
+
+/// The OpenAI auth sub-dialogue: connect via Codex / API key, with the current
+/// method shown green.
+fn openai_auth_lines(app: &App) -> Vec<Line<'static>> {
+    let mut lines = vec![Line::from(Span::styled("connect openai", muted()))];
+    let current = app.current_openai_method();
+    for (idx, row) in app.openai_auth_rows().iter().enumerate() {
+        lines.push(selectable_row(
+            &row.label,
+            idx,
+            app.selected_row,
+            current == Some(row.method),
+        ));
+    }
+    lines
+}
+
 fn model_lines(app: &App, height: usize) -> Vec<Line<'static>> {
     let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
     if let Some(notice) = app.status_notice.as_ref() {
         lines.push((None, Line::from(Span::styled(notice.clone(), failed()))));
         lines.push((None, Line::from("")));
     }
-    lines.push((None, Line::from(Span::styled("recommended", muted()))));
-    let mut row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::Recommended, 0);
-    lines.push((None, Line::from("")));
-    lines.push((
-        None,
-        Line::from(Span::styled("bring your own key", muted())),
-    ));
-    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::BringYourOwnKey, row_idx);
-    lines.push((None, Line::from("")));
-    lines.push((None, Line::from(Span::styled("openrouter", muted()))));
-    row_idx = push_model_group_lines(&mut lines, app, ModelChoiceGroup::OpenRouter, row_idx);
-    lines.push((None, Line::from("")));
-    lines.push((None, Line::from(Span::styled("deepseek", muted()))));
-    push_model_group_lines(&mut lines, app, ModelChoiceGroup::Deepseek, row_idx);
-    crop_model_lines(lines, app.selected_row, height)
-}
-
-fn push_model_group_lines(
-    lines: &mut Vec<(Option<usize>, Line<'static>)>,
-    app: &App,
-    group: ModelChoiceGroup,
-    mut row_idx: usize,
-) -> usize {
-    for (idx, _) in app
-        .model_choices
-        .iter()
-        .enumerate()
-        .filter(|(_, choice)| choice.group == group)
-    {
-        lines.push((Some(row_idx), model_row(idx, row_idx, app)));
+    let choices = app.model_surface_choices();
+    let mut row_idx = 0usize;
+    for choice in &choices {
+        lines.push((Some(row_idx), model_row(choice, row_idx, app)));
         row_idx += 1;
     }
-    row_idx
+    if app.model_surface_has_custom_row() {
+        let is_selected = row_idx == app.selected_row;
+        lines.push((Some(row_idx), model_custom_row(is_selected)));
+    }
+    // Plain catalog list — no pinned header, scroll every row.
+    crop_model_lines(lines, app.selected_row, height, 0)
 }
 
+/// The trailing "enter a custom model" row on the OpenRouter model screen.
+fn model_custom_row(is_selected: bool) -> Line<'static> {
+    let style = if is_selected { bold() } else { text_style() };
+    highlight_selectable_row(
+        vec![Span::styled(
+            "+ Enter a custom OpenRouter model".to_string(),
+            style,
+        )],
+        is_selected,
+        68,
+    )
+}
+
+/// The OpenRouter free-text search screen: a query input followed by typeahead
+/// suggestions (and the raw typed id as the first row when not an exact match).
+fn model_search_lines(app: &App, height: usize) -> Vec<Line<'static>> {
+    let mut lines: Vec<(Option<usize>, Line<'static>)> = Vec::new();
+    // Query input line; the popup cursor logic positions the caret at its end.
+    lines.push((None, Line::from(format!("  {}", app.composer.input()))));
+    lines.push((None, Line::from("")));
+    if let Some(notice) = app.status_notice.as_ref() {
+        lines.push((None, Line::from(Span::styled(notice.clone(), failed()))));
+        lines.push((None, Line::from("")));
+    }
+    let entries = app.model_search_entries();
+    if entries.is_empty() {
+        lines.push((
+            None,
+            Line::from(Span::styled(
+                "  Type a model id, e.g. moonshotai/kimi-k2.5".to_string(),
+                muted(),
+            )),
+        ));
+    }
+    // Items carry a running selectable index (matching `model_search_rows`);
+    // headers are non-selectable section labels.
+    let current_id = app.current_search_model_id();
+    let mut item_idx = 0usize;
+    for entry in &entries {
+        match entry {
+            ModelSearchEntry::Header(label) => {
+                lines.push((None, Line::from(Span::styled(label.clone(), muted()))));
+            }
+            ModelSearchEntry::Item(id) => {
+                let is_selected = item_idx == app.selected_row;
+                let is_current = current_id == Some(id.as_str());
+                let style = if is_current {
+                    current()
+                } else if is_selected {
+                    bold()
+                } else {
+                    text_style()
+                };
+                let mut spans = vec![Span::styled(id.clone(), style)];
+                if app.provider_model_is_vision(id) {
+                    spans.push(Span::styled("  · vision".to_string(), muted()));
+                }
+                lines.push((
+                    Some(item_idx),
+                    highlight_selectable_row(spans, is_selected, 68),
+                ));
+                item_idx += 1;
+            }
+        }
+    }
+    // Pin the query-input line (index 0) so the caret stays visible.
+    crop_model_lines(lines, app.selected_row, height, 1)
+}
+
+/// Crop `lines` to `height` rows, centering on `selected_row`. `pinned_head`
+/// leading lines are kept fixed at the top (used by the search surface to keep
+/// its query-input line — and the popup caret — visible while the rows beneath
+/// scroll); pass `0` for a plain list with no header to scroll normally.
 fn crop_model_lines(
     lines: Vec<(Option<usize>, Line<'static>)>,
     selected_row: usize,
     height: usize,
+    pinned_head: usize,
 ) -> Vec<Line<'static>> {
     if height == 0 {
         return Vec::new();
@@ -2498,30 +2620,39 @@ fn crop_model_lines(
     if lines.len() <= height {
         return lines.into_iter().map(|(_, line)| line).collect();
     }
-    let selected_line = lines
+    let pinned = pinned_head.min(height);
+    let head: Vec<Line<'static>> = lines[..pinned].iter().map(|(_, line)| line.clone()).collect();
+    let body = &lines[pinned..];
+    let visible = height - pinned;
+    if visible == 0 || body.len() <= visible {
+        let mut out = head;
+        out.extend(body.iter().map(|(_, line)| line.clone()));
+        return out;
+    }
+    let selected_line = body
         .iter()
         .position(|(row, _)| *row == Some(selected_row))
         .unwrap_or(0);
-    let visible = height;
     let mut start = selected_line.saturating_sub(visible / 2);
-    start = start.min(lines.len().saturating_sub(visible));
-    let end = (start + visible).min(lines.len());
-    let mut visible_lines = lines[start..end]
+    start = start.min(body.len().saturating_sub(visible));
+    let end = (start + visible).min(body.len());
+    let mut data = body[start..end]
         .iter()
         .map(|(_, line)| line.clone())
         .collect::<Vec<_>>();
     if start > 0 {
-        visible_lines[0] = Line::from(Span::styled("  ...", muted()));
+        data[0] = Line::from(Span::styled("  ...", muted()));
     }
-    if end < lines.len() {
-        let last = visible_lines.len().saturating_sub(1);
-        visible_lines[last] = Line::from(Span::styled("  ...", muted()));
+    if end < body.len() {
+        let last = data.len().saturating_sub(1);
+        data[last] = Line::from(Span::styled("  ...", muted()));
     }
-    visible_lines
+    let mut out = head;
+    out.extend(data);
+    out
 }
 
-fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
-    let choice = &app.model_choices[idx];
+fn model_row(choice: &ModelChoice, row_idx: usize, app: &App) -> Line<'static> {
     let is_selected = row_idx == app.selected_row;
     let current =
         app.model_configured && app.model == choice.display && app.account == choice.account;
@@ -2533,17 +2664,25 @@ fn model_row(idx: usize, row_idx: usize, app: &App) -> Line<'static> {
     } else {
         muted()
     };
+    // Truncate an over-long descriptor to the column width, but do not right-pad
+    // a short one, so the current-model `*` sits immediately after the text
+    // instead of floating at the far end of a fixed 22-char column.
+    let descriptor_cell = if descriptor.chars().count() <= 22 {
+        descriptor.to_string()
+    } else {
+        fixed_width_cell(descriptor, 22)
+    };
     highlight_selectable_row(
         vec![
             Span::styled(fixed_width_cell(&choice.display, 20), name_style),
             Span::styled(format!("{:<22}", access), muted()),
-            Span::styled(fixed_width_cell(descriptor, 22), descriptor_style),
+            Span::styled(descriptor_cell, descriptor_style),
             Span::styled(if current { " *" } else { "" }.to_string(), done()),
         ],
         is_selected,
-        // 2-space indent + 20 + 22 + 22 columns + " *" — width of the longest
-        // possible row (one with the current-selection marker), so every row
-        // highlights to the same end column.
+        // 2-space indent + 20 + 22 + up-to-22 descriptor + " *" — keep the
+        // highlight padding target at the widest possible row so every selected
+        // row still highlights to the same end column.
         68,
     )
 }
@@ -2712,7 +2851,7 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
     ];
     match &app.cookie_sync.status {
         CookieSyncStatus::NeedsAuth => {
-            lines.push(Line::from("  Browser Use cloud key is missing."));
+            lines.push(Line::from("  Browser Use Cloud key is missing."));
             lines.push(Line::from(""));
             lines.push(selected("Add Browser Use key", 0, app.selected_row));
         }
@@ -2721,7 +2860,7 @@ pub(crate) fn cookie_sync_lines(app: &App, width: usize) -> Vec<Line<'static>> {
         }
         CookieSyncStatus::Ready => {
             lines.push(kv_line("scope", "all cookies"));
-            lines.push(kv_line("target", "new Browser Use cloud profile"));
+            lines.push(kv_line("target", "new Browser Use Cloud profile"));
             lines.push(Line::from(""));
             lines.push(Line::from(Span::styled("LOCAL PROFILES", muted())));
             lines.push(Line::from(""));
@@ -3321,19 +3460,27 @@ fn highlight_selectable_row(
 }
 
 fn selected(text: &str, idx: usize, selected: usize) -> Line<'static> {
+    selectable_row(text, idx, selected, false)
+}
+
+/// A selectable list row. The cursor (the row being navigated) gets a blue `>`
+/// and bold text; the item currently *in use* gets green text so the active
+/// choice is visible even when the cursor has moved elsewhere.
+fn selectable_row(text: &str, idx: usize, selected: usize, is_current: bool) -> Line<'static> {
+    let cursor = idx == selected;
+    let body = if is_current {
+        current()
+    } else if cursor {
+        bold()
+    } else {
+        text_style()
+    };
     Line::from(vec![
         Span::styled(
-            if idx == selected { "> " } else { "  " },
-            if idx == selected { accent() } else { dim() },
+            if cursor { "> " } else { "  " },
+            if cursor { accent() } else { dim() },
         ),
-        Span::styled(
-            text.to_string(),
-            if idx == selected {
-                bold()
-            } else {
-                text_style()
-            },
-        ),
+        Span::styled(text.to_string(), body),
     ])
 }
 
@@ -3408,7 +3555,7 @@ fn auth_secret_label(account: &str) -> &'static str {
         ACCOUNT_OPENROUTER => "OpenRouter API key",
         ACCOUNT_DEEPSEEK => "DeepSeek API key",
         ACCOUNT_ANTHROPIC => "Anthropic API key",
-        BROWSER_USE_CLOUD => "Browser Use cloud key",
+        BROWSER_USE_CLOUD => "Browser Use Cloud key",
         account if is_claude_code_account(account) => "Claude Code OAuth token",
         _ => "Credential",
     }

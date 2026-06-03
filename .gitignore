@@ -17,3 +17,5 @@ build/
 target/
 .harness/signals/
 .omc/
+/datasets/real_v8.json
+/datasets/real_v14_short.json
