@@ -758,7 +758,25 @@ fn committed_node_for_event(
         }
         "model.turn.response" => pre_tool_commentary_node(root, events, event),
         "model.response.continued" => continued_response_commentary_node(root, events, event),
-        "plan.proposed" => None,
+        // `plan.proposed` is legacy: planning mode was removed, so nothing
+        // emits these anymore. Old persisted sessions can still contain them,
+        // though — render the text as a plain assistant turn so historical
+        // plan content is preserved instead of vanishing from the transcript.
+        "plan.proposed" => {
+            let text = payload_string(event, "text")?;
+            if text.trim().is_empty() {
+                return None;
+            }
+            Some(TranscriptNode {
+                id,
+                seq: event.seq,
+                revision: event.seq.max(0) as u64,
+                kind: TranscriptKind::Assistant {
+                    markdown: text,
+                    source: source_for_state(state),
+                },
+            })
+        }
         "session.failed" => {
             let text =
                 payload_string(event, "error").unwrap_or_else(|| "The task failed.".to_string());

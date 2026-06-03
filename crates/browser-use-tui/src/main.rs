@@ -6052,8 +6052,17 @@ impl App {
             self.close_slash_palette();
             return self.execute_palette_action(action);
         }
+        // Unrecognized slash input (e.g. the now-removed `/plan`). The palette
+        // consumed the leading `/` to open and holds the typed text in
+        // `palette_filter` while the composer stays empty, so submitting the
+        // composer here would drop the input. Reconstruct what the user typed
+        // and submit it as a normal prompt instead.
+        let typed = self.palette_filter.trim().to_string();
         self.close_slash_palette();
-        self.submit()?;
+        if !typed.is_empty() {
+            self.composer.set_input(format!("/{typed}"));
+            self.submit()?;
+        }
         Ok(false)
     }
 
@@ -10343,6 +10352,63 @@ mod redesign_tests {
             .iter()
             .any(|item| item.command == "/plan"));
         assert_eq!(app.collaboration_mode, CollaborationModeKind::Default);
+        Ok(())
+    }
+
+    /// Regression: unrecognized slash input typed *through the palette* must be
+    /// submitted as a normal prompt, not dropped. The palette consumes the
+    /// leading `/` and holds the typed text in `palette_filter` while the
+    /// composer stays empty, so the Enter fallback has to recover that text
+    /// rather than submit the empty composer.
+    #[test]
+    fn unrecognized_slash_input_is_submitted_not_dropped() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Char('/'), KeyModifiers::NONE))?);
+        assert!(app.is_slash_palette_active());
+        for ch in "plan revise this".chars() {
+            assert!(!app.handle_key(KeyEvent::new(KeyCode::Char(ch), KeyModifiers::NONE))?);
+        }
+
+        assert!(!app.handle_key(KeyEvent::new(KeyCode::Enter, KeyModifiers::NONE))?);
+        assert!(!app.is_slash_palette_active());
+
+        let session_id = app
+            .selected_session_id
+            .clone()
+            .context("selected session")?;
+        let events = app.store.events_for_session(&session_id)?;
+        assert!(events.iter().any(|event| {
+            event.event_type == "session.input"
+                && event.payload["text"] == serde_json::json!("/plan revise this")
+        }));
+        Ok(())
+    }
+
+    /// Regression: planning mode was removed, so nothing emits `plan.proposed`
+    /// anymore — but sessions persisted before the removal still contain those
+    /// events. They must render as plain assistant text instead of vanishing
+    /// from transcript history.
+    #[test]
+    fn legacy_plan_proposed_event_renders_as_assistant_text() -> Result<()> {
+        let temp = tempfile::tempdir()?;
+        let mut app = ready_app(&temp)?;
+        let session = app.store.create_session(None, std::env::current_dir()?)?;
+        app.store.append_event(
+            &session.id,
+            "session.input",
+            serde_json::json!({"text": "make a plan"}),
+        )?;
+        app.store.append_event(
+            &session.id,
+            "plan.proposed",
+            serde_json::json!({"text": "First open the site then log in."}),
+        )?;
+        app.selected_session_id = Some(session.id);
+
+        let screen = render_dump(&mut app)?;
+        assert!(screen.contains("First open the site then log in."));
         Ok(())
     }
 
