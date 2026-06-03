@@ -428,16 +428,20 @@ def switch_tab(target):
 
 
 def _current_target_url():
-    """URL of the current controlled tab, or None if it can't be resolved."""
+    """URL of the current controlled tab, or None if it can't be resolved.
+
+    Any CDP failure resolves to None so new_tab() falls back to creating a
+    fresh tab rather than erroring out before it ever opens one.
+    """
     try:
         target_id = current_tab().get("targetId")
+        if not target_id:
+            return None
+        for target in cdp("Target.getTargets").get("targetInfos", []):
+            if target.get("targetId") == target_id:
+                return target.get("url", "")
     except Exception:
         return None
-    if not target_id:
-        return None
-    for target in cdp("Target.getTargets").get("targetInfos", []):
-        if target.get("targetId") == target_id:
-            return target.get("url", "")
     return None
 
 

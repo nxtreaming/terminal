@@ -7822,8 +7822,17 @@ fn clear_manual_modal_overlay_rect(
 /// OSC-8 hyperlink wrapper: `<open>text<close>`. The visible glyphs in `text`
 /// are reprinted between the open/close so the terminal tags exactly those
 /// cells with `url` as the click target.
+///
+/// `url`/`text` originate from an untrusted browser-provided live URL
 fn live_link_osc8(url: &str, text: &str) -> String {
+    let url = strip_terminal_controls(url);
+    let text = strip_terminal_controls(text);
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
+}
+
+/// Remove control characters that could inject terminal escape sequences.
+fn strip_terminal_controls(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
 }
 
 /// Paint the live-view URL as a clickable OSC-8 hyperlink directly onto the
@@ -13015,6 +13024,23 @@ wire_api = "responses"
         assert_eq!(
             live_link_osc8(full, shown),
             format!("\x1b]8;;{full}\x1b\\{shown}\x1b]8;;\x1b\\")
+        );
+    }
+
+    #[test]
+    fn live_link_osc8_strips_control_chars_to_prevent_escape_injection() {
+        // A crafted live URL with ESC/BEL must not break out of the OSC-8
+        // sequence and inject terminal escapes.
+        let out = live_link_osc8("https://x.test/\x1b]0;pwned\x07?a=1", "https://x...\x1b[2J");
+        assert_eq!(
+            out.matches('\x1b').count(),
+            4,
+            "expected only framing ESCs, got {out:?}"
+        );
+        assert!(!out.contains('\x07'), "BEL must be stripped: {out:?}");
+        assert_eq!(
+            out,
+            "\x1b]8;;https://x.test/]0;pwned?a=1\x1b\\https://x...[2J\x1b]8;;\x1b\\"
         );
     }
 

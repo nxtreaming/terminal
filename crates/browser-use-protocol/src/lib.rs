@@ -656,6 +656,10 @@ pub fn failure_from_events(events: &[EventRecord]) -> Option<String> {
     })
 }
 
+fn sanitize_terminal_text(value: &str) -> String {
+    value.chars().filter(|ch| !ch.is_control()).collect()
+}
+
 pub fn browser_summary_from_events(
     events: &[EventRecord],
     backend: impl Into<String>,
@@ -674,10 +678,10 @@ pub fn browser_summary_from_events(
             "browser.connected" | "browser.reconnected" | "browser.target_changed" => {
                 summary.status = "connected".to_string();
                 if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
-                    summary.url = Some(url.to_string());
+                    summary.url = Some(sanitize_terminal_text(url));
                 }
                 if let Some(title) = event.payload.get("title").and_then(Value::as_str) {
-                    summary.title = Some(title.to_string());
+                    summary.title = Some(sanitize_terminal_text(title));
                 }
             }
             "browser.disconnected" => {
@@ -690,18 +694,18 @@ pub fn browser_summary_from_events(
                     .get("live_url")
                     .or_else(|| event.payload.get("url"))
                     .and_then(Value::as_str)
-                    .map(ToOwned::to_owned);
+                    .map(sanitize_terminal_text);
             }
             "browser.page" | "browser.state" => {
                 if let Some(status) = event.payload.get("status").and_then(Value::as_str) {
                     summary.status = status.to_string();
                 }
                 if let Some(url) = event.payload.get("url").and_then(Value::as_str) {
-                    summary.url = Some(url.to_string());
+                    summary.url = Some(sanitize_terminal_text(url));
                     summary.status = "connected".to_string();
                 }
                 if let Some(title) = event.payload.get("title").and_then(Value::as_str) {
-                    summary.title = Some(title.to_string());
+                    summary.title = Some(sanitize_terminal_text(title));
                 }
                 if let Some(tabs) = event
                     .payload
@@ -1427,6 +1431,38 @@ mod tests {
             ts_ms: seq,
             event_type: event_type.to_string(),
             payload,
+        }
+    }
+
+    #[test]
+    fn browser_summary_strips_control_chars_from_untrusted_strings() {
+        let events = vec![
+            event(
+                1,
+                "browser.live_url",
+                json!({ "live_url": "https://live.example.com/?wss=ws\x1b]0;pwned\x07x" }),
+            ),
+            event(
+                2,
+                "browser.page",
+                json!({
+                    "url": "https://evil.test/\x1b[2J",
+                    "title": "hi\x1bthere\u{009c}",
+                }),
+            ),
+        ];
+        let summary = browser_summary_from_events(&events, "test");
+        assert_eq!(
+            summary.live_url.as_deref(),
+            Some("https://live.example.com/?wss=ws]0;pwnedx")
+        );
+        assert_eq!(summary.url.as_deref(), Some("https://evil.test/[2J"));
+        assert_eq!(summary.title.as_deref(), Some("hithere"));
+        // No control characters survive in any displayed field
+        for field in [&summary.live_url, &summary.url, &summary.title] {
+            if let Some(value) = field {
+                assert!(!value.chars().any(|ch| ch.is_control()));
+            }
         }
     }
 
