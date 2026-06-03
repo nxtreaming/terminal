@@ -137,6 +137,7 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
+const NATIVE_TRANSCRIPT_REPLAY_EVENT_LIMIT: usize = 1000;
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
@@ -884,6 +885,14 @@ struct App {
     clipboard_paste_tx: mpsc::Sender<ClipboardPasteEvent>,
     clipboard_paste_rx: mpsc::Receiver<ClipboardPasteEvent>,
     state_cache: AppStateCache,
+    transcript_model_cache: transcript::TranscriptModelCache,
+    transcript_filtered_cache: transcript::FilteredEventCache,
+    /// Session id last checked for ready queued follow-ups / goal continuation.
+    /// Those checks read the full event history, so they only run when the store
+    /// actually changed (a notification was drained) or the selected session
+    /// changed — never on every keystroke.
+    last_followup_check_session: Option<String>,
+    modal_background: Option<ModalBackgroundSnapshot>,
     args: Args,
     selected_session_id: Option<String>,
     composer: Composer,
@@ -942,6 +951,12 @@ struct App {
     pending_auth_resume: Option<String>,
     pending_initial_goal: Option<String>,
     pending_goal_replacement: Option<PendingGoalReplacement>,
+}
+
+#[derive(Clone)]
+struct ModalBackgroundSnapshot {
+    area: Rect,
+    buffer: Buffer,
 }
 
 #[derive(Debug)]
@@ -1767,6 +1782,10 @@ impl App {
             clipboard_paste_tx,
             clipboard_paste_rx,
             state_cache,
+            transcript_model_cache: transcript::TranscriptModelCache::default(),
+            transcript_filtered_cache: transcript::FilteredEventCache::default(),
+            last_followup_check_session: None,
+            modal_background: None,
             args,
             selected_session_id,
             composer: Composer::default(),
@@ -1823,6 +1842,38 @@ impl App {
 
     fn workbench_state(&mut self) -> Result<WorkbenchState> {
         Ok(self.refresh_cached_projection().clone())
+    }
+
+    fn modal_overlay_state(&mut self) -> WorkbenchState {
+        let state = self.refresh_cached_projection();
+        WorkbenchState {
+            setup_complete: state.setup_complete,
+            current_session: state.current_session.clone(),
+            task: state.task.clone(),
+            result: state.result.clone(),
+            failure: state.failure.clone(),
+            activity: Vec::new(),
+            transcript: Vec::new(),
+            browser: state.browser.clone(),
+            telemetry: state.telemetry.clone(),
+            history: state.history.clone(),
+        }
+    }
+
+    fn session_render_state(&mut self) -> WorkbenchState {
+        let state = self.refresh_cached_projection();
+        WorkbenchState {
+            setup_complete: state.setup_complete,
+            current_session: state.current_session.clone(),
+            task: state.task.clone(),
+            result: state.result.clone(),
+            failure: state.failure.clone(),
+            activity: Vec::new(),
+            transcript: state.transcript.last().cloned().into_iter().collect(),
+            browser: state.browser.clone(),
+            telemetry: state.telemetry.clone(),
+            history: Vec::new(),
+        }
     }
 
     fn refresh_cached_projection(&mut self) -> &WorkbenchState {
@@ -5687,9 +5738,11 @@ impl App {
         if !self.native_scrollback_is_active() {
             return false;
         }
-        let state = self.refresh_cached_projection().clone();
-        let model = transcript::transcript_model(self, &state);
-        transcript::has_shimmering_live_status(model.as_ref())
+        let state = self.session_render_state();
+        transcript::with_transcript_model(self, &state, |model| {
+            transcript::has_shimmering_live_status(Some(model))
+        })
+        .unwrap_or(false)
     }
 
     fn tick_live_spinner(&mut self) {
@@ -6906,7 +6959,7 @@ impl TerminalDriver {
     fn draw(&mut self, app: &mut App) -> Result<()> {
         let manual_overlay_active = should_draw_manual_modal_overlay(app);
         let manual_overlay = if manual_overlay_active {
-            let state = app.workbench_state()?;
+            let state = app.modal_overlay_state();
             manual_modal_overlay(app, &state)
         } else {
             None
@@ -6915,6 +6968,17 @@ impl TerminalDriver {
         if let Some(previous_rect) = self.manual_modal_overlay_rect {
             if manual_overlay_rect != Some(previous_rect) {
                 clear_manual_modal_overlay_rect(self.terminal.backend_mut(), previous_rect)?;
+            }
+        }
+        if manual_overlay_active
+            && (self.manual_modal_overlay_rect.is_none()
+                || self.manual_modal_overlay_rect == manual_overlay_rect)
+        {
+            if let Some(overlay) = manual_overlay.as_ref() {
+                draw_manual_modal_overlay(self.terminal.backend_mut(), overlay)?;
+                self.manual_modal_overlay_rect = manual_overlay_rect;
+                self.sync_mouse_capture(app)?;
+                return Ok(());
             }
         }
         if self.manual_modal_overlay_rect.is_some() && !manual_overlay_active {
@@ -6986,8 +7050,7 @@ fn desired_terminal_viewport_height_for(
         return Ok(full_height);
     }
 
-    let state = app.refresh_cached_projection().clone();
-    let transcript_model = transcript::transcript_model(app, &state);
+    let state = app.session_render_state();
     let body_width = app_width.saturating_sub(4).max(1);
     let stream_skip_lines = state
         .current_session
@@ -6997,23 +7060,25 @@ fn desired_terminal_viewport_height_for(
                 .live_stream_emitted_lines_for(&session.id, body_width)
         })
         .unwrap_or(0);
-    let active_streaming_lines =
-        transcript::active_streaming_lines(transcript_model.as_ref(), body_width);
-    let estimated_stream_skip_lines =
-        if transcript::active_streaming_can_commit_all(transcript_model.as_ref())
-            && active_streaming_lines.len() > 1
-        {
-            active_streaming_lines.len()
-        } else {
-            active_streaming_lines.len().saturating_sub(1)
-        };
-    let stream_skip_lines = stream_skip_lines.max(estimated_stream_skip_lines);
-    let active_lines = transcript::active_viewport_lines_with_stream_skip(
-        transcript_model.as_ref(),
-        body_width,
-        u16::MAX,
-        stream_skip_lines,
-    );
+    let active_lines = transcript::with_transcript_model(app, &state, |model| {
+        let active_streaming_lines = transcript::active_streaming_lines(Some(model), body_width);
+        let estimated_stream_skip_lines =
+            if transcript::active_streaming_can_commit_all(Some(model))
+                && active_streaming_lines.len() > 1
+            {
+                active_streaming_lines.len()
+            } else {
+                active_streaming_lines.len().saturating_sub(1)
+            };
+        let stream_skip_lines = stream_skip_lines.max(estimated_stream_skip_lines);
+        transcript::active_viewport_lines_with_stream_skip(
+            Some(model),
+            body_width,
+            u16::MAX,
+            stream_skip_lines,
+        )
+    })
+    .unwrap_or_default();
     let active_line_count = if app.selected_session_id.is_some() && app.surface.uses_main_view() {
         active_lines.len().max(1)
     } else {
@@ -7078,14 +7143,35 @@ fn draw_manual_modal_overlay(
         if row >= term_h {
             break;
         }
+        if overlay.rect.x >= term_w {
+            break;
+        }
+        let mut run_style = None;
+        let mut run_col = overlay.rect.x;
+        let mut run_text = String::new();
         for x in 0..overlay.rect.width {
             let col = overlay.rect.x.saturating_add(x);
             if col >= term_w {
                 break;
             }
             let cell = &overlay.buffer[(x, y)];
-            queue_ratatui_cell_style(target, cell.fg, cell.bg, cell.modifier)?;
-            queue!(target, MoveTo(col, row), Print(cell.symbol()))?;
+            let style = ManualOverlayCellStyle {
+                fg: cell.fg,
+                bg: cell.bg,
+                modifier: cell.modifier,
+            };
+            if run_style != Some(style) {
+                if let Some(style) = run_style {
+                    queue_manual_overlay_run(target, row, run_col, style, &run_text)?;
+                    run_text.clear();
+                }
+                run_style = Some(style);
+                run_col = col;
+            }
+            run_text.push_str(cell.symbol());
+        }
+        if let Some(style) = run_style {
+            queue_manual_overlay_run(target, row, run_col, style, &run_text)?;
         }
     }
     queue!(target, ResetColor, SetAttribute(Attribute::Reset))?;
@@ -7103,43 +7189,63 @@ fn draw_manual_modal_overlay(
     Ok(())
 }
 
-fn queue_ratatui_cell_style(
+fn queue_manual_overlay_run(
     target: &mut CrosstermBackend<io::Stdout>,
+    row: u16,
+    col: u16,
+    style: ManualOverlayCellStyle,
+    text: &str,
+) -> io::Result<()> {
+    if text.is_empty() {
+        return Ok(());
+    }
+    queue_manual_overlay_cell_style(target, style)?;
+    queue!(target, MoveTo(col, row), Print(text))?;
+    Ok(())
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct ManualOverlayCellStyle {
     fg: RatatuiColor,
     bg: RatatuiColor,
     modifier: Modifier,
+}
+
+fn queue_manual_overlay_cell_style(
+    target: &mut CrosstermBackend<io::Stdout>,
+    style: ManualOverlayCellStyle,
 ) -> io::Result<()> {
     queue!(
         target,
         SetAttribute(Attribute::Reset),
-        SetForegroundColor(ratatui_color_to_crossterm(fg)),
-        SetBackgroundColor(ratatui_color_to_crossterm(bg))
+        SetForegroundColor(ratatui_color_to_crossterm(style.fg)),
+        SetBackgroundColor(ratatui_color_to_crossterm(style.bg))
     )?;
-    if modifier.contains(Modifier::BOLD) {
+    if style.modifier.contains(Modifier::BOLD) {
         queue!(target, SetAttribute(Attribute::Bold))?;
     }
-    if modifier.contains(Modifier::DIM) {
+    if style.modifier.contains(Modifier::DIM) {
         queue!(target, SetAttribute(Attribute::Dim))?;
     }
-    if modifier.contains(Modifier::ITALIC) {
+    if style.modifier.contains(Modifier::ITALIC) {
         queue!(target, SetAttribute(Attribute::Italic))?;
     }
-    if modifier.contains(Modifier::UNDERLINED) {
+    if style.modifier.contains(Modifier::UNDERLINED) {
         queue!(target, SetAttribute(Attribute::Underlined))?;
     }
-    if modifier.contains(Modifier::SLOW_BLINK) {
+    if style.modifier.contains(Modifier::SLOW_BLINK) {
         queue!(target, SetAttribute(Attribute::SlowBlink))?;
     }
-    if modifier.contains(Modifier::RAPID_BLINK) {
+    if style.modifier.contains(Modifier::RAPID_BLINK) {
         queue!(target, SetAttribute(Attribute::RapidBlink))?;
     }
-    if modifier.contains(Modifier::REVERSED) {
+    if style.modifier.contains(Modifier::REVERSED) {
         queue!(target, SetAttribute(Attribute::Reverse))?;
     }
-    if modifier.contains(Modifier::HIDDEN) {
+    if style.modifier.contains(Modifier::HIDDEN) {
         queue!(target, SetAttribute(Attribute::Hidden))?;
     }
-    if modifier.contains(Modifier::CROSSED_OUT) {
+    if style.modifier.contains(Modifier::CROSSED_OUT) {
         queue!(target, SetAttribute(Attribute::CrossedOut))?;
     }
     Ok(())
@@ -7324,7 +7430,6 @@ fn maybe_emit_native_transcript(
     app: &mut App,
 ) -> Result<()> {
     let size = terminal.size()?;
-    let state = app.workbench_state()?;
     if !app.surface.uses_main_view()
         || app.is_first_run_setup_visible()?
         || app.surface.is_popup()
@@ -7336,69 +7441,126 @@ fn maybe_emit_native_transcript(
     if should_clear {
         clear_native_transcript_screen(terminal)?;
     }
+    let state = app.session_render_state();
     let Some(session) = state.current_session.as_ref() else {
         return Ok(());
     };
 
     let session_id = session.id.clone();
     let width = native_scrollback_width(size.width);
-    let Some(model) = transcript::transcript_model(app, &state) else {
+    let history_active = app.native_history.is_active_for(Some(&session_id));
+    let raw_events = app.cached_events_for_session(&session_id);
+    let last_event_seq = raw_events.last().map(|event| event.seq).unwrap_or_default();
+    if !history_active
+        && session.status.is_active()
+        && raw_events.len() > NATIVE_TRANSCRIPT_REPLAY_EVENT_LIMIT
+    {
+        insert_native_lines(terminal, crate::welcome::session_header_lines(width))?;
+        app.native_history
+            .reset_for_session_with_group(session_id, last_event_seq, None);
+        return Ok(());
+    }
+    let after_seq = app.native_history.last_seq;
+    let live_stream_prefix = if history_active {
+        app.native_history
+            .live_stream_emitted_text_for(&session_id, width)
+            .map(|lines| lines.to_vec())
+    } else {
+        None
+    };
+    let Some(plan) = transcript::with_transcript_model(app, &state, |model| {
+        debug_assert_eq!(model.session_id, session_id);
+        let has_live_streaming_output =
+            !transcript::active_streaming_lines(Some(model), width).is_empty();
+        let defer_open_tail = session.status.is_active() && !has_live_streaming_output;
+        let live_stream = native_live_stream_plan(app, model, width);
+
+        if !history_active {
+            let emission =
+                transcript::terminal_scrollback_emission_since(model, 0, width, defer_open_tail);
+            let mut lines = crate::welcome::session_header_lines(width);
+            lines.extend(emission.lines);
+            return NativeTranscriptEmissionPlan {
+                reset_session: true,
+                reset_last_seq: emission.last_seq,
+                committed_lines: lines,
+                committed_last_seq: None,
+                live_stream,
+            };
+        }
+
+        let mut committed_lines = Vec::new();
+        let mut committed_last_seq = None;
+        if model.last_event_seq > after_seq {
+            let mut emission = transcript::terminal_scrollback_emission_since(
+                model,
+                after_seq,
+                width,
+                defer_open_tail,
+            );
+            if let Some(prefix) = live_stream_prefix.as_deref() {
+                emission.lines = strip_live_stream_prefix(emission.lines, prefix);
+            }
+            if emission.last_seq > after_seq {
+                committed_last_seq = Some(emission.last_seq);
+            }
+            committed_lines = emission.lines;
+        }
+
+        NativeTranscriptEmissionPlan {
+            reset_session: false,
+            reset_last_seq: 0,
+            committed_lines,
+            committed_last_seq,
+            live_stream,
+        }
+    }) else {
         return Ok(());
     };
-    debug_assert_eq!(model.session_id, session_id);
-    let _model_revision = model.revision;
-    let has_live_streaming_output =
-        !transcript::active_streaming_lines(Some(&model), width).is_empty();
-    let defer_open_tail = session.status.is_active() && !has_live_streaming_output;
 
-    if !app.native_history.is_active_for(Some(&session_id)) {
-        // The session opens with a committed header block (small BU mark,
-        // "Browser Use Terminal", cwd) above the conversation content.
-        let emission =
-            transcript::terminal_scrollback_emission_since(&model, 0, width, defer_open_tail);
-        let mut lines = crate::welcome::session_header_lines(width);
-        lines.extend(emission.lines);
-        insert_native_lines(terminal, lines)?;
+    if plan.reset_session {
+        insert_native_lines(terminal, plan.committed_lines)?;
         app.native_history
-            .reset_for_session_with_group(session_id, emission.last_seq, None);
-        maybe_emit_native_live_stream(terminal, app, &model, width)?;
+            .reset_for_session_with_group(session_id, plan.reset_last_seq, None);
+        apply_native_live_stream_plan(terminal, app, plan.live_stream)?;
         return Ok(());
     }
 
-    let after_seq = app.native_history.last_seq;
-    if model.last_event_seq > after_seq {
-        let live_stream_prefix = app
-            .native_history
-            .live_stream_emitted_text_for(&session_id, width)
-            .map(|lines| lines.to_vec());
-        let mut emission = transcript::terminal_scrollback_emission_since(
-            &model,
-            after_seq,
-            width,
-            defer_open_tail,
-        );
-        if let Some(prefix) = live_stream_prefix.as_deref() {
-            emission.lines = strip_live_stream_prefix(emission.lines, prefix);
-        }
-        if emission.last_seq > after_seq {
-            app.native_history.last_seq = emission.last_seq;
-            app.native_history.last_group = None;
-            app.native_history.clear_live_stream();
-        }
-        if !emission.lines.is_empty() {
-            insert_native_lines(terminal, emission.lines)?;
-        }
+    if let Some(last_seq) = plan.committed_last_seq {
+        app.native_history.last_seq = last_seq;
+        app.native_history.last_group = None;
+        app.native_history.clear_live_stream();
     }
-    maybe_emit_native_live_stream(terminal, app, &model, width)?;
+    if !plan.committed_lines.is_empty() {
+        insert_native_lines(terminal, plan.committed_lines)?;
+    }
+    apply_native_live_stream_plan(terminal, app, plan.live_stream)?;
     Ok(())
 }
 
-fn maybe_emit_native_live_stream(
-    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
-    app: &mut App,
+struct NativeTranscriptEmissionPlan {
+    reset_session: bool,
+    reset_last_seq: i64,
+    committed_lines: Vec<Line<'static>>,
+    committed_last_seq: Option<i64>,
+    live_stream: NativeLiveStreamPlan,
+}
+
+#[derive(Default)]
+struct NativeLiveStreamPlan {
+    clear_live_stream: bool,
+    session_id: String,
+    width: u16,
+    emit_count: usize,
+    lines: Vec<Line<'static>>,
+    emitted_text_lines: Vec<String>,
+}
+
+fn native_live_stream_plan(
+    app: &App,
     model: &transcript::TranscriptModel,
     width: u16,
-) -> Result<()> {
+) -> NativeLiveStreamPlan {
     let lines = transcript::active_streaming_lines(Some(model), width);
     let emit_count = if transcript::active_streaming_can_commit_all(Some(model)) && lines.len() > 1
     {
@@ -7407,27 +7569,51 @@ fn maybe_emit_native_live_stream(
         lines.len().saturating_sub(1)
     };
     if emit_count == 0 {
-        app.native_history.clear_live_stream();
-        return Ok(());
+        return NativeLiveStreamPlan {
+            clear_live_stream: true,
+            ..NativeLiveStreamPlan::default()
+        };
     }
     let already = app
         .native_history
         .live_stream_emitted_lines_for(&model.session_id, width)
         .min(emit_count);
     if emit_count <= already {
-        return Ok(());
+        return NativeLiveStreamPlan::default();
     }
     let mut emitted_lines = lines[already..emit_count].to_vec();
     if already == 0 {
         emitted_lines.insert(0, Line::from(""));
     }
-    insert_native_lines(terminal, emitted_lines)?;
     let emitted_text_lines = plain_text_lines(&lines[..emit_count]);
-    app.native_history.set_live_stream_emitted_lines(
-        &model.session_id,
+    NativeLiveStreamPlan {
+        clear_live_stream: false,
+        session_id: model.session_id.clone(),
         width,
         emit_count,
+        lines: emitted_lines,
         emitted_text_lines,
+    }
+}
+
+fn apply_native_live_stream_plan(
+    terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
+    app: &mut App,
+    plan: NativeLiveStreamPlan,
+) -> Result<()> {
+    if plan.clear_live_stream {
+        app.native_history.clear_live_stream();
+        return Ok(());
+    }
+    if plan.lines.is_empty() {
+        return Ok(());
+    }
+    insert_native_lines(terminal, plan.lines)?;
+    app.native_history.set_live_stream_emitted_lines(
+        &plan.session_id,
+        plan.width,
+        plan.emit_count,
+        plan.emitted_text_lines,
     );
     Ok(())
 }
