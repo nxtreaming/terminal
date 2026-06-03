@@ -137,7 +137,6 @@ const INPUT_POLL_INTERVAL: Duration = Duration::from_millis(25);
 const RESIZE_DEBOUNCE_INTERVAL: Duration = Duration::from_millis(80);
 const ANIM_TICK_INTERVAL: Duration = Duration::from_millis(16); // ~60 fps
 const LIVE_SPINNER_TICK_INTERVAL: Duration = Duration::from_millis(120);
-const NATIVE_TRANSCRIPT_REPLAY_EVENT_LIMIT: usize = 1000;
 const REEXEC_BINARY_ENV: &str = "BUT_REEXEC_BINARY";
 const REEXEC_SESSION_ENV: &str = "BUT_REEXEC_SESSION_ID";
 const CODEX_DEVICE_AUTH_URL: &str = "https://auth.openai.com/codex/device";
@@ -7460,17 +7459,11 @@ fn maybe_emit_native_transcript(
     let session_id = session.id.clone();
     let width = native_scrollback_width(size.width);
     let history_active = app.native_history.is_active_for(Some(&session_id));
-    let raw_events = app.cached_events_for_session(&session_id);
-    let last_event_seq = raw_events.last().map(|event| event.seq).unwrap_or_default();
-    if !history_active
-        && session.status.is_active()
-        && raw_events.len() > NATIVE_TRANSCRIPT_REPLAY_EVENT_LIMIT
-    {
-        insert_native_lines(terminal, crate::welcome::session_header_lines(width))?;
-        app.native_history
-            .reset_for_session_with_group(session_id, last_event_seq, None);
-        return Ok(());
-    }
+    // Re-attaching to a session (history not currently tracked, e.g. after a
+    // resize reset) always replays the full committed transcript. A previous
+    // "emit only the header for >N-event sessions" shortcut left the prior
+    // conversation permanently blank on follow-ups, since the incremental path
+    // then only ever appends new turns. Correctness over the resize-replay cost.
     let after_seq = app.native_history.last_seq;
     let live_stream_prefix = if history_active {
         app.native_history
