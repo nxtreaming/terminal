@@ -8,7 +8,6 @@ use std::io::{self, Write};
 use std::net::{TcpListener, TcpStream};
 #[cfg(unix)]
 use std::os::unix::process::CommandExt;
-use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::path::{Path, PathBuf};
 use std::process::Command as ProcessCommand;
 #[cfg(not(test))]
@@ -53,7 +52,9 @@ use browser_use_providers::{
     parse_claude_code_authorization_input, ClaudeCodeAuthorization, CLAUDE_CODE_CALLBACK_HOST,
     CLAUDE_CODE_CALLBACK_PATH, CLAUDE_CODE_CALLBACK_PORT,
 };
-use browser_use_store::{resolve_state_dir, Store, StoreNotification, StoreNotifier};
+#[cfg(test)]
+use browser_use_store::StoreNotifier;
+use browser_use_store::{resolve_state_dir, Store, StoreNotification};
 use clap::{Parser, ValueEnum};
 use crossterm::cursor::{MoveTo, Show};
 use crossterm::event::{
@@ -80,6 +81,16 @@ use ratatui::{Terminal, TerminalOptions, Viewport};
 use signal_hook::consts::signal::SIGUSR2;
 use unicode_width::UnicodeWidthStr;
 
+#[cfg(test)]
+static BROWSER_USE_TERMINAL_HOME_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+#[cfg(test)]
+pub(crate) fn browser_use_terminal_home_test_lock() -> std::sync::MutexGuard<'static, ()> {
+    BROWSER_USE_TERMINAL_HOME_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+}
+
 mod clipboard_paste;
 mod composer;
 mod markdown;
@@ -98,7 +109,10 @@ use render::{
     lines_plain_text, main_viewport_height, native_scrollback_lines, render, render_dump,
     APP_HORIZONTAL_MARGIN, NATIVE_TRANSCRIPT_HORIZONTAL_MARGIN,
 };
-use runtime::{cancel_agent_run, run_agent_thread};
+use runtime::{
+    cancel_agent_run, has_live_runtime_agent, pending_runtime_agent_mailbox_count,
+    spawn_tui_agent_run, submit_runtime_user_input,
+};
 use settings::{
     browser_use_cloud_env_key_present, display_and_provider_model_for_input,
     display_model_for_provider_model, fallback_model_choices, is_claude_code_account,
@@ -2618,15 +2632,18 @@ impl App {
         if session.status != SessionStatus::Done {
             return Ok(false);
         }
-        let mailbox_messages = self.store.messages_for_agent(&session_id)?;
-        if mailbox_messages.is_empty() {
+        let mailbox_count =
+            match pending_runtime_agent_mailbox_count(&self.args.state_dir, &session_id)? {
+                Some(count) => count,
+                None => self.store.messages_for_agent(&session_id)?.len(),
+            };
+        if mailbox_count == 0 {
             return Ok(false);
         }
         let selection = self.session_model_selection_or_current(&session_id)?;
         if !self.ensure_agent_ready_for_selection(&selection)? {
             return Ok(false);
         }
-        let mailbox_count = mailbox_messages.len();
         self.store.append_event(
             &session_id,
             SESSION_MAILBOX_CONTINUATION_STARTED_EVENT,
@@ -3227,6 +3244,99 @@ impl App {
         }
         let mut payload =
             typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
+        if active && has_live_runtime_agent(&self.args.state_dir, &session_id) {
+            payload["delivery"] = serde_json::json!(FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL);
+            payload["runtime_mailbox_id"] = serde_json::json!("pending");
+            let followup_record = self.store.append_event(
+                &session_id,
+                SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                payload,
+            )?;
+            let input_items = followup_record.payload.get("items").cloned();
+            match submit_runtime_user_input(
+                &self.args.state_dir,
+                &session_id,
+                submission.text.clone(),
+                input_items,
+                true,
+                browser_use_runtime::MailboxDeliveryPhase::CurrentTurn,
+                serde_json::json!({
+                    "pending_from_seq": followup_record.seq,
+                    "runtime_marker_event_id": followup_record.id,
+                }),
+            ) {
+                Ok(mailbox_item) => {
+                    let _ = self.store.append_event(
+                        &session_id,
+                        "session.followup.runtime_queued",
+                        serde_json::json!({
+                            "followup_seq": followup_record.seq,
+                            "runtime_mailbox_id": mailbox_item.id,
+                            "runtime_mailbox_seq": mailbox_item.seq,
+                        }),
+                    );
+                    product_analytics::capture_user_message(
+                        &self.store,
+                        "tui",
+                        &session_id,
+                        session.parent_id.is_some(),
+                        product_analytics::MESSAGE_KIND_FOLLOWUP,
+                        followup_record.seq,
+                        &submission.text,
+                    );
+                    self.prompt_history.record_submission(&submission.text);
+                    if let Some(options) = options.as_ref() {
+                        self.maybe_append_message_history(
+                            &session_id,
+                            &submission.text,
+                            Path::new(&session.cwd),
+                            options,
+                        );
+                    }
+                    return Ok(());
+                }
+                Err(error) => {
+                    let _ = self.store.append_event(
+                        &session_id,
+                        SESSION_ACTIVE_FOLLOWUP_CANCELLED_EVENT,
+                        serde_json::json!({
+                            "followup_seq": followup_record.seq,
+                            "reason": format!("runtime enqueue failed: {error:#}"),
+                        }),
+                    );
+                    let mut fallback_payload =
+                        typed_user_input_payload_for_submission_for_cwd(&submission, &session.cwd)?;
+                    fallback_payload["delivery"] =
+                        serde_json::json!(FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL);
+                    let fallback_record = self.store.append_event(
+                        &session_id,
+                        SESSION_PENDING_ACTIVE_FOLLOWUP_EVENT,
+                        fallback_payload,
+                    )?;
+                    product_analytics::capture_user_message(
+                        &self.store,
+                        "tui",
+                        &session_id,
+                        session.parent_id.is_some(),
+                        product_analytics::MESSAGE_KIND_FOLLOWUP,
+                        fallback_record.seq,
+                        &submission.text,
+                    );
+                    self.prompt_history.record_submission(&submission.text);
+                    if let Some(options) = options.as_ref() {
+                        self.maybe_append_message_history(
+                            &session_id,
+                            &submission.text,
+                            Path::new(&session.cwd),
+                            options,
+                        );
+                    }
+                    self.status_notice =
+                        Some("Follow-up queued through durable fallback.".to_string());
+                    return Ok(());
+                }
+            }
+        }
         if active {
             payload["delivery"] = serde_json::json!(FOLLOWUP_DELIVERY_AFTER_NEXT_TOOL_CALL);
         }
@@ -3314,43 +3424,18 @@ impl App {
         let config_profile = self.args.config_profile.clone();
         let config_overrides = self.parsed_config_overrides()?;
         let notifier = self.store.notifier();
-        thread::Builder::new()
-            .name(format!("browser-use-agent-{session_id}"))
-            .spawn(move || {
-                let failure_state_dir = state_dir.clone();
-                let failure_session_id = session_id.clone();
-                let failure_notifier = notifier.clone();
-                let result = catch_unwind(AssertUnwindSafe(|| {
-                    run_agent_thread(
-                        state_dir,
-                        session_id,
-                        backend,
-                        model,
-                        model_provider_id,
-                        browser,
-                        collaboration_mode,
-                        config_profile,
-                        config_overrides,
-                        notifier,
-                    )
-                }));
-                match result {
-                    Ok(Ok(())) => {}
-                    Ok(Err(error)) => record_agent_failure(
-                        failure_state_dir,
-                        failure_session_id,
-                        failure_notifier,
-                        format!("agent thread failed: {error:#}"),
-                    ),
-                    Err(panic) => record_agent_panic(
-                        failure_state_dir,
-                        failure_session_id,
-                        failure_notifier,
-                        panic_payload_message(panic),
-                    ),
-                }
-            })
-            .context("spawn agent thread")?;
+        spawn_tui_agent_run(
+            state_dir,
+            session_id,
+            backend,
+            model,
+            model_provider_id,
+            browser,
+            collaboration_mode,
+            config_profile,
+            config_overrides,
+            notifier,
+        )?;
         Ok(())
     }
 
@@ -3373,11 +3458,11 @@ impl App {
         if !self.current_task_is_active()? {
             return Ok(false);
         }
-        let cancelled_live_run = cancel_agent_run(&id);
+        let cancelled_live_run = cancel_agent_run(&self.args.state_dir, &id);
         self.pause_active_goal_for_interrupt(&id)?;
         self.store.request_cancel(&id, "stopped from terminal")?;
         cleanup_agent_runtime_state_for_agent_subtree(&self.store, &id, |session_id| {
-            usize::from(cancel_agent_run(session_id))
+            usize::from(cancel_agent_run(&self.args.state_dir, session_id))
         })?;
         if !cancelled_live_run {
             self.status_notice =
@@ -4762,9 +4847,8 @@ impl App {
     /// engine's low-level appender: it emits the developer-instructions override
     /// (the one block the TUI can reconstruct from `AgentRunOptions`) as a
     /// `permissions`-kind `workspace.context` event. The engine fn is async and
-    /// takes a `SharedStore`, so — like `runtime::run_agent_thread` — we clone
-    /// the store into an `Arc<Mutex<…>>` and block on a current-thread Tokio
-    /// runtime, preserving origin/main's synchronous call shape.
+    /// takes a `SharedStore`, so this one-shot context append reopens the store
+    /// and blocks on a current-thread Tokio runtime.
     fn append_workspace_context_event_blocking(
         &self,
         session_id: &str,
@@ -6671,6 +6755,7 @@ fn install_agent_panic_hook() {
     });
 }
 
+#[cfg(test)]
 fn record_agent_panic(
     state_dir: PathBuf,
     session_id: String,
@@ -6685,6 +6770,7 @@ fn record_agent_panic(
     );
 }
 
+#[cfg(test)]
 fn record_agent_failure(
     state_dir: PathBuf,
     session_id: String,
@@ -6698,16 +6784,6 @@ fn record_agent_failure(
             serde_json::json!({ "error": error }),
         );
     }
-}
-
-fn panic_payload_message(payload: Box<dyn std::any::Any + Send>) -> String {
-    if let Some(message) = payload.downcast_ref::<&str>() {
-        return (*message).to_string();
-    }
-    if let Some(message) = payload.downcast_ref::<String>() {
-        return message.clone();
-    }
-    "non-string panic payload".to_string()
 }
 
 fn main() -> Result<()> {
@@ -8210,8 +8286,6 @@ fn seed_demo_if_requested(store: &Store, mode: Option<&str>) -> Result<()> {
 mod redesign_tests {
     use super::*;
 
-    static BROWSER_USE_TERMINAL_HOME_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
-
     fn args(temp: &tempfile::TempDir) -> Args {
         Args {
             state_dir: temp.path().to_path_buf(),
@@ -8666,9 +8740,7 @@ mod redesign_tests {
     }
 
     fn with_browser_use_terminal_home<T>(app_home: &std::path::Path, f: impl FnOnce() -> T) -> T {
-        let _lock = BROWSER_USE_TERMINAL_HOME_TEST_LOCK
-            .lock()
-            .unwrap_or_else(|error| error.into_inner());
+        let _lock = crate::browser_use_terminal_home_test_lock();
         let previous = std::env::var_os("BROWSER_USE_TERMINAL_HOME");
         unsafe {
             std::env::set_var("BROWSER_USE_TERMINAL_HOME", app_home);

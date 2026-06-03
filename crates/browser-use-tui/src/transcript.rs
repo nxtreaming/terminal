@@ -1052,6 +1052,18 @@ fn committed_node_for_event(
             "started",
             NodeStyle::Normal,
         )),
+        "agent.spawn.queued" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "queued",
+            NodeStyle::Muted,
+        )),
+        "agent.spawn.queue_released" => Some(subagent_lifecycle_node(
+            app,
+            event,
+            "starting",
+            NodeStyle::Muted,
+        )),
         "agent.message" => Some(subagent_lifecycle_node(
             app,
             event,
@@ -1869,6 +1881,20 @@ fn active_node_for_event(
             events,
             "subagent",
             vec!["spawning".to_string()],
+            NodeStyle::Muted,
+        )),
+        "agent.spawn.queued" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["queued for capacity".to_string()],
+            NodeStyle::Muted,
+        )),
+        "agent.spawn.queue_released" => Some(active_status_node(
+            root,
+            events,
+            "subagent",
+            vec!["starting queued task".to_string()],
             NodeStyle::Muted,
         )),
         "collab_agent_interaction_begin" => Some(active_status_node(
