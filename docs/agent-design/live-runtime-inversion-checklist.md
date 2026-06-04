@@ -268,13 +268,13 @@ BrowserUseRuntime
       - capture/artifact ownership
       - active agent lease
       - action serialization
-- [ ] Make browser tools resolve a `BrowserHandle`, not only a `session_id`.
+- [x] Make browser tools resolve a `BrowserHandle`, not only a `session_id`.
 - [ ] Enforce one running agent per browser.
 - [ ] Allow many browsers in parallel.
-- [ ] Make `browser_script` start/observe/cancel operate through
+- [x] Make `browser_script` start/observe/cancel operate through
       `BrowserHandle`.
 - [ ] Journal browser claim/release/start/close as barrier events.
-- [ ] Journal script output/completion/cancellation in order.
+- [x] Journal script output/completion/cancellation in order.
 - [ ] Make SDK `Browser` map to `browser_id`.
 - [ ] On crash/resume, mark old browser/script handles lost or orphaned.
 
@@ -432,7 +432,7 @@ Tool and browser tests:
 - [ ] Background exec survives turn cancel and remains pollable.
 - [ ] Python worker persists across follow-up.
 - [ ] Python worker closes on agent close.
-- [ ] Browser script runs are scoped to `BrowserHandle`.
+- [x] Browser script runs are scoped to `BrowserHandle`.
 - [ ] Browser script cancel preserves partial output/artifacts.
 - [ ] Same browser concurrent agents fail fast.
 - [ ] Different browsers run in parallel.

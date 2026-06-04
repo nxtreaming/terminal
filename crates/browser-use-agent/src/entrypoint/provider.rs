@@ -150,6 +150,69 @@ impl RuntimeBrowserBackend {
                 action(self.backend.as_ref())
             })
     }
+
+    fn record_browser_script_response(
+        &self,
+        session_id: &str,
+        response: &browser_use_browser::BrowserScriptOutput,
+        synthesize_start: bool,
+    ) -> anyhow::Result<()> {
+        let Some(run_id) = response
+            .run_id
+            .as_deref()
+            .filter(|run_id| !run_id.trim().is_empty())
+        else {
+            return Ok(());
+        };
+        let runtime_session_id = RuntimeSessionId::from_string(session_id.to_string())?;
+        let base_payload = serde_json::json!({
+            "run_id": run_id,
+            "ok": response.ok,
+            "status": response.status.clone(),
+            "next_observe_ms": response.next_observe_ms,
+            "text": response.text.clone(),
+            "error": response.error.clone(),
+        });
+
+        if synthesize_start {
+            self.runtime.append_observed_browser_session_event(
+                runtime_session_id.clone(),
+                self.browser_id.clone(),
+                "browser_script.started",
+                base_payload.clone(),
+                RuntimeDurability::Barrier,
+            )?;
+        }
+
+        if response.status.as_deref() == Some("running") {
+            if !response.text.trim().is_empty() {
+                self.runtime.append_observed_browser_session_event(
+                    runtime_session_id,
+                    self.browser_id.clone(),
+                    "browser_script.output_delta",
+                    base_payload,
+                    RuntimeDurability::BestEffort,
+                )?;
+            }
+            return Ok(());
+        }
+
+        let event_type = match response.status.as_deref() {
+            Some("cancelled") => "browser_script.cancelled",
+            Some("failed") => "browser_script.failed",
+            Some("finished") => "browser_script.completed",
+            _ if response.ok => "browser_script.completed",
+            _ => "browser_script.failed",
+        };
+        self.runtime.append_observed_browser_session_event(
+            runtime_session_id,
+            self.browser_id.clone(),
+            event_type,
+            base_payload,
+            RuntimeDurability::Barrier,
+        )?;
+        Ok(())
+    }
 }
 
 impl BrowserBackend for RuntimeBrowserBackend {
@@ -172,7 +235,9 @@ impl BrowserBackend for RuntimeBrowserBackend {
         timeout_secs: u64,
     ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
         self.with_browser_lease(|backend| {
-            backend.run_script(session_id, cwd, artifact_dir, code, timeout_secs)
+            let output = backend.run_script(session_id, cwd, artifact_dir, code, timeout_secs)?;
+            self.record_browser_script_response(session_id, &output, true)?;
+            Ok(output)
         })
     }
 
@@ -185,7 +250,9 @@ impl BrowserBackend for RuntimeBrowserBackend {
         timeout_secs: u64,
     ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
         self.with_browser_lease(|backend| {
-            backend.start_script(session_id, cwd, artifact_dir, code, timeout_secs)
+            let output = backend.start_script(session_id, cwd, artifact_dir, code, timeout_secs)?;
+            self.record_browser_script_response(session_id, &output, true)?;
+            Ok(output)
         })
     }
 
@@ -196,7 +263,9 @@ impl BrowserBackend for RuntimeBrowserBackend {
         observe_timeout_ms: u64,
     ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
         self.with_browser_lease(|backend| {
-            backend.observe_script(session_id, run_id, observe_timeout_ms)
+            let output = backend.observe_script(session_id, run_id, observe_timeout_ms)?;
+            self.record_browser_script_response(session_id, &output, false)?;
+            Ok(output)
         })
     }
 
@@ -205,7 +274,11 @@ impl BrowserBackend for RuntimeBrowserBackend {
         session_id: &str,
         run_id: &str,
     ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
-        self.with_browser_lease(|backend| backend.cancel_script(session_id, run_id))
+        self.with_browser_lease(|backend| {
+            let output = backend.cancel_script(session_id, run_id)?;
+            self.record_browser_script_response(session_id, &output, false)?;
+            Ok(output)
+        })
     }
 }
 
@@ -2814,6 +2887,70 @@ mod tests {
         }
     }
 
+    struct ScriptLifecycleBrowserBackend;
+    impl BrowserBackend for ScriptLifecycleBrowserBackend {
+        fn command(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _command: &str,
+        ) -> anyhow::Result<BrowserCommandOutput> {
+            anyhow::bail!("command not used")
+        }
+
+        fn run_script(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _code: &str,
+            _timeout_secs: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            anyhow::bail!("run_script not used")
+        }
+
+        fn start_script(
+            &self,
+            _session_id: &str,
+            _cwd: &std::path::Path,
+            _artifact_dir: &std::path::Path,
+            _code: &str,
+            _timeout_secs: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            Ok(browser_use_browser::BrowserScriptOutput {
+                ok: true,
+                status: Some("running".to_string()),
+                run_id: Some("script-1".to_string()),
+                text: "first chunk".to_string(),
+                ..Default::default()
+            })
+        }
+
+        fn observe_script(
+            &self,
+            _session_id: &str,
+            _run_id: &str,
+            _observe_timeout_ms: u64,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            Ok(browser_use_browser::BrowserScriptOutput {
+                ok: true,
+                status: Some("finished".to_string()),
+                run_id: Some("script-1".to_string()),
+                text: "done".to_string(),
+                ..Default::default()
+            })
+        }
+
+        fn cancel_script(
+            &self,
+            _session_id: &str,
+            _run_id: &str,
+        ) -> anyhow::Result<browser_use_browser::BrowserScriptOutput> {
+            anyhow::bail!("cancel_script not used")
+        }
+    }
+
     /// A fake python backend returning a marker output (no real worker/process).
     struct MarkerPythonBackend;
     impl crate::tools::handlers::python::PythonBackend for MarkerPythonBackend {
@@ -2910,6 +3047,68 @@ mod tests {
             "browser must reach the backend, got: {:?}",
             result.output
         );
+    }
+
+    #[test]
+    fn runtime_browser_backend_records_script_lifecycle() -> anyhow::Result<()> {
+        use browser_use_runtime::{BrowserUseRuntime, CreateRootAgentRequest, JournalReader};
+
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: std::env::temp_dir(),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(RuntimeBrowserConfig::default());
+        let backend = RuntimeBrowserBackend {
+            session_id: root.session_id().as_str().to_string(),
+            runtime: handle.clone(),
+            agent_id: root.agent_id().clone(),
+            browser_id: browser_id.clone(),
+            backend: Arc::new(ScriptLifecycleBrowserBackend),
+        };
+        let cwd = std::env::temp_dir();
+        let artifact_dir = std::env::temp_dir().join("browser-script-lifecycle");
+
+        let started = backend.start_script(
+            root.session_id().as_str(),
+            &cwd,
+            &artifact_dir,
+            "await page.title()",
+            10,
+        )?;
+        assert_eq!(started.run_id.as_deref(), Some("script-1"));
+        let snapshot = handle.browsers().snapshot(&browser_id)?;
+        assert_eq!(snapshot.active_scripts.len(), 1);
+        assert_eq!(
+            snapshot.active_scripts[0].last_delta.as_deref(),
+            Some("first chunk")
+        );
+
+        let observed = backend.observe_script(root.session_id().as_str(), "script-1", 10)?;
+        assert_eq!(observed.status.as_deref(), Some("finished"));
+        assert!(handle
+            .browsers()
+            .snapshot(&browser_id)?
+            .active_scripts
+            .is_empty());
+
+        let script_events = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .filter(|event| event.event_type.starts_with("browser_script."))
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            script_events,
+            vec![
+                "browser_script.started".to_string(),
+                "browser_script.output_delta".to_string(),
+                "browser_script.completed".to_string(),
+            ]
+        );
+        Ok(())
     }
 
     /// A `python` call REACHES the injected backend through the orchestrator and

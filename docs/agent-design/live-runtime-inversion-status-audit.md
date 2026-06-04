@@ -44,7 +44,8 @@ BrowserUseRuntime
         |     +-- AgentResourceSet skeleton
         |
         +-- BrowserManager
-        |     +-- BrowserHandle metadata lease/status
+        |     +-- BrowserHandle lease/status/action lock
+        |     +-- active browser_script run projection
         |
         +-- JournalSink / StateIndex
               |
@@ -107,6 +108,11 @@ BrowserUseRuntime
   same-agent nested claims, and expose a runtime action-serialization helper used
   by the runtime browser backend. Same-browser conflicting owners still fail at
   the runtime boundary.
+- Browser script start/output/completion/cancellation/failure events now append
+  through a browser-scoped runtime journal path. `BrowserHandle` tracks active
+  script runs by `run_id`, runtime projection exposes active browser scripts,
+  and the runtime browser backend synthesizes lifecycle events while holding the
+  browser action lease.
 - Runtime session resources are attached to `AgentThread.ToolResourceBag` and
   are cleaned on `close_agent`; provider tests guard the runtime path against
   falling back to global exec/MCP/browser/Python resources.
@@ -144,10 +150,11 @@ BrowserUseRuntime
   `AgentResourceSet` name remains as a compatibility alias. Browser script
   ownership is still mediated through the provider-built runtime browser backend
   rather than a richer `BrowserHandle`.
-- `BrowserManager` now owns browser lease depth and action serialization. Actual
-  CDP/session execution and the script registry are still held by the runtime
-  browser backend resource in the agent provider, not directly by a rich
-  `BrowserHandle` with artifacts and crash semantics.
+- `BrowserManager` now owns browser lease depth, action serialization, and the
+  runtime-visible active browser script registry. Actual CDP/session execution
+  and the concrete script process registry are still held by the runtime browser
+  backend resource in the agent provider, not directly by a rich `BrowserHandle`
+  with artifacts and crash semantics.
 - TUI uses runtime for live cancellation/follow-up/mailbox counts and now
   projects active sessions from cached runtime snapshots at render time without
   mutating Store-derived history. Durable history/sidebar/event text still come
@@ -188,7 +195,8 @@ BrowserUseRuntime
    runtime-owned state plus JournalReader replay.
 3. Complete RuntimeEventProjection coverage and make it the live TUI authority.
 4. Promote BrowserManager from lease/action ownership to the owner of browser
-   sessions, script registries, artifacts, cancellation, and crash semantics.
+   sessions, concrete script process registries, artifacts, cancellation, and
+   crash semantics.
 5. Complete replay/crash recovery for durable graph fields that are not yet
    materialized through RuntimeHandle.
 6. Add negative barrier tests for remaining critical transitions not already

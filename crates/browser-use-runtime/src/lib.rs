@@ -145,6 +145,7 @@ pub enum RuntimeEventKind {
     BrowserScriptOutputDelta,
     BrowserScriptCompleted,
     BrowserScriptCancelled,
+    BrowserScriptFailed,
     ExecCommandBegin,
     ExecCommandOutputDelta,
     ExecCommandEnd,
@@ -203,6 +204,7 @@ impl RuntimeEventKind {
             Self::BrowserScriptOutputDelta => "browser.script.output_delta",
             Self::BrowserScriptCompleted => "browser.script.completed",
             Self::BrowserScriptCancelled => "browser.script.cancelled",
+            Self::BrowserScriptFailed => "browser.script.failed",
             Self::ExecCommandBegin => "exec_command.begin",
             Self::ExecCommandOutputDelta => "exec_command.output_delta",
             Self::ExecCommandEnd => "exec_command.end",
@@ -230,6 +232,7 @@ impl RuntimeEventKind {
             "browser_script.output_delta" => Self::BrowserScriptOutputDelta,
             "browser_script.completed" => Self::BrowserScriptCompleted,
             "browser_script.cancelled" => Self::BrowserScriptCancelled,
+            "browser_script.failed" => Self::BrowserScriptFailed,
             "python.started" => Self::PythonStarted,
             "python.output_delta" => Self::PythonOutputDelta,
             "python.completed" => Self::PythonCompleted,
@@ -462,6 +465,21 @@ pub struct BrowserSnapshot {
     pub config: BrowserConfig,
     pub status: BrowserStatus,
     pub active_agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub active_scripts: Vec<BrowserScriptSnapshot>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct BrowserScriptSnapshot {
+    pub run_id: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub session_id: Option<SessionId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub agent_id: Option<AgentId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool_call_id: Option<ToolCallId>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub last_delta: Option<String>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -475,6 +493,7 @@ struct BrowserHandleState {
     status: BrowserStatus,
     active_agent_id: Option<AgentId>,
     claim_depth: usize,
+    active_scripts: HashMap<String, BrowserScriptSnapshot>,
 }
 
 #[derive(Clone, Debug)]
@@ -494,6 +513,7 @@ impl BrowserHandle {
                 status: BrowserStatus::Created,
                 active_agent_id: None,
                 claim_depth: 0,
+                active_scripts: HashMap::new(),
             })),
             action_lock: Arc::new(Mutex::new(())),
         }
@@ -508,11 +528,14 @@ impl BrowserHandle {
             .state
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let mut active_scripts = state.active_scripts.values().cloned().collect::<Vec<_>>();
+        active_scripts.sort_by(|left, right| left.run_id.cmp(&right.run_id));
         BrowserSnapshot {
             id: self.id.clone(),
             config: self.config.clone(),
             status: state.status.clone(),
             active_agent_id: state.active_agent_id.clone(),
+            active_scripts,
         }
     }
 
@@ -592,6 +615,37 @@ impl BrowserHandle {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner);
         action()
+    }
+
+    fn record_script_started(&self, script: BrowserScriptSnapshot) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_scripts
+            .insert(script.run_id.clone(), script);
+    }
+
+    fn record_script_output_delta(&self, run_id: &str, delta: Option<String>) {
+        let Some(delta) = delta else {
+            return;
+        };
+        if let Some(script) = self
+            .state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_scripts
+            .get_mut(run_id)
+        {
+            script.last_delta = Some(delta);
+        }
+    }
+
+    fn record_script_finished(&self, run_id: &str) {
+        self.state
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .active_scripts
+            .remove(run_id);
     }
 }
 
@@ -703,6 +757,51 @@ impl BrowserManager {
             .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
         handle.close()?;
         browsers.remove(browser_id);
+        Ok(())
+    }
+
+    pub fn record_script_started(
+        &self,
+        browser_id: &BrowserId,
+        script: BrowserScriptSnapshot,
+    ) -> Result<()> {
+        let browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = browsers
+            .get(browser_id)
+            .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
+        handle.record_script_started(script);
+        Ok(())
+    }
+
+    pub fn record_script_output_delta(
+        &self,
+        browser_id: &BrowserId,
+        run_id: &str,
+        delta: Option<String>,
+    ) -> Result<()> {
+        let browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = browsers
+            .get(browser_id)
+            .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
+        handle.record_script_output_delta(run_id, delta);
+        Ok(())
+    }
+
+    pub fn record_script_finished(&self, browser_id: &BrowserId, run_id: &str) -> Result<()> {
+        let browsers = self
+            .browsers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let handle = browsers
+            .get(browser_id)
+            .ok_or_else(|| RuntimeError::UnknownBrowser(browser_id.as_str().to_string()))?;
+        handle.record_script_finished(run_id);
         Ok(())
     }
 
@@ -2896,6 +2995,7 @@ impl RuntimeProjectionState {
             RuntimeEventKind::ExecCommandEnd
             | RuntimeEventKind::BrowserScriptCompleted
             | RuntimeEventKind::BrowserScriptCancelled
+            | RuntimeEventKind::BrowserScriptFailed
             | RuntimeEventKind::PythonCompleted
             | RuntimeEventKind::McpToolCompleted
             | RuntimeEventKind::ToolCompleted
@@ -3032,6 +3132,7 @@ impl RuntimeProjectionState {
                     config,
                     status: BrowserStatus::Created,
                     active_agent_id: None,
+                    active_scripts: Vec::new(),
                 });
             }
             RuntimeEventKind::BrowserStarted => {
@@ -3062,13 +3163,51 @@ impl RuntimeProjectionState {
                 if let Some(browser) = self.browser_snapshot_mut(&browser_id) {
                     browser.status = BrowserStatus::Closed;
                     browser.active_agent_id = None;
+                    browser.active_scripts.clear();
                 } else {
                     self.snapshot.browsers.push(BrowserSnapshot {
                         id: browser_id,
                         config: BrowserConfig::default(),
                         status: BrowserStatus::Closed,
                         active_agent_id: None,
+                        active_scripts: Vec::new(),
                     });
+                }
+            }
+            RuntimeEventKind::BrowserScriptStarted => {
+                let payload = event_payload(event);
+                let Some(script) = browser_script_snapshot_from_payload(
+                    payload,
+                    event.session_id.clone(),
+                    event.agent_id.clone(),
+                ) else {
+                    return;
+                };
+                if let Some(browser) = self.browser_snapshot_mut(&browser_id) {
+                    upsert_browser_script(browser, script);
+                }
+            }
+            RuntimeEventKind::BrowserScriptOutputDelta => {
+                let payload = event_payload(event);
+                let Some(run_id) = browser_script_run_id_from_payload(payload) else {
+                    return;
+                };
+                let delta = output_delta_text(payload);
+                if let Some(browser) = self.browser_snapshot_mut(&browser_id) {
+                    update_browser_script_delta(browser, &run_id, delta);
+                }
+            }
+            RuntimeEventKind::BrowserScriptCompleted
+            | RuntimeEventKind::BrowserScriptCancelled
+            | RuntimeEventKind::BrowserScriptFailed => {
+                let payload = event_payload(event);
+                let Some(run_id) = browser_script_run_id_from_payload(payload) else {
+                    return;
+                };
+                if let Some(browser) = self.browser_snapshot_mut(&browser_id) {
+                    browser
+                        .active_scripts
+                        .retain(|script| script.run_id != run_id);
                 }
             }
             _ => {}
@@ -3178,6 +3317,7 @@ impl RuntimeEventProjection {
             RuntimeEventKind::ExecCommandEnd
             | RuntimeEventKind::BrowserScriptCompleted
             | RuntimeEventKind::BrowserScriptCancelled
+            | RuntimeEventKind::BrowserScriptFailed
             | RuntimeEventKind::PythonCompleted
             | RuntimeEventKind::McpToolCompleted
             | RuntimeEventKind::ToolCompleted
@@ -3254,9 +3394,15 @@ fn activity_tool_call_id(event: &RuntimeEvent) -> Option<ToolCallId> {
 }
 
 fn activity_key(event: &RuntimeEvent, kind: &str) -> String {
-    activity_tool_call_id(event)
-        .map(|id| format!("{kind}:{}", id.as_str()))
-        .unwrap_or_else(|| format!("{kind}:{}", event.id.as_str()))
+    if let Some(tool_call_id) = activity_tool_call_id(event) {
+        return format!("{kind}:{}", tool_call_id.as_str());
+    }
+    if kind == "browser_script" {
+        if let Some(run_id) = browser_script_run_id_from_payload(event_payload(event)) {
+            return format!("{kind}:{run_id}");
+        }
+    }
+    format!("{kind}:{}", event.id.as_str())
 }
 
 fn activity_name(payload: &Value) -> Option<String> {
@@ -3266,6 +3412,65 @@ fn activity_name(payload: &Value) -> Option<String> {
         .or_else(|| payload.get("command"))
         .and_then(Value::as_str)
         .map(str::to_string)
+}
+
+fn browser_script_run_id_from_payload(payload: &Value) -> Option<String> {
+    payload_resource_id(
+        payload,
+        &[
+            "run_id",
+            "browser_script_run_id",
+            "script_run_id",
+            "tool_call_id",
+        ],
+    )
+}
+
+fn browser_script_snapshot_from_payload(
+    payload: &Value,
+    session_id: Option<SessionId>,
+    agent_id: Option<AgentId>,
+) -> Option<BrowserScriptSnapshot> {
+    Some(BrowserScriptSnapshot {
+        run_id: browser_script_run_id_from_payload(payload)?,
+        session_id,
+        agent_id,
+        tool_call_id: payload
+            .get("payload")
+            .unwrap_or(payload)
+            .get("tool_call_id")
+            .and_then(Value::as_str)
+            .and_then(|id| ToolCallId::from_string(id).ok()),
+        last_delta: None,
+    })
+}
+
+fn upsert_browser_script(browser: &mut BrowserSnapshot, script: BrowserScriptSnapshot) {
+    if let Some(existing) = browser
+        .active_scripts
+        .iter_mut()
+        .find(|active| active.run_id == script.run_id)
+    {
+        *existing = script;
+        return;
+    }
+    browser.active_scripts.push(script);
+    browser
+        .active_scripts
+        .sort_by(|left, right| left.run_id.cmp(&right.run_id));
+}
+
+fn update_browser_script_delta(browser: &mut BrowserSnapshot, run_id: &str, delta: Option<String>) {
+    let Some(delta) = delta else {
+        return;
+    };
+    if let Some(script) = browser
+        .active_scripts
+        .iter_mut()
+        .find(|script| script.run_id == run_id)
+    {
+        script.last_delta = Some(delta);
+    }
 }
 
 fn start_activity(
@@ -3323,6 +3528,9 @@ fn finish_activity(agent: &mut AgentThreadSnapshot, event: &RuntimeEvent) {
 
 fn activity_keys_for_event(event: &RuntimeEvent) -> Vec<String> {
     let Some(tool_call_id) = activity_tool_call_id(event) else {
+        if let Some(run_id) = browser_script_run_id_from_payload(event_payload(event)) {
+            return vec![format!("browser_script:{run_id}")];
+        }
         return vec![
             activity_key(event, "exec_command"),
             activity_key(event, "browser_script"),
@@ -3659,6 +3867,72 @@ impl RuntimeHandle {
         if let Ok(thread) = self.inner.agents.thread(&agent_id) {
             event.root_id = Some(thread.root_id.clone());
         }
+        self.inner.events.publish(event);
+        Ok(append)
+    }
+
+    pub fn append_observed_browser_session_event(
+        &self,
+        session_id: SessionId,
+        browser_id: BrowserId,
+        event_type: &str,
+        payload: Value,
+        durability: Durability,
+    ) -> Result<JournalAppend> {
+        let thread = self.inner.agents.thread_for_session(&session_id)?;
+        let agent_id = thread.agent_id().clone();
+        self.inner.browsers.snapshot(&browser_id)?;
+
+        let append = self.inner.persistence.append_session_event(
+            &session_id,
+            event_type,
+            payload.clone(),
+            durability,
+        )?;
+        match event_type {
+            "browser_script.started" => {
+                if let Some(script) = browser_script_snapshot_from_payload(
+                    &payload,
+                    Some(session_id.clone()),
+                    Some(agent_id.clone()),
+                ) {
+                    self.inner
+                        .browsers
+                        .record_script_started(&browser_id, script)?;
+                }
+            }
+            "browser_script.output_delta" => {
+                if let Some(run_id) = browser_script_run_id_from_payload(&payload) {
+                    self.inner.browsers.record_script_output_delta(
+                        &browser_id,
+                        &run_id,
+                        output_delta_text(&payload),
+                    )?;
+                }
+            }
+            "browser_script.completed" | "browser_script.cancelled" | "browser_script.failed" => {
+                if let Some(run_id) = browser_script_run_id_from_payload(&payload) {
+                    self.inner
+                        .browsers
+                        .record_script_finished(&browser_id, &run_id)?;
+                }
+            }
+            _ => {}
+        }
+
+        let mut event = RuntimeEvent::new(
+            RuntimeEventKind::from_observed_event_type(event_type),
+            durability,
+        )
+        .with_session_id(session_id)
+        .with_agent_id(agent_id)
+        .with_browser_id(browser_id)
+        .with_payload(json!({
+            "event_type": event_type,
+            "seq": append.seq,
+            "payload": payload,
+        }));
+        event.root_id = Some(thread.root_id.clone());
         self.inner.events.publish(event);
         Ok(append)
     }
@@ -8281,6 +8555,140 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn browser_script_lifecycle_is_browser_scoped_and_projected() -> Result<()> {
+        let (runtime, journal) = BrowserUseRuntime::memory();
+        let handle = runtime.handle();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(BrowserConfig::default());
+        let mut subscription = handle.subscribe_projected();
+
+        handle.append_observed_browser_session_event(
+            root.session_id().clone(),
+            browser_id.clone(),
+            "browser_script.started",
+            json!({
+                "run_id": "script-1",
+                "tool_call_id": "call-1",
+            }),
+            Durability::Barrier,
+        )?;
+        let started = subscription.recv().await?;
+        let browser = projected_browser(&started, &browser_id);
+        assert_eq!(browser.active_scripts.len(), 1);
+        assert_eq!(browser.active_scripts[0].run_id, "script-1");
+        assert_eq!(
+            browser.active_scripts[0].agent_id,
+            Some(root.agent_id().clone())
+        );
+        let root_live = projected_agent_live(&started, root.agent_id());
+        assert_eq!(root_live.active_items.len(), 1);
+        assert_eq!(root_live.active_items[0].kind, "browser_script");
+
+        handle.append_observed_browser_session_event(
+            root.session_id().clone(),
+            browser_id.clone(),
+            "browser_script.output_delta",
+            json!({
+                "run_id": "script-1",
+                "tool_call_id": "call-1",
+                "text": "partial output",
+            }),
+            Durability::BestEffort,
+        )?;
+        let delta = subscription.recv().await?;
+        let browser = projected_browser(&delta, &browser_id);
+        assert_eq!(
+            browser.active_scripts[0].last_delta.as_deref(),
+            Some("partial output")
+        );
+        assert_eq!(
+            handle.browsers().snapshot(&browser_id)?.active_scripts[0]
+                .last_delta
+                .as_deref(),
+            Some("partial output")
+        );
+
+        handle.append_observed_browser_session_event(
+            root.session_id().clone(),
+            browser_id.clone(),
+            "browser_script.completed",
+            json!({
+                "run_id": "script-1",
+                "tool_call_id": "call-1",
+            }),
+            Durability::Barrier,
+        )?;
+        let completed = subscription.recv().await?;
+        let browser = projected_browser(&completed, &browser_id);
+        assert!(browser.active_scripts.is_empty());
+        let root_live = projected_agent_live(&completed, root.agent_id());
+        assert!(root_live.active_items.is_empty());
+        assert!(handle
+            .browsers()
+            .snapshot(&browser_id)?
+            .active_scripts
+            .is_empty());
+
+        let event_types = journal
+            .events_for_session(root.session_id())?
+            .into_iter()
+            .map(|event| event.event_type)
+            .collect::<Vec<_>>();
+        assert_eq!(
+            event_types
+                .iter()
+                .filter(|event_type| event_type.starts_with("browser_script."))
+                .cloned()
+                .collect::<Vec<_>>(),
+            vec![
+                "browser_script.started".to_string(),
+                "browser_script.output_delta".to_string(),
+                "browser_script.completed".to_string(),
+            ]
+        );
+        Ok(())
+    }
+
+    #[test]
+    fn browser_script_barrier_failure_does_not_publish_or_track_script() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        let browser_id = handle.create_browser(BrowserConfig::default());
+        let mut rx = handle.events().subscribe();
+        journal.fail_event_type("browser_script.started");
+
+        let err = handle
+            .append_observed_browser_session_event(
+                root.session_id().clone(),
+                browser_id.clone(),
+                "browser_script.started",
+                json!({
+                    "run_id": "script-1",
+                    "tool_call_id": "call-1",
+                }),
+                Durability::Barrier,
+            )
+            .expect_err("browser script start must fail before becoming live");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        assert!(handle
+            .browsers()
+            .snapshot(&browser_id)?
+            .active_scripts
+            .is_empty());
+        assert!(rx.try_recv().is_err());
+        Ok(())
+    }
+
+    #[tokio::test]
     async fn projected_subscription_reduces_observed_tool_and_terminal_state() -> Result<()> {
         let (runtime, _journal) = BrowserUseRuntime::memory();
         let handle = runtime.handle();
@@ -8503,5 +8911,19 @@ mod tests {
             .find(|agent| &agent.agent_id == agent_id)
             .expect("projected agent")
             .live
+    }
+
+    fn projected_browser<'a>(
+        event: &'a ProjectedEvent,
+        browser_id: &BrowserId,
+    ) -> &'a BrowserSnapshot {
+        event
+            .snapshot
+            .as_ref()
+            .expect("projected snapshot")
+            .browsers
+            .iter()
+            .find(|browser| &browser.id == browser_id)
+            .expect("projected browser")
     }
 }
