@@ -2534,8 +2534,6 @@ impl RuntimeHandle {
             }
         }
         let agent_id = thread.agent_id().clone();
-        thread.live_state.begin_run(request.run_id.clone());
-        thread.set_status(AgentThreadStatus::Running);
 
         self.inner.publish_after_barrier(
             RuntimeEvent::new(RuntimeEventKind::AgentStarted, Durability::Barrier)
@@ -2565,6 +2563,8 @@ impl RuntimeHandle {
                     "run_id": request.run_id.as_str(),
                 })),
         )?;
+        thread.live_state.begin_run(request.run_id.clone());
+        thread.set_status(AgentThreadStatus::Running);
 
         self.inner.active_runs.register_with_token(
             request.session_id.clone(),
@@ -2583,8 +2583,6 @@ impl RuntimeHandle {
                 } else {
                     AgentThreadStatus::Failed
                 };
-                thread.set_status(final_status);
-                thread.live_state.finish_run();
                 self.inner.publish_after_barrier(
                     RuntimeEvent::new(RuntimeEventKind::AgentTurnAborted, Durability::Barrier)
                         .with_agent_id(agent_id.clone())
@@ -2598,12 +2596,12 @@ impl RuntimeHandle {
                             "cancelled": request.cancellation_token.is_cancelled(),
                         })),
                 )?;
+                thread.set_status(final_status);
+                thread.live_state.finish_run();
                 return Err(error);
             }
         };
 
-        thread.set_status(AgentThreadStatus::Completed);
-        thread.live_state.finish_run();
         let terminal_append = self.inner.publish_after_barrier(
             RuntimeEvent::new(RuntimeEventKind::AgentTurnCompleted, Durability::Barrier)
                 .with_agent_id(agent_id.clone())
@@ -2615,6 +2613,8 @@ impl RuntimeHandle {
                     "run_id": request.run_id.as_str(),
                 })),
         )?;
+        thread.set_status(AgentThreadStatus::Completed);
+        thread.live_state.finish_run();
 
         Ok(RunAgentResponse {
             agent_id,
@@ -4364,6 +4364,55 @@ mod tests {
         assert!(event_types.contains(&"agent.started".to_string()));
         assert!(event_types.contains(&"agent.turn.started".to_string()));
         assert!(event_types.contains(&"agent.turn.completed".to_string()));
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_start_barrier_failure_does_not_mark_agent_running() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        journal.fail_event_type("agent.started");
+
+        let err = handle
+            .run_agent(RunAgentRequest::new(root.session_id().clone()), async {
+                Ok::<_, anyhow::Error>("done".to_string())
+            })
+            .await
+            .expect_err("agent.started barrier failure must fail run");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.status, AgentThreadStatus::Created);
+        assert_eq!(snapshot.live.current_run_id, None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn run_completion_barrier_failure_does_not_mark_agent_completed() -> Result<()> {
+        let (handle, journal) = runtime_with_failing_journal();
+        let root = handle.create_root_agent(CreateRootAgentRequest {
+            cwd: PathBuf::from("/tmp"),
+            task: "root task".to_string(),
+            max_concurrent_threads_per_session: 3,
+        })?;
+        journal.fail_event_type("agent.turn.completed");
+
+        let err = handle
+            .run_agent(RunAgentRequest::new(root.session_id().clone()), async {
+                Ok::<_, anyhow::Error>("done".to_string())
+            })
+            .await
+            .expect_err("agent.turn.completed barrier failure must fail run");
+
+        assert!(err.to_string().contains("forced journal failure"));
+        let snapshot = root.snapshot();
+        assert_eq!(snapshot.status, AgentThreadStatus::Running);
+        assert!(snapshot.live.current_run_id.is_some());
+        assert!(!handle.cancel_run(root.session_id()));
         Ok(())
     }
 
