@@ -11260,6 +11260,65 @@ mod redesign_tests {
     }
 
     #[test]
+    fn home_shows_cloud_banner_even_when_key_exists_or_cloud_selected() -> Result<()> {
+        let saved = std::env::var("BROWSER_USE_API_KEY").ok();
+        const BANNER_START: &str = "Cloud browser:";
+        const BANNER_CTA: &str = "no local Chrome prompts, auto-solves captchas.";
+        const BANNER_LINK: &str = "[cloud.browser-use.com]";
+        unsafe {
+            std::env::remove_var("BROWSER_USE_API_KEY");
+        }
+        let result = (|| -> Result<()> {
+            let temp = tempfile::tempdir()?;
+            let mut app = ready_app(&temp)?;
+
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains(BANNER_START));
+            assert!(screen.contains(BANNER_CTA));
+            assert!(screen.contains(BANNER_LINK));
+            assert!(row_containing(&screen, BANNER_START) < row_containing(&screen, "Browser Use"));
+            assert!(row_containing(&screen, BANNER_CTA) < row_containing(&screen, "Browser Use"));
+            assert!(row_containing(&screen, BANNER_LINK) < row_containing(&screen, "Browser Use"));
+            let first_banner_line = screen
+                .lines()
+                .find(|line| line.contains(BANNER_START))
+                .unwrap();
+            let second_banner_line = screen
+                .lines()
+                .find(|line| line.contains(BANNER_CTA))
+                .unwrap();
+            let link_banner_line = screen
+                .lines()
+                .find(|line| line.contains(BANNER_LINK))
+                .unwrap();
+            assert!(
+                first_banner_line.starts_with("    "),
+                "{first_banner_line:?}"
+            );
+            assert!(
+                second_banner_line.starts_with("    "),
+                "{second_banner_line:?}"
+            );
+            assert!(link_banner_line.starts_with("    "), "{link_banner_line:?}");
+
+            app.store
+                .set_setting(BROWSER_USE_CLOUD_API_KEY_SETTING, "bu-test")?;
+            app.browser = BROWSER_USE_CLOUD.to_string();
+            let screen = render_dump(&mut app)?;
+            assert!(screen.contains(BANNER_START));
+            assert!(screen.contains(BANNER_CTA));
+            assert!(screen.contains(BANNER_LINK));
+            Ok(())
+        })();
+        if let Some(value) = saved {
+            unsafe {
+                std::env::set_var("BROWSER_USE_API_KEY", value);
+            }
+        }
+        result
+    }
+
+    #[test]
     fn cloud_browser_without_key_is_not_reported_ready() -> Result<()> {
         let saved = std::env::var("BROWSER_USE_API_KEY").ok();
         unsafe {
