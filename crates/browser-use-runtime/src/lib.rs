@@ -3779,7 +3779,7 @@ fn initial_input_source_event_seq(initial_input: &Value) -> Option<i64> {
         })
 }
 
-fn final_result_from_events(events: &[EventRecord]) -> Option<String> {
+fn final_result_event_from_events(events: &[EventRecord]) -> Option<(i64, String)> {
     events.iter().rev().find_map(|event| {
         if event.event_type != "session.done" {
             return None;
@@ -3788,7 +3788,7 @@ fn final_result_from_events(events: &[EventRecord]) -> Option<String> {
             .payload
             .get("result")
             .and_then(Value::as_str)
-            .map(ToOwned::to_owned)
+            .map(|result| (event.seq, result.to_owned()))
     })
 }
 
@@ -4290,17 +4290,46 @@ impl RuntimeHandle {
                         "runtime_owned": true,
                     })
                 };
-                if let Err(terminal_error) = self.inner.persistence.append_session_event(
+                let terminal_append = match self.inner.persistence.append_session_event(
                     &request.session_id,
                     terminal_event_type,
                     terminal_payload,
                     Durability::Barrier,
                 ) {
+                    Ok(append) => append,
+                    Err(terminal_error) => {
+                        thread.live_state.finish_run();
+                        if let Some(lease) = browser_lease.as_ref() {
+                            self.release_browser(lease)?;
+                        }
+                        return Err(terminal_error);
+                    }
+                };
+                let terminal_kind = if request.cancellation_token.is_cancelled() {
+                    RuntimeEventKind::AgentCancelled
+                } else {
+                    RuntimeEventKind::AgentFailed
+                };
+                if let Err(terminal_runtime_error) = self.inner.publish_after_barrier(
+                    RuntimeEvent::new(terminal_kind, Durability::Barrier)
+                        .with_agent_id(agent_id.clone())
+                        .with_session_id(request.session_id.clone())
+                        .with_root_id(thread.root_id.clone())
+                        .with_run_id(request.run_id.clone())
+                        .with_payload(json!({
+                            "runtime_owned": true,
+                            "run_id": request.run_id.as_str(),
+                            "error": format!("{error:#}"),
+                            "cancelled": request.cancellation_token.is_cancelled(),
+                            "terminal_event_type": terminal_event_type,
+                            "terminal_event_seq": terminal_append.seq,
+                        })),
+                ) {
                     thread.live_state.finish_run();
                     if let Some(lease) = browser_lease.as_ref() {
                         self.release_browser(lease)?;
                     }
-                    return Err(terminal_error);
+                    return Err(terminal_runtime_error);
                 }
                 thread.set_status(final_status);
                 thread.live_state.finish_run();
@@ -4331,17 +4360,44 @@ impl RuntimeHandle {
                 return Err(error);
             }
         };
+        let final_result_event = self
+            .inner
+            .persistence
+            .events_for_session(&request.session_id)
+            .ok()
+            .and_then(|events| final_result_event_from_events(&events));
+        let final_result = final_result_event
+            .as_ref()
+            .map(|(_, result)| result.clone());
+        let terminal_append = match self.inner.publish_after_barrier(
+            RuntimeEvent::new(RuntimeEventKind::AgentCompleted, Durability::Barrier)
+                .with_agent_id(agent_id.clone())
+                .with_session_id(request.session_id.clone())
+                .with_root_id(thread.root_id.clone())
+                .with_run_id(request.run_id.clone())
+                .with_payload(json!({
+                    "runtime_owned": true,
+                    "run_id": request.run_id.as_str(),
+                    "result": final_result.clone(),
+                    "terminal_event_type": "session.done",
+                    "terminal_event_seq": final_result_event.map(|(seq, _)| seq),
+                    "turn_completed_event_seq": terminal_append.seq,
+                })),
+        ) {
+            Ok(append) => append,
+            Err(error) => {
+                thread.live_state.finish_run();
+                if let Some(lease) = browser_lease.as_ref() {
+                    self.release_browser(lease)?;
+                }
+                return Err(error);
+            }
+        };
         thread.set_status(AgentThreadStatus::Completed);
         thread.live_state.finish_run();
         if let Some(lease) = browser_lease.as_ref() {
             self.release_browser(lease)?;
         }
-        let final_result = self
-            .inner
-            .persistence
-            .events_for_session(&request.session_id)
-            .ok()
-            .and_then(|events| final_result_from_events(&events));
 
         Ok(RunAgentResponse {
             agent_id,
@@ -6696,15 +6752,27 @@ mod tests {
         assert_eq!(snapshot.status, AgentThreadStatus::Completed);
         assert_eq!(snapshot.live.current_run_id, None);
 
-        let event_types = journal
-            .events_for_session(root.session_id())?
-            .into_iter()
-            .map(|event| event.event_type)
+        let events = journal.events_for_session(root.session_id())?;
+        let event_types = events
+            .iter()
+            .map(|event| event.event_type.as_str())
             .collect::<Vec<_>>();
-        assert!(event_types.contains(&"agent.input.accepted".to_string()));
-        assert!(event_types.contains(&"agent.started".to_string()));
-        assert!(event_types.contains(&"agent.turn.started".to_string()));
-        assert!(event_types.contains(&"agent.turn.completed".to_string()));
+        assert!(event_types.contains(&"agent.input.accepted"));
+        assert!(event_types.contains(&"agent.started"));
+        assert!(event_types.contains(&"agent.turn.started"));
+        assert!(event_types.contains(&"agent.turn.completed"));
+        assert!(event_types.contains(&"agent.completed"));
+        let turn_completed_seq = events
+            .iter()
+            .find(|event| event.event_type == "agent.turn.completed")
+            .expect("agent.turn.completed")
+            .seq;
+        let completed = events
+            .iter()
+            .find(|event| event.event_type == "agent.completed")
+            .expect("agent.completed");
+        assert!(completed.seq > turn_completed_seq);
+        assert_eq!(completed.payload["payload"]["result"], "done");
         Ok(())
     }
 
@@ -6859,13 +6927,22 @@ mod tests {
                 .status,
             SessionStatus::Failed
         );
-        let event_types = journal
-            .events_for_session(root.session_id())?
-            .into_iter()
-            .map(|event| event.event_type)
+        let events = journal.events_for_session(root.session_id())?;
+        let event_types = events
+            .iter()
+            .map(|event| event.event_type.as_str())
             .collect::<Vec<_>>();
-        assert!(event_types.contains(&"agent.turn.aborted".to_string()));
-        assert!(event_types.contains(&"session.failed".to_string()));
+        assert!(event_types.contains(&"agent.turn.aborted"));
+        assert!(event_types.contains(&"session.failed"));
+        assert!(event_types.contains(&"agent.failed"));
+        let failed = events
+            .iter()
+            .find(|event| event.event_type == "agent.failed")
+            .expect("agent.failed");
+        assert_eq!(
+            failed.payload["payload"]["terminal_event_type"],
+            "session.failed"
+        );
         Ok(())
     }
 
