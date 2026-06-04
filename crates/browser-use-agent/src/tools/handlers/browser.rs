@@ -1022,35 +1022,61 @@ fn ensure_local_browser_ready_for_work(
         }
     }
 
+    if browser_status_connection(&status.content) == Some("connected") {
+        if let Some(active_profile_id) = browser_status_local_profile_id(&status.content) {
+            if active_profile_id != profile_id {
+                open_selected_local_profile(backend, session_id, cwd, artifact_dir, profile_id)?;
+                let connect =
+                    backend.command(session_id, cwd, artifact_dir, "browser connect local")?;
+                if local_browser_ready_for_profile(&connect.content, profile_id) {
+                    return Ok(());
+                }
+                return Err(local_browser_not_ready_error(&connect.content));
+            }
+        }
+    }
+
+    open_selected_local_profile(backend, session_id, cwd, artifact_dir, profile_id)?;
+    let connect = backend.command(session_id, cwd, artifact_dir, "browser connect local")?;
+    if local_browser_ready_for_profile(&connect.content, profile_id) {
+        return Ok(());
+    }
+    Err(local_browser_not_ready_error(&connect.content))
+}
+
+fn open_selected_local_profile(
+    backend: &dyn BrowserBackend,
+    session_id: &str,
+    cwd: &std::path::Path,
+    artifact_dir: &std::path::Path,
+    profile_id: &str,
+) -> anyhow::Result<()> {
     let command = format!(
         "browser local open --profile {}",
         shell_quote_browser_arg(profile_id)
     );
     backend.command(session_id, cwd, artifact_dir, &command)?;
     std::thread::sleep(std::time::Duration::from_millis(750));
-    let connect = backend.command(session_id, cwd, artifact_dir, "browser connect local")?;
-    if local_browser_ready_for_profile(&connect.content, profile_id) {
-        return Ok(());
-    }
-    let status = connect
-        .content
+    Ok(())
+}
+
+fn local_browser_not_ready_error(content: &serde_json::Value) -> anyhow::Error {
+    let status = content
         .get("status")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    let state = connect
-        .content
+    let state = content
         .get("state")
-        .or_else(|| connect.content.get("loss_reason"))
+        .or_else(|| content.get("loss_reason"))
         .and_then(serde_json::Value::as_str)
         .unwrap_or("unknown");
-    let next_step = connect
-        .content
+    let next_step = content
         .get("next_step")
         .and_then(serde_json::Value::as_str)
         .unwrap_or("follow the browser tool recovery instructions");
-    bail!(
+    anyhow!(
         "Browser work is blocked; do not answer the user's browser/search/page task from memory. local Chrome is not ready for the selected default profile before browser work; connect status: {status}; state: {state}; next_step: {next_step}"
-    );
+    )
 }
 
 fn local_browser_ready_for_profile(value: &serde_json::Value, profile_id: &str) -> bool {
